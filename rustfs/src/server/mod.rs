@@ -58,7 +58,7 @@ pub(crate) use health::{
 pub(crate) use health::{HealthProbe, build_health_response_parts, collect_probe_readiness, probe_from_path};
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
-pub(crate) use layer::RequestContextLayer;
+pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
 pub(crate) use module_switch::{
     MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
     current_module_switch_snapshot, refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store,

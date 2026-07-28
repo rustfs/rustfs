@@ -162,13 +162,13 @@ async fn handle_assume_role(
 
     let session_token = get_session_token(&uri, &headers);
     if session_token.is_some() {
-        return Err(s3_error!(InvalidRequest, "AccessDenied1"));
+        return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
     let (cred, owner) = check_key_valid(get_session_token(&uri, &headers).unwrap_or_default(), &user.access_key).await?;
 
     if cred.is_temp() || cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "AccessDenied"));
+        return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
     let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {

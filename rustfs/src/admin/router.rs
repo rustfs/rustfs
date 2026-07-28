@@ -38,6 +38,7 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
+    is_sts_query_request,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -2769,15 +2770,7 @@ where
         }
 
         // AssumeRole
-        if method == Method::POST
-            && path == "/"
-            && headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.split(';').next().unwrap_or("").trim().to_lowercase())
-                .map(|ct| ct == "application/x-www-form-urlencoded")
-                .unwrap_or(false)
-        {
+        if is_sts_query_request(method, uri, headers) {
             return true;
         }
 
@@ -2827,22 +2820,7 @@ where
         // The handler dispatches on the Action parameter: AssumeRole will reject if
         // credentials are missing, AssumeRoleWithWebIdentity will validate the JWT.
         // Require application/x-www-form-urlencoded Content-Type to narrow the bypass.
-        if req.method == Method::POST
-            && path == "/"
-            && req.credentials.is_none()
-            && req
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| {
-                    ct.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                })
-                .unwrap_or(false)
-        {
+        if req.credentials.is_none() && is_sts_query_request(&req.method, &req.uri, &req.headers) {
             return Ok(());
         }
 
@@ -4792,6 +4770,43 @@ mod tests {
             .await
             .expect_err("anonymous profile request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_limits_anonymous_sts_exemption_to_form_content_type() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let request = |content_type: Option<&'static str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            }
+            S3Request {
+                input: Body::from(String::from("Action=AssumeRoleWithWebIdentity")),
+                method: Method::POST,
+                uri: Uri::from_static("/"),
+                headers,
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            }
+        };
+
+        for content_type in [None, Some("application/json")] {
+            let mut req = request(content_type);
+            let err = router
+                .check_access(&mut req)
+                .await
+                .expect_err("anonymous STS request without form content type must be denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        }
+
+        let mut req = request(Some("application/x-www-form-urlencoded"));
+        router
+            .check_access(&mut req)
+            .await
+            .expect("anonymous form-encoded STS request should reach identity validation");
     }
 
     #[tokio::test]
