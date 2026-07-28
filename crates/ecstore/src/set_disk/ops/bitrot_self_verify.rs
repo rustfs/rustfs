@@ -258,6 +258,7 @@ mod tests {
         let shard_size = 16usize;
         let payload = b"inline bitrot payload";
         let encoded = encode_streaming_shard(payload, shard_size).await;
+        let disks = disks.into_iter().map(Some).collect::<Vec<_>>();
 
         for trailing in [vec![0xa5], vec![0xa5; 17]] {
             let mut oversized = encoded.to_vec();
