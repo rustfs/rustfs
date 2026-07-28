@@ -245,6 +245,21 @@ impl From<StorageError> for ApiError {
             };
         }
 
+        if let StorageError::Io(ref io_err) = err
+            && matches!(
+                io_err
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<rustfs_kms::KmsError>()),
+                Some(rustfs_kms::KmsError::BackendError { .. })
+            )
+        {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                source: Some(Box::new(err)),
+            };
+        }
+
         let code = match &err {
             StorageError::NotImplemented => S3ErrorCode::NotImplemented,
             StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
@@ -488,6 +503,14 @@ mod tests {
     }
 
     #[test]
+    fn test_kms_backend_unavailable_maps_to_retryable_error() {
+        let api_error = ApiError::from(StorageError::other(rustfs_kms::KmsError::backend_error("Vault connection refused")));
+
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
     fn test_unknown_authoritative_quota_usage_maps_to_retryable_error() {
         let api_error = ApiError::from(QuotaError::UsageUnavailable {
             bucket: "bucket".to_string(),
@@ -495,6 +518,16 @@ mod tests {
 
         assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
+    fn test_kms_cryptographic_error_is_not_retryable() {
+        let api_error = ApiError::from(StorageError::other(rustfs_kms::KmsError::cryptographic_error(
+            "decrypt",
+            "authentication failed",
+        )));
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
     }
 
     #[test]
