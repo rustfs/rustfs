@@ -170,6 +170,34 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
         .expect("Failed to upload test object")
 }
 
+async fn transition_uploaded_object_directly(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    tier_name: &str,
+    uploaded: &ObjectInfo,
+) -> ObjectInfo {
+    let transition_opts = ObjectOptions {
+        transition: lifecycle::lifecycle_contract::TransitionOptions {
+            status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+            tier: tier_name.to_string(),
+            etag: uploaded.etag.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        version_id: uploaded.version_id.map(|version| version.to_string()),
+        versioned: uploaded.version_id.is_some(),
+        mod_time: uploaded.mod_time,
+        ..Default::default()
+    };
+    ecstore
+        .transition_object(bucket, object, &transition_opts)
+        .await
+        .expect("Failed to transition object directly");
+    wait_for_transition(ecstore, bucket, object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should transition before restore assertions")
+}
+
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -2090,25 +2118,15 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     let backend = register_mock_tier(&tier_name).await;
 
     let bucket = format!("test-api-restore-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    // Must live under the `test/` prefix: `set_bucket_lifecycle_transition_with_tier`
-    // scopes the transition rule to `<Filter><Prefix>test/</Prefix>`, so an object
-    // outside it never matches, is never enqueued, and never transitions — the
-    // setup `wait_for_transition` would then time out before the restore assertions.
+    // Keep the object under the shared ILM test prefix even though this setup
+    // transitions it directly; it keeps diagnostics aligned with sibling tests.
     let object = "test/restore/api-object.bin";
     let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
-    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
-        .await
-        .expect("Failed to set lifecycle configuration");
-    let _ = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
-
-    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
-        .await
-        .expect("Failed to enqueue transitioned object");
-    let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
-        .await
-        .expect("object should transition before the restore API runs");
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    backend.clear_op_log().await;
 
     let get_barrier = backend.arm_get_barrier().await;
 
@@ -2208,22 +2226,14 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
     let backend = register_mock_tier(&tier_name).await;
 
     let bucket = format!("test-api-restore-cas-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    // Must live under the `test/` prefix — the shared transition rule filters on it.
+    // Keep the object under the shared ILM test prefix for diagnostics parity.
     let object = "test/restore/cas-object.bin";
     let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
-    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
-        .await
-        .expect("Failed to set lifecycle configuration");
-    let _ = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
-
-    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
-        .await
-        .expect("Failed to enqueue transitioned object");
-    let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
-        .await
-        .expect("object should transition before the concurrent restores run");
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    backend.clear_op_log().await;
 
     // Hold the accepted copy-back at the tier GET until both accept attempts
     // return, so the loser cannot observe an already-restored object.
