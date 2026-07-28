@@ -4548,6 +4548,7 @@ mod transition_commit_failure_tests {
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
     use s3s::dto::RestoreRequest;
     use tokio::io::AsyncReadExt;
 
@@ -4700,12 +4701,15 @@ mod transition_commit_failure_tests {
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .expect("successful multipart restore must leave the committed object intact");
-        assert_eq!(
-            restored
-                .user_defined
-                .get(s3s::header::X_AMZ_RESTORE.as_str())
-                .map(String::as_str),
-            Some("ongoing-request=\"false\"")
+        let restore_header = restored
+            .user_defined
+            .get(s3s::header::X_AMZ_RESTORE.as_str())
+            .expect("successful multipart restore must persist restore status");
+        let restore_status = parse_restore_obj_status(restore_header).expect("successful restore status must be valid");
+        assert!(!restore_status.on_going(), "successful multipart restore must not remain in progress");
+        assert!(
+            restore_status.expiry().is_some(),
+            "successful multipart restore must retain its expiry date"
         );
     }
 
