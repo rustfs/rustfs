@@ -79,6 +79,18 @@ impl SnapshotLeaseToken {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let uuid = Uuid::from_slice(bytes).map_err(|_| Error::other("invalid snapshot lease token"))?;
+        if uuid.is_nil() {
+            return Err(Error::other("invalid snapshot lease token"));
+        }
+        Ok(Self(uuid))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
 }
 
 impl Default for SnapshotLeaseToken {
@@ -281,6 +293,13 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.release_snapshot_lease(volume, path, token).await,
             Disk::Remote(remote_disk) => remote_disk.release_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.renew_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.renew_snapshot_lease(volume, path, token).await,
         }
     }
 
@@ -692,6 +711,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         Err(Error::other("snapshot leases are not supported by this disk"))
     }
     async fn release_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<()> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn renew_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
         Err(Error::other("snapshot leases are not supported by this disk"))
     }
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {

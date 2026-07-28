@@ -305,7 +305,8 @@ pub mod disk {
         CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
         FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
         PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk, validate_batch_read_version_item_count,
+        STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
+        validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;

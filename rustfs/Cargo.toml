@@ -124,7 +124,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
-tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-util = { workspace = true, features = ["io", "compat", "time"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
