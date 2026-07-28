@@ -2197,6 +2197,7 @@ mod metadata_cache_tests {
         let object = "object";
         let (_dir, disk) = new_read_version_test_disk(bucket).await;
         let mut fi = valid_test_fileinfo(object);
+        fi.size = 0;
         fi.mod_time = Some(OffsetDateTime::now_utc());
         disk.write_metadata(bucket, bucket, object, fi.clone())
             .await
