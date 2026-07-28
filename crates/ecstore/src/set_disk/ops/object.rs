@@ -1692,6 +1692,13 @@ async fn cleanup_rejected_transition_upload_durably(
         tier_name: lease.tier_name().to_string(),
         backend_identity: Some(lease.backend_identity()),
         version_id_exact,
+        version_state: if !version_id_exact {
+            rustfs_filemeta::TransitionVersionState::KnownDisabled
+        } else if cleanup_version == "null" {
+            rustfs_filemeta::TransitionVersionState::SuspendedNull
+        } else {
+            rustfs_filemeta::TransitionVersionState::Exact
+        },
     };
 
     let journal_error = if let Some(api) = api.as_ref() {
@@ -2107,12 +2114,28 @@ async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCo
     }
 }
 
-fn parse_transition_version_id(remote_version: &str) -> Option<String> {
-    if remote_version.is_empty() || Uuid::parse_str(remote_version).is_ok_and(|version_id| version_id.is_nil()) {
-        None
-    } else {
-        Some(remote_version.to_string())
+fn persisted_transition_version(
+    remote_version: &str,
+) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
+    if remote_version.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a missing remote tier object version remains unknown until the cluster capability gate is active",
+        ));
     }
+    let version_id = Uuid::parse_str(remote_version).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "opaque remote tier versions require the cluster capability gate",
+        )
+    })?;
+    if version_id.is_nil() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier returned a nil object version ID",
+        ));
+    }
+    Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact))
 }
 
 #[cfg(test)]
@@ -2274,13 +2297,14 @@ mod transition_upload_completion_tests {
 
 #[cfg(test)]
 mod transition_version_id_tests {
-    use super::{TransitionUploadCandidate, parse_transition_version_id};
+    use super::{TransitionUploadCandidate, persisted_transition_version};
+    use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
 
     #[test]
     fn normalizes_persisted_unversioned_ids_and_preserves_put_constraints() {
-        assert_eq!(parse_transition_version_id(""), None);
-        assert_eq!(parse_transition_version_id(&Uuid::nil().to_string()), None);
+        assert!(persisted_transition_version("").is_err());
+        assert!(persisted_transition_version(&Uuid::nil().to_string()).is_err());
         let nil_put_response = Uuid::nil().to_string();
         let nil_candidate = TransitionUploadCandidate::from_put_response(nil_put_response.clone());
         assert_eq!(nil_candidate.cleanup_version(), nil_put_response);
@@ -2292,13 +2316,14 @@ mod transition_version_id_tests {
     }
 
     #[test]
-    fn preserves_uuid_and_opaque_remote_ids() {
+    fn preserves_uuid_and_gates_opaque_remote_ids() {
         let version_id = Uuid::new_v4();
-        assert_eq!(parse_transition_version_id(&version_id.to_string()), Some(version_id.to_string()));
         assert_eq!(
-            parse_transition_version_id("opaque-version-token"),
-            Some("opaque-version-token".to_string())
+            persisted_transition_version(&version_id.to_string()).expect("UUID remote version"),
+            (Some(version_id.to_string()), TransitionVersionState::Exact)
         );
+        assert!(persisted_transition_version("null").is_err());
+        assert!(persisted_transition_version("opaque-version-token").is_err());
         assert_eq!(
             TransitionUploadCandidate::from_put_response(version_id.to_string()).cleanup_version(),
             version_id.to_string()
@@ -3552,7 +3577,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err);
         }
-        let transition_version_id = parse_transition_version_id(candidate.remote_version());
+        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
+            Ok(version) => version,
+            Err(err) => {
+                let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                    ))));
+                }
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+                return Err(err.into());
+            }
+        };
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -3614,6 +3652,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .as_deref()
             .and_then(|version_id| Uuid::parse_str(version_id).ok());
         current_fi.transition_version = transition_version_id;
+        current_fi.transition_version_state = transition_version_state;
         rustfs_utils::http::metadata_compat::insert_str(
             &mut current_fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
@@ -4427,6 +4466,34 @@ mod transition_commit_failure_tests {
         let mut metadata = restore_operation_id_metadata(operation_id);
         metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
         metadata
+    }
+
+    #[tokio::test]
+    async fn rejected_unsupported_remote_versions_are_cleaned_up() {
+        for remote_version in ["", "null", "opaque-version-token"] {
+            let manager = TierConfigMgr::new();
+            let backend = register_mock_tier(&manager, "WARM").await;
+            let lease = TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+                .await
+                .expect("mock tier lease should be available");
+            let candidate = TransitionUploadCandidate::from_put_response(remote_version.to_string());
+
+            persisted_transition_version(candidate.remote_version()).expect_err("unsupported writer version must fail closed");
+            cleanup_rejected_transition_upload_durably(
+                &lease,
+                "remote/object",
+                candidate.cleanup_version(),
+                candidate.cleanup_version_is_exact(),
+                None,
+            )
+            .await
+            .expect("rejected remote upload must be cleaned up");
+
+            assert_eq!(
+                backend.remove_versions().await,
+                vec![("remote/object".to_string(), candidate.cleanup_version().to_string())]
+            );
+        }
     }
 
     #[tokio::test]

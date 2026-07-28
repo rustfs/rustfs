@@ -42,6 +42,7 @@ const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
 const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
+const TIER_DELETE_JOURNAL_STATE_VERSION: u8 = 4;
 pub(crate) const TIER_DELETE_JOURNAL_PREFIX: &str = "ilm/tier-delete-journal/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,24 +56,35 @@ struct PersistedTierDeleteJournalEntry {
     backend_identity: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     version_id_exact: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_state: Option<rustfs_filemeta::TransitionVersionState>,
 }
 
 impl PersistedTierDeleteJournalEntry {
-    fn from_jentry(je: &Jentry) -> Self {
-        Self {
-            version: if je.version_id_exact {
-                TIER_DELETE_JOURNAL_EXACT_VERSION
-            } else if je.backend_identity.is_some() {
+    fn from_jentry(je: &Jentry) -> Result<Self> {
+        validate_version_state(je.version_state, &je.version_id, je.version_id_exact)?;
+        let legacy_unknown = je.version_state == rustfs_filemeta::TransitionVersionState::Unknown;
+        let version = if legacy_unknown {
+            if je.backend_identity.is_some() {
                 TIER_DELETE_JOURNAL_VERSION
             } else {
                 1
-            },
+            }
+        } else {
+            if je.backend_identity.is_none() {
+                return Err(Error::other("new tier delete journal entry is missing its backend identity"));
+            }
+            TIER_DELETE_JOURNAL_STATE_VERSION
+        };
+        Ok(Self {
+            version,
             obj_name: je.obj_name.clone(),
             version_id: je.version_id.clone(),
             tier_name: je.tier_name.clone(),
             backend_identity: je.backend_identity,
             version_id_exact: je.version_id_exact.then_some(true),
-        }
+            version_state: (!legacy_unknown).then_some(je.version_state),
+        })
     }
 
     fn into_jentry(self) -> Result<Jentry> {
@@ -84,19 +96,23 @@ impl PersistedTierDeleteJournalEntry {
         if self.obj_name.is_empty() || self.tier_name.is_empty() {
             return Err(Error::other("tier delete journal entry is incomplete"));
         }
-        if self.version != TIER_DELETE_JOURNAL_EXACT_VERSION && self.version_id_exact.unwrap_or(false) {
+        if self.version != TIER_DELETE_JOURNAL_EXACT_VERSION
+            && self.version != TIER_DELETE_JOURNAL_STATE_VERSION
+            && self.version_id_exact.unwrap_or(false)
+        {
             return Err(Error::other(
                 "legacy tier delete journal entry has an unsupported exact version constraint",
             ));
         }
-        let (backend_identity, version_id_exact) = match self.version {
-            1 => (None, false),
+        let (backend_identity, version_id_exact, version_state) = match self.version {
+            1 => (None, false, rustfs_filemeta::TransitionVersionState::Unknown),
             TIER_DELETE_JOURNAL_VERSION => (
                 Some(
                     self.backend_identity
                         .ok_or_else(|| Error::other("tier delete journal v2 entry is missing its backend identity"))?,
                 ),
                 false,
+                rustfs_filemeta::TransitionVersionState::Unknown,
             ),
             TIER_DELETE_JOURNAL_EXACT_VERSION => {
                 if self.version_id.is_empty() || self.version_id_exact != Some(true) {
@@ -108,6 +124,22 @@ impl PersistedTierDeleteJournalEntry {
                             .ok_or_else(|| Error::other("tier delete journal v3 entry is missing its backend identity"))?,
                     ),
                     true,
+                    rustfs_filemeta::TransitionVersionState::Exact,
+                )
+            }
+            TIER_DELETE_JOURNAL_STATE_VERSION => {
+                let state = self
+                    .version_state
+                    .ok_or_else(|| Error::other("tier delete journal v4 entry is missing its version state"))?;
+                let exact = self.version_id_exact.unwrap_or(false);
+                validate_version_state(state, &self.version_id, exact)?;
+                (
+                    Some(
+                        self.backend_identity
+                            .ok_or_else(|| Error::other("tier delete journal v4 entry is missing its backend identity"))?,
+                    ),
+                    exact,
+                    state,
                 )
             }
             version => return Err(Error::other(format!("unsupported tier delete journal version {version}"))),
@@ -118,8 +150,28 @@ impl PersistedTierDeleteJournalEntry {
             tier_name: self.tier_name,
             backend_identity,
             version_id_exact,
+            version_state,
         })
     }
+}
+
+fn validate_version_state(
+    state: rustfs_filemeta::TransitionVersionState,
+    version_id: &str,
+    version_id_exact: bool,
+) -> Result<()> {
+    use rustfs_filemeta::TransitionVersionState::{Exact, KnownDisabled, SuspendedNull, Unknown};
+
+    let valid = match state {
+        Unknown => !version_id_exact,
+        KnownDisabled => version_id.is_empty() && !version_id_exact,
+        SuspendedNull => version_id == "null" && version_id_exact,
+        Exact => !version_id.is_empty() && version_id != "null" && version_id_exact,
+    };
+    if !valid {
+        return Err(Error::other("tier delete journal version state conflicts with its version id"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +211,7 @@ pub(crate) fn decode_tier_delete_journal_entry(data: &[u8]) -> Result<Jentry> {
 }
 
 pub(crate) fn encode_tier_delete_journal_entry(je: &Jentry) -> Result<Vec<u8>> {
-    serde_json::to_vec(&PersistedTierDeleteJournalEntry::from_jentry(je))
+    serde_json::to_vec(&PersistedTierDeleteJournalEntry::from_jentry(je)?)
         .map_err(|err| Error::other(format!("encode tier delete journal failed: {err}")))
 }
 
@@ -209,6 +261,12 @@ where
 }
 
 pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
+    if je.version_state == rustfs_filemeta::TransitionVersionState::Unknown {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tier delete journal remote version state is unknown",
+        ));
+    }
     let backend_identity = je
         .backend_identity
         .ok_or_else(|| std::io::Error::other("legacy tier delete journal has no durable backend identity"))?;
@@ -406,8 +464,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        TIER_DELETE_JOURNAL_EXACT_VERSION, await_tier_delete_journal_recovery, decode_tier_delete_journal_entry,
-        encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity, tier_delete_journal_object_name,
+        TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_STATE_VERSION, await_tier_delete_journal_recovery,
+        decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
+        tier_delete_journal_object_name,
     };
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::error::Result;
@@ -420,7 +479,8 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([7; 32]),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         }
     }
 
@@ -436,6 +496,7 @@ mod tests {
         assert_eq!(decoded.tier_name, je.tier_name);
         assert_eq!(decoded.backend_identity, je.backend_identity);
         assert_eq!(decoded.version_id_exact, je.version_id_exact);
+        assert_eq!(decoded.version_state, je.version_state);
     }
 
     #[test]
@@ -450,7 +511,7 @@ mod tests {
         let persisted: serde_json::Value = serde_json::from_slice(&encoded).expect("exact journal JSON should decode");
         let decoded = decode_tier_delete_journal_entry(&encoded).expect("exact journal entry should decode");
 
-        assert_eq!(persisted["version"], TIER_DELETE_JOURNAL_EXACT_VERSION);
+        assert_eq!(persisted["version"], TIER_DELETE_JOURNAL_STATE_VERSION);
         assert_eq!(persisted["version_id_exact"], true);
         assert!(decoded.version_id_exact);
         assert_ne!(tier_delete_journal_object_name(&exact), tier_delete_journal_object_name(&normalized));
@@ -514,6 +575,46 @@ mod tests {
     }
 
     #[test]
+    fn tier_delete_journal_rejects_conflicting_v4_version_states() {
+        let identity = vec![7_u8; 32];
+        let invalid = [
+            ("known-disabled", "unexpected", false),
+            ("suspended-null", "", true),
+            ("suspended-null", "null", false),
+            ("exact", "", true),
+            ("exact", "null", true),
+            ("exact", "version", false),
+            ("unknown", "version", true),
+        ];
+
+        for (state, version_id, exact) in invalid {
+            let persisted = serde_json::json!({
+                "version": TIER_DELETE_JOURNAL_STATE_VERSION,
+                "obj_name": "remote/object",
+                "version_id": version_id,
+                "tier_name": "WARM",
+                "backend_identity": identity,
+                "version_id_exact": exact.then_some(true),
+                "version_state": state,
+            });
+            let encoded = serde_json::to_vec(&persisted).expect("invalid journal fixture should encode");
+            decode_tier_delete_journal_entry(&encoded).expect_err("conflicting v4 version state must fail closed");
+        }
+    }
+
+    #[test]
+    fn legacy_journals_decode_with_unknown_version_state() {
+        let v1 = br#"{"version":1,"obj_name":"remote/object","version_id":"opaque","tier_name":"WARM"}"#;
+        let v2 = br#"{"version":2,"obj_name":"remote/object","version_id":"opaque","tier_name":"WARM","backend_identity":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}"#;
+
+        for payload in [v1.as_slice(), v2.as_slice()] {
+            let decoded = decode_tier_delete_journal_entry(payload).expect("legacy journal should decode");
+            assert_eq!(decoded.version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+            assert!(!decoded.version_id_exact);
+        }
+    }
+
+    #[test]
     fn tier_delete_journal_path_is_stable_and_sanitized() {
         let je = journal_entry();
 
@@ -530,6 +631,8 @@ mod tests {
     fn tier_delete_journal_paths_separate_legacy_and_backend_identities() {
         let mut legacy = journal_entry();
         legacy.backend_identity = None;
+        legacy.version_id_exact = false;
+        legacy.version_state = rustfs_filemeta::TransitionVersionState::Unknown;
         let mut backend_a = journal_entry();
         backend_a.backend_identity = Some([1; 32]);
         let mut backend_b = journal_entry();
@@ -575,6 +678,8 @@ mod tests {
     fn tier_delete_journal_without_transition_identity_stays_legacy() {
         let mut je = journal_entry();
         je.backend_identity = None;
+        je.version_id_exact = false;
+        je.version_state = rustfs_filemeta::TransitionVersionState::Unknown;
 
         let encoded = encode_tier_delete_journal_entry(&je).expect("legacy journal should remain encodable");
         let persisted: serde_json::Value = serde_json::from_slice(&encoded).expect("journal JSON should decode");
