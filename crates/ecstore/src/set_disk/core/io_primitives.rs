@@ -3354,9 +3354,7 @@ impl SetDisks {
             let dst_object = dst_object.clone();
             let meta = meta.clone();
             async move {
-                let Some(disk) = disk else {
-                    return None;
-                };
+                let disk = disk?;
                 Some(
                     disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
                         .await,
