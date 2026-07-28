@@ -600,6 +600,30 @@ pub fn canonical_rename_part_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_prepare_part_transaction_request_body(
+    request: &proto_gen::node_service::PreparePartTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-prepare-part-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.meta)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_settle_part_transaction_request_body(
+    request: &proto_gen::node_service::SettlePartTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-settle-part-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.rollback);
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_volume_request_body(
     request: &proto_gen::node_service::DeleteVolumeRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -637,8 +661,8 @@ pub fn canonical_make_volumes_request_body(
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
         DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
-        MakeVolumesRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, UpdateMetadataRequest, WriteAllRequest,
-        WriteMetadataRequest,
+        MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
+        SettlePartTransactionRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
 
@@ -883,6 +907,48 @@ mod disk_mutation_canonical_tests {
             let mut request = rename_file.clone();
             mutate(&mut request);
             bodies.push(canonical_rename_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let prepare_part = PreparePartTransactionRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: vec![0x01].into(),
+        };
+        let mut bodies = vec![canonical_prepare_part_transaction_request_body(&prepare_part).unwrap()];
+        for mutate in [
+            |r: &mut PreparePartTransactionRequest| r.disk = "d2".into(),
+            |r: &mut PreparePartTransactionRequest| r.src_volume = "sv2".into(),
+            |r: &mut PreparePartTransactionRequest| r.src_path = "sp2".into(),
+            |r: &mut PreparePartTransactionRequest| r.dst_volume = "dv2".into(),
+            |r: &mut PreparePartTransactionRequest| r.dst_path = "dp2".into(),
+            |r: &mut PreparePartTransactionRequest| r.meta = vec![0x02].into(),
+        ] {
+            let mut request = prepare_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_prepare_part_transaction_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let settle_part = SettlePartTransactionRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            rollback: false,
+        };
+        let mut bodies = vec![canonical_settle_part_transaction_request_body(&settle_part).unwrap()];
+        for mutate in [
+            |r: &mut SettlePartTransactionRequest| r.disk = "d2".into(),
+            |r: &mut SettlePartTransactionRequest| r.volume = "v2".into(),
+            |r: &mut SettlePartTransactionRequest| r.path = "p2".into(),
+            |r: &mut SettlePartTransactionRequest| r.rollback = true,
+        ] {
+            let mut request = settle_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_settle_part_transaction_request_body(&request).unwrap());
         }
         assert_all_distinct(&bodies);
 

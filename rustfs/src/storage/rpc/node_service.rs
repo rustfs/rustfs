@@ -926,8 +926,22 @@ impl Node for NodeService {
         self.handle_check_parts(request).await
     }
 
+    async fn prepare_part_transaction(
+        &self,
+        request: Request<PreparePartTransactionRequest>,
+    ) -> Result<Response<PreparePartTransactionResponse>, Status> {
+        self.handle_prepare_part_transaction(request).await
+    }
+
     async fn rename_part(&self, request: Request<RenamePartRequest>) -> Result<Response<RenamePartResponse>, Status> {
         self.handle_rename_part(request).await
+    }
+
+    async fn settle_part_transaction(
+        &self,
+        request: Request<SettlePartTransactionRequest>,
+    ) -> Result<Response<SettlePartTransactionResponse>, Status> {
+        self.handle_settle_part_transaction(request).await
     }
 
     async fn rename_file(&self, request: Request<RenameFileRequest>) -> Result<Response<RenameFileResponse>, Status> {
@@ -2599,6 +2613,28 @@ mod tests {
             rustfs_protos::canonical_rename_part_request_body
         );
         assert_gated!(
+            prepare_part_transaction,
+            PreparePartTransactionRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                meta: vec![0x04].into(),
+            },
+            rustfs_protos::canonical_prepare_part_transaction_request_body
+        );
+        assert_gated!(
+            settle_part_transaction,
+            SettlePartTransactionRequest {
+                disk: disk.clone(),
+                volume: "dst".into(),
+                path: "dp".into(),
+                rollback: true,
+            },
+            rustfs_protos::canonical_settle_part_transaction_request_body
+        );
+        assert_gated!(
             delete_volume,
             DeleteVolumeRequest {
                 disk: disk.clone(),
@@ -3314,6 +3350,39 @@ mod tests {
         let rename_response = response.unwrap().into_inner();
         assert!(!rename_response.success);
         assert!(rename_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_part_transaction_invalid_disk() {
+        let service = create_test_node_service();
+
+        let prepare = service
+            .prepare_part_transaction(Request::new(PreparePartTransactionRequest {
+                disk: "invalid-disk-path".to_string(),
+                src_volume: "src-volume".to_string(),
+                src_path: "src-path".to_string(),
+                dst_volume: "dst-volume".to_string(),
+                dst_path: "dst-path".to_string(),
+                meta: Bytes::new(),
+            }))
+            .await
+            .expect("prepare RPC should return a structured disk error")
+            .into_inner();
+        assert!(!prepare.success);
+        assert!(prepare.error.is_some());
+
+        let settle = service
+            .settle_part_transaction(Request::new(SettlePartTransactionRequest {
+                disk: "invalid-disk-path".to_string(),
+                volume: "dst-volume".to_string(),
+                path: "dst-path".to_string(),
+                rollback: true,
+            }))
+            .await
+            .expect("settle RPC should return a structured disk error")
+            .into_inner();
+        assert!(!settle.success);
+        assert!(settle.error.is_some());
     }
 
     #[tokio::test]
