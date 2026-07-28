@@ -791,7 +791,13 @@ impl BucketMetadataSys {
                 await_bucket_namespace_operation(Some(&guard), bucket, "lazy bucket metadata existence check", async {
                     self.api
                         .peer_sys
-                        .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                        .get_bucket_info(
+                            bucket,
+                            &crate::storage_api_contracts::bucket::BucketOptions {
+                                no_metadata: true,
+                                ..Default::default()
+                            },
+                        )
                         .await
                         .map(|_| ())
                         .map_err(Into::into)
