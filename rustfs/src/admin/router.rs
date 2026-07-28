@@ -33,7 +33,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::auth::{check_key_valid, get_session_token};
+use crate::auth::{check_key_valid, constant_time_eq, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
@@ -905,7 +905,9 @@ fn validate_object_lambda_response_auth_headers(headers: &HeaderMap, output_rout
         .and_then(|value| value.to_str().ok())
         .map(str::trim);
 
-    if route == Some(output_route) && token == Some(output_token) {
+    if route.is_some_and(|route| constant_time_eq(route, output_route))
+        && token.is_some_and(|token| constant_time_eq(token, output_token))
+    {
         return Ok(());
     }
 
@@ -4351,6 +4353,38 @@ mod tests {
         let err = validate_object_lambda_response_auth_headers(&mismatched, "route-123", "token-456")
             .expect_err("mismatched auth headers should fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        for (route, token) in [
+            ("Route-123", "token-456"),
+            ("route-124", "token-456"),
+            ("route-1234", "token-456"),
+            ("route-123", "Token-456"),
+            ("route-123", "token-457"),
+            ("route-123", "token-4567"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-amz-request-route",
+                HeaderValue::try_from(route).expect("test route must be a valid header"),
+            );
+            headers.insert(
+                "x-amz-request-token",
+                HeaderValue::try_from(token).expect("test token must be a valid header"),
+            );
+            assert!(
+                validate_object_lambda_response_auth_headers(&headers, "route-123", "token-456").is_err(),
+                "first-byte, last-byte, and length mismatches must fail: {route}/{token}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_lambda_auth_headers_use_constant_time_helper() {
+        let source = include_str!("router.rs");
+        assert!(!source.contains("route == Some(output_route)"));
+        assert!(!source.contains("token == Some(output_token)"));
+        assert!(source.contains("constant_time_eq(route, output_route)"));
+        assert!(source.contains("constant_time_eq(token, output_token)"));
     }
 
     #[test]
