@@ -116,6 +116,39 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Request writing the complete remote-tier version state into object metadata.
+///
+/// This remains ineffective until
+/// [`ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED`] is also enabled.
+pub const ENV_TIER_REMOTE_VERSION_STATE_WRITE: &str = "RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE";
+pub const DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE: bool = false;
+
+/// Operator-attested fleet-wide confirmation for
+/// [`ENV_TIER_REMOTE_VERSION_STATE_WRITE`].
+///
+/// This flag is an operational contract, not automatic capability discovery.
+/// Operators may enable it only after every node that can write or read
+/// transitioned object metadata supports the remote version-state schema and
+/// semantics. Keeping the confirmation separate makes a single-node request or
+/// a writer whose local opt-in is removed fail closed.
+pub const ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: &str = "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED";
+pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
+const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
+
+#[cfg(test)]
+mod remote_version_state_tests {
+    #[test]
+    fn remote_version_state_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_TIER_REMOTE_VERSION_STATE_WRITE, "RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE");
+        assert_eq!(
+            super::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+            "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED"
+        );
+    }
+}
+
 // =============================================================================
 // Concurrent Request Fix - Timeout and Backpressure Configuration
 // =============================================================================
