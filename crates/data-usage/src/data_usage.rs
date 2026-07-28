@@ -32,12 +32,12 @@ use std::{
 /// save forever and freeze admin usage stats; callers must bypass the skip instead.
 pub const USAGE_LAST_UPDATE_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
 
-/// Authoritative cluster-wide usage snapshot written by coordinated scanners.
+/// Cluster-wide usage snapshot written by coordinated scanners.
 ///
-/// This object name is intentionally distinct from the legacy unfenced
-/// snapshot. Older binaries can continue writing the legacy object during a
-/// rolling upgrade without overwriting a snapshot produced by the current
-/// scanner protocol.
+/// `usage_snapshot_complete` is an additive JSON field: older readers ignore
+/// it, while current readers treat snapshots from older writers as unknown.
+/// Keeping the existing object name preserves rolling-upgrade and rollback
+/// compatibility without allowing an ambiguous snapshot to become authoritative.
 pub const DATA_USAGE_OBJECT_NAME: &str = ".usage.v2.json";
 
 /// Usage snapshot written by scanner implementations predating distributed
@@ -190,6 +190,12 @@ pub struct DataUsageInfo {
     pub buckets_count: u64,
     /// Buckets usage info provides following information across all buckets
     pub buckets_usage: HashMap<String, BucketUsageInfo>,
+    /// Whether this snapshot covers the complete bucket namespace.
+    ///
+    /// Legacy snapshots default to `false`. A complete snapshot contains an
+    /// explicit entry for every bucket, including confirmed-empty buckets.
+    #[serde(default)]
+    pub usage_snapshot_complete: bool,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
@@ -681,6 +687,12 @@ pub struct DataUsageCacheInfo {
     pub skip_healing: bool,
     #[serde(default)]
     pub failed_objects: HashMap<String, u64>,
+    /// Whether this per-set cache was produced by a completed scanner pass.
+    ///
+    /// Older cache writers omit this field and therefore deserialize as
+    /// incomplete instead of exposing partial set totals as confirmed zeros.
+    #[serde(default)]
+    pub snapshot_complete: bool,
 }
 
 /// Data usage cache
@@ -1000,6 +1012,7 @@ impl DataUsageCache {
             objects_total_size: flat.size as u64,
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
+            usage_snapshot_complete: self.info.snapshot_complete,
             ..Default::default()
         }
     }
@@ -1076,6 +1089,13 @@ impl DataUsageInfo {
     /// Create a new DataUsageInfo
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this snapshot authoritatively covers every reported bucket.
+    pub fn is_complete_bucket_usage_snapshot(&self) -> bool {
+        self.usage_snapshot_complete
+            && self.last_update.is_some()
+            && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
     }
 
     /// Add object metadata to data usage statistics
@@ -1441,6 +1461,35 @@ pub struct CompressionTotalInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Deserialize)]
+    struct LegacyUsageReader {
+        buckets_count: u64,
+    }
+
+    #[test]
+    fn completeness_marker_is_additive_for_legacy_named_readers() {
+        let current = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec_named(&current).expect("encode current data usage snapshot");
+        let legacy: LegacyUsageReader = rmp_serde::from_slice(&encoded).expect("legacy reader should ignore additive fields");
+
+        assert_eq!(legacy.buckets_count, 0);
+        assert!(current.is_complete_bucket_usage_snapshot());
+    }
+
+    #[test]
+    fn completeness_marker_requires_a_snapshot_timestamp() {
+        let untimestamped = DataUsageInfo {
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+
+        assert!(!untimestamped.is_complete_bucket_usage_snapshot());
+    }
 
     #[test]
     fn test_usage_last_update_future_tolerance_boundary() {

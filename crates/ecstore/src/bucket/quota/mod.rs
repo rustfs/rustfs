@@ -110,6 +110,8 @@ pub enum QuotaError {
     QuotaExceeded { current: u64, limit: u64, operation: u64 },
     #[error("Quota configuration not found for bucket: {bucket}")]
     ConfigNotFound { bucket: String },
+    #[error("Authoritative data usage is unavailable for bucket: {bucket}")]
+    UsageUnavailable { bucket: String },
     #[error("Invalid quota configuration: {reason}")]
     InvalidConfig { reason: String },
     #[error("Storage error: {0}")]
@@ -155,7 +157,7 @@ impl QuotaErrorResponse {
                 request_id: request_id.to_string(),
                 host_id: host_id.to_string(),
             },
-            QuotaError::StorageError(_) => Self {
+            QuotaError::UsageUnavailable { .. } | QuotaError::StorageError(_) => Self {
                 code: QUOTA_INTERNAL_ERROR_CODE.to_string(),
                 message: quota_error.to_string(),
                 resource: QUOTA_API_PATH.to_string(),

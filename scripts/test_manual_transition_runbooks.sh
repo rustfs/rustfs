@@ -8,6 +8,7 @@ SOAK_MATRIX="${PROJECT_ROOT}/scripts/manual_transition_soak_matrix.sh"
 MIXED_RUNBOOK="${PROJECT_ROOT}/scripts/manual_transition_mixed_rollout_runbook.sh"
 STRESS_RUNBOOK="${PROJECT_ROOT}/scripts/manual_transition_nightly_stress_runbook.sh"
 FAILURE_SAMPLES="${PROJECT_ROOT}/scripts/manual_transition_failure_samples.sh"
+MIXED_DOCKER_HARNESS="${PROJECT_ROOT}/scripts/manual_transition_mixed_version_docker_harness.sh"
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {
@@ -15,7 +16,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bash -n "$MIXED_MATRIX" "$SOAK_MATRIX" "$MIXED_RUNBOOK" "$STRESS_RUNBOOK" "$FAILURE_SAMPLES"
+bash -n "$MIXED_MATRIX" "$SOAK_MATRIX" "$MIXED_RUNBOOK" "$STRESS_RUNBOOK" "$FAILURE_SAMPLES" "$MIXED_DOCKER_HARNESS"
 
 if "$MIXED_MATRIX" \
   --endpoint http://127.0.0.1:9000 \
@@ -65,6 +66,8 @@ rg -qx "quick,1,1,1,balanced,70,30,4KiB,1,1,within-budget" "$TMP_DIR/soak/nightl
 
 "$MIXED_RUNBOOK" \
   --endpoint http://127.0.0.1:9000 \
+  --access-key hotadmin \
+  --secret-key hotsecret \
   --phase-matrix request-only:100:0:1 \
   --concurrencies 2 \
   --object-counts 3k \
@@ -74,7 +77,38 @@ rg -qx "quick,1,1,1,balanced,70,30,4KiB,1,1,within-budget" "$TMP_DIR/soak/nightl
 test -x "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
 rg -q "Manual transition mixed-version rollout runbook" "$TMP_DIR/mixed-runbook/manual_transition_mixed_rollout_runbook.md"
 rg -q "manual_transition_failure_samples.sh" "$TMP_DIR/mixed-runbook/manual_transition_mixed_rollout_runbook.md"
+rg -q "non-empty lifecycle-matching objects" "$TMP_DIR/mixed-runbook/manual_transition_mixed_rollout_runbook.md"
+rg -q "in-flight rollback validation" "$TMP_DIR/mixed-runbook/manual_transition_mixed_rollout_runbook.md"
 rg -q "MIXED_MATRIX_CSV='$TMP_DIR/mixed-runbook/mixed_rollout_matrix.csv'" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "ACCESS_KEY='hotadmin'" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "SECRET_KEY='hotsecret'" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "curl_admin" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "POLL_SECONDS" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "S3_ENDPOINT=" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "IN_FLIGHT_ROLLBACK_HOOK" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "seed_phase_workload" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "head_phase_probe" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "put-lifecycle" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "put-object" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+rg -q "head-object" "$TMP_DIR/mixed-runbook/run_mixed_rollout_plan.sh"
+
+if bash "$MIXED_RUNBOOK" --endpoint http://127.0.0.1:9000 --access-key hotadmin --dry-run >/tmp/manual_transition_mixed_runbook.err 2>&1; then
+  echo "mixed rollout runbook should fail when SigV4 credentials are incomplete" >&2
+  exit 1
+fi
+if ! rg -q "ERROR: --access-key and --secret-key must be provided together" /tmp/manual_transition_mixed_runbook.err; then
+  echo "mixed rollout runbook missing incomplete SigV4 credential guard output" >&2
+  exit 1
+fi
+
+if bash "$MIXED_RUNBOOK" --endpoint http://127.0.0.1:9000 --admin-token token --access-key hotadmin --secret-key hotsecret --dry-run >/tmp/manual_transition_mixed_runbook.err 2>&1; then
+  echo "mixed rollout runbook should reject mixed bearer and SigV4 credentials" >&2
+  exit 1
+fi
+if ! rg -q "ERROR: --admin-token cannot be combined with --access-key/--secret-key" /tmp/manual_transition_mixed_runbook.err; then
+  echo "mixed rollout runbook missing mixed credential guard output" >&2
+  exit 1
+fi
 
 "$STRESS_RUNBOOK" \
   --endpoint http://127.0.0.1:9000 \
@@ -107,9 +141,12 @@ if rg -q "run_entry .*\\|\\| true" "$TMP_DIR/stress-runbook/run_nightly_stress_p
 fi
 rg -q "snapshot_failure" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "manual_transition_failure_samples.sh" "$TMP_DIR/stress-runbook/manual_transition_nightly_stress_runbook.md"
+rg -q "already-in-flight transitions" "$TMP_DIR/stress-runbook/manual_transition_nightly_stress_runbook.md"
 rg -q "is_terminal_status" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "status_json" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "@tsv" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "report_already_in_flight" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "already_in_flight=" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q 'failure_reason // "__none__"' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q 'failure_reason" != "__none__"' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 if rg -F -q 'failure_reason // ""' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"; then
@@ -167,6 +204,11 @@ fi
 
 bash "$FAILURE_SAMPLES" --help >/tmp/manual_transition_failure_samples.help
 rg -q "Usage:" /tmp/manual_transition_failure_samples.help
+bash "$MIXED_DOCKER_HARNESS" --help >/tmp/manual_transition_mixed_version_docker_harness.help
+rg -q "mixed_version_docker_harness" /tmp/manual_transition_mixed_version_docker_harness.help
+rg -q -- "--old-image" /tmp/manual_transition_mixed_version_docker_harness.help
+rg -q -- "--new-image" /tmp/manual_transition_mixed_version_docker_harness.help
+rg -q -- "--no-rollback" /tmp/manual_transition_mixed_version_docker_harness.help
 if bash "$FAILURE_SAMPLES" --endpoint http://127.0.0.1:9000 --sample >/tmp/manual_transition_failure_samples.err 2>&1; then
   echo "failure samples script should fail when --sample has no value" >&2
   exit 1

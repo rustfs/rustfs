@@ -3452,7 +3452,10 @@ impl ManualTransitionRunReport {
     }
 
     pub fn has_partial_enqueue(&self) -> bool {
-        self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
+        self.skipped_already_in_flight > 0
+            || self.skipped_queue_full > 0
+            || self.skipped_queue_closed > 0
+            || self.skipped_queue_timeout > 0
     }
 
     pub fn was_truncated(&self) -> bool {
@@ -9478,6 +9481,48 @@ mod tests {
             .expect("replaced scope admission should remain");
         assert_eq!(current.job_id, second.job_id);
         assert_eq!(current.lease_id, second.lease_id);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_scope_missing_current_is_retryable_cas_miss() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let first = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-replace-race-bucket", &options, "first-owner");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&first))
+            .await
+            .expect("first scope admission should save");
+        let (_loaded, etag) = load_manual_transition_scope_admission_with_etag(ecstore.clone(), &first.scope_key)
+            .await
+            .expect("first scope admission should load with an ETag");
+        let object = manual_transition_scope_record_object_name(&first.scope_key).expect("scope admission path should encode");
+        config_boundary::delete_config(ecstore.clone(), &object)
+            .await
+            .expect("current scope admission should be deleted");
+
+        let replacement =
+            ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-replace-race-bucket", &options, "replacement-owner");
+        let stale_replace = save_manual_transition_scope_admission_if_current(
+            ecstore.clone(),
+            &ManualTransitionScopeAdmission::from_job(&replacement),
+            &etag,
+        )
+        .await
+        .expect_err("replacing a disappeared scope admission must report a CAS miss");
+        assert_eq!(stale_replace, Error::PreconditionFailed);
+
+        let claim =
+            claim_manual_transition_scope_admission(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&replacement))
+                .await
+                .expect("replacement claim should recover through the create path");
+        assert_eq!(claim, ManualTransitionScopeAdmissionClaim::Claimed);
+        let current = load_manual_transition_scope_admission(ecstore, &replacement.scope_key)
+            .await
+            .expect("replacement scope admission should be saved");
+        assert_eq!(current.job_id, replacement.job_id);
     }
 
     #[tokio::test]
