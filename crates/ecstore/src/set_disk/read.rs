@@ -1969,6 +1969,12 @@ mod metadata_cache_tests {
             let (dir, disk) = new_read_version_test_disk(bucket).await;
             if disk_index < readable_disks {
                 let mut fi = valid_test_fileinfo(object);
+                fi.parts.push(ObjectPartInfo {
+                    number: 1,
+                    size: 1,
+                    actual_size: 1,
+                    ..Default::default()
+                });
                 fi.mod_time = Some(OffsetDateTime::now_utc());
                 fi.erasure.index = fi.erasure.distribution[disk_index];
                 disk.write_metadata(bucket, bucket, object, fi)
