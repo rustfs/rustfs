@@ -1114,6 +1114,8 @@ pub struct ScannerLastMinute {
 pub struct ScannerMetricsReport {
     pub collected_at: DateTime<Utc>,
     pub current_cycle: u64,
+    #[serde(default)]
+    pub current_cycle_active: bool,
     pub current_started: DateTime<Utc>,
     pub cycles_completed_at: Vec<DateTime<Utc>>,
     pub ongoing_buckets: usize,
@@ -2793,7 +2795,8 @@ impl Metrics {
         m.current_disk_scan_concurrency_limit = disk_scan_concurrency_limit;
         m.current_disk_bucket_scans_queued = disk_bucket_scans_queued;
         m.current_disk_bucket_scans_active = disk_bucket_scans_active;
-        if self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+        m.current_cycle_active = self.current_scan_cycle_work_active.load(Ordering::Relaxed);
+        if m.current_cycle_active {
             let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
             let current_source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
             let current_replication_repair_work =
@@ -4142,6 +4145,8 @@ mod tests {
 
         let report = metrics.report().await;
 
+        assert!(report.current_cycle_active);
+        assert_eq!(report.current_cycle, 0);
         assert_eq!(report.current_cycle_objects_scanned, 7);
         assert_eq!(report.current_cycle_directories_scanned, 3);
         assert_eq!(report.current_cycle_bucket_drive_scans, 2);
@@ -4158,6 +4163,8 @@ mod tests {
         metrics.finish_scan_cycle_work(start);
         let report = metrics.report().await;
 
+        assert!(!report.current_cycle_active);
+        assert_eq!(report.current_cycle, 0);
         assert_eq!(report.current_cycle_objects_scanned, 0);
         assert_eq!(report.current_cycle_directories_scanned, 0);
         assert_eq!(report.current_cycle_bucket_drive_scans, 0);

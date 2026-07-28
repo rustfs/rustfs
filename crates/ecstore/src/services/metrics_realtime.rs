@@ -71,6 +71,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
     MadminScannerMetrics {
         collected_at: metrics.collected_at,
         current_cycle: metrics.current_cycle,
+        current_cycle_active: metrics.current_cycle_active,
         current_started: metrics.current_started,
         cycles_completed_at: metrics.cycles_completed_at,
         ongoing_buckets: metrics.ongoing_buckets,
@@ -398,10 +399,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     if types.contains(&MetricType::SCANNER) {
         debug!("start get scanner metrics");
-        let mut metrics = global_metrics().report().await;
-        if let Some(init_time) = runtime_sources::scanner_init_time().await {
-            metrics.current_started = init_time;
-        }
+        let metrics = global_metrics().report().await;
         real_time_metrics.aggregated.scanner = Some(to_madmin_scanner_metrics(metrics));
     }
 
@@ -588,7 +586,10 @@ mod test {
 
     #[test]
     fn scanner_metrics_mapping_preserves_partial_source_status() {
+        let current_started = Utc::now() - chrono::Duration::seconds(5);
         let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+            current_cycle_active: true,
+            current_started,
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
             partial_cycles_by_source: vec![rustfs_common::metrics::ScannerSourceCycleSnapshot {
@@ -598,6 +599,8 @@ mod test {
             ..Default::default()
         });
 
+        assert!(scanner.current_cycle_active);
+        assert_eq!(scanner.current_started, current_started);
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
         let usage = scanner

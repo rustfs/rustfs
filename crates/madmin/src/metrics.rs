@@ -545,6 +545,8 @@ pub struct ScannerMetrics {
     pub collected_at: DateTime<Utc>,
     #[serde(rename = "current_cycle")]
     pub current_cycle: u64,
+    #[serde(rename = "current_cycle_active", default)]
+    pub current_cycle_active: bool,
     #[serde(rename = "current_started")]
     pub current_started: DateTime<Utc>,
     #[serde(rename = "cycle_complete_times")]
@@ -719,6 +721,13 @@ pub struct ScannerMetrics {
 
 impl ScannerMetrics {
     pub fn merge(&mut self, other: &Self) {
+        // Older nodes do not send current_cycle_active. A non-zero current
+        // cycle was their only active signal, so preserve it during rolling
+        // upgrades while allowing a real first cycle (ID zero) to be explicit.
+        let self_cycle_active = self.current_cycle_active || self.current_cycle > 0;
+        let other_cycle_active = other.current_cycle_active || other.current_cycle > 0;
+        let other_cycle_is_authoritative = (other_cycle_active && !self_cycle_active)
+            || (other_cycle_active == self_cycle_active && self.current_cycle < other.current_cycle);
         let other_is_newer = self.collected_at < other.collected_at;
         if other_is_newer {
             self.collected_at = other.collected_at;
@@ -854,11 +863,12 @@ impl ScannerMetrics {
             self.ongoing_buckets = other.ongoing_buckets;
         }
 
-        if self.current_cycle < other.current_cycle {
+        if other_cycle_is_authoritative {
             self.current_cycle = other.current_cycle;
             self.cycles_completed_at = other.cycles_completed_at.clone();
             self.current_started = other.current_started;
         }
+        self.current_cycle_active = self_cycle_active || other_cycle_active;
 
         if other.cycles_completed_at.len() > self.cycles_completed_at.len() {
             self.cycles_completed_at = other.cycles_completed_at.clone();
@@ -1388,6 +1398,65 @@ pub struct Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_metrics_missing_cycle_active_defaults_to_false() {
+        let mut value = serde_json::to_value(ScannerMetrics::default()).expect("scanner metrics should serialize");
+        value
+            .as_object_mut()
+            .expect("scanner metrics should serialize as an object")
+            .remove("current_cycle_active");
+
+        let scanner: ScannerMetrics =
+            serde_json::from_value(value).expect("older scanner metrics without cycle-active should decode");
+
+        assert!(!scanner.current_cycle_active);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_prefers_an_active_first_cycle() {
+        let collected_at = Utc::now();
+        let idle_started = collected_at - chrono::Duration::hours(1);
+        let active_started = collected_at - chrono::Duration::seconds(5);
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            current_cycle: 0,
+            current_cycle_active: false,
+            current_started: idle_started,
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle: 0,
+            current_cycle_active: true,
+            current_started: active_started,
+            ..Default::default()
+        });
+
+        assert!(scanner.current_cycle_active);
+        assert_eq!(scanner.current_cycle, 0);
+        assert_eq!(scanner.current_started, active_started);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_legacy_nonzero_active_signal() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle: 7,
+            current_cycle_active: false,
+            ..Default::default()
+        });
+
+        assert!(scanner.current_cycle_active);
+        assert_eq!(scanner.current_cycle, 7);
+    }
 
     #[test]
     fn scanner_metrics_merge_aggregates_partial_cycles_by_source() {
