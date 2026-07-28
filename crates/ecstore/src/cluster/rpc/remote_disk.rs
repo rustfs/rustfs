@@ -24,8 +24,8 @@ use crate::cluster::rpc::internode_data_transport::{
 use crate::disk::error::{Error, Result};
 use crate::disk::{
     BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -48,9 +48,10 @@ use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
     DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest,
-    MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse,
-    ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest, StatVolumeRequest,
-    UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
+    MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest,
+    ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+    RenameFileRequest, SettlePartTransactionRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest,
+    WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -2474,6 +2475,71 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: Bytes,
+    ) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(PreparePartTransactionRequest {
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                    meta,
+                });
+                let canonical_body = rustfs_protos::canonical_prepare_part_transaction_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "prepare_part_transaction")?;
+
+                let response = client.prepare_part_transaction(request).await?.into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(SettlePartTransactionRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    rollback: action == PartTransactionAction::Rollback,
+                });
+                let canonical_body = rustfs_protos::canonical_settle_part_transaction_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "settle_part_transaction")?;
+
+                let response = client.settle_part_transaction(request).await?.into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
                 Ok(())
             },
             get_max_timeout_duration(),

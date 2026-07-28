@@ -1473,6 +1473,33 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: Bytes,
+    ) -> Result<()> {
+        self.track_disk_health(
+            || async {
+                self.disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: crate::disk::PartTransactionAction) -> Result<()> {
+        self.track_disk_health(
+            || async { self.disk.settle_part_transaction(volume, path, action).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         self.track_disk_health(|| async { self.disk.delete(volume, path, opt).await }, get_max_timeout_duration())
             .await
