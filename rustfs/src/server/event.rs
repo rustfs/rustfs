@@ -400,13 +400,14 @@ async fn initialize_live_event_support(
 
 #[cfg(test)]
 mod tests {
+    use super::super::module_switch::{
+        PersistedModuleSwitches, current_persisted_module_switches, persisted_module_switches_configured,
+        set_persisted_module_switches,
+    };
     use super::{
         convert_ecstore_object_info, init_event_notifier_with_store, parse_host_and_port, run_persisted_event_notifier_reconciler,
     };
-    use crate::server::{
-        PersistedModuleSwitches, current_persisted_module_switches, is_event_notifier_reconciled,
-        persisted_module_switches_configured, set_persisted_module_switches,
-    };
+    use crate::server::is_event_notifier_reconciled;
     use crate::storage_api::server::event::StorageObjectInfo;
     use crate::storage_api::server::event::contract::lifecycle::TransitionedObject;
     use chrono::{DateTime, Utc};
