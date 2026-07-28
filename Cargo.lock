@@ -9477,6 +9477,8 @@ name = "rustfs-lifecycle"
 version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
+ "metrics",
+ "metrics-util",
  "proptest",
  "rustfs-common",
  "rustfs-config",
