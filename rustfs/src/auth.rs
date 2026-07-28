@@ -1819,11 +1819,13 @@ mod tests {
     #[test]
     fn session_token_comparison_uses_constant_time_helper() {
         let source = include_str!("auth.rs");
+        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        let ordinary_comparison = ["token ", "!=", " cred.session_token"].concat();
         assert!(
-            !source.contains("token != cred.session_token"),
+            !production.contains(&ordinary_comparison),
             "temporary session tokens must not use ordinary string comparison"
         );
-        assert!(source.contains("!constant_time_eq(token, &cred.session_token)"));
+        assert!(production.contains("!constant_time_eq(token, &cred.session_token)"));
     }
 
     #[test]
