@@ -47,7 +47,8 @@ use crate::diagnostics::get::{
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::disk::{
-    OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PartTransactionAction, part_transaction_path,
+    OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
+    part_transaction_path,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
