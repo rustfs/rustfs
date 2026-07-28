@@ -726,10 +726,6 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_config(&self, bucket: &str) -> Result<(Arc<BucketMetadata>, bool)> {
-        if bucket.is_empty() {
-            return Err(Error::other("invalid argument"));
-        }
-
         let has_bm = {
             let map = self.metadata_map.read().await;
             map.get(bucket).cloned()
@@ -761,7 +757,7 @@ impl BucketMetadataSys {
                 Some(&guard),
                 bucket,
                 "lazy bucket metadata load",
-                load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true),
+                Box::pin(load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true)),
             )
             .await
             {
@@ -788,20 +784,19 @@ impl BucketMetadataSys {
             // defaults for buckets listed on disk — legacy buckets without a
             // metadata file — but never lets one replace an existing entry.)
             if persisted {
-                await_bucket_namespace_operation(Some(&guard), bucket, "lazy bucket metadata existence check", async {
-                    self.api
-                        .peer_sys
-                        .get_bucket_info(
-                            bucket,
-                            &crate::storage_api_contracts::bucket::BucketOptions {
-                                no_metadata: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(Into::into)
-                })
+                await_bucket_namespace_operation(
+                    Some(&guard),
+                    bucket,
+                    "lazy bucket metadata existence check",
+                    Box::pin(async {
+                        self.api
+                            .peer_sys
+                            .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                            .await
+                            .map(|_| ())
+                            .map_err(Into::into)
+                    }),
+                )
                 .await?;
                 if guard.is_lock_lost() {
                     return Err(Error::other(format!(
@@ -1106,12 +1101,6 @@ mod tests {
     async fn get_config_never_caches_fabricated_defaults_as_authoritative() {
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
         let sys = Arc::new(BucketMetadataSys::new(ecstore));
-
-        let err = sys
-            .get_config("")
-            .await
-            .expect_err("an empty bucket name must fail before namespace locking");
-        assert!(matches!(err, Error::Io(ref source) if source.to_string() == "invalid argument"));
 
         // (a) Miss: the fabricated default is returned but not cached.
         let (bm, _) = sys

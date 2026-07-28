@@ -340,9 +340,7 @@ impl ECStore {
     pub(super) async fn handle_get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
 
-        if !opts.no_metadata
-            && let Ok(sys) = metadata_sys::get_in(&self.ctx, bucket).await
-        {
+        if let Ok(sys) = metadata_sys::get_in(&self.ctx, bucket).await {
             if should_override_created_from_metadata(sys.created) {
                 info.created = Some(sys.created);
             }
@@ -568,7 +566,7 @@ mod tests {
         bucket_deleted_marker_prefix, bucket_deleted_marker_volume, run_bucket_usage_cleanup, run_physical_bucket_deletion,
         scanner_bucket_list_set_concurrency, should_override_created_from_metadata, validate_table_bucket_delete_allowed,
     };
-    use crate::bucket::metadata::{BucketMetadata, table_bucket_catalog_metadata_prefix};
+    use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::bucket::metadata_sys;
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
     use crate::error::StorageError;
@@ -1358,46 +1356,6 @@ mod tests {
             ecstore.get_bucket_info(&bucket, &BucketOptions::default()).await.is_ok(),
             "physical creation should happen after the usage fence succeeds"
         );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn get_bucket_info_no_metadata_skips_metadata_overlay() {
-        let (_, ecstore) = setup_bucket_delete_test_env().await;
-        let bucket = format!("bucket-info-no-metadata-{}", Uuid::new_v4().simple());
-        ecstore
-            .make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("bucket should be created");
-        let physical_created = ecstore
-            .peer_sys
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .expect("physical bucket info should load")
-            .created;
-        let mut metadata = BucketMetadata::new(&bucket);
-        metadata.set_created(Some(OffsetDateTime::UNIX_EPOCH + time::Duration::days(1)));
-        metadata_sys::set_bucket_metadata_in(&ecstore.ctx, metadata)
-            .await
-            .expect("bucket metadata should persist");
-
-        let info = ecstore
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .expect("bucket info with metadata should load");
-        assert_eq!(info.created, Some(OffsetDateTime::UNIX_EPOCH + time::Duration::days(1)));
-
-        let physical_info = ecstore
-            .get_bucket_info(
-                &bucket,
-                &BucketOptions {
-                    no_metadata: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("physical bucket info should load without metadata");
-        assert_eq!(physical_info.created, physical_created);
     }
 
     #[tokio::test]
