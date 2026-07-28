@@ -98,6 +98,126 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
     Some(object_info.size)
 }
 
+const RESTORE_MULTIPART_ABORT_FAILURES_TOTAL: &str = "rustfs_restore_multipart_abort_failures_total";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreMultipartFailurePoint {
+    InvalidPartSize,
+    RangeOverflow,
+    TierGet,
+    HashReader,
+    PutPart,
+    SizeMismatch,
+    Complete,
+}
+
+#[cfg(test)]
+static RESTORE_MULTIPART_FAILURE_POINT: std::sync::Mutex<Option<RestoreMultipartFailurePoint>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static RESTORE_MULTIPART_UPLOAD_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static RESTORE_MULTIPART_ABORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn restore_multipart_failure_is(point: RestoreMultipartFailurePoint) -> bool {
+    *RESTORE_MULTIPART_FAILURE_POINT
+        .lock()
+        .expect("restore multipart failure-point lock must not be poisoned")
+        == Some(point)
+}
+
+#[cfg(test)]
+fn fail_restore_multipart_at(point: RestoreMultipartFailurePoint) -> Result<()> {
+    if restore_multipart_failure_is(point) {
+        return Err(StorageError::Unexpected);
+    }
+    Ok(())
+}
+
+struct RestoreMultipartUploadCleanup {
+    store: Arc<SetDisks>,
+    bucket: String,
+    object: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl RestoreMultipartUploadCleanup {
+    fn new(store: Arc<SetDisks>, bucket: &str, object: &str, upload_id: &str) -> Self {
+        Self {
+            store,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            upload_id: upload_id.to_string(),
+            armed: true,
+        }
+    }
+
+    async fn abort(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        #[cfg(test)]
+        RESTORE_MULTIPART_ABORT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = self
+            .store
+            .abort_multipart_upload(&self.bucket, &self.object, &self.upload_id, &ObjectOptions::default())
+            .await
+            && !is_err_invalid_upload_id(&err)
+        {
+            metrics::counter!(RESTORE_MULTIPART_ABORT_FAILURES_TOTAL).increment(1);
+            warn!(
+                bucket = self.bucket,
+                object = self.object,
+                upload_id = self.upload_id,
+                error = ?err,
+                "failed to abort incomplete multipart restore"
+            );
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestoreMultipartUploadCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let bucket = self.bucket.clone();
+        let object = self.object.clone();
+        let upload_id = self.upload_id.clone();
+        #[cfg(test)]
+        RESTORE_MULTIPART_ABORT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        // Cancellation while the restore runtime is alive is cleaned
+        // asynchronously. Runtime teardown itself is only best-effort because
+        // Drop cannot await storage IO; normal error exits use abort() above.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(err) = store
+                    .abort_multipart_upload(&bucket, &object, &upload_id, &ObjectOptions::default())
+                    .await
+                    && !is_err_invalid_upload_id(&err)
+                {
+                    metrics::counter!(RESTORE_MULTIPART_ABORT_FAILURES_TOTAL).increment(1);
+                    warn!(
+                        bucket,
+                        object,
+                        upload_id,
+                        error = ?err,
+                        "failed to abort cancelled multipart restore"
+                    );
+                }
+            });
+        }
+    }
+}
+
 pub(crate) fn body_cache_plaintext_len(
     range: &Option<HTTPRangeSpec>,
     opts: &ObjectOptions,
@@ -3853,116 +3973,124 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
-        //if err != nil {
-        //    return set_restore_header_fn(&mut oi, err).await;
-        //}
-
-        let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let parts = Arc::clone(&oi.parts);
-        let mut part_offset: i64 = 0;
-        for part_info in parts.iter() {
-            let mut part_opts = opts.clone();
-            part_opts.part_number = Some(part_info.number);
-            if part_info.actual_size <= 0 {
-                return set_restore_header_fn(
-                    &mut oi,
-                    Some(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size))),
+        #[cfg(test)]
+        {
+            *RESTORE_MULTIPART_UPLOAD_ID
+                .lock()
+                .expect("restore multipart upload-id lock must not be poisoned") = Some(res.upload_id.clone());
+        }
+        let mut upload_cleanup = RestoreMultipartUploadCleanup::new(self_.clone(), bucket, object, &res.upload_id);
+        let restore_result: Result<ObjectInfo> = async {
+            let mut uploaded_parts: Vec<CompletePart> = vec![];
+            let parts = Arc::clone(&oi.parts);
+            let mut part_offset: i64 = 0;
+            for part_info in parts.iter() {
+                let mut part_opts = opts.clone();
+                part_opts.part_number = Some(part_info.number);
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::InvalidPartSize)?;
+                if part_info.actual_size <= 0 {
+                    return Err(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size)));
+                }
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::RangeOverflow)?;
+                let part_end = part_offset
+                    .checked_add(part_info.actual_size - 1)
+                    .ok_or_else(|| Error::other("multipart restore part range overflow".to_string()))?;
+                let rs = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: part_offset,
+                    end: part_end,
+                });
+                part_offset = part_end
+                    .checked_add(1)
+                    .ok_or_else(|| Error::other("multipart restore part offset overflow".to_string()))?;
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::TierGet)?;
+                let gr = get_transitioned_object_reader_with_tier_manager(
+                    bucket,
+                    object,
+                    &rs,
+                    &HeaderMap::new(),
+                    &oi,
+                    &part_opts,
+                    &self_.ctx.tier_config_mgr(),
                 )
-                .await;
-            }
-            let part_end = match part_offset.checked_add(part_info.actual_size - 1) {
-                Some(end) => end,
-                None => {
-                    return set_restore_header_fn(
-                        &mut oi,
-                        Some(Error::other("multipart restore part range overflow".to_string())),
-                    )
-                    .await;
-                }
-            };
-            let rs = Some(HTTPRangeSpec {
-                is_suffix_length: false,
-                start: part_offset,
-                end: part_end,
-            });
-            part_offset = match part_end.checked_add(1) {
-                Some(next) => next,
-                None => {
-                    return set_restore_header_fn(
-                        &mut oi,
-                        Some(Error::other("multipart restore part offset overflow".to_string())),
-                    )
-                    .await;
-                }
-            };
-            let gr = match get_transitioned_object_reader_with_tier_manager(
-                bucket,
-                object,
-                &rs,
-                &HeaderMap::new(),
-                &oi,
-                &part_opts,
-                &self_.ctx.tier_config_mgr(),
-            )
-            .await
-            {
-                Ok(reader) => reader,
-                Err(err) => {
-                    return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
-                }
-            };
-            let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
-            let mut p_reader = PutObjReader::new(hash_reader);
-            let p_info = self_
-                .clone()
-                .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
-                .await?;
-            //if let Err(err) = p_info {
-            //    return set_restore_header_fn(&mut oi, err).await;
-            //}
-            if p_info.size as i64 != part_info.actual_size {
-                return set_restore_header_fn(
-                    &mut oi,
-                    Some(Error::other(ObjectApiError::InvalidObjectState(GenericError {
+                .await
+                .map_err(StorageError::Io)?;
+                let reader = BufReader::new(gr.stream);
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::HashReader)?;
+                let hash_reader =
+                    HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
+                let mut p_reader = PutObjReader::new(hash_reader);
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::PutPart)?;
+                let p_info = self_
+                    .clone()
+                    .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
+                    .await?;
+                #[cfg(test)]
+                let p_info = if restore_multipart_failure_is(RestoreMultipartFailurePoint::SizeMismatch) {
+                    let mut injected = p_info;
+                    injected.size = 0;
+                    injected
+                } else {
+                    p_info
+                };
+                if p_info.size as i64 != part_info.actual_size {
+                    return Err(Error::other(ObjectApiError::InvalidObjectState(GenericError {
                         bucket: bucket.to_string(),
                         object: object.to_string(),
                         ..Default::default()
-                    }))),
-                )
-                .await;
+                    })));
+                }
+                uploaded_parts.push(CompletePart {
+                    part_num: p_info.part_num,
+                    etag: p_info.etag,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                });
             }
-            uploaded_parts.push(CompletePart {
-                part_num: p_info.part_num,
-                etag: p_info.etag,
-                checksum_crc32: None,
-                checksum_crc32c: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
-                checksum_crc64nvme: None,
-            });
+            #[cfg(test)]
+            if restore_multipart_failure_is(RestoreMultipartFailurePoint::Complete) {
+                uploaded_parts
+                    .first_mut()
+                    .expect("multipart restore must contain at least one uploaded part")
+                    .etag = "injected-invalid-complete-etag".to_string();
+            }
+            self_
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    object,
+                    &res.upload_id,
+                    uploaded_parts,
+                    &ObjectOptions {
+                        mod_time: oi.mod_time,
+                        version_id: oi.version_id.map(|version| version.to_string()),
+                        user_defined: restore_commit_metadata,
+                        // Inherit the restore write lock (see ropts.no_lock above):
+                        // the commit phase re-acquires this object's write lock.
+                        no_lock: opts.no_lock,
+                        ..Default::default()
+                    },
+                )
+                .await
         }
-        let restored_info = match self_
-            .clone()
-            .complete_multipart_upload(
-                bucket,
-                object,
-                &res.upload_id,
-                uploaded_parts,
-                &ObjectOptions {
-                    mod_time: oi.mod_time,
-                    version_id: oi.version_id.map(|version| version.to_string()),
-                    user_defined: restore_commit_metadata,
-                    // Inherit the restore write lock (see ropts.no_lock above):
-                    // the commit phase re-acquires this object's write lock.
-                    no_lock: opts.no_lock,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(info) => info,
-            Err(err) => return set_restore_header_fn(&mut oi, Some(err)).await,
+        .await;
+        let restored_info = match restore_result {
+            Ok(info) => {
+                upload_cleanup.disarm();
+                info
+            }
+            Err(err) => {
+                upload_cleanup.abort().await;
+                return set_restore_header_fn(&mut oi, Some(err)).await;
+            }
         };
         send_event(EventArgs {
             event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
@@ -4416,6 +4544,7 @@ mod transition_commit_failure_tests {
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
     use crate::services::tier::tier::TierConfigMgr;
+    use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
     use s3s::dto::RestoreRequest;
@@ -4435,6 +4564,142 @@ mod transition_commit_failure_tests {
         let mut metadata = restore_operation_id_metadata(operation_id);
         metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
         metadata
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(restore_multipart_failure_point)]
+    async fn multipart_restore_aborts_every_post_create_failure() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        RESTORE_MULTIPART_ABORT_ATTEMPTS.store(0, Ordering::Relaxed);
+        let bucket = "restore-multipart-failure-cleanup-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let source_upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("source multipart upload should be created");
+        let mut first_reader = PutObjReader::from_vec(vec![b'a'; 5 * 1024 * 1024]);
+        let first = set_disks
+            .put_object_part(bucket, object, &source_upload.upload_id, 1, &mut first_reader, &ObjectOptions::default())
+            .await
+            .expect("first source part should be staged");
+        let mut second_reader = PutObjReader::from_vec(vec![b'b'; 1024 * 1024]);
+        let second = set_disks
+            .put_object_part(bucket, object, &source_upload.upload_id, 2, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("second source part should be staged");
+        let original = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &source_upload.upload_id,
+                vec![
+                    CompletePart {
+                        part_num: first.part_num,
+                        etag: first.etag,
+                        ..Default::default()
+                    },
+                    CompletePart {
+                        part_num: second.part_num,
+                        etag: second.etag,
+                        ..Default::default()
+                    },
+                ],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("source multipart upload should complete");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart source should transition before restore");
+
+        for point in [
+            RestoreMultipartFailurePoint::InvalidPartSize,
+            RestoreMultipartFailurePoint::RangeOverflow,
+            RestoreMultipartFailurePoint::TierGet,
+            RestoreMultipartFailurePoint::HashReader,
+            RestoreMultipartFailurePoint::PutPart,
+            RestoreMultipartFailurePoint::SizeMismatch,
+            RestoreMultipartFailurePoint::Complete,
+        ] {
+            *RESTORE_MULTIPART_FAILURE_POINT
+                .lock()
+                .expect("restore multipart failure-point lock must not be poisoned") = Some(point);
+            *RESTORE_MULTIPART_UPLOAD_ID
+                .lock()
+                .expect("restore multipart upload-id lock must not be poisoned") = None;
+            let mut opts = ObjectOptions::default();
+            opts.transition.restore_request.days = Some(1);
+            set_disks
+                .clone()
+                .restore_transitioned_object(bucket, object, &opts)
+                .await
+                .expect_err("injected post-create restore failure must surface");
+            let upload_id = RESTORE_MULTIPART_UPLOAD_ID
+                .lock()
+                .expect("restore multipart upload-id lock must not be poisoned")
+                .clone()
+                .expect("restore must create an upload before the injected failure");
+            let err = set_disks
+                .get_multipart_info(bucket, object, &upload_id, &ObjectOptions::default())
+                .await
+                .expect_err("failed restore upload must immediately disappear");
+            assert!(is_err_invalid_upload_id(&err), "{point:?}: unexpected upload lookup error: {err:?}");
+            let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+            for temp_dir in &temp_dirs {
+                assert!(
+                    !temp_dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path).exists(),
+                    "{point:?}: failed restore must remove staged multipart data"
+                );
+            }
+        }
+        assert_eq!(
+            RESTORE_MULTIPART_ABORT_ATTEMPTS.load(Ordering::Relaxed),
+            7,
+            "every injected post-create failure must attempt an abort"
+        );
+        *RESTORE_MULTIPART_FAILURE_POINT
+            .lock()
+            .expect("restore multipart failure-point lock must not be poisoned") = None;
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+        set_disks
+            .clone()
+            .restore_transitioned_object(bucket, object, &opts)
+            .await
+            .expect("multipart restore should complete after failure injection is cleared");
+        assert_eq!(
+            RESTORE_MULTIPART_ABORT_ATTEMPTS.load(Ordering::Relaxed),
+            7,
+            "successful multipart completion must disarm cleanup without aborting"
+        );
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("successful multipart restore must leave the committed object intact");
+        assert_ne!(restored.transitioned_object.status, TRANSITION_COMPLETE);
     }
 
     #[tokio::test]
