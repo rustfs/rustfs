@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
+use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time};
 use crate::ecstore_validation_blackbox::make_local_set_disks;
 use crate::services::tier::test_util::register_mock_tier;
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -91,7 +91,7 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
             ("RUSTFS_ILM_PROCESS_TIME", Some("1")),
         ],
         async {
-            let expiry_from_restore_start = lifecycle::expected_expiry_time(restore_started, 1);
+            let expiry_from_restore_start = expected_expiry_time(restore_started, 1);
             let get_barrier = backend.arm_get_barrier().await;
             let restore_set = Arc::clone(&set_disks);
             let restore =
@@ -99,7 +99,7 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
             get_barrier.wait_until_paused().await;
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), 1) > expiry_from_restore_start {
+                    if expected_expiry_time(OffsetDateTime::now_utc(), 1) > expiry_from_restore_start {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
