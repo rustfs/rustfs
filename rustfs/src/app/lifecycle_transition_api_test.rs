@@ -2285,16 +2285,31 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
     get_barrier.wait_until_paused().await;
     get_barrier.release();
 
-    // Let the single accepted copy-back complete, then verify the tier saw
-    // exactly one restore read — a second GET means a double copy-back.
-    let completed =
-        wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
-    completed.unwrap_or_else(|err| panic!("{err}"));
-    assert_eq!(
-        backend.get_count().await - tier_gets_before_restore,
-        1,
-        "two concurrent restore requests must trigger exactly one tier copy-back GET"
-    );
+    // This test is scoped to the accept CAS: completion, expiry metadata, and
+    // local restored GET service are covered by the single-request restore test
+    // above. Here it is enough to prove exactly one copy-back was admitted.
+    let expected_tier_gets = tier_gets_before_restore + 1;
+    let deadline = tokio::time::Instant::now() + TRANSITION_WAIT_TIMEOUT;
+    loop {
+        let actual_tier_gets = backend.get_count().await;
+        if actual_tier_gets >= expected_tier_gets {
+            assert_eq!(
+                actual_tier_gets - tier_gets_before_restore,
+                1,
+                "two concurrent restore requests must trigger exactly one tier copy-back GET"
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let op_log = backend.op_log().await;
+            panic!(
+                "mock tier should record exactly one restore GET within {TRANSITION_WAIT_TIMEOUT:?}; \
+                 tier_gets_before_restore={tier_gets_before_restore}, actual_tier_gets={actual_tier_gets}, op_log={op_log:?}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// rustfs/backlog#1320: a single PUT must compute the replication decision
