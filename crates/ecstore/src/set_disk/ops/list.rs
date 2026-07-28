@@ -29,6 +29,12 @@ impl SetDisks {
     pub async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
         ListOperations::new(self.ctx()).delete_all(bucket, prefix).await
     }
+
+    pub(crate) async fn delete_all_with_quorum(&self, bucket: &str, prefix: &str, write_quorum: usize) -> Result<()> {
+        ListOperations::new(self.ctx())
+            .delete_all_with_quorum(bucket, prefix, write_quorum)
+            .await
+    }
 }
 
 /// List/prefix maintenance operations, borrowing the `SetDisks` core state
@@ -48,6 +54,14 @@ impl<'a> ListOperations<'a> {
     }
 
     pub(crate) async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
+        self.delete_all_inner(bucket, prefix, None).await
+    }
+
+    async fn delete_all_with_quorum(&self, bucket: &str, prefix: &str, write_quorum: usize) -> Result<()> {
+        self.delete_all_inner(bucket, prefix, Some(write_quorum)).await
+    }
+
+    async fn delete_all_inner(&self, bucket: &str, prefix: &str, write_quorum: Option<usize>) -> Result<()> {
         let disks = self.ctx.disks().read().await;
 
         let disks = disks.clone();
@@ -100,7 +114,9 @@ impl<'a> ListOperations<'a> {
             );
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, self.ctx.core().default_write_quorum()) {
+        if let Some(write_quorum) = write_quorum
+            && let Some(err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum)
+        {
             return Err(err.into());
         }
 
