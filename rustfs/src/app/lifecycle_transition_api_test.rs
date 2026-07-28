@@ -60,6 +60,7 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const RESTORE_COPY_BACK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
 const ENV_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
 const ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
@@ -307,6 +308,42 @@ async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str,
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_restore_completion(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    timeout: Duration,
+) -> Result<ObjectInfo, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_state = None;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "restore copy-back should complete within {timeout:?}; last observed state: {}",
+                last_state.unwrap_or_else(|| "no object info observed".to_string())
+            ));
+        }
+
+        match (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
+            Ok(info) => {
+                if !info.restore_ongoing && info.restore_expires.is_some() {
+                    return Ok(info);
+                }
+                last_state = Some(format!(
+                    "restore_ongoing={}, restore_expires={:?}, transitioned_status={}",
+                    info.restore_ongoing, info.restore_expires, info.transitioned_object.status
+                ));
+            }
+            Err(err) => {
+                last_state = Some(format!("get_object_info failed: {err}"));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -2118,20 +2155,9 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     );
 
     // Completion: ongoing flips to false and a future expiry-date appears.
-    let mut completed = None;
-    for _ in 0..40 {
-        let info = ecstore
-            .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
-            .await
-            .expect("Failed to poll object info for restore completion");
-        if !info.restore_ongoing && info.restore_expires.is_some() {
-            completed = Some(info);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    let completed = completed.expect("restore copy-back should complete within the poll window");
+    let completed = wait_for_restore_completion(&ecstore, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
     backend.clear_faults().await;
+    let completed = completed.unwrap_or_else(|err| panic!("{err}"));
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2243,20 +2269,9 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
 
     // Let the single accepted copy-back complete, then verify the tier saw
     // exactly one restore read — a second GET means a double copy-back.
-    let mut completed = false;
-    for _ in 0..40 {
-        let info = ecstore
-            .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
-            .await
-            .expect("Failed to poll object info for restore completion");
-        if !info.restore_ongoing && info.restore_expires.is_some() {
-            completed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let completed = wait_for_restore_completion(&ecstore, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
     backend.clear_faults().await;
-    assert!(completed, "the accepted restore copy-back should complete within the poll window");
+    completed.unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(
         backend.get_count().await - tier_gets_before_restore,
         1,
