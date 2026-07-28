@@ -25,9 +25,11 @@ COLD_IMAGE="${COLD_IMAGE:-${NEW_IMAGE}}"
 BASE_PORT="${BASE_PORT:-19400}"
 OUT_DIR="${OUT_DIR:-${PROJECT_ROOT}/target/manual-transition-1508-docker/$(date +%Y%m%dT%H%M%S)}"
 KEEP_UP=false
-ROLLBACK_NEW2_TO_OLD=true
+ROLLBACK_PHASE="${ROLLBACK_PHASE:-after-terminal}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-180}"
 POLL_SECONDS="${POLL_SECONDS:-180}"
+TRANSITION_WORKERS="${TRANSITION_WORKERS:-2}"
+TRANSITION_QUEUE_CAPACITY="${TRANSITION_QUEUE_CAPACITY:-64}"
 
 HOT_ACCESS_KEY="${HOT_ACCESS_KEY:-mvadmin}"
 HOT_SECRET_KEY="${HOT_SECRET_KEY:-mvsecret}"
@@ -58,14 +60,16 @@ Options:
   --object-count <n>           Non-empty probe object count
   --tier <name>                Remote tier name
   --keep-up                    Leave Docker services running
-  --no-rollback                Do not replace node2 with old image after job admission
+  --rollback-phase <phase>     Rollback node2 timing: after-terminal, in-flight, none
+  --no-rollback                Alias for --rollback-phase none
   -h, --help                   Show help
 
 Environment:
   PROJECT_NAME OLD_IMAGE NEW_IMAGE COLD_IMAGE BASE_PORT OUT_DIR KEEP_UP
   HOT_ACCESS_KEY HOT_SECRET_KEY COLD_ACCESS_KEY COLD_SECRET_KEY
   TIER_NAME TIER_BUCKET TIER_PREFIX JOB_BUCKET JOB_PREFIX OBJECT_COUNT
-  WAIT_TIMEOUT_SECS POLL_SECONDS AWS_SIGV4_SCOPE
+  ROLLBACK_PHASE WAIT_TIMEOUT_SECS POLL_SECONDS TRANSITION_WORKERS
+  TRANSITION_QUEUE_CAPACITY AWS_SIGV4_SCOPE
 
 Artifacts:
   compose.yml, image inspect files, health/readiness logs, API responses,
@@ -76,7 +80,9 @@ Result classifications:
   baseline_tiered_storage_pass      Same old/new image completed transition; useful baseline, not #1508 closure
   blocked_manual_api_not_implemented Manual transition API returned 501 before job admission
   blocked_manual_api_unavailable    Manual transition API did not return a usable job_id
+  blocked_cluster_readiness_failed  Docker cluster did not reach health/readiness before admission
   blocked_empty_scan_or_lifecycle   Job completed without lifecycle-matching transition work
+  blocked_manual_job_preempted_by_lifecycle_queue Lifecycle/immediate transition queued work before the job
   strict_mixed_rollout_fail         Mixed rollout ran but did not satisfy the strict #1508 gate
 USAGE
 }
@@ -119,6 +125,17 @@ parse_positive_int() {
   fi
 }
 
+validate_rollback_phase() {
+  case "$ROLLBACK_PHASE" in
+    after-terminal|in-flight|none)
+      ;;
+    *)
+      log_error "--rollback-phase must be one of: after-terminal, in-flight, none"
+      exit 1
+      ;;
+  esac
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -158,8 +175,12 @@ parse_args() {
         KEEP_UP=true
         shift
         ;;
+      --rollback-phase)
+        ROLLBACK_PHASE="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
       --no-rollback)
-        ROLLBACK_NEW2_TO_OLD=false
+        ROLLBACK_PHASE=none
         shift
         ;;
       -h|--help)
@@ -212,6 +233,7 @@ services:
   cold:
     image: ${COLD_IMAGE}
     hostname: cold
+    user: "0:0"
     environment:
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_ACCESS_KEY=${COLD_ACCESS_KEY}
@@ -232,12 +254,17 @@ services:
   node1:
     image: ${OLD_IMAGE}
     hostname: node1
+    user: "0:0"
     environment: &hot-env
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_ACCESS_KEY=${HOT_ACCESS_KEY}
       - RUSTFS_SECRET_KEY=${HOT_SECRET_KEY}
       - RUSTFS_VOLUMES=$(hot_volumes)
       - RUSTFS_SCANNER_ENABLED=false
+      - RUSTFS_SCANNER_CYCLE=3600
+      - RUSTFS_SCANNER_START_DELAY_SECS=3600
+      - RUSTFS_MAX_TRANSITION_WORKERS=${TRANSITION_WORKERS}
+      - RUSTFS_TRANSITION_QUEUE_CAPACITY=${TRANSITION_QUEUE_CAPACITY}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
       - RUSTFS_OBS_LOGGER_LEVEL=warn
     volumes:
@@ -253,6 +280,7 @@ services:
   node2:
     image: ${NEW_IMAGE}
     hostname: node2
+    user: "0:0"
     environment: *hot-env
     volumes:
       - node2_data_0:/data/rustfs0
@@ -267,6 +295,7 @@ services:
   node3:
     image: ${NEW_IMAGE}
     hostname: node3
+    user: "0:0"
     environment: *hot-env
     volumes:
       - node3_data_0:/data/rustfs0
@@ -281,6 +310,7 @@ services:
   node4:
     image: ${NEW_IMAGE}
     hostname: node4
+    user: "0:0"
     environment: *hot-env
     volumes:
       - node4_data_0:/data/rustfs0
@@ -462,19 +492,24 @@ start_transition_job() {
 replace_node2_with_old_image() {
   local network
   network="$(network_name)"
-  log_info "Replacing node2 with old image ${OLD_IMAGE} for in-flight rollback readback"
+  log_info "Replacing node2 with old image ${OLD_IMAGE} for ${ROLLBACK_PHASE} rollback readback"
   compose stop node2 >/dev/null
   compose rm -f node2 >/dev/null
   docker run -d \
     --name "${PROJECT_NAME}-node2-rollback-old" \
     --network "$network" \
     --network-alias node2 \
+    --user 0:0 \
     -p "$((BASE_PORT + 2)):9000" \
     -e RUSTFS_ADDRESS=:9000 \
     -e RUSTFS_ACCESS_KEY="$HOT_ACCESS_KEY" \
     -e RUSTFS_SECRET_KEY="$HOT_SECRET_KEY" \
     -e RUSTFS_VOLUMES="$(hot_volumes)" \
     -e RUSTFS_SCANNER_ENABLED=false \
+    -e RUSTFS_SCANNER_CYCLE=3600 \
+    -e RUSTFS_SCANNER_START_DELAY_SECS=3600 \
+    -e RUSTFS_MAX_TRANSITION_WORKERS="$TRANSITION_WORKERS" \
+    -e RUSTFS_TRANSITION_QUEUE_CAPACITY="$TRANSITION_QUEUE_CAPACITY" \
     -e RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true \
     -e RUSTFS_OBS_LOGGER_LEVEL=warn \
     -v "${PROJECT_NAME}_node2_data_0:/data/rustfs0" \
@@ -550,7 +585,14 @@ classify_result() {
   local lifecycle_config_found="$8"
   local scanned="$9"
   local eligible="${10}"
+  local skipped_already_transitioned="${11}"
+  local skipped_already_in_flight="${12}"
   local old_image_id new_image_id images_are_mixed readback_ok
+
+  if [[ -f "${OUT_DIR}/readiness-failed" ]]; then
+    printf 'blocked_cluster_readiness_failed\n'
+    return
+  fi
 
   old_image_id="$(image_id "${OUT_DIR}/old-image.inspect.json")"
   new_image_id="$(image_id "${OUT_DIR}/new-image.inspect.json")"
@@ -561,7 +603,7 @@ classify_result() {
 
   readback_ok=false
   if is_compat_readback_code "$old_code"; then
-    if [[ "$ROLLBACK_NEW2_TO_OLD" != "true" ]] || is_compat_readback_code "$rollback_code"; then
+    if [[ "$ROLLBACK_PHASE" == "none" ]] || is_compat_readback_code "$rollback_code"; then
       readback_ok=true
     fi
   fi
@@ -577,6 +619,12 @@ classify_result() {
   if [[ "$terminal_state" == "completed" && ( "$lifecycle_config_found" != "true" || "$scanned" == "0" || "$eligible" == "0" || "$transition_completed" == "0" ) ]]; then
     printf 'blocked_empty_scan_or_lifecycle\n'
     return
+  fi
+  if [[ "$transition_completed" == "0" && "$eligible" != "0" && "$transition_failed" == "0" && "$tier_failure" == "0" ]]; then
+    if [[ "$skipped_already_transitioned" != "0" || "$skipped_already_in_flight" != "0" ]]; then
+      printf 'blocked_manual_job_preempted_by_lifecycle_queue\n'
+      return
+    fi
   fi
   if [[ "$terminal_state" == "completed" && "$transition_completed" != "0" && "$transition_failed" == "0" && "$tier_failure" == "0" ]]; then
     if [[ "$images_are_mixed" == "true" && "$readback_ok" == "true" ]]; then
@@ -601,7 +649,7 @@ collect_logs() {
 }
 
 summarize() {
-  local terminal_state transition_completed tier_failure transition_failed old_code rollback_code run_http_code lifecycle_config_found scanned eligible result_classification
+  local terminal_state transition_completed tier_failure transition_failed old_code rollback_code run_http_code lifecycle_config_found scanned eligible skipped_already_transitioned skipped_already_in_flight queue_queued queue_active result_classification
   terminal_state="$(cat "${OUT_DIR}/terminal-state.txt" 2>/dev/null || true)"
   transition_completed="$(jq -r '.report.transition_completed // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
   tier_failure="$(jq -r '.report.tier_failure // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
@@ -612,7 +660,11 @@ summarize() {
   lifecycle_config_found="$(jq -r '.report.lifecycle_config_found // false' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf 'false')"
   scanned="$(jq -r '.report.scanned // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
   eligible="$(jq -r '.report.eligible // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
-  result_classification="$(classify_result "$terminal_state" "$transition_completed" "$transition_failed" "$tier_failure" "$old_code" "$rollback_code" "$run_http_code" "$lifecycle_config_found" "$scanned" "$eligible")"
+  skipped_already_transitioned="$(jq -r '.report.skipped_already_transitioned // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
+  skipped_already_in_flight="$(jq -r '.report.skipped_already_in_flight // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
+  queue_queued="$(jq -r '.queue_snapshot.queued // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
+  queue_active="$(jq -r '.queue_snapshot.active // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
+  result_classification="$(classify_result "$terminal_state" "$transition_completed" "$transition_failed" "$tier_failure" "$old_code" "$rollback_code" "$run_http_code" "$lifecycle_config_found" "$scanned" "$eligible" "$skipped_already_transitioned" "$skipped_already_in_flight")"
   cat >"${OUT_DIR}/summary.env" <<EOF
 project_name=${PROJECT_NAME}
 old_image=${OLD_IMAGE}
@@ -625,17 +677,24 @@ tier=${TIER_NAME}
 job_bucket=${JOB_BUCKET}
 job_prefix=${JOB_PREFIX}
 object_count=${OBJECT_COUNT}
+transition_workers=${TRANSITION_WORKERS}
+transition_queue_capacity=${TRANSITION_QUEUE_CAPACITY}
 run_http_code=${run_http_code}
 terminal_state=${terminal_state}
 lifecycle_config_found=${lifecycle_config_found}
 scanned=${scanned}
 eligible=${eligible}
+skipped_already_transitioned=${skipped_already_transitioned}
+skipped_already_in_flight=${skipped_already_in_flight}
 transition_completed=${transition_completed}
 transition_failed=${transition_failed}
 tier_failure=${tier_failure}
+queue_queued=${queue_queued}
+queue_active=${queue_active}
 old_node_status_http_code=${old_code}
 rollback_node2_status_http_code=${rollback_code}
-rollback_new2_to_old=${ROLLBACK_NEW2_TO_OLD}
+rollback_phase=${ROLLBACK_PHASE}
+rollback_new2_to_old=$([[ "$ROLLBACK_PHASE" == "none" ]] && printf 'false' || printf 'true')
 result_classification=${result_classification}
 EOF
   cat "${OUT_DIR}/summary.env"
@@ -649,6 +708,7 @@ main() {
   parse_args "$@"
   parse_positive_int "--base-port" "$BASE_PORT"
   parse_positive_int "--object-count" "$OBJECT_COUNT"
+  validate_rollback_phase
   require_cmd docker
   require_cmd curl
   require_cmd jq
@@ -663,7 +723,12 @@ main() {
   docker image inspect "$COLD_IMAGE" >"${OUT_DIR}/cold-image.inspect.json"
 
   compose up -d
-  wait_cluster_ready
+  if ! wait_cluster_ready; then
+    printf 'cluster readiness failed before manual transition admission\n' >"${OUT_DIR}/readiness-failed"
+    collect_logs
+    summarize
+    return 1
+  fi
 
   curl_cold PUT "$(cold_endpoint)/${TIER_BUCKET}" -o "${OUT_DIR}/create-cold-bucket.response" -w "%{http_code}\n" >"${OUT_DIR}/create-cold-bucket.http_code"
   create_bucket "$(hot_endpoint 2)" "$JOB_BUCKET" "${OUT_DIR}/create-hot-bucket"
@@ -671,10 +736,14 @@ main() {
   put_lifecycle
   seed_objects
   if start_transition_job; then
-    if [[ "$ROLLBACK_NEW2_TO_OLD" == "true" ]]; then
+    if [[ "$ROLLBACK_PHASE" == "in-flight" ]]; then
       replace_node2_with_old_image
     fi
     poll_terminal_status "$(cat "${OUT_DIR}/job-id.txt")" || true
+    if [[ "$ROLLBACK_PHASE" == "after-terminal" ]]; then
+      replace_node2_with_old_image
+      wait_http_ok "$(hot_endpoint 2)/health" "rollback-node2-live" || true
+    fi
     capture_old_node_readback "$(cat "${OUT_DIR}/job-id.txt")"
     head_probe
   else
