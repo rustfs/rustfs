@@ -252,7 +252,10 @@ impl ObjSweeper {
                 version_id: self.transition_version_id.clone(),
                 tier_name: self.transition_tier.clone(),
                 backend_identity: None,
-                version_id_exact: false,
+                version_id_exact: matches!(
+                    self.transition_version_state,
+                    rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact
+                ),
                 version_state: self.transition_version_state,
             });
         }
@@ -465,6 +468,7 @@ pub fn transitioned_delete_journal_entry(
     versioned: bool,
     suspended: bool,
     transitioned: &TransitionedObject,
+    transition_version_state: rustfs_filemeta::TransitionVersionState,
 ) -> Option<Jentry> {
     let sweeper = ObjSweeper {
         version_id,
@@ -473,6 +477,7 @@ pub fn transitioned_delete_journal_entry(
         transition_status: transitioned.status.clone(),
         transition_tier: transitioned.tier.clone(),
         transition_version_id: transitioned.version_id.clone(),
+        transition_version_state,
         remote_object: transitioned.name.clone(),
         ..Default::default()
     };
@@ -480,8 +485,13 @@ pub fn transitioned_delete_journal_entry(
     sweeper.should_remove_remote_object()
 }
 
-pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject) -> Option<Jentry> {
-    if transitioned.status != lifecycle::TRANSITION_COMPLETE {
+pub fn transitioned_force_delete_journal_entry(
+    transitioned: &TransitionedObject,
+    transition_version_state: rustfs_filemeta::TransitionVersionState,
+) -> Option<Jentry> {
+    if transitioned.status != lifecycle::TRANSITION_COMPLETE
+        || transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+    {
         return None;
     }
 
@@ -490,8 +500,11 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
         version_id: transitioned.version_id.clone(),
         tier_name: transitioned.tier.clone(),
         backend_identity: None,
-        version_id_exact: false,
-        version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+        version_id_exact: matches!(
+            transition_version_state,
+            rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact
+        ),
+        version_state: transition_version_state,
     })
 }
 
@@ -502,9 +515,11 @@ mod test {
     use super::{
         ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, RemoteDeleteBreaker, RemoteTierDeleteOutcome,
         delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
-        is_remote_tier_not_found_error, is_signer_header_error, set_remote_tier_delete_test_hook,
-        should_record_remote_delete_failure,
+        is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
+        should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
     };
+    use crate::storage_api_contracts::lifecycle::TransitionedObject;
+    use rustfs_filemeta::TransitionVersionState;
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
 
@@ -546,6 +561,43 @@ mod test {
         assert!(!should_record_remote_delete_failure(&Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED)));
         assert!(should_record_remote_delete_failure(&Error::other("driver not found")));
         assert!(should_record_remote_delete_failure(&Error::other("NoSuchVersion")));
+    }
+
+    #[test]
+    fn transitioned_delete_journal_preserves_remote_version_state() {
+        let cases = [
+            (TransitionVersionState::Unknown, "legacy-version", None),
+            (TransitionVersionState::KnownDisabled, "", Some(false)),
+            (TransitionVersionState::SuspendedNull, "null", Some(true)),
+            (TransitionVersionState::Exact, "opaque-version", Some(true)),
+        ];
+
+        for (state, version_id, expected_exact) in cases {
+            let transitioned = TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: version_id.to_string(),
+                tier: "WARM".to_string(),
+                status: lifecycle::TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            };
+            let regular = transitioned_delete_journal_entry(None, false, false, &transitioned, state);
+            let forced = transitioned_force_delete_journal_entry(&transitioned, state);
+
+            match expected_exact {
+                Some(expected_exact) => {
+                    let regular = regular.expect("known version state should produce a regular delete journal entry");
+                    assert_eq!(regular.version_state, state);
+                    assert_eq!(regular.version_id_exact, expected_exact);
+                    let forced = forced.expect("known version state should produce a forced delete journal entry");
+                    assert_eq!(forced.version_state, state);
+                    assert_eq!(forced.version_id_exact, expected_exact);
+                }
+                None => {
+                    assert!(regular.is_none());
+                    assert!(forced.is_none());
+                }
+            }
+        }
     }
 
     #[tokio::test]
