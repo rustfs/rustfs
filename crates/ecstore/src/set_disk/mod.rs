@@ -104,7 +104,7 @@ use crate::{
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
+        SnapshotLeaseToken, UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
@@ -116,6 +116,7 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
+use futures::task::AtomicWaker;
 use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
@@ -164,7 +165,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
@@ -359,6 +360,163 @@ struct SetDiskLockGuardedReader {
     guard: Option<ObjectLockDiagGuard>,
 }
 
+#[derive(Clone)]
+struct SnapshotLease {
+    disk: DiskStore,
+    volume: String,
+    path: String,
+    token: SnapshotLeaseToken,
+}
+
+struct SnapshotLeaseState {
+    leases: parking_lot::Mutex<Vec<SnapshotLease>>,
+    renewal_failed: AtomicBool,
+    renewal_waker: AtomicWaker,
+    cancel: CancellationToken,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for SnapshotLeaseState {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let leases = mem::take(&mut *self.leases.lock());
+        if leases.is_empty() {
+            return;
+        }
+        self.runtime.spawn(async move {
+            join_all(leases.into_iter().map(|lease| async move {
+                lease
+                    .disk
+                    .release_snapshot_lease(&lease.volume, &lease.path, lease.token)
+                    .await
+            }))
+            .await;
+        });
+    }
+}
+
+#[derive(Clone)]
+struct SnapshotLeaseHandle(Arc<SnapshotLeaseState>);
+
+impl SnapshotLeaseHandle {
+    fn new(leases: Vec<SnapshotLease>) -> Self {
+        let state = Arc::new(SnapshotLeaseState {
+            leases: parking_lot::Mutex::new(leases),
+            renewal_failed: AtomicBool::new(false),
+            renewal_waker: AtomicWaker::new(),
+            cancel: CancellationToken::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let weak = Arc::downgrade(&state);
+        let cancel = state.cancel.clone();
+        tokio::spawn(async move {
+            let renew_interval = crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL / 3;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(renew_interval) => {}
+                }
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let leases = state.leases.lock().clone();
+                let results = join_all(
+                    leases
+                        .iter()
+                        .map(|lease| lease.disk.renew_snapshot_lease(&lease.volume, &lease.path, lease.token)),
+                )
+                .await;
+                let mut current = state.leases.lock();
+                let mut failed = false;
+                for (lease, result) in current.iter_mut().zip(results) {
+                    match result {
+                        Ok(token) => lease.token = token,
+                        Err(_) => failed = true,
+                    }
+                }
+                drop(current);
+                if failed {
+                    state.renewal_failed.store(true, Ordering::Release);
+                    state.renewal_waker.wake();
+                    return;
+                }
+            }
+        });
+        Self(state)
+    }
+
+    fn renewal_failed(&self) -> bool {
+        self.0.renewal_failed.load(Ordering::Acquire)
+    }
+}
+
+struct SnapshotLeaseReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    lease: Option<SnapshotLeaseHandle>,
+}
+
+impl AsyncRead for SnapshotLeaseReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let Some(lease) = self.lease.as_ref() else {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        };
+        if lease.renewal_failed() {
+            self.lease.take();
+            return Poll::Ready(Err(std::io::Error::other("snapshot lease renewal failed")));
+        }
+        lease.0.renewal_waker.register(cx.waker());
+        if lease.renewal_failed() {
+            self.lease.take();
+            return Poll::Ready(Err(std::io::Error::other("snapshot lease renewal failed")));
+        }
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Err(_)))
+            || matches!(poll, Poll::Ready(Ok(())) if buf.filled().len() == filled_before && buf.remaining() > 0)
+        {
+            self.lease.take();
+        }
+        poll
+    }
+}
+
+async fn acquire_snapshot_leases(
+    disks: &[Option<DiskStore>],
+    volume: &str,
+    path: &str,
+    read_quorum: usize,
+) -> Option<SnapshotLeaseHandle> {
+    let candidates = disks.iter().flatten().cloned().collect::<Vec<_>>();
+    if candidates.len() < read_quorum {
+        return None;
+    }
+    let results = join_all(candidates.iter().map(|disk| disk.acquire_snapshot_lease(volume, path))).await;
+    let mut leases = Vec::with_capacity(candidates.len());
+    let mut failed = false;
+    for (disk, result) in candidates.into_iter().zip(results) {
+        match result {
+            Ok(token) => leases.push(SnapshotLease {
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                token,
+            }),
+            Err(_) => failed = true,
+        }
+    }
+    if failed || leases.len() < read_quorum {
+        join_all(leases.into_iter().map(|lease| async move {
+            lease
+                .disk
+                .release_snapshot_lease(&lease.volume, &lease.path, lease.token)
+                .await
+        }))
+        .await;
+        return None;
+    }
+    Some(SnapshotLeaseHandle::new(leases))
+}
+
 impl AsyncRead for SetDiskLockGuardedReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let had_capacity = buf.remaining() > 0;
@@ -374,12 +532,21 @@ impl AsyncRead for SetDiskLockGuardedReader {
 fn finish_set_disk_read_lock(
     mut reader: GetObjectReader,
     read_lock_guard: Option<ObjectLockDiagGuard>,
-    lock_optimization_enabled: bool,
+    snapshot_lease: Option<SnapshotLeaseHandle>,
     bucket: &str,
     object: &str,
 ) -> GetObjectReader {
-    if lock_optimization_enabled || reader.buffered_body.is_some() {
+    if reader.buffered_body.is_some() {
         release_materialized_read_lock(bucket, object, read_lock_guard);
+        return reader;
+    }
+
+    if let Some(lease) = snapshot_lease {
+        release_materialized_read_lock(bucket, object, read_lock_guard);
+        reader.stream = Box::new(SnapshotLeaseReader {
+            inner: reader.stream,
+            lease: Some(lease),
+        });
         return reader;
     }
 
@@ -1020,8 +1187,9 @@ pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
 }
 
 /// Check if lock optimization is enabled.
-/// When enabled, fully materialized reads may release the read lock before
-/// returning to the caller. Streaming reads keep the lock until EOF or drop.
+/// Fully materialized reads release the read lock before returning. Streaming
+/// reads may replace it with data-directory snapshot leases when every
+/// candidate disk supports the lease protocol.
 ///
 /// **Note**: Cached via `OnceLock` in production — env var changes require
 /// process restart. In test builds the env var is read directly so that
@@ -5471,6 +5639,60 @@ mod tests {
         (dir, disk)
     }
 
+    #[tokio::test]
+    async fn snapshot_lease_acquisition_is_all_or_nothing() {
+        let (_dir1, disk1) = make_single_local_disk().await;
+        let (_dir2, disk2) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-acquire";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        disk1.make_volume(bucket).await.expect("first volume should be created");
+        disk2.make_volume(bucket).await.expect("second volume should be created");
+        disk1
+            .write_all(bucket, &part, Bytes::from_static(b"shard"))
+            .await
+            .expect("first shard should be written");
+
+        let lease = acquire_snapshot_leases(&[Some(disk1.clone()), Some(disk2)], bucket, data_dir, 1).await;
+        assert!(lease.is_none(), "one unsupported candidate must retain the namespace lock");
+        assert_eq!(
+            disk1
+                .delete_data_dir(
+                    bucket,
+                    data_dir,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("released partial lease should not defer cleanup"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_reader_fails_when_renewal_fails() {
+        let state = Arc::new(SnapshotLeaseState {
+            leases: parking_lot::Mutex::new(Vec::new()),
+            renewal_failed: AtomicBool::new(true),
+            renewal_waker: AtomicWaker::new(),
+            cancel: CancellationToken::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let mut reader = SnapshotLeaseReader {
+            inner: Box::new(Cursor::new(Bytes::from_static(b"payload"))),
+            lease: Some(SnapshotLeaseHandle(state)),
+        };
+        let mut body = Vec::new();
+        let err = reader
+            .read_to_end(&mut body)
+            .await
+            .expect_err("renewal failure must terminate the body");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(body.is_empty());
+    }
+
     async fn make_set_disks_with(disks: Vec<Option<DiskStore>>) -> Arc<SetDisks> {
         let drive_count = disks.len();
         let endpoints = (0..drive_count)
@@ -9045,6 +9267,78 @@ mod tests {
             is_err_object_not_found(&err),
             "deleted object read must fail closed with object-not-found, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn streaming_get_snapshot_survives_concurrent_overwrite() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "snapshot-streaming-overwrite";
+            let object = "object";
+            let old_body = vec![0x41; 2 * 1024 * 1024];
+            let new_body = vec![0x42; old_body.len()];
+            let opts = ObjectOptions::default();
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut old_reader = PutObjReader::from_vec(old_body.clone());
+            set_disks
+                .put_object(bucket, object, &mut old_reader, &opts)
+                .await
+                .expect("old object should be written");
+
+            let mut snapshot = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("snapshot reader should open");
+            let overwrite_set = Arc::clone(&set_disks);
+            let overwrite_body = new_body.clone();
+            let overwrite_opts = opts.clone();
+            let overwrite = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(overwrite_body);
+                overwrite_set.put_object(bucket, object, &mut reader, &overwrite_opts).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), overwrite)
+                .await
+                .expect("overwrite should not wait for the response body")
+                .expect("overwrite task should join")
+                .expect("overwrite should succeed");
+
+            let mut restored = Vec::new();
+            snapshot
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("leased snapshot should remain readable");
+            assert_eq!(restored, old_body);
+
+            let mut latest = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("latest reader should open");
+            let mut latest_body = Vec::new();
+            latest
+                .stream
+                .read_to_end(&mut latest_body)
+                .await
+                .expect("latest object should remain readable");
+            assert_eq!(latest_body, new_body);
+
+            let cancelled = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("cancelled reader should open");
+            drop(cancelled);
+            let mut replacement = PutObjReader::from_vec(vec![0x43; 2 * 1024 * 1024]);
+            tokio::time::timeout(Duration::from_secs(5), set_disks.put_object(bucket, object, &mut replacement, &opts))
+                .await
+                .expect("reader drop must release its snapshot")
+                .expect("replacement after cancellation should succeed");
+        })
+        .await;
     }
 
     #[tokio::test]
