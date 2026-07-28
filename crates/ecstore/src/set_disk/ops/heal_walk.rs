@@ -344,6 +344,6 @@ mod tests {
         let error = collector.lock_objects().expect_err("poisoned collection must fail closed");
         assert_eq!(error, DiskError::FileCorrupt);
         assert!(collector.cancel.is_cancelled(), "a poisoned page collector must cancel its walk");
-        assert!(matches!(collector.objects.lock(), Err(_)), "poisoned state must remain fail-closed");
+        assert!(collector.objects.lock().is_err(), "poisoned state must remain fail-closed");
     }
 }
