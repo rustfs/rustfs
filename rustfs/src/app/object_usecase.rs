@@ -9778,7 +9778,17 @@ mod tests {
             Ok(_) => panic!("unknown remote version state must not persist a delete journal"),
             Err(err) => err,
         };
-        assert!(matches!(legacy_err, StorageError::FileNotFound));
+        assert!(
+            matches!(
+                &legacy_err,
+                StorageError::FileNotFound
+                    | StorageError::ObjectNotFound(_, _)
+                    | StorageError::FileVersionNotFound
+                    | StorageError::VersionNotFound(_, _, _)
+                    | StorageError::VolumeNotFound
+            ),
+            "unknown remote version state must leave no journal, got {legacy_err:?}"
+        );
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
