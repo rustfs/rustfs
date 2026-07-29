@@ -506,8 +506,22 @@ pub struct ReplicationStats {
 }
 
 impl ReplicationStats {
+    pub fn is_empty(&self) -> bool {
+        self.pending_size == 0
+            && self.replicated_size == 0
+            && self.failed_size == 0
+            && self.failed_count == 0
+            && self.pending_count == 0
+            && self.missed_threshold_size == 0
+            && self.after_threshold_size == 0
+            && self.missed_threshold_count == 0
+            && self.after_threshold_count == 0
+            && self.replicated_count == 0
+    }
+
+    #[deprecated(note = "use is_empty instead")]
     pub fn empty(&self) -> bool {
-        self.replicated_size == 0 && self.failed_size == 0 && self.failed_count == 0
+        self.is_empty()
     }
 }
 
@@ -520,16 +534,13 @@ pub struct ReplicationAllStats {
 }
 
 impl ReplicationAllStats {
+    pub fn is_empty(&self) -> bool {
+        self.replica_size == 0 && self.replica_count == 0 && self.targets.values().all(ReplicationStats::is_empty)
+    }
+
+    #[deprecated(note = "use is_empty instead")]
     pub fn empty(&self) -> bool {
-        if self.replica_size != 0 && self.replica_count != 0 {
-            return false;
-        }
-        for v in self.targets.values() {
-            if !v.empty() {
-                return false;
-            }
-        }
-        true
+        self.is_empty()
     }
 }
 
@@ -783,7 +794,7 @@ impl DataUsageCache {
                     return Some(root);
                 }
                 let mut flat = self.flatten(&root);
-                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
+                if flat.replication_stats.as_ref().is_some_and(ReplicationAllStats::is_empty) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -1580,6 +1591,128 @@ mod tests {
         let map = hist.to_map();
 
         assert_eq!(map["BETWEEN_1024B_AND_1_MB"], u64::MAX);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn replication_stats_empty_checks_every_field() {
+        type SetField = fn(&mut ReplicationStats);
+
+        let cases: [(&str, SetField); 10] = [
+            ("pending_size", |stats| stats.pending_size = 1),
+            ("replicated_size", |stats| stats.replicated_size = 1),
+            ("failed_size", |stats| stats.failed_size = 1),
+            ("failed_count", |stats| stats.failed_count = 1),
+            ("pending_count", |stats| stats.pending_count = 1),
+            ("missed_threshold_size", |stats| stats.missed_threshold_size = 1),
+            ("after_threshold_size", |stats| stats.after_threshold_size = 1),
+            ("missed_threshold_count", |stats| stats.missed_threshold_count = 1),
+            ("after_threshold_count", |stats| stats.after_threshold_count = 1),
+            ("replicated_count", |stats| stats.replicated_count = 1),
+        ];
+
+        assert!(ReplicationStats::default().empty());
+        for (field, set_nonzero) in cases {
+            let mut stats = ReplicationStats::default();
+            set_nonzero(&mut stats);
+            assert!(!stats.empty(), "{field} must make replication stats non-empty");
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn replication_all_stats_empty_checks_aggregate_fields_independently() {
+        let cases = [
+            (
+                "replica_size",
+                ReplicationAllStats {
+                    replica_size: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "replica_count",
+                ReplicationAllStats {
+                    replica_count: 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        assert!(ReplicationAllStats::default().empty());
+        for (field, stats) in cases {
+            assert!(!stats.empty(), "{field} must make aggregate replication stats non-empty");
+        }
+
+        let empty_targets = ReplicationAllStats {
+            targets: HashMap::from([("arn:test:empty".to_string(), ReplicationStats::default())]),
+            ..Default::default()
+        };
+        assert!(empty_targets.empty(), "all-empty targets must keep aggregate stats empty");
+
+        let stats = ReplicationAllStats {
+            targets: HashMap::from([
+                ("arn:test:empty".to_string(), ReplicationStats::default()),
+                (
+                    "arn:test:non-empty".to_string(),
+                    ReplicationStats {
+                        pending_count: 1,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert!(!stats.empty(), "a non-empty target must make aggregate replication stats non-empty");
+    }
+
+    #[test]
+    fn size_recursive_prunes_empty_and_preserves_pending_replication_stats() {
+        let root = hash_path("bucket");
+        let child = hash_path("bucket/child");
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats::default()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cache
+                .size_recursive("bucket")
+                .expect("bucket usage should flatten")
+                .replication_stats
+                .is_none()
+        );
+
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats {
+                    targets: HashMap::from([(
+                        "arn:test:pending".to_string(),
+                        ReplicationStats {
+                            pending_count: 1,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let flattened = cache.size_recursive("bucket").expect("bucket usage should flatten");
+        let replication = flattened
+            .replication_stats
+            .expect("pending-only replication stats must survive pruning");
+
+        assert_eq!(replication.targets["arn:test:pending"].pending_count, 1);
     }
 
     #[test]
