@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
-    path::Path,
     time::{Duration, SystemTime},
 };
 
@@ -1110,9 +1108,39 @@ fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String
     }
 }
 
-/// Hash a path for data usage caching
+fn clean_data_usage_path(data: &str) -> String {
+    let rooted = data.starts_with('/');
+    let mut parts = Vec::new();
+
+    for part in data.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !rooted {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let clean = parts.join("/");
+    match (rooted, clean.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{clean}"),
+        (false, true) => ".".to_string(),
+        (false, false) => clean,
+    }
+}
+
+/// Hash a slash-separated path for data usage caching.
+///
+/// Cache identifiers are persisted and exchanged across nodes, so their
+/// normalization must not depend on the host operating system.
 pub fn hash_path(data: &str) -> DataUsageHash {
-    DataUsageHash(Path::new(&data).clean().to_string_lossy().to_string())
+    DataUsageHash(clean_data_usage_path(data))
 }
 
 impl DataUsageInfo {
@@ -1495,6 +1523,23 @@ mod tests {
     #[derive(Deserialize)]
     struct LegacyUsageReader {
         buckets_count: u64,
+    }
+
+    #[test]
+    fn hash_path_uses_portable_slash_semantics() {
+        for (input, expected) in [
+            ("", "."),
+            (".", "."),
+            ("/", "/"),
+            ("//bucket///prefix/", "/bucket/prefix"),
+            ("bucket/./prefix//object", "bucket/prefix/object"),
+            ("bucket/a/../b", "bucket/b"),
+            ("../bucket/..", ".."),
+            ("/../../bucket", "/bucket"),
+            ("bucket\\prefix/object", "bucket\\prefix/object"),
+        ] {
+            assert_eq!(hash_path(input).key(), expected, "unexpected portable cache key for {input:?}");
+        }
     }
 
     #[test]
