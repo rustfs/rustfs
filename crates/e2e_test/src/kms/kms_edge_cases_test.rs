@@ -25,11 +25,17 @@ use super::common::{LocalKMSTestEnvironment, sse_customer_key_md5_base64};
 use crate::common::{TEST_BUCKET, init_logging};
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64::Engine;
-use md5::compute;
+use md5::{Digest as Md5Digest, Md5};
 use serial_test::serial;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
+
+fn md5_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hex::encode(hasher.finalize())
+}
 
 /// Test encryption of zero-byte files (empty files)
 #[tokio::test]
@@ -294,7 +300,7 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     info!("🔍 Testing invalid SSE-C key length");
     let invalid_short_key = "short"; // Too short
     let invalid_key_b64 = base64::engine::general_purpose::STANDARD.encode(invalid_short_key);
-    let invalid_key_md5 = format!("{:x}", compute(invalid_short_key));
+    let invalid_key_md5 = md5_hex(invalid_short_key);
 
     let invalid_key_result = s3_client
         .put_object()

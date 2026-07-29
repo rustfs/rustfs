@@ -26,6 +26,9 @@ documentation = "https://docs.rs/rustfs-heal/latest/rustfs_heal/"
 keywords = ["RustFS", "heal", "erasure-coding", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 
+[lints]
+workspace = true
+
 [dependencies]
 rustfs-config = { workspace = true }
 rustfs-concurrency = { workspace = true }
@@ -53,7 +56,7 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
 http = { workspace = true }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 
 [lib]
