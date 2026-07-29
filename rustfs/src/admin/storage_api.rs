@@ -210,6 +210,10 @@ pub(crate) mod lifecycle {
     pub(crate) type ManualTransitionRunOptions =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
     pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;
+    pub(crate) use super::ecstore_bucket::lifecycle::transition_transaction::{
+        TransitionOperatorDeleteResult, TransitionOperatorError, delete_transition_candidate_for_operator,
+        finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
+    };
 
     pub(crate) async fn enqueue_transition_for_existing_objects_scoped(
         api: std::sync::Arc<super::ECStore>,

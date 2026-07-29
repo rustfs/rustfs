@@ -98,6 +98,39 @@ rc admin ilm transition run local/mybucket --prefix logs/ --tier cold --max-obje
 
 Inspect the aggregate counters before widening scope. Full object-key lists are intentionally not returned by the admin response. If `RUSTFS_RPC_SECRET` or other credentials were pasted into an issue, chat, log, or ticket while debugging tiering, rotate them on every node, restart the cluster with the new value, and redact the exposed copy before sharing more diagnostics.
 
+## Reconcile an unknown transition upload
+
+Historical transition transactions in `upload_outcome_unknown` state can use an explicit two-stage operator workflow when the tier probe is ambiguous and the provider supports exact version deletion. The endpoint refuses transactions that are still inside their ownership window or are in any other state.
+
+First inspect the transaction without changing it:
+
+```text
+GET /rustfs/admin/v3/ilm/transition/reconcile/<transaction-id>
+```
+
+If independent provider evidence identifies the exact remote version to remove, submit that opaque version identifier with explicit confirmation:
+
+```json
+POST /rustfs/admin/v3/ilm/transition/reconcile/<transaction-id>
+{
+  "action": "delete_candidate",
+  "confirm": true,
+  "remote_version_id": "<exact-provider-version>"
+}
+```
+
+This operation performs only an exact version delete. Its response reports whether the transaction journal was still observed after the delete; background recovery may have finalized the same transaction concurrently. If the journal remains, inspect the transaction again and finalize it only after the live provider probe proves that the candidate is missing:
+
+```json
+POST /rustfs/admin/v3/ilm/transition/reconcile/<transaction-id>
+{
+  "action": "finalize_missing",
+  "confirm": true
+}
+```
+
+`finalize_missing` re-runs the provider probe and fails closed for `unversioned_present`, `versioned_present`, `ambiguous`, `unsupported`, or probe errors. It never accepts an operator assertion in place of a live `missing` result. Providers without an authoritative probe or exact version deletion remain pending; this endpoint does not infer provider capabilities, accept external absence assertions, or select a candidate automatically.
+
 ## Historical fixes (for context, already merged)
 
 - Expire/GET race (`NoSuchVersion` during expiry of a tiered object):
