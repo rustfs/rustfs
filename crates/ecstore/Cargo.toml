@@ -158,6 +158,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
+# Only for `pin_callsite_interest_for_test`, which registers a `NoSubscriber`
+# dispatcher to keep tracing's process-global callsite-interest cache honest.
+tracing-core = { workspace = true }
 serial_test = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 proptest = "1"

@@ -303,6 +303,7 @@ test-case = "3.3.1"
 thiserror = "2.0.19"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
+tracing-core = "0.1.36"
 tracing-error = "0.2.1"
 tracing-opentelemetry = { version = "0.33" }
 tracing-subscriber = { version = "0.3.23" }
