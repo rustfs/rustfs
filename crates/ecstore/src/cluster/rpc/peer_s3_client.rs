@@ -40,7 +40,14 @@ use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClie
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
+#[cfg(test)]
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
@@ -49,6 +56,68 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DeleteBucketEmptyScanBarrier {
+    arrived: AtomicBool,
+    arrived_notify: Notify,
+    released: AtomicBool,
+    release_notify: Notify,
+}
+
+#[cfg(test)]
+impl DeleteBucketEmptyScanBarrier {
+    pub(crate) async fn wait_until_paused(&self) {
+        loop {
+            let notified = self.arrived_notify.notified();
+            if self.arrived.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    async fn pause(&self) {
+        self.arrived.store(true, Ordering::Release);
+        self.arrived_notify.notify_waiters();
+        loop {
+            let notified = self.release_notify.notified();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+static DELETE_BUCKET_EMPTY_SCAN_BARRIER: StdMutex<Option<Arc<DeleteBucketEmptyScanBarrier>>> = StdMutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_delete_bucket_empty_scan_barrier() -> Arc<DeleteBucketEmptyScanBarrier> {
+    let barrier = Arc::new(DeleteBucketEmptyScanBarrier::default());
+    *DELETE_BUCKET_EMPTY_SCAN_BARRIER
+        .lock()
+        .expect("empty scan barrier lock should not be poisoned") = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_after_delete_bucket_empty_scan() {
+    let barrier = DELETE_BUCKET_EMPTY_SCAN_BARRIER
+        .lock()
+        .expect("empty scan barrier lock should not be poisoned")
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.pause().await;
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ScannerBucketListing {
@@ -650,24 +719,22 @@ impl PeerS3Client for LocalPeerS3Client {
             return Err(Error::ErasureWriteQuorum);
         }
 
-        let force = if opts.force_if_empty && !opts.force {
+        if opts.force_if_empty && !opts.force {
             for disk in local_disks.iter() {
                 if has_xlmeta_files(&disk.path().join(bucket)).await.map_err(Error::Io)? {
                     return Err(Error::VolumeNotEmpty);
                 }
             }
-            true
-        } else {
-            opts.force
-        };
+            #[cfg(test)]
+            pause_after_delete_bucket_empty_scan().await;
+        }
 
         let mut futures = Vec::with_capacity(local_disks.len());
 
         for disk in local_disks.iter() {
-            // Non-force delete refuses a non-empty bucket (VolumeNotEmpty), which
-            // the recreate loop below turns into BucketNotEmpty; only an explicit
-            // force delete removes recursively (backlog#799 B1).
-            futures.push(disk.delete_volume(bucket, force));
+            // `force_if_empty` is validation-only. Passing it as force would let
+            // a PutObject committed after the scan be removed recursively.
+            futures.push(disk.delete_volume(bucket, opts.force));
         }
 
         let results = join_all(futures).await;
@@ -730,6 +797,15 @@ pub struct RemotePeerS3Client {
 }
 
 impl RemotePeerS3Client {
+    fn encode_delete_bucket_options(opts: &DeleteBucketOptions) -> Result<String> {
+        let mut remote_opts = opts.clone();
+        // Older peers promote `force_if_empty` to recursive force after their
+        // metadata scan. Keep this coordinator-only hint off the wire so a
+        // mixed-version delete fails closed on non-empty directory remnants.
+        remote_opts.force_if_empty = false;
+        serde_json::to_string(&remote_opts).map_err(Into::into)
+    }
+
     fn recovery_monitor_span(addr: &str) -> tracing::Span {
         tracing::info_span!(
             "recovery-monitor",
@@ -1040,7 +1116,7 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         self.execute_with_timeout(
             || async {
-                let options = serde_json::to_string(opts)?;
+                let options = Self::encode_delete_bucket_options(opts)?;
                 let mut client = self.get_client().await?;
 
                 let mut request = Request::new(DeleteBucketRequest {
@@ -1414,6 +1490,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_delete_bucket_options_fail_closed_for_legacy_peers() {
+        let encoded = RemotePeerS3Client::encode_delete_bucket_options(&DeleteBucketOptions {
+            no_lock: true,
+            no_recreate: true,
+            force_if_empty: true,
+            ..Default::default()
+        })
+        .expect("remote delete options should serialize");
+        let legacy_opts: DeleteBucketOptions =
+            serde_json::from_str(&encoded).expect("legacy peer should decode remote delete options");
+
+        assert!(legacy_opts.no_lock);
+        assert!(legacy_opts.no_recreate);
+        assert!(!legacy_opts.force);
+        assert!(!legacy_opts.force_if_empty);
+
+        let legacy_recursive_force = if legacy_opts.force_if_empty && !legacy_opts.force {
+            true
+        } else {
+            legacy_opts.force
+        };
+        assert!(
+            !legacy_recursive_force,
+            "legacy peer must not upgrade empty-only delete to recursive force"
+        );
+    }
+
+    #[test]
+    fn remote_delete_bucket_options_preserve_explicit_force() {
+        let encoded = RemotePeerS3Client::encode_delete_bucket_options(&DeleteBucketOptions {
+            force: true,
+            force_if_empty: true,
+            ..Default::default()
+        })
+        .expect("remote force-delete options should serialize");
+        let remote_opts: DeleteBucketOptions =
+            serde_json::from_str(&encoded).expect("remote peer should decode force-delete options");
+
+        assert!(remote_opts.force);
+        assert!(!remote_opts.force_if_empty);
+    }
+
     #[tokio::test]
     async fn test_execute_with_timeout_marks_remote_peer_faulty_on_network_like_error() {
         let client = test_remote_peer("http://peer-network-error:9000");
@@ -1567,6 +1686,54 @@ mod tests {
             .await
             .expect("pool 1 local listing should succeed against its own disks");
         assert!(pool1_buckets.is_empty());
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_peer_force_if_empty_preserves_unclassified_file_in_selected_pool() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for empty-only delete regression");
+        let disks = init_test_local_disks_for_pools(
+            &temp_dir,
+            &[(0, 1), (1, 1)],
+            "local-peer-force-if-empty-preserves-unclassified-file",
+        )
+        .await;
+        let bucket = "empty-only-delete-bucket";
+        let marker = "object/commit-marker";
+        let data = bytes::Bytes::from_static(b"committed object data");
+
+        disks[1]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should be created in the selected pool");
+        disks[1]
+            .write_all(bucket, marker, data.clone())
+            .await
+            .expect("unclassified committed file should be written");
+
+        let err = LocalPeerS3Client::new_with_local_disks(None, Some(vec![1]), disks.clone())
+            .delete_bucket(
+                bucket,
+                &DeleteBucketOptions {
+                    force_if_empty: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("empty-only delete must not recursively remove an unclassified file");
+
+        assert_eq!(err, Error::VolumeNotEmpty);
+        assert_eq!(
+            disks[1]
+                .read_all(bucket, marker)
+                .await
+                .expect("unclassified committed file should be preserved"),
+            data
+        );
 
         reset_local_disk_test_state().await;
     }
