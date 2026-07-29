@@ -25,7 +25,10 @@ use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
-    tier_sweeper::{Jentry, RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent},
+    tier_sweeper::{
+        Jentry, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_lease_idempotent,
+        delete_object_from_remote_tier_with_lease_idempotent,
+    },
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
         TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
@@ -1663,7 +1666,11 @@ pub(crate) async fn cleanup_uncommitted_transition_upload(
     cleanup_version: &str,
     version_id_exact: bool,
 ) -> std::io::Result<RemoteTierDeleteOutcome> {
-    delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, version_id_exact).await
+    if version_id_exact {
+        delete_confirmed_transition_candidate_exact_with_lease_idempotent(object, cleanup_version, lease).await
+    } else {
+        delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, false).await
+    }
 }
 
 fn log_transition_upload_cleanup_failure(lease: &TierOperationLease, object: &str, cleanup_version: &str, err: &std::io::Error) {
@@ -1800,7 +1807,7 @@ impl Drop for TransitionUploadCleanup {
     }
 }
 
-async fn cleanup_rejected_transition_upload_durably(
+pub(crate) async fn cleanup_rejected_transition_upload_durably(
     lease: &TierOperationLease,
     object: &str,
     cleanup_version: &str,
@@ -1813,6 +1820,13 @@ async fn cleanup_rejected_transition_upload_durably(
         tier_name: lease.tier_name().to_string(),
         backend_identity: Some(lease.backend_identity()),
         version_id_exact,
+        version_state: if !version_id_exact {
+            rustfs_filemeta::TransitionVersionState::KnownDisabled
+        } else if cleanup_version == "null" {
+            rustfs_filemeta::TransitionVersionState::SuspendedNull
+        } else {
+            rustfs_filemeta::TransitionVersionState::Exact
+        },
     };
 
     let journal_error = if let Some(api) = api.as_ref() {
@@ -1972,10 +1986,81 @@ async fn advance_and_save_transition_transaction(
     next: TransitionTransactionState,
     remote_version: Option<TransitionRemoteVersion>,
 ) -> Result<()> {
+    #[cfg(test)]
+    record_transition_uploaded_save_attempt(transaction, next);
     transaction
         .advance(transaction.fence(), next, remote_version)
         .map_err(Error::other)?;
     save_transition_transaction_if_available(api, transaction).await
+}
+
+#[cfg(test)]
+struct TransitionUploadedSaveProbeState {
+    bucket: String,
+    object: String,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct TransitionUploadedSaveProbe {
+    state: Arc<TransitionUploadedSaveProbeState>,
+}
+
+#[cfg(test)]
+static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionUploadedSaveProbeState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TransitionUploadedSaveProbe {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TransitionUploadedSaveProbeState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded-save probe mutex should not poison");
+        assert!(slot.is_none(), "transition uploaded-save probe must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    fn attempts(&self) -> usize {
+        self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransitionUploadedSaveProbe {
+    fn drop(&mut self) {
+        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded-save probe mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, next: TransitionTransactionState) {
+    if next != TransitionTransactionState::Uploaded {
+        return;
+    }
+    let state = TRANSITION_UPLOADED_SAVE_PROBE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition uploaded-save probe mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == transaction.source.bucket && state.object == transaction.source.object)
+        .cloned();
+    if let Some(state) = state {
+        state.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
@@ -2228,11 +2313,25 @@ async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCo
     }
 }
 
-fn parse_transition_version_id(remote_version: &str) -> std::result::Result<Option<Uuid>, uuid::Error> {
+fn persisted_transition_version(
+    remote_version: &str,
+) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
     if remote_version.is_empty() {
-        return Ok(None);
+        return Ok((None, rustfs_filemeta::TransitionVersionState::KnownDisabled));
     }
-    Uuid::parse_str(remote_version).map(|version_id| (!version_id.is_nil()).then_some(version_id))
+    let version_id = Uuid::parse_str(remote_version).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "opaque remote tier versions require the cluster capability gate",
+        )
+    })?;
+    if version_id.is_nil() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier returned a nil object version ID",
+        ));
+    }
+    Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact))
 }
 
 #[cfg(test)]
@@ -2470,16 +2569,17 @@ mod transition_upload_completion_tests {
 
 #[cfg(test)]
 mod transition_version_id_tests {
-    use super::{TransitionUploadCandidate, parse_transition_version_id};
+    use super::{TransitionUploadCandidate, persisted_transition_version};
+    use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
 
     #[test]
     fn normalizes_persisted_unversioned_ids_and_preserves_put_constraints() {
-        assert_eq!(parse_transition_version_id("").expect("empty remote version should be valid"), None);
         assert_eq!(
-            parse_transition_version_id(&Uuid::nil().to_string()).expect("nil remote version should be valid"),
-            None
+            persisted_transition_version("").expect("empty remote version identifies an unversioned tier"),
+            (None, TransitionVersionState::KnownDisabled)
         );
+        assert!(persisted_transition_version(&Uuid::nil().to_string()).is_err());
         let nil_put_response = Uuid::nil().to_string();
         let nil_candidate = TransitionUploadCandidate::from_put_response(nil_put_response.clone());
         assert_eq!(nil_candidate.cleanup_version(), nil_put_response);
@@ -2491,12 +2591,14 @@ mod transition_version_id_tests {
     }
 
     #[test]
-    fn preserves_valid_remote_id_and_rejects_invalid_text() {
+    fn preserves_uuid_and_gates_opaque_remote_ids() {
         let version_id = Uuid::new_v4();
         assert_eq!(
-            parse_transition_version_id(&version_id.to_string()).expect("UUID remote version should be valid"),
-            Some(version_id)
+            persisted_transition_version(&version_id.to_string()).expect("UUID remote version"),
+            (Some(version_id.to_string()), TransitionVersionState::Exact)
         );
+        assert!(persisted_transition_version("null").is_err());
+        assert!(persisted_transition_version("opaque-version-token").is_err());
         assert_eq!(
             TransitionUploadCandidate::from_put_response(version_id.to_string()).cleanup_version(),
             version_id.to_string()
@@ -2505,7 +2607,6 @@ mod transition_version_id_tests {
             TransitionUploadCandidate::from_put_response("opaque-version-token".to_string()).cleanup_version(),
             "opaque-version-token"
         );
-        assert!(parse_transition_version_id("not-a-uuid").is_err());
     }
 }
 
@@ -3775,6 +3876,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err.into());
         }
+        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
+            Ok(version) => version,
+            Err(err) => {
+                let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                    ))));
+                }
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+                return Err(err.into());
+            }
+        };
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -3792,16 +3907,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err);
         }
-        let transition_version_id = match parse_transition_version_id(candidate.remote_version()) {
-            Ok(version_id) => version_id,
-            Err(err) => {
-                if upload_cleanup.cleanup().await.is_ok() {
-                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                        .await;
-                }
-                return Err(err.into());
-            }
-        };
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -3859,7 +3964,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         current_fi.transition_status = TRANSITION_COMPLETE.to_string();
         current_fi.transitioned_objname = dest_obj;
         current_fi.transition_tier = opts.transition.tier.clone();
-        current_fi.transition_version_id = transition_version_id;
+        current_fi.transition_version_id = transition_version_id
+            .as_deref()
+            .and_then(|version_id| Uuid::parse_str(version_id).ok());
+        current_fi.transition_version = transition_version_id;
+        current_fi.transition_version_state = transition_version_state;
         rustfs_utils::http::metadata_compat::insert_str(
             &mut current_fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
@@ -4668,6 +4777,33 @@ mod transition_commit_failure_tests {
     }
 
     #[tokio::test]
+    async fn rejected_unsupported_remote_versions_are_cleaned_up() {
+        for remote_version in ["null", "opaque-version-token"] {
+            let manager = TierConfigMgr::new();
+            let backend = register_mock_tier(&manager, "WARM").await;
+            let lease = TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+                .await
+                .expect("mock tier lease should be available");
+            let candidate = TransitionUploadCandidate::from_put_response(remote_version.to_string());
+
+            persisted_transition_version(candidate.remote_version()).expect_err("unsupported writer version must fail closed");
+            cleanup_rejected_transition_upload_durably(
+                &lease,
+                "remote/object",
+                candidate.cleanup_version(),
+                candidate.cleanup_version_is_exact(),
+                None,
+            )
+            .await
+            .expect("rejected remote upload must be cleaned up");
+
+            assert_eq!(
+                backend.remove_versions().await,
+                vec![("remote/object".to_string(), candidate.cleanup_version().to_string())]
+            );
+        }
+    }
+
     #[serial_test::serial(restore_multipart_failure_point)]
     async fn multipart_restore_aborts_every_post_create_failure() {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -6617,6 +6753,45 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn unversioned_remote_version_is_persisted_without_version_id() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-unversioned-tier-bucket";
+        let object = "object.bin";
+        let payload = b"unversioned remote tier must commit without a version id".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("an unversioned remote version must commit");
+        let (fi, _, _) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("committed unversioned transition metadata should be readable");
+        assert_eq!(fi.transition_version_id, None);
+        assert_eq!(fi.transition_version, None);
+        assert_eq!(fi.transition_version_state, rustfs_filemeta::TransitionVersionState::KnownDisabled);
+        assert_eq!(save_probe.attempts(), 1);
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn opaque_remote_version_is_cleaned_before_parse_failure() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-unknown-version-bucket";
@@ -6630,10 +6805,42 @@ mod transition_upload_integrity_tests {
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
             .await
-            .expect_err("an unparseable remote version must fail closed");
+            .expect_err("an opaque remote version must fail closed until the capability gate is active");
         let removed_versions = backend.remove_versions().await;
         assert_eq!(removed_versions.len(), 1);
         assert_eq!(removed_versions[0].1, "opaque-version-token");
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn nil_remote_version_is_cleaned_exactly_before_transaction_persistence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-nil-version-bucket";
+        let object = "object.bin";
+        let payload = b"nil remote version must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::nil().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("a nil remote version must fail closed before transaction persistence");
+        let put_versions = backend.put_versions().await;
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions, put_versions);
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(
+            removed_versions.first().map(|(_, version)| version.as_str()),
+            Some(remote_version.as_str())
+        );
+        assert_eq!(save_probe.attempts(), 0, "nil remote version must be rejected before saving Uploaded");
+        assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
@@ -6985,23 +7192,36 @@ mod transition_source_identity_matrix_tests {
             let object = format!("identity-{index}.bin");
             let payload = vec![u8::try_from(index + 1).expect("matrix index should fit u8"); 1024 * 1024];
             let mut reader = PutObjReader::from_vec(payload);
+            let source_version_id = Uuid::new_v4();
+            let source_opts = ObjectOptions {
+                version_id: Some(source_version_id.to_string()),
+                versioned: true,
+                ..Default::default()
+            };
             let original = set_disks
-                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .put_object(bucket, &object, &mut reader, &source_opts)
                 .await
                 .expect("source object should be written");
             let (source, _, _) = set_disks
-                .get_object_fileinfo(bucket, &object, &ObjectOptions::default(), true, false)
+                .get_object_fileinfo(bucket, &object, &source_opts, true, false)
                 .await
                 .expect("source metadata should resolve");
+            assert_eq!(source.version_id, Some(source_version_id));
+            assert_eq!(
+                transition_source_identity(bucket, &object, &source, &source_opts, &get_raw_etag(&source.metadata))
+                    .expect("persisted versioned source identity should build")
+                    .version_mode,
+                TransitionSourceVersionMode::Versioned
+            );
             let opts = ObjectOptions {
                 no_lock: true,
+                versioned: true,
                 transition: TransitionOptions {
                     status: TRANSITION_PENDING.to_string(),
                     tier: tier_name.clone(),
                     etag: original.etag.clone().unwrap_or_default(),
                     ..Default::default()
                 },
-                version_id: original.version_id.map(|version| version.to_string()),
                 mod_time: original.mod_time,
                 ..Default::default()
             };
@@ -7014,7 +7234,10 @@ mod transition_source_identity_matrix_tests {
 
             let mut changed = source.clone();
             match field {
-                IdentityField::VersionId => changed.version_id = Some(Uuid::new_v4()),
+                IdentityField::VersionId => {
+                    changed.version_id = Some(Uuid::new_v4());
+                    changed.fresh = true;
+                }
                 IdentityField::DataDir => changed.data_dir = Some(Uuid::new_v4()),
                 IdentityField::ModTime => {
                     changed.mod_time = changed.mod_time.map(|value| value + time::Duration::nanoseconds(1));
@@ -7032,12 +7255,19 @@ mod transition_source_identity_matrix_tests {
                     .await
                     .expect("single-field metadata drift should be written");
             }
+            let persisted_opts = ObjectOptions {
+                version_id: changed.version_id.map(|version_id| version_id.to_string()),
+                versioned: true,
+                ..Default::default()
+            };
+            let (persisted, _, _) = set_disks
+                .get_object_fileinfo(bucket, &object, &persisted_opts, true, false)
+                .await
+                .expect("drifted source metadata should resolve");
             put_barrier.release();
 
-            transition
-                .await
-                .expect("transition task should not panic")
-                .expect_err("transition must reject a source whose identity changed after upload");
+            let result = transition.await.expect("transition task should not panic");
+            assert!(result.is_err(), "transition must reject {field:?} drift");
             let expected_attempts = index + 1;
             assert_eq!(backend.put_count().await, expected_attempts);
             assert_eq!(backend.remove_count().await, expected_attempts);
@@ -7048,26 +7278,26 @@ mod transition_source_identity_matrix_tests {
             );
 
             match field {
-                IdentityField::VersionId => assert_ne!(source.version_id, changed.version_id),
-                IdentityField::DataDir => assert_ne!(source.data_dir, changed.data_dir),
-                IdentityField::ModTime => assert_ne!(source.mod_time, changed.mod_time),
-                IdentityField::Size => assert_ne!(source.size, changed.size),
-                IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata)),
+                IdentityField::VersionId => assert_ne!(source.version_id, persisted.version_id),
+                IdentityField::DataDir => assert_ne!(source.data_dir, persisted.data_dir),
+                IdentityField::ModTime => assert_ne!(source.mod_time, persisted.mod_time),
+                IdentityField::Size => assert_ne!(source.size, persisted.size),
+                IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&persisted.metadata)),
             }
             if !matches!(field, IdentityField::VersionId) {
-                assert_eq!(source.version_id, changed.version_id);
+                assert_eq!(source.version_id, persisted.version_id);
             }
             if !matches!(field, IdentityField::DataDir) {
-                assert_eq!(source.data_dir, changed.data_dir);
+                assert_eq!(source.data_dir, persisted.data_dir);
             }
             if !matches!(field, IdentityField::ModTime) {
-                assert_eq!(source.mod_time, changed.mod_time);
+                assert_eq!(source.mod_time, persisted.mod_time);
             }
             if !matches!(field, IdentityField::Size) {
-                assert_eq!(source.size, changed.size);
+                assert_eq!(source.size, persisted.size);
             }
             if !matches!(field, IdentityField::Etag) {
-                assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata));
+                assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&persisted.metadata));
             }
         }
     }

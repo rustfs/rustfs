@@ -692,6 +692,8 @@ pub(crate) use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
+#[cfg(test)]
+pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
 mod read;
 mod replication;
 pub(crate) mod shard_source;
