@@ -390,8 +390,10 @@ mod serial_tests {
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
-        std::fs::remove_dir_all(&disk_paths[0]).expect("failed to delete all contents under disk_paths[0]");
+        let failed_disk_path = disk_paths[0].with_extension("failed");
+        std::fs::rename(&disk_paths[0], &failed_disk_path).expect("failed to detach disk_paths[0]");
         std::fs::create_dir_all(&disk_paths[0]).expect("failed to recreate disk_paths[0] directory");
+        assert!(!format_path.exists(), "replacement disk already contains format.json before heal");
         println!("✅ Deleted format.json on disk: {:?}", disk_paths[0]);
 
         let (_format_result, format_error) = heal_storage.heal_format(false).await.expect("failed to run heal_format");
