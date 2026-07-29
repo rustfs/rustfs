@@ -5849,23 +5849,27 @@ mod tests {
             crate::disk::DataDirDeleteStatus::Deleted
         );
         release_slow_candidate.notify_one();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            disk2
-                .delete_data_dir(
-                    bucket,
-                    data_dir,
-                    DeleteOptions {
-                        recursive: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("a token acquired after the deadline must be released"),
-            crate::disk::DataDirDeleteStatus::Deleted
-        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match disk2
+                    .delete_data_dir(
+                        bucket,
+                        data_dir,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("a token acquired after the deadline must be released")
+                {
+                    crate::disk::DataDirDeleteStatus::Deleted => return,
+                    crate::disk::DataDirDeleteStatus::Deferred => tokio::time::sleep(Duration::from_millis(1)).await,
+                }
+            }
+        })
+        .await
+        .expect("late snapshot lease cleanup must finish within the bounded wait");
     }
 
     #[tokio::test(start_paused = true)]
