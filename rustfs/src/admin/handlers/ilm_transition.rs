@@ -444,6 +444,9 @@ fn map_transition_operator_error(err: TransitionOperatorError) -> S3Error {
         TransitionOperatorError::CandidateNotMissing(_) => {
             s3_error!(OperationAborted, "remote candidate is not proven missing")
         }
+        TransitionOperatorError::CandidateVersionMismatch { .. } => {
+            s3_error!(OperationAborted, "remote candidate version does not match requested exact version")
+        }
         TransitionOperatorError::Store(_) | TransitionOperatorError::Remote(_) => {
             s3_error!(InternalError, "transition reconciliation failed")
         }

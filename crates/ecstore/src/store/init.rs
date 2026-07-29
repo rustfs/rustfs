@@ -2903,15 +2903,18 @@ mod tests {
         assert_eq!(status.probe, TransitionOperatorProbe::VersionedPresent(remote_version.clone()));
 
         let wrong_version = uuid::Uuid::new_v4().to_string();
-        let result = delete_transition_candidate_for_operator(store.clone(), transaction.transaction_id, &wrong_version)
+        let err = delete_transition_candidate_for_operator(store.clone(), transaction.transaction_id, &wrong_version)
             .await
-            .expect("an exact delete of an absent version should be idempotent");
-        assert_eq!(
-            result.status.probe,
-            TransitionOperatorProbe::VersionedPresent(remote_version.clone()),
-            "an incorrect exact version must not delete the provider-confirmed candidate"
-        );
-        assert!(result.journal_observed_after_delete);
+            .expect_err("a mismatched exact version must fail before deleting a candidate");
+        assert!(matches!(
+            err,
+            TransitionOperatorError::CandidateVersionMismatch {
+                expected,
+                actual: TransitionOperatorProbe::VersionedPresent(ref observed),
+            } if expected == wrong_version && observed == &remote_version
+        ));
+        assert!(backend.contains(&transaction.remote_object).await);
+        assert_eq!(backend.exact_remove_count(), 0);
         load_transition_transaction_record(store.clone(), transaction.transaction_id)
             .await
             .expect("an incorrect exact version must retain the transaction journal");
@@ -2921,7 +2924,7 @@ mod tests {
             .expect("operator-confirmed exact candidate should be deleted");
         assert_eq!(result.status.probe, TransitionOperatorProbe::Missing);
         assert!(result.journal_observed_after_delete);
-        assert_eq!(backend.exact_remove_count(), 2);
+        assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.remove_versions().await, vec![(transaction.remote_object.clone(), remote_version)]);
         load_transition_transaction_record(store.clone(), transaction.transaction_id)
             .await

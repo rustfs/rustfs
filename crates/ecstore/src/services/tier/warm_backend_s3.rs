@@ -459,7 +459,7 @@ mod tests {
         let metadata = candidate_metadata(identity);
         assert!(transition_candidate_metadata_matches(&metadata, identity).unwrap());
 
-        let mut adjacent = metadata.clone();
+        let mut adjacent = metadata;
         rustfs_utils::http::metadata_compat::insert_str(
             &mut adjacent,
             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,

@@ -667,6 +667,11 @@ pub enum TransitionOperatorError {
     RemoteVersionRequired,
     #[error("remote candidate is not proven missing: {0:?}")]
     CandidateNotMissing(TransitionOperatorProbe),
+    #[error("remote candidate version does not match requested exact version: expected {expected}, observed {actual:?}")]
+    CandidateVersionMismatch {
+        expected: String,
+        actual: TransitionOperatorProbe,
+    },
     #[error("transition transaction store failed: {0}")]
     Store(#[source] Error),
     #[error("remote tier reconciliation failed: {0}")]
@@ -757,6 +762,17 @@ pub async fn delete_transition_candidate_for_operator(
     lease
         .validate_remote_version_id(remote_version_id)
         .map_err(TransitionOperatorError::Remote)?;
+    let before_delete_probe = lease
+        .probe_transition_candidate_for(&transaction.remote_object, transaction.transaction_id)
+        .await
+        .map(TransitionOperatorProbe::from)
+        .map_err(TransitionOperatorError::Remote)?;
+    if !matches!(&before_delete_probe, TransitionOperatorProbe::VersionedPresent(version_id) if version_id == remote_version_id) {
+        return Err(TransitionOperatorError::CandidateVersionMismatch {
+            expected: remote_version_id.to_string(),
+            actual: before_delete_probe,
+        });
+    }
     delete_confirmed_transition_candidate_exact_with_lease_idempotent(&transaction.remote_object, remote_version_id, &lease)
         .await
         .map_err(TransitionOperatorError::Remote)?;
