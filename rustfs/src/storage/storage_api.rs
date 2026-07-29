@@ -236,8 +236,8 @@ pub(crate) mod rpc_consumer {
             ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
             ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
             StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata, set_bucket_metadata, validate_batch_read_version_item_count,
+            find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
+            remove_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -1365,10 +1365,6 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
     }
 }
 
-pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
-    ecstore_bucket::metadata::load_bucket_metadata(api, bucket).await
-}
-
 #[cfg(test)]
 pub(crate) fn bucket_metadata_sys_initialized() -> bool {
     ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
@@ -1441,8 +1437,13 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
     ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
+#[cfg(test)]
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
+}
+
+pub(crate) async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
+    ecstore_bucket::metadata_sys::reload_bucket_metadata(bucket).await
 }
 
 pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {

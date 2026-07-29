@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(handler.event_count(), 1);
 
         handler.add_event(event.clone());
-        handler.add_event(event.clone());
+        handler.add_event(event);
         assert_eq!(handler.event_count(), 3);
     }
 
@@ -593,7 +593,7 @@ mod tests {
 
         handler.add_event(event.clone());
         handler.add_event(event.clone());
-        handler.add_event(event.clone()); // Should remove oldest
+        handler.add_event(event); // Should remove oldest
 
         assert_eq!(handler.event_count(), 2);
     }
@@ -610,7 +610,7 @@ mod tests {
         };
 
         handler.add_event(event.clone());
-        handler.add_event(event.clone());
+        handler.add_event(event);
 
         let events = handler.get_events();
         assert_eq!(events.len(), 2);

@@ -44,6 +44,7 @@ pub mod expiration;
 pub mod expiration_worker;
 pub mod formpost;
 pub mod handler;
+pub mod metadata_update;
 pub mod object;
 pub mod quota;
 pub mod router;
@@ -57,6 +58,7 @@ pub mod types;
 pub mod versioning;
 
 pub use errors::{SwiftError, SwiftResult};
+pub use metadata_update::MetadataUpdate;
 pub use router::{SwiftRoute, SwiftRouter};
 
 /// Maximum number of metadata headers allowed per resource (Swift standard)
@@ -71,9 +73,10 @@ pub(crate) const MAX_METADATA_VALUE_SIZE: usize = 256;
 /// - Total number of metadata entries doesn't exceed MAX_METADATA_COUNT
 /// - Individual metadata values don't exceed MAX_METADATA_VALUE_SIZE
 ///
-/// Applies to object, container and account metadata alike: all three are
-/// persisted, and container/account metadata additionally lands in the
-/// bucket metadata file that every later config write rewrites in full.
+/// This is the object-metadata form, where a POST replaces the whole set and
+/// the request is therefore the complete result. Account and container POSTs
+/// are additive, so their count has to be measured against the merged state
+/// instead — see [`MetadataUpdate::apply_to_tags`].
 ///
 /// Returns error if limits are exceeded.
 pub(crate) fn validate_metadata(metadata: &std::collections::HashMap<String, String>) -> SwiftResult<()> {
