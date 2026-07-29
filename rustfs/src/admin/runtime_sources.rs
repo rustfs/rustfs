@@ -76,19 +76,177 @@ pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<EC
 }
 
 pub(crate) fn app_context_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<AppContext>> {
-    req.extensions
-        .get::<Arc<ServerContextSlot>>()
-        .and_then(|slot| slot.app_context())
-        .or_else(current_app_context)
+    app_context_from_extensions(&req.extensions)
+}
+
+/// Resolve an application context from request extensions.
+///
+/// An injected slot identifies the server that owns the request. If that
+/// server has not finished startup yet, returning its ambient global context
+/// could select a different server, so this fails closed. Only requests with
+/// no slot retain the legacy ambient fallback.
+pub(crate) fn app_context_from_extensions(extensions: &http::Extensions) -> Option<Arc<AppContext>> {
+    match extensions.get::<Arc<ServerContextSlot>>() {
+        Some(slot) => slot.installed_app_context(),
+        None => current_app_context(),
+    }
 }
 
 /// Field-borrow form of [`object_store_from_req`] for handlers that have
 /// already moved other request fields (body, credentials) out of the request.
 pub(crate) fn object_store_from_extensions(extensions: &http::Extensions) -> Option<Arc<ECStore>> {
-    extensions
-        .get::<Arc<ServerContextSlot>>()
-        .and_then(|slot| slot.object_store())
-        .or_else(current_object_store_handle)
+    match extensions.get::<Arc<ServerContextSlot>>() {
+        Some(slot) => slot.installed_object_store(),
+        None => current_object_store_handle(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_extensions, app_context_from_req,
+        current_app_context, object_store_from_extensions, publish_test_app_context,
+    };
+    use crate::admin::router::{Operation, S3Router};
+    use hyper::{Method, StatusCode};
+    use matchit::Params;
+    use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_kms::KmsServiceManager;
+    use s3s::route::S3Route;
+    use s3s::{Body, S3ErrorCode, S3Request, S3Response, s3_error};
+    use std::sync::Arc;
+
+    struct UnreadyIam;
+
+    impl IamInterface for UnreadyIam {
+        fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+            panic!("test context does not resolve IAM")
+        }
+
+        fn is_ready(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestKms;
+
+    impl KmsInterface for TestKms {
+        fn handle(&self) -> Arc<KmsServiceManager> {
+            Arc::new(KmsServiceManager::new())
+        }
+    }
+
+    async fn ambient_context() -> Arc<AppContext> {
+        if let Some(context) = current_app_context() {
+            return context;
+        }
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("server_context_slot")
+            .disk_count(1)
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        let context = Arc::new(AppContext::new(env.ecstore, Arc::new(UnreadyIam), Arc::new(TestKms)));
+        publish_test_app_context(context.clone());
+        current_app_context().expect("test context must be globally published")
+    }
+
+    fn distinct_context(context: &AppContext) -> Arc<AppContext> {
+        Arc::new(AppContext::new(context.object_store(), Arc::new(UnreadyIam), Arc::new(TestKms)))
+    }
+
+    fn request(extensions: http::Extensions) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: "/context-probe".parse().expect("test URI"),
+            headers: http::HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_with_empty_slot_never_uses_ambient_context() {
+        let ambient = ambient_context().await;
+        let slot = ServerContextSlot::new();
+        let mut extensions = http::Extensions::new();
+        extensions.insert(slot);
+
+        assert!(app_context_from_extensions(&extensions).is_none());
+        assert!(object_store_from_extensions(&extensions).is_none());
+        assert!(app_context_from_req(&request(extensions)).is_none());
+        assert!(Arc::ptr_eq(
+            &current_app_context().expect("ambient context must remain available"),
+            &ambient
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_with_installed_slot_resolves_only_its_context() {
+        let ambient = ambient_context().await;
+        let installed = distinct_context(&ambient);
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(installed.clone()));
+        let mut extensions = http::Extensions::new();
+        extensions.insert(slot);
+
+        let resolved = app_context_from_extensions(&extensions).expect("installed slot must resolve");
+        assert!(Arc::ptr_eq(&resolved, &installed));
+        assert!(!Arc::ptr_eq(&resolved, &ambient));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_without_slot_keeps_legacy_ambient_resolution() {
+        let ambient = ambient_context().await;
+        let extensions = http::Extensions::new();
+
+        let resolved = app_context_from_extensions(&extensions).expect("legacy request must use ambient context");
+        assert!(Arc::ptr_eq(&resolved, &ambient));
+        assert!(object_store_from_extensions(&extensions).is_some());
+    }
+
+    struct ContextDependentAdminRoute;
+
+    #[async_trait::async_trait]
+    impl Operation for ContextDependentAdminRoute {
+        async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> s3s::S3Result<S3Response<(StatusCode, Body)>> {
+            app_context_from_req(&req).ok_or_else(|| s3_error!(ServiceUnavailable, "server context is not ready"))?;
+            Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty())))
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn context_dependent_admin_route_fails_closed_until_slot_installation() {
+        let ambient = ambient_context().await;
+        let slot = ServerContextSlot::new();
+        let mut router = S3Router::new(false);
+        router.set_server_ctx(slot.clone());
+        router
+            .insert(Method::GET, "/context-probe", ContextDependentAdminRoute)
+            .expect("register test route");
+
+        let err = router
+            .call(request(http::Extensions::new()))
+            .await
+            .expect_err("empty slot must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+
+        assert!(slot.install(distinct_context(&ambient)));
+        let response = router
+            .call(request(http::Extensions::new()))
+            .await
+            .expect("installed slot must serve request");
+        assert_eq!(response.status, Some(StatusCode::NO_CONTENT));
+    }
 }
 
 pub(crate) fn current_notification_system() -> Option<Arc<NotificationSys>> {

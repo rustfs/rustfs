@@ -2655,6 +2655,10 @@ fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
+fn server_context_not_ready_error() -> S3Error {
+    s3_error!(ServiceUnavailable, "server context is not ready")
+}
+
 fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
     if method != Method::GET {
         return false;
@@ -2783,6 +2787,9 @@ where
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
+            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
+                return Err(server_context_not_ready_error());
+            }
         }
         if parse_replication_extension_request(&req.method, &req.uri).is_some()
             || parse_misc_extension_request(&req.method, &req.uri).is_some()
@@ -2836,6 +2843,9 @@ where
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
+            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
+                return Err(server_context_not_ready_error());
+            }
         }
         if let Some(ext_req) = parse_replication_extension_request(&req.method, &req.uri) {
             return handle_replication_extension_request(&mut req, &ext_req).await;
