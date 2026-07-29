@@ -29,13 +29,23 @@ const LEGACY_HIGHWAY_HASH256_KEY: [u8; 32] = [
     3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-fn highway_key_from_bytes(bytes: &[u8; 32]) -> [u64; 4] {
-    let mut key = [0u64; 4];
-    for (i, chunk) in bytes.chunks_exact(8).enumerate() {
-        key[i] = u64::from_le_bytes(chunk.try_into().unwrap());
-    }
-    key
+const fn highway_key_from_bytes(bytes: &[u8; 32]) -> [u64; 4] {
+    [
+        u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]),
+        u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]),
+        u64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ]),
+        u64::from_le_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]),
+    ]
 }
+
+const MAGIC_HIGHWAY_HASH256_PARSED_KEY: Key = Key(highway_key_from_bytes(&MAGIC_HIGHWAY_HASH256_KEY));
+const LEGACY_HIGHWAY_HASH256_PARSED_KEY: Key = Key(highway_key_from_bytes(&LEGACY_HIGHWAY_HASH256_KEY));
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
 /// Supported hash algorithms for bitrot protection.
@@ -100,25 +110,23 @@ impl HashAlgorithm {
     /// # Returns
     /// A byte slice containing the hash of the input data
     ///
+    #[inline]
     pub fn hash_encode(&self, data: &[u8]) -> impl AsRef<[u8]> {
         match self {
             HashAlgorithm::Md5 => HashEncoded::Md5(Md5::digest(data).into()),
             HashAlgorithm::HighwayHash256 => {
-                let key = Key(highway_key_from_bytes(&MAGIC_HIGHWAY_HASH256_KEY));
-                let mut hasher = HighwayHasher::new(key);
+                let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
                 hasher.append(data);
                 HashEncoded::HighwayHash256(u8x32_from_u64x4(hasher.finalize256()))
             }
             HashAlgorithm::SHA256 => HashEncoded::Sha256(Sha256::digest(data).into()),
             HashAlgorithm::HighwayHash256S => {
-                let key = Key(highway_key_from_bytes(&MAGIC_HIGHWAY_HASH256_KEY));
-                let mut hasher = HighwayHasher::new(key);
+                let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
                 hasher.append(data);
                 HashEncoded::HighwayHash256S(u8x32_from_u64x4(hasher.finalize256()))
             }
             HashAlgorithm::HighwayHash256SLegacy => {
-                let key = Key(highway_key_from_bytes(&LEGACY_HIGHWAY_HASH256_KEY));
-                let mut hasher = HighwayHasher::new(key);
+                let mut hasher = HighwayHasher::new(LEGACY_HIGHWAY_HASH256_PARSED_KEY);
                 hasher.append(data);
                 HashEncoded::HighwayHash256SLegacy(u8x32_from_u64x4(hasher.finalize256()))
             }

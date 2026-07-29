@@ -1440,8 +1440,8 @@ pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> R
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
 }
 
-pub(crate) async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
-    ecstore_bucket::metadata_sys::reload_bucket_metadata(bucket).await
+pub(crate) async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<()> {
+    ecstore_bucket::metadata_sys::reload_bucket_metadata(api, bucket).await
 }
 
 pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {

@@ -25,6 +25,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use md5::{Digest as Md5Digest, Md5};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
@@ -827,11 +828,23 @@ fn ensure_body_growth(current: usize, added: usize) -> S3Result {
 
 async fn md5_digest(body: Bytes, permit: OwnedSemaphorePermit) -> S3Result<([u8; 16], OwnedSemaphorePermit)> {
     if body.len() < 1024 * 1024 {
-        return Ok((md5::compute(body).0, permit));
+        return Ok((md5_bytes(body), permit));
     }
-    tokio::task::spawn_blocking(move || (md5::compute(body).0, permit))
+    tokio::task::spawn_blocking(move || (md5_bytes(body), permit))
         .await
         .map_err(|error| s3s::s3_error!(InternalError, "MD5 worker failed: {error}"))
+}
+
+fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hasher.finalize().into()
+}
+
+fn md5_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hex::encode(hasher.finalize())
 }
 
 fn ensure_store_budget(state: &StoreState, removed_bytes: usize, added_bytes: usize, adds_version: bool) -> S3Result {
@@ -1005,7 +1018,7 @@ impl S3 for FakeBackend {
             Some(value) => value,
             None => {
                 let (digest, _body_permit) = md5_digest(body.clone(), _body_permit).await?;
-                format!("{:x}", md5::Digest(digest))
+                hex::encode(digest)
             }
         };
         let version = ObjectVersion {
@@ -1208,7 +1221,7 @@ impl S3 for FakeBackend {
         }
         let body = collect_stream(input.body, input.content_length, fault.as_ref(), &self.control).await?;
         let (digest, _body_permit) = md5_digest(body.clone(), _body_permit).await?;
-        let e_tag = format!("{:x}", md5::Digest(digest));
+        let e_tag = hex::encode(digest);
         let mut state = lock(&self.store);
         let existing_bytes = state
             .uploads
@@ -1336,7 +1349,7 @@ impl S3 for FakeBackend {
             .collect();
         let (body, digests, _body_permits) = assemble_multipart(assembly_parts, total_len, _body_permits).await?;
         let part_count = requested.len();
-        let e_tag = source_etag(&headers)?.unwrap_or_else(|| format!("{:x}-{part_count}", md5::compute(digests)));
+        let e_tag = source_etag(&headers)?.unwrap_or_else(|| format!("{}-{part_count}", md5_hex(digests)));
         let version = ObjectVersion {
             version_id: upload.version_id.clone(),
             body,
