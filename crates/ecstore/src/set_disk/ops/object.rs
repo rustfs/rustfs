@@ -4185,6 +4185,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let mut p_reader = PutObjReader::new(hash_reader);
             return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 Ok(restored_info) => {
+                    let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
                     send_event(EventArgs {
                         event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
                         bucket_name: bucket.to_string(),
@@ -4319,6 +4320,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return set_restore_header_fn(&mut oi, Some(err)).await;
             }
         };
+        let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
         send_event(EventArgs {
             event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
             bucket_name: bucket.to_string(),
