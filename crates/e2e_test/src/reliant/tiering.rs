@@ -95,6 +95,7 @@ const MANUAL_ASYNC_PARALLEL_OBJECTS: usize = 64;
 const MANUAL_ACTIVE_CANCEL_OBJECTS: usize = 512;
 const MANUAL_RESTART_CANCEL_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const MANUAL_TRANSITION_CANCEL_BARRIER_ENV: &str = "RUSTFS_E2E_MANUAL_TRANSITION_CANCEL_BARRIER";
 const MANUAL_ASYNC_CONFLICT_TERMINAL_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 const MANUAL_RESTART_RECOVERY_TIMEOUT: StdDuration = StdDuration::from_secs(80);
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
@@ -1684,8 +1685,15 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    hot.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_SCANNER_ENABLED", "false"),
+            ("RUSTFS_SCANNER_CYCLE", "3600"),
+            (MANUAL_TRANSITION_CANCEL_BARRIER_ENV, "1"),
+        ],
+    )
+    .await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 

@@ -698,7 +698,7 @@ impl DataUsageCache {
                 let mut visited = HashSet::new();
                 visited.insert(hash_path(path).key());
                 let mut flat = self.flatten_with_guard(root, &mut visited, 0);
-                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.is_empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -1574,6 +1574,7 @@ mod tests {
     use super::*;
     use crate::storage_api::scanner_io::{HTTPRangeSpec, ObjectIO};
     use crate::{ScannerGetObjectReader, ScannerPutObjReader};
+    use rustfs_data_usage::{ReplicationAllStats, ReplicationStats};
     use serde_json::Value;
     use std::io::Cursor;
     use std::pin::Pin;
@@ -2765,6 +2766,55 @@ mod tests {
         assert_eq!(flat.objects, 3);
         assert_eq!(flat.size, 30);
         assert!(flat.children.is_empty());
+    }
+
+    #[test]
+    fn size_recursive_prunes_empty_and_preserves_threshold_replication_stats() {
+        let root = hash_path("bucket");
+        let child = hash_path("bucket/child");
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats::default()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cache
+                .size_recursive("bucket")
+                .expect("scanner bucket usage should flatten")
+                .replication_stats
+                .is_none()
+        );
+
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats {
+                    targets: HashMap::from([(
+                        "arn:test:threshold".to_string(),
+                        ReplicationStats {
+                            after_threshold_count: 1,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let flattened = cache.size_recursive("bucket").expect("scanner bucket usage should flatten");
+        let replication = flattened
+            .replication_stats
+            .expect("threshold-only replication stats must survive pruning");
+
+        assert_eq!(replication.targets["arn:test:threshold"].after_threshold_count, 1);
     }
 
     #[test]

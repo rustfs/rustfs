@@ -16,15 +16,20 @@
 //! metadata file, not just the in-memory cache. The metadata has to survive
 //! the disk-truth reloads performed by peer LoadBucketMetadata notifications
 //! and the periodic refresh loop — and, transitively, a process restart.
+//!
+//! Durability is what makes the *content* of those writes matter, so this file
+//! also covers Swift's additive account/container POST semantics: an item the
+//! request does not name keeps its stored value, and removal is explicit. The
+//! two are tested together because a reload is the only way to tell a real
+//! merge from one that happened to look right in the cache.
 
 #![cfg(feature = "swift")]
 
 use std::collections::HashMap;
 
 use rustfs_credentials::Credentials;
-use rustfs_protocols::swift::SwiftError;
 use rustfs_protocols::swift::container::{ContainerMapper, update_container_metadata};
-use rustfs_protocols::swift::{account, container};
+use rustfs_protocols::swift::{MetadataUpdate, SwiftError, account, container};
 use rustfs_test_utils::TestECStoreEnv;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -97,6 +102,8 @@ async fn swift_metadata_writes_are_durable() {
 
     posts_survive_disk_truth_reload(&env).await;
     tag_writers_preserve_each_others_state(&env).await;
+    unrelated_account_posts_preserve_the_tempurl_key().await;
+    acl_only_posts_leave_container_metadata_alone(&env).await;
     versioning_writes_reject_missing_containers().await;
 }
 
@@ -109,11 +116,14 @@ async fn posts_survive_disk_truth_reload(env: &TestECStoreEnv) {
     let bucket = ContainerMapper::default().swift_to_s3_bucket(swift_container, project_id);
     env.make_bucket(&bucket, false).await;
 
-    let mut metadata = HashMap::new();
-    metadata.insert("color".to_string(), "blue".to_string());
-    update_container_metadata(&swift_account, swift_container, &credentials, metadata)
-        .await
-        .expect("container metadata POST should succeed");
+    update_container_metadata(
+        &swift_account,
+        swift_container,
+        &credentials,
+        MetadataUpdate::default().set("color", "blue"),
+    )
+    .await
+    .expect("container metadata POST should succeed");
 
     reload_bucket_metadata_from_disk(&bucket).await;
 
@@ -124,22 +134,47 @@ async fn posts_survive_disk_truth_reload(env: &TestECStoreEnv) {
         "container metadata POST must survive a disk-truth metadata reload"
     );
 
-    // A follow-up POST replaces the Swift metadata and that replacement must
-    // survive a reload too (the rewrite merges against disk state, so the
-    // previous value must actually be gone).
-    let mut metadata = HashMap::new();
-    metadata.insert("season".to_string(), "summer".to_string());
-    update_container_metadata(&swift_account, swift_container, &credentials, metadata)
-        .await
-        .expect("second container metadata POST should succeed");
+    // A follow-up POST names a different item. Swift POSTs are additive, so
+    // the new item lands and the first one stays — and both are still there
+    // after a reload, which is what proves the merge ran against disk state
+    // rather than looking right in the cache.
+    update_container_metadata(
+        &swift_account,
+        swift_container,
+        &credentials,
+        MetadataUpdate::default().set("season", "summer"),
+    )
+    .await
+    .expect("second container metadata POST should succeed");
 
     reload_bucket_metadata_from_disk(&bucket).await;
 
     let container_meta = persisted_container_metadata(&bucket).await;
     assert_eq!(container_meta.get("season").map(String::as_str), Some("summer"));
+    assert_eq!(
+        container_meta.get("color").map(String::as_str),
+        Some("blue"),
+        "a POST that does not name an item must not delete it"
+    );
+
+    // X-Remove-Container-Meta-Color is the deletion path, and it has to be
+    // durable in the other direction: the removed item must not come back
+    // from the persisted tags on reload.
+    update_container_metadata(&swift_account, swift_container, &credentials, MetadataUpdate::default().remove("color"))
+        .await
+        .expect("container metadata removal should succeed");
+
+    reload_bucket_metadata_from_disk(&bucket).await;
+
+    let container_meta = persisted_container_metadata(&bucket).await;
     assert!(
         !container_meta.contains_key("color"),
-        "replaced container metadata must not resurrect on reload"
+        "an explicitly removed item must not resurrect on reload"
+    );
+    assert_eq!(
+        container_meta.get("season").map(String::as_str),
+        Some("summer"),
+        "removing one item must not disturb the others"
     );
 
     // --- Container versioning POST (X-Versions-Location) ---
@@ -163,11 +198,13 @@ async fn posts_survive_disk_truth_reload(env: &TestECStoreEnv) {
     );
 
     // --- Account metadata POST (TempURL keys etc.) ---
-    let mut account_meta = HashMap::new();
-    account_meta.insert("temp-url-key".to_string(), "s3cr3t".to_string());
-    account::update_account_metadata(&swift_account, &account_meta, &Some(credentials.clone()))
-        .await
-        .expect("account metadata POST should succeed");
+    account::update_account_metadata(
+        &swift_account,
+        &MetadataUpdate::default().set("temp-url-key", "s3cr3t"),
+        &Some(credentials.clone()),
+    )
+    .await
+    .expect("account metadata POST should succeed");
 
     reload_bucket_metadata_from_disk(&account_metadata_bucket_name(&swift_account)).await;
 
@@ -196,9 +233,7 @@ async fn tag_writers_preserve_each_others_state(env: &TestECStoreEnv) {
     env.make_bucket(&ContainerMapper::default().swift_to_s3_bucket(archive, project_id), false)
         .await;
 
-    let mut metadata = HashMap::new();
-    metadata.insert("color".to_string(), "blue".to_string());
-    update_container_metadata(&swift_account, container, &credentials, metadata)
+    update_container_metadata(&swift_account, container, &credentials, MetadataUpdate::default().set("color", "blue"))
         .await
         .expect("container metadata POST should succeed");
     container::enable_versioning(&swift_account, container, archive, &credentials)
@@ -252,6 +287,111 @@ async fn tag_writers_preserve_each_others_state(env: &TestECStoreEnv) {
     assert!(!acl.read.is_empty(), "disable_versioning must not disturb the ACL");
 }
 
+/// The failure additive POSTs exist to prevent. Account metadata holds the
+/// TempURL signing key, so a POST that replaced the whole set — setting a
+/// quota, say — would delete that key and permanently invalidate every
+/// outstanding TempURL and FormPost signature for the account. Durable
+/// storage made that loss permanent instead of a cache blip, so the check
+/// runs against reloaded disk state.
+///
+/// Relies on the ambient store the caller's `TestECStoreEnv` published; the
+/// account metadata bucket is created by the write path itself.
+async fn unrelated_account_posts_preserve_the_tempurl_key() {
+    let project_id = "swiftmergeproj";
+    let swift_account = format!("AUTH_{project_id}");
+    let credentials = Some(keystone_credentials(project_id));
+    let account_bucket = account_metadata_bucket_name(&swift_account);
+
+    account::update_account_metadata(&swift_account, &MetadataUpdate::default().set("temp-url-key", "s3cr3t"), &credentials)
+        .await
+        .expect("TempURL key POST should succeed");
+
+    // A later POST that has nothing to do with the TempURL key.
+    account::update_account_metadata(&swift_account, &MetadataUpdate::default().set("quota-bytes", "100"), &credentials)
+        .await
+        .expect("quota POST should succeed");
+
+    reload_bucket_metadata_from_disk(&account_bucket).await;
+
+    let loaded = account::get_account_metadata(&swift_account, &None)
+        .await
+        .expect("account metadata should load");
+    assert_eq!(
+        loaded.get("temp-url-key").map(String::as_str),
+        Some("s3cr3t"),
+        "an unrelated account POST must not delete the TempURL signing key"
+    );
+    assert_eq!(loaded.get("quota-bytes").map(String::as_str), Some("100"));
+
+    // And the lookup that actually breaks when the key is lost still resolves.
+    assert_eq!(
+        account::get_tempurl_key(&swift_account, &None)
+            .await
+            .expect("TempURL key should load")
+            .as_deref(),
+        Some("s3cr3t"),
+        "TempURL signature validation must still find the key"
+    );
+
+    // X-Remove-Account-Meta-Quota-Bytes drops that item and nothing else.
+    account::update_account_metadata(&swift_account, &MetadataUpdate::default().remove("quota-bytes"), &credentials)
+        .await
+        .expect("account metadata removal should succeed");
+
+    reload_bucket_metadata_from_disk(&account_bucket).await;
+
+    let loaded = account::get_account_metadata(&swift_account, &None)
+        .await
+        .expect("account metadata should load");
+    assert!(
+        !loaded.contains_key("quota-bytes"),
+        "an explicitly removed item must not resurrect on reload"
+    );
+    assert_eq!(
+        loaded.get("temp-url-key").map(String::as_str),
+        Some("s3cr3t"),
+        "removing one item must not disturb the TempURL key"
+    );
+}
+
+/// An ACL-only or versioning-only container POST carries no `X-Container-Meta-*`
+/// header, but the handler still runs the metadata step on every POST. That
+/// step must leave stored metadata alone rather than treating "named nothing"
+/// as "wants everything gone".
+async fn acl_only_posts_leave_container_metadata_alone(env: &TestECStoreEnv) {
+    let project_id = "swiftaclonlyproj";
+    let swift_account = format!("AUTH_{project_id}");
+    let credentials = keystone_credentials(project_id);
+    let container = "gallery";
+    let bucket = ContainerMapper::default().swift_to_s3_bucket(container, project_id);
+    env.make_bucket(&bucket, false).await;
+
+    update_container_metadata(&swift_account, container, &credentials, MetadataUpdate::default().set("color", "blue"))
+        .await
+        .expect("container metadata POST should succeed");
+
+    // What the handler does for `POST … -H 'X-Container-Read: .r:*'`: set the
+    // ACL, then run the metadata step with an update that names no item.
+    container::set_container_acl(&swift_account, container, Some(".r:*"), None, &credentials)
+        .await
+        .expect("ACL-only POST should succeed");
+    update_container_metadata(&swift_account, container, &credentials, MetadataUpdate::default())
+        .await
+        .expect("the metadata step of an ACL-only POST should succeed");
+
+    reload_bucket_metadata_from_disk(&bucket).await;
+
+    assert_eq!(
+        persisted_container_metadata(&bucket).await.get("color").map(String::as_str),
+        Some("blue"),
+        "an ACL-only POST must not wipe X-Container-Meta-*"
+    );
+    let acl = container::get_container_acl(&swift_account, container, &credentials)
+        .await
+        .expect("container ACL should load");
+    assert!(!acl.read.is_empty(), "the ACL that POST set must be stored");
+}
+
 /// A container that does not exist must not get metadata persisted for it:
 /// the metadata loader turns "nothing on disk" into a fresh default, so an
 /// unguarded rewrite would create an orphan metadata file and cache a
@@ -265,6 +405,16 @@ async fn versioning_writes_reject_missing_containers() {
     let err = container::disable_versioning(&swift_account, missing, &credentials)
         .await
         .expect_err("disabling versioning on a missing container must fail");
+    assert!(
+        matches!(err, SwiftError::NotFound(_)),
+        "expected NotFound for a missing container, got {err:?}"
+    );
+
+    // Naming no item skips the persisted write, but must not skip the
+    // existence check that turns a POST to a missing container into a 404.
+    let err = update_container_metadata(&swift_account, missing, &credentials, MetadataUpdate::default())
+        .await
+        .expect_err("a metadata POST to a missing container must fail");
     assert!(
         matches!(err, SwiftError::NotFound(_)),
         "expected NotFound for a missing container, got {err:?}"
@@ -291,8 +441,7 @@ async fn account_metadata_write_rejects_foreign_and_anonymous_callers() {
     let victim_account = "AUTH_victimproject";
     let attacker_credentials = keystone_credentials("attackerproject");
 
-    let mut poisoned = HashMap::new();
-    poisoned.insert("temp-url-key".to_string(), "attacker-key".to_string());
+    let poisoned = MetadataUpdate::default().set("temp-url-key", "attacker-key");
 
     let err = account::update_account_metadata(victim_account, &poisoned, &Some(attacker_credentials))
         .await

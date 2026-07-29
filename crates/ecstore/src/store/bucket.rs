@@ -87,7 +87,7 @@ fn bucket_deleted_marker_volume(bucket: &str) -> String {
     format!("{RUSTFS_META_BUCKET}/{}", bucket_deleted_marker_prefix(bucket))
 }
 
-async fn await_bucket_namespace_operation<T, F>(
+pub(crate) async fn await_bucket_namespace_operation<T, F>(
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
     bucket: &str,
     operation: &'static str,

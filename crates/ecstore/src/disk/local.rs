@@ -7908,6 +7908,23 @@ impl DiskAPI for LocalDisk {
         }
     }
 
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        let key = SnapshotLeaseKey {
+            volume: volume.to_string(),
+            path: path.to_string(),
+        };
+        let mut registry = self.snapshot_leases.lock().await;
+        let Some(entry) = registry.entries.get_mut(&key) else {
+            return Err(DiskError::FileNotFound);
+        };
+        if entry.deleting || !entry.tokens.remove(&token) {
+            return Err(DiskError::FileNotFound);
+        }
+        let renewed = SnapshotLeaseToken::new();
+        entry.tokens.insert(renewed);
+        Ok(renewed)
+    }
+
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
@@ -14957,6 +14974,13 @@ mod test {
             .acquire_snapshot_lease(volume, &data_dir)
             .await
             .expect("second lease should be acquired");
+        let renewed = disk
+            .renew_snapshot_lease(volume, &data_dir, first)
+            .await
+            .expect("first lease should renew atomically");
+        disk.release_snapshot_lease(volume, &data_dir, first)
+            .await
+            .expect("the superseded token should be idempotent");
         let status = disk
             .delete_data_dir(
                 volume,
@@ -14976,9 +15000,9 @@ mod test {
             Bytes::from_static(b"later")
         );
 
-        disk.release_snapshot_lease(volume, &data_dir, first)
+        disk.release_snapshot_lease(volume, &data_dir, renewed)
             .await
-            .expect("first lease release should succeed");
+            .expect("renewed lease release should succeed");
         assert!(
             disk.read_all(volume, &first_part).await.is_ok(),
             "one remaining lease must keep the data directory"

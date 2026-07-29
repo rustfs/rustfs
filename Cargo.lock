@@ -9460,6 +9460,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "temp-env",
  "tempfile",
  "thiserror 2.0.19",
@@ -11829,6 +11830,7 @@ dependencies = [
  "futures-util",
  "libc",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
