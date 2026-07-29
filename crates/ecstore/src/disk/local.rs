@@ -4555,9 +4555,11 @@ impl LocalDisk {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
-        rename_all(&tmp_path, &tmp_old_path, root).await.inspect_err(|err| {
-            log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
-        })?;
+        rename_all_ignore_missing_source(&tmp_path, &tmp_old_path, root)
+            .await
+            .inspect_err(|err| {
+                log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
+            })?;
 
         let tmp_deleted_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET);
         tokio::fs::create_dir_all(&tmp_deleted_path).await.inspect_err(|err| {
@@ -13063,6 +13065,19 @@ mod test {
         assert!(format_info.data.is_empty(), "cached format bytes should be cleared");
         assert!(format_info.file_info.is_none(), "cached file metadata should be cleared");
         assert!(format_info.last_check.is_none(), "cached format timestamp should be cleared");
+    }
+
+    #[tokio::test]
+    async fn cleanup_tmp_on_startup_allows_missing_tmp_directory() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+
+        LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
+            .await
+            .expect("missing temporary directory should already be clean");
+
+        assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
     }
 
     #[tokio::test]
