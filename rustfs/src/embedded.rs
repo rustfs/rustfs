@@ -60,6 +60,94 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "e2e-test-hooks")]
+use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "e2e-test-hooks")]
+use tokio::sync::oneshot;
+
+#[cfg(feature = "e2e-test-hooks")]
+struct EmbeddedStartupHook {
+    port: u16,
+    http_bound: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+static EMBEDDED_STARTUP_HOOK: OnceLock<Mutex<Option<EmbeddedStartupHook>>> = OnceLock::new();
+
+/// Test-only gate for the point after an embedded HTTP listener binds and
+/// before its application context is installed.
+#[cfg(feature = "e2e-test-hooks")]
+#[doc(hidden)]
+pub struct EmbeddedStartupBarrier {
+    http_bound: oneshot::Receiver<()>,
+    release: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+impl EmbeddedStartupBarrier {
+    /// Wait until the next embedded server has bound its HTTP listener.
+    pub async fn wait_until_http_bound(&mut self) {
+        (&mut self.http_bound)
+            .await
+            .expect("embedded startup hook must signal after binding HTTP");
+    }
+
+    /// Allow the paused embedded startup to install its application context.
+    pub fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+impl Drop for EmbeddedStartupBarrier {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+/// Pause the embedded startup for `port` after its HTTP listener binds.
+#[cfg(feature = "e2e-test-hooks")]
+#[doc(hidden)]
+pub fn pause_embedded_startup_after_http_bind(port: u16) -> EmbeddedStartupBarrier {
+    let (http_bound_tx, http_bound) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let hook = EmbeddedStartupHook {
+        port,
+        http_bound: http_bound_tx,
+        release: release_rx,
+    };
+    let mut active_hook = EMBEDDED_STARTUP_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("embedded startup hook lock must not be poisoned");
+    assert!(active_hook.replace(hook).is_none(), "only one embedded startup hook may be active");
+
+    EmbeddedStartupBarrier {
+        http_bound,
+        release: Some(release),
+    }
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) async fn wait_for_embedded_startup_hook(port: u16) {
+    let hook = {
+        let mut active_hook = EMBEDDED_STARTUP_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("embedded startup hook lock must not be poisoned");
+        active_hook.take_if(|hook| hook.port == port)
+    };
+    if let Some(hook) = hook {
+        let _ = hook.http_bound.send(());
+        let _ = hook.release.await;
+    }
+}
+
 /// Error type for embedded server operations.
 #[derive(Debug)]
 pub enum ServerError {
