@@ -507,16 +507,29 @@ pub struct ReplicationStats {
 
 impl ReplicationStats {
     pub fn is_empty(&self) -> bool {
-        self.pending_size == 0
-            && self.replicated_size == 0
-            && self.failed_size == 0
-            && self.failed_count == 0
-            && self.pending_count == 0
-            && self.missed_threshold_size == 0
-            && self.after_threshold_size == 0
-            && self.missed_threshold_count == 0
-            && self.after_threshold_count == 0
-            && self.replicated_count == 0
+        let Self {
+            pending_size,
+            replicated_size,
+            failed_size,
+            failed_count,
+            pending_count,
+            missed_threshold_size,
+            after_threshold_size,
+            missed_threshold_count,
+            after_threshold_count,
+            replicated_count,
+        } = self;
+
+        *pending_size == 0
+            && *replicated_size == 0
+            && *failed_size == 0
+            && *failed_count == 0
+            && *pending_count == 0
+            && *missed_threshold_size == 0
+            && *after_threshold_size == 0
+            && *missed_threshold_count == 0
+            && *after_threshold_count == 0
+            && *replicated_count == 0
     }
 
     #[deprecated(note = "use is_empty instead")]
@@ -535,7 +548,13 @@ pub struct ReplicationAllStats {
 
 impl ReplicationAllStats {
     pub fn is_empty(&self) -> bool {
-        self.replica_size == 0 && self.replica_count == 0 && self.targets.values().all(ReplicationStats::is_empty)
+        let Self {
+            replica_size,
+            replica_count,
+            targets,
+        } = self;
+
+        *replica_size == 0 && *replica_count == 0 && targets.values().all(ReplicationStats::is_empty)
     }
 
     #[deprecated(note = "use is_empty instead")]
@@ -1594,7 +1613,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn replication_stats_empty_checks_every_field() {
         type SetField = fn(&mut ReplicationStats);
 
@@ -1611,16 +1629,15 @@ mod tests {
             ("replicated_count", |stats| stats.replicated_count = 1),
         ];
 
-        assert!(ReplicationStats::default().empty());
+        assert!(ReplicationStats::default().is_empty());
         for (field, set_nonzero) in cases {
             let mut stats = ReplicationStats::default();
             set_nonzero(&mut stats);
-            assert!(!stats.empty(), "{field} must make replication stats non-empty");
+            assert!(!stats.is_empty(), "{field} must make replication stats non-empty");
         }
     }
 
     #[test]
-    #[allow(deprecated)]
     fn replication_all_stats_empty_checks_aggregate_fields_independently() {
         let cases = [
             (
@@ -1639,16 +1656,16 @@ mod tests {
             ),
         ];
 
-        assert!(ReplicationAllStats::default().empty());
+        assert!(ReplicationAllStats::default().is_empty());
         for (field, stats) in cases {
-            assert!(!stats.empty(), "{field} must make aggregate replication stats non-empty");
+            assert!(!stats.is_empty(), "{field} must make aggregate replication stats non-empty");
         }
 
         let empty_targets = ReplicationAllStats {
             targets: HashMap::from([("arn:test:empty".to_string(), ReplicationStats::default())]),
             ..Default::default()
         };
-        assert!(empty_targets.empty(), "all-empty targets must keep aggregate stats empty");
+        assert!(empty_targets.is_empty(), "all-empty targets must keep aggregate stats empty");
 
         let stats = ReplicationAllStats {
             targets: HashMap::from([
@@ -1663,7 +1680,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert!(!stats.empty(), "a non-empty target must make aggregate replication stats non-empty");
+        assert!(!stats.is_empty(), "a non-empty target must make aggregate replication stats non-empty");
     }
 
     #[test]
