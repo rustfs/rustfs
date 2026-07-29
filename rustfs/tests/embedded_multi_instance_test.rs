@@ -361,12 +361,14 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
         }
     };
     let endpoint_b = format!("http://127.0.0.1:{port_b}");
+    let b_access_key = "startup-window-access-b";
+    let b_secret_key = "startup-window-secret-b";
     let mut barrier = pause_embedded_startup_after_http_bind(port_b);
     let startup_b = tokio::spawn(async move {
         RustFSServerBuilder::new()
             .address(format!("127.0.0.1:{port_b}"))
-            .access_key("startup-window-access-b")
-            .secret_key("startup-window-secret-b")
+            .access_key(b_access_key)
+            .secret_key(b_secret_key)
             .build()
             .await
     });
@@ -380,7 +382,7 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
         .build()
         .expect("build local admin client without proxy");
     let inspect_path = "/rustfs/admin/v3/inspect-data?file=marker.txt&volume=startup-window";
-    let before_install = signed_admin_request(&http, &endpoint_b, inspect_path, server_a.access_key(), server_a.secret_key())
+    let before_install = signed_admin_request(&http, &endpoint_b, inspect_path, b_access_key, b_secret_key)
         .send()
         .await
         .expect("server B HTTP listener must accept the paused request");
@@ -414,11 +416,10 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
         .await
         .expect("server B writes its marker");
 
-    let after_install =
-        signed_admin_request(&http, &server_b.endpoint(), inspect_path, server_a.access_key(), server_a.secret_key())
-            .send()
-            .await
-            .expect("server B admin request after context installation");
+    let after_install = signed_admin_request(&http, &server_b.endpoint(), inspect_path, b_access_key, b_secret_key)
+        .send()
+        .await
+        .expect("server B admin request after context installation");
     assert_eq!(after_install.status(), StatusCode::OK);
     assert_eq!(after_install.bytes().await.expect("read server B marker"), b"from B".as_slice());
 
