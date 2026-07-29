@@ -9212,6 +9212,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-core",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",

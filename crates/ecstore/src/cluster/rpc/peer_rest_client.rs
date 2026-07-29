@@ -2741,6 +2741,11 @@ mod tests {
                 .with_span_list(true),
         );
         let _guard = tracing::subscriber::set_default(subscriber);
+        // The `recovery-monitor` callsite is shared with the production
+        // `mark_offline_and_spawn_recovery` path that sibling tests exercise from
+        // subscriber-less threads; without this the span can be cached as
+        // `Interest::never()` and silently degrade to `Span::none()`.
+        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
 
         let client = test_peer_client();
         let span = tracing::info_span!("request-span", request_id = "req-peer-rest");
