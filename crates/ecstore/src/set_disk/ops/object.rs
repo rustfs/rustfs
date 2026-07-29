@@ -7308,6 +7308,9 @@ mod transition_source_identity_matrix_tests {
                     changed.metadata.insert("etag".to_string(), format!("changed-{index}"));
                 }
             }
+            // Replace the object version list so VersionId drift removes the
+            // accepted source version instead of appending a second version.
+            changed.fresh = true;
             for disk in &disk_stores {
                 disk.write_metadata("", bucket, &object, changed.clone())
                     .await

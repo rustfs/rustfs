@@ -80,7 +80,7 @@ pub(crate) fn current_persisted_module_switches() -> PersistedModuleSwitches {
     }
 }
 
-fn persisted_module_switches_configured() -> bool {
+pub(crate) fn persisted_module_switches_configured() -> bool {
     PERSISTED_MODULE_SWITCH_CONFIGURED.load(Ordering::Relaxed)
 }
 
