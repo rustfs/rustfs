@@ -14,7 +14,7 @@
 
 use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
-use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use hashbrown::HashMap;
 use http::StatusCode;
@@ -73,6 +73,13 @@ where
     }
 }
 
+/// Builds S3-compatible notification response elements with the canonical request ID.
+pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
+    let mut resp_elements = extract_resp_elements(response);
+    resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
+    resp_elements
+}
+
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
 pub enum OperationHelper {
     Disabled,
@@ -86,7 +93,7 @@ pub struct EnabledOperationHelper {
     api_builder: ApiDetailsBuilder,
     event_builder: Option<EventArgsBuilder>,
     start_time: std::time::Instant,
-    request_context: Option<RequestContext>,
+    request_context: RequestContext,
 }
 
 impl OperationHelper {
@@ -157,16 +164,13 @@ impl OperationHelper {
             api_builder = api_builder.object(&object_key);
         }
         // Audit builder
-        // Resolve canonical request context and request_id in a single pass:
-        //   RequestContext.request_id > extract_request_id_from_headers() > generated fallback id
+        // Resolve the canonical request context once for both output chains.
         let request_context = request_context_from_req(req);
         if request_context.is_none() {
             counter!("rustfs_log_chain_orphan_total", "component" => "operation_helper").increment(1);
         }
-        let request_id = request_context
-            .as_ref()
-            .map(|ctx| ctx.request_id.clone())
-            .unwrap_or_else(|| extract_request_id_from_headers(&req.headers));
+        let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
+        let request_id = request_context.request_id.clone();
 
         let audit_builder = if audit_enabled {
             Some(
@@ -189,12 +193,6 @@ impl OperationHelper {
         };
 
         let mut req_params = extract_params_header(&req.headers);
-        // Inject x-amz-request-id from RequestContext into req_params for event correlation
-        if let Some(ref ctx) = request_context {
-            req_params
-                .entry(AMZ_REQUEST_ID.to_string())
-                .or_insert_with(|| ctx.x_amz_request_id.clone());
-        }
         if let Some(principal_id) = req_info
             .and_then(|info| info.cred.as_ref())
             .map(|cred| cred.access_key.clone())
@@ -228,10 +226,7 @@ impl OperationHelper {
             audit_builder,
             api_builder,
             event_builder,
-            start_time: request_context
-                .as_ref()
-                .map(|ctx| ctx.start_time)
-                .unwrap_or_else(std::time::Instant::now),
+            start_time: request_context.start_time,
             request_context,
         }))
     }
@@ -331,14 +326,12 @@ impl OperationHelper {
             }
 
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
-            if let Some(ref ctx) = state.request_context
-                && (ctx.trace_id.is_some() || ctx.span_id.is_some())
-            {
+            if state.request_context.trace_id.is_some() || state.request_context.span_id.is_some() {
                 let mut tags = HashMap::new();
-                if let Some(ref tid) = ctx.trace_id {
+                if let Some(ref tid) = state.request_context.trace_id {
                     tags.insert("traceId".to_string(), Value::String(tid.clone()));
                 }
-                if let Some(ref sid) = ctx.span_id {
+                if let Some(ref sid) = state.request_context.span_id {
                     tags.insert("spanId".to_string(), Value::String(sid.clone()));
                 }
                 final_builder = final_builder.tags(tags);
@@ -352,7 +345,7 @@ impl OperationHelper {
         if state.notify_enabled
             && let (Some(builder), Ok(res)) = (state.event_builder.take(), result)
         {
-            state.event_builder = Some(builder.resp_elements(extract_resp_elements(res)));
+            state.event_builder = Some(builder.resp_elements(build_event_resp_elements(res, &state.request_context.request_id)));
         }
 
         self
@@ -364,6 +357,17 @@ impl OperationHelper {
             state.event_builder = None;
         }
         self
+    }
+
+    /// Returns the operation's canonical context, reading the ingress extension
+    /// when the disabled fast path holds no request state.
+    pub(crate) fn request_context_or_from_request<T>(&self, req: &S3Request<T>) -> RequestContext {
+        match self {
+            Self::Enabled(state) => state.request_context.clone(),
+            Self::Disabled => {
+                request_context_from_req(req).unwrap_or_else(|| RequestContext::from_external_headers(&req.headers))
+            }
+        }
     }
 }
 
@@ -381,7 +385,7 @@ impl Drop for OperationHelper {
         if state.audit_enabled
             && let Some(builder) = state.audit_builder.take()
         {
-            let ctx = state.request_context.clone();
+            let ctx = Some(state.request_context.clone());
             spawn_background_with_context(ctx, async move {
                 AuditLogger::log(builder.build()).await;
             });
@@ -395,7 +399,7 @@ impl Drop for OperationHelper {
             let event_args = builder.build();
             // Avoid generating notifications for copy requests
             if !event_args.is_replication_request() {
-                let ctx = state.request_context.clone();
+                let ctx = Some(state.request_context.clone());
                 spawn_background_with_context(ctx, async move {
                     runtime_sources::current_notify_interface().notify(event_args).await;
                 });
@@ -416,8 +420,9 @@ mod tests {
     use rustfs_credentials::Credentials;
     use rustfs_s3_ops::S3Operation;
     use rustfs_s3_types::EventName;
-    use s3s::S3Request;
-    use s3s::dto::DeleteObjectTaggingInput;
+    use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
+    use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput};
+    use s3s::{S3Request, S3Response};
     use std::sync::{Arc, Mutex};
     use temp_env::with_vars;
 
@@ -554,11 +559,14 @@ mod tests {
                 let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
                 req.headers.insert("host", HeaderValue::from_static("example.com"));
                 req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+                req.headers
+                    .insert(REQUEST_ID_HEADER, HeaderValue::from_static("ingress-canonical-uuid"));
+                req.headers
+                    .insert("x-amz-request-id", HeaderValue::from_static("client-supplied-request-id"));
 
-                // Insert RequestContext (set by ingress layer) with a specific request_id
                 req.extensions.insert(RequestContext {
                     request_id: "ingress-canonical-uuid".to_string(),
-                    x_amz_request_id: "ingress-canonical-uuid".to_string(),
+                    x_amz_request_id: "client-supplied-request-id".to_string(),
                     trace_id: None,
                     span_id: None,
                     start_time: std::time::Instant::now(),
@@ -570,20 +578,32 @@ mod tests {
                     ..Default::default()
                 });
 
-                let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let mut helper =
+                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
 
                 // Verify the helper stored the RequestContext
-                let OperationHelper::Enabled(state) = &helper else {
+                let OperationHelper::Enabled(state) = &mut helper else {
                     panic!("helper should be enabled when notify/audit switches are on");
                 };
-                assert!(state.request_context.is_some());
-                assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
+                assert_eq!(state.request_context.request_id, "ingress-canonical-uuid");
+                let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
+                assert_eq!(audit_entry.request_id.as_deref(), Some("ingress-canonical-uuid"));
+                let event_args = state.event_builder.clone().expect("event builder should exist").build();
+                assert_eq!(
+                    event_args.req_params.get(AMZ_REQUEST_ID).map(String::as_str),
+                    Some("client-supplied-request-id")
+                );
+                assert_eq!(
+                    event_args.resp_elements.get(AMZ_REQUEST_ID).map(String::as_str),
+                    Some("ingress-canonical-uuid")
+                );
             },
         );
     }
 
     #[test]
-    fn operation_helper_no_request_context_when_absent() {
+    fn operation_helper_reuses_generated_context_when_headers_absent() {
         with_vars(
             [
                 (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
@@ -601,8 +621,6 @@ mod tests {
                 let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
                 req.headers.insert("host", HeaderValue::from_static("example.com"));
                 req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
-                req.headers
-                    .insert("x-amz-request-id", HeaderValue::from_static("amz-header-uuid"));
 
                 // No RequestContext inserted
                 req.extensions.insert(ReqInfo {
@@ -612,12 +630,21 @@ mod tests {
                 });
 
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
-
-                // Verify the helper has no RequestContext
+                let request_context = helper.request_context_or_from_request(&req);
+                let request_id = request_context.request_id;
+                assert!(uuid::Uuid::parse_str(&request_id).is_ok());
+                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let helper = helper.complete(&result);
                 let OperationHelper::Enabled(state) = &helper else {
                     panic!("helper should be enabled when notify/audit switches are on");
                 };
-                assert!(state.request_context.is_none());
+                assert_eq!(state.request_context.request_id, request_id);
+                let event_args = state.event_builder.clone().expect("event builder should exist").build();
+                assert!(!event_args.req_params.contains_key(AMZ_REQUEST_ID));
+                assert_eq!(
+                    event_args.resp_elements.get(AMZ_REQUEST_ID).map(String::as_str),
+                    Some(request_id.as_str())
+                );
             },
         );
     }
@@ -638,10 +665,20 @@ mod tests {
                     .key("test-key".to_string())
                     .build()
                     .unwrap();
-                let req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
+                let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
+                req.headers
+                    .insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-request-id"));
+                req.extensions.insert(RequestContext {
+                    request_id: "server-request-id".to_string(),
+                    x_amz_request_id: "server-request-id".to_string(),
+                    trace_id: None,
+                    span_id: None,
+                    start_time: std::time::Instant::now(),
+                });
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
-                assert!(matches!(helper, OperationHelper::Disabled));
+                assert!(matches!(&helper, OperationHelper::Disabled));
+                assert_eq!(helper.request_context_or_from_request(&req).request_id, "server-request-id");
             },
         );
     }

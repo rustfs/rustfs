@@ -303,6 +303,7 @@ test-case = "3.3.1"
 thiserror = "2.0.19"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
+tracing-core = "0.1.36"
 tracing-error = "0.2.1"
 tracing-opentelemetry = { version = "0.33" }
 tracing-subscriber = { version = "0.3.23" }
@@ -313,7 +314,9 @@ uuid = { version = "1.24.0" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
+winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
+windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.18" }
 zip = "8.6.0"
 zstd = "0.13.3"

@@ -174,7 +174,7 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
-    pub(crate) use super::super::helper::{OperationHelper, spawn_background_with_context};
+    pub(crate) use super::super::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
@@ -203,9 +203,7 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{
-        RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
-    };
+    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 }
 
 pub(crate) mod rpc_consumer {
@@ -472,7 +470,7 @@ pub(crate) mod ecstore_metrics {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -497,8 +495,9 @@ pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature,
+        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -845,7 +844,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
     };
 
     for bucket in buckets {
-        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await?;
+        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
         let status = pool.get_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
@@ -978,6 +977,10 @@ pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
 pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_notification::new_global_notification_sys(endpoint_pools).await
+}
+
+pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
+    ecstore_notification::start_remote_version_state_fleet_probe(topology_fingerprint);
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
@@ -1459,8 +1462,8 @@ pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> R
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
 }
 
-pub(crate) async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
-    ecstore_bucket::metadata_sys::reload_bucket_metadata(bucket).await
+pub(crate) async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<()> {
+    ecstore_bucket::metadata_sys::reload_bucket_metadata(api, bucket).await
 }
 
 pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
@@ -1477,8 +1480,8 @@ pub(crate) async fn update_bucket_metadata_config(
     Ok(updated_at)
 }
 
-pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
-    ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await
+pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {
@@ -1620,8 +1623,21 @@ pub(crate) fn sign_ns_scanner_capability(challenge: uuid::Uuid, server_epoch: uu
     ecstore_rpc::sign_ns_scanner_capability(challenge, server_epoch)
 }
 
-pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {
-    ecstore_rpc::verify_tonic_rpc_signature(audience, path, headers)
+pub(crate) fn verify_tonic_rpc_signature_with_bootstrap(
+    audience: &str,
+    path: &str,
+    headers: &http::HeaderMap,
+    allow_replay_scope_bootstrap: bool,
+) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(audience, path, headers, allow_replay_scope_bootstrap)
+}
+
+pub(crate) fn tonic_boot_epoch_challenge(headers: &http::HeaderMap) -> std::io::Result<Option<uuid::Uuid>> {
+    ecstore_rpc::tonic_boot_epoch_challenge(headers)
+}
+
+pub(crate) fn tonic_boot_epoch_response_headers(audience: &str, challenge: uuid::Uuid) -> std::io::Result<http::HeaderMap> {
+    ecstore_rpc::tonic_boot_epoch_response_headers(audience, challenge)
 }
 
 pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {

@@ -28,6 +28,13 @@ pub(crate) fn hybrid<MakeRest, Grpc>(make_rest: MakeRest, grpc: Grpc) -> HybridS
     HybridService { rest: make_rest, grpc }
 }
 
+pub(crate) fn is_grpc_request<B>(req: &Request<B>) -> bool {
+    matches!(
+        (req.version(), req.headers().get(hyper::header::CONTENT_TYPE)),
+        (hyper::Version::HTTP_2, Some(value)) if value.as_bytes().starts_with(b"application/grpc")
+    )
+}
+
 /// The service that can serve both gRPC and REST HTTP Requests
 #[derive(Clone)]
 pub struct HybridService<Rest, Grpc> {
@@ -63,14 +70,14 @@ where
     /// and if the Content-Type is "application/grpc"; otherwise, the request is served
     /// as a REST request
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        match (req.version(), req.headers().get(hyper::header::CONTENT_TYPE)) {
-            (hyper::Version::HTTP_2, Some(hv)) if hv.as_bytes().starts_with(b"application/grpc") => HybridFuture::Grpc {
+        if is_grpc_request(&req) {
+            HybridFuture::Grpc {
                 grpc_future: self.grpc.call(req),
-            },
-
-            _ => HybridFuture::Rest {
+            }
+        } else {
+            HybridFuture::Rest {
                 rest_future: self.rest.call(req),
-            },
+            }
         }
     }
 }

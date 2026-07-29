@@ -104,7 +104,7 @@ use crate::{
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
+        SnapshotLeaseToken, UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
@@ -116,6 +116,7 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
+use futures::task::AtomicWaker;
 use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
@@ -162,11 +163,12 @@ use rustfs_utils::{
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
@@ -361,6 +363,254 @@ struct SetDiskLockGuardedReader {
     guard: Option<ObjectLockDiagGuard>,
 }
 
+#[derive(Clone)]
+struct SnapshotLease {
+    disk: DiskStore,
+    token: SnapshotLeaseToken,
+}
+
+struct SnapshotLeaseState {
+    volume: Arc<str>,
+    path: Arc<str>,
+    leases: parking_lot::Mutex<Vec<SnapshotLease>>,
+    renewal_failed: AtomicBool,
+    renewal_waker: AtomicWaker,
+    cancel: CancellationToken,
+    runtime: tokio::runtime::Handle,
+}
+
+impl SnapshotLeaseState {
+    fn apply_renewal_results(&self, results: Vec<std::result::Result<SnapshotLeaseToken, DiskError>>) -> bool {
+        let mut leases = self.leases.lock();
+        let mut failed = false;
+        for (lease, result) in leases.iter_mut().zip(results) {
+            match result {
+                Ok(token) => lease.token = token,
+                Err(_) => failed = true,
+            }
+        }
+        drop(leases);
+        if failed {
+            self.renewal_failed.store(true, Ordering::Release);
+            self.renewal_waker.wake();
+        }
+        failed
+    }
+}
+
+impl Drop for SnapshotLeaseState {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let leases = mem::take(&mut *self.leases.lock());
+        if leases.is_empty() {
+            return;
+        }
+        let volume = Arc::clone(&self.volume);
+        let path = Arc::clone(&self.path);
+        self.runtime.spawn(async move {
+            join_all(leases.into_iter().map(|lease| {
+                let volume = Arc::clone(&volume);
+                let path = Arc::clone(&path);
+                async move { lease.disk.release_snapshot_lease(&volume, &path, lease.token).await }
+            }))
+            .await;
+        });
+    }
+}
+
+#[derive(Clone)]
+struct SnapshotLeaseHandle(Arc<SnapshotLeaseState>);
+
+impl SnapshotLeaseHandle {
+    fn new(volume: Arc<str>, path: Arc<str>, leases: Vec<SnapshotLease>) -> Self {
+        let state = Arc::new(SnapshotLeaseState {
+            volume,
+            path,
+            leases: parking_lot::Mutex::new(leases),
+            renewal_failed: AtomicBool::new(false),
+            renewal_waker: AtomicWaker::new(),
+            cancel: CancellationToken::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let weak = Arc::downgrade(&state);
+        let cancel = state.cancel.clone();
+        tokio::spawn(async move {
+            let renew_interval = crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL / 3;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(renew_interval) => {}
+                }
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let leases = state.leases.lock().clone();
+                let results = renew_snapshot_leases_with_timeout(
+                    &leases,
+                    Arc::clone(&state.volume),
+                    Arc::clone(&state.path),
+                    renew_interval,
+                    |disk, volume, path, token| async move { disk.renew_snapshot_lease(&volume, &path, token).await },
+                )
+                .await;
+                if state.apply_renewal_results(results) {
+                    return;
+                }
+            }
+        });
+        Self(state)
+    }
+
+    fn renewal_failed(&self) -> bool {
+        self.0.renewal_failed.load(Ordering::Acquire)
+    }
+}
+
+async fn renew_snapshot_leases_with_timeout<F, Fut>(
+    leases: &[SnapshotLease],
+    volume: Arc<str>,
+    path: Arc<str>,
+    renewal_timeout: Duration,
+    renew: F,
+) -> Vec<std::result::Result<SnapshotLeaseToken, DiskError>>
+where
+    F: Fn(DiskStore, Arc<str>, Arc<str>, SnapshotLeaseToken) -> Fut,
+    Fut: Future<Output = std::result::Result<SnapshotLeaseToken, DiskError>>,
+{
+    join_all(leases.iter().map(|lease| {
+        let renew = renew(Arc::clone(&lease.disk), Arc::clone(&volume), Arc::clone(&path), lease.token);
+        async move {
+            match timeout(renewal_timeout, renew).await {
+                Ok(result) => result,
+                Err(_) => Err(DiskError::Timeout),
+            }
+        }
+    }))
+    .await
+}
+
+struct SnapshotLeaseReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    lease: Option<SnapshotLeaseHandle>,
+    terminal_error: bool,
+}
+
+impl AsyncRead for SnapshotLeaseReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.terminal_error {
+            return Poll::Ready(Err(std::io::Error::other("snapshot lease renewal failed")));
+        }
+        let Some(lease) = self.lease.as_ref() else {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        };
+        if lease.renewal_failed() {
+            self.lease.take();
+            self.terminal_error = true;
+            return Poll::Ready(Err(std::io::Error::other("snapshot lease renewal failed")));
+        }
+        lease.0.renewal_waker.register(cx.waker());
+        if lease.renewal_failed() {
+            self.lease.take();
+            self.terminal_error = true;
+            return Poll::Ready(Err(std::io::Error::other("snapshot lease renewal failed")));
+        }
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Err(_)))
+            || matches!(poll, Poll::Ready(Ok(())) if buf.filled().len() == filled_before && buf.remaining() > 0)
+        {
+            self.lease.take();
+        }
+        poll
+    }
+}
+
+async fn acquire_snapshot_leases(
+    disks: &[Option<DiskStore>],
+    volume: &str,
+    path: &str,
+    read_quorum: usize,
+) -> Option<SnapshotLeaseHandle> {
+    acquire_snapshot_leases_with_timeout(
+        disks,
+        volume,
+        path,
+        read_quorum,
+        crate::disk::disk_store::get_drive_metadata_timeout(),
+        |disk, volume, path| async move { disk.acquire_snapshot_lease(&volume, &path).await },
+    )
+    .await
+}
+
+async fn acquire_snapshot_leases_with_timeout<F, Fut>(
+    disks: &[Option<DiskStore>],
+    volume: &str,
+    path: &str,
+    read_quorum: usize,
+    candidate_timeout: Duration,
+    acquire: F,
+) -> Option<SnapshotLeaseHandle>
+where
+    F: Fn(DiskStore, Arc<str>, Arc<str>) -> Fut,
+    Fut: Future<Output = std::result::Result<SnapshotLeaseToken, DiskError>> + Send + 'static,
+{
+    let candidates = disks.iter().cloned().collect::<Option<Vec<_>>>()?;
+    if candidates.len() < read_quorum {
+        return None;
+    }
+    let volume: Arc<str> = Arc::from(volume);
+    let path: Arc<str> = Arc::from(path);
+    let results = join_all(candidates.iter().cloned().map(|disk| {
+        let volume = Arc::clone(&volume);
+        let path = Arc::clone(&path);
+        let acquire_disk = Arc::clone(&disk);
+        let acquire = acquire(acquire_disk, Arc::clone(&volume), Arc::clone(&path));
+        async move {
+            let mut task = tokio::spawn(acquire);
+            match timeout(candidate_timeout, &mut task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => Err(DiskError::Io(std::io::Error::other(format!(
+                    "snapshot lease acquisition task failed: {err}"
+                )))),
+                Err(_) => {
+                    tokio::spawn(async move {
+                        match timeout(crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL, &mut task).await {
+                            Ok(Ok(Ok(token))) => {
+                                let _ = disk.release_snapshot_lease(&volume, &path, token).await;
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                task.abort();
+                                let _ = task.await;
+                            }
+                        }
+                    });
+                    Err(DiskError::Timeout)
+                }
+            }
+        }
+    }))
+    .await;
+    let mut leases = Vec::with_capacity(candidates.len());
+    let mut failed = false;
+    for (disk, result) in candidates.into_iter().zip(results) {
+        match result {
+            Ok(token) => leases.push(SnapshotLease { disk, token }),
+            Err(_) => failed = true,
+        }
+    }
+    if failed || leases.len() < read_quorum {
+        join_all(leases.into_iter().map(|lease| {
+            let volume = Arc::clone(&volume);
+            let path = Arc::clone(&path);
+            async move { lease.disk.release_snapshot_lease(&volume, &path, lease.token).await }
+        }))
+        .await;
+        return None;
+    }
+    Some(SnapshotLeaseHandle::new(volume, path, leases))
+}
+
 impl AsyncRead for SetDiskLockGuardedReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let had_capacity = buf.remaining() > 0;
@@ -376,12 +626,22 @@ impl AsyncRead for SetDiskLockGuardedReader {
 fn finish_set_disk_read_lock(
     mut reader: GetObjectReader,
     read_lock_guard: Option<ObjectLockDiagGuard>,
-    lock_optimization_enabled: bool,
+    snapshot_lease: Option<SnapshotLeaseHandle>,
     bucket: &str,
     object: &str,
 ) -> GetObjectReader {
-    if lock_optimization_enabled || reader.buffered_body.is_some() {
+    if reader.buffered_body.is_some() {
         release_materialized_read_lock(bucket, object, read_lock_guard);
+        return reader;
+    }
+
+    if let Some(lease) = snapshot_lease {
+        release_materialized_read_lock(bucket, object, read_lock_guard);
+        reader.stream = Box::new(SnapshotLeaseReader {
+            inner: reader.stream,
+            lease: Some(lease),
+            terminal_error: false,
+        });
         return reader;
     }
 
@@ -1023,8 +1283,9 @@ pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
 }
 
 /// Check if lock optimization is enabled.
-/// When enabled, fully materialized reads may release the read lock before
-/// returning to the caller. Streaming reads keep the lock until EOF or drop.
+/// Fully materialized reads release the read lock before returning. Streaming
+/// reads may replace it with data-directory snapshot leases when every
+/// candidate disk supports the lease protocol.
 ///
 /// **Note**: Cached via `OnceLock` in production — env var changes require
 /// process restart. In test builds the env var is read directly so that
@@ -4436,6 +4697,7 @@ mod tests {
     use crate::bucket::replication::{replication_statuses_map, version_purge_statuses_map};
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::DataDirDeleteStatus;
     use crate::disk::DiskOption;
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::disk::RUSTFS_META_TMP_BUCKET;
@@ -5474,6 +5736,396 @@ mod tests {
         (dir, disk)
     }
 
+    #[tokio::test]
+    async fn snapshot_lease_acquisition_is_all_or_nothing() {
+        let (_dir1, disk1) = make_single_local_disk().await;
+        let (_dir2, disk2) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-acquire";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        disk1.make_volume(bucket).await.expect("first volume should be created");
+        disk2.make_volume(bucket).await.expect("second volume should be created");
+        disk1
+            .write_all(bucket, &part, Bytes::from_static(b"shard"))
+            .await
+            .expect("first shard should be written");
+
+        let lease = acquire_snapshot_leases(&[Some(disk1.clone()), Some(disk2)], bucket, data_dir, 1).await;
+        assert!(lease.is_none(), "one candidate missing snapshot data must retain the namespace lock");
+        assert_eq!(
+            disk1
+                .delete_data_dir(
+                    bucket,
+                    data_dir,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("released partial lease should not defer cleanup"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_acquisition_rejects_unavailable_candidate() {
+        let (_dir, disk) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-unavailable";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        disk.make_volume(bucket).await.expect("volume should be created");
+        disk.write_all(bucket, &part, Bytes::from_static(b"shard"))
+            .await
+            .expect("shard should be written");
+
+        let lease = acquire_snapshot_leases(&[Some(disk.clone()), None], bucket, data_dir, 1).await;
+        assert!(lease.is_none(), "one unavailable candidate must retain the namespace lock");
+        assert_eq!(
+            disk.delete_data_dir(
+                bucket,
+                data_dir,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unavailable candidate fallback must not leave a lease"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_lease_acquisition_times_out_one_candidate_and_releases_partial_success() {
+        let (_dir1, disk1) = make_single_local_disk().await;
+        let (_dir2, disk2) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-timeout";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        for disk in [&disk1, &disk2] {
+            disk.make_volume(bucket).await.expect("volume should be created");
+            disk.write_all(bucket, &part, Bytes::from_static(b"shard"))
+                .await
+                .expect("shard should be written");
+        }
+        let slow_endpoint = disk2.endpoint();
+        let release_slow_candidate = Arc::new(tokio::sync::Notify::new());
+        let slow_candidate_gate = Arc::clone(&release_slow_candidate);
+
+        let lease = acquire_snapshot_leases_with_timeout(
+            &[Some(disk1.clone()), Some(disk2.clone())],
+            bucket,
+            data_dir,
+            1,
+            Duration::from_millis(10),
+            move |disk, volume, path| {
+                let slow = disk.endpoint() == slow_endpoint;
+                let release_slow_candidate = Arc::clone(&slow_candidate_gate);
+                async move {
+                    if slow {
+                        release_slow_candidate.notified().await;
+                    }
+                    disk.acquire_snapshot_lease(&volume, &path).await
+                }
+            },
+        )
+        .await;
+
+        assert!(lease.is_none(), "a timed-out candidate must retain the namespace lock");
+        assert_eq!(
+            disk1
+                .delete_data_dir(
+                    bucket,
+                    data_dir,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the successful candidate lease must be released"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+        release_slow_candidate.notify_one();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            disk2
+                .delete_data_dir(
+                    bucket,
+                    data_dir,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("a token acquired after the deadline must be released"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_lease_acquisition_aborts_permanently_pending_cleanup_at_ttl() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let (_dir, disk) = make_single_local_disk().await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let acquire_probe = Arc::clone(&dropped);
+        let lease = acquire_snapshot_leases_with_timeout(
+            &[Some(disk)],
+            "snapshot-lease-pending-cleanup",
+            "object/11111111-1111-1111-1111-111111111111",
+            1,
+            Duration::from_millis(10),
+            move |_disk, _volume, _path| {
+                let probe = DropProbe(Arc::clone(&acquire_probe));
+                async move {
+                    let _probe = probe;
+                    futures::future::pending().await
+                }
+            },
+        )
+        .await;
+        assert!(lease.is_none(), "a pending candidate must retain the namespace lock");
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "the late cleanup must initially retain the acquire task"
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL).await;
+        for _ in 0..10 {
+            if dropped.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the TTL fallback must abort and drop a permanently pending acquire task"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_acquisition_fails_closed_for_an_old_peer() {
+        let (_dir1, disk1) = make_single_local_disk().await;
+        let (_dir2, disk2) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-old-peer";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        for disk in [&disk1, &disk2] {
+            disk.make_volume(bucket).await.expect("volume should be created");
+            disk.write_all(bucket, &part, Bytes::from_static(b"shard"))
+                .await
+                .expect("shard should be written");
+        }
+        let old_peer_endpoint = disk2.endpoint();
+
+        let lease = acquire_snapshot_leases_with_timeout(
+            &[Some(disk1.clone()), Some(disk2)],
+            bucket,
+            data_dir,
+            1,
+            Duration::from_secs(1),
+            move |disk, volume, path| {
+                let old_peer = disk.endpoint() == old_peer_endpoint;
+                async move {
+                    if old_peer {
+                        return Err(DiskError::MethodNotAllowed);
+                    }
+                    disk.acquire_snapshot_lease(&volume, &path).await
+                }
+            },
+        )
+        .await;
+
+        assert!(lease.is_none(), "an old peer without the lease RPC must retain the namespace lock");
+        assert_eq!(
+            disk1
+                .delete_data_dir(
+                    bucket,
+                    data_dir,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the compatible peer lease must be released"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_reader_fails_when_renewal_fails() {
+        let state = Arc::new(SnapshotLeaseState {
+            volume: Arc::from("bucket"),
+            path: Arc::from("object/data-dir"),
+            leases: parking_lot::Mutex::new(Vec::new()),
+            renewal_failed: AtomicBool::new(true),
+            renewal_waker: AtomicWaker::new(),
+            cancel: CancellationToken::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let mut reader = SnapshotLeaseReader {
+            inner: Box::new(Cursor::new(Bytes::from_static(b"payload"))),
+            lease: Some(SnapshotLeaseHandle(state)),
+            terminal_error: false,
+        };
+        let mut body = Vec::new();
+        let err = reader
+            .read_to_end(&mut body)
+            .await
+            .expect_err("renewal failure must terminate the body");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(body.is_empty());
+        let mut second = [0; 1];
+        let second_err = reader
+            .read(&mut second)
+            .await
+            .expect_err("renewal failure must remain terminal on later polls");
+        assert_eq!(second_err.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_lease_pending_renewal_hits_deadline_and_terminates_reader() {
+        let (_dir, disk) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-renewal-timeout";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        disk.make_volume(bucket).await.expect("volume should be created");
+        disk.write_all(bucket, &part, Bytes::from_static(b"shard"))
+            .await
+            .expect("shard should be written");
+        let token = disk
+            .acquire_snapshot_lease(bucket, data_dir)
+            .await
+            .expect("candidate lease should be acquired");
+        let state = Arc::new(SnapshotLeaseState {
+            volume: Arc::from(bucket),
+            path: Arc::from(data_dir),
+            leases: parking_lot::Mutex::new(vec![SnapshotLease { disk, token }]),
+            renewal_failed: AtomicBool::new(false),
+            renewal_waker: AtomicWaker::new(),
+            cancel: CancellationToken::new(),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let (pending_reader, _pending_writer) = tokio::io::duplex(1);
+        let reader_state = Arc::clone(&state);
+        let read = tokio::spawn(async move {
+            let mut reader = SnapshotLeaseReader {
+                inner: Box::new(pending_reader),
+                lease: Some(SnapshotLeaseHandle(reader_state)),
+                terminal_error: false,
+            };
+            let mut byte = [0; 1];
+            let first = reader.read(&mut byte).await;
+            let second = reader.read(&mut byte).await;
+            (first, second)
+        });
+        tokio::task::yield_now().await;
+        assert!(!read.is_finished(), "the body must be pending before the renewal deadline");
+
+        let leases = state.leases.lock().clone();
+        let results = renew_snapshot_leases_with_timeout(
+            &leases,
+            Arc::clone(&state.volume),
+            Arc::clone(&state.path),
+            crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL / 3,
+            |_disk, _volume, _path, _token| futures::future::pending(),
+        )
+        .await;
+        assert!(
+            state.apply_renewal_results(results),
+            "a pending renewal must fail at the bounded deadline"
+        );
+
+        let (first, second) = read.await.expect("the renewal wake must resume the body task");
+        let first = first.expect_err("the deadline must terminate the reader before it emits data");
+        let second = second.expect_err("the deadline failure must remain terminal");
+        assert_eq!(first.kind(), std::io::ErrorKind::Other);
+        assert_eq!(second.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_lease_renewal_partial_failure_releases_renewed_tokens() {
+        let (_dir1, disk1) = make_single_local_disk().await;
+        let (_dir2, disk2) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-renewal";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        for disk in [&disk1, &disk2] {
+            disk.make_volume(bucket).await.expect("volume should be created");
+            disk.write_all(bucket, &part, Bytes::from_static(b"shard"))
+                .await
+                .expect("shard should be written");
+        }
+        let first = disk1
+            .acquire_snapshot_lease(bucket, data_dir)
+            .await
+            .expect("first candidate lease should be acquired");
+        let second = disk2
+            .acquire_snapshot_lease(bucket, data_dir)
+            .await
+            .expect("second candidate lease should be acquired");
+        let lease = SnapshotLeaseHandle::new(
+            Arc::from(bucket),
+            Arc::from(data_dir),
+            vec![
+                SnapshotLease {
+                    disk: disk1.clone(),
+                    token: first,
+                },
+                SnapshotLease {
+                    disk: disk2.clone(),
+                    token: second,
+                },
+            ],
+        );
+        disk2
+            .release_snapshot_lease(bucket, data_dir, second)
+            .await
+            .expect("removing one token should force a real renewal failure");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL / 3).await;
+        for _ in 0..10 {
+            if lease.renewal_failed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(lease.renewal_failed(), "one failed renewal must terminate the lease set");
+
+        drop(lease);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            disk1
+                .delete_data_dir(
+                    bucket,
+                    data_dir,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the successfully renewed token must be released"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
     async fn make_set_disks_with(disks: Vec<Option<DiskStore>>) -> Arc<SetDisks> {
         let drive_count = disks.len();
         let endpoints = (0..drive_count)
@@ -5751,6 +6403,62 @@ mod tests {
         assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
     }
 
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_recovers_deferred_cleanup_after_restart() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        let orphan_path = format!("obj/{orphan}");
+        disk.write_all("bucket", &format!("{orphan_path}/part.1"), Bytes::from_static(b"stale"))
+            .await
+            .expect("orphan part should be written");
+
+        let _token = disk
+            .acquire_snapshot_lease("bucket", &orphan_path)
+            .await
+            .expect("snapshot lease should be acquired");
+        assert_eq!(
+            disk.delete_data_dir(
+                "bucket",
+                &orphan_path,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("cleanup should be deferred"),
+            DataDirDeleteStatus::Deferred
+        );
+        drop(disk);
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let restarted = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should restart");
+        let set = make_set_disks_with(vec![Some(restarted)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("restart reclaim should succeed");
+
+        assert_eq!(removed, 1, "the deferred orphan should be reclaimed after restart");
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(!object_dir.join(orphan.to_string()).exists(), "deferred orphan must be removed");
+    }
+
     // Nothing to reclaim when every physical data dir is still referenced.
     #[tokio::test]
     async fn reclaim_orphan_data_dirs_keeps_referenced_dir() {
@@ -5789,6 +6497,16 @@ mod tests {
         fs::write(object_dir.join(stray.to_string()).join("part.1"), b"data")
             .await
             .expect("part should be written");
+        fs::write(
+            object_dir.join(stray.to_string()).join(format!(
+                "{}{}",
+                crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+                Uuid::new_v4()
+            )),
+            [],
+        )
+        .await
+        .expect("pre-commit delete reservation should be written");
 
         let set = make_set_disks_with(vec![Some(disk)]).await;
         let removed = set
@@ -5801,6 +6519,36 @@ mod tests {
             object_dir.join(stray.to_string()).exists(),
             "degraded object's data dir must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_recovers_committed_delete_marker_without_meta() {
+        let (dir, disk) = make_single_local_disk().await;
+        let stale = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket").join("obj");
+        let stale_dir = object_dir.join(stale.to_string());
+        fs::create_dir_all(&stale_dir)
+            .await
+            .expect("committed stale data dir should be created");
+        fs::write(stale_dir.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            stale_dir.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("upgrade reclaim should succeed");
+
+        assert_eq!(removed, 1, "the committed delete residue should be reclaimed");
+        assert!(!stale_dir.exists(), "the committed stale data dir should be removed");
     }
 
     // Cross-replica union: a data dir referenced by ANOTHER disk's xl.meta must be
@@ -9048,6 +9796,185 @@ mod tests {
             is_err_object_not_found(&err),
             "deleted object read must fail closed with object-not-found, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn streaming_get_snapshot_survives_concurrent_overwrite() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "snapshot-streaming-overwrite";
+            let object = "object";
+            let old_body = vec![0x41; 2 * 1024 * 1024];
+            let new_body = vec![0x42; old_body.len()];
+            let opts = ObjectOptions::default();
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut old_reader = PutObjReader::from_vec(old_body.clone());
+            set_disks
+                .put_object(bucket, object, &mut old_reader, &opts)
+                .await
+                .expect("old object should be written");
+
+            let mut snapshot = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("snapshot reader should open");
+            let overwrite_set = Arc::clone(&set_disks);
+            let overwrite_body = new_body.clone();
+            let overwrite_opts = opts.clone();
+            let overwrite = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(overwrite_body);
+                overwrite_set.put_object(bucket, object, &mut reader, &overwrite_opts).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), overwrite)
+                .await
+                .expect("overwrite should not wait for the response body")
+                .expect("overwrite task should join")
+                .expect("overwrite should succeed");
+
+            let mut restored = Vec::new();
+            snapshot
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("leased snapshot should remain readable");
+            assert_eq!(restored, old_body);
+
+            let mut latest = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("latest reader should open");
+            let mut latest_body = Vec::new();
+            latest
+                .stream
+                .read_to_end(&mut latest_body)
+                .await
+                .expect("latest object should remain readable");
+            assert_eq!(latest_body, new_body);
+
+            let cancelled = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("cancelled reader should open");
+            drop(cancelled);
+            let mut replacement = PutObjReader::from_vec(vec![0x43; 2 * 1024 * 1024]);
+            tokio::time::timeout(Duration::from_secs(5), set_disks.put_object(bucket, object, &mut replacement, &opts))
+                .await
+                .expect("reader drop must release its snapshot")
+                .expect("replacement after cancellation should succeed");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn streaming_get_snapshot_survives_concurrent_delete() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "snapshot-streaming-delete";
+            let object = "object";
+            let body = vec![0x41; 2 * 1024 * 1024];
+            let opts = ObjectOptions::default();
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = PutObjReader::from_vec(body.clone());
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("object should be written");
+
+            let mut snapshot = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("snapshot reader should open");
+            let delete_set = Arc::clone(&set_disks);
+            let delete_opts = opts.clone();
+            let delete = tokio::spawn(async move { delete_set.delete_object(bucket, object, delete_opts).await });
+            tokio::time::timeout(Duration::from_secs(30), delete)
+                .await
+                .expect("delete should not wait for the response body")
+                .expect("delete task should join")
+                .expect("delete should succeed");
+
+            let mut restored = Vec::new();
+            snapshot
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("leased snapshot should remain readable after delete");
+            assert_eq!(restored, body);
+            let err = match set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+            {
+                Ok(_) => panic!("a new read must not observe the deleted object"),
+                Err(err) => err,
+            };
+            assert!(is_err_object_not_found(&err));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn streaming_get_snapshot_survives_concurrent_delete_objects() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "snapshot-streaming-delete-objects";
+            let object = "object";
+            let body = vec![0x41; 2 * 1024 * 1024];
+            let opts = ObjectOptions::default();
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = PutObjReader::from_vec(body.clone());
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("object should be written");
+
+            let mut snapshot = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("snapshot reader should open");
+            let delete_set = Arc::clone(&set_disks);
+            let delete_opts = opts.clone();
+            let delete = tokio::spawn(async move {
+                delete_set
+                    .delete_objects(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: object.to_string(),
+                            ..Default::default()
+                        }],
+                        delete_opts,
+                    )
+                    .await
+            });
+            let (_, errors) = tokio::time::timeout(Duration::from_secs(30), delete)
+                .await
+                .expect("batch delete should not wait for the response body")
+                .expect("batch delete task should join");
+            assert!(errors.iter().all(Option::is_none));
+
+            let mut restored = Vec::new();
+            snapshot
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("leased snapshot should remain readable after batch delete");
+            assert_eq!(restored, body);
+        })
+        .await;
     }
 
     #[tokio::test]

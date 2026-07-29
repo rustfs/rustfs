@@ -568,6 +568,7 @@ mod tests {
     };
     use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::bucket::metadata_sys;
+    use crate::cluster::rpc::peer_s3_client::install_delete_bucket_empty_scan_barrier;
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
     use crate::error::StorageError;
     use crate::object_api::{ObjectOptions, PutObjReader};
@@ -589,6 +590,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::{Notify, OnceCell};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -1048,7 +1050,7 @@ mod tests {
             .await
             .expect("bucket should be created");
         for disk_path in &disk_paths {
-            tokio::fs::create_dir_all(disk_path.join(&bucket).join("empty-directory"))
+            tokio::fs::create_dir_all(disk_path.join(&bucket).join("empty-directory/nested/leaf"))
                 .await
                 .expect("empty directory remnant should be created");
         }
@@ -1255,6 +1257,55 @@ mod tests {
             metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok(),
             "failed default S3 DeleteBucket must keep metadata cache"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_delete_preserves_put_committed_after_empty_scan() {
+        let (_, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-empty-scan-race-{}", Uuid::new_v4().simple());
+        let object = "committed-after-empty-scan";
+        let payload = b"object committed after DeleteBucket empty scan".to_vec();
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let barrier = install_delete_bucket_empty_scan_barrier();
+        let delete_store = ecstore.clone();
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_bucket(&delete_bucket, &DeleteBucketOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        ecstore
+            .put_object(&bucket, object, &mut put_reader, &ObjectOptions::default())
+            .await
+            .expect("PUT should commit while DeleteBucket is paused after its empty scan");
+
+        barrier.release();
+        let err = delete
+            .await
+            .expect("DeleteBucket task should join")
+            .expect_err("DeleteBucket must reject a PUT committed after its empty scan");
+        assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed object should remain readable after DeleteBucket fails");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("object body should remain readable");
+        assert_eq!(restored, payload);
     }
 
     #[tokio::test]

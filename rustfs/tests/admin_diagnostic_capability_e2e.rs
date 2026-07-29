@@ -84,6 +84,22 @@ async fn signed_bytes_request(
         .expect("signed admin request")
 }
 
+async fn wait_for_ready(client: &Client, endpoint: &str) {
+    let ready_url = format!("{endpoint}/health/ready");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(response) = client.get(&ready_url).send().await
+                && response.status().is_success()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("embedded server should become ready");
+}
+
 #[tokio::test]
 async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
     let port = match find_available_port() {
@@ -100,9 +116,11 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
         .expect("start embedded server");
     let endpoint = server.endpoint();
     let client = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("HTTP client");
+    wait_for_ready(&client, &endpoint).await;
 
     let response = signed_bytes_request(
         &client,
@@ -144,6 +162,7 @@ async fn diagnostic_handlers_enforce_advertised_runtime_contract() {
     );
 
     let stalled_client = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(60))
         .build()
         .expect("stalled HTTP client");

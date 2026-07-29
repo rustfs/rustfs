@@ -206,10 +206,9 @@ impl ObjectKeyMapper {
     #[allow(dead_code)] // Used in: object operations
     pub fn normalize_path(object: &str) -> String {
         // Split by '/', filter out empty segments (except if it's the end)
-        let segments: Vec<&str> = object.split('/').collect();
         let has_trailing_slash = object.ends_with('/');
 
-        let normalized_segments: Vec<&str> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+        let normalized_segments: Vec<&str> = object.split('/').filter(|s| !s.is_empty()).collect();
 
         let mut result = normalized_segments.join("/");
 

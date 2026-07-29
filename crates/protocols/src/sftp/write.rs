@@ -1495,12 +1495,12 @@ mod tests {
             let buffer_len_u64 = part_buffer_len as u64;
             let phase = match phase_variant {
                 0 => WritePhase::Buffering {
-                    part_buffer: part_buffer.clone(),
+                    part_buffer,
                 },
                 1 => WritePhase::Streaming {
                     upload_id: "UP-proptest".to_string(),
                     abort_authorized: true,
-                    part_buffer: part_buffer.clone(),
+                    part_buffer,
                     uploaded_parts: Vec::new(),
                     next_part_number,
                 },

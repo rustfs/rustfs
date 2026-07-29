@@ -562,13 +562,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 &self.ctx.tier_config_mgr(),
             )
             .await?;
-            return Ok(finish_set_disk_read_lock(
-                gr,
-                read_lock_guard.take(),
-                lock_optimization_enabled,
-                bucket,
-                object,
-            ));
+            return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), None, bucket, object));
         }
 
         // App-layer object data cache probe: metadata (etag/size) is resolved
@@ -695,6 +689,18 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
+        let snapshot_lease = if lock_optimization_enabled {
+            match fi.data_dir.filter(|data_dir| !data_dir.is_nil()) {
+                Some(data_dir) => {
+                    let data_dir_path = format!("{object}/{data_dir}");
+                    acquire_snapshot_leases(&disks, bucket, &data_dir_path, fi.erasure.data_blocks).await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
                 match Self::get_object_decode_reader_with_fileinfo(
@@ -724,13 +730,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         // Carry the hook probe result so the app layer skips its
                         // now-redundant lookup on the streaming miss path (ODC-16).
                         reader.body_source = body_source;
-                        return Ok(finish_set_disk_read_lock(
-                            reader,
-                            read_lock_guard.take(),
-                            lock_optimization_enabled,
-                            bucket,
-                            object,
-                        ));
+                        return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), snapshot_lease, bucket, object));
                     }
                     core::io_primitives::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
@@ -770,15 +770,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        if lock_optimization_enabled {
+        let producer_snapshot_lease = snapshot_lease.clone();
+        if let Some(lease) = snapshot_lease {
             release_materialized_read_lock(&bucket, &object, read_lock_guard.take());
-            debug!(bucket, object, "Lock optimization: released read lock before streaming read");
+            reader.stream = Box::new(SnapshotLeaseReader {
+                inner: reader.stream,
+                lease: Some(lease),
+                terminal_error: false,
+            });
+            debug!(bucket, object, "Lock optimization: replaced read lock with snapshot leases");
         }
 
-        // When lock optimization is disabled, keep the read-lock guard in the
-        // task so it lives for the duration of the streaming read.
+        // The producer shares the lease lifetime with the body so cancellation
+        // cannot release the snapshot while the duplex task is still unwinding.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
+            let _snapshot_lease = producer_snapshot_lease;
             let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
@@ -2327,13 +2334,25 @@ async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCo
     }
 }
 
+#[cfg(test)]
 fn persisted_transition_version(
     remote_version: &str,
 ) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
     persisted_transition_version_with_gate(remote_version, remote_version_state_writer_enabled())
 }
 
+#[cfg(test)]
 fn remote_version_state_writer_enabled() -> bool {
+    remote_version_state_writer_fleet_proof().is_some()
+}
+
+fn remote_version_state_writer_fleet_proof() -> Option<crate::services::notification_sys::RemoteVersionStateFleetProofToken> {
+    remote_version_state_writer_requested()
+        .then(crate::services::notification_sys::acquire_remote_version_state_fleet_proof)
+        .flatten()
+}
+
+fn remote_version_state_writer_requested() -> bool {
     remote_version_state_writer_enabled_for(
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
@@ -2343,11 +2362,25 @@ fn remote_version_state_writer_enabled() -> bool {
             rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
             rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
         ),
+        true,
     )
 }
 
-fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool) -> bool {
-    requested && fleet_confirmed
+fn remote_version_state_writer_fleet_proof_matches(
+    proof: &crate::services::notification_sys::RemoteVersionStateFleetProofToken,
+) -> bool {
+    remote_version_state_writer_fleet_proof_matches_for(
+        remote_version_state_writer_requested(),
+        crate::services::notification_sys::remote_version_state_fleet_proof_matches(proof),
+    )
+}
+
+fn remote_version_state_writer_fleet_proof_matches_for(requested: bool, fleet_proof_matches: bool) -> bool {
+    requested && fleet_proof_matches
+}
+
+fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool, fleet_proof_valid: bool) -> bool {
+    requested && fleet_confirmed && fleet_proof_valid
 }
 
 fn persisted_transition_version_with_gate(
@@ -2366,7 +2399,7 @@ fn persisted_transition_version_with_gate(
         Ok(_) => Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact)),
         Err(_) if !remote_version_state_writer_enabled => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "opaque remote tier versions require the operator-attested fleet gate",
+            "opaque remote tier versions require the operator-attested live fleet capability gate",
         )),
         Err(_) if remote_version == "null" => {
             Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::SuspendedNull))
@@ -2612,7 +2645,7 @@ mod transition_upload_completion_tests {
 mod transition_version_id_tests {
     use super::{
         TransitionUploadCandidate, persisted_transition_version, persisted_transition_version_with_gate,
-        remote_version_state_writer_enabled_for,
+        remote_version_state_writer_enabled_for, remote_version_state_writer_fleet_proof_matches_for,
     };
     use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
@@ -2655,15 +2688,35 @@ mod transition_version_id_tests {
 
     #[test]
     fn remote_version_state_writer_requires_request_and_fleet_confirmation() {
-        for (case, requested, fleet_confirmed, expected) in [
-            ("old defaults", false, false, false),
-            ("missing fleet confirmation", true, false, false),
-            ("missing local opt-in", false, true, false),
-            ("explicitly unconfirmed fleet", true, false, false),
-            ("rolled-back writer", false, true, false),
-            ("fully upgraded fleet", true, true, true),
+        for (case, requested, fleet_confirmed, fleet_proof_valid, expected) in [
+            ("old defaults", false, false, false, false),
+            ("missing fleet confirmation", true, false, true, false),
+            ("missing local opt-in", false, true, true, false),
+            ("missing fleet proof", true, true, false, false),
+            ("explicitly unconfirmed fleet", true, false, true, false),
+            ("rolled-back writer", false, true, true, false),
+            ("fully upgraded fleet", true, true, true, true),
         ] {
-            assert_eq!(remote_version_state_writer_enabled_for(requested, fleet_confirmed), expected, "{case}");
+            assert_eq!(
+                remote_version_state_writer_enabled_for(requested, fleet_confirmed, fleet_proof_valid),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_version_state_commit_rechecks_operator_gate_and_live_proof() {
+        for (case, requested, fleet_proof_matches, expected) in [
+            ("operator gate closed", false, true, false),
+            ("fleet proof changed", true, false, false),
+            ("current authorization", true, true, true),
+        ] {
+            assert_eq!(
+                remote_version_state_writer_fleet_proof_matches_for(requested, fleet_proof_matches),
+                expected,
+                "{case}"
+            );
         }
     }
 
@@ -3848,6 +3901,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
         transition_meta.insert("name".to_string(), object.to_string());
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut transition_meta,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            transaction.transaction_id.to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut transition_meta,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(transaction.backend_fingerprint),
+        );
 
         if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
             transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
@@ -3958,20 +4021,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err.into());
         }
-        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
-            Ok(version) => version,
-            Err(err) => {
-                let cleanup_api = transition_cleanup_store(&self.ctx).await;
-                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
-                    return Err(StorageError::Io(std::io::Error::other(format!(
-                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
-                    ))));
+        let fleet_proof = remote_version_state_writer_fleet_proof();
+        let remote_version_requires_fleet_proof =
+            !candidate.remote_version().is_empty() && Uuid::parse_str(candidate.remote_version()).is_err();
+        let (transition_version_id, transition_version_state) =
+            match persisted_transition_version_with_gate(candidate.remote_version(), fleet_proof.is_some()) {
+                Ok(version) => version,
+                Err(err) => {
+                    let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                        return Err(StorageError::Io(std::io::Error::other(format!(
+                            "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                        ))));
+                    }
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                        .await;
+                    return Err(err.into());
                 }
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
-                return Err(err.into());
-            }
-        };
+            };
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -4087,6 +4154,21 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         #[cfg(test)]
         pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseValidation).await;
+        // This check is the fleet-proof lease linearization point. Revocation
+        // blocks later commits; an already-authorized local quorum commit is
+        // allowed to finish without holding a synchronous lock across I/O.
+        if remote_version_requires_fleet_proof
+            && !fleet_proof
+                .as_ref()
+                .is_some_and(remote_version_state_writer_fleet_proof_matches)
+        {
+            drop(transition_lock_guard);
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+            }
+            return Err(Error::other("remote version state fleet capability changed during transition"));
+        }
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
