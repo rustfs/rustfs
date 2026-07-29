@@ -24,9 +24,10 @@ mod tests {
     use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use base64::Engine;
+    use md5::{Digest as Md5Digest, Md5};
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
     use serial_test::serial;
-    use sha2::{Digest, Sha256};
+    use sha2::Sha256;
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -70,7 +71,9 @@ mod tests {
     }
 
     fn content_md5_base64(body: &[u8]) -> String {
-        let digest = md5::compute(body);
+        let mut hasher = Md5::new();
+        hasher.update(body);
+        let digest = hasher.finalize();
         base64::engine::general_purpose::STANDARD.encode(digest.as_slice())
     }
 

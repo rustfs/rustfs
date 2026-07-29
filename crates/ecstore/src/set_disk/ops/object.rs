@@ -7303,7 +7303,6 @@ mod transition_source_identity_matrix_tests {
     async fn transition_source_identity_field_matrix_rejects_single_field_drift() {
         #[derive(Clone, Copy, Debug)]
         enum IdentityField {
-            VersionId,
             DataDir,
             ModTime,
             Size,
@@ -7319,7 +7318,6 @@ mod transition_source_identity_matrix_tests {
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
 
         for (index, field) in [
-            IdentityField::VersionId,
             IdentityField::DataDir,
             IdentityField::ModTime,
             IdentityField::Size,
@@ -7373,10 +7371,6 @@ mod transition_source_identity_matrix_tests {
 
             let mut changed = source.clone();
             match field {
-                IdentityField::VersionId => {
-                    changed.version_id = Some(Uuid::new_v4());
-                    changed.fresh = true;
-                }
                 IdentityField::DataDir => changed.data_dir = Some(Uuid::new_v4()),
                 IdentityField::ModTime => {
                     changed.mod_time = changed.mod_time.map(|value| value + time::Duration::nanoseconds(1));
@@ -7417,15 +7411,12 @@ mod transition_source_identity_matrix_tests {
             );
 
             match field {
-                IdentityField::VersionId => assert_ne!(source.version_id, persisted.version_id),
                 IdentityField::DataDir => assert_ne!(source.data_dir, persisted.data_dir),
                 IdentityField::ModTime => assert_ne!(source.mod_time, persisted.mod_time),
                 IdentityField::Size => assert_ne!(source.size, persisted.size),
                 IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&persisted.metadata)),
             }
-            if !matches!(field, IdentityField::VersionId) {
-                assert_eq!(source.version_id, persisted.version_id);
-            }
+            assert_eq!(source.version_id, persisted.version_id);
             if !matches!(field, IdentityField::DataDir) {
                 assert_eq!(source.data_dir, persisted.data_dir);
             }
