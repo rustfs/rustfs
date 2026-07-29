@@ -246,6 +246,35 @@ pub async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Ve
     bucket_meta_sys.update(bucket, BUCKET_TARGETS_FILE, data).await
 }
 
+/// Read-modify-write one bucket config file under the metadata system's
+/// outer write guard.
+///
+/// `mutate` sees the freshly loaded on-disk metadata and returns the
+/// replacement payload for `config_file` (empty clears it, like
+/// [`delete`]). Both the read and the persisted write happen inside the
+/// same guard that [`update`] uses, so within this process the rewrite can
+/// neither clobber a concurrent update to another config file nor lose a
+/// concurrent write to the same one — unlike caching a mutated clone of
+/// previously read metadata.
+///
+/// This guard is process-local. Writers on other nodes still race, exactly
+/// as they do for [`update`]: each rewrites the whole metadata file, so the
+/// later save wins. What this narrows is the window — from "as stale as the
+/// local cache" down to a single metadata read plus write.
+pub async fn update_config_with<F>(bucket: &str, config_file: &str, mutate: F) -> Result<OffsetDateTime>
+where
+    F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
+{
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let _targets_guard = if config_file == BUCKET_TARGETS_FILE {
+        Some(acquire_bucket_targets_transaction_lock(bucket).await?)
+    } else {
+        None
+    };
+    let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+    bucket_meta_sys.update_config_with(bucket, config_file, mutate).await
+}
+
 pub async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let api = bucket_meta_sys_lock.read().await.object_store();
@@ -666,30 +695,56 @@ impl BucketMetadataSys {
             return Err(Error::other("errServerNotInitialized"));
         };
 
-        if is_meta_bucketname(bucket) {
-            return Err(Error::other("errInvalidArgument"));
-        }
-
-        let mut bm = match load_bucket_metadata_parse(store, bucket, parse).await {
-            Ok(res) => res,
-            Err(err) => {
-                if !runtime_sources::setup_is_erasure().await
-                    && !runtime_sources::setup_is_dist_erasure().await
-                    && is_err_bucket_not_found(&err)
-                {
-                    BucketMetadata::new(bucket)
-                } else {
-                    error!("load bucket metadata failed: {}", err);
-                    return Err(err);
-                }
-            }
-        };
+        let mut bm = Self::load_bucket_metadata_for_update(store, bucket, parse).await?;
 
         let updated = bm.update_config(config_file, data)?;
 
         self.save(bm).await?;
 
         Ok(updated)
+    }
+
+    /// See the free [`update_config_with`]: same load-mutate-persist cycle as
+    /// [`Self::update`], with the payload computed from the loaded metadata
+    /// instead of supplied up front. Loads through this system's own store so
+    /// the read and the persisted write target the same instance.
+    async fn update_config_with<F>(&mut self, bucket: &str, config_file: &str, mutate: F) -> Result<OffsetDateTime>
+    where
+        F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
+    {
+        let mut bm = Self::load_bucket_metadata_for_update(self.api.clone(), bucket, true).await?;
+
+        let data = mutate(&bm)?;
+        let updated = bm.update_config(config_file, data)?;
+
+        self.save(bm).await?;
+
+        Ok(updated)
+    }
+
+    /// Load a bucket's on-disk metadata as the base of a config rewrite.
+    /// Outside erasure setups a missing metadata file degrades to a fresh
+    /// default (legacy buckets without one); erasure setups fail instead of
+    /// fabricating state that a quorum may still hold.
+    async fn load_bucket_metadata_for_update(store: Arc<ECStore>, bucket: &str, parse: bool) -> Result<BucketMetadata> {
+        if is_meta_bucketname(bucket) {
+            return Err(Error::other("errInvalidArgument"));
+        }
+
+        match load_bucket_metadata_parse(store, bucket, parse).await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                if !runtime_sources::setup_is_erasure().await
+                    && !runtime_sources::setup_is_dist_erasure().await
+                    && is_err_bucket_not_found(&err)
+                {
+                    Ok(BucketMetadata::new(bucket))
+                } else {
+                    error!("load bucket metadata failed: {}", err);
+                    Err(err)
+                }
+            }
+        }
     }
 
     async fn save(&self, bm: BucketMetadata) -> Result<()> {
@@ -1252,6 +1307,122 @@ mod tests {
             .expect_err("malformed persisted policy must not be treated as missing");
 
         assert!(matches!(err, Error::Io(_)), "malformed persisted policy must surface its parse failure");
+    }
+    /// A tagging rewrite through `update_config_with` (the Swift metadata
+    /// POST path) is persisted: it survives a metadata reload from disk, and
+    /// an emptied rewrite clears the config in the cached copy too instead of
+    /// leaving stale parsed tags behind.
+    #[tokio::test]
+    async fn update_config_with_persists_tagging_rewrite_across_disk_reload() {
+        use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
+        use s3s::dto::Tag;
+
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let mut sys = BucketMetadataSys::new(ecstore);
+
+        let bucket = "swift-tagging-bucket";
+        sys.persist_and_set(BucketMetadata::new(bucket))
+            .await
+            .expect("initial metadata should persist");
+
+        let tagging = Tagging {
+            tag_set: vec![Tag {
+                key: Some("swift-meta-color".to_string()),
+                value: Some("blue".to_string()),
+            }],
+        };
+        let xml = crate::bucket::utils::serialize::<Tagging>(&tagging).expect("tagging should serialize");
+        sys.update_config_with(bucket, BUCKET_TAGGING_CONFIG, move |bm| {
+            assert!(bm.tagging_config.is_none(), "rewrite must see the on-disk state");
+            Ok(xml)
+        })
+        .await
+        .expect("tagging rewrite should persist");
+
+        // Simulate the disk-truth reload that used to lose Swift writes: drop
+        // the cached entry and lazily re-load from the metadata file.
+        sys.metadata_map.write().await.clear();
+        let (tags, _) = sys
+            .get_tagging_config(bucket)
+            .await
+            .expect("tagging must survive a reload from disk");
+        assert_eq!(tags.tag_set.len(), 1);
+        assert_eq!(tags.tag_set[0].key.as_deref(), Some("swift-meta-color"));
+        assert_eq!(tags.tag_set[0].value.as_deref(), Some("blue"));
+
+        // An emptied rewrite clears the config everywhere.
+        sys.update_config_with(bucket, BUCKET_TAGGING_CONFIG, |bm| {
+            assert!(bm.tagging_config.is_some(), "rewrite must see the persisted tags");
+            Ok(Vec::new())
+        })
+        .await
+        .expect("clearing rewrite should persist");
+        assert_eq!(
+            sys.get_tagging_config(bucket).await.unwrap_err(),
+            Error::ConfigNotFound,
+            "cleared tagging must not be served from the cache"
+        );
+        sys.metadata_map.write().await.clear();
+        assert_eq!(
+            sys.get_tagging_config(bucket).await.unwrap_err(),
+            Error::ConfigNotFound,
+            "cleared tagging must not reappear after a reload from disk"
+        );
+    }
+
+    /// The load and the persisted write share one write guard, so concurrent
+    /// rewrites of the same config compose instead of clobbering each other.
+    /// Moving the load outside that guard loses all but the last tag.
+    #[tokio::test]
+    async fn concurrent_update_config_with_calls_do_not_lose_writes() {
+        use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
+        use s3s::dto::Tag;
+
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
+
+        let bucket = "swift-tagging-concurrent";
+        sys.read()
+            .await
+            .persist_and_set(BucketMetadata::new(bucket))
+            .await
+            .expect("initial metadata should persist");
+
+        const WRITERS: usize = 8;
+        let mut handles = Vec::with_capacity(WRITERS);
+        for idx in 0..WRITERS {
+            let sys = sys.clone();
+            handles.push(tokio::spawn(async move {
+                sys.write()
+                    .await
+                    .update_config_with(bucket, BUCKET_TAGGING_CONFIG, move |bm| {
+                        // Each writer merges its own tag onto whatever is
+                        // currently persisted — the Swift rewrite shape.
+                        let mut tagging = bm.tagging_config.clone().unwrap_or_else(|| Tagging { tag_set: vec![] });
+                        tagging.tag_set.push(Tag {
+                            key: Some(format!("swift-meta-key{idx}")),
+                            value: Some(idx.to_string()),
+                        });
+                        crate::bucket::utils::serialize::<Tagging>(&tagging).map_err(|e| Error::other(e.to_string()))
+                    })
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .await
+                .expect("writer task should join")
+                .expect("rewrite should persist");
+        }
+
+        let (tags, _) = sys
+            .read()
+            .await
+            .get_tagging_config(bucket)
+            .await
+            .expect("tagging should be readable");
+        assert_eq!(tags.tag_set.len(), WRITERS, "every concurrent rewrite must survive: {tags:?}");
     }
 
     fn target(bucket: &str, id: &str) -> BucketTarget {

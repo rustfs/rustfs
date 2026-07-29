@@ -14,7 +14,7 @@
 
 use crate::cluster::rpc::http_auth::RPC_CONTENT_SHA256_HEADER;
 use crate::cluster::rpc::{gen_tonic_signature_headers, normalize_tonic_rpc_audience};
-use crate::disk::error::{DiskError, Error as DiskErrorType};
+use crate::disk::error::{DiskError, Error as DiskErrorType, RpcStatusError};
 use crate::runtime::sources as runtime_sources;
 use http::Uri;
 use rustfs_protos::{
@@ -107,10 +107,79 @@ pub async fn node_service_time_out_client_no_auth(
     node_service_time_out_client(addr, TonicInterceptor::NoOp(NoOpInterceptor)).await
 }
 
+/// The typed `tonic::Status` an internode RPC failure was converted from, if
+/// this error carries one.
+pub(crate) fn embedded_tonic_status(io_err: &std::io::Error) -> Option<&tonic::Status> {
+    io_err.get_ref()?.downcast_ref::<RpcStatusError>().map(RpcStatusError::status)
+}
+
+/// Decide whether a gRPC status reports a peer we cannot currently reach,
+/// rather than an application outcome from a live peer.
+///
+/// `Unavailable` is the one code that means "no service behind this channel":
+/// the client transport raises it when the connection is broken, and the
+/// server's own not-ready gates use it deliberately.
+///
+/// `Unknown` is the client transport's escape hatch for a cause it could not
+/// map to a code — tower's "Service was not ready: <cause>", an h2 error with
+/// no gRPC mapping. Our handlers never return it, so there its message is the
+/// only evidence available and the anchored needles decide.
+///
+/// Every other code is an answer from a live peer and is never a transport
+/// failure, whatever its message says. That distinction is the point of
+/// classifying by code: a peer relaying its own downstream trouble as
+/// `Internal("connection refused ...")`, or a handler interpolating a local
+/// `io::Error` into `Status::internal`, answered us perfectly well. Marking it
+/// offline over that text is the bug this classification replaces. Likewise a
+/// `Cancelled` "Timeout expired" from the per-RPC channel deadline means the
+/// peer is slow, not gone; gating it would turn load into a partition.
+pub(crate) fn is_network_like_status(status: &tonic::Status) -> bool {
+    match status.code() {
+        tonic::Code::Unavailable => true,
+        tonic::Code::Unknown => message_has_network_needle(&status.to_string()),
+        _ => false,
+    }
+}
+
+/// Substring fallback for failures that only exist as text: dial errors
+/// wrapped by `get_client`, remote `error_info` payloads, and statuses
+/// flattened through `format!`. Needles must stay anchored to transport
+/// context — a bare word like "unavailable" also matches application text
+/// (e.g. a bucket named "unavailable-logs") and would take a healthy peer
+/// offline.
+pub(crate) fn message_has_network_needle(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "temporarily offline",
+        "transport error",
+        // tonic >= 0.14 renders Code::Unavailable as
+        // `code: 'The service is currently unavailable'`.
+        "code: 'the service is currently unavailable'",
+        // RUSTFS_COMPAT_TODO(tonic-013-status-render): releases up to 1.0.0-alpha.38 shipped tonic 0.13, which rendered the same status as `status: Unavailable`, and peers relay that text in error_info. Remove after the minimum supported RustFS peer version ships tonic >= 0.14.
+        "status: unavailable",
+        "error trying to connect",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        "not connected",
+        "unexpected eof",
+        "timed out",
+        "deadline has elapsed",
+        "connection closed",
+        "connection aborted",
+        "tcp connect error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
     match err {
         DiskError::Timeout => true,
         DiskError::Io(io_err) => {
+            if let Some(status) = embedded_tonic_status(io_err) {
+                return is_network_like_status(status);
+            }
             if matches!(
                 io_err.kind(),
                 ErrorKind::TimedOut
@@ -124,24 +193,7 @@ pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
                 return true;
             }
 
-            let message = io_err.to_string().to_ascii_lowercase();
-            [
-                "transport error",
-                "unavailable",
-                "error trying to connect",
-                "connection refused",
-                "connection reset",
-                "broken pipe",
-                "not connected",
-                "unexpected eof",
-                "timed out",
-                "deadline has elapsed",
-                "connection closed",
-                "connection aborted",
-                "tcp connect error",
-            ]
-            .iter()
-            .any(|needle| message.contains(needle))
+            message_has_network_needle(&io_err.to_string())
         }
         _ => false,
     }
@@ -267,6 +319,70 @@ mod tests {
             f();
         });
         let _ = provider.shutdown();
+    }
+
+    #[test]
+    fn network_like_disk_error_uses_typed_status_code() {
+        // Transport-level Unavailable statuses justify retry/eviction.
+        assert!(is_network_like_disk_error(&DiskError::from(tonic::Status::unavailable(
+            "storage layer is not initialized"
+        ))));
+        // Application statuses from a live peer must not look network-like,
+        // even when their message contains transport-sounding words.
+        assert!(!is_network_like_disk_error(&DiskError::from(tonic::Status::internal(
+            "failed to heal bucket \"unavailable-logs\""
+        ))));
+        assert!(!is_network_like_disk_error(&DiskError::from(tonic::Status::unauthenticated(
+            "No valid auth token"
+        ))));
+        // A slow peer that blew the per-RPC deadline is still answering.
+        assert!(!is_network_like_disk_error(&DiskError::from(tonic::Status::cancelled("Timeout expired"))));
+    }
+
+    #[test]
+    fn embedded_tonic_status_is_recovered_across_error_conversions() {
+        // DiskError and StorageError share one wrapper, so a status keeps its
+        // typed classification whichever error it was converted into first.
+        let from_storage: DiskErrorType = crate::error::Error::from(tonic::Status::unavailable("peer gone")).into();
+        let DiskError::Io(io_err) = &from_storage else {
+            panic!("status-derived disk error should stay an Io error");
+        };
+        assert_eq!(embedded_tonic_status(io_err).map(|status| status.code()), Some(tonic::Code::Unavailable));
+
+        let from_disk = crate::error::Error::from(DiskError::from(tonic::Status::unavailable("peer gone")));
+        let crate::error::Error::Io(io_err) = &from_disk else {
+            panic!("status-derived storage error should stay an Io error");
+        };
+        assert_eq!(embedded_tonic_status(io_err).map(|status| status.code()), Some(tonic::Code::Unavailable));
+    }
+
+    #[test]
+    fn network_like_disk_error_ignores_transport_words_in_application_statuses() {
+        // Same contract as the peer client: a status the peer answered with
+        // is not a transport failure, so it must not drive a reconnect even
+        // when its message describes one.
+        assert!(!is_network_like_disk_error(&DiskError::from(tonic::Status::internal(
+            "connection refused while dialing downstream backend"
+        ))));
+        assert!(!is_network_like_disk_error(&DiskError::from(tonic::Status::unauthenticated(
+            "connection reset while validating token"
+        ))));
+    }
+
+    #[test]
+    fn network_like_disk_error_requires_anchored_unavailable_needle() {
+        // Regression: a bare "unavailable" needle used to match application
+        // text such as a bucket name.
+        assert!(!is_network_like_disk_error(&DiskError::other("bucket \"unavailable-logs\" not found")));
+        // Anchored renderings of a flattened Unavailable status still match.
+        assert!(is_network_like_disk_error(&DiskError::other(
+            "code: 'The service is currently unavailable', message: \"peer gone\""
+        )));
+        assert!(is_network_like_disk_error(&DiskError::other(
+            "status: Unavailable, message: \"peer gone\""
+        )));
+        assert!(is_network_like_disk_error(&DiskError::other("connection refused")));
+        assert!(!is_network_like_disk_error(&DiskError::FileNotFound));
     }
 
     #[test]

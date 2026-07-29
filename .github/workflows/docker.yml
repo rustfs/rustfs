@@ -66,7 +66,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY_DOCKERHUB: rustfs/rustfs
   REGISTRY_GHCR: ghcr.io/${{ github.repository }}
-  REGISTRY_QUAY: quay.io/${{ secrets.QUAY_USERNAME }}/rustfs
+  REGISTRY_QUAY: quay.io/rustfs/rustfs
   DOCKER_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:

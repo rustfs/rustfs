@@ -22,7 +22,10 @@ use uuid::Uuid;
 
 use crate::bucket::lifecycle::config_boundary;
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
-use crate::bucket::lifecycle::tier_sweeper::delete_object_from_remote_tier_idempotent_with_manager_and_identity;
+use crate::bucket::lifecycle::tier_sweeper::{
+    delete_confirmed_transition_candidate_exact_with_manager_and_identity,
+    delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
 use crate::object_api::ObjectOptions;
@@ -707,6 +710,21 @@ async fn recover_unknown_upload_outcome(
         }
         TransitionCandidateProbe::UnversionedPresent => {
             cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::unversioned()).await
+        }
+        TransitionCandidateProbe::VersionedPresent(version_id)
+            if Uuid::parse_str(&version_id).is_ok_and(|version_id| version_id.is_nil()) =>
+        {
+            delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+                &transaction.remote_object,
+                &version_id,
+                &transaction.tier_name,
+                transaction.backend_fingerprint,
+                &api.tier_config_mgr(),
+            )
+            .await
+            .map_err(Error::other)?;
+            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
         }
         TransitionCandidateProbe::VersionedPresent(version_id) => {
             cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::versioned(version_id)).await
