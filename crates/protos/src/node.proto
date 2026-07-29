@@ -997,9 +997,9 @@ service NodeService {
 
 /* -------------------------------disk service-------------------------- */
 
-   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
-   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
-   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
+  rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
+  rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
+  rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
@@ -1009,9 +1009,9 @@ service NodeService {
   rpc PreparePartTransaction(PreparePartTransactionRequest) returns (PreparePartTransactionResponse) {}; // auth-policy: body-bound
   rpc RenamePart(RenamePartRequest) returns (RenamePartResponse) {}; // auth-policy: body-bound
   rpc SettlePartTransaction(SettlePartTransactionRequest) returns (SettlePartTransactionResponse) {}; // auth-policy: body-bound
-   rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {}; // auth-policy: body-bound
-   rpc Write(WriteRequest) returns (WriteResponse) {}; // auth-policy: unimplemented
-   rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {}; // auth-policy: streaming
+  rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {}; // auth-policy: body-bound
+  rpc Write(WriteRequest) returns (WriteResponse) {}; // auth-policy: unimplemented
+  rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {}; // auth-policy: streaming
 //  rpc Append(AppendRequest) returns (AppendResponse) {};
   rpc ReadAt(stream ReadAtRequest) returns (stream ReadAtResponse) {}; // auth-policy: streaming
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
