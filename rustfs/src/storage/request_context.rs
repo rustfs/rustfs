@@ -115,8 +115,8 @@ impl RequestContext {
 
     /// Create an external request context with a server-owned ID while keeping
     /// client headers unchanged for signature verification.
-    pub(crate) fn from_external_headers_without_trace_context(headers: &HeaderMap) -> Self {
-        Self::new(uuid::Uuid::new_v4().to_string(), headers, None)
+    pub(crate) fn from_external_headers(headers: &HeaderMap) -> Self {
+        Self::new(uuid::Uuid::new_v4().to_string(), headers, extract_trace_context_ids_from_headers(headers))
     }
 
     fn new(request_id: String, headers: &HeaderMap, trace_context: Option<(String, String)>) -> Self {
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_external_request_context_owns_id_and_defers_trace_extraction() {
+    fn test_external_request_context_owns_id_and_preserves_trace_context() {
         global::set_text_map_propagator(TraceContextPropagator::new());
         let mut headers = HeaderMap::new();
         headers.insert("x-request-id", HeaderValue::from_static("client-request-id"));
@@ -353,13 +353,13 @@ mod tests {
             HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
         );
 
-        let ctx = RequestContext::from_external_headers_without_trace_context(&headers);
+        let ctx = RequestContext::from_external_headers(&headers);
 
         assert_ne!(ctx.request_id, "client-request-id");
         assert!(uuid::Uuid::parse_str(&ctx.request_id).is_ok());
         assert_eq!(ctx.x_amz_request_id, "client-amz-request-id");
-        assert!(ctx.trace_id.is_none());
-        assert!(ctx.span_id.is_none());
+        assert_eq!(ctx.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(ctx.span_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 
     #[test]

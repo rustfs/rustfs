@@ -167,9 +167,7 @@ fn uses_server_owned_s3_request_id<B>(req: &HttpRequest<B>, console_redirect_ena
     }
 
     #[cfg(feature = "swift")]
-    if req.uri().path().starts_with(SWIFT_API_PATH_PREFIX)
-        && SwiftRouter::new(true, None).route(req.uri(), req.method().clone()).is_some()
-    {
+    if req.uri().path().starts_with(SWIFT_API_PATH_PREFIX) && SwiftRouter::new(true, None).matches(req.uri()) {
         return false;
     }
 
@@ -244,7 +242,7 @@ where
         let is_s3 = uses_server_owned_s3_request_id(&req, self.console_redirect_enabled);
         let has_request_id = req.headers().contains_key(REQUEST_ID_HEADER);
         let request_context = if is_s3 {
-            let request_context = RequestContext::from_external_headers_without_trace_context(req.headers());
+            let request_context = RequestContext::from_external_headers(req.headers());
             if !has_request_id && let Ok(request_id) = HeaderValue::from_str(&request_context.request_id) {
                 req.headers_mut().insert(REQUEST_ID_HEADER, request_id);
             }
@@ -2255,6 +2253,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_request_context_rejects_client_request_id_as_canonical() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
         let capture = HeaderCaptureService::default();
         let captured_headers = capture.headers();
         let captured_context = capture.request_context();
@@ -2266,6 +2265,10 @@ mod tests {
         request
             .headers_mut()
             .insert(AMZ_REQUEST_ID, HeaderValue::from_static("client-supplied-amz-request-id"));
+        request.headers_mut().insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
 
         let response = service.call(request).await.expect("response");
         let request_id = response
@@ -2287,12 +2290,18 @@ mod tests {
             headers.get(AMZ_REQUEST_ID).expect("client x-amz-request-id"),
             "client-supplied-amz-request-id"
         );
+        assert_eq!(
+            headers.get("traceparent").expect("client traceparent"),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
         let context = captured_context
             .lock()
             .expect("captured request context")
             .clone()
             .expect("S3 request context");
         assert_eq!(context.request_id, request_id);
+        assert_eq!(context.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(context.span_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 
     #[tokio::test]
@@ -2445,6 +2454,22 @@ mod tests {
         let path = "/v1/AUTH_project/container/object";
         let request = Request::builder().uri(path).body(()).expect("build Swift request");
         assert_non_s3_request_id_contract(request, path).await;
+    }
+
+    #[cfg(feature = "swift")]
+    #[test]
+    fn swift_request_id_classification_preserves_v1_prefix_boundary() {
+        let swift_request = Request::builder()
+            .uri("/v1/AUTH_project/container/object")
+            .body(())
+            .expect("build Swift request");
+        assert!(!uses_server_owned_s3_request_id(&swift_request, false));
+
+        let double_slash_request = Request::builder()
+            .uri("//v1/AUTH_project/container/object")
+            .body(())
+            .expect("build double-slash request");
+        assert!(uses_server_owned_s3_request_id(&double_slash_request, false));
     }
 
     #[cfg(feature = "swift")]

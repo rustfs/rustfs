@@ -169,8 +169,7 @@ impl OperationHelper {
         if request_context.is_none() {
             counter!("rustfs_log_chain_orphan_total", "component" => "operation_helper").increment(1);
         }
-        let request_context =
-            request_context.unwrap_or_else(|| RequestContext::from_external_headers_without_trace_context(&req.headers));
+        let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
         let request_id = request_context.request_id.clone();
 
         let audit_builder = if audit_enabled {
@@ -365,8 +364,9 @@ impl OperationHelper {
     pub(crate) fn request_context_or_from_request<T>(&self, req: &S3Request<T>) -> RequestContext {
         match self {
             Self::Enabled(state) => state.request_context.clone(),
-            Self::Disabled => request_context_from_req(req)
-                .unwrap_or_else(|| RequestContext::from_external_headers_without_trace_context(&req.headers)),
+            Self::Disabled => {
+                request_context_from_req(req).unwrap_or_else(|| RequestContext::from_external_headers(&req.headers))
+            }
         }
     }
 }
