@@ -47,8 +47,8 @@ use crate::diagnostics::get::{
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::disk::{
-    OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
-    part_transaction_path,
+    DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
+    PartTransactionAction, part_transaction_path,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
@@ -547,6 +547,8 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
         && left.transitioned_objname == right.transitioned_objname
         && left.transition_tier == right.transition_tier
         && left.transition_version_id == right.transition_version_id
+        && left.transition_version == right.transition_version
+        && left.transition_version_state == right.transition_version_state
         && left.expire_restored == right.expire_restored
         && left.size == right.size
         && left.mod_time == right.mod_time
@@ -2985,29 +2987,48 @@ impl SetDisks {
                 Self::rename_fanout_barrier(&object_for_fault, idx, rename_fanout_barrier_phase::CLEANUP).await;
 
                 if let Some(err) = Self::cleanup_injected_error(&object_for_fault, idx) {
-                    return Some(err);
+                    return (false, Some(err));
                 }
                 if let Some(disk) = disk {
-                    disk.delete(
-                        &bucket,
-                        &file_path,
-                        DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .err()
+                    match disk
+                        .delete_data_dir(
+                            &bucket,
+                            &file_path,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        Ok(DataDirDeleteStatus::Deleted) => (false, None),
+                        Ok(DataDirDeleteStatus::Deferred) => (true, None),
+                        Err(err) => (false, Some(err)),
+                    }
                 } else {
                     // `None` slot: ignored placeholder. It is not `attempted`, so
                     // classification excludes it from residue regardless.
-                    Some(DiskError::DiskNotFound)
+                    (false, Some(DiskError::DiskNotFound))
                 }
             })
         });
-        let errs: Vec<Option<DiskError>> = join_all(futures).await.into_iter().map(map_cleanup_join_result).collect();
+        let mut deferred = 0usize;
+        let errs: Vec<Option<DiskError>> = join_all(futures)
+            .await
+            .into_iter()
+            .map(|result| match result {
+                Ok((was_deferred, err)) => {
+                    deferred += usize::from(was_deferred);
+                    err
+                }
+                Err(join_err) => Some(DiskError::other(format!("old data dir cleanup task failed: {join_err}"))),
+            })
+            .collect();
 
-        classify_old_data_dir_cleanup(&errs, &attempted, write_quorum)
+        let mut cleanup = classify_old_data_dir_cleanup(&errs, &attempted, write_quorum);
+        cleanup.deferred = deferred;
+        cleanup.reclaimed = cleanup.reclaimed.saturating_sub(deferred);
+        cleanup
     }
 
     /// Test-only fault-injection seam for the old-data-dir cleanup path
@@ -3097,6 +3118,20 @@ impl SetDisks {
         let actions = old_data_dir_cleanup_actions(c);
 
         rustfs_io_metrics::record_old_data_dir_cleanup(c.attempted, c.reclaimed, c.unreclaimed_disks.len(), c.below_quorum);
+
+        if c.deferred > 0 {
+            debug!(
+                event = EVENT_SET_DISK_WRITE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket = %bucket,
+                object = %object,
+                old_data_dir = %old_dir,
+                deferred = c.deferred,
+                state = "old_data_cleanup_deferred",
+                "Old data directory cleanup deferred for active snapshot leases"
+            );
+        }
 
         if actions.warn {
             warn!(
@@ -4129,6 +4164,9 @@ pub(in crate::set_disk) struct OldDataDirCleanup {
     /// Number of attempted disks that returned `Ok` or a not-found variant
     /// (a missing dir == already reclaimed).
     pub reclaimed: usize,
+    /// Number of attempted disks that retained the directory for an active
+    /// snapshot lease and registered it for deletion after the final release.
+    pub deferred: usize,
     /// Indices of attempted disks that failed with a non-ignored, non-not-found
     /// error (including task panic/cancel). This is the residue that actually
     /// leaks and drives the leak metric + heal enqueue.
@@ -4191,6 +4229,7 @@ fn classify_old_data_dir_cleanup(errs: &[Option<DiskError>], attempted: &[bool],
     OldDataDirCleanup {
         attempted: attempted_count,
         reclaimed,
+        deferred: 0,
         unreclaimed_disks,
         below_quorum,
     }
@@ -5129,6 +5168,40 @@ mod tests {
         assert_eq!(cleanup.reclaimed, 2, "the real old-data-dir must still be reclaimed after release");
 
         drop((disk1, disk2));
+    }
+
+    #[tokio::test]
+    async fn commit_cleanup_reports_and_releases_deferred_snapshot_data_dirs() {
+        let bucket = "cleanup-lease-bucket";
+        let object = "cleanup-lease-object";
+        let old_data_dir = "11111111-1111-1111-1111-111111111111";
+        let committed_data_dir = "22222222-2222-2222-2222-222222222222";
+        let data_dir_path = format!("{object}/{old_data_dir}");
+        let shard_path = format!("{data_dir_path}/part.1");
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[(&shard_path, b"one".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone())], 0).await;
+        let lease = disk1
+            .acquire_snapshot_lease(bucket, &data_dir_path)
+            .await
+            .expect("snapshot lease should be acquired before cleanup");
+
+        let cleanup = set
+            .commit_rename_data_dir(&[Some(disk1.clone())], bucket, object, old_data_dir, committed_data_dir, 1)
+            .await;
+        assert_eq!(cleanup.attempted, 1);
+        assert_eq!(cleanup.reclaimed, 0);
+        assert_eq!(cleanup.deferred, 1);
+        assert!(cleanup.unreclaimed_disks.is_empty());
+        disk1
+            .read_all(bucket, &shard_path)
+            .await
+            .expect("deferred cleanup must leave later shard opens available");
+
+        disk1
+            .release_snapshot_lease(bucket, &data_dir_path, lease)
+            .await
+            .expect("final lease release should reclaim the old data directory");
+        assert!(matches!(disk1.read_all(bucket, &shard_path).await, Err(DiskError::FileNotFound)));
     }
 
     /// Isolation guard: an armed barrier / observed object only affects its own
