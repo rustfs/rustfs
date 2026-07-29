@@ -141,6 +141,7 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
 const MAX_UPLOADS_LIST: usize = 10000;
 
 mod bucket;
+pub(crate) use bucket::await_bucket_namespace_operation;
 mod heal;
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;

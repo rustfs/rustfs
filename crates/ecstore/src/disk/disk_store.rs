@@ -1365,6 +1365,14 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        self.track_disk_health(
+            || async { self.disk.renew_snapshot_lease(volume, path, token).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
         self.track_disk_health(
             || async { self.disk.delete_data_dir(volume, path, opts).await },
