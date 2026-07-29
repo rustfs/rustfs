@@ -7260,23 +7260,29 @@ mod transition_source_identity_matrix_tests {
             let object = format!("identity-{index}.bin");
             let payload = vec![u8::try_from(index + 1).expect("matrix index should fit u8"); 1024 * 1024];
             let mut reader = PutObjReader::from_vec(payload);
+            let source_opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
             let original = set_disks
-                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .put_object(bucket, &object, &mut reader, &source_opts)
                 .await
                 .expect("source object should be written");
             let (source, _, _) = set_disks
-                .get_object_fileinfo(bucket, &object, &ObjectOptions::default(), true, false)
+                .get_object_fileinfo(bucket, &object, &source_opts, true, false)
                 .await
                 .expect("source metadata should resolve");
+            assert!(source.versioned);
+            assert!(source.version_id.is_some());
             let opts = ObjectOptions {
                 no_lock: true,
+                versioned: true,
                 transition: TransitionOptions {
                     status: TRANSITION_PENDING.to_string(),
                     tier: tier_name.clone(),
                     etag: original.etag.clone().unwrap_or_default(),
                     ..Default::default()
                 },
-                version_id: original.version_id.map(|version| version.to_string()),
                 mod_time: original.mod_time,
                 ..Default::default()
             };
@@ -7289,7 +7295,10 @@ mod transition_source_identity_matrix_tests {
 
             let mut changed = source.clone();
             match field {
-                IdentityField::VersionId => changed.version_id = Some(Uuid::new_v4()),
+                IdentityField::VersionId => {
+                    changed.version_id = Some(Uuid::new_v4());
+                    changed.fresh = true;
+                }
                 IdentityField::DataDir => changed.data_dir = Some(Uuid::new_v4()),
                 IdentityField::ModTime => {
                     changed.mod_time = changed.mod_time.map(|value| value + time::Duration::nanoseconds(1));
@@ -7304,12 +7313,14 @@ mod transition_source_identity_matrix_tests {
                     .await
                     .expect("single-field metadata drift should be written");
             }
+            let (persisted, _, _) = set_disks
+                .get_object_fileinfo(bucket, &object, &source_opts, true, false)
+                .await
+                .expect("drifted source metadata should resolve");
             put_barrier.release();
 
-            transition
-                .await
-                .expect("transition task should not panic")
-                .expect_err("transition must reject a source whose identity changed after upload");
+            let result = transition.await.expect("transition task should not panic");
+            assert!(result.is_err(), "transition must reject {field:?} drift");
             let expected_attempts = index + 1;
             assert_eq!(backend.put_count().await, expected_attempts);
             assert_eq!(backend.remove_count().await, expected_attempts);
@@ -7320,26 +7331,26 @@ mod transition_source_identity_matrix_tests {
             );
 
             match field {
-                IdentityField::VersionId => assert_ne!(source.version_id, changed.version_id),
-                IdentityField::DataDir => assert_ne!(source.data_dir, changed.data_dir),
-                IdentityField::ModTime => assert_ne!(source.mod_time, changed.mod_time),
-                IdentityField::Size => assert_ne!(source.size, changed.size),
-                IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata)),
+                IdentityField::VersionId => assert_ne!(source.version_id, persisted.version_id),
+                IdentityField::DataDir => assert_ne!(source.data_dir, persisted.data_dir),
+                IdentityField::ModTime => assert_ne!(source.mod_time, persisted.mod_time),
+                IdentityField::Size => assert_ne!(source.size, persisted.size),
+                IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&persisted.metadata)),
             }
             if !matches!(field, IdentityField::VersionId) {
-                assert_eq!(source.version_id, changed.version_id);
+                assert_eq!(source.version_id, persisted.version_id);
             }
             if !matches!(field, IdentityField::DataDir) {
-                assert_eq!(source.data_dir, changed.data_dir);
+                assert_eq!(source.data_dir, persisted.data_dir);
             }
             if !matches!(field, IdentityField::ModTime) {
-                assert_eq!(source.mod_time, changed.mod_time);
+                assert_eq!(source.mod_time, persisted.mod_time);
             }
             if !matches!(field, IdentityField::Size) {
-                assert_eq!(source.size, changed.size);
+                assert_eq!(source.size, persisted.size);
             }
             if !matches!(field, IdentityField::Etag) {
-                assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata));
+                assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&persisted.metadata));
             }
         }
     }
