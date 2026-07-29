@@ -1810,7 +1810,7 @@ impl DefaultBucketUsecase {
             client_info,
         );
 
-        let read_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+        let read_allowed = PolicySys::try_is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
             action: Action::S3Action(S3Action::ListBucketAction),
             is_owner: false,
@@ -1819,9 +1819,10 @@ impl DefaultBucketUsecase {
             conditions: &conditions,
             object: "",
         })
-        .await;
+        .await
+        .map_err(ApiError::from)?;
 
-        let write_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+        let write_allowed = PolicySys::try_is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
             action: Action::S3Action(S3Action::PutObjectAction),
             is_owner: false,
@@ -1830,7 +1831,8 @@ impl DefaultBucketUsecase {
             conditions: &conditions,
             object: "",
         })
-        .await;
+        .await
+        .map_err(ApiError::from)?;
 
         let mut is_public = read_allowed || write_allowed;
         let ignore_public_acls = match metadata_sys::get_public_access_block_config(&bucket).await {

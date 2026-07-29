@@ -193,7 +193,7 @@ impl Operation for KmsStatusHandler {
             hit_count: hits,
             miss_count: misses,
         });
-        let config = kms_service_manager_from_context().get_config().await;
+        let config = kms_service_manager_from_context().get_redacted_config().await;
 
         let response = KmsStatusResponse {
             backend_type: config
@@ -243,7 +243,7 @@ impl Operation for KmsConfigHandler {
         };
 
         let config = kms_service_manager_from_context()
-            .get_config()
+            .get_redacted_config()
             .await
             .ok_or_else(|| s3_error!(InternalError, "KMS config not available"))?;
 

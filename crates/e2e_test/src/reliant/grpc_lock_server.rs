@@ -400,6 +400,20 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn prepare_part_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::PreparePartTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::PreparePartTransactionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn settle_part_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::SettlePartTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::SettlePartTransactionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn rename_file(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameFileRequest>,

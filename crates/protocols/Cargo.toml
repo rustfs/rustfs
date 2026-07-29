@@ -49,6 +49,8 @@ swift = [
     "dep:hmac",
     "dep:sha1",
     "dep:hex",
+    "dep:ipnetwork",
+    "dep:rustfs-trusted-proxies",
     "dep:astral-tokio-tar",
     "dep:base64",
     "dep:async-compression",
@@ -111,6 +113,8 @@ quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+ipnetwork = { workspace = true, optional = true }
+rustfs-trusted-proxies = { workspace = true, optional = true }
 astral-tokio-tar = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
