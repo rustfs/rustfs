@@ -23,8 +23,6 @@ pub(crate) mod remote_disk;
 pub(crate) mod remote_locker;
 pub(crate) mod runtime_sources;
 
-#[cfg(test)]
-pub(crate) use background_monitor::pin_callsite_interest_for_test;
 pub use background_monitor::shutdown_background_monitors;
 pub(crate) use background_monitor::spawn_background_monitor;
 pub use client::{
