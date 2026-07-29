@@ -29,6 +29,7 @@ use crate::client::{
     api_remove::{RemoveObjectOptions, RemoveObjectResult},
     api_s3_datatypes::ListVersionsResult,
     credentials::{Credentials, SignatureType, Static, Value},
+    provider_versions::validate_remote_version_id,
     transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
@@ -189,44 +190,102 @@ impl WarmBackendS3 {
         remote_bucket_versioning_from_status(config.status.as_ref().map(|status| status.as_str()))
     }
 
-    async fn list_transition_candidate_versions(&self, object: &str) -> Result<ListVersionsResult, std::io::Error> {
+    async fn probe_transition_candidate_versions(
+        &self,
+        object: &str,
+        bucket_versioning: RemoteBucketVersioning,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let remote_object = self.get_dest(object);
         let mut opts = ListObjectsOptions::default();
-        opts.set("prefix", &self.get_dest(object));
-        opts.set("max-keys", "2");
-        self.client.list_object_versions_query(&self.bucket, &opts, "", "", "").await
+        opts.set("prefix", &remote_object);
+        opts.set("max-keys", "1000");
+
+        let mut key_marker = String::new();
+        let mut version_id_marker = String::new();
+        let mut candidates = TransitionCandidateVersions::default();
+        loop {
+            let versions = self
+                .client
+                .list_object_versions_query(&self.bucket, &opts, &key_marker, &version_id_marker, "")
+                .await?;
+            candidates.extend(&remote_object, &versions);
+            if candidates.is_ambiguous() {
+                return Ok(TransitionCandidateProbe::Ambiguous);
+            }
+            if !versions.is_truncated {
+                return classify_transition_candidates(candidates, bucket_versioning);
+            }
+
+            advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
+        }
     }
 }
 
-fn classify_transition_candidate_versions(
-    remote_object: &str,
+fn classify_transition_candidates(
+    candidates: TransitionCandidateVersions,
     bucket_versioning: RemoteBucketVersioning,
+) -> Result<TransitionCandidateProbe, std::io::Error> {
+    let probe = candidates.classify(bucket_versioning);
+    if let TransitionCandidateProbe::VersionedPresent(version_id) = &probe {
+        validate_remote_version_id(version_id)?;
+    }
+    Ok(probe)
+}
+
+fn advance_version_markers(
+    key_marker: &mut String,
+    version_id_marker: &mut String,
     versions: &ListVersionsResult,
-) -> TransitionCandidateProbe {
-    if versions.is_truncated {
-        return TransitionCandidateProbe::Ambiguous;
+) -> Result<(), std::io::Error> {
+    let next_markers = (&versions.next_key_marker, &versions.next_version_id_marker);
+    if next_markers == (&*key_marker, &*version_id_marker) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ListObjectVersions pagination markers did not advance",
+        ));
     }
+    key_marker.clone_from(&versions.next_key_marker);
+    version_id_marker.clone_from(&versions.next_version_id_marker);
+    Ok(())
+}
 
-    if versions.delete_markers.iter().any(|marker| marker.key == remote_object) {
-        return TransitionCandidateProbe::Ambiguous;
-    }
+#[derive(Default)]
+struct TransitionCandidateVersions {
+    version_id: Option<String>,
+    ambiguous: bool,
+}
 
-    let mut exact_versions = versions.versions.iter().filter(|version| version.key == remote_object);
-    let Some(version) = exact_versions.next() else {
-        return TransitionCandidateProbe::Missing;
-    };
-    if exact_versions.next().is_some() {
-        return TransitionCandidateProbe::Ambiguous;
-    }
-
-    match bucket_versioning {
-        RemoteBucketVersioning::Disabled => TransitionCandidateProbe::UnversionedPresent,
-        RemoteBucketVersioning::Suspended if version.version_id == "null" => {
-            TransitionCandidateProbe::VersionedPresent(version.version_id.clone())
+impl TransitionCandidateVersions {
+    fn extend(&mut self, remote_object: &str, versions: &ListVersionsResult) {
+        for version in versions.versions.iter().filter(|version| version.key == remote_object) {
+            if self.version_id.is_some() {
+                self.ambiguous = true;
+                return;
+            }
+            self.version_id = Some(version.version_id.clone());
         }
-        RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if !version.version_id.is_empty() => {
-            TransitionCandidateProbe::VersionedPresent(version.version_id.clone())
+    }
+
+    fn is_ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+
+    fn classify(self, bucket_versioning: RemoteBucketVersioning) -> TransitionCandidateProbe {
+        if self.ambiguous {
+            return TransitionCandidateProbe::Ambiguous;
         }
-        RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled => TransitionCandidateProbe::Ambiguous,
+        let Some(version_id) = self.version_id else {
+            return TransitionCandidateProbe::Missing;
+        };
+
+        match bucket_versioning {
+            RemoteBucketVersioning::Disabled => TransitionCandidateProbe::UnversionedPresent,
+            RemoteBucketVersioning::Suspended if version_id == "null" => TransitionCandidateProbe::VersionedPresent(version_id),
+            RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if !version_id.is_empty() => {
+                TransitionCandidateProbe::VersionedPresent(version_id)
+            }
+            RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled => TransitionCandidateProbe::Ambiguous,
+        }
     }
 }
 
@@ -275,72 +334,110 @@ mod tests {
         }
     }
 
+    fn classify_pages(bucket_versioning: RemoteBucketVersioning, pages: &[ListVersionsResult]) -> TransitionCandidateProbe {
+        let mut candidates = TransitionCandidateVersions::default();
+        for page in pages {
+            candidates.extend("archive/object", page);
+        }
+        candidates.classify(bucket_versioning)
+    }
+
     #[test]
     fn transition_candidate_probe_classifier_is_fail_closed() {
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Disabled,
-                &list_versions(&[], &[], false),
-            ),
+            classify_pages(RemoteBucketVersioning::Disabled, &[list_versions(&[], &[], false)],),
             TransitionCandidateProbe::Missing
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Disabled,
-                &list_versions(&[("archive/object", "")], &[], false),
-            ),
+            classify_pages(RemoteBucketVersioning::Disabled, &[list_versions(&[("archive/object", "")], &[], false)],),
             TransitionCandidateProbe::UnversionedPresent
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a")], &[], false),
+                &[list_versions(&[("archive/object", "version-a")], &[], false)],
             ),
             TransitionCandidateProbe::VersionedPresent("version-a".to_string())
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Suspended,
-                &list_versions(&[("archive/object", "null")], &[], false),
+                &[list_versions(&[("archive/object", "null")], &[], false)],
             ),
             TransitionCandidateProbe::VersionedPresent("null".to_string())
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "")], &[], false),
-            ),
+            classify_pages(RemoteBucketVersioning::Enabled, &[list_versions(&[("archive/object", "")], &[], false)],),
             TransitionCandidateProbe::Ambiguous
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a"), ("archive/object", "version-b")], &[], false),
+                &[list_versions(
+                    &[("archive/object", "version-a"), ("archive/object", "version-b")],
+                    &[],
+                    false,
+                )],
             ),
             TransitionCandidateProbe::Ambiguous
+        );
+    }
+
+    #[test]
+    fn transition_candidate_probe_reconciles_all_pages_and_ignores_delete_markers() {
+        assert_eq!(
+            classify_pages(
+                RemoteBucketVersioning::Enabled,
+                &[
+                    list_versions(&[], &[("archive/object", "marker-a")], true),
+                    list_versions(&[("archive/object", "version-a"), ("archive/object-adjacent", "unrelated"),], &[], false,),
+                ],
+            ),
+            TransitionCandidateProbe::VersionedPresent("version-a".to_string())
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a")], &[("archive/object", "marker-a")], false),
+                &[
+                    list_versions(&[("archive/object", "version-a")], &[], true),
+                    list_versions(&[("archive/object", "version-b")], &[], false),
+                ],
             ),
             TransitionCandidateProbe::Ambiguous
         );
-        assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a")], &[], true),
-            ),
-            TransitionCandidateProbe::Ambiguous
+    }
+
+    #[test]
+    fn transition_candidate_pagination_advances_both_markers() {
+        let mut key_marker = "old-key".to_string();
+        let mut version_id_marker = "old-version".to_string();
+        let page = ListVersionsResult {
+            next_key_marker: "next-key".to_string(),
+            next_version_id_marker: "next-version".to_string(),
+            ..Default::default()
+        };
+
+        advance_version_markers(&mut key_marker, &mut version_id_marker, &page)
+            .expect("new ListObjectVersions markers should advance pagination");
+        assert_eq!(key_marker, "next-key");
+        assert_eq!(version_id_marker, "next-version");
+
+        let err = advance_version_markers(&mut key_marker, &mut version_id_marker, &page)
+            .expect_err("repeated ListObjectVersions markers must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn transition_candidate_probe_rejects_untrusted_version_ids() {
+        let mut candidates = TransitionCandidateVersions::default();
+        candidates.extend(
+            "archive/object",
+            &list_versions(&[("archive/object", "version\ninjection")], &[], false),
         );
+
+        let err = classify_transition_candidates(candidates, RemoteBucketVersioning::Enabled)
+            .expect_err("control characters in listed version IDs must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -397,12 +494,7 @@ impl WarmBackend for WarmBackendS3 {
 
     async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
         let bucket_versioning = self.remote_bucket_versioning().await?;
-        let versions = self.list_transition_candidate_versions(object).await?;
-        Ok(classify_transition_candidate_versions(
-            &self.get_dest(object),
-            bucket_versioning,
-            &versions,
-        ))
+        self.probe_transition_candidate_versions(object, bucket_versioning).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
