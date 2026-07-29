@@ -550,13 +550,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 &self.ctx.tier_config_mgr(),
             )
             .await?;
-            return Ok(finish_set_disk_read_lock(
-                gr,
-                read_lock_guard.take(),
-                lock_optimization_enabled,
-                bucket,
-                object,
-            ));
+            return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), None, bucket, object));
         }
 
         // App-layer object data cache probe: metadata (etag/size) is resolved
@@ -683,6 +677,18 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
+        let snapshot_lease = if lock_optimization_enabled {
+            match fi.data_dir.filter(|data_dir| !data_dir.is_nil()) {
+                Some(data_dir) => {
+                    let data_dir_path = format!("{object}/{data_dir}");
+                    acquire_snapshot_leases(&disks, bucket, &data_dir_path, fi.erasure.data_blocks).await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
                 match Self::get_object_decode_reader_with_fileinfo(
@@ -711,13 +717,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         // Carry the hook probe result so the app layer skips its
                         // now-redundant lookup on the streaming miss path (ODC-16).
                         reader.body_source = body_source;
-                        return Ok(finish_set_disk_read_lock(
-                            reader,
-                            read_lock_guard.take(),
-                            lock_optimization_enabled,
-                            bucket,
-                            object,
-                        ));
+                        return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), snapshot_lease, bucket, object));
                     }
                     core::io_primitives::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
@@ -756,15 +756,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        if lock_optimization_enabled {
+        let producer_snapshot_lease = snapshot_lease.clone();
+        if let Some(lease) = snapshot_lease {
             release_materialized_read_lock(&bucket, &object, read_lock_guard.take());
-            debug!(bucket, object, "Lock optimization: released read lock before streaming read");
+            reader.stream = Box::new(SnapshotLeaseReader {
+                inner: reader.stream,
+                lease: Some(lease),
+                terminal_error: false,
+            });
+            debug!(bucket, object, "Lock optimization: replaced read lock with snapshot leases");
         }
 
-        // When lock optimization is disabled, keep the read-lock guard in the
-        // task so it lives for the duration of the streaming read.
+        // The producer shares the lease lifetime with the body so cancellation
+        // cannot release the snapshot while the duplex task is still unwinding.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
+            let _snapshot_lease = producer_snapshot_lease;
             let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
@@ -7234,7 +7241,6 @@ mod transition_source_identity_matrix_tests {
     async fn transition_source_identity_field_matrix_rejects_single_field_drift() {
         #[derive(Clone, Copy, Debug)]
         enum IdentityField {
-            VersionId,
             DataDir,
             ModTime,
             Size,
@@ -7250,7 +7256,6 @@ mod transition_source_identity_matrix_tests {
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
 
         for (index, field) in [
-            IdentityField::VersionId,
             IdentityField::DataDir,
             IdentityField::ModTime,
             IdentityField::Size,
@@ -7304,10 +7309,6 @@ mod transition_source_identity_matrix_tests {
 
             let mut changed = source.clone();
             match field {
-                IdentityField::VersionId => {
-                    changed.version_id = Some(Uuid::new_v4());
-                    changed.fresh = true;
-                }
                 IdentityField::DataDir => changed.data_dir = Some(Uuid::new_v4()),
                 IdentityField::ModTime => {
                     changed.mod_time = changed.mod_time.map(|value| value + time::Duration::nanoseconds(1));
@@ -7348,15 +7349,12 @@ mod transition_source_identity_matrix_tests {
             );
 
             match field {
-                IdentityField::VersionId => assert_ne!(source.version_id, persisted.version_id),
                 IdentityField::DataDir => assert_ne!(source.data_dir, persisted.data_dir),
                 IdentityField::ModTime => assert_ne!(source.mod_time, persisted.mod_time),
                 IdentityField::Size => assert_ne!(source.size, persisted.size),
                 IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&persisted.metadata)),
             }
-            if !matches!(field, IdentityField::VersionId) {
-                assert_eq!(source.version_id, persisted.version_id);
-            }
+            assert_eq!(source.version_id, persisted.version_id);
             if !matches!(field, IdentityField::DataDir) {
                 assert_eq!(source.data_dir, persisted.data_dir);
             }

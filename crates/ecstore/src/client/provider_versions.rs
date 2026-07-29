@@ -172,7 +172,7 @@ impl ProviderVersionCapabilities {
     }
 }
 
-fn validate_remote_version_id(version_id: &str) -> Result<(), Error> {
+pub(crate) fn validate_remote_version_id(version_id: &str) -> Result<(), Error> {
     if version_id.is_empty() {
         return Err(Error::new(
             ErrorKind::InvalidData,

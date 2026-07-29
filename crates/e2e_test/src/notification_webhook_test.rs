@@ -21,18 +21,22 @@
 //! function, never as an S3 event sink.
 //!
 //! Coverage:
-//!   * PUT / multipart-complete / DELETE each deliver one event with the correct
+//!   * PUT / multipart-complete / DeleteObject / DeleteObjects each deliver one event with the correct
 //!     eventName, bucket, key, versionId and eTag.
 //!   * prefix/suffix filters drop non-matching keys (rule-engine gate).
 //!   * an event queued while the target endpoint is unreachable is redelivered
 //!     from the on-disk store once the endpoint recovers (store-and-forward).
+//!   * responseElements and the S3 response use the canonical request ID while
+//!     requestParameters preserve a conflicting client-supplied value.
 
 use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Event, FilterRule, FilterRuleName,
-    NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter, VersioningConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, Event, FilterRule, FilterRuleName,
+    NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, QueueConfiguration, S3KeyFilter,
+    VersioningConfiguration,
 };
 use http::header::{CONTENT_TYPE, HOST};
 use local_ip_address::local_ip;
@@ -40,10 +44,12 @@ use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
+use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
 use s3s::Body;
 use serde_json::Value;
 use serial_test::serial;
 use std::error::Error;
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::{
     Arc, Once,
@@ -63,6 +69,8 @@ type BoxError = Box<dyn Error + Send + Sync>;
 /// for target lookup (see `process_queue_configurations`), so the region is
 /// nominal, but it must be present for `ARN::parse` to succeed.
 const NOTIFY_REGION: &str = "us-east-1";
+const CLIENT_REQUEST_ID: &str = "client-supplied-request-id";
+const CLIENT_AMZ_REQUEST_ID: &str = "client-supplied-amz-request-id";
 
 /// Webhook targets are registered as `TargetID { id: <name>, name: "webhook" }`,
 /// so the ARN a notification rule references is
@@ -579,6 +587,36 @@ fn trimmed_etag(value: Option<&str>) -> Option<String> {
     value.map(|e| e.trim_matches('"').to_string())
 }
 
+fn assert_conflicting_request_id_correlation(record: &Value, server_request_id: &str) {
+    assert_eq!(
+        record["requestParameters"][REQUEST_ID_HEADER].as_str(),
+        Some(CLIENT_REQUEST_ID),
+        "notification request parameters should retain the actual client header: {record}"
+    );
+    assert_eq!(
+        record["requestParameters"][AMZ_REQUEST_ID].as_str(),
+        Some(CLIENT_AMZ_REQUEST_ID),
+        "notification request parameters should retain the actual client header: {record}"
+    );
+    assert_eq!(
+        record["responseElements"][AMZ_REQUEST_ID].as_str(),
+        Some(server_request_id),
+        "notification response elements should use the canonical request ID: {record}"
+    );
+}
+
+fn assert_generated_request_id_correlation(record: &Value, request_id: &str) {
+    assert!(
+        record["requestParameters"][AMZ_REQUEST_ID].is_null(),
+        "notification request parameters must not invent a client request header: {record}"
+    );
+    assert_eq!(
+        record["responseElements"][AMZ_REQUEST_ID].as_str(),
+        Some(request_id),
+        "notification response elements should match the S3 response request ID: {record}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -671,8 +709,17 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
         .bucket(bucket)
         .key(put_key)
         .body(ByteStream::from_static(b"peri-1 put body"))
+        .customize()
+        .mutate_request(|request| {
+            request.headers_mut().insert(REQUEST_ID_HEADER, CLIENT_REQUEST_ID);
+            request.headers_mut().insert(AMZ_REQUEST_ID, CLIENT_AMZ_REQUEST_ID);
+        })
         .send()
         .await?;
+    let put_request_id = put.request_id().ok_or("PUT response missing request ID")?.to_owned();
+    assert!(uuid::Uuid::parse_str(&put_request_id).is_ok());
+    assert_ne!(put_request_id, CLIENT_REQUEST_ID);
+    assert_ne!(put_request_id, CLIENT_AMZ_REQUEST_ID);
     let put_version = put
         .version_id()
         .ok_or("PUT response missing versionId (versioning not enabled?)")?;
@@ -692,6 +739,7 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
         "record eventName: {record}"
     );
     assert_eq!(record["s3"]["bucket"]["name"].as_str(), Some(bucket), "bucket in event: {record}");
+    assert_conflicting_request_id_correlation(record, &put_request_id);
     assert_eq!(object["versionId"].as_str(), Some(put_version), "versionId in event: {object}");
     assert_eq!(
         trimmed_etag(object["eTag"].as_str()),
@@ -744,6 +792,35 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
         "multipart eTag in event: {mp_record}"
     );
 
+    // --- Snowball extract: direct notification path keeps response correlation
+    let snowball_key = "uploads/snowball.dat";
+    let snowball_body = b"snowball notification body";
+    let mut archive_builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+    let mut archive_header = tokio_tar::Header::new_gnu();
+    archive_header.set_size(u64::try_from(snowball_body.len()).expect("snowball fixture length should fit in u64"));
+    archive_header.set_mode(0o644);
+    archive_header.set_cksum();
+    archive_builder
+        .append_data(&mut archive_header, snowball_key, Cursor::new(snowball_body))
+        .await?;
+    let archive = archive_builder.into_inner().await?.into_inner();
+    let snowball = client
+        .put_object()
+        .bucket(bucket)
+        .key("snowball-fixture.tar")
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|request| {
+            request.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    let snowball_request_id = snowball.request_id().ok_or("Snowball response missing request ID")?;
+
+    let snowball_event = wait_for_event(&mut rx, snowball_key, "s3:ObjectCreated:", Duration::from_secs(20)).await?;
+    let snowball_record = &snowball_event["Records"][0];
+    assert_generated_request_id_correlation(snowball_record, snowball_request_id);
+
     // --- Filter: non-matching prefix and suffix must never be delivered ------
     let wrong_prefix = "logs/report.dat"; // right suffix, wrong prefix
     let wrong_suffix = "uploads/report.txt"; // right prefix, wrong suffix
@@ -772,7 +849,32 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
         "wrong-suffix key {wrong_suffix} bypassed the filter; saw {seen:?}"
     );
 
-    // --- DELETE on a versioned bucket: ObjectRemoved:* with delete-marker version
+    // --- DeleteObjects: direct notification path keeps response correlation --
+    let delete_many_key = "uploads/delete-many.dat";
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(delete_many_key)
+        .body(ByteStream::from_static(b"delete objects notification body"))
+        .send()
+        .await?;
+    wait_for_event(&mut rx, delete_many_key, "s3:ObjectCreated:", Duration::from_secs(20)).await?;
+
+    let delete_many = client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(
+            Delete::builder()
+                .objects(ObjectIdentifier::builder().key(delete_many_key).build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    let delete_many_request_id = delete_many.request_id().ok_or("DeleteObjects response missing request ID")?;
+    let delete_many_event = wait_for_event(&mut rx, delete_many_key, "s3:ObjectRemoved:", Duration::from_secs(20)).await?;
+    assert_generated_request_id_correlation(&delete_many_event["Records"][0], delete_many_request_id);
+
+    // --- DeleteObject on a versioned bucket: delete-marker version ----------
     let delete = client.delete_object().bucket(bucket).key(put_key).send().await?;
     let removed = wait_for_event(&mut rx, put_key, "s3:ObjectRemoved:", Duration::from_secs(20)).await?;
     let removed_record = &removed["Records"][0];

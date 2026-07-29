@@ -853,7 +853,9 @@ pub(crate) mod head_prefix {
 }
 
 pub(crate) mod helper {
-    pub(crate) use crate::storage::storage_api::helper_consumer::{OperationHelper, spawn_background_with_context};
+    pub(crate) use crate::storage::storage_api::helper_consumer::{
+        OperationHelper, build_event_resp_elements, spawn_background_with_context,
+    };
 }
 
 pub(crate) mod object_utils {

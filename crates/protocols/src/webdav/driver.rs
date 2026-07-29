@@ -222,7 +222,7 @@ where
                         created: modified,
                         is_dir: false,
                         etag: output.e_tag.as_ref().map(etag_to_string),
-                        content_type: output.content_type.map(|c| c.to_string()),
+                        content_type: output.content_type,
                     }) as Box<dyn DavMetaData>)
                 }
                 Err(e) => {
@@ -1185,7 +1185,7 @@ where
                             created: modified,
                             is_dir: false,
                             etag: output.e_tag.as_ref().map(etag_to_string),
-                            content_type: output.content_type.map(|c| c.to_string()),
+                            content_type: output.content_type,
                         }) as Box<dyn DavMetaData>)
                     }
                     ResolvedPath::Directory { metadata, .. } => {
@@ -1204,7 +1204,7 @@ where
                             created: modified,
                             is_dir: true,
                             etag: metadata.as_ref().and_then(|output| output.e_tag.as_ref().map(etag_to_string)),
-                            content_type: metadata.and_then(|output| output.content_type.map(|c| c.to_string())),
+                            content_type: metadata.and_then(|output| output.content_type),
                         }) as Box<dyn DavMetaData>)
                     }
                 };
@@ -2035,7 +2035,7 @@ mod tests {
             _access_key: &str,
             _secret_key: &str,
         ) -> Result<ListObjectsV2Output, Self::Error> {
-            let prefix = input.prefix.map(|p| p.to_string()).unwrap_or_default();
+            let prefix = input.prefix.unwrap_or_default();
             let mut keys: Vec<String> = self
                 .state
                 .lock()

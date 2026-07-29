@@ -66,14 +66,14 @@ impl NodeService {
             }));
         }
 
-        let Some(_store) = self.resolve_object_store() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LoadBucketMetadataResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        match reload_bucket_metadata(&bucket).await {
+        match reload_bucket_metadata(store, &bucket).await {
             Ok(()) => {
                 if scanner_maintenance_change {
                     rustfs_scanner::record_scanner_maintenance_change(&bucket);

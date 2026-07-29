@@ -371,7 +371,7 @@ impl UserDetailProvider for FtpsUserDetailProvider {
 
         let ftps_user = FtpsUser {
             username: principal.username.clone(),
-            name: identity.credentials.name.clone(),
+            name: identity.credentials.name,
             session_context,
         };
 

@@ -174,7 +174,7 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
-    pub(crate) use super::super::helper::{OperationHelper, spawn_background_with_context};
+    pub(crate) use super::super::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
@@ -203,9 +203,7 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{
-        RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
-    };
+    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 }
 
 pub(crate) mod rpc_consumer {
@@ -1442,8 +1440,8 @@ pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> R
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
 }
 
-pub(crate) async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
-    ecstore_bucket::metadata_sys::reload_bucket_metadata(bucket).await
+pub(crate) async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<()> {
+    ecstore_bucket::metadata_sys::reload_bucket_metadata(api, bucket).await
 }
 
 pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {

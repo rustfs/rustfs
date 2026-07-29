@@ -3005,6 +3005,7 @@ mod tests {
     use crate::cluster::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
     use crate::runtime::sources as runtime_sources;
     use serde_json::Value;
+    use serial_test::serial;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex, Mutex as StdMutex, Once};
@@ -3017,6 +3018,20 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    // `#[serial(internode_metrics)]` marks every test that observes
+    // `global_internode_metrics()`. Those counters are a process-wide singleton:
+    // some of these tests snapshot a counter, run one decode, and assert on the
+    // delta, while others deliberately record decode errors or call
+    // `reset_internode_metrics_for_test()`. Run concurrently in one process they
+    // corrupt each other's deltas — a sibling's error bumps the "no decode error"
+    // assertion off zero, and a sibling's reset can drive an `after > before`
+    // assertion backwards.
+    //
+    // The marker only takes effect under the `cargo test` fallback; nextest
+    // already isolates each test in its own process, so every test there gets its
+    // own copy of the counters (see `docs/testing/README.md`). Any new test that
+    // reads or mutates the global internode metrics belongs in this group.
 
     #[test]
     fn snapshot_lease_response_requires_current_protocol_and_valid_token() {
@@ -3306,6 +3321,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn read_multiple_response_decode_prefers_msgpack_payloads() {
         let endpoint = sample_remote_endpoint();
         let msgpack_resp = sample_read_multiple_resp("msgpack", b"binary");
@@ -3328,6 +3344,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn read_multiple_response_decode_falls_back_to_json_payloads() {
         let endpoint = sample_remote_endpoint();
         let json_resp = sample_read_multiple_resp("json", b"fallback");
@@ -3349,6 +3366,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn rename_data_response_accepts_legacy_json_without_decode_error() {
         crate::cluster::rpc::runtime_sources::reset_internode_metrics_for_test();
         let response = RenameDataResp {
@@ -3500,6 +3518,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn read_multiple_response_decode_reports_corrupt_msgpack_item() {
         let endpoint = sample_remote_endpoint();
         let response = ReadMultipleResponse {
@@ -3525,6 +3544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn read_multiple_response_decode_reports_corrupt_json_item() {
         let endpoint = sample_remote_endpoint();
         let response = ReadMultipleResponse {
@@ -3565,6 +3585,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn batch_read_version_response_decode_prefers_msgpack_payloads() {
         let endpoint = sample_remote_endpoint();
         let msgpack_resp = sample_batch_read_version_resp(7, "msgpack-object", true);
@@ -3585,6 +3606,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn batch_read_version_response_rejects_invalid_success_metadata() {
         let endpoint = sample_remote_endpoint();
         let mut response_item = sample_batch_read_version_resp(0, "invalid-object", true);
@@ -3604,6 +3626,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn batch_read_version_response_decode_reports_corrupt_msgpack_item() {
         let endpoint = sample_remote_endpoint();
         let response = BatchReadVersionResponse {
@@ -3630,6 +3653,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(internode_metrics)]
     fn batch_read_version_response_decode_reports_corrupt_json_item() {
         let endpoint = sample_remote_endpoint();
         let response = BatchReadVersionResponse {
@@ -4419,6 +4443,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(internode_metrics)]
     async fn test_remote_disk_create_file_retries_once_on_retryable_open_write_error() {
         let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![
             OpenWriteTestStep::Error(DiskError::from(rustfs_rio::new_test_internode_http_io_error(
@@ -4457,6 +4482,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(internode_metrics)]
     async fn test_remote_disk_read_file_stream_retries_once_on_retryable_open_read_error() {
         // A transient reset-by-peer on a shard read during the read-after-write window must be
         // absorbed by one re-dial rather than eroding read quorum (issue #2761).
@@ -5306,6 +5332,11 @@ mod tests {
                 .with_span_list(true),
         );
         let _guard = tracing::subscriber::set_default(subscriber);
+        // The `recovery-monitor` span and the monitor's own log events are
+        // production callsites that sibling tests exercise from subscriber-less
+        // threads; without this they can be cached as `Interest::never()` and go
+        // silently missing here.
+        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
 
         let endpoint = Endpoint {
             url: url::Url::parse("http://127.0.0.1:59996/data").expect("endpoint URL should parse"),
@@ -5360,6 +5391,11 @@ mod tests {
                 .with_span_list(true),
         );
         let _guard = tracing::subscriber::set_default(subscriber);
+        // The `recovery-monitor` span and the monitor's own log events are
+        // production callsites that sibling tests exercise from subscriber-less
+        // threads; without this they can be cached as `Interest::never()` and go
+        // silently missing here.
+        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
 
         let addr = "http://127.0.0.1:59997".to_string();
         let endpoint = Endpoint {

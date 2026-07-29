@@ -207,10 +207,6 @@ pub(crate) async fn ensure_boot_time() {
     GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 }
 
-pub(crate) async fn scanner_init_time() -> Option<chrono::DateTime<chrono::Utc>> {
-    rustfs_common::get_global_init_time().await
-}
-
 pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
     if is_erasure_sd().await {
         None

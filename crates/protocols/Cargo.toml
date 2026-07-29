@@ -25,6 +25,9 @@ description = "Protocol implementations for RustFS (FTPS, SFTP, etc.)"
 keywords = ["ftp", "sftp", "protocol", "storage", "rustfs"]
 categories = ["network-programming", "filesystem"]
 
+[lints]
+workspace = true
+
 [features]
 default = []
 ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime", "dep:subtle"]

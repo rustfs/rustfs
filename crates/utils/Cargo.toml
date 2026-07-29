@@ -58,10 +58,15 @@ url = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 temp-env = { workspace = true }
 proptest = "1"
+
+[[bench]]
+name = "hash_hotpath_benchmark"
+harness = false
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem"] }
