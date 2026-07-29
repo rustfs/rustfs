@@ -818,7 +818,11 @@ impl From<s3s::xml::DeError> for Error {
 
 impl From<tonic::Status> for Error {
     fn from(e: tonic::Status) -> Self {
-        Error::other(e.to_string())
+        // Keep the typed status as the io::Error payload instead of a
+        // flattened string so RPC failure classifiers can read the gRPC code
+        // via downcast (see `PeerRestClient::is_network_like_error`).
+        // `RpcStatusError` renders exactly as `e.to_string()` did.
+        Error::other(crate::disk::error::RpcStatusError::from(e))
     }
 }
 
