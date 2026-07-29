@@ -74,47 +74,6 @@ const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
 const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
 const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
 
-/// Decrypt a Local KMS data-key envelope with explicitly supplied AES-256 key material.
-///
-/// This is intentionally narrower than constructing a Local KMS backend: it does
-/// not read key files, mutate backend state, or select a key by an untrusted
-/// envelope identifier. The caller supplies the expected key ID and object
-/// encryption context, and both are checked before any plaintext DEK is returned.
-///
-/// The function exists for SSE-S3 migration/fallback reads where the object was
-/// historically written while Local KMS was active but only the exported raw key
-/// remains available. It must not be used to bypass an SSE-KMS availability
-/// requirement.
-pub async fn decrypt_local_data_key_envelope(
-    ciphertext: &[u8],
-    master_key: &[u8; 32],
-    expected_master_key_id: &str,
-    expected_context: &HashMap<String, String>,
-) -> Result<[u8; 32]> {
-    let envelope: DataKeyEnvelope = serde_json::from_slice(ciphertext)?;
-    if envelope.master_key_id != expected_master_key_id {
-        return Err(KmsError::invalid_key(
-            "Local KMS data-key envelope master key ID does not match object metadata",
-        ));
-    }
-    if envelope.key_spec != "AES_256" {
-        return Err(KmsError::unsupported_algorithm(envelope.key_spec));
-    }
-    for (key, expected_value) in &envelope.encryption_context {
-        if expected_context.get(key) != Some(expected_value) {
-            return Err(KmsError::context_mismatch(format!(
-                "Local KMS data-key envelope context does not match the current object for key {key:?}"
-            )));
-        }
-    }
-
-    let plaintext = AesDekCrypto::new()
-        .decrypt(master_key, &envelope.encrypted_key, &envelope.nonce)
-        .await?;
-    let actual = plaintext.len();
-    plaintext.try_into().map_err(|_| KmsError::invalid_key_size(32, actual))
-}
-
 /// Local KMS client that stores keys in local files
 pub struct LocalKmsClient {
     config: LocalConfig,

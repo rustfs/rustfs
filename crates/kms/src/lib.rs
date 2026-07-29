@@ -83,7 +83,6 @@ pub use api_types::{
     StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
-pub use backends::local::decrypt_local_data_key_envelope;
 pub use config::*;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
