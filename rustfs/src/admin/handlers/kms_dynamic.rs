@@ -79,10 +79,40 @@ fn kms_service_control_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::ServiceControlAction)]
 }
 
-fn normalize_configure_request_auth(
+fn normalize_configure_request_secrets(
     request: &mut ConfigureKmsRequest,
     existing_config: Option<&KmsConfig>,
 ) -> Result<(), String> {
+    if existing_config.is_some_and(|config| matches!(&config.backend_config, rustfs_kms::BackendConfig::Local(_)))
+        && !matches!(request, ConfigureKmsRequest::Local(_))
+    {
+        return Err("Changing from the Local KMS backend is not supported".to_string());
+    }
+
+    if let ConfigureKmsRequest::Local(request) = request
+        && let Some(KmsConfig {
+            backend_config: rustfs_kms::BackendConfig::Local(existing),
+            allow_insecure_dev_defaults,
+            ..
+        }) = existing_config
+    {
+        if request.key_dir != existing.key_dir {
+            return Err("Changing the Local KMS key directory is not supported".to_string());
+        }
+        match request.file_permissions {
+            Some(permissions) if Some(permissions) != existing.file_permissions => {
+                return Err("Changing Local KMS file permissions is not supported".to_string());
+            }
+            None => request.file_permissions = existing.file_permissions,
+            Some(_) => {}
+        }
+        if request.master_key.as_deref().is_some_and(|master_key| !master_key.is_empty()) {
+            return Err("Changing the Local KMS master key is not supported".to_string());
+        }
+        request.master_key.clone_from(&existing.master_key);
+        request.allow_insecure_dev_defaults = Some(*allow_insecure_dev_defaults);
+    }
+
     let needs_existing_auth = match request {
         ConfigureKmsRequest::VaultKv2(req) => token_is_blank(&req.auth_method),
         ConfigureKmsRequest::VaultTransit(req) => token_is_blank(&req.auth_method),
@@ -350,9 +380,9 @@ impl Operation for ConfigureKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-        let existing_config = service_manager.get_redacted_config().await;
+        let existing_config = service_manager.get_config().await;
 
-        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+        if let Err(e) = normalize_configure_request_secrets(&mut configure_request, existing_config.as_ref()) {
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
         }
 
@@ -895,9 +925,9 @@ impl Operation for ReconfigureKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-        let existing_config = service_manager.get_redacted_config().await;
+        let existing_config = service_manager.get_config().await;
 
-        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+        if let Err(e) = normalize_configure_request_secrets(&mut configure_request, existing_config.as_ref()) {
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
         }
 
@@ -986,8 +1016,12 @@ impl Operation for ReconfigureKmsHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_persisted_kms_config, ensure_kms_config_persistable, kms_configure_actions, kms_service_control_actions};
+    use super::{
+        decode_persisted_kms_config, ensure_kms_config_persistable, kms_configure_actions, kms_service_control_actions,
+        normalize_configure_request_secrets,
+    };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn assert_has_action(actions: &[Action], action: Action) {
@@ -1083,5 +1117,141 @@ mod tests {
         );
 
         assert!(ensure_kms_config_persistable(&config).is_err());
+    }
+
+    #[test]
+    fn local_reconfigure_preserves_hidden_master_key_for_same_directory() {
+        let key_dir = PathBuf::from("/var/lib/rustfs/kms");
+        let mut existing = rustfs_kms::KmsConfig::local(key_dir.clone());
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+
+        let mut request = rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+            key_dir,
+            master_key: None,
+            file_permissions: Some(0o600),
+            default_key_id: Some("experience-key".to_string()),
+            timeout_seconds: Some(30),
+            retry_attempts: Some(3),
+            enable_cache: Some(true),
+            max_cached_keys: Some(1000),
+            cache_ttl_seconds: Some(3600),
+            allow_insecure_dev_defaults: Some(false),
+        });
+
+        normalize_configure_request_secrets(&mut request, Some(&existing)).expect("normalize local request");
+        let rustfs_kms::ConfigureKmsRequest::Local(request) = request else {
+            panic!("request must remain local");
+        };
+        assert_eq!(request.master_key.as_deref(), Some("stored-master-key"));
+    }
+
+    #[test]
+    fn local_reconfigure_preserves_unspecified_legacy_file_permissions() {
+        let key_dir = PathBuf::from("/var/lib/rustfs/kms");
+        let mut existing = rustfs_kms::KmsConfig::local(key_dir.clone());
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+        existing_local.file_permissions = None;
+
+        let mut request = rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+            key_dir,
+            master_key: None,
+            file_permissions: None,
+            default_key_id: Some("experience-key".to_string()),
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: Some(false),
+        });
+
+        normalize_configure_request_secrets(&mut request, Some(&existing)).expect("normalize legacy local request");
+        let rustfs_kms::ConfigureKmsRequest::Local(request) = request else {
+            panic!("request must remain local");
+        };
+        assert!(request.file_permissions.is_none());
+    }
+
+    #[test]
+    fn local_reconfigure_does_not_reuse_master_key_for_different_directory() {
+        let mut existing = rustfs_kms::KmsConfig::local(PathBuf::from("/var/lib/rustfs/kms"));
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+
+        let mut request = rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+            key_dir: PathBuf::from("/var/lib/rustfs/other-kms"),
+            master_key: None,
+            file_permissions: Some(0o600),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: Some(false),
+        });
+
+        let error = normalize_configure_request_secrets(&mut request, Some(&existing))
+            .expect_err("changing the local key directory must be rejected");
+        assert_eq!(error, "Changing the Local KMS key directory is not supported");
+    }
+
+    #[test]
+    fn local_reconfigure_rejects_file_permission_and_master_key_changes() {
+        let key_dir = PathBuf::from("/var/lib/rustfs/kms");
+        let mut existing = rustfs_kms::KmsConfig::local(key_dir.clone());
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+        existing_local.file_permissions = Some(0o600);
+
+        let request = |master_key, file_permissions| {
+            rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+                key_dir: key_dir.clone(),
+                master_key,
+                file_permissions,
+                default_key_id: None,
+                timeout_seconds: None,
+                retry_attempts: None,
+                enable_cache: None,
+                max_cached_keys: None,
+                cache_ttl_seconds: None,
+                allow_insecure_dev_defaults: Some(false),
+            })
+        };
+
+        let mut permissions_change = request(None, Some(0o666));
+        let permissions_error = normalize_configure_request_secrets(&mut permissions_change, Some(&existing))
+            .expect_err("changing file permissions must be rejected");
+        assert_eq!(permissions_error, "Changing Local KMS file permissions is not supported");
+
+        let mut master_key_change = request(Some("replacement-master-key".to_string()), Some(0o600));
+        let master_key_error = normalize_configure_request_secrets(&mut master_key_change, Some(&existing))
+            .expect_err("changing the master key must be rejected");
+        assert_eq!(master_key_error, "Changing the Local KMS master key is not supported");
+
+        let mut backend_change = rustfs_kms::ConfigureKmsRequest::Static(rustfs_kms::ConfigureStaticKmsRequest {
+            key_id: "static-key".to_string(),
+            secret_key: "not-used-by-normalization".to_string(),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
+        });
+        let backend_error = normalize_configure_request_secrets(&mut backend_change, Some(&existing))
+            .expect_err("changing from the local backend must be rejected");
+        assert_eq!(backend_error, "Changing from the Local KMS backend is not supported");
     }
 }

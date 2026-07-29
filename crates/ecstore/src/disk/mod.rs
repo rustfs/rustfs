@@ -72,6 +72,39 @@ pub type DiskStore = Arc<Disk>;
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotLeaseToken(Uuid);
+
+impl SnapshotLeaseToken {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let uuid = Uuid::from_slice(bytes).map_err(|_| Error::other("invalid snapshot lease token"))?;
+        if uuid.is_nil() {
+            return Err(Error::other("invalid snapshot lease token"));
+        }
+        Ok(Self(uuid))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+}
+
+impl Default for SnapshotLeaseToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataDirDeleteStatus {
+    Deleted,
+    Deferred,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PartTransactionAction {
     Commit,
@@ -246,6 +279,34 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.delete_paths(volume, paths).await,
             Disk::Remote(remote_disk) => remote_disk.delete_paths(volume, paths).await,
+        }
+    }
+
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.acquire_snapshot_lease(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.acquire_snapshot_lease(volume, path).await,
+        }
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.release_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.release_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.renew_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.renew_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        match self {
+            Disk::Local(local_disk) => local_disk.delete_data_dir(volume, path, opts).await,
+            Disk::Remote(remote_disk) => remote_disk.delete_data_dir(volume, path, opts).await,
         }
     }
 
@@ -646,6 +707,19 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<()>;
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()>;
+    async fn acquire_snapshot_lease(&self, _volume: &str, _path: &str) -> Result<SnapshotLeaseToken> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn release_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<()> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn renew_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        self.delete(volume, path, opts).await?;
+        Ok(DataDirDeleteStatus::Deleted)
+    }
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
     async fn read_version(

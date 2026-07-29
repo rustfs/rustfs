@@ -25,7 +25,7 @@ use crate::disk::error::{Error, Result};
 use crate::disk::{
     BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
     DiskOption, FileInfoVersions, FileReader, FileWriter, PartTransactionAction, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -50,8 +50,9 @@ use rustfs_protos::proto_gen::node_service::{
     DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest,
     MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest,
     ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
-    RenameFileRequest, SettlePartTransactionRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest,
-    WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
+    RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+    WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -100,6 +101,18 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_SNAPSHOT_LEASE_TTL: Duration = Duration::from_secs(60);
+
+fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result<SnapshotLeaseToken> {
+    if !response.success {
+        return Err(response.error.unwrap_or_default().into());
+    }
+    if response.protocol_version != SNAPSHOT_LEASE_PROTOCOL_VERSION {
+        return Err(Error::other("remote snapshot lease protocol is incompatible"));
+    }
+    SnapshotLeaseToken::from_slice(&response.token)
+}
 
 /// Bind a mutating disk RPC to its canonical body: the digest lands in the request metadata, and
 /// the signing interceptor folds it (plus a replay-protected nonce) into the v2 signature scope
@@ -1784,6 +1797,81 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(SnapshotLeaseRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    ttl_ms: u64::try_from(REMOTE_SNAPSHOT_LEASE_TTL.as_millis())
+                        .map_err(|_| Error::other("snapshot lease TTL cannot be represented"))?,
+                });
+                let canonical_body = rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "acquire_snapshot_lease")?;
+                let response = client.acquire_snapshot_lease(request).await?.into_inner();
+                snapshot_lease_token_from_response(response)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(SnapshotLeaseRenewRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    token: token.as_bytes().to_vec().into(),
+                    ttl_ms: u64::try_from(REMOTE_SNAPSHOT_LEASE_TTL.as_millis())
+                        .map_err(|_| Error::other("snapshot lease TTL cannot be represented"))?,
+                });
+                let canonical_body = rustfs_protos::canonical_snapshot_lease_renew_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "renew_snapshot_lease")?;
+                let response = client.renew_snapshot_lease(request).await?.into_inner();
+                snapshot_lease_token_from_response(response)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(SnapshotLeaseReleaseRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    token: token.as_bytes().to_vec().into(),
+                });
+                let canonical_body = rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "release_snapshot_lease")?;
+                let response = client.release_snapshot_lease(request).await?.into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         trace!(
@@ -2929,6 +3017,34 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[test]
+    fn snapshot_lease_response_requires_current_protocol_and_valid_token() {
+        let token = SnapshotLeaseToken::new();
+        let response = SnapshotLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+            error: None,
+        };
+        assert_eq!(snapshot_lease_token_from_response(response).unwrap(), token);
+
+        let incompatible = SnapshotLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION + 1,
+            error: None,
+        };
+        assert!(snapshot_lease_token_from_response(incompatible).is_err());
+
+        let malformed = SnapshotLeaseResponse {
+            success: true,
+            token: Bytes::from_static(b"not-a-uuid"),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+            error: None,
+        };
+        assert!(snapshot_lease_token_from_response(malformed).is_err());
+    }
 
     #[test]
     fn list_volumes_decode_rejects_a_malformed_entry() {

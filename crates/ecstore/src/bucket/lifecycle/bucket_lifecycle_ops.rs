@@ -8974,7 +8974,7 @@ mod tests {
         .await
         .expect("first worker result should persist");
         assert_eq!(first.state, ManualTransitionJobState::Running);
-        assert_eq!(first.report.transition_completed, 1);
+        assert_eq!(first.report.transition_completed, 0);
         assert_eq!(first.report.transition_failed, 0);
 
         let duplicate = record_manual_transition_worker_result(
@@ -8987,11 +8987,11 @@ mod tests {
         .await
         .expect("duplicate worker result should be idempotent");
         assert_eq!(duplicate.state, ManualTransitionJobState::Running);
-        assert_eq!(duplicate.report.transition_completed, 1);
+        assert_eq!(duplicate.report.transition_completed, 0);
         assert_eq!(duplicate.report.transition_failed, 0);
 
         let second_key = manual_transition_worker_result_task_key(&bucket, "logs/b", None);
-        let final_record = record_manual_transition_worker_result(
+        let pending_record = record_manual_transition_worker_result(
             ecstore.clone(),
             job_id,
             &second_key,
@@ -9000,7 +9000,14 @@ mod tests {
         )
         .await
         .expect("second distinct worker result should persist");
+        assert_eq!(pending_record.state, ManualTransitionJobState::Running);
+        assert_eq!(pending_record.report.transition_completed, 0);
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record =
+            reconcile_manual_transition_worker_results(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+                .await
+                .expect("worker result journal should reconcile");
         assert_eq!(final_record.state, ManualTransitionJobState::Partial);
         assert_eq!(final_record.report.transition_completed, 1);
         assert_eq!(final_record.report.transition_failed, 1);
@@ -9035,7 +9042,7 @@ mod tests {
             .expect("worker result job record should save");
 
         let task_key = manual_transition_worker_result_task_key(&bucket, "logs/fail", None);
-        let final_record = record_manual_transition_worker_result_with_reason(
+        let pending_record = record_manual_transition_worker_result_with_reason(
             ecstore.clone(),
             job_id,
             &task_key,
@@ -9045,7 +9052,12 @@ mod tests {
         )
         .await
         .expect("worker result with failure reason should persist");
+        assert!(pending_record.report.tier_failure_by_reason.is_empty());
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record = reconcile_manual_transition_worker_results(ecstore, job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("worker failure reason should reconcile");
         assert_eq!(
             final_record
                 .report
@@ -11291,6 +11303,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn concurrent_resend_same_part_commits_one_generation() {
+        use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
         use crate::storage_api_contracts::object::ObjectIO as _;
 
         let (_paths, ecstore) = setup_test_env().await;
@@ -11305,58 +11318,44 @@ mod tests {
 
         // Distinct payloads with distinct sizes: a mixed-generation reassembly
         // would produce bytes matching none of them (or fail the read outright).
-        let candidates: Vec<Vec<u8>> = (0..3)
+        let candidates: Vec<Vec<u8>> = (0..2)
             .map(|g| {
                 let len = 4096 + g * 512;
                 vec![b'a' + g as u8; len]
             })
             .collect();
 
-        // Two independent causes can produce a spurious lock-acquire timeout
-        // here, and both must stay covered:
-        // 1. A lost/stolen fast-lock wakeup could strand a waiter until the
-        //    deadline — fixed for real in fast_lock::shard by bounding each
-        //    notification wait (NOTIFY_WAIT_CAP re-polling).
-        // 2. Under the full nextest suite on loaded CI disks, the
-        //    *legitimately serialized* cross-disk commits can exceed the
-        //    acquire deadline all by themselves — observed on CI at the 5s
-        //    default and the 30s production default with six resends, and
-        //    again at 60s, which is a hard ceiling: fast_lock clamps every
-        //    requested timeout to MAX_ACQUIRE_TIMEOUT (60s), so raising the
-        //    env override higher is a no-op (the Timeout error still reports
-        //    the requested value). Keep the guard about the correctness
-        //    property, not disk latency: request the full 60s ceiling and cap
-        //    the queue depth at three resends, so the last waiter sits behind
-        //    at most two serialized commits (~12s each on the slowest observed
-        //    CI runner, comfortably inside the deadline). Three concurrent
-        //    resends still race the streaming phase and contend on the commit
-        //    lock, which is all the generation-mixing regression needs.
-        //    `#[serial]` keeps the process-wide env override isolated.
-        let results = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60"))], async {
-            let mut tasks = tokio::task::JoinSet::new();
-            for payload in candidates.iter().cloned() {
-                let store = ecstore.clone();
-                let bucket = bucket.clone();
-                let upload_id = upload.upload_id.clone();
-                tasks.spawn(async move {
-                    let mut data = PutObjReader::from_vec(payload.clone());
-                    store
-                        .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
-                        .await
-                        .map(|info| (info, payload))
-                });
-            }
+        let commit_barrier = MultipartCommitBarrier::install_for_arrivals(
+            &bucket,
+            object,
+            MultipartCommitPause::PutPartBeforeLockAcquire,
+            candidates.len(),
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        for payload in candidates.iter().cloned() {
+            let store = ecstore.clone();
+            let bucket = bucket.clone();
+            let upload_id = upload.upload_id.clone();
+            tasks.spawn(async move {
+                let mut data = PutObjReader::from_vec(payload.clone());
+                store
+                    .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
+                    .await
+                    .map(|info| (info, payload))
+            });
+        }
 
-            // Every concurrent resend must succeed; the commit lock must never
-            // starve a waiter into a timeout.
-            let mut results = Vec::new();
-            while let Some(joined) = tasks.join_next().await {
-                let outcome = joined.expect("put_object_part task should not panic");
-                results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
-            }
-            results
-        })
-        .await;
+        // Both writers finish streaming before racing for the uploadId commit
+        // lock. Two generations are sufficient to exercise the mixed-shard
+        // hazard, while each waiter sits behind at most one cross-disk rename.
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release();
+
+        let mut results = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let outcome = joined.expect("put_object_part task should not panic");
+            results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
+        }
         assert_eq!(results.len(), candidates.len());
 
         // Exactly one generation is visible after the serialized commits, and its

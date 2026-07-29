@@ -23,7 +23,8 @@ use rustfs_protos::{
     proto_gen::node_service::{
         BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
         GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
-        node_service_server::NodeService,
+        SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        SnapshotLeaseResponse, node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -101,6 +102,27 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<BatchReadVersionRequest>,
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn acquire_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn renew_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseRenewRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
         Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 

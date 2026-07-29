@@ -44,6 +44,7 @@ pub mod expiration;
 pub mod expiration_worker;
 pub mod formpost;
 pub mod handler;
+pub mod metadata_update;
 pub mod object;
 pub mod quota;
 pub mod router;
@@ -57,11 +58,56 @@ pub mod types;
 pub mod versioning;
 
 pub use errors::{SwiftError, SwiftResult};
+pub use metadata_update::MetadataUpdate;
 pub use router::{SwiftRoute, SwiftRouter};
+
+/// Maximum number of metadata headers allowed per resource (Swift standard)
+pub(crate) const MAX_METADATA_COUNT: usize = 90;
+
+/// Maximum size in bytes for a single metadata value (Swift standard)
+pub(crate) const MAX_METADATA_VALUE_SIZE: usize = 256;
+
+/// Validate metadata against Swift limits
+///
+/// Checks that:
+/// - Total number of metadata entries doesn't exceed MAX_METADATA_COUNT
+/// - Individual metadata values don't exceed MAX_METADATA_VALUE_SIZE
+///
+/// This is the object-metadata form, where a POST replaces the whole set and
+/// the request is therefore the complete result. Account and container POSTs
+/// are additive, so their count has to be measured against the merged state
+/// instead — see [`MetadataUpdate::apply_to_tags`].
+///
+/// Returns error if limits are exceeded.
+pub(crate) fn validate_metadata(metadata: &std::collections::HashMap<String, String>) -> SwiftResult<()> {
+    // Check total metadata count
+    if metadata.len() > MAX_METADATA_COUNT {
+        return Err(SwiftError::BadRequest(format!(
+            "Too many metadata headers: {} (max: {})",
+            metadata.len(),
+            MAX_METADATA_COUNT
+        )));
+    }
+
+    // Check individual value sizes
+    for (key, value) in metadata.iter() {
+        if value.len() > MAX_METADATA_VALUE_SIZE {
+            return Err(SwiftError::BadRequest(format!(
+                "Metadata value for '{}' too large: {} bytes (max: {} bytes)",
+                key,
+                value.len(),
+                MAX_METADATA_VALUE_SIZE
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
 pub use storage_api::public_api::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
 pub(crate) use storage_api::public_api::{
-    get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, set_swift_bucket_metadata,
+    get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, update_swift_bucket_tagging,
 };
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};
