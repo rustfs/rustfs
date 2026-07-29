@@ -4225,7 +4225,7 @@ mod tests {
         let cycle_state = metrics.cycle_info.read().await;
         let mut start_transition = Box::pin(metrics.start_scan_cycle_work_with_cycle(active_cycle));
         let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(&waker);
+        let mut context = std::task::Context::from_waker(waker);
         assert!(start_transition.as_mut().poll(&mut context).is_pending());
         assert!(!metrics.current_scan_cycle_work_active.load(Ordering::Acquire));
         drop(cycle_state);
@@ -4269,7 +4269,7 @@ mod tests {
         let paths = metrics.current_paths.write().await;
         let mut report = Box::pin(metrics.report());
         let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(&waker);
+        let mut context = std::task::Context::from_waker(waker);
         assert!(report.as_mut().poll(&mut context).is_pending());
 
         metrics
