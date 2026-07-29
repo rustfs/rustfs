@@ -23,9 +23,9 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
-        HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer,
-        RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer, StsQueryApiCompatLayer,
-        VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
+        PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
+        StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     tls_material::{
@@ -34,7 +34,6 @@ use crate::server::{
     },
 };
 use crate::storage_api::server::http as storage;
-use crate::storage_api::server::http::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::{
@@ -1135,47 +1134,6 @@ struct PathDispatchService<A, B> {
     internode: B,
 }
 
-#[derive(Clone, Default)]
-struct InternodeRequestContextLiteLayer;
-
-impl<S> tower::Layer<S> for InternodeRequestContextLiteLayer {
-    type Service = InternodeRequestContextLiteService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        InternodeRequestContextLiteService { inner }
-    }
-}
-
-#[derive(Clone)]
-struct InternodeRequestContextLiteService<S> {
-    inner: S,
-}
-
-impl<S, B> Service<HttpRequest<B>> for InternodeRequestContextLiteService<S>
-where
-    S: Service<HttpRequest<B>> + Clone,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
-        let request_id = extract_request_id_from_headers(req.headers());
-        req.extensions_mut().insert(RequestContext {
-            x_amz_request_id: request_id.clone(),
-            request_id,
-            trace_id: None,
-            span_id: None,
-            start_time: std::time::Instant::now(),
-        });
-        self.inner.call(req)
-    }
-}
-
 impl<A, B> PathDispatchService<A, B> {
     fn new(external: A, internode: B) -> Self {
         Self { external, internode }
@@ -1388,34 +1346,28 @@ fn process_connection(
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
-        //  4. SetRequestIdLayer                       — generates X-Request-ID
-        //  5. RequestContextLayer                    — creates RequestContext in extensions
-        //  6. StsQueryApiCompatLayer                 — route-scoped STS envelopes, including outer short-circuit errors
-        //  7. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
-        //  8. CatchPanicLayer                        — panic → 500
-        //  9. RateLimitLayer                         — conditional (external stack only), per-client 429 throttling
-        // 10. ReadinessGateLayer                     — blocks until ready
-        // 11. KeystoneAuthLayer                      — X-Auth-Token validation
-        // 12. TraceLayer                             — request span creation + metrics
-        // 13. RequestLoggingLayer                    — single completion event per request
-        // 14. PropagateRequestIdLayer                — X-Request-ID → response
-        // 15. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 16. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 17. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 18. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        // 19. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 20. ConditionalCorsLayer                   — S3 API CORS
-        // 21. RedirectLayer                          — console redirect (conditional)
-        // 22. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 23. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 24. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 25. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 26. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        //  4. ExternalRequestContextLayer            — S3 canonical ID / control-plane propagated ID
+        //  5. StsQueryApiCompatLayer                 — route-scoped STS envelopes, including outer short-circuit errors
+        //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
+        //  7. CatchPanicLayer                        — panic → 500
+        //  8. RateLimitLayer                         — conditional (external stack only), per-client 429 throttling
+        //  9. ReadinessGateLayer                     — blocks until ready
+        // 10. KeystoneAuthLayer                      — X-Auth-Token validation
+        // 11. TraceLayer                             — request span creation + metrics
+        // 12. RequestLoggingLayer                    — single completion event per request
+        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 18. ConditionalCorsLayer                   — S3 API CORS
+        // 19. RedirectLayer                          — console redirect (conditional)
+        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
+        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
         // ─────────────────────────────────────────────────────────────
-        // Batch 1 intentionally keeps the external and internode stacks behaviorally
-        // identical while giving each path family a named construction boundary.
-        // Later batches will trim internode-only middleware without risking drift in
-        // the public HTTP stack.
         let build_external_stack = |service| {
             ServiceBuilder::new()
                 // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -1430,8 +1382,7 @@ fn process_connection(
                 // This should be placed before TraceLayer so that logs reflect the real client IP
                 // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
                 .option_layer(trusted_proxy_layer.clone())
-                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-                .layer(InternodeRequestContextLiteLayer)
+                .layer(ExternalRequestContextLayer::new(is_console))
                 .layer(StsQueryApiCompatLayer)
                 .layer(EmptyBodyContentLengthCompatLayer)
                 .layer(CatchPanicLayer::new())
@@ -1584,7 +1535,6 @@ fn process_connection(
                         }),
                 )
                 .layer(RequestLoggingLayer)
-                .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
                 .layer(PathCategoryInjectionLayer)
                 .layer(S3ErrorMessageCompatLayer)

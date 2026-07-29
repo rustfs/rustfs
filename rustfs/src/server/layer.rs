@@ -17,27 +17,28 @@ use crate::admin::console::is_console_path;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
-use crate::server::hybrid::HybridBody;
+use crate::server::hybrid::{HybridBody, is_grpc_request};
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
-    MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, build_health_response_parts,
-    collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
+    MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests,
+    build_health_response_parts, collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 use crate::storage_api::server::layer::apply_cors_headers;
-use crate::storage_api::server::layer::request_context::{
-    RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
-};
+use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
 use futures::future::Either;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use pin_project_lite::pin_project;
 use quick_xml::events::Event;
+#[cfg(feature = "swift")]
+use rustfs_protocols::swift::SwiftRouter;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
-use rustfs_utils::http::headers::AMZ_REQUEST_ID;
+use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
 use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -62,6 +63,8 @@ const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 const STS_RESPONSE_METADATA_TAG: &str = "ResponseMetadata";
 const STS_REQUEST_ID_TAG: &str = "RequestId";
 const STS_SUCCESS_RESPONSE_TAGS: [&str; 2] = ["AssumeRoleResponse", "AssumeRoleWithWebIdentityResponse"];
+#[cfg(feature = "swift")]
+const SWIFT_API_PATH_PREFIX: &str = "/v1/";
 
 pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let path = uri.path();
@@ -117,9 +120,6 @@ fn is_object_zip_download_path(path: &str) -> bool {
 ///
 /// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
 /// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
-///
-/// Additionally, it preserves any upstream `x-amz-request-id` in the separate
-/// `RequestContext.x_amz_request_id` field without mutating signed request headers.
 #[derive(Clone, Default)]
 pub struct RequestContextLayer;
 
@@ -150,32 +150,162 @@ where
     }
 
     fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
-        let request_id = extract_request_id_from_headers(req.headers());
-
-        let (trace_id, span_id) = extract_trace_context_ids_from_headers(req.headers())
-            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
-            .unwrap_or((None, None));
-
-        // Preserve the upstream x-amz-request-id if present as the S3 compatibility alias;
-        // otherwise mirror the canonical internal request_id.
-        let x_amz_request_id = req
-            .headers()
-            .get(AMZ_REQUEST_ID)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from)
-            .unwrap_or_else(|| request_id.clone());
-
-        let ctx = RequestContext {
-            request_id,
-            x_amz_request_id,
-            trace_id,
-            span_id,
-            start_time: Instant::now(),
-        };
-
-        req.extensions_mut().insert(ctx);
+        let request_context = RequestContext::from_headers(req.headers());
+        req.extensions_mut().insert(request_context);
 
         self.inner.call(req)
+    }
+}
+
+fn uses_server_owned_s3_request_id<B>(req: &HttpRequest<B>, console_redirect_enabled: bool) -> bool {
+    if is_grpc_request(req)
+        || req.uri().path().starts_with(RPC_PREFIX)
+        || is_sts_query_request(req.method(), req.uri(), req.headers())
+        || (console_redirect_enabled && is_console_redirect_request(req))
+    {
+        return false;
+    }
+
+    #[cfg(feature = "swift")]
+    if req.uri().path().starts_with(SWIFT_API_PATH_PREFIX)
+        && SwiftRouter::new(true, None).route(req.uri(), req.method().clone()).is_some()
+    {
+        return false;
+    }
+
+    let path = req.uri().path();
+    let method = req.method();
+    let is_admin_health_request =
+        (method == Method::GET || method == Method::HEAD) && matches!(path, HEALTH_PREFIX | HEALTH_READY_PATH);
+    let is_profile_request = method == Method::GET && matches!(path, PROFILE_CPU_PATH | PROFILE_MEMORY_PATH);
+    let is_public_health_alias_request = (method == Method::GET || method == Method::HEAD)
+        && matches!(
+            path,
+            HEALTH_COMPAT_LIVE_PATH
+                | MINIO_HEALTH_LIVE_PATH
+                | MINIO_HEALTH_READY_PATH
+                | MINIO_HEALTH_CLUSTER_PATH
+                | MINIO_HEALTH_CLUSTER_READ_PATH
+        )
+        && is_public_health_endpoint_request(method, path);
+
+    !(is_admin_path(path)
+        || is_console_path(path)
+        || is_admin_health_request
+        || is_profile_request
+        || is_public_health_alias_request)
+}
+
+/// Creates a server-owned context and response ID for S3 requests while
+/// preserving the existing request-ID propagation contract for non-S3 routes.
+#[derive(Clone, Default)]
+pub struct ExternalRequestContextLayer {
+    console_redirect_enabled: bool,
+}
+
+impl ExternalRequestContextLayer {
+    pub(crate) fn new(console_redirect_enabled: bool) -> Self {
+        Self {
+            console_redirect_enabled,
+        }
+    }
+}
+
+impl<S> Layer<S> for ExternalRequestContextLayer {
+    type Service = ExternalRequestContextService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ExternalRequestContextService {
+            inner,
+            console_redirect_enabled: self.console_redirect_enabled,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ExternalRequestContextService<S> {
+    inner: S,
+    console_redirect_enabled: bool,
+}
+
+impl<S, B, ResBody> Service<HttpRequest<B>> for ExternalRequestContextService<S>
+where
+    S: Service<HttpRequest<B>, Response = Response<ResBody>>,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = ExternalRequestContextFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let is_s3 = uses_server_owned_s3_request_id(&req, self.console_redirect_enabled);
+        let has_request_id = req.headers().contains_key(REQUEST_ID_HEADER);
+        let request_context = if is_s3 {
+            let request_context = RequestContext::from_external_headers_without_trace_context(req.headers());
+            if !has_request_id && let Ok(request_id) = HeaderValue::from_str(&request_context.request_id) {
+                req.headers_mut().insert(REQUEST_ID_HEADER, request_id);
+            }
+            request_context
+        } else {
+            if !has_request_id {
+                let request_id = uuid::Uuid::new_v4().to_string();
+                if let Ok(request_id) = HeaderValue::from_str(&request_id) {
+                    req.headers_mut().insert(REQUEST_ID_HEADER, request_id);
+                }
+            }
+            RequestContext::from_headers_without_trace_context(req.headers())
+        };
+        let request_id = if is_s3 {
+            HeaderValue::from_str(&request_context.request_id).ok()
+        } else {
+            req.headers().get(REQUEST_ID_HEADER).cloned()
+        };
+        req.extensions_mut().insert(request_context);
+
+        ExternalRequestContextFuture {
+            inner: self.inner.call(req),
+            request_id,
+            is_s3,
+        }
+    }
+}
+
+pin_project! {
+    pub struct ExternalRequestContextFuture<F> {
+        #[pin]
+        inner: F,
+        request_id: Option<HeaderValue>,
+        is_s3: bool,
+    }
+}
+
+impl<F, ResBody, E> Future for ExternalRequestContextFuture<F>
+where
+    F: Future<Output = Result<Response<ResBody>, E>>,
+{
+    type Output = Result<Response<ResBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut response = match this.inner.poll(cx) {
+            Poll::Ready(Ok(response)) => response,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        };
+
+        if let Some(request_id) = this.request_id.take() {
+            if *this.is_s3 {
+                response.headers_mut().insert(REQUEST_ID_HEADER, request_id.clone());
+                response.headers_mut().insert(AMZ_REQUEST_ID, request_id);
+            } else if !response.headers().contains_key(REQUEST_ID_HEADER) {
+                response.headers_mut().insert(REQUEST_ID_HEADER, request_id);
+            }
+        }
+
+        Poll::Ready(Ok(response))
     }
 }
 
@@ -395,6 +525,18 @@ pub struct RedirectService<S> {
     inner: S,
 }
 
+fn is_console_redirect_request<B>(req: &HttpRequest<B>) -> bool {
+    let path = req.uri().path().trim_end_matches('/');
+    req.method() == http::Method::GET
+        && !req.headers().contains_key(http::header::AUTHORIZATION)
+        && req
+            .headers()
+            .get(http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|user_agent| user_agent.contains("Mozilla"))
+        && (path.is_empty() || path == "/rustfs" || path == "/index.html")
+}
+
 impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for RedirectService<S>
 where
     S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
@@ -412,20 +554,8 @@ where
     }
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
-        // Check if this is a GET request without Authorization header and User-Agent contains Mozilla
-        // and the path is either "/" or "/index.html"
         let path = req.uri().path().trim_end_matches('/');
-        let should_redirect = req.method() == http::Method::GET
-            && !req.headers().contains_key(http::header::AUTHORIZATION)
-            && req
-                .headers()
-                .get(http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .map(|ua| ua.contains("Mozilla"))
-                .unwrap_or(false)
-            && (path.is_empty() || path == "/rustfs" || path == "/index.html");
-
-        if should_redirect {
+        if is_console_redirect_request(&req) {
             debug!("Redirecting browser request from {} to console", path);
 
             // Create redirect response
@@ -1733,7 +1863,7 @@ impl ConditionalCorsLayer {
         // Expose common headers
         response_headers.insert(
             cors::response::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("x-request-id, content-type, content-length, etag"),
+            HeaderValue::from_static("x-request-id, x-amz-request-id, content-type, content-length, etag"),
         );
 
         // Credentials are only safe for origins matched from an explicit allow-list.
@@ -2046,11 +2176,24 @@ mod tests {
     #[derive(Clone, Default)]
     struct HeaderCaptureService {
         headers: Arc<Mutex<Option<HeaderMap>>>,
+        request_context: Arc<Mutex<Option<RequestContext>>>,
+        response_request_id: Option<HeaderValue>,
     }
 
     impl HeaderCaptureService {
+        fn with_response_request_id(request_id: &'static str) -> Self {
+            Self {
+                response_request_id: Some(HeaderValue::from_static(request_id)),
+                ..Self::default()
+            }
+        }
+
         fn headers(&self) -> Arc<Mutex<Option<HeaderMap>>> {
             Arc::clone(&self.headers)
+        }
+
+        fn request_context(&self) -> Arc<Mutex<Option<RequestContext>>> {
+            Arc::clone(&self.request_context)
         }
     }
 
@@ -2065,8 +2208,321 @@ mod tests {
 
         fn call(&mut self, req: Request<B>) -> Self::Future {
             *self.headers.lock().expect("capture headers") = Some(req.headers().clone());
-            ready(Ok(Response::new(Full::from(Bytes::new()))))
+            *self.request_context.lock().expect("capture request context") = req.extensions().get::<RequestContext>().cloned();
+            let mut response = Response::new(Full::from(Bytes::new()));
+            if let Some(request_id) = self.response_request_id.clone() {
+                response.headers_mut().insert(REQUEST_ID_HEADER, request_id);
+            }
+            ready(Ok(response))
         }
+    }
+
+    async fn assert_non_s3_request_id_contract(mut request: Request<()>, route: &str) {
+        let capture = HeaderCaptureService::default();
+        let captured_context = capture.request_context();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        request
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-request-id"));
+        request
+            .headers_mut()
+            .insert(AMZ_REQUEST_ID, HeaderValue::from_static("client-amz-request-id"));
+
+        let response = service.call(request).await.expect("non-S3 response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("client-request-id"),
+            "non-S3 x-request-id contract changed for {route}"
+        );
+        assert!(
+            !response.headers().contains_key(AMZ_REQUEST_ID),
+            "non-S3 response unexpectedly gained x-amz-request-id for {route}"
+        );
+        let context = captured_context
+            .lock()
+            .expect("captured request context")
+            .clone()
+            .expect("non-S3 request context");
+        assert_eq!(context.request_id, "client-request-id", "non-S3 context changed for {route}");
+        assert_eq!(context.x_amz_request_id, "client-request-id");
+        assert!(context.trace_id.is_none());
+        assert!(context.span_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_request_context_rejects_client_request_id_as_canonical() {
+        let capture = HeaderCaptureService::default();
+        let captured_headers = capture.headers();
+        let captured_context = capture.request_context();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let mut request = Request::builder().uri("/bucket/object").body(()).expect("build S3 request");
+        request
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-supplied-request-id"));
+        request
+            .headers_mut()
+            .insert(AMZ_REQUEST_ID, HeaderValue::from_static("client-supplied-amz-request-id"));
+
+        let response = service.call(request).await.expect("response");
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("canonical request ID");
+
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+        assert_ne!(request_id, "client-supplied-request-id");
+        assert_eq!(
+            response.headers().get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some(request_id)
+        );
+        let headers = captured_headers.lock().expect("captured headers");
+        let headers = headers.as_ref().expect("inner request headers");
+        assert_eq!(headers.get(REQUEST_ID_HEADER).expect("client x-request-id"), "client-supplied-request-id");
+        assert_eq!(
+            headers.get(AMZ_REQUEST_ID).expect("client x-amz-request-id"),
+            "client-supplied-amz-request-id"
+        );
+        let context = captured_context
+            .lock()
+            .expect("captured request context")
+            .clone()
+            .expect("S3 request context");
+        assert_eq!(context.request_id, request_id);
+    }
+
+    #[tokio::test]
+    async fn external_request_context_replaces_empty_response_id() {
+        let capture = HeaderCaptureService::default();
+        let captured_headers = capture.headers();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let mut request = Request::builder().uri("/bucket/object").body(()).expect("build S3 request");
+        request.headers_mut().insert(REQUEST_ID_HEADER, HeaderValue::from_static(""));
+        request.headers_mut().insert(AMZ_REQUEST_ID, HeaderValue::from_static("   "));
+
+        let response = service.call(request).await.expect("response");
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("canonical request ID");
+
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+        assert_eq!(
+            response.headers().get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some(request_id)
+        );
+        let headers = captured_headers.lock().expect("captured headers");
+        let headers = headers.as_ref().expect("inner request headers");
+        assert_eq!(headers.get(REQUEST_ID_HEADER).expect("empty client x-request-id"), "");
+        assert_eq!(headers.get(AMZ_REQUEST_ID).expect("blank client x-amz-request-id"), "   ");
+    }
+
+    #[tokio::test]
+    async fn external_request_context_inserts_generated_id_when_header_is_absent() {
+        let capture = HeaderCaptureService::default();
+        let captured_headers = capture.headers();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let request = Request::builder().uri("/bucket/object").body(()).expect("build S3 request");
+
+        let response = service.call(request).await.expect("response");
+        let response_request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("canonical request ID");
+        let headers = captured_headers.lock().expect("captured headers");
+        let headers = headers.as_ref().expect("inner request headers");
+
+        assert_eq!(
+            headers.get(REQUEST_ID_HEADER).and_then(|value| value.to_str().ok()),
+            Some(response_request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_s3_request_id_contract_preserves_client_correlation() {
+        for path in [
+            "/rustfs/admin/v3/info",
+            "/minio/admin/v3/info",
+            "/rustfs/console/",
+            HEALTH_PREFIX,
+            "/iceberg/v1/config",
+            "/rustfs/rpc/v1/read-file",
+            "/rustfs/rpcx",
+        ] {
+            let request = Request::builder().uri(path).body(()).expect("build non-S3 request");
+            assert_non_s3_request_id_contract(request, path).await;
+        }
+    }
+
+    #[test]
+    fn console_redirect_request_id_contract_follows_redirect_enablement() {
+        for path in ["/", "/rustfs", "/index.html"] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(http::header::USER_AGENT, "Mozilla/5.0")
+                .body(())
+                .expect("build console redirect request");
+
+            assert!(!uses_server_owned_s3_request_id(&request, true));
+            assert!(uses_server_owned_s3_request_id(&request, false));
+        }
+    }
+
+    #[test]
+    fn method_scoped_control_routes_preserve_request_id_contract() {
+        for path in [HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH] {
+            let control_request = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(())
+                .expect("build control-plane request");
+            assert!(!uses_server_owned_s3_request_id(&control_request, false));
+
+            let s3_request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(())
+                .expect("build S3 request");
+            assert!(uses_server_owned_s3_request_id(&s3_request, false));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn public_health_alias_request_id_contract_follows_enablement() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(MINIO_HEALTH_LIVE_PATH)
+            .body(())
+            .expect("build health request");
+
+        with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"), || {
+            assert!(!uses_server_owned_s3_request_id(&request, false));
+        });
+        with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"), || {
+            assert!(uses_server_owned_s3_request_id(&request, false));
+        });
+    }
+
+    #[tokio::test]
+    async fn grpc_request_id_contract_preserves_client_correlation() {
+        for path in [
+            "/node_service.NodeService/GetMetrics",
+            "/node_service.HealControlService/HealControl",
+            "/node_service.TierMutationControlService/PrepareTierMutation",
+        ] {
+            let request = Request::builder()
+                .version(http::Version::HTTP_2)
+                .uri(path)
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .body(())
+                .expect("build gRPC request");
+            assert_non_s3_request_id_contract(request, path).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sts_query_request_id_contract_preserves_client_correlation() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(())
+            .expect("build STS Query request");
+        assert_non_s3_request_id_contract(request, "STS Query").await;
+    }
+
+    #[cfg(feature = "swift")]
+    #[tokio::test]
+    async fn swift_request_id_contract_preserves_client_correlation() {
+        let path = "/v1/AUTH_project/container/object";
+        let request = Request::builder().uri(path).body(()).expect("build Swift request");
+        assert_non_s3_request_id_contract(request, path).await;
+    }
+
+    #[cfg(feature = "swift")]
+    #[tokio::test]
+    async fn non_swift_v1_path_keeps_s3_request_id_contract() {
+        let capture = HeaderCaptureService::default();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let mut request = Request::builder()
+            .uri("/v1/not-a-swift-account/object")
+            .body(())
+            .expect("build S3 request");
+        request
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-request-id"));
+
+        let response = service.call(request).await.expect("S3 response");
+        let response_request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("S3 response request ID");
+
+        assert!(uuid::Uuid::parse_str(response_request_id).is_ok());
+        assert_eq!(
+            response.headers().get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some(response_request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_s3_response_preserves_handler_request_id() {
+        let capture = HeaderCaptureService::with_response_request_id("handler-request-id");
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let mut request = Request::builder()
+            .uri("/rustfs/admin/v3/info")
+            .body(())
+            .expect("build admin request");
+        request
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, HeaderValue::from_static("client-request-id"));
+
+        let response = service.call(request).await.expect("admin response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("handler-request-id")
+        );
+        assert!(!response.headers().contains_key(AMZ_REQUEST_ID));
+    }
+
+    #[tokio::test]
+    async fn non_s3_request_without_id_generates_only_x_request_id() {
+        let capture = HeaderCaptureService::default();
+        let captured_context = capture.request_context();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let request = Request::builder()
+            .uri("/rustfs/admin/v3/info")
+            .body(())
+            .expect("build admin request");
+
+        let response = service.call(request).await.expect("admin response");
+        let response_request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("generated admin request ID");
+
+        assert!(uuid::Uuid::parse_str(response_request_id).is_ok());
+        assert!(!response.headers().contains_key(AMZ_REQUEST_ID));
+        let context = captured_context
+            .lock()
+            .expect("captured request context")
+            .clone()
+            .expect("admin request context");
+        assert_eq!(context.request_id, response_request_id);
     }
 
     #[derive(Clone, Default)]
@@ -3571,6 +4027,12 @@ mod tests {
             "https://allowed.com"
         );
         assert_eq!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
+        let exposed = resp_headers
+            .get(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .expect("exposed response headers");
+        assert!(exposed.split(',').any(|header| header.trim() == "x-request-id"));
+        assert!(exposed.split(',').any(|header| header.trim() == "x-amz-request-id"));
     }
 
     #[test]
@@ -3619,7 +4081,7 @@ mod tests {
     }
 
     #[test]
-    fn request_context_layer_preserves_upstream_s3_request_id() {
+    fn request_context_layer_does_not_mutate_upstream_s3_request_id() {
         let mut service = RequestContextLayer.layer(CaptureService);
         let request = Request::builder()
             .uri("/bucket/object")

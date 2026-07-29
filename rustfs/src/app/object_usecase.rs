@@ -72,7 +72,7 @@ use super::storage_api::object_usecase::error::{
     is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use super::storage_api::object_usecase::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
@@ -130,9 +130,7 @@ use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_targets::{
-    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-};
+use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
@@ -6540,6 +6538,7 @@ impl DefaultObjectUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects).suppress_event();
+        let request_context = helper.request_context_or_from_request(&req);
         let (bucket, delete) = {
             let bucket = req.input.bucket.clone();
             let delete = req.input.delete.clone();
@@ -6948,10 +6947,12 @@ impl DefaultObjectUsecase {
 
         let req_headers = req.headers.clone();
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let req_params = rustfs_targets::extract_params_header(&req_headers);
+        let resp_elements =
+            build_event_resp_elements(&S3Response::new(DeleteObjectsOutput::default()), &request_context.request_id);
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
         let notify_bucket = bucket.clone();
-        spawn_background_with_context(request_context, async move {
+        spawn_background_with_context(Some(request_context), async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
@@ -6966,8 +6967,8 @@ impl DefaultObjectUsecase {
                         }),
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                    .req_params(extract_params_header(&req_headers))
-                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .req_params(req_params.clone())
+                    .resp_elements(resp_elements.clone())
                     .host(get_request_host(&req_headers))
                     .user_agent(get_request_user_agent(&req_headers))
                     .build();
@@ -7849,6 +7850,7 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
+        let request_context = helper.request_context_or_from_request(&req);
         let auth_method = req.method.clone();
         let auth_uri = req.uri.clone();
         let auth_headers = req.headers.clone();
@@ -8025,7 +8027,7 @@ impl DefaultObjectUsecase {
         };
 
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let req_params = extract_params_header(&req.headers);
+        let req_params = rustfs_targets::extract_params_header(&req.headers);
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
@@ -8254,7 +8256,7 @@ impl DefaultObjectUsecase {
                 bucket_name: bucket.clone(),
                 object: convert_ecstore_object_info(obj_info.clone()),
                 req_params: req_params.clone(),
-                resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
+                resp_elements: build_event_resp_elements(&S3Response::new(output.clone()), &request_context.request_id),
                 version_id: version_id.clone(),
                 host: host.clone(),
                 port,
@@ -8262,8 +8264,7 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
+            spawn_background_with_context(Some(request_context.clone()), async move {
                 notify.notify(event_args).await;
             });
         }
