@@ -26,6 +26,8 @@ use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
 use std::future::Future;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -33,7 +35,7 @@ const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MultipartCommitPause {
+pub(crate) enum MultipartCommitPause {
     PutPartBeforeLockLost,
     PutPartAfterRename,
     BeforeLockLost,
@@ -45,12 +47,13 @@ struct MultipartCommitBarrierState {
     bucket: String,
     object: String,
     pause: MultipartCommitPause,
+    armed: AtomicBool,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
 #[cfg(test)]
-struct MultipartCommitBarrier {
+pub(crate) struct MultipartCommitBarrier {
     state: Arc<MultipartCommitBarrierState>,
 }
 
@@ -60,11 +63,12 @@ static MULTIPART_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc
 
 #[cfg(test)]
 impl MultipartCommitBarrier {
-    fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
+    pub(crate) fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
         let state = Arc::new(MultipartCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
             pause,
+            armed: AtomicBool::new(true),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -78,13 +82,13 @@ impl MultipartCommitBarrier {
         Self { state }
     }
 
-    async fn wait_until_paused(&self) {
+    pub(crate) async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("multipart completion should reach the deterministic commit barrier");
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
 }
@@ -112,7 +116,9 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
         .as_ref()
         .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
         .cloned();
-    if let Some(barrier) = barrier {
+    if let Some(barrier) = barrier
+        && barrier.armed.swap(false, Ordering::AcqRel)
+    {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
     }
