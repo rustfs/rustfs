@@ -22,7 +22,10 @@ use super::storage_api::container::{
 };
 use super::types::Container;
 use super::{SwiftError, SwiftResult};
-use super::{get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, set_swift_bucket_metadata};
+use super::{
+    get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, update_swift_bucket_tagging,
+    validate_metadata,
+};
 use rustfs_credentials::Credentials;
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
@@ -483,6 +486,11 @@ pub async fn update_container_metadata(
     // Validate container name
     validate_container_name(container)?;
 
+    // These tags are persisted into the bucket metadata file, which every
+    // later config write rewrites in full — so unbounded metadata inflates
+    // the cost of unrelated writes for the life of the container.
+    validate_metadata(&metadata)?;
+
     // Create mapper with default config (tenant prefixing enabled)
     let mapper = ContainerMapper::default();
 
@@ -506,57 +514,30 @@ pub async fn update_container_metadata(
             }
         })?;
 
-    // Load current bucket metadata
-    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+    // Rewrite the persisted tags: replace swift-meta-* tags with the new
+    // metadata while preserving non-Swift tags. An empty result clears the
+    // tagging config.
+    update_swift_bucket_tagging(bucket_name, |current| {
+        let mut tagging = current.cloned().unwrap_or_else(|| Tagging { tag_set: vec![] });
 
-    let mut bucket_meta_clone = (*bucket_meta).clone();
+        tagging.tag_set.retain(|tag| {
+            if let Some(key) = &tag.key {
+                !key.starts_with("swift-meta-")
+            } else {
+                true // Keep tags with no key (shouldn't happen, but be safe)
+            }
+        });
 
-    // Get existing tags, preserving non-Swift tags
-    let mut existing_tagging = bucket_meta_clone
-        .tagging_config
-        .clone()
-        .unwrap_or_else(|| Tagging { tag_set: vec![] });
-
-    // Remove old swift-meta-* tags while preserving other tags
-    existing_tagging.tag_set.retain(|tag| {
-        if let Some(key) = &tag.key {
-            !key.starts_with("swift-meta-")
-        } else {
-            true // Keep tags with no key (shouldn't happen, but be safe)
+        if let Some(mut new_tagging) = swift_metadata_to_s3_tags(&metadata) {
+            tagging.tag_set.append(&mut new_tagging.tag_set);
         }
-    });
+        // If metadata.is_empty() and swift_metadata_to_s3_tags returns None,
+        // we've already removed swift-meta-* tags above, so only non-Swift
+        // tags remain
 
-    // Add new Swift metadata tags if provided
-    if let Some(mut new_tagging) = swift_metadata_to_s3_tags(&metadata) {
-        // Merge: existing non-Swift tags + new Swift tags
-        existing_tagging.tag_set.append(&mut new_tagging.tag_set);
-    }
-    // If metadata.is_empty() and swift_metadata_to_s3_tags returns None,
-    // we've already removed swift-meta-* tags above, so only non-Swift tags remain
-
-    let now = time::OffsetDateTime::now_utc();
-
-    if existing_tagging.tag_set.is_empty() {
-        // No tags remain after removing swift-meta-* tags; clear tagging config
-        bucket_meta_clone.tagging_config_xml = Vec::new();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = None;
-    } else {
-        // Serialize the merged tags to XML
-        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
-
-        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = Some(existing_tagging);
-    }
-
-    // Save updated metadata
-    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+        tagging
+    })
+    .await?;
 
     Ok(())
 }
@@ -819,44 +800,23 @@ pub async fn enable_versioning(
             }
         })?;
 
-    // Load current bucket metadata
-    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+    // Rewrite the persisted tags: replace any versioning tag with the new
+    // archive location while preserving all other tags.
+    update_swift_bucket_tagging(bucket_name, |current| {
+        let mut tagging = current.cloned().unwrap_or_else(|| Tagging { tag_set: vec![] });
 
-    let mut bucket_meta_clone = (*bucket_meta).clone();
+        tagging
+            .tag_set
+            .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
 
-    // Get existing tags
-    let mut existing_tagging = bucket_meta_clone
-        .tagging_config
-        .clone()
-        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+        tagging.tag_set.push(Tag {
+            key: Some("swift-versions-location".to_string()),
+            value: Some(archive_container.to_string()), // Store Swift container name, not S3 bucket name
+        });
 
-    // Remove old versioning tag if present
-    existing_tagging
-        .tag_set
-        .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
-
-    // Add new versioning tag
-    existing_tagging.tag_set.push(Tag {
-        key: Some("swift-versions-location".to_string()),
-        value: Some(archive_container.to_string()), // Store Swift container name, not S3 bucket name
-    });
-
-    let now = time::OffsetDateTime::now_utc();
-
-    // Serialize tags to XML
-    let tagging_xml = quick_xml::se::to_string(&existing_tagging)
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
-
-    bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
-    bucket_meta_clone.tagging_config_updated_at = now;
-    bucket_meta_clone.tagging_config = Some(existing_tagging);
-
-    // Save updated metadata
-    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+        tagging
+    })
+    .await?;
 
     Ok(())
 }
@@ -882,50 +842,38 @@ pub async fn disable_versioning(account: &str, container: &str, credentials: &Cr
     let mapper = ContainerMapper::default();
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
-    // Verify container exists
-    let Some(_store) = resolve_swift_object_store_handle() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
-    // Load current bucket metadata
-    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
+    // Verify container exists. Without this the rewrite below would persist a
+    // fabricated default for a container that does not exist: the metadata
+    // loader turns "no metadata on disk" into a fresh BucketMetadata, and
+    // writing that creates an orphan .metadata.bin and caches a fabricated
+    // default as authoritative.
+    store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container verification", e)
+            }
+        })?;
 
-    let mut bucket_meta_clone = (*bucket_meta).clone();
+    // Rewrite the persisted tags: drop the versioning tag while preserving
+    // all other tags. An empty result clears the tagging config.
+    update_swift_bucket_tagging(bucket_name, |current| {
+        let mut tagging = current.cloned().unwrap_or_else(|| Tagging { tag_set: vec![] });
 
-    // Get existing tags
-    let mut existing_tagging = bucket_meta_clone
-        .tagging_config
-        .clone()
-        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+        tagging
+            .tag_set
+            .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
 
-    // Remove versioning tag
-    existing_tagging
-        .tag_set
-        .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
-
-    let now = time::OffsetDateTime::now_utc();
-
-    if existing_tagging.tag_set.is_empty() {
-        // No tags remain; clear tagging config
-        bucket_meta_clone.tagging_config_xml = Vec::new();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = None;
-    } else {
-        // Serialize remaining tags to XML
-        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
-
-        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = Some(existing_tagging);
-    }
-
-    // Save updated metadata
-    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+        tagging
+    })
+    .await?;
 
     Ok(())
 }
@@ -1050,65 +998,37 @@ pub async fn set_container_acl(
             }
         })?;
 
-    // Load current bucket metadata
-    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+    // Rewrite the persisted tags: replace the ACL tags with the new grants
+    // while preserving all other tags. An empty result clears the tagging
+    // config.
+    update_swift_bucket_tagging(bucket_name, |current| {
+        let mut tagging = current.cloned().unwrap_or_else(|| Tagging { tag_set: vec![] });
 
-    let mut bucket_meta_clone = (*bucket_meta).clone();
+        tagging
+            .tag_set
+            .retain(|tag| tag.key.as_deref() != Some("swift-acl-read") && tag.key.as_deref() != Some("swift-acl-write"));
 
-    // Get existing tags
-    let mut existing_tagging = bucket_meta_clone
-        .tagging_config
-        .clone()
-        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+        if let Some(read) = read_acl
+            && !read.trim().is_empty()
+        {
+            tagging.tag_set.push(Tag {
+                key: Some("swift-acl-read".to_string()),
+                value: Some(read.to_string()),
+            });
+        }
 
-    // Remove old ACL tags
-    existing_tagging
-        .tag_set
-        .retain(|tag| tag.key.as_deref() != Some("swift-acl-read") && tag.key.as_deref() != Some("swift-acl-write"));
+        if let Some(write) = write_acl
+            && !write.trim().is_empty()
+        {
+            tagging.tag_set.push(Tag {
+                key: Some("swift-acl-write".to_string()),
+                value: Some(write.to_string()),
+            });
+        }
 
-    // Add new read ACL tag if provided
-    if let Some(read) = read_acl
-        && !read.trim().is_empty()
-    {
-        existing_tagging.tag_set.push(Tag {
-            key: Some("swift-acl-read".to_string()),
-            value: Some(read.to_string()),
-        });
-    }
-
-    // Add new write ACL tag if provided
-    if let Some(write) = write_acl
-        && !write.trim().is_empty()
-    {
-        existing_tagging.tag_set.push(Tag {
-            key: Some("swift-acl-write".to_string()),
-            value: Some(write.to_string()),
-        });
-    }
-
-    let now = time::OffsetDateTime::now_utc();
-
-    if existing_tagging.tag_set.is_empty() {
-        // No tags remain; clear tagging config
-        bucket_meta_clone.tagging_config_xml = Vec::new();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = None;
-    } else {
-        // Serialize tags to XML
-        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
-
-        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = Some(existing_tagging);
-    }
-
-    // Save updated metadata
-    set_swift_bucket_metadata(bucket_name, bucket_meta_clone)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+        tagging
+    })
+    .await?;
 
     debug!(
         "Set ACLs for container {}/{}: read={:?}, write={:?}",

@@ -26,13 +26,14 @@ use super::msgp_decode::{
     PrependByteReader, prealloc_hint, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value,
 };
 use super::*;
-use crate::ChecksumInfo;
+use crate::{ChecksumInfo, TransitionVersionState};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID,
     SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes, get_consistent_bytes, get_str,
-    has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
+    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes,
+    get_bytes, get_consistent_bytes, get_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
+    strip_internal_prefix,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -43,6 +44,7 @@ const MSGPACK_FIXEXT8: u8 = 0xd7;
 const MSGPACK_TIME_EXT_LEGACY: i8 = 5;
 const MSGPACK_TIME_EXT_OFFICIAL: i8 = -1;
 const MSGPACK_TIME_LEN: u8 = 12;
+const MAX_TRANSITION_VERSION_LEN: usize = 1024;
 
 /// Sentinel signature returned when a version has no computable body (invalid /
 /// missing inner object). Mirrors MinIO's `signatureErr` so such versions never
@@ -251,23 +253,93 @@ fn parse_legacy_uuid_bytes(bytes: &[u8], field: &str) -> Result<Option<Uuid>> {
 
 /// Decode a stored transitioned-version-id from a version's `meta_sys`.
 ///
-/// RustFS writes it as 16 raw UUID bytes; MinIO-migrated tiered objects store
-/// the remote tier's version id as a UUID *string*. Accept both, and treat any
-/// absent / nil / otherwise-unparseable value as "no tier version" (matching the
-/// tolerant pre-hardening behavior) rather than failing the whole object read —
-/// a malformed tier id must not make an otherwise-readable object unreadable.
-fn transitioned_version_id_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Option<Uuid> {
-    let value = get_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)?;
+/// Legacy RustFS writes used 16 raw UUID bytes. New writes and MinIO-migrated
+/// records use the provider's exact UTF-8 version text. Empty, nil UUID, and
+/// malformed bytes are not usable remote versions.
+fn transitioned_version_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Result<Option<String>> {
+    if !contains_key_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) {
+        return Ok(None);
+    }
+    let Some(value) = get_consistent_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) else {
+        return Ok(None);
+    };
+    let value = value.to_vec();
     if value.is_empty() {
-        return None;
+        return Ok(None);
     }
     if let Ok(id) = Uuid::from_slice(&value) {
-        return (!id.is_nil()).then_some(id);
+        return Ok((!id.is_nil()).then(|| id.to_string()));
     }
-    std::str::from_utf8(&value)
+    let Ok(value) = String::from_utf8(value) else {
+        return Ok(None);
+    };
+    if value.is_empty()
+        || value.len() > MAX_TRANSITION_VERSION_LEN
+        || value.chars().any(char::is_control)
+        || Uuid::parse_str(&value).is_ok_and(|id| id.is_nil())
+    {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn transition_version_state_from_meta_sys(
+    meta_sys: &HashMap<String, Vec<u8>>,
+    version: Option<&str>,
+) -> Result<TransitionVersionState> {
+    if !contains_key_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE) {
+        return Ok(TransitionVersionState::Unknown);
+    }
+    let value = get_consistent_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE).ok_or(Error::FileCorrupt)?;
+    let state = match value {
+        b"known-disabled" => TransitionVersionState::KnownDisabled,
+        b"suspended-null" => TransitionVersionState::SuspendedNull,
+        b"exact" => TransitionVersionState::Exact,
+        b"unknown" => TransitionVersionState::Unknown,
+        _ => return Err(Error::FileCorrupt),
+    };
+    let valid = match state {
+        TransitionVersionState::Unknown | TransitionVersionState::KnownDisabled => version.is_none(),
+        TransitionVersionState::SuspendedNull => version == Some("null"),
+        TransitionVersionState::Exact => version.is_some_and(|value| value != "null"),
+    };
+    valid.then_some(state).ok_or(Error::FileCorrupt)
+}
+
+fn transition_version_state_bytes(state: TransitionVersionState) -> &'static [u8] {
+    match state {
+        TransitionVersionState::Unknown => b"unknown",
+        TransitionVersionState::KnownDisabled => b"known-disabled",
+        TransitionVersionState::SuspendedNull => b"suspended-null",
+        TransitionVersionState::Exact => b"exact",
+    }
+}
+
+fn set_transition_version_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: TransitionVersionState) {
+    if state == TransitionVersionState::Unknown {
+        remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
+    } else {
+        insert_bytes(
+            meta_sys,
+            SUFFIX_TRANSITIONED_VERSION_STATE,
+            transition_version_state_bytes(state).to_vec(),
+        );
+    }
+}
+
+fn legacy_transitioned_version_id_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Option<Uuid> {
+    transitioned_version_from_meta_sys(meta_sys)
         .ok()
-        .and_then(|s| Uuid::parse_str(s.trim()).ok())
-        .filter(|id| !id.is_nil())
+        .flatten()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+}
+
+fn transitioned_version_bytes(fi: &FileInfo) -> Option<Vec<u8>> {
+    fi.transition_version
+        .as_ref()
+        .map(|version| version.as_bytes().to_vec())
+        .or_else(|| fi.transition_version_id.map(|version_id| version_id.as_bytes().to_vec()))
 }
 
 fn parse_legacy_erasure_algo(value: &str) -> ErasureAlgo {
@@ -2398,7 +2470,9 @@ impl MetaObject {
         let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transition_version_id = transitioned_version_id_from_meta_sys(&self.meta_sys);
+        let transition_version = transitioned_version_from_meta_sys(&self.meta_sys)?;
+        let transition_version_state = transition_version_state_from_meta_sys(&self.meta_sys, transition_version.as_deref())?;
+        let transition_version_id = transition_version.as_deref().and_then(|value| Uuid::parse_str(value).ok());
         let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
@@ -2419,6 +2493,8 @@ impl MetaObject {
             transition_status,
             transitioned_objname,
             transition_version_id,
+            transition_version,
+            transition_version_state,
             transition_tier,
             ..Default::default()
         })
@@ -2431,13 +2507,12 @@ impl MetaObject {
             SUFFIX_TRANSITIONED_OBJECTNAME,
             fi.transitioned_objname.as_bytes().to_vec(),
         );
-        if let Some(transition_version_id) = fi.transition_version_id.as_ref() {
-            insert_bytes(
-                &mut self.meta_sys,
-                SUFFIX_TRANSITIONED_VERSION_ID,
-                transition_version_id.as_bytes().to_vec(),
-            );
+        if let Some(transition_version) = transitioned_version_bytes(fi) {
+            insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
+        } else {
+            remove_bytes(&mut self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID);
         }
+        set_transition_version_state(&mut self.meta_sys, fi.transition_version_state);
         insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER, fi.transition_tier.as_bytes().to_vec());
         if let Some(destination_id) = get_str(&fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID) {
             insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, destination_id.into_bytes());
@@ -2501,6 +2576,7 @@ impl MetaObject {
                 SUFFIX_TRANSITION_TIER,
                 SUFFIX_TRANSITIONED_OBJECTNAME,
                 SUFFIX_TRANSITIONED_VERSION_ID,
+                SUFFIX_TRANSITIONED_VERSION_STATE,
             ] {
                 if let Some(v) = get_bytes(&self.meta_sys, suffix) {
                     insert_bytes(&mut delete_marker.meta_sys, suffix, v);
@@ -2562,8 +2638,11 @@ impl From<FileInfo> for MetaObject {
             );
         }
 
-        if let Some(vid) = &value.transition_version_id {
-            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, vid.as_bytes().to_vec());
+        if let Some(transition_version) = transitioned_version_bytes(&value) {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
+        }
+        if !value.transition_status.is_empty() {
+            set_transition_version_state(&mut meta_sys, value.transition_version_state);
         }
 
         if !value.transition_tier.is_empty() {
@@ -2706,7 +2785,11 @@ impl MetaDeleteMarker {
                 .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transition_version_id = transitioned_version_id_from_meta_sys(&self.meta_sys);
+            fi.transition_version = transitioned_version_from_meta_sys(&self.meta_sys).ok().flatten();
+            fi.transition_version_id = legacy_transitioned_version_id_from_meta_sys(&self.meta_sys);
+            fi.transition_version_state =
+                transition_version_state_from_meta_sys(&self.meta_sys, fi.transition_version.as_deref())
+                    .unwrap_or(TransitionVersionState::Unknown);
         }
 
         fi
@@ -2859,8 +2942,11 @@ impl From<FileInfo> for MetaDeleteMarker {
                 value.transitioned_objname.as_bytes().to_vec(),
             );
         }
-        if let Some(version_id) = value.transition_version_id {
-            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, version_id.as_bytes().to_vec());
+        if let Some(transition_version) = transitioned_version_bytes(&value) {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
+        }
+        if !value.transition_status.is_empty() || value.tier_free_version() {
+            set_transition_version_state(&mut meta_sys, value.transition_version_state);
         }
         if !value.transition_tier.is_empty() {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
@@ -3412,7 +3498,7 @@ mod tests {
             .insert("x-rustfs-internal-healing".to_string(), "true".to_string());
         marker.metadata.insert("content-type".to_string(), "text/plain".to_string());
         let remote_version_id = Uuid::new_v4();
-        marker.transition_version_id = Some(remote_version_id);
+        marker.transition_version = Some(remote_version_id.to_string());
 
         let converted = MetaDeleteMarker::from(marker);
 
@@ -3420,7 +3506,19 @@ mod tests {
         assert_eq!(converted.meta_sys.get("x-minio-internal-purgestatus"), Some(&b"pending".to_vec()));
         assert_eq!(
             get_bytes(&converted.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID),
-            Some(remote_version_id.as_bytes().to_vec())
+            Some(remote_version_id.to_string().into_bytes())
+        );
+        assert_eq!(
+            converted
+                .meta_sys
+                .get(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_ID}")),
+            Some(&remote_version_id.to_string().into_bytes())
+        );
+        assert_eq!(
+            converted
+                .meta_sys
+                .get(&format!("{}{SUFFIX_TRANSITIONED_VERSION_ID}", rustfs_utils::http::MINIO_INTERNAL_PREFIX)),
+            Some(&remote_version_id.to_string().into_bytes())
         );
         assert!(!converted.meta_sys.contains_key("x-rustfs-internal-healing"));
         assert!(!converted.meta_sys.contains_key("content-type"));
@@ -4097,19 +4195,129 @@ mod tests {
             .into_fileinfo("b", "k", false)
             .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, Some(id));
+        assert_eq!(fi.transition_version, Some(id.to_string()));
+        assert_eq!(fi.transition_version_state, TransitionVersionState::Unknown);
     }
 
     #[test]
-    fn meta_object_transition_version_id_unparseable_stays_readable_as_none() {
-        // A non-UUID / non-16-byte tier version id must NOT make the object
-        // unreadable; it is tolerated as "no tier version" (compat with
-        // pre-hardening behavior and foreign/edge metadata).
+    fn meta_object_transition_version_id_opaque_text_is_preserved() {
         let mut sys = HashMap::new();
-        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"opaque-generation-42".to_vec());
         let fi = make_meta_object_with_sys(sys)
             .into_fileinfo("b", "k", false)
-            .expect("unparseable transition version id must not fail the object read");
+            .expect("opaque transition version id must decode");
         assert_eq!(fi.transition_version_id, None);
+        assert_eq!(fi.transition_version.as_deref(), Some("opaque-generation-42"));
+        assert_eq!(fi.transition_version_state, TransitionVersionState::Unknown);
+    }
+
+    #[test]
+    fn meta_object_transition_version_state_exact_round_trips_dual_keys() {
+        let id = sample_version_id();
+        let expected_version = id.to_string();
+        let fi = FileInfo {
+            transition_status: "complete".to_string(),
+            transition_version: Some(expected_version.clone()),
+            transition_version_state: TransitionVersionState::Exact,
+            ..Default::default()
+        };
+
+        let object = MetaObject::from(fi);
+        assert_eq!(
+            object
+                .meta_sys
+                .get(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_STATE}"))
+                .map(Vec::as_slice),
+            Some(b"exact".as_slice())
+        );
+        assert_eq!(
+            object
+                .meta_sys
+                .get(&format!(
+                    "{}{SUFFIX_TRANSITIONED_VERSION_STATE}",
+                    rustfs_utils::http::MINIO_INTERNAL_PREFIX
+                ))
+                .map(Vec::as_slice),
+            Some(b"exact".as_slice())
+        );
+        assert_eq!(
+            legacy_transitioned_version_id_from_meta_sys(&object.meta_sys),
+            Some(id),
+            "UUID exact writes must remain readable by the legacy UUID consumer"
+        );
+        let decoded = object.into_fileinfo("b", "k", false).expect("exact state should round trip");
+        assert_eq!(decoded.transition_version_state, TransitionVersionState::Exact);
+        assert_eq!(decoded.transition_version.as_deref(), Some(expected_version.as_str()));
+    }
+
+    #[test]
+    fn set_transition_known_disabled_removes_stale_version_dual_keys() {
+        let mut meta_sys = HashMap::new();
+        insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, b"stale-legacy-version".to_vec());
+        let mut object = make_meta_object_with_sys(meta_sys);
+        object.set_transition(&FileInfo {
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_state: TransitionVersionState::KnownDisabled,
+            transition_tier: "WARM".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(get_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID), None);
+        assert!(
+            !object
+                .meta_sys
+                .contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_ID}"))
+        );
+        assert!(
+            !object
+                .meta_sys
+                .contains_key(&format!("{}{SUFFIX_TRANSITIONED_VERSION_ID}", rustfs_utils::http::MINIO_INTERNAL_PREFIX))
+        );
+        let decoded = object
+            .into_fileinfo("b", "k", false)
+            .expect("known-disabled transition must remain readable after replacing stale metadata");
+        assert_eq!(decoded.transition_version, None);
+        assert_eq!(decoded.transition_version_state, TransitionVersionState::KnownDisabled);
+    }
+
+    #[test]
+    fn meta_object_transition_version_state_conflict_fails_closed() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, sample_version_id().as_bytes().to_vec());
+        sys.insert(format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_STATE}"), b"exact".to_vec());
+        sys.insert(
+            format!("{}{SUFFIX_TRANSITIONED_VERSION_STATE}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            b"known-disabled".to_vec(),
+        );
+
+        make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect_err("conflicting state keys must fail closed");
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_invalid_utf8_yields_none() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, vec![0xff]);
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("invalid transition version bytes must not fail the object read");
+        assert_eq!(fi.transition_version_id, None);
+        assert_eq!(fi.transition_version, None);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_unsafe_text_yields_none() {
+        for value in [b"opaque\0version".to_vec(), vec![b'x'; MAX_TRANSITION_VERSION_LEN + 1]] {
+            let mut sys = HashMap::new();
+            insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, value);
+            let fi = make_meta_object_with_sys(sys)
+                .into_fileinfo("b", "k", false)
+                .expect("unsafe transition version text must not fail the object read");
+            assert_eq!(fi.transition_version_id, None);
+            assert_eq!(fi.transition_version, None);
+        }
     }
 
     #[test]
@@ -4123,6 +4331,7 @@ mod tests {
             .into_fileinfo("b", "k", false)
             .expect("string-form transition version id must decode");
         assert_eq!(fi.transition_version_id, Some(id));
+        assert_eq!(fi.transition_version, Some(id.to_string()));
     }
 
     #[test]
@@ -4152,16 +4361,14 @@ mod tests {
         }
         .into_fileinfo("b", "k", false);
         assert_eq!(fi.transition_version_id, Some(id));
+        assert_eq!(fi.transition_version, Some(id.to_string()));
     }
 
     #[test]
-    fn delete_marker_free_version_transition_version_id_unparseable_stays_readable() {
-        // A malformed tier version id must not make a free-version record corrupt:
-        // it decodes to None and stays readable. Otherwise free-version expiry
-        // fails and the remote-tier object leaks.
+    fn delete_marker_free_version_transition_version_id_opaque_text_is_preserved() {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
-        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"opaque-generation-42".to_vec());
         insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_OBJECTNAME, b"remote-object".to_vec());
         let fi = MetaDeleteMarker {
@@ -4172,8 +4379,9 @@ mod tests {
         .into_fileinfo("b", "k", false);
 
         assert_eq!(fi.transition_version_id, None);
+        assert_eq!(fi.transition_version.as_deref(), Some("opaque-generation-42"));
         fi.validate_for_metadata_read()
-            .expect("free-version record with an unparseable tier id must remain readable");
+            .expect("free-version record with an opaque tier id must remain readable");
     }
 
     #[test]
@@ -4193,6 +4401,7 @@ mod tests {
         .into_fileinfo("b", "k", false);
 
         assert_eq!(fi.transition_version_id, Some(id));
+        assert_eq!(fi.transition_version, Some(id.to_string()));
     }
 
     #[test]
