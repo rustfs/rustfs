@@ -1628,10 +1628,14 @@ impl PeerRestClient {
     pub async fn load_transition_tier_config(&self) -> Result<()> {
         match self.load_transition_tier_config_outcome().await {
             TierConfigReloadOutcome::Success => Ok(()),
-            TierConfigReloadOutcome::TransientReconnect(err) | TierConfigReloadOutcome::TransientRetrySameChannel(err) => {
-                self.finalize_result(Err(err)).await
-            }
-            TierConfigReloadOutcome::Terminal(err) => Err(err),
+            // Only a reconnect-class failure says anything about the channel.
+            // `finalize_result` marks the peer offline and evicts its connection
+            // whenever the message looks network-like, and a peer that answered
+            // and rejected the apply can easily report one ("release RPC failed:
+            // transport error"). Routing those through here would gate a healthy,
+            // responding peer out of every unrelated RPC.
+            TierConfigReloadOutcome::TransientReconnect(err) => self.finalize_result(Err(err)).await,
+            TierConfigReloadOutcome::TransientRetrySameChannel(err) | TierConfigReloadOutcome::Terminal(err) => Err(err),
         }
     }
 
@@ -1710,13 +1714,24 @@ fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
     message_has_network_needle(&message)
 }
 
+/// Classifies a reload the peer answered but refused to apply.
+///
+/// The peer replied, so the channel is healthy and only the remote apply
+/// failed. Those failures are transient by nature: the reload reads the tier
+/// mutation intents and takes the distributed tier-config lock, both of which
+/// fail while any other node is restarting or while the lock quorum is briefly
+/// disturbed. Retiring the worker on the first such rejection leaves that peer
+/// pinned to the old configuration with nothing left to heal it, so it answers
+/// `TierNotFound` for a tier the rest of the cluster already committed until a
+/// second admin mutation happens to spawn a fresh worker.
+///
+/// Convergence is the whole point of this path, so a rejection is retried on
+/// the same channel. The worker's exponential backoff caps the cost at one
+/// reload every `TIER_CONFIG_RELOAD_RETRY_CAP`, and `Terminal` stays reachable
+/// for transport and gRPC status failures, which is where a genuinely
+/// unrecoverable peer surfaces.
 fn tier_config_reload_remote_failure(error_info: Option<String>) -> TierConfigReloadOutcome {
-    let error_info = error_info.unwrap_or_default();
-    if matches!(error_info.as_str(), "errServerNotInitialized" | "ServerNotInitialized") {
-        TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info))
-    } else {
-        TierConfigReloadOutcome::Terminal(Error::other(error_info))
-    }
+    TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info.unwrap_or_default()))
 }
 
 fn tier_config_reload_status_outcome(status: tonic::Status) -> TierConfigReloadOutcome {
@@ -1726,6 +1741,14 @@ fn tier_config_reload_status_outcome(status: tonic::Status) -> TierConfigReloadO
         TierConfigReloadOutcome::TransientReconnect(status.into())
     } else if status.code() == Code::Unknown && status.message().starts_with("Service was not ready:") {
         TierConfigReloadOutcome::TransientRetrySameChannel(status.into())
+    } else if status.code() == Code::Unknown
+        && is_tier_config_reload_connection_failure(&Error::other(status.message().to_string()))
+    {
+        // tonic reports a connection dropped mid-call as `Unknown` carrying the
+        // transport error text rather than as `Unavailable`, which is what a peer
+        // restarting under an active mutation produces. Reconnect and retry, so
+        // the restart does not permanently retire this peer's reload worker.
+        TierConfigReloadOutcome::TransientReconnect(status.into())
     } else {
         TierConfigReloadOutcome::Terminal(status.into())
     }
@@ -2279,9 +2302,12 @@ mod tests {
             tier_config_reload_status_outcome(tonic::Status::cancelled("request cancelled")),
             TierConfigReloadOutcome::Terminal(_)
         ));
+        // A peer that answered and then refused the apply is retried rather than
+        // retired: the channel is healthy, so the rejection reflects remote state
+        // that the next attempt can find healed.
         assert!(matches!(
             tier_config_reload_remote_failure(Some("backend unavailable".to_string())),
-            TierConfigReloadOutcome::Terminal(_)
+            TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
         assert!(matches!(
             tier_config_reload_remote_failure(Some("errServerNotInitialized".to_string())),
@@ -2301,6 +2327,50 @@ mod tests {
             tier_config_reload_connection_outcome(Error::other(
                 "bucket unavailable-logs rejected it, then: can not get client, err: some other reason"
             )),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+    }
+
+    /// A tier mutation issued while another node restarts must still converge on
+    /// the nodes that stayed up. Those peers answer the reload RPC and reject the
+    /// apply, because reloading reads the tier mutation intents and takes the
+    /// distributed tier-config lock while the lock quorum is still disturbed.
+    /// Classifying those rejections as terminal retired the reload worker on its
+    /// first attempt and pinned the peer to the previous configuration, so it
+    /// served `TierNotFound` for an already-committed tier until an unrelated
+    /// second admin mutation spawned a new worker.
+    #[test]
+    fn tier_config_reload_retries_peers_that_reject_the_apply_mid_restart() {
+        for error_info in [
+            "Lock acquisition timeout for resource '.rustfs.sys/config/tier-config.bin.lock' after 5s",
+            "Resource '.rustfs.sys/config/tier-config.bin.lock' is already locked by node-3",
+            "Internal error: release RPC failed: transport error",
+            "save_config_with_opts: err: PreconditionFailed",
+            "erasure read quorum",
+        ] {
+            assert!(
+                matches!(
+                    tier_config_reload_remote_failure(Some(error_info.to_string())),
+                    TierConfigReloadOutcome::TransientRetrySameChannel(_)
+                ),
+                "a peer that rejected the apply must stay retryable so it converges: {error_info}"
+            );
+        }
+
+        // An absent error message is still a rejection, not a reason to stop.
+        assert!(matches!(
+            tier_config_reload_remote_failure(None),
+            TierConfigReloadOutcome::TransientRetrySameChannel(_)
+        ));
+
+        // tonic surfaces a connection dropped mid-call as `Unknown`, not `Unavailable`.
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unknown("transport error")),
+            TierConfigReloadOutcome::TransientReconnect(_)
+        ));
+        // An `Unknown` that is not transport-shaped stays terminal.
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unknown("peer response unknown")),
             TierConfigReloadOutcome::Terminal(_)
         ));
     }

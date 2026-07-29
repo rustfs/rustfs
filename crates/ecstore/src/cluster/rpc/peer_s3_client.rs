@@ -89,6 +89,22 @@ fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Erro
     reduce_write_quorum_errs(per_pool_errs, BUCKET_OP_IGNORED_ERRS, pool_write_quorum(per_pool_errs.len()))
 }
 
+fn resolve_heal_bucket_mode(opts: &mut HealOpts, pool_errs: &[Option<Error>]) -> Result<()> {
+    if opts.recreate {
+        return Ok(());
+    }
+    if let Some(err) = pool_errs
+        .iter()
+        .flatten()
+        .find(|err| **err != Error::DiskNotFound && **err != Error::VolumeNotFound)
+    {
+        return Err(err.clone());
+    }
+    opts.remove = is_all_buckets_not_found(pool_errs);
+    opts.recreate = !opts.remove;
+    Ok(())
+}
+
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
@@ -159,10 +175,7 @@ impl S3PeerSys {
             pool_errs.push(reduce_pool_write_quorum_errs(&per_pool_errs));
         }
 
-        if !opts.recreate {
-            opts.remove = is_all_buckets_not_found(&pool_errs);
-            opts.recreate = !opts.remove;
-        }
+        resolve_heal_bucket_mode(&mut opts, &pool_errs)?;
 
         let mut futures = Vec::new();
         let heal_bucket_results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.clients.len()]));
@@ -1616,6 +1629,30 @@ mod tests {
         let err = reduce_pool_write_quorum_errs(&per_pool_errs).expect("all pool participants returned VolumeExists");
 
         assert_eq!(err, Error::VolumeExists);
+    }
+
+    #[test]
+    fn heal_bucket_mode_fails_closed_on_incomplete_topology() {
+        let mut opts = HealOpts::default();
+        assert_eq!(
+            resolve_heal_bucket_mode(&mut opts, &[Some(Error::ErasureWriteQuorum)]),
+            Err(Error::ErasureWriteQuorum)
+        );
+        assert!(!opts.recreate);
+        assert!(!opts.remove);
+    }
+
+    #[test]
+    fn heal_bucket_mode_distinguishes_deleted_and_partial_buckets() {
+        let mut deleted = HealOpts::default();
+        resolve_heal_bucket_mode(&mut deleted, &[Some(Error::VolumeNotFound)]).unwrap();
+        assert!(deleted.remove);
+        assert!(!deleted.recreate);
+
+        let mut partial = HealOpts::default();
+        resolve_heal_bucket_mode(&mut partial, &[None, Some(Error::VolumeNotFound)]).unwrap();
+        assert!(!partial.remove);
+        assert!(partial.recreate);
     }
 
     #[tokio::test]
