@@ -342,6 +342,40 @@ message DeletePathsResponse {
   optional Error error = 2;
 }
 
+message SnapshotLeaseRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  uint64 ttl_ms = 4;
+}
+
+message SnapshotLeaseRenewRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bytes token = 4;
+  uint64 ttl_ms = 5;
+}
+
+message SnapshotLeaseReleaseRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bytes token = 4;
+}
+
+message SnapshotLeaseResponse {
+  bool success = 1;
+  bytes token = 2;
+  uint32 protocol_version = 3;
+  optional Error error = 4;
+}
+
+message SnapshotLeaseMutationResponse {
+  bool success = 1;
+  optional Error error = 2;
+}
+
 message ReadMetadataRequest {
   string disk = 1;
   string volume = 2;
@@ -966,6 +1000,9 @@ service NodeService {
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {};
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {};
   rpc Delete(DeleteRequest) returns (DeleteResponse) {};
+  rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {};
+  rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {};
+  rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {};
   rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {};
   rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {};
   rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {};

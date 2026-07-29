@@ -343,6 +343,7 @@ mod metrics;
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
     context: Option<Arc<runtime_sources::AppContext>>,
+    snapshot_lease_expiry: disk::SnapshotLeaseExpiryScheduler,
 }
 
 impl std::fmt::Debug for NodeService {
@@ -361,7 +362,11 @@ pub fn make_server() -> NodeService {
 
 pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer, context }
+    NodeService {
+        local_peer,
+        context,
+        snapshot_lease_expiry: disk::SnapshotLeaseExpiryScheduler::new(),
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1123,6 +1128,24 @@ impl Node for NodeService {
 
     async fn delete_paths(&self, request: Request<DeletePathsRequest>) -> Result<Response<DeletePathsResponse>, Status> {
         self.handle_delete_paths(request).await
+    }
+    async fn acquire_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        self.handle_acquire_snapshot_lease(request).await
+    }
+    async fn renew_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseRenewRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        self.handle_renew_snapshot_lease(request).await
+    }
+    async fn release_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        self.handle_release_snapshot_lease(request).await
     }
     async fn read_metadata(&self, request: Request<ReadMetadataRequest>) -> Result<Response<ReadMetadataResponse>, Status> {
         self.handle_read_metadata(request).await

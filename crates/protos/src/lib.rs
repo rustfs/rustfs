@@ -451,6 +451,10 @@ impl CanonicalBodyBuilder {
         self.body.push(u8::from(field));
     }
 
+    fn push_u64(&mut self, field: u64) {
+        self.body.extend_from_slice(&field.to_be_bytes());
+    }
+
     fn push_count(&mut self, count: usize) -> Result<(), std::num::TryFromIntError> {
         self.body.extend_from_slice(&u64::try_from(count)?.to_be_bytes());
         Ok(())
@@ -575,6 +579,40 @@ pub fn canonical_delete_paths_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_snapshot_lease_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_u64(request.ttl_ms);
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_renew_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseRenewRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-renew-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.token)?;
+    body.push_u64(request.ttl_ms);
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_release_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-release-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.token)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_rename_file_request_body(
     request: &proto_gen::node_service::RenameFileRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -662,7 +700,8 @@ mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
         DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
         MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        SettlePartTransactionRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
 
@@ -1017,6 +1056,58 @@ mod disk_mutation_canonical_tests {
         assert_ne!(
             canonical_make_volumes_request_body(&make_volumes).unwrap(),
             canonical_make_volumes_request_body(&merged).unwrap(),
+        );
+    }
+
+    #[test]
+    fn snapshot_lease_canonical_bodies_bind_every_field() {
+        let acquire = SnapshotLeaseRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            ttl_ms: 60_000,
+        };
+        let mut acquire_bodies = vec![canonical_snapshot_lease_request_body(&acquire).unwrap()];
+        for mutate in [
+            |r: &mut SnapshotLeaseRequest| r.disk = "d2".into(),
+            |r: &mut SnapshotLeaseRequest| r.volume = "v2".into(),
+            |r: &mut SnapshotLeaseRequest| r.path = "p2".into(),
+            |r: &mut SnapshotLeaseRequest| r.ttl_ms = 60_001,
+        ] {
+            let mut request = acquire.clone();
+            mutate(&mut request);
+            acquire_bodies.push(canonical_snapshot_lease_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&acquire_bodies);
+
+        let renew = SnapshotLeaseRenewRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+            ttl_ms: 60_000,
+        };
+        let mut changed_token = renew.clone();
+        changed_token.token = vec![2; 16].into();
+        let mut changed_ttl = renew.clone();
+        changed_ttl.ttl_ms += 1;
+        assert_all_distinct(&[
+            canonical_snapshot_lease_renew_request_body(&renew).unwrap(),
+            canonical_snapshot_lease_renew_request_body(&changed_token).unwrap(),
+            canonical_snapshot_lease_renew_request_body(&changed_ttl).unwrap(),
+        ]);
+
+        let release = SnapshotLeaseReleaseRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+        };
+        let mut changed_release = release.clone();
+        changed_release.token = vec![2; 16].into();
+        assert_ne!(
+            canonical_snapshot_lease_release_request_body(&release).unwrap(),
+            canonical_snapshot_lease_release_request_body(&changed_release).unwrap()
         );
     }
 
