@@ -8974,7 +8974,7 @@ mod tests {
         .await
         .expect("first worker result should persist");
         assert_eq!(first.state, ManualTransitionJobState::Running);
-        assert_eq!(first.report.transition_completed, 1);
+        assert_eq!(first.report.transition_completed, 0);
         assert_eq!(first.report.transition_failed, 0);
 
         let duplicate = record_manual_transition_worker_result(
@@ -8987,11 +8987,11 @@ mod tests {
         .await
         .expect("duplicate worker result should be idempotent");
         assert_eq!(duplicate.state, ManualTransitionJobState::Running);
-        assert_eq!(duplicate.report.transition_completed, 1);
+        assert_eq!(duplicate.report.transition_completed, 0);
         assert_eq!(duplicate.report.transition_failed, 0);
 
         let second_key = manual_transition_worker_result_task_key(&bucket, "logs/b", None);
-        let final_record = record_manual_transition_worker_result(
+        let pending_record = record_manual_transition_worker_result(
             ecstore.clone(),
             job_id,
             &second_key,
@@ -9000,7 +9000,14 @@ mod tests {
         )
         .await
         .expect("second distinct worker result should persist");
+        assert_eq!(pending_record.state, ManualTransitionJobState::Running);
+        assert_eq!(pending_record.report.transition_completed, 0);
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record =
+            reconcile_manual_transition_worker_results(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+                .await
+                .expect("worker result journal should reconcile");
         assert_eq!(final_record.state, ManualTransitionJobState::Partial);
         assert_eq!(final_record.report.transition_completed, 1);
         assert_eq!(final_record.report.transition_failed, 1);
@@ -9035,7 +9042,7 @@ mod tests {
             .expect("worker result job record should save");
 
         let task_key = manual_transition_worker_result_task_key(&bucket, "logs/fail", None);
-        let final_record = record_manual_transition_worker_result_with_reason(
+        let pending_record = record_manual_transition_worker_result_with_reason(
             ecstore.clone(),
             job_id,
             &task_key,
@@ -9045,7 +9052,12 @@ mod tests {
         )
         .await
         .expect("worker result with failure reason should persist");
+        assert!(pending_record.report.tier_failure_by_reason.is_empty());
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record = reconcile_manual_transition_worker_results(ecstore, job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("worker failure reason should reconcile");
         assert_eq!(
             final_record
                 .report
