@@ -134,6 +134,7 @@ socket2 = { workspace = true, optional = true, features = ["all"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
+rustfs-test-utils = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 tokio = { workspace = true, features = ["test-util", "macros", "fs"] }
 
