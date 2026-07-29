@@ -20,8 +20,8 @@
 //! rustfs/rustfs#4402) is anchored by the `ghsa_r5qv_*` tests in the module
 //! below, plus the broader negative-signature suite. The advisory class is: a
 //! node must never accept an RPC whose auth is missing, malformed, or signed
-//! with the default/empty shared secret. Body-bound v2 requests additionally
-//! receive process-local replay protection. See
+//! with the default/empty shared secret. Body-bound v2 requests and all replay-scoped v3
+//! requests additionally receive process-local replay protection. See
 //! `docs/testing/security-regressions.md` for the full advisory -> test map.
 //!
 //! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q>
@@ -50,13 +50,22 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 const SIGNATURE_HEADER: &str = "x-rustfs-signature";
-const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
-const RPC_AUTH_VERSION_HEADER: &str = "x-rustfs-rpc-auth-version";
+pub(crate) const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
+pub(crate) const RPC_AUTH_VERSION_HEADER: &str = "x-rustfs-rpc-auth-version";
 const RPC_SIGNATURE_V2_HEADER: &str = "x-rustfs-rpc-signature-v2";
 const RPC_NONCE_HEADER: &str = "x-rustfs-rpc-nonce";
 pub(crate) const RPC_CONTENT_SHA256_HEADER: &str = "x-rustfs-content-sha256";
-const RPC_AUTH_VERSION_V2: &str = "2";
+pub(crate) const RPC_AUTH_VERSION_V2: &str = "2";
+pub const RPC_REPLAY_SCOPE_VERSION_HEADER: &str = "x-rustfs-rpc-replay-scope-version";
+pub const RPC_REPLAY_SCOPE_SIGNATURE_HEADER: &str = "x-rustfs-rpc-signature-v3";
+pub const RPC_REPLAY_SCOPE_NONCE_HEADER: &str = "x-rustfs-rpc-replay-nonce";
+pub const RPC_BOOT_EPOCH_HEADER: &str = "x-rustfs-rpc-boot-epoch";
+pub const RPC_BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-challenge";
+pub const RPC_BOOT_EPOCH_PROOF_HEADER: &str = "x-rustfs-rpc-boot-epoch-proof";
+const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
+const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
+const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
@@ -75,9 +84,15 @@ static INTERNODE_RPC_BODY_DIGEST_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
     )
 });
-// Sized for peak legitimate body-bound mutation RPS x the retention window; overflow fails closed
-// and increments the replay-cache overflow counter. Clamped to at least 1 so a misconfigured zero
-// cannot disable replay protection by rejecting every body-bound request.
+static INTERNODE_RPC_REPLAY_SCOPE_STRICT: LazyLock<bool> = LazyLock::new(|| {
+    get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
+        rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
+    )
+});
+// Sized for peak legitimate authenticated RPC RPS x the retention window once replay scope is
+// active; overflow fails closed and increments the replay-cache overflow counter. Clamped to at
+// least 1 so a misconfigured zero cannot disable replay protection by rejecting every request.
 static REPLAY_CACHE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
     rustfs_utils::get_env_usize(
         rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
@@ -86,6 +101,7 @@ static REPLAY_CACHE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
     .max(1)
 });
 static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
+static RPC_BOOT_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 #[derive(Default)]
 struct RpcNonceCache {
@@ -313,6 +329,189 @@ fn verify_signature_v2(secret: &str, scope: SignatureV2Scope<'_>, signature: &st
     mac.verify_slice(&signature).is_ok()
 }
 
+#[derive(Clone, Copy)]
+struct ReplayScope<'a> {
+    audience: &'a str,
+    path: &'a str,
+    timestamp: &'a str,
+    nonce: Uuid,
+    content_sha256: &'a str,
+    boot_epoch: Uuid,
+}
+
+fn update_replay_scope(mac: &mut HmacSha256, scope: ReplayScope<'_>) {
+    mac.update(RPC_REPLAY_SCOPE_DOMAIN);
+    for part in [
+        scope.audience.as_bytes(),
+        b"|",
+        scope.path.as_bytes(),
+        b"|POST|",
+        scope.timestamp.as_bytes(),
+        b"|",
+        scope.nonce.as_bytes(),
+        b"|",
+        scope.content_sha256.as_bytes(),
+        b"|",
+        scope.boot_epoch.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+}
+
+fn generate_replay_scope_signature(secret: &str, scope: ReplayScope<'_>) -> std::io::Result<String> {
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_scope(&mut mac, scope);
+    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_replay_scope_signature(secret: &str, scope: ReplayScope<'_>, signature: &str) -> bool {
+    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+        return false;
+    };
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    update_replay_scope(&mut mac, scope);
+    mac.verify_slice(&signature).is_ok()
+}
+
+fn update_boot_epoch_proof(mac: &mut HmacSha256, audience: &str, challenge: Uuid, boot_epoch: Uuid) {
+    mac.update(RPC_BOOT_EPOCH_PROOF_DOMAIN);
+    mac.update(audience.as_bytes());
+    mac.update(b"|");
+    mac.update(challenge.as_bytes());
+    mac.update(boot_epoch.as_bytes());
+}
+
+fn generate_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_epoch: Uuid) -> std::io::Result<String> {
+    if audience.is_empty() || challenge.is_nil() || boot_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid RPC boot epoch proof scope"));
+    }
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_boot_epoch_proof(&mut mac, audience, challenge, boot_epoch);
+    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_epoch: Uuid, proof: &str) -> std::io::Result<()> {
+    if audience.is_empty() || challenge.is_nil() || boot_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid RPC boot epoch proof scope"));
+    }
+    let proof = general_purpose::STANDARD
+        .decode(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC boot epoch proof"))?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_boot_epoch_proof(&mut mac, audience, challenge, boot_epoch);
+    mac.verify_slice(&proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC boot epoch proof"))
+}
+
+fn non_nil_uuid(value: &str, name: &str) -> std::io::Result<Uuid> {
+    let value = Uuid::parse_str(value).map_err(|_| std::io::Error::other(format!("Invalid {name}")))?;
+    (!value.is_nil())
+        .then_some(value)
+        .ok_or_else(|| std::io::Error::other(format!("Invalid {name}")))
+}
+
+fn parse_tonic_rpc_path(path: &str) -> std::io::Result<(&str, &str)> {
+    path.strip_prefix('/')
+        .and_then(|path| path.split_once('/'))
+        .filter(|(service, rpc_method)| !service.is_empty() && !rpc_method.is_empty() && !rpc_method.contains('/'))
+        .ok_or_else(|| std::io::Error::other("Invalid RPC request path"))
+}
+
+/// The process-unique epoch included in every replay-scoped server verification.
+///
+/// A fresh process gets a fresh value, so a signature captured before a server restart cannot be
+/// admitted even though the bounded in-memory nonce cache necessarily starts empty again.
+pub fn tonic_rpc_boot_epoch() -> Uuid {
+    *RPC_BOOT_EPOCH
+}
+
+/// Build the additive replay-scope headers for a request that already carries rolling-upgrade-safe
+/// v1/v2 metadata. `timestamp` and `content_sha256` are deliberately reused from the v2 scope so
+/// old servers can continue validating the same request unchanged.
+pub fn gen_tonic_replay_scope_headers(
+    audience: &str,
+    path: &str,
+    timestamp: &str,
+    content_sha256: &str,
+    boot_epoch: Uuid,
+) -> std::io::Result<HeaderMap> {
+    if audience.is_empty() || !path.starts_with('/') || !valid_content_sha256(content_sha256) || boot_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid replay-scoped RPC signing scope"));
+    }
+    parse_tonic_rpc_path(path)?;
+    timestamp
+        .parse::<i64>()
+        .map_err(|_| std::io::Error::other("Invalid timestamp format"))?;
+
+    let nonce = Uuid::new_v4();
+    let signature = generate_replay_scope_signature(
+        &get_shared_secret()?,
+        ReplayScope {
+            audience,
+            path,
+            timestamp,
+            nonce,
+            content_sha256,
+            boot_epoch,
+        },
+    )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(RPC_REPLAY_SCOPE_VERSION_HEADER, HeaderValue::from_static(RPC_REPLAY_SCOPE_VERSION_V3));
+    headers.insert(
+        RPC_REPLAY_SCOPE_SIGNATURE_HEADER,
+        header_value(&signature, RPC_REPLAY_SCOPE_SIGNATURE_HEADER)?,
+    );
+    headers.insert(
+        RPC_REPLAY_SCOPE_NONCE_HEADER,
+        header_value(&nonce.to_string(), RPC_REPLAY_SCOPE_NONCE_HEADER)?,
+    );
+    headers.insert(RPC_BOOT_EPOCH_HEADER, header_value(&boot_epoch.to_string(), RPC_BOOT_EPOCH_HEADER)?);
+    Ok(headers)
+}
+
+/// Parse the optional client challenge used to authenticate a server boot-epoch advertisement.
+pub fn tonic_boot_epoch_challenge(headers: &HeaderMap) -> std::io::Result<Option<Uuid>> {
+    headers
+        .get(RPC_BOOT_EPOCH_CHALLENGE_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| std::io::Error::other("Invalid RPC boot epoch challenge"))
+                .and_then(|value| non_nil_uuid(value, "RPC boot epoch challenge"))
+        })
+        .transpose()
+}
+
+/// Build the authenticated response headers for a client boot-epoch challenge.
+pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std::io::Result<HeaderMap> {
+    let boot_epoch = tonic_rpc_boot_epoch();
+    let proof = generate_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(RPC_BOOT_EPOCH_HEADER, header_value(&boot_epoch.to_string(), RPC_BOOT_EPOCH_HEADER)?);
+    headers.insert(RPC_BOOT_EPOCH_PROOF_HEADER, header_value(&proof, RPC_BOOT_EPOCH_PROOF_HEADER)?);
+    Ok(headers)
+}
+
+/// Verify the server boot-epoch response for a challenge generated by this client.
+pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers: &HeaderMap) -> std::io::Result<Uuid> {
+    let boot_epoch = headers
+        .get(RPC_BOOT_EPOCH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC boot epoch"))
+        .and_then(|value| non_nil_uuid(value, "RPC boot epoch"))?;
+    let proof = headers
+        .get(RPC_BOOT_EPOCH_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC boot epoch proof"))?;
+    verify_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch, proof)?;
+    Ok(boot_epoch)
+}
+
 fn valid_content_sha256(value: &str) -> bool {
     value == UNSIGNED_PAYLOAD
         || (value.len() == 64
@@ -531,6 +730,17 @@ fn has_v2_auth_headers(headers: &HeaderMap) -> bool {
     .any(|name| headers.contains_key(*name))
 }
 
+fn has_replay_scope_headers(headers: &HeaderMap) -> bool {
+    [
+        RPC_REPLAY_SCOPE_VERSION_HEADER,
+        RPC_REPLAY_SCOPE_SIGNATURE_HEADER,
+        RPC_REPLAY_SCOPE_NONCE_HEADER,
+        RPC_BOOT_EPOCH_HEADER,
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+}
+
 /// Whether the server requires target-bound v2 authentication on every internode gRPC request,
 /// rejecting the legacy constant-target fallback instead of accepting it. Default-off rollout
 /// lever gated on the v1-fallback counter reading zero fleet-wide; see
@@ -540,9 +750,127 @@ fn internode_rpc_signature_strict() -> bool {
     *INTERNODE_RPC_SIGNATURE_STRICT
 }
 
+fn internode_rpc_replay_scope_strict() -> bool {
+    *INTERNODE_RPC_REPLAY_SCOPE_STRICT
+}
+
+fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &HeaderMap) -> std::io::Result<()> {
+    if audience.is_empty() {
+        return Err(std::io::Error::other("Missing RPC audience"));
+    }
+    parse_tonic_rpc_path(path)?;
+
+    let version = headers
+        .get(RPC_REPLAY_SCOPE_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay scope version"))?;
+    if version != RPC_REPLAY_SCOPE_VERSION_V3 {
+        return Err(std::io::Error::other("Unsupported RPC replay scope version"));
+    }
+    let signature = headers
+        .get(RPC_REPLAY_SCOPE_SIGNATURE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay scope signature"))?;
+    let timestamp = headers
+        .get(TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing timestamp header"))?;
+    let signed_at = timestamp
+        .parse::<i64>()
+        .map_err(|_| std::io::Error::other("Invalid timestamp format"))?;
+    check_timestamp(signed_at)?;
+    let nonce = headers
+        .get(RPC_REPLAY_SCOPE_NONCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay scope nonce"))
+        .and_then(|value| non_nil_uuid(value, "RPC replay scope nonce"))?;
+    let content_sha256 = headers
+        .get(RPC_CONTENT_SHA256_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC content SHA-256"))?;
+    if !valid_content_sha256(content_sha256) {
+        return Err(std::io::Error::other("Invalid RPC content SHA-256"));
+    }
+    let boot_epoch = headers
+        .get(RPC_BOOT_EPOCH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC boot epoch"))
+        .and_then(|value| non_nil_uuid(value, "RPC boot epoch"))?;
+    let secret = get_shared_secret()?;
+    if !verify_replay_scope_signature(
+        &secret,
+        ReplayScope {
+            audience,
+            path,
+            timestamp,
+            nonce,
+            content_sha256,
+            boot_epoch,
+        },
+        signature,
+    ) {
+        return Err(std::io::Error::other("Invalid RPC replay scope signature"));
+    }
+    if boot_epoch != tonic_rpc_boot_epoch() {
+        return Err(std::io::Error::other("RPC boot epoch is stale"));
+    }
+    check_and_record_nonce(nonce, signed_at)
+}
+
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
 pub fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &HeaderMap) -> std::io::Result<()> {
-    verify_tonic_rpc_signature_with_strictness(audience, path, headers, internode_rpc_signature_strict())
+    verify_tonic_rpc_signature_with_policy(
+        audience,
+        path,
+        headers,
+        internode_rpc_signature_strict(),
+        internode_rpc_replay_scope_strict(),
+        false,
+    )
+}
+
+/// Verify gRPC authentication while allowing the narrowly scoped v2 `Ping` bootstrap used to
+/// obtain an authenticated server boot epoch when replay-scope strictness is enabled.
+pub fn verify_tonic_rpc_signature_with_bootstrap(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    allow_replay_scope_bootstrap: bool,
+) -> std::io::Result<()> {
+    verify_tonic_rpc_signature_with_policy(
+        audience,
+        path,
+        headers,
+        internode_rpc_signature_strict(),
+        internode_rpc_replay_scope_strict(),
+        allow_replay_scope_bootstrap,
+    )
+}
+
+fn verify_tonic_rpc_signature_with_policy(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    signature_strict: bool,
+    replay_scope_strict: bool,
+    allow_replay_scope_bootstrap: bool,
+) -> std::io::Result<()> {
+    if has_replay_scope_headers(headers) {
+        return verify_tonic_replay_scope_signature(audience, path, headers);
+    }
+
+    // Only a method-bound v2 Ping with a syntactically valid challenge may bootstrap a strict
+    // client after its peer restarts. Legacy metadata never gets this exception.
+    let bootstrap = allow_replay_scope_bootstrap
+        && has_v2_auth_headers(headers)
+        && tonic_boot_epoch_challenge(headers).is_ok_and(|challenge| challenge.is_some());
+    if replay_scope_strict && !bootstrap {
+        return Err(std::io::Error::other("RPC replay-scoped authentication required"));
+    }
+
+    verify_tonic_rpc_signature_with_strictness(audience, path, headers, signature_strict)?;
+    global_internode_metrics().record_replay_scope_fallback();
+    Ok(())
 }
 
 /// [`verify_tonic_rpc_signature`] with the strict gate injected as a parameter, so both rollout
@@ -1271,6 +1599,104 @@ mod tests {
         let error = verify_tonic_rpc_signature("node-b:9000", "/node_service.NodeService/Ping", &headers)
             .expect_err("signature replayed to a different node must fail");
         assert_eq!(error.to_string(), "Invalid RPC v2 signature");
+    }
+
+    #[test]
+    fn replay_scope_binds_path_epoch_and_random_nonce() {
+        ensure_test_rpc_secret();
+        let path = "/node_service.NodeService/Ping";
+        let mut headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "Ping", None)
+            .expect("v2 compatibility headers should build");
+        let timestamp = headers
+            .get(TIMESTAMP_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("v2 timestamp")
+            .to_string();
+        let content_sha256 = headers
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("v2 content digest")
+            .to_string();
+        headers.extend(
+            gen_tonic_replay_scope_headers("node-a:9000", path, &timestamp, &content_sha256, tonic_rpc_boot_epoch())
+                .expect("replay-scope headers should build"),
+        );
+
+        assert!(
+            verify_tonic_rpc_signature_with_policy("node-a:9000", path, &headers, false, false, false).is_ok(),
+            "the first replay-scoped request must be accepted"
+        );
+        let replay = verify_tonic_rpc_signature_with_policy("node-a:9000", path, &headers, false, false, false)
+            .expect_err("the random replay-scope nonce must be single-use");
+        assert_eq!(replay.to_string(), "RPC request replay detected");
+
+        let path_error = verify_tonic_replay_scope_signature("node-a:9000", "/node_service.NodeService/SignalService", &headers)
+            .expect_err("a replay-scoped signature must not move to another method");
+        assert_eq!(path_error.to_string(), "Invalid RPC replay scope signature");
+    }
+
+    #[test]
+    fn replay_scope_rejects_partial_metadata_and_stale_epoch_without_fallback() {
+        ensure_test_rpc_secret();
+        let path = "/node_service.NodeService/Ping";
+        let mut partial = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "Ping", None)
+            .expect("v2 compatibility headers should build");
+        partial.insert(RPC_REPLAY_SCOPE_VERSION_HEADER, HeaderValue::from_static(RPC_REPLAY_SCOPE_VERSION_V3));
+        let error = verify_tonic_rpc_signature_with_policy("node-a:9000", path, &partial, false, false, false)
+            .expect_err("partial replay-scope metadata must never downgrade to v2");
+        assert_eq!(error.to_string(), "Missing RPC replay scope signature");
+
+        let timestamp = partial
+            .get(TIMESTAMP_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("v2 timestamp")
+            .to_string();
+        let content_sha256 = partial
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("v2 content digest")
+            .to_string();
+        let stale_epoch = Uuid::new_v4();
+        partial.extend(
+            gen_tonic_replay_scope_headers("node-a:9000", path, &timestamp, &content_sha256, stale_epoch)
+                .expect("replay-scope headers should build"),
+        );
+        let stale = verify_tonic_rpc_signature_with_policy("node-a:9000", path, &partial, false, false, false)
+            .expect_err("a signature from a prior server boot epoch must be rejected");
+        assert_eq!(stale.to_string(), "RPC boot epoch is stale");
+    }
+
+    #[test]
+    fn replay_scope_strictness_allows_only_authenticated_ping_bootstrap() {
+        ensure_test_rpc_secret();
+        let mut headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "Ping", None)
+            .expect("v2 compatibility headers should build");
+        let rejected =
+            verify_tonic_rpc_signature_with_policy("node-a:9000", "/node_service.NodeService/Ping", &headers, false, true, false)
+                .expect_err("strict replay scope must reject stripped new metadata");
+        assert_eq!(rejected.to_string(), "RPC replay-scoped authentication required");
+
+        headers.insert(
+            RPC_BOOT_EPOCH_CHALLENGE_HEADER,
+            HeaderValue::from_str(&Uuid::new_v4().to_string()).expect("UUID header"),
+        );
+        assert!(
+            verify_tonic_rpc_signature_with_policy("node-a:9000", "/node_service.NodeService/Ping", &headers, false, true, true,)
+                .is_ok(),
+            "only the signed Ping bootstrap may obtain a new server epoch in strict mode"
+        );
+    }
+
+    #[test]
+    fn boot_epoch_response_proof_binds_audience_challenge_and_epoch() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("proof headers should build");
+        let epoch =
+            verify_tonic_boot_epoch_response("node-a:9000", challenge, &headers).expect("matching proof headers should verify");
+        assert_eq!(epoch, tonic_rpc_boot_epoch());
+        assert!(verify_tonic_boot_epoch_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_boot_epoch_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
     }
 
     #[test]

@@ -37,7 +37,8 @@ use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::{
-    ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+    ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
+    tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
 };
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response, Uri};
@@ -152,13 +153,17 @@ impl<S> RpcRequestPathService<S> {
     }
 }
 
-impl<S, B> Service<HttpRequest<B>> for RpcRequestPathService<S>
+impl<S, B, ResBody> Service<HttpRequest<B>> for RpcRequestPathService<S>
 where
-    S: Service<HttpRequest<B>>,
+    S: Service<HttpRequest<B>, Response = Response<ResBody>>,
+    S::Error: Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+    ResBody: Send + 'static,
 {
-    type Response = S::Response;
+    type Response = Response<ResBody>;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -170,7 +175,22 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
-        self.inner.call(req)
+        let response_headers = tonic_boot_epoch_challenge(req.headers())
+            .ok()
+            .flatten()
+            .and_then(|challenge| {
+                storage::try_current_local_node_name()
+                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
+                    .and_then(|audience| tonic_boot_epoch_response_headers(&audience, challenge).ok())
+            });
+        let future = self.inner.call(req);
+        Box::pin(async move {
+            let mut response = future.await?;
+            if let Some(headers) = response_headers {
+                response.headers_mut().extend(headers);
+            }
+            Ok(response)
+        })
     }
 }
 
@@ -1862,7 +1882,15 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .filter(|method| !method.is_empty() && !method.contains('/'))
         .ok_or_else(|| Status::unauthenticated("Invalid RPC request path"))?;
     debug_assert!(!rpc_method.is_empty());
-    verify_tonic_rpc_signature(&audience, target.uri.path(), req.metadata().as_ref()).map_err(|e| {
+    let allow_replay_scope_bootstrap = target.uri.path() == "/node_service.NodeService/Ping"
+        && tonic_boot_epoch_challenge(req.metadata().as_ref()).is_ok_and(|challenge| challenge.is_some());
+    verify_tonic_rpc_signature_with_bootstrap(
+        &audience,
+        target.uri.path(),
+        req.metadata().as_ref(),
+        allow_replay_scope_bootstrap,
+    )
+    .map_err(|e| {
         error!(
             event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
             component = LOG_COMPONENT_SERVER,

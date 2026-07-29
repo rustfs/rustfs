@@ -14,7 +14,8 @@
 
 use crate::bucket::metadata_sys;
 use crate::cluster::rpc::client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error,
+    node_service_time_out_client,
 };
 use crate::cluster::rpc::set_tonic_mutation_body_digest;
 use crate::disk::error::DiskError;
@@ -52,7 +53,6 @@ use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
@@ -832,7 +832,7 @@ impl RemotePeerS3Client {
         client
     }
 
-    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
