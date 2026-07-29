@@ -100,15 +100,18 @@ impl RequestContext {
         )
     }
 
-    /// Create a context from propagated request headers without copying trace
-    /// state into the request context.
-    pub(crate) fn from_headers_without_trace_context(headers: &HeaderMap) -> Self {
+    /// Create a context for a non-S3 request while mirroring the propagated
+    /// canonical request ID into the compatibility alias.
+    pub(crate) fn from_propagated_headers(headers: &HeaderMap) -> Self {
         let request_id = extract_request_id_from_headers(headers);
+        let (trace_id, span_id) = extract_trace_context_ids_from_headers(headers)
+            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
+            .unwrap_or((None, None));
         Self {
             x_amz_request_id: request_id.clone(),
             request_id,
-            trace_id: None,
-            span_id: None,
+            trace_id,
+            span_id,
             start_time: Instant::now(),
         }
     }
@@ -329,17 +332,22 @@ mod tests {
     }
 
     #[test]
-    fn test_propagated_request_context_mirrors_canonical_request_id() {
+    fn test_propagated_request_context_mirrors_canonical_id_and_preserves_trace_context() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
         let mut headers = HeaderMap::new();
         headers.insert("x-request-id", HeaderValue::from_static("canonical-request-id"));
         headers.insert("x-amz-request-id", HeaderValue::from_static("untrusted-amz-request-id"));
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
 
-        let ctx = RequestContext::from_headers_without_trace_context(&headers);
+        let ctx = RequestContext::from_propagated_headers(&headers);
 
         assert_eq!(ctx.request_id, "canonical-request-id");
         assert_eq!(ctx.x_amz_request_id, "canonical-request-id");
-        assert!(ctx.trace_id.is_none());
-        assert!(ctx.span_id.is_none());
+        assert_eq!(ctx.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(ctx.span_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 
     #[test]
