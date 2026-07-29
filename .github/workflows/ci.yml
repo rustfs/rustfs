@@ -175,6 +175,33 @@ jobs:
       - name: Run nextest tests
         run: |
           mkdir -p artifacts/test-and-lint
+          # Evidence sampler for issue #5394: the post-mortem pgrep below runs
+          # only after `timeout` has already TERM'd the whole cargo process
+          # group, so it cannot name a wedged process. Sample system and
+          # process state every 60s instead; the last samples before the
+          # timeout show what was stuck (rustc, linker, build script, memory
+          # pressure, ...). The log rides along in the existing artifact.
+          (
+            while true; do
+              {
+                echo "=== $(date --utc --iso-8601=seconds)"
+                echo "--- load";  cat /proc/loadavg
+                echo "--- psi";   grep -H . /proc/pressure/* 2>/dev/null || true
+                echo "--- mem";   free -m
+                echo "--- disk";  df -h / /home/runner 2>/dev/null || df -h /
+                echo "--- top-rss"
+                ps -eo pid,ppid,stat,etime,rss,pcpu,args --sort=-rss | head -15
+                echo "--- build/test processes"
+                ps -eo pid,ppid,stat,etime,rss,pcpu,args | grep -E '[c]argo|[r]ustc|[n]extest|[c]ollect2|rust-ll[d]|[b]uild-script|deps[/]' || true
+                echo "--- d-state (uninterruptible IO)"
+                ps -eo pid,stat,etime,args | awk 'NR > 1 && $2 ~ /D/' || true
+                echo
+              } >> artifacts/test-and-lint/sampler.log 2>&1 || true
+              sleep 60
+            done
+          ) &
+          sampler_pid=$!
+          trap 'kill "${sampler_pid}" 2>/dev/null || true' EXIT
           set +e
           NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 75m \
             cargo nextest run --profile ci --all --exclude e2e_test \
@@ -188,6 +215,9 @@ jobs:
             echo
             echo "Remaining test-related processes:"
             pgrep -af 'cargo|nextest|target/.*/deps/' || true
+            echo
+            echo "Kernel OOM / kill events:"
+            dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -20 || true
           } > artifacts/test-and-lint/nextest-diagnostics.txt
           exit "${status}"
 

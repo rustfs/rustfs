@@ -337,7 +337,7 @@ measure() {
   )
   [[ -n "$COOLDOWN_SECS" ]] && args+=(--cooldown-secs "$COOLDOWN_SECS")
   [[ -n "$baseline_csv" ]] && args+=(--baseline-csv "$baseline_csv")
-  run "$ENHANCED_BENCH" "${args[@]}"
+  run "$ENHANCED_BENCH" "${args[@]}" >&2
   echo "$cell"
 }
 

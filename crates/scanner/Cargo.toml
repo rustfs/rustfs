@@ -47,7 +47,7 @@ rmp-serde = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rustfs-filemeta = { workspace = true }
-tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-util = { workspace = true, features = ["io", "compat", "rt"] }
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
 http = { workspace = true }
