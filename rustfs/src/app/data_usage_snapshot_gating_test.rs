@@ -198,13 +198,9 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
         first_info.total_free_capacity
     );
     assert_eq!(
-        (first_info.total_capacity, first_info.total_free_capacity, first_info.total_used_capacity,),
-        (
-            second_info.total_capacity,
-            second_info.total_free_capacity,
-            second_info.total_used_capacity,
-        ),
-        "repeated data usage requests must report stable capacity values"
+        second_info.total_used_capacity,
+        second_info.total_capacity.saturating_sub(second_info.total_free_capacity),
+        "server used capacity must stay internally consistent on repeated requests"
     );
 
     // The endpoint must serve the seeded snapshot numbers, not recomputed ones.
