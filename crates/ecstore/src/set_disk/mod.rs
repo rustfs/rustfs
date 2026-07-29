@@ -486,7 +486,7 @@ async fn acquire_snapshot_leases(
     path: &str,
     read_quorum: usize,
 ) -> Option<SnapshotLeaseHandle> {
-    let candidates = disks.iter().flatten().cloned().collect::<Vec<_>>();
+    let candidates = disks.iter().cloned().collect::<Option<Vec<_>>>()?;
     if candidates.len() < read_quorum {
         return None;
     }
@@ -5658,7 +5658,7 @@ mod tests {
             .expect("first shard should be written");
 
         let lease = acquire_snapshot_leases(&[Some(disk1.clone()), Some(disk2)], bucket, data_dir, 1).await;
-        assert!(lease.is_none(), "one unsupported candidate must retain the namespace lock");
+        assert!(lease.is_none(), "one candidate missing snapshot data must retain the namespace lock");
         assert_eq!(
             disk1
                 .delete_data_dir(
@@ -5671,6 +5671,34 @@ mod tests {
                 )
                 .await
                 .expect("released partial lease should not defer cleanup"),
+            crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_acquisition_rejects_unavailable_candidate() {
+        let (_dir, disk) = make_single_local_disk().await;
+        let bucket = "snapshot-lease-unavailable";
+        let data_dir = "object/11111111-1111-1111-1111-111111111111";
+        let part = format!("{data_dir}/part.1");
+        disk.make_volume(bucket).await.expect("volume should be created");
+        disk.write_all(bucket, &part, Bytes::from_static(b"shard"))
+            .await
+            .expect("shard should be written");
+
+        let lease = acquire_snapshot_leases(&[Some(disk.clone()), None], bucket, data_dir, 1).await;
+        assert!(lease.is_none(), "one unavailable candidate must retain the namespace lock");
+        assert_eq!(
+            disk.delete_data_dir(
+                bucket,
+                data_dir,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unavailable candidate fallback must not leave a lease"),
             crate::disk::DataDirDeleteStatus::Deleted
         );
     }
