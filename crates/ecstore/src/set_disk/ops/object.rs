@@ -7260,7 +7260,9 @@ mod transition_source_identity_matrix_tests {
             let object = format!("identity-{index}.bin");
             let payload = vec![u8::try_from(index + 1).expect("matrix index should fit u8"); 1024 * 1024];
             let mut reader = PutObjReader::from_vec(payload);
+            let source_version_id = Uuid::new_v4();
             let source_opts = ObjectOptions {
+                version_id: Some(source_version_id.to_string()),
                 versioned: true,
                 ..Default::default()
             };
@@ -7272,8 +7274,13 @@ mod transition_source_identity_matrix_tests {
                 .get_object_fileinfo(bucket, &object, &source_opts, true, false)
                 .await
                 .expect("source metadata should resolve");
-            assert!(source.versioned);
-            assert!(source.version_id.is_some());
+            assert_eq!(source.version_id, Some(source_version_id));
+            assert_eq!(
+                transition_source_identity(bucket, &object, &source, &source_opts, &get_raw_etag(&source.metadata))
+                    .expect("persisted versioned source identity should build")
+                    .version_mode,
+                TransitionSourceVersionMode::Versioned
+            );
             let opts = ObjectOptions {
                 no_lock: true,
                 versioned: true,
@@ -7316,8 +7323,13 @@ mod transition_source_identity_matrix_tests {
                     .await
                     .expect("single-field metadata drift should be written");
             }
+            let persisted_opts = ObjectOptions {
+                version_id: changed.version_id.map(|version_id| version_id.to_string()),
+                versioned: true,
+                ..Default::default()
+            };
             let (persisted, _, _) = set_disks
-                .get_object_fileinfo(bucket, &object, &source_opts, true, false)
+                .get_object_fileinfo(bucket, &object, &persisted_opts, true, false)
                 .await
                 .expect("drifted source metadata should resolve");
             put_barrier.release();
