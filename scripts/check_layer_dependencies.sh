@@ -13,7 +13,14 @@ fi
 classify_source_layer() {
   local file="$1"
 
-  if [[ "$file" == rustfs/src/app/* ]]; then
+  if [[ "$file" == rustfs/src/server/* ]] ||
+    [[ "$file" == rustfs/src/startup_*.rs ]] ||
+    [[ "$file" == rustfs/src/init.rs ]] ||
+    [[ "$file" == rustfs/src/main.rs ]] ||
+    [[ "$file" == rustfs/src/lib.rs ]] ||
+    [[ "$file" == rustfs/src/embedded.rs ]]; then
+    printf 'composition'
+  elif [[ "$file" == rustfs/src/app/* ]]; then
     printf 'app'
   elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]]; then
     printf 'interface'
@@ -30,6 +37,14 @@ classify_target_layer() {
   local storage_path
 
   case "$root" in
+    init | main | lib | embedded | startup_*)
+      printf 'composition'
+      ;;
+    server)
+      # Server files are composition roots when they import lower layers, but
+      # their exported HTTP contracts belong to the interface boundary.
+      printf 'interface'
+      ;;
     app)
       printf 'app'
       ;;
@@ -53,6 +68,9 @@ classify_target_layer() {
 
 layer_rank() {
   case "$1" in
+    composition)
+      printf '4'
+      ;;
     interface)
       printf '3'
       ;;
@@ -66,6 +84,48 @@ layer_rank() {
       printf '0'
       ;;
   esac
+}
+
+is_reverse_dependency() {
+  local source_rank target_rank
+
+  source_rank="$(layer_rank "$1")"
+  target_rank="$(layer_rank "$2")"
+  (( source_rank < target_rank ))
+}
+
+assert_dependency_direction() {
+  local expected="$1"
+  local source="$2"
+  local target="$3"
+  local actual='allowed'
+
+  if is_reverse_dependency "$source" "$target"; then
+    actual='reverse'
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: %s -> %s (expected %s, got %s)\n' \
+      "$source" "$target" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+run_layer_model_self_tests() {
+  local server_source app_source storage_source server_target admin_target app_target
+
+  server_source="$(classify_source_layer rustfs/src/server/http.rs)"
+  app_source="$(classify_source_layer rustfs/src/app/bucket_usecase.rs)"
+  storage_source="$(classify_source_layer rustfs/src/storage/rpc/node_service.rs)"
+  server_target="$(classify_target_layer server::http)"
+  admin_target="$(classify_target_layer admin::router)"
+  app_target="$(classify_target_layer app::bucket_usecase)"
+
+  assert_dependency_direction 'allowed' "$server_source" "$admin_target"
+  assert_dependency_direction 'allowed' "$server_source" "$app_target"
+  assert_dependency_direction 'reverse' "$app_source" "$server_target"
+  assert_dependency_direction 'reverse' "$storage_source" "$server_target"
+  assert_dependency_direction 'reverse' "$app_source" "$admin_target"
+  assert_dependency_direction 'reverse' "$storage_source" "$admin_target"
 }
 
 normalize_import_group_item() {
@@ -182,6 +242,11 @@ normalize_import_path() {
 
 emit_crate_use_statements() {
   (cd "$ROOT_DIR" && rg --files -g '*.rs' rustfs/src | while IFS= read -r file; do
+    # The guard is file-scoped: dedicated test modules are excluded, while
+    # inline #[cfg(test)] imports remain subject to the source file's layer.
+    if [[ "$file" == *_test.rs ]] || [[ "$file" == */tests/* ]]; then
+      continue
+    fi
     perl -0777 -ne '
       while (/\buse\s+crate::.*?;/sg) {
         my $statement = $&;
@@ -193,6 +258,26 @@ emit_crate_use_statements() {
     ' "$file"
   done)
 }
+
+write_baseline_file() {
+  local entries="$1"
+
+  cat >"$BASELINE_FILE" <<'EOF'
+# Layer dependency baseline for the rustfs binary crate.
+#
+# The guard models production imports as:
+#   composition -> interface -> app -> infra
+#
+# Canonical dependency entry:
+#   dep|source_file|source_layer->target_layer|crate::imported_symbol
+#
+# Canonical conceptual cycle entry:
+#   cycle|left_layer<->right_layer
+EOF
+  cat "$entries" >>"$BASELINE_FILE"
+}
+
+run_layer_model_self_tests
 
 normalize_baseline_file() {
   local input="$1"
@@ -265,10 +350,7 @@ while IFS= read -r line; do
       printf '%s->%s\n' "$source_layer" "$target_layer" >>"$EDGES_RAW"
     fi
 
-    source_rank="$(layer_rank "$source_layer")"
-    target_rank="$(layer_rank "$target_layer")"
-
-    if (( source_rank < target_rank )); then
+    if is_reverse_dependency "$source_layer" "$target_layer"; then
       printf 'dep|%s|%s->%s|crate::%s\n' "$file" "$source_layer" "$target_layer" "$import_path" >>"$VIOLATIONS_RAW"
     fi
   done < <(normalize_import_path "$text")
@@ -292,7 +374,7 @@ done <"${TMP_DIR}/edges_sorted.txt" | sort -u >"${TMP_DIR}/cycles_sorted.txt"
 cat "${TMP_DIR}/violations_sorted.txt" "${TMP_DIR}/cycles_sorted.txt" | sort -u >"$CURRENT_BASELINE"
 
 if [[ "$MODE" == "update" ]]; then
-  cp "$CURRENT_BASELINE" "$BASELINE_FILE"
+  write_baseline_file "$CURRENT_BASELINE"
   echo "Updated baseline: $BASELINE_FILE"
   exit 0
 fi
