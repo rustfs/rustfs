@@ -85,6 +85,20 @@ pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<(
     Ok(())
 }
 
+/// Re-read a bucket's metadata from disk into this instance's cache under the
+/// metadata-system write guard.
+///
+/// This is the entry point for peer reload notifications (the
+/// `LoadBucketMetadata` RPC). Prefer it over loading separately and then
+/// calling [`set_bucket_metadata`]: the guard must cover the disk read as
+/// well as the install, or concurrent reloads can install their snapshots out
+/// of order. See [`BucketMetadataSys::reload_bucket_metadata`].
+pub async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
+    let sys = get_bucket_metadata_sys()?;
+    let mut lock = sys.write().await;
+    lock.reload_bucket_metadata(bucket).await
+}
+
 /// Drop a bucket's cached metadata from the in-memory map.
 ///
 /// This is the counterpart to [`set_bucket_metadata`] and is invoked when a
@@ -619,6 +633,35 @@ impl BucketMetadataSys {
         map.clear();
     }
 
+    /// Re-read a bucket's metadata from disk and install it in the cache.
+    ///
+    /// Takes `&mut self` so the read and the install are necessarily covered
+    /// by the *same* `BucketMetadataSys` write guard — a read guard cannot
+    /// call this. That exclusion is the point, not an implementation detail:
+    /// a load performed outside the guard lets two overlapping reload
+    /// notifications both read before either writes, so the one holding the
+    /// OLDER snapshot can install last and resurrect superseded
+    /// configuration. Holding the guard across both steps makes the last
+    /// writer also the last reader, so the cache converges on the newest
+    /// state on disk. It equally excludes [`Self::update`], which would
+    /// otherwise be able to persist a new config in that same window only to
+    /// have a concurrent reload overwrite its cache entry.
+    ///
+    /// This matters beyond freshness: consumers that resolve secrets from
+    /// this cache with no disk fallback — Swift TempURL signing keys go
+    /// through the map-only [`get`] — would otherwise keep honoring a
+    /// revoked key for unauthenticated pre-signed access until the
+    /// 15-minute refresh loop repaired the entry (and that loop only runs
+    /// under dist-erasure).
+    ///
+    /// Reads through `self.api` rather than the ambient store handle so the
+    /// snapshot comes from the same instance whose cache receives it.
+    pub async fn reload_bucket_metadata(&mut self, bucket: &str) -> Result<()> {
+        let bm = load_bucket_metadata(self.api.clone(), bucket).await?;
+        self.set(bucket.to_owned(), Arc::new(bm)).await;
+        Ok(())
+    }
+
     pub async fn update(&mut self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         self.update_and_parse(bucket, config_file, data, true).await
     }
@@ -1105,6 +1148,61 @@ mod tests {
             kept.policy_config_json,
             b"kept-marker".to_vec(),
             "a fabricated refresh default must not replace real metadata"
+        );
+    }
+
+    /// A peer reload notification must re-read disk and install the fresh
+    /// snapshot, and it must do so under the metadata-system write guard.
+    ///
+    /// The guard placement is what keeps overlapping reloads from installing
+    /// their snapshots out of order, and it is enforced by the `&mut self`
+    /// receiver — the `sys.write()` below is the only way to call this.
+    /// Holding that guard across disk I/O also means nothing in the load path
+    /// may re-enter the metadata system, so the reload is wrapped in a
+    /// timeout: a re-entrant read would deadlock rather than fail visibly.
+    #[tokio::test]
+    #[serial]
+    async fn reload_bucket_metadata_installs_the_current_on_disk_snapshot() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore.clone())));
+
+        // V1 is installed through the cache, so map and disk agree.
+        let mut v1 = BucketMetadata::new("reloaded-bucket");
+        v1.policy_config_json = b"v1-marker".to_vec();
+        sys.read().await.persist_and_set(v1).await.expect("v1 should persist");
+
+        // V2 lands on disk only — the cache still holds V1. This is exactly
+        // the state a peer is in when a reload notification arrives.
+        let mut v2 = BucketMetadata::new("reloaded-bucket");
+        v2.policy_config_json = b"v2-marker".to_vec();
+        v2.save_with_store(ecstore.clone()).await.expect("v2 should persist");
+        assert_eq!(
+            sys.read()
+                .await
+                .get("reloaded-bucket")
+                .await
+                .expect("v1 cached")
+                .policy_config_json,
+            b"v1-marker".to_vec(),
+            "writing straight to disk must leave the cache untouched"
+        );
+
+        timeout(Duration::from_secs(30), async {
+            sys.write().await.reload_bucket_metadata("reloaded-bucket").await
+        })
+        .await
+        .expect("reload must not deadlock while holding the write guard across the disk read")
+        .expect("reload should succeed");
+
+        assert_eq!(
+            sys.read()
+                .await
+                .get("reloaded-bucket")
+                .await
+                .expect("v2 cached")
+                .policy_config_json,
+            b"v2-marker".to_vec(),
+            "reload must install the snapshot it read from disk"
         );
     }
 

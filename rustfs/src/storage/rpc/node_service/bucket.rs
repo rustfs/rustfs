@@ -17,7 +17,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskError, StoragePeerS3ClientExt as _, load_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
+    DiskError, StoragePeerS3ClientExt as _, reload_bucket_metadata, remove_bucket_metadata,
 };
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_protos::proto_gen::node_service::*;
@@ -66,21 +66,23 @@ impl NodeService {
             }));
         }
 
-        let Some(store) = self.resolve_object_store() else {
+        // The reload below resolves the metadata system's own store; this
+        // check only preserves the RPC's "server not initialized" contract.
+        if self.resolve_object_store().is_none() {
             return Ok(Response::new(LoadBucketMetadataResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
-        };
+        }
 
-        match load_bucket_metadata(store, &bucket).await {
-            Ok(meta) => {
-                if let Err(err) = set_bucket_metadata(bucket.clone(), meta).await {
-                    return Ok(Response::new(LoadBucketMetadataResponse {
-                        success: false,
-                        error_info: Some(err.to_string()),
-                    }));
-                };
+        // Reload under a single write guard rather than loading here and
+        // calling `set_bucket_metadata` after: a load outside the guard lets
+        // two overlapping notifications install their snapshots out of order,
+        // leaving the cache on the older one until the 15-minute refresh loop
+        // repairs it. Cache-only consumers (Swift TempURL signing keys) would
+        // keep honoring revoked configuration for that whole window.
+        match reload_bucket_metadata(&bucket).await {
+            Ok(()) => {
                 if scanner_maintenance_change {
                     rustfs_scanner::record_scanner_maintenance_change(&bucket);
                 }
