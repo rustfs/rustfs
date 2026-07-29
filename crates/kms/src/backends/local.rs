@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 /// Reject key identifiers that would not name a single file directly inside the key
@@ -77,8 +76,6 @@ const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
 /// Local KMS client that stores keys in local files
 pub struct LocalKmsClient {
     config: LocalConfig,
-    /// In-memory cache of loaded keys for performance
-    key_cache: RwLock<HashMap<String, MasterKeyInfo>>,
     /// Master encryption key for encrypting stored keys
     master_cipher: Option<Aes256Gcm>,
     /// Legacy pre-beta.9 master cipher for reading pre-Argon2 key files
@@ -139,13 +136,14 @@ impl LocalKmsClient {
             (None, None)
         };
 
-        Ok(Self {
+        let client = Self {
             config,
-            key_cache: RwLock::new(HashMap::new()),
             master_cipher,
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
-        })
+        };
+        client.validate_existing_keys().await?;
+        Ok(client)
     }
 
     /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
@@ -193,10 +191,35 @@ impl LocalKmsClient {
 
         let mut salt = [0u8; LOCAL_KMS_MASTER_KEY_SALT_LEN];
         rand::rng().fill(&mut salt[..]);
-        fs::write(&salt_path, salt).await?;
-        Self::set_file_permissions(&salt_path, config.file_permissions).await?;
-        debug!(path = ?salt_path, "Local KMS master key salt created");
-        Ok(salt)
+        let temp_path = config
+            .key_dir
+            .join(format!("{LOCAL_KMS_MASTER_KEY_SALT_FILE}.tmp-{}", uuid::Uuid::new_v4()));
+        fs::write(&temp_path, salt).await?;
+        Self::set_file_permissions(&temp_path, config.file_permissions).await?;
+        match fs::hard_link(&temp_path, &salt_path).await {
+            Ok(()) => {
+                if let Err(error) = fs::remove_file(&temp_path).await {
+                    warn!(path = ?temp_path, %error, "Failed to remove Local KMS salt temporary file");
+                }
+                debug!(path = ?salt_path, "Local KMS master key salt created");
+                Ok(salt)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path).await;
+                let bytes = fs::read(&salt_path).await?;
+                bytes.try_into().map_err(|_| {
+                    KmsError::configuration_error(format!(
+                        "Local KMS master key salt at {} must be exactly {} bytes",
+                        salt_path.display(),
+                        LOCAL_KMS_MASTER_KEY_SALT_LEN
+                    ))
+                })
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path).await;
+                Err(error.into())
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -242,6 +265,12 @@ impl LocalKmsClient {
 
         let content = fs::read(&key_path).await?;
         let stored_key: StoredMasterKey = serde_json::from_slice(&content)?;
+        if stored_key.key_id != key_id {
+            return Err(KmsError::invalid_key(format!(
+                "Local KMS key file identity mismatch: expected {key_id:?}, found {:?}",
+                stored_key.key_id
+            )));
+        }
 
         let encrypted_bytes = BASE64
             .decode(&stored_key.encrypted_key_material)
@@ -326,8 +355,43 @@ impl LocalKmsClient {
     /// Save a master key to disk
     async fn save_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
         let key_path = self.master_key_path(&master_key.key_id)?;
+        let content = self.encode_master_key(master_key, key_material)?;
+        let temp_path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        fs::write(&temp_path, &content).await?;
+        Self::set_file_permissions(&temp_path, self.config.file_permissions).await?;
+        fs::rename(&temp_path, &key_path).await?;
 
-        // Encrypt key material if master cipher is available
+        debug!(key_id = %master_key.key_id, path = ?key_path, "Local KMS master key saved");
+        Ok(())
+    }
+
+    async fn save_new_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
+        let key_path = self.master_key_path(&master_key.key_id)?;
+        let content = self.encode_master_key(master_key, key_material)?;
+        let temp_path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        fs::write(&temp_path, &content).await?;
+        Self::set_file_permissions(&temp_path, self.config.file_permissions).await?;
+
+        match fs::hard_link(&temp_path, &key_path).await {
+            Ok(()) => {
+                if let Err(error) = fs::remove_file(&temp_path).await {
+                    warn!(path = ?temp_path, %error, "Failed to remove Local KMS key temporary file");
+                }
+                debug!(key_id = %master_key.key_id, path = ?key_path, "Local KMS master key created");
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path).await;
+                Err(KmsError::key_already_exists(&master_key.key_id))
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path).await;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn encode_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<Vec<u8>> {
         let (encrypted_key_material, nonce, at_rest_protection) = if let Some(ref cipher) = self.master_cipher {
             let mut nonce_bytes = [0u8; 12];
             rand::rng().fill(&mut nonce_bytes[..]);
@@ -362,23 +426,30 @@ impl LocalKmsClient {
             at_rest_protection,
         };
 
-        let content = serde_json::to_vec_pretty(&stored_key)?;
-
-        // Write to temporary file first, then rename for atomicity
-        let temp_path = key_path.with_extension("tmp");
-        fs::write(&temp_path, &content).await?;
-        Self::set_file_permissions(&temp_path, self.config.file_permissions).await?;
-
-        fs::rename(&temp_path, &key_path).await?;
-
-        debug!(key_id = %master_key.key_id, path = ?key_path, "Local KMS master key saved");
-        Ok(())
+        serde_json::to_vec_pretty(&stored_key).map_err(Into::into)
     }
 
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
         let (_stored_key, key_material) = self.decode_stored_key(key_id).await?;
         Ok(key_material)
+    }
+
+    async fn validate_existing_keys(&self) -> Result<()> {
+        let mut entries = fs::read_dir(&self.config.key_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "key") {
+                continue;
+            }
+
+            let key_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| KmsError::configuration_error("Local KMS key file name must be valid UTF-8"))?;
+            self.decode_stored_key(key_id).await?;
+        }
+        Ok(())
     }
 
     /// Encrypt data using a master key
@@ -513,11 +584,7 @@ impl KmsClient for LocalKmsClient {
         let master_key = MasterKeyInfo::new_with_description(key_id.to_string(), algorithm.to_string(), Some(created_by), None);
 
         // Save to disk
-        self.save_master_key(&master_key, &key_material).await?;
-
-        // Cache the key
-        let mut cache = self.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key.clone());
+        self.save_new_master_key(&master_key, &key_material).await?;
 
         debug!(key_id, "Local KMS master key created");
         Ok(master_key)
@@ -526,23 +593,7 @@ impl KmsClient for LocalKmsClient {
     async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
         debug!("Describing key: {}", key_id);
 
-        // Check cache first
-        {
-            let cache = self.key_cache.read().await;
-            if let Some(master_key) = cache.get(key_id) {
-                return Ok(master_key.clone().into());
-            }
-        }
-
-        // Load from disk
         let master_key = self.load_master_key(key_id).await?;
-
-        // Update cache
-        {
-            let mut cache = self.key_cache.write().await;
-            cache.insert(key_id.to_string(), master_key.clone());
-        }
-
         Ok(master_key.into())
     }
 
@@ -602,10 +653,6 @@ impl KmsClient for LocalKmsClient {
         let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
-        // Update cache
-        let mut cache = self.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key);
-
         debug!(key_id, "Local KMS key enabled");
         Ok(())
     }
@@ -620,10 +667,6 @@ impl KmsClient for LocalKmsClient {
         // regenerate the master key, or every DEK wrapped by it becomes undecryptable.
         let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
-
-        // Update cache
-        let mut cache = self.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key);
 
         debug!(key_id, "Local KMS key disabled");
         Ok(())
@@ -646,10 +689,6 @@ impl KmsClient for LocalKmsClient {
         let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
-        // Update cache
-        let mut cache = self.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key);
-
         debug!(key_id, "Local KMS key deletion scheduled");
         Ok(())
     }
@@ -665,31 +704,17 @@ impl KmsClient for LocalKmsClient {
         let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
-        // Update cache
-        let mut cache = self.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key);
-
         debug!(key_id, "Local KMS key deletion canceled");
         Ok(())
     }
 
     async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
-        debug!("Rotating key: {}", key_id);
-
-        let mut master_key = self.load_master_key(key_id).await?;
-        master_key.version += 1;
-        master_key.rotated_at = Some(Zoned::now());
-
-        // Generate new key material
-        let key_material = generate_key_material(&master_key.algorithm)?;
-        self.save_master_key(&master_key, &key_material).await?;
-
-        // Update cache
-        let mut cache = self.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key.clone());
-
-        debug!(key_id, "Local KMS key rotated");
-        Ok(master_key)
+        if !fs::try_exists(self.master_key_path(key_id)?).await? {
+            return Err(KmsError::key_not_found(key_id));
+        }
+        Err(KmsError::invalid_operation(
+            "Local KMS key rotation is unavailable until historical key versions can be retained",
+        ))
     }
 
     async fn health_check(&self) -> Result<()> {
@@ -745,11 +770,6 @@ impl KmsBackend for LocalKmsBackend {
     async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         let key_id = request.key_name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        // `save_master_key` writes through a temp file and renames over the destination, so
-        // creating a key under an existing name would replace its material and silently
-        // destroy the ability to decrypt everything wrapped under it. The sibling
-        // `KmsClient::create_key` has always refused this; the backend path did not, and
-        // this is the path the admin API uses.
         if self.client.master_key_path(&key_id)?.exists() {
             return Err(KmsError::key_already_exists(&key_id));
         }
@@ -767,11 +787,8 @@ impl KmsBackend for LocalKmsBackend {
                 request.description.clone(),
             );
 
-            // Save to disk and cache
-            self.client.save_master_key(&master_key, &key_material).await?;
-
-            let mut cache = self.client.key_cache.write().await;
-            cache.insert(key_id.clone(), master_key.clone());
+            // Save to disk
+            self.client.save_new_master_key(&master_key, &key_material).await?;
 
             master_key
         };
@@ -888,10 +905,6 @@ impl KmsBackend for LocalKmsBackend {
                 .await
                 .map_err(|e| KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
 
-            // Remove from cache
-            let mut cache = self.client.key_cache.write().await;
-            cache.remove(key_id);
-
             debug!(key_id, "Local KMS key deleted immediately");
 
             // Return success response for immediate deletion
@@ -934,10 +947,6 @@ impl KmsBackend for LocalKmsBackend {
             .map_err(|e| KmsError::internal_error(format!("Failed to decode key: {e}")))?;
 
         self.client.save_master_key(&master_key, &existing_key_material).await?;
-
-        // Update cache
-        let mut cache = self.client.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key.clone());
 
         // Convert master_key to KeyMetadata for response
         let key_metadata = KeyMetadata {
@@ -985,10 +994,6 @@ impl KmsBackend for LocalKmsBackend {
             .map_err(|e| KmsError::internal_error(format!("Failed to decode key: {e}")))?;
 
         self.client.save_master_key(&master_key, &existing_key_material).await?;
-
-        // Update cache
-        let mut cache = self.client.key_cache.write().await;
-        cache.insert(key_id.to_string(), master_key.clone());
 
         // Convert master_key to KeyMetadata for response
         let key_metadata = KeyMetadata {
@@ -1189,6 +1194,18 @@ mod tests {
         .expect("stored encrypted key should deserialize");
         assert_eq!(stored.at_rest_protection, StoredKeyProtection::EncryptedMasterKey);
         assert_eq!(stored.nonce.len(), 12);
+
+        let wrong_master_error = match LocalKmsClient::new(LocalConfig {
+            key_dir: client.config.key_dir.clone(),
+            master_key: Some("wrong-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        {
+            Ok(_) => panic!("wrong master key must fail initialization"),
+            Err(error) => error,
+        };
+        assert!(matches!(wrong_master_error, KmsError::CryptographicError { .. }));
     }
 
     #[tokio::test]
@@ -1228,15 +1245,55 @@ mod tests {
             master_key: None,
             file_permissions: Some(0o600),
         };
-        let client_without_master = LocalKmsClient::new(config)
-            .await
-            .expect("client without master key should still initialize in dev-mode tests");
-
-        let err = client_without_master
-            .describe_key("encrypted-key", None)
-            .await
-            .expect_err("encrypted key should require a master key to read");
+        let err = match LocalKmsClient::new(config).await {
+            Ok(_) => panic!("initialization must reject an unreadable encrypted key"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("requires a configured master key"));
+    }
+
+    #[tokio::test]
+    async fn local_key_rotation_is_rejected_without_overwriting_key_material() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "rotation-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+        let original_material = client.get_key_material(key_id).await.expect("load original material");
+
+        let error = client
+            .rotate_key(key_id, None)
+            .await
+            .expect_err("rotation must remain unavailable without historical key versions");
+
+        assert!(matches!(error, KmsError::InvalidOperation { .. }));
+        assert_eq!(
+            client.get_key_material(key_id).await.expect("reload original material"),
+            original_material
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_key_file_with_mismatched_embedded_id() {
+        let (client, temp_dir) = create_dev_mode_client().await;
+        client.create_key("file-name", "AES_256", None).await.expect("create key");
+        let key_path = client.master_key_path("file-name").expect("valid key id");
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key file")).expect("decode key file");
+        stored["key_id"] = serde_json::json!("embedded-name");
+        fs::write(&key_path, serde_json::to_vec_pretty(&stored).expect("encode mismatched key"))
+            .await
+            .expect("write mismatched key");
+
+        let error = match LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: None,
+            file_permissions: Some(0o600),
+        })
+        .await
+        {
+            Ok(_) => panic!("mismatched key identity must fail initialization"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, KmsError::InvalidKey { .. }));
     }
 
     #[tokio::test]
@@ -1329,17 +1386,6 @@ mod tests {
         )
         .await
         .expect("write beta.5 fixture");
-        let mut explicit_protection = stored_key.clone();
-        let explicit_object = explicit_protection.as_object_mut().expect("beta.5 fixture is a JSON object");
-        explicit_object.insert("key_id".to_string(), serde_json::json!("beta5-explicit-key"));
-        explicit_object.insert("at_rest_protection".to_string(), serde_json::json!("encrypted-master-key"));
-        fs::write(
-            temp_dir.path().join("beta5-explicit-key.key"),
-            serde_json::to_vec_pretty(&explicit_protection).expect("serialize explicit-protection fixture"),
-        )
-        .await
-        .expect("write explicit-protection fixture");
-
         let client = LocalKmsClient::new(LocalConfig {
             key_dir: temp_dir.path().to_path_buf(),
             master_key: Some("beta5-test-master-key".to_string()),
@@ -1353,24 +1399,34 @@ mod tests {
             .await
             .expect("decrypt beta.5 SHA-256 protected key");
         assert_eq!(material, vec![0x42; 32]);
+
+        let mut explicit_protection = stored_key.clone();
+        let explicit_object = explicit_protection.as_object_mut().expect("beta.5 fixture is a JSON object");
+        explicit_object.insert("key_id".to_string(), serde_json::json!("beta5-explicit-key"));
+        explicit_object.insert("at_rest_protection".to_string(), serde_json::json!("encrypted-master-key"));
+        fs::write(
+            temp_dir.path().join("beta5-explicit-key.key"),
+            serde_json::to_vec_pretty(&explicit_protection).expect("serialize explicit-protection fixture"),
+        )
+        .await
+        .expect("write explicit-protection fixture");
         let explicit_error = client
             .get_key_material("beta5-explicit-key")
             .await
             .expect_err("explicit current protection must not fall back to the beta.5 KDF");
         assert!(matches!(explicit_error, KmsError::CryptographicError { .. }));
 
-        let wrong_key_client = LocalKmsClient::new(LocalConfig {
+        let wrong_key_error = match LocalKmsClient::new(LocalConfig {
             key_dir: temp_dir.path().to_path_buf(),
             master_key: Some("wrong-beta5-master-key".to_string()),
             file_permissions: Some(0o600),
         })
         .await
-        .expect("initialize local KMS with wrong beta.5 master key");
-        let error = wrong_key_client
-            .get_key_material("beta5-key")
-            .await
-            .expect_err("wrong beta.5 master key must not decrypt the fixture");
-        assert!(matches!(error, KmsError::CryptographicError { .. }));
+        {
+            Ok(_) => panic!("wrong beta.5 master key must fail initialization"),
+            Err(error) => error,
+        };
+        assert!(matches!(wrong_key_error, KmsError::CryptographicError { .. }));
     }
 
     /// R03-CAN-072 / R03-CAN-073: key identifiers arrive from request input, so every path
@@ -1429,9 +1485,7 @@ mod tests {
         }
     }
 
-    /// R07-CAN-103: `save_master_key` writes a temp file and renames over the destination,
-    /// so creating a key under an existing name would replace its material and silently
-    /// destroy the ability to decrypt anything wrapped under it.
+    /// R07-CAN-103: creating a duplicate key must preserve its original material.
     #[tokio::test]
     async fn backend_create_key_refuses_to_replace_existing_key_material() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1468,5 +1522,34 @@ mod tests {
             .await
             .expect("original key material must survive the refused create");
         assert_eq!(original, after, "existing key material must not be replaced");
+    }
+
+    #[tokio::test]
+    async fn concurrent_backend_create_allows_only_one_writer() {
+        let temp_dir = TempDir::new().expect("create key directory");
+        let config = || LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        };
+        let first = LocalKmsBackend {
+            client: LocalKmsClient::new(config()).await.expect("create first client"),
+        };
+        let second = LocalKmsBackend {
+            client: LocalKmsClient::new(config()).await.expect("create second client"),
+        };
+        let request = || CreateKeyRequest {
+            key_name: Some("concurrent-key".to_string()),
+            ..Default::default()
+        };
+
+        let (first_result, second_result) = tokio::join!(first.create_key(request()), second.create_key(request()));
+        assert_ne!(first_result.is_ok(), second_result.is_ok(), "exactly one create must succeed");
+        let error = first_result
+            .err()
+            .or_else(|| second_result.err())
+            .expect("one create must fail");
+        assert!(matches!(error, KmsError::KeyAlreadyExists { .. }));
+        assert_eq!(first.client.get_key_material("concurrent-key").await.expect("load key").len(), 32);
     }
 }

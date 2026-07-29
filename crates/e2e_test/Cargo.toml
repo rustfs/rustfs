@@ -70,7 +70,8 @@ walkdir.workspace = true
 base64 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
-md5 = { workspace = true }
+hex = { workspace = true }
+md-5 = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true
 sha2 = { workspace = true }

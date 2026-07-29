@@ -236,8 +236,8 @@ pub(crate) mod rpc_consumer {
             ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
             ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
             StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata, set_bucket_metadata, validate_batch_read_version_item_count,
+            find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
+            remove_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -431,7 +431,7 @@ pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore,
         FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
-        ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
         get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
@@ -606,6 +606,7 @@ pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::E
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
+pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
@@ -1075,6 +1076,9 @@ pub(crate) trait StorageDiskRpcExt {
     ) -> DiskResult<()>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken>;
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken>;
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()>;
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo>;
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
@@ -1199,6 +1203,18 @@ where
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()> {
         ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
+    }
+
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::acquire_snapshot_lease(self, volume, path).await
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::renew_snapshot_lease(self, volume, path, token).await
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::release_snapshot_lease(self, volume, path, token).await
     }
 
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo> {
@@ -1349,10 +1365,6 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
     }
 }
 
-pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
-    ecstore_bucket::metadata::load_bucket_metadata(api, bucket).await
-}
-
 #[cfg(test)]
 pub(crate) fn bucket_metadata_sys_initialized() -> bool {
     ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
@@ -1425,8 +1437,13 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
     ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
+#[cfg(test)]
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
+}
+
+pub(crate) async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
+    ecstore_bucket::metadata_sys::reload_bucket_metadata(bucket).await
 }
 
 pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {

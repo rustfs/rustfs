@@ -22,6 +22,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use base64::Engine;
+use md5::{Digest as Md5Digest, Md5};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -102,10 +103,12 @@ impl Intercept for ResponseHeaderCapture {
 
 fn customer_key(byte: u8) -> CustomerKey {
     let raw = [byte; 32];
+    let mut hasher = Md5::new();
+    hasher.update(raw);
     CustomerKey {
         raw: String::from_utf8_lossy(&raw).into_owned(),
         encoded: base64::engine::general_purpose::STANDARD.encode(raw),
-        md5: base64::engine::general_purpose::STANDARD.encode(md5::compute(raw).0),
+        md5: base64::engine::general_purpose::STANDARD.encode(hasher.finalize()),
     }
 }
 
