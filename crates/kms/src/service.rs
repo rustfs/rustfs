@@ -350,11 +350,7 @@ impl ObjectEncryptionService {
             encryption_context: context.clone(),
         };
 
-        let data_key = self
-            .kms_manager
-            .generate_data_key(request)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to generate data key: {e}")))?;
+        let data_key = self.kms_manager.generate_data_key(request).await?;
 
         let plaintext_key = data_key.plaintext_key;
 
@@ -431,11 +427,7 @@ impl ObjectEncryptionService {
             grant_tokens: Vec::new(),
         };
 
-        let decrypt_response = self
-            .kms_manager
-            .decrypt(decrypt_request)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data key: {e}")))?;
+        let decrypt_response = self.kms_manager.decrypt(decrypt_request).await?;
 
         // Create cipher
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;

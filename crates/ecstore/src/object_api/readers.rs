@@ -28,7 +28,6 @@ use md5::{Digest, Md5};
 use rustfs_kms::{KmsUnavailableError, is_data_key_envelope, types::ObjectEncryptionContext};
 use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use rustfs_utils::path::path_join_buf;
-#[cfg(feature = "rio-v2")]
 use serde::Deserialize;
 #[cfg(feature = "rio-v2")]
 use sha2::Sha256;
@@ -44,6 +43,7 @@ const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
 const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
 const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
 const DEFAULT_SSE_ALGORITHM: &str = "AES256";
+const LOCAL_SSE_DEK_FORMAT_VERSION: u8 = 1;
 #[cfg(feature = "rio-v2")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
 #[cfg(feature = "rio-v2")]
@@ -1716,16 +1716,39 @@ fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str, object_context
 
 fn decrypt_rustfs_local_sse_dek(encrypted_dek: &[u8]) -> Result<[u8; 32]> {
     let encrypted_dek = std::str::from_utf8(encrypted_dek).map_err(|_| Error::other("managed DEK is not valid UTF-8"))?;
-    let parts: Vec<&str> = encrypted_dek.split(':').collect();
-    if parts.len() != 2 {
-        return Err(Error::other("invalid managed DEK format"));
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LocalSseDekEnvelope<'a> {
+        version: u8,
+        nonce: &'a str,
+        ciphertext: &'a str,
     }
 
+    let (nonce, ciphertext) = match serde_json::from_str::<LocalSseDekEnvelope<'_>>(encrypted_dek) {
+        Ok(envelope) => {
+            if envelope.version != LOCAL_SSE_DEK_FORMAT_VERSION {
+                return Err(Error::other(format!("unsupported managed DEK format version: {}", envelope.version)));
+            }
+            (envelope.nonce, envelope.ciphertext)
+        }
+        Err(_) => {
+            // DEPRECATED: read-only compatibility for persisted colon-delimited DEKs.
+            // RUSTFS_COMPAT_TODO(sse-local-dek-json-v1): Remove after all supported upgrades have rewritten legacy DEKs.
+            let Some((nonce, ciphertext)) = encrypted_dek.split_once(':') else {
+                return Err(Error::other("invalid managed DEK format"));
+            };
+            if ciphertext.contains(':') {
+                return Err(Error::other("invalid managed DEK format"));
+            }
+            (nonce, ciphertext)
+        }
+    };
+
     let nonce_vec = BASE64_STANDARD
-        .decode(parts[0])
+        .decode(nonce)
         .map_err(|_| Error::other("invalid managed DEK nonce"))?;
     let ciphertext = BASE64_STANDARD
-        .decode(parts[1])
+        .decode(ciphertext)
         .map_err(|_| Error::other("invalid managed DEK ciphertext"))?;
 
     let nonce_array: [u8; 12] = nonce_vec
@@ -2324,7 +2347,34 @@ mod tests {
         let cipher = Aes256Gcm::new(&key);
         let nonce = Nonce::from([0u8; 12]);
         let ciphertext = cipher.encrypt(&nonce, dek.as_slice()).expect("encrypt managed dek");
+        serde_json::json!({
+            "version": LOCAL_SSE_DEK_FORMAT_VERSION,
+            "nonce": BASE64_STANDARD.encode(nonce),
+            "ciphertext": BASE64_STANDARD.encode(ciphertext),
+        })
+        .to_string()
+    }
+
+    fn encrypt_legacy_managed_dek_for_test(dek: [u8; 32], master_key: [u8; 32]) -> String {
+        let key = Key::<Aes256Gcm>::from(master_key);
+        let cipher = Aes256Gcm::new(&key);
+        let nonce = Nonce::from([0u8; 12]);
+        let ciphertext = cipher.encrypt(&nonce, dek.as_slice()).expect("encrypt legacy managed dek");
         format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext))
+    }
+
+    #[test]
+    fn decrypt_rustfs_local_sse_dek_rejects_unknown_json_version() {
+        let envelope = serde_json::json!({
+            "version": LOCAL_SSE_DEK_FORMAT_VERSION + 1,
+            "nonce": BASE64_STANDARD.encode([0u8; 12]),
+            "ciphertext": BASE64_STANDARD.encode([0u8; 48]),
+        })
+        .to_string();
+
+        let error =
+            decrypt_rustfs_local_sse_dek(envelope.as_bytes()).expect_err("unknown local SSE DEK versions must fail closed");
+        assert!(error.to_string().contains("unsupported managed DEK format version"));
     }
 
     #[cfg(feature = "rio-v2")]
@@ -2433,7 +2483,7 @@ mod tests {
         async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([7u8; 32])))], async {
             let data_key = [0x24; 32];
             let base_nonce = [0x14; 12];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [7u8; 32]);
+            let encrypted_dek = encrypt_legacy_managed_dek_for_test(data_key, [7u8; 32]);
             let metadata = HashMap::from([
                 (
                     INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),

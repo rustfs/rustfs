@@ -94,6 +94,16 @@ impl KmsServiceManager {
         self.config.read().await.clone()
     }
 
+    /// Get configuration for status and management responses without static key material.
+    pub async fn get_redacted_config(&self) -> Option<KmsConfig> {
+        let mut config = self.config.read().await.clone()?;
+        if let BackendConfig::Static(static_config) = &mut config.backend_config {
+            use zeroize::Zeroize;
+            static_config.secret_key.zeroize();
+        }
+        Some(config)
+    }
+
     /// Configure KMS with new configuration
     pub async fn configure(&self, new_config: KmsConfig) -> Result<()> {
         new_config.validate()?;
@@ -448,5 +458,23 @@ mod tests {
         assert!(error.to_string().contains(crate::config::ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS));
         assert_eq!(manager.get_status().await, KmsServiceStatus::NotConfigured);
         assert!(manager.get_config().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn redacted_config_omits_static_key_material() {
+        use base64::Engine as _;
+
+        let manager = KmsServiceManager::new();
+        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        manager
+            .configure(KmsConfig::static_kms("static-key".to_string(), encoded_key))
+            .await
+            .expect("configure static KMS");
+
+        let config = manager.get_redacted_config().await.expect("redacted config");
+        let BackendConfig::Static(static_config) = config.backend_config else {
+            panic!("expected static config");
+        };
+        assert!(static_config.secret_key.is_empty());
     }
 }
