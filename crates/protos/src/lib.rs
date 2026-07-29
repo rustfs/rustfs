@@ -171,6 +171,7 @@ pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SI
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
 pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
@@ -195,6 +196,49 @@ pub fn heal_control_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
 
 pub fn is_heal_control_capability_probe(command: &[u8]) -> bool {
     command.len() == HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + 16 && command.starts_with(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn remote_version_state_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
+    command.len() == REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn encode_remote_version_state_capability(
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let topology_member = topology_member.as_bytes();
+    let mut result = Vec::with_capacity(8 + topology_member.len() + process_epoch.len());
+    result.extend_from_slice(&u64::try_from(topology_member.len())?.to_be_bytes());
+    result.extend_from_slice(topology_member);
+    result.extend_from_slice(process_epoch);
+    Ok(result)
+}
+
+pub fn decode_remote_version_state_capability(result: &[u8]) -> Result<(&str, &[u8; 16]), &'static str> {
+    let member_len = result
+        .get(..8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or("remote version state capability is truncated")?;
+    let member_len = usize::try_from(member_len).map_err(|_| "remote version state member length cannot be represented")?;
+    let member_end = 8_usize
+        .checked_add(member_len)
+        .ok_or("remote version state member length overflow")?;
+    let topology_member = std::str::from_utf8(result.get(8..member_end).ok_or("remote version state member is truncated")?)
+        .map_err(|_| "remote version state member is not UTF-8")?;
+    let process_epoch = result
+        .get(member_end..)
+        .and_then(|value| value.try_into().ok())
+        .ok_or("remote version state process epoch has an invalid length")?;
+    Ok((topology_member, process_epoch))
 }
 
 /// Builds the stable byte representation authenticated for a heal-control request.
@@ -1203,10 +1247,12 @@ mod scanner_activity_tests {
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
-        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, canonical_heal_control_capability_ack,
-        canonical_heal_control_request_body, canonical_heal_control_response_body, heal_control_capability_probe,
+        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
+        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
+        decode_remote_version_state_capability, encode_remote_version_state_capability, heal_control_capability_probe,
         heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
-        internode_rpc_timeout, is_heal_control_capability_probe, normalize_internode_rpc_timeout,
+        internode_rpc_timeout, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
+        normalize_internode_rpc_timeout, remote_version_state_capability_probe,
     };
     use crate::heal_control;
     use std::time::Duration;
@@ -1261,6 +1307,29 @@ mod heal_control_tests {
         );
         assert!(is_heal_control_capability_probe(&probe));
         assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn remote_version_state_capability_probe_requires_exact_nonce() {
+        let probe = remote_version_state_capability_probe(&[7; 16]);
+        assert!(is_remote_version_state_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn remote_version_state_capability_binds_member_and_process_epoch() {
+        let encoded =
+            encode_remote_version_state_capability("node-a:9000", &[7; 16]).expect("small capability response should encode");
+        assert_eq!(
+            decode_remote_version_state_capability(&encoded).expect("capability response should decode"),
+            ("node-a:9000", &[7; 16])
+        );
+        assert!(decode_remote_version_state_capability(&encoded[..encoded.len() - 1]).is_err());
+
+        let mut invalid_utf8 =
+            encode_remote_version_state_capability("node-a", &[7; 16]).expect("small capability response should encode");
+        invalid_utf8[8] = 0xff;
+        assert!(decode_remote_version_state_capability(&invalid_utf8).is_err());
     }
 
     #[test]

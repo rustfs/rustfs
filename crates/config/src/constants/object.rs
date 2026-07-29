@@ -137,18 +137,6 @@ pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
 
-#[cfg(test)]
-mod remote_version_state_tests {
-    #[test]
-    fn remote_version_state_gate_uses_stable_environment_names() {
-        assert_eq!(super::ENV_TIER_REMOTE_VERSION_STATE_WRITE, "RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE");
-        assert_eq!(
-            super::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
-            "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED"
-        );
-    }
-}
-
 // =============================================================================
 // Concurrent Request Fix - Timeout and Backpressure Configuration
 // =============================================================================
@@ -650,3 +638,15 @@ pub const ENV_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY: &str = "RUSTFS_OBJ
 
 /// Default read-ahead disable concurrency threshold: 4.
 pub const DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+mod remote_version_state_tests {
+    #[test]
+    fn remote_version_state_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_TIER_REMOTE_VERSION_STATE_WRITE, "RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE");
+        assert_eq!(
+            super::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+            "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED"
+        );
+    }
+}

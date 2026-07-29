@@ -384,6 +384,7 @@ pub mod metrics {
 pub mod notification {
     pub use crate::services::notification_sys::{
         NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
 }
 
