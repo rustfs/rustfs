@@ -16,7 +16,7 @@ use crate::cluster::rpc::client::{
     TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
     is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
 };
-use crate::cluster::rpc::{set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
+use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -50,6 +50,7 @@ use rustfs_protos::proto_gen::node_service::{
     TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
+pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
@@ -69,9 +70,6 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub const PEER_RESTSIGNAL: &str = "signal";
-pub const PEER_RESTSUB_SYS: &str = "sub-sys";
-pub const PEER_RESTDRY_RUN: &str = "dry-run";
 pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
 pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
@@ -1160,10 +1158,11 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadBucketMetadataRequest {
+                let mut request = Request::new(LoadBucketMetadataRequest {
                     bucket: bucket.to_string(),
                     scanner_maintenance_change,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_bucket_metadata(request).await?.into_inner();
                 if !response.success {
@@ -1183,9 +1182,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeleteBucketMetadataRequest {
+                let mut request = Request::new(DeleteBucketMetadataRequest {
                     bucket: bucket.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_bucket_metadata(request).await?.into_inner();
                 if !response.success {
@@ -1205,9 +1205,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeletePolicyRequest {
+                let mut request = Request::new(DeletePolicyRequest {
                     policy_name: policy.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_policy(request).await?.into_inner();
                 if !response.success {
@@ -1227,9 +1228,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadPolicyRequest {
+                let mut request = Request::new(LoadPolicyRequest {
                     policy_name: policy.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_policy(request).await?.into_inner();
                 if !response.success {
@@ -1249,11 +1251,12 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadPolicyMappingRequest {
+                let mut request = Request::new(LoadPolicyMappingRequest {
                     user_or_group: user_or_group.to_string(),
                     user_type,
                     is_group,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_policy_mapping(request).await?.into_inner();
                 if !response.success {
@@ -1273,9 +1276,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeleteUserRequest {
+                let mut request = Request::new(DeleteUserRequest {
                     access_key: access_key.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_user(request).await?.into_inner();
                 if !response.success {
@@ -1295,9 +1299,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeleteServiceAccountRequest {
+                let mut request = Request::new(DeleteServiceAccountRequest {
                     access_key: access_key.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_service_account(request).await?.into_inner();
                 if !response.success {
@@ -1317,10 +1322,11 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadUserRequest {
+                let mut request = Request::new(LoadUserRequest {
                     access_key: access_key.to_string(),
                     temp,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_user(request).await?.into_inner();
                 if !response.success {
@@ -1340,9 +1346,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadServiceAccountRequest {
+                let mut request = Request::new(LoadServiceAccountRequest {
                     access_key: access_key.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_service_account(request).await?.into_inner();
                 if !response.success {
@@ -1362,9 +1369,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadGroupRequest {
+                let mut request = Request::new(LoadGroupRequest {
                     group: group.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_group(request).await?.into_inner();
                 if !response.success {
@@ -1384,7 +1392,8 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(ReloadSiteReplicationConfigRequest {});
+                let mut request = Request::new(ReloadSiteReplicationConfigRequest {});
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.reload_site_replication_config(request).await?.into_inner();
                 if !response.success {
@@ -1408,9 +1417,10 @@ impl PeerRestClient {
                 vars.insert(PEER_RESTSIGNAL.to_string(), sig.to_string());
                 vars.insert(PEER_RESTSUB_SYS.to_string(), sub_sys.to_string());
                 vars.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
-                let request = Request::new(SignalServiceRequest {
+                let mut request = Request::new(SignalServiceRequest {
                     vars: Some(Mss { value: vars }),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.signal_service(request).await?.into_inner();
                 if !response.success {
@@ -1479,7 +1489,8 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(ReloadPoolMetaRequest {});
+                let mut request = Request::new(ReloadPoolMetaRequest {});
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.reload_pool_meta(request).await?.into_inner();
                 if !response.success {
@@ -1500,9 +1511,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(StopRebalanceRequest {
+                let mut request = Request::new(StopRebalanceRequest {
                     expected_rebalance_id: expected_rebalance_id.unwrap_or_default().to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.stop_rebalance(request).await?.into_inner();
                 if !response.success {
@@ -1523,7 +1535,8 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
+                let mut request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_rebalance_meta(request).await?.into_inner();
 
@@ -1562,7 +1575,8 @@ impl PeerRestClient {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(StartDecommissionRequest { pool_indices });
+                let mut request = Request::new(StartDecommissionRequest { pool_indices });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.start_decommission(request).await?.into_inner();
                 if !response.success {
@@ -1585,7 +1599,8 @@ impl PeerRestClient {
                 let pool_index = u32::try_from(pool_index)
                     .map_err(|_| Error::other(format!("decommission pool index {pool_index} exceeds RPC range")))?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(CancelDecommissionRequest { pool_index });
+                let mut request = Request::new(CancelDecommissionRequest { pool_index });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.cancel_decommission(request).await?.into_inner();
                 if !response.success {
@@ -1608,7 +1623,8 @@ impl PeerRestClient {
                 let pool_index = u32::try_from(pool_index)
                     .map_err(|_| Error::other(format!("decommission pool index {pool_index} exceeds RPC range")))?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(ClearDecommissionRequest { pool_index });
+                let mut request = Request::new(ClearDecommissionRequest { pool_index });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.clear_decommission(request).await?.into_inner();
                 if !response.success {
@@ -1661,6 +1677,9 @@ impl PeerRestClient {
             Err(err) => return tier_config_reload_connection_outcome(err),
         };
         let mut request = Request::new(LoadTransitionTierConfigRequest {});
+        if let Err(err) = set_tonic_mutation_body_digest(&mut request) {
+            return TierConfigReloadOutcome::Terminal(Error::other(err));
+        }
         request.set_timeout(rustfs_protos::heal_control_execution_timeout());
 
         let response = match client.load_transition_tier_config(request).await {
