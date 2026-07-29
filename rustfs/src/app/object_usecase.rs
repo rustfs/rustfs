@@ -44,8 +44,8 @@ use super::storage_api::object_usecase::bucket::{
         REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType, check_replicate_delete,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
         must_replicate_object, schedule_object_replication, schedule_replication_delete, set_deleted_object_replication_state,
-        set_object_to_delete_version_purge_status, should_schedule_delete_replication,
-        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+        set_object_to_delete_version_purge_status, should_use_existing_delete_replication_info,
+        should_use_existing_delete_replication_source,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -6704,7 +6704,7 @@ impl DefaultObjectUsecase {
         // the same early, advisory rejection as before.
         let store_ref = &store;
         let bucket_ref = bucket.as_str();
-        let admitted_deletes: Vec<AdmittedDelete> =
+        let admitted_deletes: Vec<Result<AdmittedDelete, ApiError>> =
             futures::stream::iter(prepared_deletes.into_iter().map(|prepared| async move {
                 let PreparedDelete {
                     idx,
@@ -6729,7 +6729,7 @@ impl DefaultObjectUsecase {
                     && let Some(block_reason) = check_object_lock_for_deletion(bucket_ref, &goi, bypass_governance).await
                 {
                     let blocked_key = object.object_name.clone();
-                    return AdmittedDelete {
+                    return Ok(AdmittedDelete {
                         idx,
                         object,
                         size: 0,
@@ -6740,14 +6740,10 @@ impl DefaultObjectUsecase {
                             message: Some(block_reason.error_message()),
                             version_id,
                         }),
-                    };
+                    });
                 }
 
                 let size = goi.size;
-
-                if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                    object.version_id = Some(Uuid::nil());
-                }
 
                 if replicate_deletes {
                     let dsc = check_replicate_delete(
@@ -6761,7 +6757,8 @@ impl DefaultObjectUsecase {
                         &opts,
                         gerr.clone(),
                     )
-                    .await;
+                    .await
+                    .map_err(ApiError::from)?;
                     if dsc.replicate_any() {
                         if object.version_id.is_some() {
                             set_object_to_delete_version_purge_status(&mut object, VersionPurgeStatusType::Pending);
@@ -6773,18 +6770,23 @@ impl DefaultObjectUsecase {
                     }
                 }
 
+                if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                    object.version_id = Some(Uuid::nil());
+                }
+
                 let existing = (!skip_stat && gerr.is_none()).then_some(goi);
-                AdmittedDelete {
+                Ok(AdmittedDelete {
                     idx,
                     object,
                     size,
                     existing,
                     blocked: None,
-                }
+                })
             }))
             .buffered(DELETE_OBJECTS_PRE_STAT_CONCURRENCY)
             .collect()
             .await;
+        let admitted_deletes: Vec<AdmittedDelete> = admitted_deletes.into_iter().collect::<Result<_, ApiError>>()?;
 
         // Phase 3 (serial): apply outcomes in the original request order so
         // per-key success/failure reporting is unchanged.
@@ -7102,6 +7104,31 @@ impl DefaultObjectUsecase {
             }
         };
 
+        let delete_replication_state = if !replica && !force_delete && (opts.versioned || opts.version_suspended) {
+            let fallback_source;
+            let source = if let Some(source) = existing_object_info.as_ref() {
+                source
+            } else {
+                fallback_source = ObjectInfo {
+                    name: key.clone(),
+                    ..Default::default()
+                };
+                &fallback_source
+            };
+            match metadata_sys::get_replication_config(&bucket).await {
+                Ok((config, _)) => delete_replication_state_from_config(
+                    &config,
+                    source,
+                    version_id_clone.as_ref().and_then(|_| source.version_id),
+                    false,
+                ),
+                Err(StorageError::ConfigNotFound) => None,
+                Err(err) => return Err(ApiError::from(err).into()),
+            }
+        } else {
+            None
+        };
+
         let cache_adapter = self.object_data_cache();
         // A force (delete_prefix) delete removes every object under `key` as a
         // prefix, so invalidating only the exact key would strand every cached
@@ -7197,7 +7224,7 @@ impl DefaultObjectUsecase {
         let schedule_delete_replication = if opts.replication_request && replica {
             should_schedule_replica_delete_replication(&bucket, replication_state_source, delete_replication_version_id).await
         } else {
-            should_schedule_delete_replication(&opts, deleted_object_source, deleted_delete_marker_version)
+            delete_replication_state.is_some()
         };
 
         if schedule_delete_replication {
@@ -7219,8 +7246,12 @@ impl DefaultObjectUsecase {
                 replication_state: None,
                 ..Default::default()
             };
-            set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
-            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object, replication_state_source).await;
+            if let Some(state) = delete_replication_state.as_ref() {
+                set_deleted_object_replication_state(&mut deleted_object, state);
+            } else {
+                set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
+                enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object, replication_state_source).await;
+            }
             schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
         }
 
@@ -8358,9 +8389,10 @@ mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
     use s3s::dto::{
-        Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
-        ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, SourceSelectionCriteria,
+        Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
+        ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications,
+        ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest,
+        SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -13368,63 +13400,6 @@ mod tests {
         assert!(!can_skip_delete_objects_pre_stat(false, false, &delete_marker_creating_opts(), false));
     }
 
-    #[test]
-    fn should_schedule_delete_replication_skips_replica_requests() {
-        let opts = ObjectOptions {
-            replication_request: true,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let replication_source = ObjectInfo {
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        assert!(
-            !should_schedule_delete_replication(&opts, &replication_source, true),
-            "replica delete requests on target sites must not enqueue a second replication delete task"
-        );
-    }
-
-    #[test]
-    fn should_schedule_delete_replication_keeps_delete_marker_version_purge_from_source() {
-        let opts = ObjectOptions {
-            replication_request: false,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let replication_source = ObjectInfo {
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        assert!(
-            should_schedule_delete_replication(&opts, &replication_source, true),
-            "source-side delete-marker version purge still needs replication scheduling"
-        );
-    }
-
-    #[test]
-    fn should_schedule_delete_replication_keeps_object_version_purge_from_completed_source() {
-        let opts = ObjectOptions {
-            replication_request: false,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let replication_source = ObjectInfo {
-            delete_marker: false,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        assert!(
-            should_schedule_delete_replication(&opts, &replication_source, false),
-            "source-side object version purge must still enqueue delete replication after the original PUT completed"
-        );
-    }
-
     #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
@@ -13689,7 +13664,9 @@ mod tests {
                 delete_marker_replication: Some(DeleteMarkerReplication {
                     status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
                 }),
-                delete_replication: None,
+                delete_replication: Some(DeleteReplication {
+                    status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                }),
                 destination: Destination {
                     bucket: arn.clone(),
                     ..Default::default()

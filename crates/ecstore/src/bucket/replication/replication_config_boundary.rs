@@ -14,5 +14,5 @@
 
 pub use rustfs_replication::{
     ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, replication_target_arns,
-    should_remove_replication_target, validate_replication_config_target_arns,
+    should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_target_arns,
 };

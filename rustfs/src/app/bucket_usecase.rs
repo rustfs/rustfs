@@ -35,7 +35,7 @@ use super::storage_api::bucket_usecase::bucket::{
     policy_sys::PolicySys,
     replication::{
         ReplicationTargetValidationError, replication_target_arns, should_remove_replication_target,
-        validate_replication_config_target_arns,
+        unsupported_replication_config_field, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -556,6 +556,16 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
     }
 }
 
+fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+    if let Some(field) = unsupported_replication_config_field(config) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("replication field {field} is not supported by this RustFS version"),
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
     if !BucketVersioningSys::enabled(bucket).await {
         return Err(s3_error!(
@@ -563,6 +573,8 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
             "bucket versioning must be enabled before replication can be configured"
         ));
     }
+
+    validate_replication_config_capabilities(config)?;
 
     let targets = metadata_sys::get_bucket_targets_config(bucket)
         .await
@@ -3073,6 +3085,25 @@ mod tests {
         };
 
         validate_replication_config_targets(&targets, &config).expect("disabled rules should not require live targets");
+    }
+
+    #[test]
+    fn validate_replication_config_capabilities_names_unsupported_field() {
+        let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration::default());
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+
+        let err = validate_replication_config_capabilities(&config)
+            .expect_err("destination encryption must be rejected until the execution path supports it");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(
+            err.to_string()
+                .contains("Destination.EncryptionConfiguration is not supported")
+        );
     }
 
     #[test]

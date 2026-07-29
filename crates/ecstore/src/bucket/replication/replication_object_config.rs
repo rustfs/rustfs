@@ -169,9 +169,8 @@ pub(crate) async fn check_replicate_delete(
     del_opts: &ObjectOptions,
     gerr: Option<String>,
 ) -> ReplicateDecision {
-    let rcfg = match get_replication_config(bucket).await {
-        Ok(Some(config)) => config,
-        Ok(None) => return ReplicateDecision::default(),
+    match check_replicate_delete_strict(bucket, dobj, oi, del_opts, gerr).await {
+        Ok(decision) => decision,
         Err(err) => {
             error!(
                 event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
@@ -182,16 +181,30 @@ pub(crate) async fn check_replicate_delete(
                 error = %err,
                 "Failed to look up replication config for delete replication"
             );
-            return ReplicateDecision::default();
+            ReplicateDecision::default()
         }
+    }
+}
+
+pub(crate) async fn check_replicate_delete_strict(
+    bucket: &str,
+    dobj: &ObjectToDelete,
+    oi: &ObjectInfo,
+    del_opts: &ObjectOptions,
+    gerr: Option<String>,
+) -> Result<ReplicateDecision> {
+    let rcfg = match get_replication_config(bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => return Ok(ReplicateDecision::default()),
+        Err(err) => return Err(err),
     };
 
     if del_opts.replication_request {
-        return ReplicateDecision::default();
+        return Ok(ReplicateDecision::default());
     }
 
-    if !del_opts.versioned {
-        return ReplicateDecision::default();
+    if !del_opts.versioned && !del_opts.version_suspended {
+        return Ok(ReplicateDecision::default());
     }
 
     let replication_delete = object_to_delete_for_replication(dobj);
@@ -209,7 +222,7 @@ pub(crate) async fn check_replicate_delete(
     let mut dsc = ReplicateDecision::new();
 
     if tgt_arns.is_empty() {
-        return dsc;
+        return Ok(dsc);
     }
 
     for tgt_arn in tgt_arns {
@@ -239,7 +252,7 @@ pub(crate) async fn check_replicate_delete(
         dsc.set(tgt_dsc);
     }
 
-    dsc
+    Ok(dsc)
 }
 
 pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
