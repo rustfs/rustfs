@@ -99,7 +99,9 @@ const SCANNER_CYCLE_STATE_HEADER_LEN: usize = 24;
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 #[cfg(test)]
-static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<(u64, Arc<Notify>)>>> =
+type ScannerCycleStatePersistTestHook = (u64, Arc<Notify>);
+#[cfg(test)]
+static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<ScannerCycleStatePersistTestHook>>> =
     LazyLock::new(|| StdMutex::new(None));
 
 #[cfg(test)]
@@ -4561,7 +4563,7 @@ mod tests {
             .expect("scanner cycle state lock should be acquired");
         let mut cycle = Box::pin(run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, leader_epoch));
         let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(&waker);
+        let mut context = std::task::Context::from_waker(waker);
 
         assert!(cycle.as_mut().poll(&mut context).is_pending());
         let active = global_metrics().report().await;
