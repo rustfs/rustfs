@@ -9732,6 +9732,7 @@ dependencies = [
  "rustfs-policy",
  "rustfs-rio",
  "rustfs-storage-api",
+ "rustfs-test-utils",
  "rustfs-tls-runtime",
  "rustfs-trusted-proxies",
  "rustfs-utils",

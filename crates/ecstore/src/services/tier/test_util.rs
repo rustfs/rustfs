@@ -931,7 +931,10 @@ pub async fn read_transition_meta(disk_path: &Path, bucket: &str, object: &str) 
         status: fi.transition_status.clone(),
         tier: fi.transition_tier.clone(),
         remote_object: fi.transitioned_objname.clone(),
-        remote_version_id: fi.transition_version_id.map(|id| id.to_string()),
+        remote_version_id: fi
+            .transition_version
+            .clone()
+            .or_else(|| fi.transition_version_id.map(|id| id.to_string())),
         free_version_count,
     })
 }
