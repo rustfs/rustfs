@@ -1167,7 +1167,7 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
-    async fn register_operator_reconcile_test_tier(
+    async fn register_transition_reconcile_test_tier(
         handle: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
         tier_name: &str,
     ) -> MockWarmBackend {
@@ -2772,7 +2772,7 @@ mod tests {
             .await;
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-            let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+            let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
             let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
                 .await
                 .expect("tier lease should resolve")
@@ -2853,7 +2853,7 @@ mod tests {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
         let tier_name = "TXOPERATOR";
-        let backend = register_operator_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
         let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
             .await
             .expect("tier lease should resolve")
@@ -2949,7 +2949,7 @@ mod tests {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
         let tier_name = "TXOPERATORFAIL";
-        let backend = register_operator_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
         let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
             .await
             .expect("tier lease should resolve")
@@ -3004,7 +3004,7 @@ mod tests {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
         let tier_name = "TXRESPONSELOSS";
-        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
         let bucket = "transition-response-loss-bucket";
         let object = "source.bin";
         store
