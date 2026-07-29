@@ -36,12 +36,13 @@ name = "rustfs"
 path = "src/main.rs"
 
 [features]
-default = ["ftps", "webdav"]
+default = ["ftps", "webdav", "tftp"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 sftp = ["rustfs-protocols/sftp"]
+tftp = ["rustfs-protocols/tftp"]
 license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)

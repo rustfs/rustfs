@@ -14,6 +14,8 @@
 
 #[cfg(feature = "sftp")]
 use crate::init::init_sftp_system;
+#[cfg(feature = "tftp")]
+use crate::init::init_tftp_system;
 #[cfg(feature = "webdav")]
 use crate::init::init_webdav_system;
 #[cfg(feature = "ftps")]
@@ -36,6 +38,7 @@ pub(crate) struct ProtocolShutdownSenders {
     pub(crate) ftps: Option<ShutdownHandle>,
     pub(crate) webdav: Option<ShutdownHandle>,
     pub(crate) sftp: Option<ShutdownHandle>,
+    pub(crate) tftp: Option<ShutdownHandle>,
 }
 
 pub(crate) async fn init_protocol_shutdown_senders() -> Result<ProtocolShutdownSenders> {
@@ -44,6 +47,7 @@ pub(crate) async fn init_protocol_shutdown_senders() -> Result<ProtocolShutdownS
         ftps: init_ftps_protocol().await?,
         webdav: init_webdav_protocol().await?,
         sftp: init_sftp_protocol().await?,
+        tftp: init_tftp_protocol().await?,
     })
 }
 
@@ -84,6 +88,16 @@ async fn init_sftp_protocol() -> Result<Option<ShutdownHandle>> {
 
 #[cfg(not(feature = "sftp"))]
 async fn init_sftp_protocol() -> Result<Option<ShutdownHandle>> {
+    Ok(None)
+}
+
+#[cfg(feature = "tftp")]
+async fn init_tftp_protocol() -> Result<Option<ShutdownHandle>> {
+    init_protocol("tftp", init_tftp_system).await
+}
+
+#[cfg(not(feature = "tftp"))]
+async fn init_tftp_protocol() -> Result<Option<ShutdownHandle>> {
     Ok(None)
 }
 

@@ -60,6 +60,7 @@ swift = [
 ]
 webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
+tftp = ["dep:async-tftp", "dep:futures-lite"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -133,6 +134,10 @@ russh = { workspace = true, optional = true, features = ["serde"] }
 russh-sftp = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true, features = ["all"] }
+
+# TFTP specific dependencies (optional)
+async-tftp = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

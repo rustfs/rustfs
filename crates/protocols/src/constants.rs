@@ -72,4 +72,8 @@ pub mod defaults {
     /// Default SFTP server address
     #[cfg(feature = "sftp")]
     pub const DEFAULT_SFTP_ADDRESS: &str = "0.0.0.0:2222";
+
+    /// Default TFTP server address
+    #[cfg(feature = "tftp")]
+    pub const DEFAULT_TFTP_ADDRESS: &str = "0.0.0.0:6969";
 }

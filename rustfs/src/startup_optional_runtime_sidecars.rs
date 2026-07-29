@@ -45,6 +45,7 @@ enum OptionalRuntimeShutdownStep {
     Ftps,
     Webdav,
     Sftp,
+    Tftp,
 }
 
 impl OptionalRuntimeShutdownStep {
@@ -54,13 +55,14 @@ impl OptionalRuntimeShutdownStep {
             Self::Ftps => "ftps",
             Self::Webdav => "webdav",
             Self::Sftp => "sftp",
+            Self::Tftp => "tftp",
         }
     }
 }
 
 #[cfg(test)]
 fn optional_runtime_shutdown_steps(protocols: &ProtocolShutdownSenders) -> Vec<OptionalRuntimeShutdownStep> {
-    let mut steps = Vec::with_capacity(4);
+    let mut steps = Vec::with_capacity(5);
     if protocols.ftp.is_some() {
         steps.push(OptionalRuntimeShutdownStep::Ftp);
     }
@@ -73,11 +75,20 @@ fn optional_runtime_shutdown_steps(protocols: &ProtocolShutdownSenders) -> Vec<O
     if protocols.sftp.is_some() {
         steps.push(OptionalRuntimeShutdownStep::Sftp);
     }
+    if protocols.tftp.is_some() {
+        steps.push(OptionalRuntimeShutdownStep::Tftp);
+    }
     steps
 }
 
 pub(crate) fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRuntimeServices) -> Vec<ShutdownHandle> {
-    let ProtocolShutdownSenders { ftp, ftps, webdav, sftp } = optional_runtimes.protocols;
+    let ProtocolShutdownSenders {
+        ftp,
+        ftps,
+        webdav,
+        sftp,
+        tftp,
+    } = optional_runtimes.protocols;
 
     let mut protocol_shutdowns = Vec::new();
     if let Some(handle) = ftp {
@@ -94,6 +105,10 @@ pub(crate) fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRunt
     }
     if let Some(handle) = sftp {
         log_protocol_stopping(OptionalRuntimeShutdownStep::Sftp);
+        protocol_shutdowns.push(handle);
+    }
+    if let Some(handle) = tftp {
+        log_protocol_stopping(OptionalRuntimeShutdownStep::Tftp);
         protocol_shutdowns.push(handle);
     }
 
@@ -147,6 +162,7 @@ mod tests {
             ftps: Some(completed_shutdown_handle()),
             webdav: Some(completed_shutdown_handle()),
             sftp: Some(completed_shutdown_handle()),
+            tftp: Some(completed_shutdown_handle()),
         };
 
         assert_eq!(
@@ -156,6 +172,7 @@ mod tests {
                 OptionalRuntimeShutdownStep::Ftps,
                 OptionalRuntimeShutdownStep::Webdav,
                 OptionalRuntimeShutdownStep::Sftp,
+                OptionalRuntimeShutdownStep::Tftp,
             ]
         );
     }
@@ -168,6 +185,7 @@ mod tests {
             ftps: None,
             webdav: Some(observed_shutdown_handle("webdav", events.clone())),
             sftp: None,
+            tftp: None,
         };
 
         let protocol_shutdowns = prepare_optional_runtime_shutdowns(OptionalRuntimeServices::new(protocols));

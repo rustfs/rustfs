@@ -1351,6 +1351,133 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
     }
 }
 
+/// Initialize the TFTP system
+///
+/// This function initializes the TFTP server if enabled in the configuration.
+/// It sets up the TFTP server with the appropriate configuration and starts
+/// the server in a background task.
+#[cfg(feature = "tftp")]
+#[instrument(skip_all)]
+pub async fn init_tftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::protocols::ProtocolStorageClient;
+    use rustfs_config::{
+        DEFAULT_TFTP_ADDRESS, ENV_TFTP_ACCESS_KEY, ENV_TFTP_ACCESS_MODE, ENV_TFTP_ADDRESS, ENV_TFTP_DEFAULT_BUCKET,
+        ENV_TFTP_ENABLE,
+    };
+    use rustfs_protocols::{TftpAccessMode, TftpConfig, TftpInitError, TftpServer};
+    use std::str::FromStr;
+
+    let enabled = rustfs_utils::get_env_bool(ENV_TFTP_ENABLE, false);
+    if !enabled {
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "tftp",
+            state = "disabled",
+            "Protocol runtime disabled"
+        );
+        return Ok(None);
+    }
+
+    let addr_str = rustfs_utils::get_env_str(ENV_TFTP_ADDRESS, DEFAULT_TFTP_ADDRESS);
+    let addr = rustfs_utils::net::parse_and_resolve_address(&addr_str)
+        .map_err(|e| TftpInitError::InvalidBindAddress(format!("'{}': {}", addr_str, e)))?;
+    let default_bucket = rustfs_utils::get_env_str(ENV_TFTP_DEFAULT_BUCKET, "");
+    let mode_str = rustfs_utils::get_env_str(ENV_TFTP_ACCESS_MODE, "rw");
+    let mode = match TftpAccessMode::from_str(&mode_str) {
+        Ok(m) => m,
+        Err(e) => {
+            error!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "tftp",
+                state = "invalid_access_mode",
+                access_mode = %mode_str,
+                error = %e,
+                "Invalid TFTP access mode, use 'ro' for read-only, wr for write-only and 'rw' for read-write by set RUSTFS_TFTP_ACCESS_MODE"
+            );
+            return Err(Box::new(e));
+        }
+    };
+    let mut access_key = rustfs_utils::get_env_str(ENV_TFTP_ACCESS_KEY, "");
+
+    // If access key is not provided, use global credentials
+    if access_key.is_empty() {
+        warn!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "tftp",
+            state = "credentials_missing",
+            "TFTP access key not provided, using global credentials"
+        );
+        access_key = rustfs_credentials::get_global_access_key();
+    }
+
+    let config = TftpConfig {
+        bind_addr: addr,
+        default_bucket: if default_bucket.is_empty() {
+            None
+        } else {
+            Some(default_bucket)
+        },
+        access_key: access_key,
+        mode,
+    };
+
+    config.validate().await?;
+
+    // Create TFTP server with protocol storage client
+    let fs = crate::storage_api::startup::init::ecfs::FS::new();
+    let storage_client = ProtocolStorageClient::new(fs);
+    let server: TftpServer<crate::protocols::ProtocolStorageClient> = TftpServer::new(config, Arc::new(storage_client));
+
+    // Hook into shutdown support
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+    // Start TFTP server in background task
+    let task_handle = tokio::spawn(async move {
+        if let Err(e) = server.start(shutdown_rx).await {
+            error!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "tftp",
+                state = "runtime_failed",
+                error = %e,
+                "Protocol server failed"
+            );
+        }
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_SERVER_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "tftp",
+            state = "stopped",
+            "Protocol server stopped"
+        );
+    });
+
+    info!(
+        target: "rustfs::init",
+        event = EVENT_PROTOCOL_RUNTIME_STATE,
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_PROTOCOL,
+        protocol = "tftp",
+        state = "started",
+        bind_addr = addr_str,
+        "Protocol runtime started"
+    );
+    Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{notification_config_to_event_rules, resolve_buffer_profile_config};

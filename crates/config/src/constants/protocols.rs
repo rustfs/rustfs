@@ -169,3 +169,13 @@ pub const DEFAULT_SFTP_READ_ONLY: bool = false;
 
 /// Default SSH identification string (no version disclosure).
 pub const DEFAULT_SFTP_BANNER: &str = "SSH-2.0-RustFS";
+
+/// Default TFTP server bind address
+pub const DEFAULT_TFTP_ADDRESS: &str = "0.0.0.0:6969";
+
+/// TFTP environment variable names
+pub const ENV_TFTP_ENABLE: &str = "RUSTFS_TFTP_ENABLE";
+pub const ENV_TFTP_ADDRESS: &str = "RUSTFS_TFTP_ADDRESS";
+pub const ENV_TFTP_DEFAULT_BUCKET: &str = "RUSTFS_TFTP_DEFAULT_BUCKET";
+pub const ENV_TFTP_ACCESS_MODE: &str = "RUSTFS_TFTP_ACCESS_MODE";
+pub const ENV_TFTP_ACCESS_KEY: &str = "RUSTFS_TFTP_ACCESS_KEY";

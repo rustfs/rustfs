@@ -29,6 +29,9 @@ pub mod webdav;
 #[cfg(feature = "sftp")]
 pub mod sftp;
 
+#[cfg(feature = "tftp")]
+pub mod tftp;
+
 pub use common::session::Protocol;
 pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
 
@@ -43,3 +46,6 @@ pub use webdav::{config::WebDavConfig, server::WebDavServer};
 
 #[cfg(feature = "sftp")]
 pub use sftp::{SftpConfig, SftpInitError, SftpServer};
+
+#[cfg(feature = "tftp")]
+pub use tftp::{TftpAccessMode, TftpConfig, TftpInitError, TftpServer};

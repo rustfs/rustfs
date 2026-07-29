@@ -254,6 +254,12 @@ pub fn is_operation_supported(protocol: super::session::Protocol, action: &S3Act
             S3Action::GetObjectAcl => false,
             S3Action::PutObjectAcl => false,
         },
+        super::session::Protocol::Tftp => match action {
+            // TFTP only supports read (RRQ) and write (WRQ).
+            S3Action::GetObject => true,
+            S3Action::PutObject => true,
+            _ => false,
+        },
     }
 }
 
