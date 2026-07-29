@@ -137,21 +137,21 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
         .as_ref()
         .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
         .cloned();
-    if let Some(barrier) = barrier {
-        if let Ok(previous) = barrier.arrivals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    if let Some(barrier) = barrier
+        && let Ok(previous) = barrier.arrivals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < barrier.expected_arrivals).then_some(current + 1)
-        }) {
-            let arrival = previous + 1;
-            if arrival == barrier.expected_arrivals {
-                barrier.arrived.notify_one();
-            }
-            barrier
-                .release
-                .acquire()
-                .await
-                .expect("multipart commit barrier should remain open")
-                .forget();
+        })
+    {
+        let arrival = previous + 1;
+        if arrival == barrier.expected_arrivals {
+            barrier.arrived.notify_one();
         }
+        barrier
+            .release
+            .acquire()
+            .await
+            .expect("multipart commit barrier should remain open")
+            .forget();
     }
 }
 
