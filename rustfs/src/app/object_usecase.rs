@@ -7782,7 +7782,12 @@ impl DefaultObjectUsecase {
         let bucket_clone = bucket.clone();
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
-        let version_id_clone = obj_info_.version_id.map(|v| v.to_string());
+        let version_id_clone = obj_info_
+            .version_id
+            .map(|v| v.to_string())
+            .or_else(|| (opts.versioned || opts.version_suspended).then(|| Uuid::nil().to_string()));
+        let versioned = opts.versioned;
+        let version_suspended = opts.version_suspended;
         let mut restore_operation_metadata = HashMap::new();
         if let Some(id) = restore_operation_id {
             insert_str(&mut restore_operation_metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
@@ -7796,6 +7801,8 @@ impl DefaultObjectUsecase {
                     ..Default::default()
                 },
                 version_id: version_id_clone,
+                versioned,
+                version_suspended,
                 user_defined: restore_operation_metadata,
                 ..Default::default()
             };
