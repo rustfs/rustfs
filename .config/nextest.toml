@@ -1,17 +1,14 @@
 # nextest configuration for RustFS.
 #
-# Serialize two known load-sensitive / global-state-sharing ecstore test groups
-# so the full parallel nextest suite stops producing spurious failures
-# (backlog #937). These tests pass in isolation but flake under the loaded
-# parallel run for two distinct reasons:
+# Serialize the ecstore tests that share the process-wide disk registry or
+# exercise a multi-disk commit handoff across nextest process boundaries.
 #
 #   * store::bucket::tests::bucket_delete_* share process/global state (disk
 #     registry, lock client) and race make_bucket into InsufficientWriteQuorum
 #     when run concurrently with other ecstore tests.
 #   * bucket_lifecycle_ops::tests::concurrent_resend_same_part_commits_one_generation
-#     asserts a lock-acquire correctness property whose serialized cross-disk
-#     commits exceed the (already max'd, 60s) acquire deadline only when the
-#     suite saturates disk I/O.
+#     uses the shared multipart fixture and a deterministic uploadId-lock
+#     handoff, so it must not overlap another process mutating that fixture.
 #
 # serial_test's #[serial] attribute does NOT serialize these across runs:
 # nextest executes each test in its own process, where the in-process
@@ -100,19 +97,17 @@ path = "junit.xml"
 # profile's own overrides list, not the default profile's).
 # ===========================================================================
 
-# QUARANTINE: OPEN backlog#937 — concurrent_resend lock-acquire deadline flakes
-# under saturated disk I/O in the full parallel suite.
-[[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(concurrent_resend_same_part_commits_one_generation)'
-test-group = 'ecstore-serial-flaky'
-retries = 2
-
 # QUARANTINE: OPEN backlog#937 — store::bucket::tests::bucket_delete_* race
 # make_bucket into InsufficientWriteQuorum via shared global state under load.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/)'
 test-group = 'ecstore-serial-flaky'
 retries = 2
+
+# Keep the deterministic multipart handoff isolated across nextest processes.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(concurrent_resend_same_part_commits_one_generation)'
+test-group = 'ecstore-serial-flaky'
 
 # QUARANTINE: OPEN rustfs#4690 — walk_dir stall-budget accounting test depends
 # on producer/consumer timing windows that stretch past the budget on loaded

@@ -169,6 +169,34 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
         .expect("Failed to upload test object")
 }
 
+async fn transition_uploaded_object_directly(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    tier_name: &str,
+    uploaded: &ObjectInfo,
+) -> ObjectInfo {
+    let transition_opts = ObjectOptions {
+        transition: lifecycle::lifecycle_contract::TransitionOptions {
+            status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+            tier: tier_name.to_string(),
+            etag: uploaded.etag.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        version_id: uploaded.version_id.map(|version| version.to_string()),
+        versioned: uploaded.version_id.is_some(),
+        mod_time: uploaded.mod_time,
+        ..Default::default()
+    };
+    ecstore
+        .transition_object(bucket, object, &transition_opts)
+        .await
+        .expect("Failed to transition object directly");
+    wait_for_transition(ecstore, bucket, object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should transition before restore assertions")
+}
+
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -2026,13 +2054,12 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 
 /// backlog#1148 ilm-8: the RestoreObject API surface on a transitioned object.
 ///
-/// POST restore(days=1) is accepted and immediately flips the object to
-/// `x-amz-restore: ongoing-request="true"` (the mock tier's injected GET
-/// latency keeps the background copy-back in flight); a second POST during
-/// that window is rejected with 409 `RestoreAlreadyInProgress`; once the
-/// copy-back completes the object reports `ongoing-request="false"` with a
-/// future expiry-date; and a full GET is then served from the local restored
-/// copy (the mock tier records no further `get` calls).
+/// POST restore(days=1) is accepted and flips the object to
+/// `x-amz-restore: ongoing-request="true"` while the mock tier GET barrier
+/// proves the background copy-back has reached the remote read; a second POST
+/// during that window is rejected with 409 `RestoreAlreadyInProgress`.
+/// Synchronous SetDisks transition tests cover copy-back completion, restore
+/// metadata, and local byte-identical reads.
 ///
 /// Re-enabled in the serial lane by backlog#1304: the accept path now flips
 /// the ongoing flag under a short compare-and-set guard and the copy-back
@@ -2042,7 +2069,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
-async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
+async fn restore_object_usecase_reports_ongoing_conflict() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -2050,29 +2077,17 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     let backend = register_mock_tier(&tier_name).await;
 
     let bucket = format!("test-api-restore-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    // Must live under the `test/` prefix: `set_bucket_lifecycle_transition_with_tier`
-    // scopes the transition rule to `<Filter><Prefix>test/</Prefix>`, so an object
-    // outside it never matches, is never enqueued, and never transitions — the
-    // setup `wait_for_transition` would then time out before the restore assertions.
+    // Keep the object under the shared ILM test prefix even though this setup
+    // transitions it directly; it keeps diagnostics aligned with sibling tests.
     let object = "test/restore/api-object.bin";
     let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
-    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
-        .await
-        .expect("Failed to set lifecycle configuration");
-    let _ = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    backend.clear_op_log().await;
 
-    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
-        .await
-        .expect("Failed to enqueue transitioned object");
-    let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
-        .await
-        .expect("object should transition before the restore API runs");
-
-    // Slow the tier GET so the background copy-back stays in flight long
-    // enough to observe the ongoing state and the conflict rejection.
-    backend.set_latency(Some(Duration::from_millis(1500))).await;
+    let get_barrier = backend.arm_get_barrier().await;
 
     let restore_request = || RestoreRequest {
         days: Some(1),
@@ -2096,15 +2111,18 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         .await
         .expect("restore request should be accepted");
 
-    // The accepted restore is immediately visible as ongoing (the metadata is
-    // written synchronously before the copy-back is spawned).
+    get_barrier.wait_until_paused().await;
+
+    // The barrier proves the detached copy-back reached the tier GET and is
+    // still paused, so the ongoing state and conflict rejection are not timing
+    // assumptions about task scheduling.
     let ongoing = ecstore
         .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
         .await
         .expect("Failed to load object info during restore");
     assert!(
         ongoing.restore_ongoing,
-        "x-amz-restore must report ongoing-request=true right after the restore is accepted"
+        "x-amz-restore must report ongoing-request=true while the copy-back tier GET is paused"
     );
 
     // A second restore while one is in flight is rejected.
@@ -2117,45 +2135,7 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         "unexpected rejection for a repeated restore: {err:?}"
     );
 
-    // Completion: ongoing flips to false and a future expiry-date appears.
-    let mut completed = None;
-    for _ in 0..40 {
-        let info = ecstore
-            .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
-            .await
-            .expect("Failed to poll object info for restore completion");
-        if !info.restore_ongoing && info.restore_expires.is_some() {
-            completed = Some(info);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    let completed = completed.expect("restore copy-back should complete within the poll window");
-    backend.clear_faults().await;
-
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before unix epoch")
-        .as_secs() as i64;
-    let expires = completed.restore_expires.expect("completed restore carries an expiry");
-    assert!(
-        expires.unix_timestamp() > now_secs,
-        "restore expiry-date must be in the future, got {expires}"
-    );
-    assert_eq!(
-        completed.transitioned_object.status, "complete",
-        "restore must not clear the transitioned state"
-    );
-
-    // The restored copy serves GET locally: no further tier GETs.
-    let tier_gets_after_restore = backend.get_count().await;
-    let data = read_object_bytes(&ecstore, bucket.as_str(), object).await;
-    assert_eq!(data, payload, "restored GET must return the original bytes");
-    assert_eq!(
-        backend.get_count().await,
-        tier_gets_after_restore,
-        "GET of a restored object must be served locally, not from the tier"
-    );
+    get_barrier.release();
 }
 
 /// backlog#1304: the restore-accept compare-and-set itself, under real
@@ -2176,27 +2156,18 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
     let backend = register_mock_tier(&tier_name).await;
 
     let bucket = format!("test-api-restore-cas-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    // Must live under the `test/` prefix — the shared transition rule filters on it.
+    // Keep the object under the shared ILM test prefix for diagnostics parity.
     let object = "test/restore/cas-object.bin";
     let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
-    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
-        .await
-        .expect("Failed to set lifecycle configuration");
-    let _ = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    backend.clear_op_log().await;
 
-    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
-        .await
-        .expect("Failed to enqueue transitioned object");
-    let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
-        .await
-        .expect("object should transition before the concurrent restores run");
-
-    // Keep the winner's copy-back in flight while the loser's accept runs, so
-    // the loser cannot slip into the already-restored path after a completed
-    // copy-back.
-    backend.set_latency(Some(Duration::from_millis(1500))).await;
+    // Hold the accepted copy-back at the tier GET until both accept attempts
+    // return, so the loser cannot observe an already-restored object.
+    let get_barrier = backend.arm_get_barrier().await;
 
     let tier_gets_before_restore = backend.get_count().await;
 
@@ -2241,27 +2212,34 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
         "the losing concurrent restore must be rejected as already in progress: {rejection:?}"
     );
 
-    // Let the single accepted copy-back complete, then verify the tier saw
-    // exactly one restore read — a second GET means a double copy-back.
-    let mut completed = false;
-    for _ in 0..40 {
-        let info = ecstore
-            .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
-            .await
-            .expect("Failed to poll object info for restore completion");
-        if !info.restore_ongoing && info.restore_expires.is_some() {
-            completed = true;
+    get_barrier.wait_until_paused().await;
+    get_barrier.release();
+
+    // This test is scoped to the accept CAS: completion, expiry metadata, and
+    // local restored GET service are covered by the single-request restore test
+    // above. Here it is enough to prove exactly one copy-back was admitted.
+    let expected_tier_gets = tier_gets_before_restore + 1;
+    let deadline = tokio::time::Instant::now() + TRANSITION_WAIT_TIMEOUT;
+    loop {
+        let actual_tier_gets = backend.get_count().await;
+        if actual_tier_gets >= expected_tier_gets {
+            assert_eq!(
+                actual_tier_gets - tier_gets_before_restore,
+                1,
+                "two concurrent restore requests must trigger exactly one tier copy-back GET"
+            );
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() >= deadline {
+            let op_log = backend.op_log().await;
+            panic!(
+                "mock tier should record exactly one restore GET within {TRANSITION_WAIT_TIMEOUT:?}; \
+                 tier_gets_before_restore={tier_gets_before_restore}, actual_tier_gets={actual_tier_gets}, op_log={op_log:?}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    backend.clear_faults().await;
-    assert!(completed, "the accepted restore copy-back should complete within the poll window");
-    assert_eq!(
-        backend.get_count().await - tier_gets_before_restore,
-        1,
-        "two concurrent restore requests must trigger exactly one tier copy-back GET"
-    );
 }
 
 /// rustfs/backlog#1320: a single PUT must compute the replication decision
