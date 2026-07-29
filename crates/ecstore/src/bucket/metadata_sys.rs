@@ -1315,12 +1315,18 @@ mod tests {
     #[tokio::test]
     async fn update_config_with_persists_tagging_rewrite_across_disk_reload() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
+        use crate::storage_api_contracts::bucket::MakeBucketOptions;
         use s3s::dto::Tag;
 
         let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
-        let mut sys = BucketMetadataSys::new(ecstore);
 
         let bucket = "swift-tagging-bucket";
+        ecstore
+            .peer_sys
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket volume should be created");
+        let mut sys = BucketMetadataSys::new(ecstore);
         sys.persist_and_set(BucketMetadata::new(bucket))
             .await
             .expect("initial metadata should persist");
