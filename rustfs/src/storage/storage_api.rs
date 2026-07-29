@@ -510,10 +510,19 @@ pub(crate) mod ecstore_object {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
+        ObjectEncryptionResolver, ObjectMutationHook, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
+}
+
+#[cfg(test)]
+pub(crate) mod ecstore_test_support {
+    pub(crate) use rustfs_ecstore::api::bitrot::create_bitrot_reader;
+    pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::erasure::Erasure;
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions};
 }
 
 pub(crate) mod ecstore_set_disk {
@@ -945,13 +954,21 @@ pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Res
 /// The process-level bootstrap instance context that single-instance startup
 /// threads through the storage foundation (Phase 5 follow-up, backlog#1052).
 pub(crate) fn bootstrap_instance_ctx() -> Arc<InstanceContext> {
-    ecstore_runtime::bootstrap_ctx()
+    let context = ecstore_runtime::bootstrap_ctx();
+    configure_object_encryption_resolver(&context);
+    context
 }
 
 /// Construct a fresh per-server instance context (backlog#1052 S5): a second
 /// embedded server owns its own erasure/region/endpoint/deployment id cells.
 pub(crate) fn new_instance_ctx() -> Arc<InstanceContext> {
-    Arc::new(InstanceContext::new())
+    let context = Arc::new(InstanceContext::new());
+    configure_object_encryption_resolver(&context);
+    context
+}
+
+fn configure_object_encryption_resolver(context: &InstanceContext) {
+    let _ = context.set_object_encryption_resolver(Arc::new(super::sse::SseObjectEncryptionResolver));
 }
 
 pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
@@ -1713,7 +1730,7 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 mod tests {
     use super::{
         apply_active_resync_intents, bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata,
-        scanner_maintenance_config_file,
+        new_instance_ctx, scanner_maintenance_config_file,
     };
     use std::time::Duration;
 
@@ -1742,6 +1759,16 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn fresh_instance_context_installs_object_encryption_resolver() {
+        assert!(new_instance_ctx().object_encryption_resolver().is_some());
+    }
+
+    #[test]
+    fn bootstrap_instance_context_installs_object_encryption_resolver() {
+        assert!(super::bootstrap_instance_ctx().object_encryption_resolver().is_some());
     }
 
     #[test]

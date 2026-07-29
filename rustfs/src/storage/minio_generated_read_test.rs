@@ -4,14 +4,13 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-mod storage_api;
-
+use super::sse::SseObjectEncryptionResolver;
+use super::storage_api::ecstore_test_support::{
+    DiskAPI as _, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
+};
 use rustfs_filemeta::{FileInfo, FileInfoOpts, get_file_info};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use storage_api::minio_generated_read::{
-    DiskAPI as _, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
-};
 use temp_env::async_with_vars;
 use tokio::io::{AsyncReadExt, AsyncWrite};
 
@@ -49,7 +48,7 @@ impl AsyncWrite for VecAsyncWriter {
 fn fixture_root() -> PathBuf {
     std::env::var_os("RUSTFS_MINIO_FIXTURE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rio-v2/tests/fixtures/minio-generated"))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/rio-v2/tests/fixtures/minio-generated"))
 }
 
 fn case_dir(case_id: &str) -> PathBuf {
@@ -137,12 +136,14 @@ async fn read_fixture_plaintext(encrypted: Vec<u8>, object_info: ObjectInfo, kms
             ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
         ],
         async move {
-            let (mut reader, offset, length) = GetObjectReader::new(
+            let resolver = SseObjectEncryptionResolver;
+            let (mut reader, offset, length) = GetObjectReader::new_with_resolver(
                 Box::new(Cursor::new(encrypted)),
                 None,
                 &object_info,
                 &ObjectOptions::default(),
                 &http::HeaderMap::new(),
+                Some(&resolver),
             )
             .await
             .map_err(|err| format!("construct GetObjectReader from MinIO raw fixture: {err:?}"))?;
@@ -219,11 +220,12 @@ async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, fil
             readers.push(reader);
         }
 
-        let erasure = Erasure::new(
+        let erasure = Erasure::try_new(
             file_info.erasure.data_blocks,
             file_info.erasure.parity_blocks,
             file_info.erasure.block_size,
-        );
+        )
+        .expect("fixture erasure geometry");
         let mut writer = VecAsyncWriter::default();
         let (written, err) = erasure.decode(&mut writer, readers, 0, part.size, part.size).await;
         if let Some(err) = err {

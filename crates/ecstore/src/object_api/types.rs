@@ -271,29 +271,9 @@ impl ObjectInfo {
     }
 
     pub fn is_encrypted(&self) -> bool {
-        // Corresponding to the logic in rustfs/src/sse.rs/encryption_material_to_metadata function
-        use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-
-        self.user_defined.keys().any(|key| {
-            let lower = key.to_ascii_lowercase();
-            lower.starts_with("x-minio-encryption-")
-                || lower.starts_with("x-minio-internal-server-side-encryption-")
-                || matches!(
-                    lower.as_str(),
-                    "x-minio-internal-encrypted-multipart"
-                        | "x-rustfs-encryption-key"
-                        | "x-rustfs-encryption-algorithm"
-                        | "x-rustfs-encryption-iv"
-                        | "x-rustfs-encryption-key-id"
-                        | "x-rustfs-encryption-context"
-                        | "x-rustfs-encryption-tag"
-                        | "x-amz-server-side-encryption-aws-kms-key-id"
-                        | SSEC_ALGORITHM_HEADER
-                        | SSEC_KEY_HEADER
-                        | SSEC_KEY_MD5_HEADER
-                        | "x-amz-server-side-encryption"
-                )
-        })
+        self.user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
     }
 
     /// Maximum inline size for non-versioned objects (128 KiB).
@@ -337,26 +317,7 @@ impl ObjectInfo {
     }
 
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
-        let actual_size = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE);
-        if let Some(size_str) = self
-            .user_defined
-            .get("x-rustfs-encryption-original-size")
-            .map(String::as_str)
-            .or_else(|| {
-                self.user_defined
-                    .get("x-amz-server-side-encryption-customer-original-size")
-                    .map(String::as_str)
-            })
-            .or(actual_size.as_deref())
-            && !size_str.is_empty()
-        {
-            let size = size_str
-                .parse::<i64>()
-                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
-            return Ok(Some(size));
-        }
-
-        Ok(None)
+        rustfs_utils::http::get_object_encryption_original_size(&self.user_defined)
     }
 
     pub fn decrypted_size(&self) -> std::io::Result<i64> {
@@ -386,9 +347,6 @@ impl ObjectInfo {
             return Ok(actual_size);
         }
 
-        // Check if object is encrypted
-        // Managed SSE stores original size in x-rustfs-encryption-original-size metadata
-        // SSE-C stores original size in x-amz-server-side-encryption-customer-original-size
         if let Some(size) = self.encryption_original_size()? {
             return Ok(size);
         }
@@ -876,6 +834,19 @@ mod tests {
         object.user_defined = Arc::default();
         object.transitioned_object.tier = "remote-tier".to_string();
         assert!(!object.is_inline_fast_path_eligible(), "transitioned objects must fall back");
+    }
+
+    #[test]
+    fn minio_internal_encryption_metadata_is_not_treated_as_plaintext() {
+        let object = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([(
+                "X-Minio-Internal-Server-Side-Encryption-Sealed-Key".to_string(),
+                "sealed".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        assert!(object.is_encrypted());
     }
 
     #[test]

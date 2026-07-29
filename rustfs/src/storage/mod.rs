@@ -36,6 +36,8 @@ mod ecfs_extend;
 mod ecfs_test;
 pub(crate) mod head_prefix;
 #[cfg(test)]
+mod minio_generated_read_test;
+#[cfg(test)]
 mod multi_factor_scheduler_integration_test;
 pub(crate) mod runtime_sources;
 #[cfg(test)]

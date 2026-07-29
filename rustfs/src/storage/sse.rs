@@ -70,6 +70,10 @@
 //! ```
 
 use super::StorageError;
+use super::storage_api::ecstore_object::{
+    EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
+    ReadEncryptionMode, ReadEncryptionRequest,
+};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -144,6 +148,7 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
+use std::borrow::Cow;
 
 // ============================================================================
 // High-Level SSE Configuration
@@ -641,6 +646,23 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
 }
 
 pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
+    if let StorageError::Io(io_error) = &err
+        && let Some(resolution_error) = io_error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<EncryptionResolutionError>())
+    {
+        let code = match resolution_error.kind() {
+            EncryptionResolutionErrorKind::InvalidRequest => S3ErrorCode::InvalidRequest,
+            EncryptionResolutionErrorKind::ServiceUnavailable => S3ErrorCode::ServiceUnavailable,
+            _ => S3ErrorCode::InternalError,
+        };
+        return ApiError {
+            code,
+            message: resolution_error.to_string(),
+            source: Some(Box::new(err)),
+        };
+    }
+
     if let Some(message) = map_ssec_get_object_reader_error_message(&err) {
         return ApiError {
             code: S3ErrorCode::InvalidRequest,
@@ -761,6 +783,104 @@ pub enum SSEType {
 pub enum EncryptionKeyKind {
     Direct,
     Object,
+}
+
+pub(crate) struct SseObjectEncryptionResolver;
+
+#[async_trait]
+impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
+    async fn resolve_read_material(
+        &self,
+        request: ReadEncryptionRequest<'_>,
+    ) -> Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+        let metadata = normalize_encryption_metadata_case(request.metadata)?;
+        let (_, customer_key, customer_key_md5) =
+            extract_ssec_params_from_headers(request.headers).map_err(map_encryption_resolution_error)?;
+        let material = sse_decryption(DecryptionRequest {
+            bucket: request.bucket,
+            key: request.object,
+            metadata: &metadata,
+            sse_customer_key: customer_key.as_ref(),
+            sse_customer_key_md5: customer_key_md5.as_ref(),
+        })
+        .await
+        .map_err(map_encryption_resolution_error)?;
+
+        Ok(material.map(|material| ReadEncryptionMaterial {
+            key_bytes: material.key_bytes,
+            mode: match material.key_kind {
+                EncryptionKeyKind::Direct => ReadEncryptionMode::Direct {
+                    base_nonce: material.base_nonce,
+                },
+                EncryptionKeyKind::Object => ReadEncryptionMode::Object,
+            },
+        }))
+    }
+}
+
+fn normalize_encryption_metadata_case(
+    metadata: &HashMap<String, String>,
+) -> Result<Cow<'_, HashMap<String, String>>, EncryptionResolutionError> {
+    const CANONICAL_KEYS: &[&str] = &[
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        SSEC_ORIGINAL_SIZE_HEADER,
+        INTERNAL_ENCRYPTION_KEY_ID_HEADER,
+        INTERNAL_ENCRYPTION_KEY_HEADER,
+        INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        INTERNAL_ENCRYPTION_IV_HEADER,
+        "x-rustfs-encryption-context",
+        "x-rustfs-encryption-tag",
+        INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
+    ];
+
+    let needs_normalization = metadata.keys().any(|key| {
+        CANONICAL_KEYS
+            .iter()
+            .any(|canonical| key != canonical && key.eq_ignore_ascii_case(canonical))
+    });
+    if !needs_normalization {
+        return Ok(Cow::Borrowed(metadata));
+    }
+
+    let mut normalized = metadata.clone();
+    for canonical in CANONICAL_KEYS {
+        let mut matching_values = metadata
+            .iter()
+            .filter_map(|(key, value)| key.eq_ignore_ascii_case(canonical).then_some(value));
+        let Some(value) = matching_values.next() else {
+            continue;
+        };
+        if matching_values.any(|candidate| candidate != value) {
+            return Err(EncryptionResolutionError::new(
+                EncryptionResolutionErrorKind::InvalidMetadata,
+                format!("conflicting object encryption metadata for {canonical}"),
+            ));
+        }
+        if !normalized.contains_key(*canonical) {
+            normalized.insert((*canonical).to_string(), value.clone());
+        }
+    }
+    Ok(Cow::Owned(normalized))
+}
+
+fn map_encryption_resolution_error(error: ApiError) -> EncryptionResolutionError {
+    let kind = match error.code {
+        S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => EncryptionResolutionErrorKind::InvalidRequest,
+        S3ErrorCode::ServiceUnavailable => EncryptionResolutionErrorKind::ServiceUnavailable,
+        _ => EncryptionResolutionErrorKind::DecryptionFailed,
+    };
+    EncryptionResolutionError::new(kind, error.message)
 }
 
 #[derive(Debug, Clone)]
@@ -2631,19 +2751,20 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 mod tests {
     use super::{
         ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
-        INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
-        INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider, KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_IV_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, PrepareEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER, SSEType,
-        SseDekProvider, SsecParams, StorageError, TestSseDekProvider, apply_managed_decryption_material,
-        apply_managed_encryption_material, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
-        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
-        kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata,
-        reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption,
-        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        validate_ssec_params, verify_ssec_key_match,
+        EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
+        INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider, KmsUnavailableError,
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
+        SSEType, SseDekProvider, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
+        apply_managed_decryption_material, apply_managed_encryption_material, encryption_material_to_metadata,
+        extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
+        generate_ssec_nonce, is_managed_sse, kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+        normalize_managed_metadata, reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption,
+        sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write,
+        validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -2701,6 +2822,97 @@ mod tests {
 
     async fn lock_sse_test_state() -> tokio::sync::MutexGuard<'static, ()> {
         SSE_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_returns_ssec_read_material() {
+        let key = [0x31; 32];
+        let key_b64 = BASE64_STANDARD.encode(key);
+        let key_md5 = BASE64_STANDARD.encode(md5::compute(key).0);
+        let nonce = [0x42; 12];
+        let metadata = HashMap::from([
+            ("X-Amz-Server-Side-Encryption-Customer-Algorithm".to_string(), "AES256".to_string()),
+            ("X-Amz-Server-Side-Encryption-Customer-Key-Md5".to_string(), key_md5.clone()),
+            ("X-Rustfs-Encryption-Iv".to_string(), BASE64_STANDARD.encode(nonce)),
+        ]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_str(&key_b64).expect("base64 key is a valid header"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_str(&key_md5).expect("base64 MD5 is a valid header"),
+        );
+
+        let material = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &headers,
+            })
+            .await
+            .expect("SSE-C material should resolve")
+            .expect("SSE-C metadata should produce material");
+
+        assert_eq!(material.key_bytes, key);
+        assert_eq!(material.mode, ReadEncryptionMode::Direct { base_nonce: nonce });
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_classifies_missing_ssec_key_as_invalid_request() {
+        let metadata = HashMap::from([("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string())]);
+        let result = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &HeaderMap::new(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing SSE-C key must fail closed"),
+        };
+
+        assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_rejects_conflicting_metadata_case_variants() {
+        let metadata = HashMap::from([
+            ("x-rustfs-encryption-key".to_string(), "first".to_string()),
+            ("X-Rustfs-Encryption-Key".to_string(), "second".to_string()),
+        ]);
+        let result = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &HeaderMap::new(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting metadata aliases must fail closed"),
+        };
+
+        assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
+    }
+
+    #[test]
+    fn normalize_encryption_metadata_case_accepts_lowercase_minio_internal_keys() {
+        let lowercase_key = MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_ascii_lowercase();
+        let metadata = HashMap::from([(lowercase_key, "sealed-key".to_string())]);
+
+        let normalized = super::normalize_encryption_metadata_case(&metadata).expect("metadata aliases should normalize");
+
+        assert_eq!(
+            normalized.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER),
+            Some(&"sealed-key".to_string())
+        );
     }
 
     struct UnavailableSseDekProvider;
@@ -3725,6 +3937,19 @@ mod tests {
 
                 assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
                 assert_eq!(decrypted.key_bytes, material.key_bytes);
+
+                let resolved = SseObjectEncryptionResolver
+                    .resolve_read_material(ReadEncryptionRequest {
+                        bucket: "bucket",
+                        object: "object",
+                        metadata: &metadata,
+                        headers: &HeaderMap::new(),
+                    })
+                    .await
+                    .expect("managed resolver")
+                    .expect("managed material");
+                assert_eq!(resolved.mode, ReadEncryptionMode::Object);
+                assert_eq!(resolved.key_bytes, material.key_bytes);
             },
         )
         .await;
@@ -3785,6 +4010,29 @@ mod tests {
 
         assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
         assert_eq!(decrypted.key_bytes, material.key_bytes);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_str(&customer_key).expect("customer key header"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_str(&customer_key_md5).expect("customer key MD5 header"),
+        );
+        let resolved = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &headers,
+            })
+            .await
+            .expect("SSE-C resolver")
+            .expect("SSE-C material");
+        assert_eq!(resolved.mode, ReadEncryptionMode::Object);
+        assert_eq!(resolved.key_bytes, material.key_bytes);
     }
 
     #[cfg(feature = "rio-v2")]
@@ -4713,6 +4961,15 @@ mod tests {
             err.message,
             "The calculated MD5 hash of the key did not match the hash that was provided."
         );
+    }
+
+    #[test]
+    fn test_map_get_object_reader_error_preserves_typed_service_unavailable() {
+        let resolution_error =
+            super::EncryptionResolutionError::new(EncryptionResolutionErrorKind::ServiceUnavailable, "KMS unavailable");
+        let err = map_get_object_reader_error(StorageError::other(resolution_error));
+        assert_eq!(err.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.message, "KMS unavailable");
     }
 
     #[test]

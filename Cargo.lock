@@ -9106,7 +9106,6 @@ dependencies = [
 name = "rustfs-ecstore"
 version = "1.0.0-beta.11"
 dependencies = [
- "aes-gcm",
  "arc-swap",
  "async-channel",
  "async-recursion",
@@ -9122,7 +9121,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "bytesize",
- "chacha20poly1305",
  "chrono",
  "criterion",
  "enumset",
@@ -9175,7 +9173,6 @@ dependencies = [
  "rustfs-erasure-codec",
  "rustfs-filemeta",
  "rustfs-io-metrics",
- "rustfs-kms",
  "rustfs-lifecycle",
  "rustfs-lock",
  "rustfs-madmin",

@@ -84,6 +84,7 @@ pub(crate) fn legacy_encrypted_range_seek_enabled() -> bool {
 }
 
 mod body_cache_hook;
+mod encryption;
 mod hook_slot;
 mod object_mutation_hook;
 mod readers;
@@ -97,6 +98,10 @@ pub use body_cache_hook::{
 };
 pub(crate) use body_cache_hook::{
     get_object_body_cache_hook, get_object_body_cache_hook_suppressed, without_get_object_body_cache_hook,
+};
+pub use encryption::{
+    EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
+    ReadEncryptionMode, ReadEncryptionRequest,
 };
 pub(crate) use object_mutation_hook::notify_object_mutation;
 pub use object_mutation_hook::{ObjectMutationHook, register_object_mutation_hook, unregister_object_mutation_hook};

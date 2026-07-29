@@ -505,9 +505,7 @@ impl SetDisks {
     }
 
     fn file_info_has_encryption_metadata(meta: &FileInfo) -> bool {
-        meta.metadata
-            .keys()
-            .any(|name| http::is_encryption_metadata_key(name) || http::is_sse_header(name))
+        meta.metadata.keys().any(|name| http::is_object_encryption_marker(name))
     }
 
     fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
