@@ -60,7 +60,7 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const RESTORE_COPY_BACK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const RESTORE_SUSPENDED_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
 const ENV_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
 const ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
@@ -2114,10 +2114,9 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 /// POST restore(days=1) is accepted and flips the object to
 /// `x-amz-restore: ongoing-request="true"` while the mock tier GET barrier
 /// proves the background copy-back has reached the remote read; a second POST
-/// during that window is rejected with 409 `RestoreAlreadyInProgress`; once the
-/// copy-back completes the object reports `ongoing-request="false"` with a
-/// future expiry-date; and a full GET is then served from the local restored
-/// copy (the mock tier records no further `get` calls).
+/// during that window is rejected with 409 `RestoreAlreadyInProgress`.
+/// Synchronous SetDisks transition tests cover copy-back completion, restore
+/// metadata, and local byte-identical reads.
 ///
 /// Re-enabled in the serial lane by backlog#1304: the accept path now flips
 /// the ongoing flag under a short compare-and-set guard and the copy-back
@@ -2127,7 +2126,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
-async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
+async fn restore_object_usecase_reports_ongoing_conflict() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -2145,8 +2144,6 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     assert!(uploaded.version_id.is_none(), "fixture must create the null version");
     let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
     backend.clear_op_log().await;
-    let tier_gets_before_restore = backend.get_count().await;
-
     let get_barrier = backend.arm_get_barrier().await;
 
     let restore_request = || RestoreRequest {
@@ -2196,49 +2193,6 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     );
 
     get_barrier.release();
-
-    // Completion: ongoing flips to false and a future expiry-date appears.
-    let completed =
-        wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
-    let completed = completed.unwrap_or_else(|err| panic!("{err}"));
-
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before unix epoch")
-        .as_secs() as i64;
-    let expires = completed.restore_expires.expect("completed restore carries an expiry");
-    assert!(
-        expires.unix_timestamp() > now_secs,
-        "restore expiry-date must be in the future, got {expires}"
-    );
-    assert_eq!(
-        completed.transitioned_object.status, "complete",
-        "restore must not clear the transitioned state"
-    );
-    assert!(
-        completed.version_id.is_none() || completed.version_id.is_some_and(|version_id| version_id.is_nil()),
-        "restore must complete on the original null version"
-    );
-    assert_eq!(
-        live_object_version_count(&ecstore, bucket.as_str(), object).await,
-        1,
-        "restore must not create a replacement UUID version"
-    );
-    assert_eq!(
-        backend.get_count().await - tier_gets_before_restore,
-        1,
-        "restore copy-back must fetch the tier exactly once"
-    );
-
-    // The restored copy serves GET locally: no further tier GETs.
-    let tier_gets_after_restore = backend.get_count().await;
-    let data = read_object_bytes(&ecstore, bucket.as_str(), object).await;
-    assert_eq!(data, payload, "restored GET must return the original bytes");
-    assert_eq!(
-        backend.get_count().await,
-        tier_gets_after_restore,
-        "GET of a restored object must be served locally, not from the tier"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2286,7 +2240,7 @@ async fn restore_object_usecase_completes_suspended_null_version_in_place() {
 
     get_barrier.wait_until_paused().await;
     get_barrier.release();
-    let completed = wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT)
+    let completed = wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_SUSPENDED_WAIT_TIMEOUT)
         .await
         .unwrap_or_else(|err| panic!("{err}"));
 
