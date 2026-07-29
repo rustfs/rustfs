@@ -687,6 +687,8 @@ mod core;
 mod ctx;
 mod metadata;
 mod ops;
+#[cfg(test)]
+pub(crate) use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
