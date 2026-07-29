@@ -1466,7 +1466,7 @@ pub async fn save_manual_transition_scope_admission_if_current(
     admission.validate().map_err(manual_transition_job_store_error)?;
     let object = manual_transition_scope_record_object_name(&admission.scope_key).map_err(manual_transition_job_store_error)?;
     let data = serde_json::to_vec(admission).map_err(Error::other)?;
-    config_boundary::save_config_with_opts(
+    match config_boundary::save_config_with_opts(
         api,
         &object,
         data,
@@ -1480,6 +1480,12 @@ pub async fn save_manual_transition_scope_admission_if_current(
         },
     )
     .await
+    {
+        Err(Error::ObjectNotFound(bucket, current_object)) if bucket == RUSTFS_META_BUCKET && current_object == object => {
+            Err(Error::PreconditionFailed)
+        }
+        result => result,
+    }
 }
 
 pub async fn claim_manual_transition_scope_admission(

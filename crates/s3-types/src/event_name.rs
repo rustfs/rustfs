@@ -271,7 +271,11 @@ impl EventName {
                 EventName::ObjectCreatedPut,
             ],
             EventName::ObjectTaggingAll => vec![EventName::ObjectTaggingPut, EventName::ObjectTaggingDelete],
-            EventName::ObjectRemovedAll => vec![EventName::ObjectRemovedDelete, EventName::ObjectRemovedDeleteMarkerCreated],
+            EventName::ObjectRemovedAll => vec![
+                EventName::ObjectRemovedDelete,
+                EventName::ObjectRemovedDeleteMarkerCreated,
+                EventName::ObjectRemovedNoOP,
+            ],
             EventName::ObjectReplicationAll => vec![
                 EventName::ObjectReplicationFailed,
                 EventName::ObjectReplicationComplete,
@@ -637,6 +641,15 @@ mod tests {
     fn test_object_scanner_all_round_trips() {
         assert_eq!(EventName::ObjectScannerAll.as_str(), "s3:Scanner:*");
         assert_eq!(EventName::parse("s3:Scanner:*").unwrap(), EventName::ObjectScannerAll);
+    }
+
+    #[test]
+    fn test_object_removed_all_includes_noop_extension() {
+        let expanded = EventName::ObjectRemovedAll.expand();
+
+        assert!(expanded.contains(&EventName::ObjectRemovedDelete));
+        assert!(expanded.contains(&EventName::ObjectRemovedDeleteMarkerCreated));
+        assert!(expanded.contains(&EventName::ObjectRemovedNoOP));
     }
 
     /// `is_removed` must be true for every `ObjectRemoved*` variant and false

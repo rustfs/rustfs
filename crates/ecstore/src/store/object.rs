@@ -2601,10 +2601,10 @@ mod tests {
     // (backlog#1304): restore entry no longer serializes on the object lock.
     // The replacement semantics — non-blocking reads during the copy-back and
     // fast rejection of a concurrent restore — are covered end-to-end by
-    // `restore_object_usecase_reports_ongoing_conflict_and_completion`
-    // (rustfs/src/app/lifecycle_transition_api_test.rs) and at the lock level
-    // by the accept-guard test below; restore-vs-reader data protection lives
-    // in the inner put_object/complete_multipart_upload commit locks.
+    // `restore_object_usecase_reports_ongoing_conflict`
+    // (rustfs/src/app/lifecycle_transition_api_test.rs), while the SetDisks
+    // transition matrix covers the final local commit. Restore-vs-reader data
+    // protection lives in the inner put_object/complete_multipart_upload locks.
     #[tokio::test]
     #[serial_test::serial]
     async fn restore_accept_guard_serializes_concurrent_accepts() {

@@ -172,7 +172,7 @@
             ],
         },
         {
-            "name": "Debug executable target/debug/rustfs with sse",
+            "name": "Debug executable target/debug/rustfs with sse kms",
             "type":  "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/target/debug/rustfs",
@@ -200,7 +200,7 @@
                 // 2. kms local backend test key
                 // "RUSTFS_KMS_ENABLE": "true",
                 // "RUSTFS_KMS_BACKEND": "local",
-                // "RUSTFS_KMS_KEY_DIR": "./target/kms-key-dir",
+                // "RUSTFS_KMS_KEY_DIR": "/tmp/kms-key-dir",
                 // "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
                 // "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
 
@@ -223,6 +223,29 @@
                 "RUSTFS_KMS_ENABLE": "true",
                 "RUSTFS_KMS_BACKEND": "static",
                 "RUSTFS_KMS_STATIC_SECRET_KEY": "rustfs-master-key:2dfNXGHlsEflGVCxb+5DIdGEl1sIvtwX+QfmYasi5QM="
+            },
+            "sourceLanguages": [
+                "rust"
+            ],
+        },
+        {
+            "name": "Debug executable target/debug/rustfs with local sse",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/rustfs",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUSTFS_ACCESS_KEY": "rustfsadmin",
+                "RUSTFS_SECRET_KEY": "rustfsadmin",
+                "RUSTFS_VOLUMES": "./target/volumes/test{1...4}",
+                "RUSTFS_ADDRESS": ":9000",
+                "RUSTFS_CONSOLE_ENABLE": "true",
+                "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
+                "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
+                "RUSTFS_UNSAFE_BYPASS_DISK_CHECK": "true",
+                "RUSTFS_SSE_S3_MASTER_KEY": "xGb3aYSp825j2tPpg8JrUzghiXsIkfdOtmrsJ/iafiM=",
+                "RUST_LOG": "rustfs=debug,ecstore=debug,s3s=debug,iam=debug",
             },
             "sourceLanguages": [
                 "rust"

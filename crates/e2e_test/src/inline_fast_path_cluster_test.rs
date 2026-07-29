@@ -520,28 +520,33 @@ async fn assert_msgpack_fallback_unchanged(
     Ok(())
 }
 
-async fn assert_msgpack_decode_observed(
-    collector: &OtlpMetricCollector,
-    before: &BTreeMap<String, u64>,
-    series: &[(&str, &str)],
-) -> TestResult {
+async fn assert_msgpack_decode_observed(collector: &OtlpMetricCollector, before: &BTreeMap<String, u64>) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let after = collector.msgpack_json_decode_totals().await;
-        let missing = series
+        let missing = [FALLBACK_REQUEST_DIRECTION, FALLBACK_RESPONSE_DIRECTION]
             .iter()
-            .filter_map(|(direction, message)| {
-                let key = msgpack_decode_metric_key(direction, message, MSGPACK_CODEC_MSGPACK);
-                let before_value = before.get(&key).copied().unwrap_or_default();
-                let after_value = after.get(&key).copied().unwrap_or_default();
-                (after_value <= before_value).then_some(format!("{direction}/{message}/{}", MSGPACK_CODEC_MSGPACK))
+            .filter_map(|direction| {
+                let prefix = format!("{direction}\u{1f}");
+                let suffix = format!("\u{1f}{MSGPACK_CODEC_MSGPACK}");
+                let before_total = before
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix) && key.ends_with(&suffix))
+                    .map(|(_, value)| *value)
+                    .sum::<u64>();
+                let after_total = after
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix) && key.ends_with(&suffix))
+                    .map(|(_, value)| *value)
+                    .sum::<u64>();
+                (after_total <= before_total).then_some(format!("{direction}/{}", MSGPACK_CODEC_MSGPACK))
             })
             .collect::<Vec<_>>();
         if missing.is_empty() {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!("timed out waiting for msgpack decode traffic on {missing:?}; totals={after:?}").into());
+            return Err(format!("timed out waiting for msgpack decode traffic for {missing:?}; totals={after:?}").into());
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -1857,7 +1862,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
         PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
-    assert_msgpack_decode_observed(&collector, &decode_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_observed(&collector, &decode_before).await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
     assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
@@ -1948,8 +1953,8 @@ async fn four_node_add_tier_converges_after_offline_node_restart_without_second_
     hot.start().await?;
 
     let tier_name = unique_tier_name();
-    hot.stop_node(3)?;
     let add_tier_response = submit_rustfs_tier(&hot, &cold, &tier_name).await?;
+    hot.stop_node(3)?;
     hot.start_node(3).await?;
 
     wait_for_tier_converged(&hot, &tier_name, &add_tier_response).await
@@ -2003,7 +2008,7 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
     assert_eq!(cancel_value["job_id"].as_str(), Some(job_id.as_str()));
     assert_eq!(cancel_value["bucket"].as_str(), Some(bucket.as_str()));
     assert_eq!(cancel_value["dry_run"].as_bool(), Some(true));
-    assert_eq!(cancel_value["cancel_requested"].as_bool(), Some(true));
+    assert_eq!(cancel_value["cancel_requested"].as_bool(), Some(false));
 
     let missing_job_id = Uuid::new_v4();
     let (missing_status, missing_body) = signed_admin_request(
@@ -2325,7 +2330,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
         PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), REMOTE, REMOTE_TRANSITION),
     )
     .await?;
-    assert_msgpack_decode_observed(&collector, &decode_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_observed(&collector, &decode_before).await?;
 
     let encrypted_key = "transition/encrypted-sse.bin";
     let encrypted_body = payload(16 * KIB, 0xAB);

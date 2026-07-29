@@ -101,6 +101,9 @@ mod admin_auth_test;
 #[cfg(test)]
 mod existing_object_tag_policy_test;
 
+#[cfg(test)]
+mod sts_query_compat_test;
+
 // Regression tests for Issue #2036: anonymous access with PublicAccessBlock
 #[cfg(test)]
 mod anonymous_access_test;
