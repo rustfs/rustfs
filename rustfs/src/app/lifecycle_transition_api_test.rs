@@ -60,7 +60,6 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const RESTORE_COPY_BACK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
 const ENV_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
 const ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
@@ -336,45 +335,6 @@ async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str,
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_for_restore_completion(
-    ecstore: &Arc<ECStore>,
-    backend: &MockWarmBackend,
-    bucket: &str,
-    object: &str,
-    timeout: Duration,
-) -> Result<ObjectInfo, String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_state = None;
-
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            let tier_gets = backend.get_count().await;
-            let op_log = backend.op_log().await;
-            return Err(format!(
-                "restore copy-back should complete within {timeout:?}; tier_gets={tier_gets}, op_log={op_log:?}; last observed state: {}",
-                last_state.unwrap_or_else(|| "no object info observed".to_string())
-            ));
-        }
-
-        match (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-            Ok(info) => {
-                if !info.restore_ongoing && info.restore_expires.is_some() {
-                    return Ok(info);
-                }
-                last_state = Some(format!(
-                    "restore_ongoing={}, restore_expires={:?}, transitioned_status={}",
-                    info.restore_ongoing, info.restore_expires, info.transitioned_object.status
-                ));
-            }
-            Err(err) => {
-                last_state = Some(format!("get_object_info failed: {err}"));
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -2097,10 +2057,9 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 /// POST restore(days=1) is accepted and flips the object to
 /// `x-amz-restore: ongoing-request="true"` while the mock tier GET barrier
 /// proves the background copy-back has reached the remote read; a second POST
-/// during that window is rejected with 409 `RestoreAlreadyInProgress`; once the
-/// copy-back completes the object reports `ongoing-request="false"` with a
-/// future expiry-date; and a full GET is then served from the local restored
-/// copy (the mock tier records no further `get` calls).
+/// during that window is rejected with 409 `RestoreAlreadyInProgress`.
+/// Synchronous SetDisks transition tests cover copy-back completion, restore
+/// metadata, and local byte-identical reads.
 ///
 /// Re-enabled in the serial lane by backlog#1304: the accept path now flips
 /// the ongoing flag under a short compare-and-set guard and the copy-back
@@ -2110,7 +2069,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
-async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
+async fn restore_object_usecase_reports_ongoing_conflict() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -2177,35 +2136,6 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     );
 
     get_barrier.release();
-
-    // Completion: ongoing flips to false and a future expiry-date appears.
-    let completed =
-        wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
-    let completed = completed.unwrap_or_else(|err| panic!("{err}"));
-
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before unix epoch")
-        .as_secs() as i64;
-    let expires = completed.restore_expires.expect("completed restore carries an expiry");
-    assert!(
-        expires.unix_timestamp() > now_secs,
-        "restore expiry-date must be in the future, got {expires}"
-    );
-    assert_eq!(
-        completed.transitioned_object.status, "complete",
-        "restore must not clear the transitioned state"
-    );
-
-    // The restored copy serves GET locally: no further tier GETs.
-    let tier_gets_after_restore = backend.get_count().await;
-    let data = read_object_bytes(&ecstore, bucket.as_str(), object).await;
-    assert_eq!(data, payload, "restored GET must return the original bytes");
-    assert_eq!(
-        backend.get_count().await,
-        tier_gets_after_restore,
-        "GET of a restored object must be served locally, not from the tier"
-    );
 }
 
 /// backlog#1304: the restore-accept compare-and-set itself, under real
