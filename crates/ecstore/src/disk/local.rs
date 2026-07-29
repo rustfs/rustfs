@@ -18,11 +18,12 @@ use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
-    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize, PART_TRANSACTION_NEW_META,
-    PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
-    RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
-    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions,
+    DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
+    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
+    RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+    STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -66,7 +67,7 @@ use tokio::fs::{self, File};
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
-use tokio::sync::{Notify, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -3856,6 +3857,25 @@ pub struct LocalDisk {
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
     file_sync_permits: Arc<Semaphore>,
+    snapshot_leases: Arc<Mutex<SnapshotLeaseRegistry>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SnapshotLeaseKey {
+    volume: String,
+    path: String,
+}
+
+#[derive(Default)]
+struct SnapshotLeaseEntry {
+    tokens: HashSet<SnapshotLeaseToken>,
+    pending_delete: Option<DeleteOptions>,
+    deleting: bool,
+}
+
+#[derive(Default)]
+struct SnapshotLeaseRegistry {
+    entries: HashMap<SnapshotLeaseKey, SnapshotLeaseEntry>,
 }
 
 impl Drop for LocalDisk {
@@ -4092,6 +4112,7 @@ impl LocalDisk {
             exit_signal: None,
             io_backend: build_local_io_backend(root.clone()),
             file_sync_permits: os::disk_file_sync_limiter(&root),
+            snapshot_leases: Arc::new(Mutex::new(SnapshotLeaseRegistry::default())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -4573,6 +4594,23 @@ impl LocalDisk {
             return Err(err);
         }
 
+        Ok(())
+    }
+
+    async fn delete_unleased(&self, volume: &str, path: &str, opt: &DeleteOptions) -> Result<()> {
+        let volume_dir = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume)
+            && let Err(e) = access(&volume_dir).await
+        {
+            return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
+        }
+
+        let file_path = self.get_object_path(volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+        self.delete_file(&volume_dir, &file_path, opt.recursive, opt.immediate)
+            .await?;
+        // A deleted shard must not remain readable through the io_uring fd cache.
+        self.io_backend.invalidate_cached_fds_under(volume, path);
         Ok(())
     }
 
@@ -6216,27 +6254,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         crate::hp_guard!("LocalDisk::delete");
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume)
-            && let Err(e) = access(&volume_dir).await
-        {
-            return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-
-        check_path_length(file_path.to_string_lossy().to_string().as_str())?;
-
-        self.delete_file(&volume_dir, &file_path, opt.recursive, opt.immediate)
-            .await?;
-
-        // The inode is unlinked, but a cached descriptor would keep it readable —
-        // a deleted shard must not keep answering reads (backlog#1145). The part
-        // numbers under `path` are not known here, so this is the one caller that
-        // needs the predicate form.
-        self.io_backend.invalidate_cached_fds_under(volume, path);
-
-        Ok(())
+        self.delete_unleased(volume, path, &opt).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -7822,6 +7840,118 @@ impl DiskAPI for LocalDisk {
         }
 
         Ok(())
+    }
+
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
+        let file_path = self.get_object_path(volume, path)?;
+        let key = SnapshotLeaseKey {
+            volume: volume.to_string(),
+            path: path.to_string(),
+        };
+        let token = {
+            let mut registry = self.snapshot_leases.lock().await;
+            if registry.entries.get(&key).is_some_and(|entry| entry.deleting) {
+                return Err(DiskError::FileNotFound);
+            }
+            let token = SnapshotLeaseToken::new();
+            registry.entries.entry(key).or_default().tokens.insert(token);
+            token
+        };
+        match fs::metadata(file_path).await {
+            Ok(metadata) if metadata.is_dir() => Ok(token),
+            Ok(_) => {
+                self.release_snapshot_lease(volume, path, token).await?;
+                Err(DiskError::FileNotFound)
+            }
+            Err(err) => {
+                self.release_snapshot_lease(volume, path, token).await?;
+                Err(to_file_error(err).into())
+            }
+        }
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
+        let key = SnapshotLeaseKey {
+            volume: volume.to_string(),
+            path: path.to_string(),
+        };
+        let opts = {
+            let mut registry = self.snapshot_leases.lock().await;
+            let Some(entry) = registry.entries.get_mut(&key) else {
+                return Ok(());
+            };
+            entry.tokens.remove(&token);
+            if !entry.tokens.is_empty() || entry.deleting {
+                return Ok(());
+            }
+
+            let Some(opts) = entry.pending_delete.clone() else {
+                registry.entries.remove(&key);
+                return Ok(());
+            };
+            entry.deleting = true;
+            opts
+        };
+        let result = self.delete_unleased(volume, path, &opts).await;
+        let mut registry = self.snapshot_leases.lock().await;
+        match result {
+            Ok(()) => {
+                registry.entries.remove(&key);
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(entry) = registry.entries.get_mut(&key) {
+                    entry.deleting = false;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        let key = SnapshotLeaseKey {
+            volume: volume.to_string(),
+            path: path.to_string(),
+        };
+        {
+            let mut registry = self.snapshot_leases.lock().await;
+            if let Some(entry) = registry.entries.get_mut(&key) {
+                if !entry.tokens.is_empty() {
+                    entry.pending_delete.get_or_insert_with(|| opts.clone());
+                    return Ok(DataDirDeleteStatus::Deferred);
+                }
+                if entry.deleting {
+                    entry.pending_delete.get_or_insert_with(|| opts.clone());
+                    return Ok(DataDirDeleteStatus::Deferred);
+                }
+                entry.deleting = true;
+                entry.pending_delete.get_or_insert_with(|| opts.clone());
+            } else {
+                registry.entries.insert(
+                    key.clone(),
+                    SnapshotLeaseEntry {
+                        pending_delete: Some(opts.clone()),
+                        deleting: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let result = self.delete_unleased(volume, path, &opts).await;
+        let mut registry = self.snapshot_leases.lock().await;
+        match result {
+            Ok(()) => {
+                registry.entries.remove(&key);
+                Ok(DataDirDeleteStatus::Deleted)
+            }
+            Err(err) => {
+                if let Some(entry) = registry.entries.get_mut(&key) {
+                    entry.deleting = false;
+                }
+                Err(err)
+            }
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -14798,6 +14928,162 @@ mod test {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
+    }
+
+    #[tokio::test]
+    async fn snapshot_leases_defer_data_dir_cleanup_until_last_release() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "snapshot-lease-volume";
+        let data_dir = path_join_buf(&["object", &Uuid::new_v4().to_string()]);
+        let first_part = path_join_buf(&[&data_dir, "part.1"]);
+        let later_part = path_join_buf(&[&data_dir, "part.2"]);
+        ensure_test_volume(&disk, volume).await;
+        disk.write_all(volume, &first_part, Bytes::from_static(b"first"))
+            .await
+            .expect("first shard should be written");
+        disk.write_all(volume, &later_part, Bytes::from_static(b"later"))
+            .await
+            .expect("later shard should be written");
+
+        let first = disk
+            .acquire_snapshot_lease(volume, &data_dir)
+            .await
+            .expect("first lease should be acquired");
+        let second = disk
+            .acquire_snapshot_lease(volume, &data_dir)
+            .await
+            .expect("second lease should be acquired");
+        let status = disk
+            .delete_data_dir(
+                volume,
+                &data_dir,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("cleanup should be deferred");
+        assert_eq!(status, DataDirDeleteStatus::Deferred);
+        assert_eq!(
+            disk.read_all(volume, &later_part)
+                .await
+                .expect("a later multipart shard must remain openable while leased"),
+            Bytes::from_static(b"later")
+        );
+
+        disk.release_snapshot_lease(volume, &data_dir, first)
+            .await
+            .expect("first lease release should succeed");
+        assert!(
+            disk.read_all(volume, &first_part).await.is_ok(),
+            "one remaining lease must keep the data directory"
+        );
+        disk.release_snapshot_lease(volume, &data_dir, second)
+            .await
+            .expect("last lease release should run deferred cleanup");
+        disk.release_snapshot_lease(volume, &data_dir, second)
+            .await
+            .expect("releasing an already released token should be idempotent");
+        assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn data_dir_cleanup_without_a_lease_keeps_existing_behavior() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "snapshot-no-lease-volume";
+        let data_dir = path_join_buf(&["object", &Uuid::new_v4().to_string()]);
+        let part = path_join_buf(&[&data_dir, "part.1"]);
+        ensure_test_volume(&disk, volume).await;
+        disk.write_all(volume, &part, Bytes::from_static(b"payload"))
+            .await
+            .expect("test shard should be written");
+
+        let status = disk
+            .delete_data_dir(
+                volume,
+                &data_dir,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unleased cleanup should retain the existing delete behavior");
+        assert_eq!(status, DataDirDeleteStatus::Deleted);
+        assert!(matches!(disk.read_all(volume, &part).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_acquire_and_cleanup_are_atomic() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let volume = "snapshot-race-volume";
+        ensure_test_volume(&disk, volume).await;
+
+        for iteration in 0..32 {
+            let data_dir = path_join_buf(&["object", &format!("{iteration:032x}")]);
+            let part = path_join_buf(&[&data_dir, "part.1"]);
+            disk.write_all(volume, &part, Bytes::from_static(b"payload"))
+                .await
+                .expect("test shard should be written");
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let acquire_disk = Arc::clone(&disk);
+            let acquire_barrier = Arc::clone(&barrier);
+            let acquire_path = data_dir.clone();
+            let acquire = tokio::spawn(async move {
+                acquire_barrier.wait().await;
+                acquire_disk.acquire_snapshot_lease(volume, &acquire_path).await
+            });
+            let delete_disk = Arc::clone(&disk);
+            let delete_barrier = Arc::clone(&barrier);
+            let delete_path = data_dir.clone();
+            let delete = tokio::spawn(async move {
+                delete_barrier.wait().await;
+                delete_disk
+                    .delete_data_dir(
+                        volume,
+                        &delete_path,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            barrier.wait().await;
+
+            let acquired = acquire.await.expect("acquire task should join");
+            let deleted = delete
+                .await
+                .expect("delete task should join")
+                .expect("delete should either run or defer");
+            match acquired {
+                Ok(token) => {
+                    assert_eq!(deleted, DataDirDeleteStatus::Deferred);
+                    assert!(disk.read_all(volume, &part).await.is_ok());
+                    disk.release_snapshot_lease(volume, &data_dir, token)
+                        .await
+                        .expect("release should finish deferred cleanup");
+                }
+                Err(DiskError::FileNotFound) => {
+                    assert_eq!(deleted, DataDirDeleteStatus::Deleted);
+                }
+                Err(err) => panic!("unexpected lease acquisition error: {err}"),
+            }
+            assert!(matches!(disk.read_all(volume, &part).await, Err(DiskError::FileNotFound)));
+        }
     }
 
     #[tokio::test]
