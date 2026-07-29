@@ -3876,6 +3876,7 @@ struct SnapshotLeaseEntry {
 #[derive(Default)]
 struct SnapshotLeaseRegistry {
     entries: HashMap<SnapshotLeaseKey, SnapshotLeaseEntry>,
+    version_deletes: HashMap<(String, String, Uuid), Vec<(SnapshotLeaseKey, SnapshotLeaseToken)>>,
 }
 
 impl Drop for LocalDisk {
@@ -6086,6 +6087,63 @@ fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
     result
 }
 
+impl LocalDisk {
+    async fn reserve_version_delete(&self, volume: &str, object: &str, data_dir: Uuid, rollback_dir: Uuid) -> Result<bool> {
+        let path = format!("{object}/{data_dir}");
+        let token = match self.acquire_snapshot_lease(volume, &path).await {
+            Ok(token) => token,
+            Err(err) if err == DiskError::FileNotFound || err == DiskError::VolumeNotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let key = SnapshotLeaseKey {
+            volume: volume.to_string(),
+            path,
+        };
+        self.snapshot_leases
+            .lock()
+            .await
+            .version_deletes
+            .entry((volume.to_string(), object.to_string(), rollback_dir))
+            .or_default()
+            .push((key, token));
+        Ok(true)
+    }
+
+    async fn finish_version_delete(&self, volume: &str, object: &str, rollback_dir: Uuid, commit: bool) -> Result<()> {
+        let reservations = self
+            .snapshot_leases
+            .lock()
+            .await
+            .version_deletes
+            .remove(&(volume.to_string(), object.to_string(), rollback_dir))
+            .unwrap_or_default();
+        let mut first_err = None;
+        for (key, token) in reservations {
+            if commit
+                && let Err(err) = self
+                    .delete_data_dir(
+                        &key.volume,
+                        &key.path,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+            if let Err(err) = self.release_snapshot_lease(&key.volume, &key.path, token).await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
     fn to_string(&self) -> String {
@@ -8163,6 +8221,13 @@ impl DiskAPI for LocalDisk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        if opts.finalize_delete {
+            let rollback_dir = opts
+                .old_data_dir
+                .ok_or_else(|| DiskError::other("missing delete transaction id"))?;
+            return self.finish_version_delete(volume, path, rollback_dir, true).await;
+        }
+
         if path.starts_with(SLASH_SEPARATOR) {
             return self
                 .delete(
@@ -8188,7 +8253,10 @@ impl DiskAPI for LocalDisk {
             && opts.undo_write
         {
             if opts.undo_delete {
-                restore_delete_rollback(file_path.as_path(), &xl_path, old_data_dir).await?;
+                let restore_result = restore_delete_rollback(file_path.as_path(), &xl_path, old_data_dir).await;
+                let release_result = self.finish_version_delete(volume, path, old_data_dir, false).await;
+                restore_result?;
+                release_result?;
             } else {
                 restore_metadata_backup(file_path.as_path(), &xl_path, old_data_dir).await?;
             }
@@ -8252,6 +8320,7 @@ impl DiskAPI for LocalDisk {
 
         let mut meta = FileMeta::load(&buf)?;
         let old_dir = meta.delete_version(&fi)?;
+        let mut reserved_version_delete = false;
         if let Some(rollback_dir) = rollback_dir {
             write_metadata_rollback_backup(file_path.as_path(), rollback_dir, &buf).await?;
         }
@@ -8301,8 +8370,25 @@ impl DiskAPI for LocalDisk {
                     )
                     .await);
                 }
+                reserved_version_delete = match self.reserve_version_delete(volume, path, uuid, rollback_dir).await {
+                    Ok(reserved) => reserved,
+                    Err(err) => {
+                        return Err(restore_delete_rollback_after_error(
+                            file_path.as_path(),
+                            &xl_path,
+                            Some(rollback_dir),
+                            volume,
+                            path,
+                            "delete_version_reserve_data",
+                            err,
+                        )
+                        .await);
+                    }
+                };
                 let rollback_data_path = rollback_path.join(uuid.to_string());
-                if let Err(err) = rename_all_ignore_missing_source(&old_path, &rollback_data_path, &rollback_path).await {
+                if !reserved_version_delete
+                    && let Err(err) = rename_all_ignore_missing_source(&old_path, &rollback_data_path, &rollback_path).await
+                {
                     return Err(restore_delete_rollback_after_error(
                         file_path.as_path(),
                         &xl_path,
@@ -8315,6 +8401,9 @@ impl DiskAPI for LocalDisk {
                     .await);
                 }
                 if should_fail_after_delete_data_staged(path) {
+                    if reserved_version_delete {
+                        self.finish_version_delete(volume, path, rollback_dir, false).await?;
+                    }
                     return Err(restore_delete_rollback_after_error(
                         file_path.as_path(),
                         &xl_path,
@@ -8345,6 +8434,9 @@ impl DiskAPI for LocalDisk {
             let buf = match meta.marshal_msg() {
                 Ok(buf) => buf,
                 Err(err) => {
+                    if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
+                        self.finish_version_delete(volume, path, rollback_dir, false).await?;
+                    }
                     let err: DiskError = err.into();
                     return Err(restore_delete_rollback_after_error(
                         file_path.as_path(),
@@ -8365,6 +8457,9 @@ impl DiskAPI for LocalDisk {
         };
 
         if let Err(err) = commit_result {
+            if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
+                self.finish_version_delete(volume, path, rollback_dir, false).await?;
+            }
             return Err(restore_delete_rollback_after_error(
                 file_path.as_path(),
                 &xl_path,
@@ -8378,6 +8473,9 @@ impl DiskAPI for LocalDisk {
         }
 
         if should_fail_after_delete_commit(self.root.as_path(), path) {
+            if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
+                self.finish_version_delete(volume, path, rollback_dir, false).await?;
+            }
             return Err(DiskError::Unexpected);
         }
 
@@ -11784,7 +11882,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_version_rollback_restores_staged_data_dir() {
+    async fn test_delete_version_rollback_releases_reserved_data_dir() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -11826,20 +11924,17 @@ mod test {
         .expect("delete should stage rollback state");
 
         assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
-        assert!(!data_path.exists());
+        assert!(
+            data_path.exists(),
+            "the delete transaction must reserve the original data dir instead of moving it"
+        );
         assert!(
             object_dir
                 .join(rollback_dir.to_string())
                 .join(STORAGE_FORMAT_FILE_BACKUP)
                 .exists()
         );
-        assert!(
-            object_dir
-                .join(rollback_dir.to_string())
-                .join(data_dir.to_string())
-                .join("part.1")
-                .exists()
-        );
+        assert!(!object_dir.join(rollback_dir.to_string()).join(data_dir.to_string()).exists());
 
         disk.delete_version(
             bucket,
@@ -14150,6 +14245,7 @@ mod test {
             immediate: true,
             undo_write: false,
             undo_delete: false,
+            finalize_delete: false,
             old_data_dir: None,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
@@ -15013,6 +15109,75 @@ mod test {
         disk.release_snapshot_lease(volume, &data_dir, second)
             .await
             .expect("releasing an already released token should be idempotent");
+        assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn delete_version_keeps_later_part_until_snapshot_release() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "snapshot-version-delete";
+        let object = "object";
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let rollback_dir = Uuid::new_v4();
+        let data_path = path_join_buf(&[object, &data_dir.to_string()]);
+        let first_part = path_join_buf(&[&data_path, "part.1"]);
+        let later_part = path_join_buf(&[&data_path, "part.2"]);
+        ensure_test_volume(&disk, volume).await;
+        disk.write_all(volume, &first_part, Bytes::from_static(b"first"))
+            .await
+            .expect("first shard should be written");
+        disk.write_all(volume, &later_part, Bytes::from_static(b"later"))
+            .await
+            .expect("later shard should be written");
+        let fi = test_file_info(object, version_id, Some(data_dir), None);
+        disk.write_all(volume, &path_join_buf(&[object, STORAGE_FORMAT_FILE]), test_meta(fi.clone()).into())
+            .await
+            .expect("metadata should be written");
+
+        let snapshot = disk
+            .acquire_snapshot_lease(volume, &data_path)
+            .await
+            .expect("snapshot lease should be acquired");
+        disk.delete_version(
+            volume,
+            object,
+            fi.clone(),
+            false,
+            DeleteOptions {
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("version delete should commit metadata");
+        disk.delete_version(
+            volume,
+            object,
+            fi,
+            false,
+            DeleteOptions {
+                finalize_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("version delete should schedule physical cleanup");
+
+        assert_eq!(
+            disk.read_all(volume, &later_part)
+                .await
+                .expect("a later multipart shard must remain openable while leased"),
+            Bytes::from_static(b"later")
+        );
+        disk.release_snapshot_lease(volume, &data_path, snapshot)
+            .await
+            .expect("snapshot release should run deferred cleanup");
         assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
     }
 

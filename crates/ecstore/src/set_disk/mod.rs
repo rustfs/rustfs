@@ -4601,6 +4601,7 @@ mod tests {
     use crate::bucket::replication::{replication_statuses_map, version_purge_statuses_map};
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::DataDirDeleteStatus;
     use crate::disk::DiskOption;
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::disk::RUSTFS_META_TMP_BUCKET;
@@ -5968,6 +5969,62 @@ mod tests {
         assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
         assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
         assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_recovers_deferred_cleanup_after_restart() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        let orphan_path = format!("obj/{orphan}");
+        disk.write_all("bucket", &format!("{orphan_path}/part.1"), Bytes::from_static(b"stale"))
+            .await
+            .expect("orphan part should be written");
+
+        let _token = disk
+            .acquire_snapshot_lease("bucket", &orphan_path)
+            .await
+            .expect("snapshot lease should be acquired");
+        assert_eq!(
+            disk.delete_data_dir(
+                "bucket",
+                &orphan_path,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("cleanup should be deferred"),
+            DataDirDeleteStatus::Deferred
+        );
+        drop(disk);
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let restarted = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should restart");
+        let set = make_set_disks_with(vec![Some(restarted)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("restart reclaim should succeed");
+
+        assert_eq!(removed, 1, "the deferred orphan should be reclaimed after restart");
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(!object_dir.join(orphan.to_string()).exists(), "deferred orphan must be removed");
     }
 
     // Nothing to reclaim when every physical data dir is still referenced.
@@ -9337,6 +9394,58 @@ mod tests {
                 .await
                 .expect("reader drop must release its snapshot")
                 .expect("replacement after cancellation should succeed");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn streaming_get_snapshot_survives_concurrent_delete() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "snapshot-streaming-delete";
+            let object = "object";
+            let body = vec![0x41; 2 * 1024 * 1024];
+            let opts = ObjectOptions::default();
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = PutObjReader::from_vec(body.clone());
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("object should be written");
+
+            let mut snapshot = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("snapshot reader should open");
+            let delete_set = Arc::clone(&set_disks);
+            let delete_opts = opts.clone();
+            let delete = tokio::spawn(async move { delete_set.delete_object(bucket, object, delete_opts).await });
+            tokio::time::timeout(Duration::from_secs(5), delete)
+                .await
+                .expect("delete should not wait for the response body")
+                .expect("delete task should join")
+                .expect("delete should succeed");
+
+            let mut restored = Vec::new();
+            snapshot
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("leased snapshot should remain readable after delete");
+            assert_eq!(restored, body);
+            let err = match set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+            {
+                Ok(_) => panic!("a new read must not observe the deleted object"),
+                Err(err) => err,
+            };
+            assert!(is_err_object_not_found(&err));
         })
         .await;
     }
