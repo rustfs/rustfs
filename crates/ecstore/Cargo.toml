@@ -153,6 +153,10 @@ metrics = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 rustfs-uring = "0.2.1"
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }

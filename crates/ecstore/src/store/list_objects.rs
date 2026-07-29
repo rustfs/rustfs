@@ -6895,6 +6895,7 @@ mod test {
         )
         .await
         .expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("test bucket should be created");
         let mut fi = FileInfo::new("object", 1, 1);
         fi.volume = "bucket".to_owned();
         fi.name = "object".to_owned();
