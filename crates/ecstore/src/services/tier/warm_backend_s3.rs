@@ -430,10 +430,7 @@ mod tests {
     #[test]
     fn transition_candidate_probe_rejects_untrusted_version_ids() {
         let mut candidates = TransitionCandidateVersions::default();
-        candidates.extend(
-            "archive/object",
-            &list_versions(&[("archive/object", "version\ninjection")], &[], false),
-        );
+        candidates.extend("archive/object", &list_versions(&[("archive/object", "version\ninjection")], &[], false));
 
         let err = classify_transition_candidates(candidates, RemoteBucketVersioning::Enabled)
             .expect_err("control characters in listed version IDs must fail closed");
