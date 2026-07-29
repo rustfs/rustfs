@@ -409,20 +409,24 @@ pub(crate) mod bucket {
                 versioned: bool,
                 suspended: bool,
                 transitioned: &super::super::super::storage_contracts::TransitionedObject,
+                transition_version_state: rustfs_filemeta::TransitionVersionState,
             ) -> Option<Jentry> {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
                     version_id,
                     versioned,
                     suspended,
                     transitioned,
+                    transition_version_state,
                 )
             }
 
             pub(crate) fn transitioned_force_delete_journal_entry(
                 transitioned: &super::super::super::storage_contracts::TransitionedObject,
+                transition_version_state: rustfs_filemeta::TransitionVersionState,
             ) -> Option<Jentry> {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
                     transitioned,
+                    transition_version_state,
                 )
             }
         }
