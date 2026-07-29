@@ -363,36 +363,27 @@ impl Operation for ConfigureKmsHandler {
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
 
-        // Configure the service
-        let (success, message, status) = match service_manager.configure(kms_config.clone()).await {
+        let persisted_config = kms_config.clone();
+        let (success, message, status) = match service_manager
+            .configure_with_persistence(kms_config, || async move {
+                save_kms_config(&persisted_config)
+                    .await
+                    .map_err(|error| rustfs_kms::KmsError::backend_error(format!("Failed to persist KMS configuration: {error}")))
+            })
+            .await
+        {
             Ok(()) => {
-                // Persist the configuration to cluster storage
-                if let Err(e) = save_kms_config(&kms_config).await {
-                    let error_msg = format!("KMS configured in memory but failed to persist: {e}");
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "configure",
-                        state = "persist_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    let status = service_manager.get_status().await;
-                    (false, error_msg, status)
-                } else {
-                    let status = service_manager.get_status().await;
-                    info!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "configure",
-                        state = "configured",
-                        status = ?status,
-                        "admin kms dynamic state"
-                    );
-                    (true, "KMS configured successfully".to_string(), status)
-                }
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "configure",
+                    state = "configured",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS configured successfully".to_string(), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
@@ -499,125 +490,61 @@ impl Operation for StartKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-
-        // Check if already running and force flag
-        let current_status = service_manager.get_status().await;
-        if matches!(current_status, KmsServiceStatus::Running) && !start_request.force.unwrap_or(false) {
-            warn!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_KMS,
-                event = "kms_service_state",
-                operation = "start",
-                state = "already_running",
-                "admin kms dynamic state"
-            );
-            let response = StartKmsResponse {
-                success: false,
-                message: "KMS service is already running. Use force=true to restart.".to_string(),
-                status: current_status,
-            };
-            let json_response = match serde_json::to_string(&response) {
-                Ok(json) => json,
-                Err(e) => {
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
-                        operation = "start",
-                        result = "response_serialize_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from("Serialization error".to_string()),
-                    )));
-                }
-            };
-            return Ok(S3Response::new((StatusCode::OK, Body::from(json_response))));
-        }
-
-        // Start the service (or restart if force=true)
-        let (success, message, status) =
-            if start_request.force.unwrap_or(false) && matches!(current_status, KmsServiceStatus::Running) {
-                // Force restart
-                match service_manager.stop().await {
-                    Ok(()) => match service_manager.start().await {
-                        Ok(()) => {
-                            let status = service_manager.get_status().await;
-                            info!(
-                                component = LOG_COMPONENT_ADMIN,
-                                subsystem = LOG_SUBSYSTEM_KMS,
-                                event = "kms_service_state",
-                                operation = "restart",
-                                state = "running",
-                                status = ?status,
-                                "admin kms dynamic state"
-                            );
-                            (true, "KMS service restarted successfully".to_string(), status)
-                        }
-                        Err(e) => {
-                            let error_msg = format!("Failed to restart KMS service: {e}");
-                            error!(
-                                component = LOG_COMPONENT_ADMIN,
-                                subsystem = LOG_SUBSYSTEM_KMS,
-                                event = "kms_service_state",
-                                operation = "restart",
-                                state = "start_failed",
-                                error = %e,
-                                "admin kms dynamic state"
-                            );
-                            let status = service_manager.get_status().await;
-                            (false, error_msg, status)
-                        }
-                    },
-                    Err(e) => {
-                        let error_msg = format!("Failed to stop KMS service for restart: {e}");
-                        error!(
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_KMS,
-                            event = "kms_service_state",
-                            operation = "restart",
-                            state = "stop_failed",
-                            error = %e,
-                            "admin kms dynamic state"
-                        );
-                        let status = service_manager.get_status().await;
-                        (false, error_msg, status)
-                    }
-                }
-            } else {
-                // Normal start
-                match service_manager.start().await {
-                    Ok(()) => {
-                        let status = service_manager.get_status().await;
-                        info!(
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_KMS,
-                            event = "kms_service_state",
-                            operation = "start",
-                            state = "running",
-                            status = ?status,
-                            "admin kms dynamic state"
-                        );
-                        (true, "KMS service started successfully".to_string(), status)
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Failed to start KMS service: {e}");
-                        error!(
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_KMS,
-                            event = "kms_service_state",
-                            operation = "start",
-                            state = "start_failed",
-                            error = %e,
-                            "admin kms dynamic state"
-                        );
-                        let status = service_manager.get_status().await;
-                        (false, error_msg, status)
-                    }
-                }
-            };
+        let force = start_request.force.unwrap_or(false);
+        let (success, message, status) = match service_manager.start_or_restart(force).await {
+            Ok(rustfs_kms::KmsStartOutcome::Started) => {
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "start",
+                    state = "running",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS service started successfully".to_string(), status)
+            }
+            Ok(rustfs_kms::KmsStartOutcome::Restarted) => {
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "restart",
+                    state = "running",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS service restarted successfully".to_string(), status)
+            }
+            Ok(rustfs_kms::KmsStartOutcome::AlreadyRunning) => {
+                let status = service_manager.get_status().await;
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "start",
+                    state = "already_running",
+                    "admin kms dynamic state"
+                );
+                (false, "KMS service is already running. Use force=true to restart.".to_string(), status)
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to start or restart KMS service: {e}");
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "start",
+                    state = "start_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
+                let status = service_manager.get_status().await;
+                (false, error_msg, status)
+            }
+        };
 
         let response = StartKmsResponse {
             success,
@@ -774,8 +701,7 @@ impl Operation for GetKmsStatusHandler {
 
         let service_manager = kms_service_manager_from_context();
 
-        let status = service_manager.get_status().await;
-        let config = service_manager.get_redacted_config().await;
+        let (status, config) = service_manager.get_redacted_state().await;
 
         // Get backend type and health status
         let backend_type = config.as_ref().map(|c| c.backend.clone());
@@ -908,36 +834,27 @@ impl Operation for ReconfigureKmsHandler {
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
 
-        // Reconfigure the service (stops, reconfigures, and starts)
-        let (success, message, status) = match service_manager.reconfigure(kms_config.clone()).await {
+        let persisted_config = kms_config.clone();
+        let (success, message, status) = match service_manager
+            .reconfigure_with_persistence(kms_config, || async move {
+                save_kms_config(&persisted_config)
+                    .await
+                    .map_err(|error| rustfs_kms::KmsError::backend_error(format!("Failed to persist KMS configuration: {error}")))
+            })
+            .await
+        {
             Ok(()) => {
-                // Persist the configuration to cluster storage
-                if let Err(e) = save_kms_config(&kms_config).await {
-                    let error_msg = format!("KMS reconfigured in memory but failed to persist: {e}");
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "reconfigure",
-                        state = "persist_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    let status = service_manager.get_status().await;
-                    (false, error_msg, status)
-                } else {
-                    let status = service_manager.get_status().await;
-                    info!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "reconfigure",
-                        state = "reconfigured",
-                        status = ?status,
-                        "admin kms dynamic state"
-                    );
-                    (true, "KMS reconfigured and restarted successfully".to_string(), status)
-                }
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "reconfigure",
+                    state = "reconfigured",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS reconfigured and restarted successfully".to_string(), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");

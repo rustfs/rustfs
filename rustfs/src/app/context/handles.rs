@@ -128,12 +128,19 @@ impl KmsInterface for KmsHandle {
 }
 
 /// Default KMS runtime interface adapter.
-#[derive(Default)]
-pub struct KmsRuntimeHandle;
+pub struct KmsRuntimeHandle {
+    kms: Option<Arc<KmsServiceManager>>,
+}
+
+impl KmsRuntimeHandle {
+    pub fn new(kms: Arc<KmsServiceManager>) -> Self {
+        Self { kms: Some(kms) }
+    }
+}
 
 impl KmsRuntimeInterface for KmsRuntimeHandle {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
-        runtime_sources::kms_service_manager()
+        self.kms.clone()
     }
 }
 
@@ -485,7 +492,9 @@ pub fn default_notification_system_interface() -> Arc<dyn NotificationSystemInte
 }
 
 pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
-    Arc::new(KmsRuntimeHandle)
+    Arc::new(KmsRuntimeHandle {
+        kms: runtime_sources::kms_service_manager(),
+    })
 }
 
 pub fn default_outbound_tls_runtime_interface() -> Arc<dyn OutboundTlsRuntimeInterface> {
@@ -607,10 +616,10 @@ pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerConfigHandle, default_federated_identity_interface, federated_identity_interface,
-        publish_default_federated_identity_service, runtime_sources,
+        KmsRuntimeHandle, KmsServiceManager, ServerConfigHandle, default_federated_identity_interface,
+        federated_identity_interface, publish_default_federated_identity_service, runtime_sources,
     };
-    use crate::app::context::interfaces::ServerConfigInterface;
+    use crate::app::context::interfaces::{KmsRuntimeInterface, ServerConfigInterface};
     use rustfs_config::server_config::Config;
     use rustfs_iam::{
         federation::{FederatedIdentityRegistry, FederatedIdentityService, oidc::StandardOidcAdapter},
@@ -732,5 +741,20 @@ mod tests {
             Some(cred_b.access_key),
             "handle B must serve its own credentials"
         );
+    }
+
+    #[test]
+    fn kms_runtime_handles_keep_injected_managers_isolated() {
+        let manager_a = Arc::new(KmsServiceManager::new());
+        let manager_b = Arc::new(KmsServiceManager::new());
+        let handle_a = KmsRuntimeHandle::new(manager_a.clone());
+        let handle_b = KmsRuntimeHandle::new(manager_b.clone());
+
+        assert!(Arc::ptr_eq(&handle_a.service_manager().expect("manager A"), &manager_a));
+        assert!(Arc::ptr_eq(&handle_b.service_manager().expect("manager B"), &manager_b));
+        assert!(!Arc::ptr_eq(
+            &handle_a.service_manager().expect("manager A"),
+            &handle_b.service_manager().expect("manager B")
+        ));
     }
 }

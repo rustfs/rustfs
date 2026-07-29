@@ -517,7 +517,7 @@ pub(crate) mod ecstore_object {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rio-v2"))]
 pub(crate) mod ecstore_test_support {
     pub(crate) use rustfs_ecstore::api::bitrot::create_bitrot_reader;
     pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
