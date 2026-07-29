@@ -332,7 +332,7 @@ impl<'de> Deserialize<'de> for SizeHistogram {
 impl SizeHistogram {
     pub fn add(&mut self, size: u64) {
         let intervals = [
-            (0, 1024),                                  // LESS_THAN_1024_B
+            (0, 1024 - 1),                              // LESS_THAN_1024_B
             (1024, 64 * 1024 - 1),                      // BETWEEN_1024_B_AND_64_KB
             (64 * 1024, 256 * 1024 - 1),                // BETWEEN_64_KB_AND_256_KB
             (256 * 1024, 512 * 1024 - 1),               // BETWEEN_256_KB_AND_512_KB
@@ -360,7 +360,7 @@ impl SizeHistogram {
         // the sub-ranges in [1 KiB, 512 KiB).
         const ONE_MIB: u64 = 1024 * 1024;
         let intervals = [
-            (0, 1024),                          // LESS_THAN_1024_B
+            (0, 1024 - 1),                      // LESS_THAN_1024_B
             (1024, 64 * 1024 - 1),              // BETWEEN_1024_B_AND_64_KB
             (64 * 1024, 256 * 1024 - 1),        // BETWEEN_64_KB_AND_256_KB
             (256 * 1024, 512 * 1024 - 1),       // BETWEEN_256_KB_AND_512_KB
@@ -1644,6 +1644,49 @@ mod tests {
         assert_eq!(map["BETWEEN_64_KB_AND_256_KB"], 1);
         assert_eq!(map["BETWEEN_256_KB_AND_512_KB"], 1);
         assert_eq!(map["BETWEEN_512_KB_AND_1_MB"], 1);
+    }
+
+    #[test]
+    fn test_size_histogram_classifies_adjacent_boundaries_once() {
+        let cases = [
+            (1023, 0),
+            (1024, 1),
+            (64 * 1024 - 1, 1),
+            (64 * 1024, 2),
+            (256 * 1024 - 1, 2),
+            (256 * 1024, 3),
+            (512 * 1024 - 1, 3),
+            (512 * 1024, 4),
+            (1024 * 1024 - 1, 4),
+            (1024 * 1024, 6),
+            (10 * 1024 * 1024 - 1, 6),
+            (10 * 1024 * 1024, 7),
+            (64 * 1024 * 1024 - 1, 7),
+            (64 * 1024 * 1024, 8),
+            (128 * 1024 * 1024 - 1, 8),
+            (128 * 1024 * 1024, 9),
+            (512 * 1024 * 1024 - 1, 9),
+            (512 * 1024 * 1024, 10),
+        ];
+
+        for (size, expected_bucket) in cases {
+            let mut hist = SizeHistogram::default();
+            hist.add(size);
+
+            assert_eq!(hist.0.iter().sum::<u64>(), 1, "size {size} must have exactly one physical bucket");
+            assert_eq!(hist.0[expected_bucket], 1, "size {size} must select the expected bucket");
+        }
+    }
+
+    #[test]
+    fn test_size_histogram_1024_bytes_contributes_to_compat_rollup() {
+        let mut hist = SizeHistogram::default();
+        hist.add(1024);
+
+        let map = hist.to_map();
+        assert_eq!(map["LESS_THAN_1024_B"], 0);
+        assert_eq!(map["BETWEEN_1024_B_AND_64_KB"], 1);
+        assert_eq!(map["BETWEEN_1024B_AND_1_MB"], 1);
     }
 
     #[test]
