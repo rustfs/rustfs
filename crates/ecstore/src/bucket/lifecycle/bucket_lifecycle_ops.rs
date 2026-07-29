@@ -11306,23 +11306,25 @@ mod tests {
 
         // Distinct payloads with distinct sizes: a mixed-generation reassembly
         // would produce bytes matching none of them (or fail the read outright).
-        let candidates: Vec<Vec<u8>> = (0..3)
+        let candidates: Vec<Vec<u8>> = (0..2)
             .map(|g| {
                 let len = 4096 + g * 512;
                 vec![b'a' + g as u8; len]
             })
             .collect();
 
-        let commit_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
-        let start = Arc::new(tokio::sync::Barrier::new(candidates.len() + 1));
+        let commit_barrier = MultipartCommitBarrier::install_for_arrivals(
+            &bucket,
+            object,
+            MultipartCommitPause::PutPartBeforeLockAcquire,
+            candidates.len(),
+        );
         let mut tasks = tokio::task::JoinSet::new();
         for payload in candidates.iter().cloned() {
             let store = ecstore.clone();
             let bucket = bucket.clone();
             let upload_id = upload.upload_id.clone();
-            let start = Arc::clone(&start);
             tasks.spawn(async move {
-                start.wait().await;
                 let mut data = PutObjReader::from_vec(payload.clone());
                 store
                     .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
@@ -11330,11 +11332,10 @@ mod tests {
                     .map(|info| (info, payload))
             });
         }
-        start.wait().await;
 
-        // The first writer holds the uploadId commit lock while the other
-        // resends reach the same critical section. Releasing it proves the
-        // handoff without depending on saturated CI disk latency.
+        // Both writers finish streaming before racing for the uploadId commit
+        // lock. Two generations are sufficient to exercise the mixed-shard
+        // hazard, while each waiter sits behind at most one cross-disk rename.
         commit_barrier.wait_until_paused().await;
         commit_barrier.release();
 

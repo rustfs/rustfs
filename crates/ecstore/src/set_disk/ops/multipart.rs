@@ -27,7 +27,7 @@ use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
 use std::future::Future;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -36,6 +36,7 @@ const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MultipartCommitPause {
+    PutPartBeforeLockAcquire,
     PutPartBeforeLockLost,
     PutPartAfterRename,
     BeforeLockLost,
@@ -47,9 +48,10 @@ struct MultipartCommitBarrierState {
     bucket: String,
     object: String,
     pause: MultipartCommitPause,
-    armed: AtomicBool,
+    expected_arrivals: usize,
+    arrivals: AtomicUsize,
     arrived: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
 }
 
 #[cfg(test)]
@@ -64,13 +66,24 @@ static MULTIPART_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc
 #[cfg(test)]
 impl MultipartCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
+        Self::install_for_arrivals(bucket, object, pause, 1)
+    }
+
+    pub(crate) fn install_for_arrivals(
+        bucket: &str,
+        object: &str,
+        pause: MultipartCommitPause,
+        expected_arrivals: usize,
+    ) -> Self {
+        assert!(expected_arrivals > 0, "multipart commit barrier must wait for at least one arrival");
         let state = Arc::new(MultipartCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
             pause,
-            armed: AtomicBool::new(true),
+            expected_arrivals,
+            arrivals: AtomicUsize::new(0),
             arrived: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
         });
         let mut slot = MULTIPART_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -83,20 +96,28 @@ impl MultipartCommitBarrier {
     }
 
     pub(crate) async fn wait_until_paused(&self) {
-        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
-            .await
-            .expect("multipart completion should reach the deterministic commit barrier");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let arrived = self.state.arrived.notified();
+                if self.state.arrivals.load(Ordering::Acquire) >= self.state.expected_arrivals {
+                    return;
+                }
+                arrived.await;
+            }
+        })
+        .await
+        .expect("multipart completion should reach the deterministic commit barrier");
     }
 
     pub(crate) fn release(&self) {
-        self.state.release.notify_one();
+        self.state.release.add_permits(self.state.expected_arrivals);
     }
 }
 
 #[cfg(test)]
 impl Drop for MultipartCommitBarrier {
     fn drop(&mut self) {
-        self.state.release.notify_one();
+        self.release();
         let mut slot = MULTIPART_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
@@ -116,11 +137,21 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
         .as_ref()
         .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
         .cloned();
-    if let Some(barrier) = barrier
-        && barrier.armed.swap(false, Ordering::AcqRel)
-    {
-        barrier.arrived.notify_one();
-        barrier.release.notified().await;
+    if let Some(barrier) = barrier {
+        if let Ok(previous) = barrier.arrivals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < barrier.expected_arrivals).then_some(current + 1)
+        }) {
+            let arrival = previous + 1;
+            if arrival == barrier.expected_arrivals {
+                barrier.arrived.notify_one();
+            }
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("multipart commit barrier should remain open")
+                .forget();
+        }
     }
 }
 
@@ -693,6 +724,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
 
+            #[cfg(test)]
+            pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockAcquire).await;
             // Serialize only the commit (rename_part), not the whole upload. Each
             // concurrent stream writes to its own unique temp dir (see `tmp_part`
             // above), so the encode/stream phase never conflicts and must stay
