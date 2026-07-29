@@ -174,7 +174,7 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
-    pub(crate) use super::super::helper::{OperationHelper, spawn_background_with_context};
+    pub(crate) use super::super::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
@@ -203,9 +203,7 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{
-        RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
-    };
+    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 }
 
 pub(crate) mod rpc_consumer {

@@ -124,9 +124,7 @@ pub(crate) mod server {
         }
 
         pub(crate) mod request_context {
-            pub(crate) use crate::storage::storage_api::request_context_consumer::{
-                RequestContext, extract_request_id_from_headers,
-            };
+            pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         }
 
         pub(crate) mod rpc {
@@ -149,7 +147,7 @@ pub(crate) mod server {
 
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
-                RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
+                RequestContext, extract_request_id_from_headers, spawn_traced,
             };
         }
     }
