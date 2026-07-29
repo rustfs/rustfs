@@ -836,7 +836,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
     };
 
     for bucket in buckets {
-        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await?;
+        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
         let status = pool.get_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
@@ -1460,8 +1460,8 @@ pub(crate) async fn update_bucket_metadata_config(
     Ok(updated_at)
 }
 
-pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
-    ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await
+pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {

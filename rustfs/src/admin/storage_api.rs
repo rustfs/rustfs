@@ -282,8 +282,8 @@ pub(crate) mod metadata_sys {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
 
-    pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
-        crate::storage::storage_api::acquire_bucket_targets_transaction_lock(bucket).await
+    pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+        crate::storage::storage_api::acquire_bucket_metadata_transaction_lock(bucket).await
     }
 
     pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<OffsetDateTime> {

@@ -2478,7 +2478,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
     };
 
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let _transaction_guard = metadata_sys::acquire_bucket_targets_transaction_lock(bucket)
+    let _transaction_guard = metadata_sys::acquire_bucket_metadata_transaction_lock(bucket)
         .await
         .map_err(ApiError::from)?;
     let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
