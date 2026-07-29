@@ -67,6 +67,14 @@ pub mod bucket {
             };
         }
 
+        pub mod transition_transaction {
+            pub use crate::bucket::lifecycle::transition_transaction::{
+                TransitionOperatorDeleteResult, TransitionOperatorError, TransitionOperatorProbe, TransitionOperatorStatus,
+                delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
+                inspect_transition_transaction_for_operator,
+            };
+        }
+
         pub mod evaluator {
             pub use crate::bucket::lifecycle::evaluator::Evaluator;
         }
@@ -377,6 +385,7 @@ pub mod metrics {
 pub mod notification {
     pub use crate::services::notification_sys::{
         NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
 }
 

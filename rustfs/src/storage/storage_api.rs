@@ -472,7 +472,7 @@ pub(crate) mod ecstore_metrics {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -961,6 +961,10 @@ pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
 pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_notification::new_global_notification_sys(endpoint_pools).await
+}
+
+pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
+    ecstore_notification::start_remote_version_state_fleet_probe(topology_fingerprint);
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {

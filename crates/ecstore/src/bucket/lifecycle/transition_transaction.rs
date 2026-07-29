@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::bucket::lifecycle::config_boundary;
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::lifecycle::tier_sweeper::{
+    delete_confirmed_transition_candidate_exact_with_lease_idempotent,
     delete_confirmed_transition_candidate_exact_with_manager_and_identity,
     delete_object_from_remote_tier_idempotent_with_manager_and_identity,
 };
@@ -616,6 +617,183 @@ pub enum TransitionTransactionRecoveryOutcome {
     Retained,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionOperatorProbe {
+    Missing,
+    UnversionedPresent,
+    VersionedPresent(String),
+    Ambiguous,
+    Unsupported,
+}
+
+impl From<TransitionCandidateProbe> for TransitionOperatorProbe {
+    fn from(value: TransitionCandidateProbe) -> Self {
+        match value {
+            TransitionCandidateProbe::Missing => Self::Missing,
+            TransitionCandidateProbe::UnversionedPresent => Self::UnversionedPresent,
+            TransitionCandidateProbe::VersionedPresent(version_id) => Self::VersionedPresent(version_id),
+            TransitionCandidateProbe::Ambiguous => Self::Ambiguous,
+            TransitionCandidateProbe::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransitionOperatorStatus {
+    pub transaction_id: Uuid,
+    pub state: TransitionTransactionState,
+    pub tier_name: String,
+    pub remote_object: String,
+    pub not_after_unix_nanos: i64,
+    pub probe: TransitionOperatorProbe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransitionOperatorDeleteResult {
+    pub status: TransitionOperatorStatus,
+    pub journal_observed_after_delete: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TransitionOperatorError {
+    #[error("transition transaction was not found")]
+    NotFound,
+    #[error("transition transaction is still inside its active ownership window")]
+    NotExpired,
+    #[error("transition transaction state is not eligible for operator reconciliation: {0:?}")]
+    InvalidState(TransitionTransactionState),
+    #[error("an exact non-empty remote version is required")]
+    RemoteVersionRequired,
+    #[error("remote candidate is not proven missing: {0:?}")]
+    CandidateNotMissing(TransitionOperatorProbe),
+    #[error("transition transaction store failed: {0}")]
+    Store(#[source] Error),
+    #[error("remote tier reconciliation failed: {0}")]
+    Remote(#[source] std::io::Error),
+}
+
+type TransitionOperatorResult<T> = std::result::Result<T, TransitionOperatorError>;
+
+fn validate_operator_reconcile_transaction(
+    transaction: &TransitionTransaction,
+    now_unix_nanos: i128,
+) -> TransitionOperatorResult<()> {
+    transaction
+        .validate()
+        .map_err(|err| TransitionOperatorError::Store(Error::other(err)))?;
+    if transaction.state != TransitionTransactionState::UploadOutcomeUnknown {
+        return Err(TransitionOperatorError::InvalidState(transaction.state));
+    }
+    if now_unix_nanos < i128::from(transaction.not_after_unix_nanos) {
+        return Err(TransitionOperatorError::NotExpired);
+    }
+    Ok(())
+}
+
+async fn load_operator_reconcile_transaction(
+    api: Arc<ECStore>,
+    transaction_id: Uuid,
+) -> TransitionOperatorResult<TransitionTransaction> {
+    match load_transition_transaction_record(api, transaction_id).await {
+        Ok(transaction) => Ok(transaction),
+        Err(Error::ConfigNotFound) => Err(TransitionOperatorError::NotFound),
+        Err(err) => Err(TransitionOperatorError::Store(err)),
+    }
+}
+
+async fn operator_probe_transition_candidate(
+    api: Arc<ECStore>,
+    transaction: &TransitionTransaction,
+) -> TransitionOperatorResult<TransitionOperatorProbe> {
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(
+        &api.tier_config_mgr(),
+        &transaction.tier_name,
+        transaction.backend_fingerprint,
+    )
+    .await
+    .map_err(|err| TransitionOperatorError::Remote(std::io::Error::other(err)))?;
+    lease
+        .probe_transition_candidate_for(&transaction.remote_object, transaction.transaction_id)
+        .await
+        .map(TransitionOperatorProbe::from)
+        .map_err(TransitionOperatorError::Remote)
+}
+
+pub async fn inspect_transition_transaction_for_operator(
+    api: Arc<ECStore>,
+    transaction_id: Uuid,
+) -> TransitionOperatorResult<TransitionOperatorStatus> {
+    let transaction = load_operator_reconcile_transaction(api.clone(), transaction_id).await?;
+    validate_operator_reconcile_transaction(&transaction, time::OffsetDateTime::now_utc().unix_timestamp_nanos())?;
+    let probe = operator_probe_transition_candidate(api, &transaction).await?;
+    Ok(TransitionOperatorStatus {
+        transaction_id,
+        state: transaction.state,
+        tier_name: transaction.tier_name,
+        remote_object: transaction.remote_object,
+        not_after_unix_nanos: transaction.not_after_unix_nanos,
+        probe,
+    })
+}
+
+pub async fn delete_transition_candidate_for_operator(
+    api: Arc<ECStore>,
+    transaction_id: Uuid,
+    remote_version_id: &str,
+) -> TransitionOperatorResult<TransitionOperatorDeleteResult> {
+    if remote_version_id.is_empty() {
+        return Err(TransitionOperatorError::RemoteVersionRequired);
+    }
+    let transaction = load_operator_reconcile_transaction(api.clone(), transaction_id).await?;
+    validate_operator_reconcile_transaction(&transaction, time::OffsetDateTime::now_utc().unix_timestamp_nanos())?;
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(
+        &api.tier_config_mgr(),
+        &transaction.tier_name,
+        transaction.backend_fingerprint,
+    )
+    .await
+    .map_err(|err| TransitionOperatorError::Remote(std::io::Error::other(err)))?;
+    lease
+        .validate_remote_version_id(remote_version_id)
+        .map_err(TransitionOperatorError::Remote)?;
+    delete_confirmed_transition_candidate_exact_with_lease_idempotent(&transaction.remote_object, remote_version_id, &lease)
+        .await
+        .map_err(TransitionOperatorError::Remote)?;
+    let probe = operator_probe_transition_candidate(api.clone(), &transaction).await?;
+    let journal_observed_after_delete = match load_transition_transaction_record(api, transaction_id).await {
+        Ok(_) => true,
+        Err(Error::ConfigNotFound) => false,
+        Err(err) => return Err(TransitionOperatorError::Store(err)),
+    };
+    Ok(TransitionOperatorDeleteResult {
+        status: TransitionOperatorStatus {
+            transaction_id,
+            state: transaction.state,
+            tier_name: transaction.tier_name,
+            remote_object: transaction.remote_object,
+            not_after_unix_nanos: transaction.not_after_unix_nanos,
+            probe,
+        },
+        journal_observed_after_delete,
+    })
+}
+
+pub async fn finalize_missing_transition_transaction_for_operator(
+    api: Arc<ECStore>,
+    transaction_id: Uuid,
+) -> TransitionOperatorResult<()> {
+    let transaction = load_operator_reconcile_transaction(api.clone(), transaction_id).await?;
+    validate_operator_reconcile_transaction(&transaction, time::OffsetDateTime::now_utc().unix_timestamp_nanos())?;
+    let probe = operator_probe_transition_candidate(api.clone(), &transaction).await?;
+    if probe != TransitionOperatorProbe::Missing {
+        return Err(TransitionOperatorError::CandidateNotMissing(probe));
+    }
+    delete_transition_transaction_record(api, transaction_id)
+        .await
+        .map_err(TransitionOperatorError::Store)
+}
+
 pub(crate) fn decode_transition_transaction_record(object: &str, data: &[u8]) -> Result<TransitionTransaction> {
     let transaction_id = transition_transaction_id_from_record_object_name(object)?;
     TransitionTransaction::decode(transaction_id, data)
@@ -1095,6 +1273,27 @@ mod tests {
                 Some(TransitionRemoteVersion::versioned(Uuid::new_v4().to_string())),
             )
             .expect("upload state change should succeed")
+    }
+
+    #[test]
+    fn operator_reconcile_requires_expired_unknown_upload_outcome() {
+        let mut transaction = new_transaction();
+        let active_deadline = transaction.not_after_unix_nanos;
+
+        assert!(matches!(
+            validate_operator_reconcile_transaction(&transaction, i128::from(active_deadline) + 1),
+            Err(TransitionOperatorError::InvalidState(TransitionTransactionState::UploadStarted))
+        ));
+
+        transaction
+            .advance(transaction.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("unknown upload outcome should be recorded");
+        assert!(matches!(
+            validate_operator_reconcile_transaction(&transaction, i128::from(active_deadline) - 1),
+            Err(TransitionOperatorError::NotExpired)
+        ));
+        validate_operator_reconcile_transaction(&transaction, i128::from(active_deadline))
+            .expect("expired unknown upload outcome should be eligible");
     }
 
     fn cleanup_proof(transaction: &TransitionTransaction, decision: TransitionCleanupDecision) -> TransitionCleanupProof {
