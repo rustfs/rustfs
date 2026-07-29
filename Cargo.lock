@@ -10128,6 +10128,7 @@ dependencies = [
  "bytes",
  "convert_case 0.11.0",
  "crc-fast",
+ "criterion",
  "flate2",
  "futures",
  "hex-simd",
