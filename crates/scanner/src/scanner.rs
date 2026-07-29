@@ -14,6 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::ScannerObjectIO;
@@ -38,8 +40,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
-    emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult, ScannerWorkSource,
+    emit_scan_cycle_complete, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -50,9 +52,12 @@ use rustfs_config::{
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_api::scan::{
@@ -93,6 +98,42 @@ const SCANNER_CYCLE_STATE_MAGIC: &[u8; 8] = b"RSCYC001";
 const SCANNER_CYCLE_STATE_HEADER_LEN: usize = 24;
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
+#[cfg(test)]
+static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<(u64, Arc<Notify>)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+struct ScannerCycleStatePersistTestHookGuard;
+
+#[cfg(test)]
+impl Drop for ScannerCycleStatePersistTestHookGuard {
+    fn drop(&mut self) {
+        *SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn set_scanner_cycle_state_persist_test_hook(leader_epoch: u64, reached: Arc<Notify>) -> ScannerCycleStatePersistTestHookGuard {
+    *SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((leader_epoch, reached));
+    ScannerCycleStatePersistTestHookGuard
+}
+
+#[cfg(test)]
+fn notify_scanner_cycle_state_persist_test_hook(leader_epoch: u64) {
+    let reached = SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(expected_epoch, _)| *expected_epoch == leader_epoch)
+        .map(|(_, reached)| reached.clone());
+    if let Some(reached) = reached {
+        reached.notify_one();
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum ScannerCycleStateError {
@@ -1691,10 +1732,10 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
-async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
+async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard: &mut ScannerCycleMetricsGuard) {
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
-    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
 }
 
 fn encode_scanner_cycle_state(cycle_info: &CurrentCycle, leader_epoch: u64) -> Result<Vec<u8>, ScannerCycleStateError> {
@@ -2218,6 +2259,8 @@ async fn persist_scanner_cycle_state(
             return false;
         }
 
+        #[cfg(test)]
+        notify_scanner_cycle_state_persist_test_hook(leader_epoch);
         match save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf.clone(), revision.preconditions())
             .await
         {
@@ -2340,7 +2383,6 @@ async fn persist_scanner_cycle_state(
 
                     if persisted_cycle.next >= cycle_info.next {
                         *cycle_info = persisted_cycle;
-                        global_metrics().set_cycle(Some(cycle_info.clone())).await;
                         debug!(
                             target: "rustfs::scanner",
                             event = EVENT_SCANNER_PERSIST_STATE,
@@ -2406,6 +2448,7 @@ async fn finalize_partial_scan_cycle(
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
+    cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
 ) -> bool {
     // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
     // must still advance (and persist) because per-bucket next_cycle is stamped from
@@ -2422,11 +2465,14 @@ async fn finalize_partial_scan_cycle(
             error = %err,
             "Scanner partial cycle could not advance"
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, cycle_metrics_guard).await;
         return false;
     }
-    mark_scan_cycle_idle(cycle_info).await;
-    persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await
+    cycle_info.current = 0;
+    global_metrics().clear_current_scan_mode();
+    let persisted = persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await;
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
+    persisted
 }
 
 async fn persist_required_scanner_cycle_floor(
@@ -2436,6 +2482,7 @@ async fn persist_required_scanner_cycle_floor(
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
     required_cycle: u64,
+    cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
 ) -> bool {
     if required_cycle <= cycle_info.current || required_cycle == u64::MAX {
         error!(
@@ -2448,13 +2495,16 @@ async fn persist_required_scanner_cycle_floor(
             state = "invalid_cache_cycle_floor",
             "Scanner cache cycle floor is invalid"
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, cycle_metrics_guard).await;
         return false;
     }
 
     cycle_info.next = cycle_info.next.max(required_cycle);
-    mark_scan_cycle_idle(cycle_info).await;
-    persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await
+    cycle_info.current = 0;
+    global_metrics().clear_current_scan_mode();
+    let persisted = persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await;
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
+    persisted
 }
 
 async fn await_scanner_cycle_with_lock_fence<Cycle, LockLost>(
@@ -2513,7 +2563,7 @@ async fn run_data_scanner_cycle(
     let now = Instant::now();
     cycle_info.started = Utc::now();
 
-    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
     let mut background_heal_info = read_background_heal_info(storeapi.clone()).await;
 
@@ -2564,14 +2614,14 @@ async fn run_data_scanner_cycle(
                 "Scanner cycle could not capture the data usage persistence baseline"
             );
             emit_scan_cycle_complete(false, cycle_start.elapsed());
-            mark_scan_cycle_idle(cycle_info).await;
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
     };
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
     let storeapi_clone = storeapi.clone();
     let ctx_clone = ctx.clone();
-    let mut usage_persist_task = tokio::spawn(async move {
+    let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
         store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
             ctx_clone,
             storeapi_clone,
@@ -2580,10 +2630,9 @@ async fn run_data_scanner_cycle(
             Some(usage_persist_baseline),
         )
         .await
-    });
+    }));
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
-    let cycle_work_start = global_metrics().start_scan_cycle_work();
     let cycle_budget = ScannerCycleBudget::new(ctx, cycle_budget_config);
     let scan_result = storeapi
         .clone()
@@ -2640,7 +2689,6 @@ async fn run_data_scanner_cycle(
         }
     };
     let unresolved_heal_work = global_metrics().current_scan_cycle_has_unresolved_heal_work();
-    global_metrics().finish_scan_cycle_work(cycle_work_start);
 
     let scan_cycle_result = match scan_result {
         Ok(result) => result,
@@ -2663,7 +2711,7 @@ async fn run_data_scanner_cycle(
             {
                 save_background_heal_info(storeapi.clone(), new_heal_info).await;
             }
-            mark_scan_cycle_idle(cycle_info).await;
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
     };
@@ -2678,7 +2726,7 @@ async fn run_data_scanner_cycle(
             "Scanner cycle stopped before committing cycle state"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
     if let Some(required_cycle) = scan_cycle_result.required_cycle_floor() {
@@ -2700,6 +2748,7 @@ async fn run_data_scanner_cycle(
             cycle_revision,
             leader_epoch,
             required_cycle,
+            &mut cycle_metrics_guard,
         )
         .await
         {
@@ -2719,7 +2768,7 @@ async fn run_data_scanner_cycle(
             "Scanner cycle completed without a durable data usage snapshot"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
     if budget_elapsed {
@@ -2743,7 +2792,16 @@ async fn run_data_scanner_cycle(
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        return if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+        return if finalize_partial_scan_cycle(
+            ctx,
+            storeapi.clone(),
+            cycle_info,
+            cycle_revision,
+            leader_epoch,
+            &mut cycle_metrics_guard,
+        )
+        .await
+        {
             ScannerCycleOutcome::Partial
         } else {
             ScannerCycleOutcome::Failed
@@ -2792,7 +2850,7 @@ async fn run_data_scanner_cycle(
                 "Scanner cycle completed without a durable data usage snapshot"
             );
             emit_scan_cycle_complete(false, cycle_start.elapsed());
-            mark_scan_cycle_idle(cycle_info).await;
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
         ScannerCycleOutcome::Partial => {
@@ -2818,7 +2876,16 @@ async fn run_data_scanner_cycle(
                 );
             }
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            return if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+            return if finalize_partial_scan_cycle(
+                ctx,
+                storeapi.clone(),
+                cycle_info,
+                cycle_revision,
+                leader_epoch,
+                &mut cycle_metrics_guard,
+            )
+            .await
+            {
                 ScannerCycleOutcome::Partial
             } else {
                 ScannerCycleOutcome::Failed
@@ -2834,7 +2901,16 @@ async fn run_data_scanner_cycle(
                 state = "superseded",
                 "Scanner cycle usage snapshot was superseded by concurrent namespace activity"
             );
-            if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+            if finalize_partial_scan_cycle(
+                ctx,
+                storeapi.clone(),
+                cycle_info,
+                cycle_revision,
+                leader_epoch,
+                &mut cycle_metrics_guard,
+            )
+            .await
+            {
                 emit_scan_cycle_superseded(cycle_start.elapsed());
                 return ScannerCycleOutcome::Superseded;
             }
@@ -2853,7 +2929,7 @@ async fn run_data_scanner_cycle(
             error = %err,
             "Scanner completed cycle could not advance"
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
     }
@@ -2862,9 +2938,8 @@ async fn run_data_scanner_cycle(
     global_metrics().clear_current_scan_mode();
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
-    global_metrics().set_cycle(Some(cycle_info.clone())).await;
     if !persist_scanner_cycle_state(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
-        mark_scan_cycle_idle(cycle_info).await;
+        cycle_metrics_guard.finish(cycle_info.clone()).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
     }
@@ -2888,7 +2963,35 @@ async fn run_data_scanner_cycle(
         "Scanner cycle completed"
     );
 
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
     scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, pending_maintenance_work)
+}
+
+struct ScannerCycleMetricsGuard {
+    start: Option<ScanCycleWorkSnapshot>,
+}
+
+impl ScannerCycleMetricsGuard {
+    async fn new(cycle: CurrentCycle) -> Self {
+        Self {
+            start: Some(global_metrics().start_scan_cycle_work_with_cycle(cycle).await),
+        }
+    }
+
+    async fn finish(&mut self, cycle: CurrentCycle) {
+        if let Some(start) = self.start {
+            global_metrics().finish_scan_cycle_work_with_cycle(start, cycle).await;
+            self.start = None;
+        }
+    }
+}
+
+impl Drop for ScannerCycleMetricsGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            global_metrics().finish_scan_cycle_work(start);
+        }
+    }
 }
 
 async fn record_scanner_leader_lock_lost(message: &'static str) {
@@ -3443,7 +3546,7 @@ enum DataUsagePersistTaskResult {
 
 async fn wait_for_data_usage_persist_task(
     ctx: &CancellationToken,
-    task: &mut tokio::task::JoinHandle<DataUsagePersistOutcome>,
+    task: &mut AbortOnDropHandle<DataUsagePersistOutcome>,
     timeout: Duration,
 ) -> DataUsagePersistTaskResult {
     tokio::select! {
@@ -3840,8 +3943,9 @@ mod tests {
     use super::*;
     use crate::EcstoreResult;
     use crate::{
-        ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
-        ScannerPutObjReader as PutObjReader,
+        Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerGetObjectReader as GetObjectReader,
+        ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
+        init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
     };
     use serial_test::serial;
     use std::collections::HashMap;
@@ -3852,6 +3956,47 @@ mod tests {
     use tokio::sync::Mutex;
 
     const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+
+    async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
+        init_ecstore_config_for_scanner_tests();
+        let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
+        let mut endpoints = Vec::new();
+        for disk_index in 0..4 {
+            let disk_path = temp_dir.path().join(format!("disk{disk_index}"));
+            tokio::fs::create_dir_all(&disk_path)
+                .await
+                .expect("scanner cycle test disk should be created");
+            let mut endpoint =
+                Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+        let endpoint_pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "scanner-cycle-metrics".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("scanner cycle test disks should initialize");
+        let store = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address should parse"),
+            endpoint_pools,
+            CancellationToken::new(),
+            instance_ctx,
+        )
+        .await
+        .expect("scanner cycle test ECStore should initialize");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+
+        (temp_dir, store)
+    }
 
     fn assert_run_data_scanner_signature<F, Fut>(_run: F)
     where
@@ -4312,9 +4457,9 @@ mod tests {
         };
 
         global_metrics().set_current_scan_mode(HealScanMode::Deep);
-        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        mark_scan_cycle_idle(&mut cycle_info).await;
+        mark_scan_cycle_idle(&mut cycle_info, &mut cycle_metrics_guard).await;
 
         let published = global_metrics()
             .get_cycle()
@@ -4332,6 +4477,123 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
+        let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+        let mut cycle_info = CurrentCycle {
+            current: 0,
+            next: 1,
+            started: cycle_started,
+            ..Default::default()
+        };
+        let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+        let setup_report = global_metrics().report().await;
+        assert!(setup_report.current_cycle_active);
+        assert_eq!(setup_report.current_cycle, 0);
+        assert_eq!(setup_report.current_started, cycle_started);
+
+        mark_scan_cycle_idle(&mut cycle_info, &mut guard).await;
+        let idle_report = global_metrics().report().await;
+        assert!(!idle_report.current_cycle_active);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finalization() {
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 13,
+            started: Utc::now(),
+            ..Default::default()
+        };
+        let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+
+        cycle_info.current = 0;
+        tokio::task::yield_now().await;
+        let finalizing_report = global_metrics().report().await;
+        assert!(finalizing_report.current_cycle_active);
+        assert_eq!(finalizing_report.current_cycle, 12);
+
+        guard.finish(cycle_info).await;
+        let idle_report = global_metrics().report().await;
+        assert!(!idle_report.current_cycle_active);
+        assert_eq!(idle_report.current_cycle, 0);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cycle_metrics_guard_drop_clears_activity() {
+        let guard = ScannerCycleMetricsGuard::new(CurrentCycle {
+            current: 12,
+            next: 13,
+            started: Utc::now(),
+            ..Default::default()
+        })
+        .await;
+        assert!(global_metrics().report().await.current_cycle_active);
+
+        drop(guard);
+
+        assert!(!global_metrics().report().await.current_cycle_active);
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
+        let (_temp_dir, store) = setup_scanner_cycle_store().await;
+        let ctx = CancellationToken::new();
+        let mut cycle_info = CurrentCycle::default();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let leader_epoch = u64::MAX - 1;
+        let state_persist_reached = Arc::new(Notify::new());
+        let _state_persist_hook = set_scanner_cycle_state_persist_test_hook(leader_epoch, state_persist_reached.clone());
+        let state_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str())
+            .await
+            .expect("scanner cycle state lock should be created");
+        let state_guard = state_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("scanner cycle state lock should be acquired");
+        let mut cycle = Box::pin(run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, leader_epoch));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(&waker);
+
+        assert!(cycle.as_mut().poll(&mut context).is_pending());
+        let active = global_metrics().report().await;
+        assert!(active.current_cycle_active);
+        assert_eq!(active.current_cycle, 0);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                outcome = &mut cycle => panic!("scanner cycle finished before state persistence was released: {outcome:?}"),
+                _ = state_persist_reached.notified() => {}
+            }
+        })
+        .await
+        .expect("scanner cycle should reach state persistence");
+        let finalizing = global_metrics().report().await;
+        assert!(finalizing.current_cycle_active);
+
+        drop(state_guard);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), cycle)
+            .await
+            .expect("scanner cycle should finish");
+        assert!(matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ));
+        assert!(!global_metrics().report().await.current_cycle_active);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         let store = Arc::new(MemoryConfigStore::default());
         let ctx = CancellationToken::new();
@@ -4342,8 +4604,11 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1).await);
+        assert!(
+            finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await
+        );
 
         assert_eq!(cycle_info.next, 13);
         assert_eq!(cycle_info.current, 0);
@@ -4377,8 +4642,20 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(persist_required_scanner_cycle_floor(&ctx, store.clone(), &mut cycle_info, &mut revision, 7, 19).await);
+        assert!(
+            persist_required_scanner_cycle_floor(
+                &ctx,
+                store.clone(),
+                &mut cycle_info,
+                &mut revision,
+                7,
+                19,
+                &mut cycle_metrics_guard,
+            )
+            .await
+        );
         assert_eq!(cycle_info.current, 0);
         assert_eq!(cycle_info.next, 19);
 
@@ -4405,22 +4682,37 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(!persist_required_scanner_cycle_floor(&ctx, store.clone(), &mut cycle_info, &mut revision, 7, 12).await);
-        assert_eq!(cycle_info.next, 12);
-        assert_eq!(revision, DataUsageCacheRevision::Missing);
         assert!(
             !persist_required_scanner_cycle_floor(
                 &ctx,
                 store.clone(),
-                &mut CurrentCycle {
-                    current: 12,
-                    next: 12,
-                    ..Default::default()
-                },
+                &mut cycle_info,
+                &mut revision,
+                7,
+                12,
+                &mut cycle_metrics_guard,
+            )
+            .await
+        );
+        assert_eq!(cycle_info.next, 12);
+        assert_eq!(revision, DataUsageCacheRevision::Missing);
+        let mut max_cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            ..Default::default()
+        };
+        let mut max_cycle_metrics_guard = ScannerCycleMetricsGuard::new(max_cycle_info.clone()).await;
+        assert!(
+            !persist_required_scanner_cycle_floor(
+                &ctx,
+                store.clone(),
+                &mut max_cycle_info,
                 &mut revision,
                 7,
                 u64::MAX,
+                &mut max_cycle_metrics_guard,
             )
             .await
         );
@@ -4685,8 +4977,9 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1).await);
+        assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
         assert_eq!(cycle_info.next, 13);
         assert_eq!(cycle_info.current, 0);
         assert_eq!(revision, DataUsageCacheRevision::Missing);
@@ -5943,10 +6236,10 @@ mod tests {
     #[tokio::test]
     async fn data_usage_persist_wait_aborts_when_scanner_is_cancelled() {
         let ctx = CancellationToken::new();
-        let mut task = tokio::spawn(async {
+        let mut task = AbortOnDropHandle::new(tokio::spawn(async {
             std::future::pending::<()>().await;
             DataUsagePersistOutcome::Saved
-        });
+        }));
         ctx.cancel();
 
         let result = wait_for_data_usage_persist_task(&ctx, &mut task, Duration::from_secs(60)).await;
@@ -5958,10 +6251,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn data_usage_persist_wait_aborts_after_timeout() {
         let ctx = CancellationToken::new();
-        let mut task = tokio::spawn(async {
+        let mut task = AbortOnDropHandle::new(tokio::spawn(async {
             std::future::pending::<()>().await;
             DataUsagePersistOutcome::Saved
-        });
+        }));
 
         let result = wait_for_data_usage_persist_task(&ctx, &mut task, Duration::from_secs(30)).await;
 

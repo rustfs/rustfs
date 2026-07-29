@@ -71,7 +71,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
     MadminScannerMetrics {
         collected_at: metrics.collected_at,
         current_cycle: metrics.current_cycle,
-        current_cycle_active: metrics.current_cycle_active,
+        current_cycle_active: Some(metrics.current_cycle_active),
         current_started: metrics.current_started,
         cycles_completed_at: metrics.cycles_completed_at,
         ongoing_buckets: metrics.ongoing_buckets,
@@ -538,7 +538,9 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
 #[cfg(test)]
 mod test {
     use super::*;
+    use rustfs_common::metrics::CurrentCycle;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use serial_test::serial;
     use std::time::Duration;
 
     #[test]
@@ -599,7 +601,7 @@ mod test {
             ..Default::default()
         });
 
-        assert!(scanner.current_cycle_active);
+        assert_eq!(scanner.current_cycle_active, Some(true));
         assert_eq!(scanner.current_started, current_started);
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
@@ -609,6 +611,39 @@ mod test {
             .find(|source| source.source == "usage")
             .expect("usage partial source should be mapped");
         assert_eq!(usage.cycles, 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn collect_local_metrics_preserves_scanner_cycle_started_time() {
+        let previous_init_time = *rustfs_common::globals::GLOBAL_INIT_TIME.read().await;
+        let previous_cycle = global_metrics().get_cycle().await;
+        let init_time = Utc::now() - chrono::Duration::hours(1);
+        let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+        *rustfs_common::globals::GLOBAL_INIT_TIME.write().await = Some(init_time);
+        let cycle = CurrentCycle {
+            current: 0,
+            next: 1,
+            started: cycle_started,
+            ..Default::default()
+        };
+        let cycle_start = global_metrics().start_scan_cycle_work_with_cycle(cycle).await;
+
+        let realtime = collect_local_metrics(MetricType::SCANNER, &CollectMetricsOpts::default()).await;
+
+        global_metrics()
+            .finish_scan_cycle_work_with_cycle(cycle_start, previous_cycle.clone().unwrap_or_default())
+            .await;
+        global_metrics().set_cycle(previous_cycle).await;
+        *rustfs_common::globals::GLOBAL_INIT_TIME.write().await = previous_init_time;
+
+        let encoded = rmp_serde::to_vec_named(&realtime).expect("realtime metrics should encode");
+        let decoded: RealtimeMetrics = rmp_serde::from_slice(&encoded).expect("realtime metrics should decode");
+        let mut aggregated = RealtimeMetrics::default();
+        aggregated.merge(decoded);
+        let scanner = aggregated.aggregated.scanner.expect("scanner metrics");
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_started, cycle_started);
     }
 
     #[test]
