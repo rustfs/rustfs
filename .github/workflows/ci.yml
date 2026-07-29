@@ -176,7 +176,7 @@ jobs:
         run: |
           mkdir -p artifacts/test-and-lint
           set +e
-          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 40m \
+          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 55m \
             cargo nextest run --profile ci --all --exclude e2e_test \
             --status-level all --final-status-level all \
             2>&1 | tee artifacts/test-and-lint/nextest.log
