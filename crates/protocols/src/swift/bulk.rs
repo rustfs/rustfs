@@ -627,9 +627,7 @@ mod tests {
     #[test]
     fn test_parse_paths_with_empty_lines() {
         let body = "/container1/file1.txt\n\n/container2/file2.txt\n   \n/container1/file3.txt";
-        let paths: Vec<&str> = body.lines().filter(|line| !line.trim().is_empty()).collect();
-
-        assert_eq!(paths.len(), 3);
+        assert_eq!(body.lines().filter(|line| !line.trim().is_empty()).count(), 3);
     }
 
     /// Tests for the `extract_tar_entries` async function.

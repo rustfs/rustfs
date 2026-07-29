@@ -608,7 +608,7 @@ impl StorageBackend for DummyBackend {
             inner.put_object_calls.push(PutObjectCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                metadata: input.metadata.clone(),
+                metadata: input.metadata,
             });
             let stall = inner.stall_put_object;
             let entered = inner.put_object_entered.clone();
@@ -731,7 +731,7 @@ impl StorageBackend for DummyBackend {
             inner.create_multipart_calls.push(CreateMultipartCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                metadata: input.metadata.clone(),
+                metadata: input.metadata,
             });
         }
         match self.inner.lock().expect("lock").create_multipart_upload.pop_front() {
@@ -749,7 +749,7 @@ impl StorageBackend for DummyBackend {
             inner.upload_part_calls.push(UploadPartCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                upload_id: input.upload_id,
                 part_number: input.part_number,
                 content_length: input.content_length,
             });
@@ -787,7 +787,7 @@ impl StorageBackend for DummyBackend {
             inner.complete_multipart_calls.push(CompleteCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                upload_id: input.upload_id,
                 part_count,
             });
         }
@@ -808,7 +808,7 @@ impl StorageBackend for DummyBackend {
             inner.abort_multipart_calls.push(AbortCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                upload_id: input.upload_id,
             });
         }
         match self.inner.lock().expect("lock").abort_multipart_upload.pop_front() {

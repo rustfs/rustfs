@@ -436,12 +436,10 @@ fn test_symlink_to_nested_object() {
 fn test_listing_empty_container() {
     let objects: Vec<&str> = vec![];
 
-    let filtered: Vec<_> = objects.iter().collect();
-    assert_eq!(filtered.len(), 0);
+    assert!(objects.is_empty());
 
     // With prefix
-    let with_prefix: Vec<_> = objects.iter().filter(|o| o.starts_with("prefix/")).collect();
-    assert_eq!(with_prefix.len(), 0);
+    assert!(!objects.iter().any(|o| o.starts_with("prefix/")));
 }
 
 /// Test listing lexicographic ordering
