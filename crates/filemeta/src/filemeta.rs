@@ -356,6 +356,14 @@ impl FileMeta {
             .versions
             .partition_point(|existing| existing.header.sorts_before(&new_shallow.header));
         self.versions.insert(insert_pos, new_shallow);
+        // `partition_point` only returns the canonical slot when `versions` is
+        // already canonically ordered, and nothing establishes that: `FileMeta::load`
+        // replays the on-disk order verbatim, and metadata written before the
+        // canonical-order fix ordered equal-`mod_time` ties by insertion rather than
+        // by `sorts_before`. Re-sort so an insert leaves the list canonical either
+        // way, matching what `set_idx` already does on the replace path. Cheap: after
+        // a correctly placed insert the slice is a single sorted run.
+        self.sort_by_mod_time();
         Ok(())
 
         // if !ver.valid() {
@@ -1213,6 +1221,57 @@ mod test {
         assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
         assert_eq!(fm.versions[1].header.version_type, VersionType::Delete);
         assert!(fm.versions[0].header.sorts_before(&fm.versions[1].header));
+    }
+
+    /// `add_version_filemata` positions an inserted version with
+    /// `partition_point(sorts_before)`, which only yields the canonical slot when
+    /// `versions` is already canonically ordered. Nothing establishes that
+    /// precondition on load: `FileMeta::unmarshal_msg` pushes versions in file
+    /// order, and metadata written before the canonical-order fix ordered
+    /// equal-`mod_time` ties by insertion instead of by `sorts_before`. An insert
+    /// into such a list must still leave it canonical, the same way `set_idx`
+    /// already re-sorts on the replace path.
+    #[test]
+    fn add_version_filemata_canonicalizes_versions_loaded_out_of_order() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid test timestamp");
+        let first = version_for_ordering(VersionType::Object, Uuid::from_u128(70), mod_time, 70);
+        let second = version_for_ordering(VersionType::Object, Uuid::from_u128(80), mod_time, 80);
+        let (early, late) = if first.header().sorts_before(&second.header()) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        // Persist the pair the wrong way round to emulate a pre-canonical-order
+        // xl.meta, bypassing add_version_filemata so the bad order really lands on
+        // the wire.
+        let mut legacy = FileMeta::new();
+        legacy
+            .versions
+            .push(FileMetaShallowVersion::try_from(late).expect("shallow later version"));
+        legacy
+            .versions
+            .push(FileMetaShallowVersion::try_from(early).expect("shallow earlier version"));
+
+        let mut loaded =
+            FileMeta::load(&legacy.marshal_msg().expect("serialize legacy metadata")).expect("reload legacy metadata");
+        assert!(
+            !loaded.versions[0].header.sorts_before(&loaded.versions[1].header),
+            "fixture must reach add_version_filemata non-canonically ordered"
+        );
+
+        loaded
+            .add_version_filemata(version_for_ordering(VersionType::Delete, Uuid::from_u128(90), mod_time, 90))
+            .expect("insert equal-time delete marker");
+
+        assert_eq!(loaded.versions.len(), 3);
+        assert!(
+            loaded
+                .versions
+                .windows(2)
+                .all(|pair| pair[0].header.sorts_before(&pair[1].header)),
+            "insert must leave the version list canonically ordered"
+        );
     }
 
     /// Regression for backlog#799 B16: replication reset state must be

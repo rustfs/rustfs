@@ -88,6 +88,10 @@ pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResul
 /// disk-truth reloads. Peers are then told to reload, matching what the S3
 /// handlers do after a config write.
 ///
+/// A rewrite may also refuse the update outright, for limits that can only be
+/// judged against the state being merged into. That verdict is the client's
+/// answer, so it is returned as-is rather than folded into a storage error.
+///
 /// Storage failures are logged in full and reported to the client as a
 /// generic error: these now carry real disk and quorum detail, which does not
 /// belong in a Swift response body. The one exception is an unreadable
@@ -95,8 +99,12 @@ pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResul
 /// to act on it.
 pub(crate) async fn update_swift_bucket_tagging<F>(bucket: String, rewrite: F) -> SwiftResult<()>
 where
-    F: FnOnce(Option<&Tagging>) -> Tagging + Send,
+    F: FnOnce(Option<&Tagging>) -> SwiftResult<Tagging> + Send,
 {
+    // Carries a rewrite's refusal back out past the storage error the config
+    // write has to fail with to abort the transaction.
+    let mut rejected = None;
+
     let result = update_config_with(&bucket, BUCKET_TAGGING_CONFIG, |bm| {
         // Merging onto an unparseable tag set would silently drop every tag
         // the bucket has — including the container ACL and versioning tags —
@@ -106,7 +114,14 @@ where
             return Err(SwiftStorageError::other(UNREADABLE_TAGGING_SENTINEL));
         }
 
-        let tagging = rewrite(bm.tagging_config.as_ref());
+        let tagging = match rewrite(bm.tagging_config.as_ref()) {
+            Ok(tagging) => tagging,
+            Err(err) => {
+                rejected = Some(err);
+                return Err(SwiftStorageError::other("swift: tagging rewrite rejected the update"));
+            }
+        };
+
         if tagging.tag_set.is_empty() {
             Ok(Vec::new())
         } else {
@@ -117,6 +132,12 @@ where
         }
     })
     .await;
+
+    // Nothing was written, but that is the rewrite's own decision about the
+    // request rather than a storage fault, so it is not logged as one.
+    if let Some(err) = rejected {
+        return Err(err);
+    }
 
     if let Err(err) = result {
         let unreadable = err.to_string().contains(UNREADABLE_TAGGING_SENTINEL);
