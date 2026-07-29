@@ -28,6 +28,7 @@ use rustfs_heal::heal::storage::{
 };
 use serial_test::serial;
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -52,15 +53,9 @@ fn versioned_test_data(seed: u8) -> Vec<u8> {
         .collect()
 }
 
-/// Disable the dangling-delete grace window so the destructive path is genuinely
-/// LIVE in these tests: without the decision-1 guard, a recoverable version WOULD
-/// be dangling-deleted here. With grace at its 1h default the delete path would be
-/// masked and the test would prove nothing.
-fn disable_dangling_grace() {
-    // Safe under nextest: each test runs in its own process and is `#[serial]`.
-    unsafe {
-        std::env::set_var(GRACE_ENV, "0");
-    }
+/// Disable the grace window while the destructive heal decision is evaluated.
+async fn with_dangling_grace_disabled<T>(future: impl Future<Output = T>) -> T {
+    temp_env::async_with_vars([(GRACE_ENV, Some("0"))], future).await
 }
 
 /// Build a real N-disk single-set `ECStore` + `ECStoreHealStorage` via the
@@ -250,7 +245,6 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn union_meta_lost_data_present_is_repaired_not_destroyed() {
-        disable_dangling_grace();
         let (disk_paths, ecstore, heal_storage) = heal_env_n(8).await;
         let bucket = "b920-meta-lost";
         let object = "obj.bin";
@@ -268,10 +262,10 @@ mod serial_tests {
         }
 
         // Heal the version through the real heal storage (Deep).
-        let (_result, error) = heal_storage
-            .heal_object(bucket, object, Some(&v1), &deep_heal_opts())
-            .await
-            .expect("heal_object call must not itself error");
+        let (_result, error) =
+            with_dangling_grace_disabled(heal_storage.heal_object(bucket, object, Some(&v1), &deep_heal_opts()))
+                .await
+                .expect("heal_object call must not itself error");
         assert!(
             error.is_none(),
             "recoverable version must heal without error (must NOT be dangling-deleted): {error:?}"
@@ -300,7 +294,6 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn deep_heal_torn_minority_is_dangling_deleted_with_grace_zero() {
-        disable_dangling_grace();
         let (disk_paths, ecstore, heal_storage) = heal_env_n(4).await;
         let bucket = "b920-torn";
         let object = "obj.bin";
@@ -318,10 +311,10 @@ mod serial_tests {
         // is a real destructive action, not a no-op).
         assert_eq!(count_part_files(&object_dir(&disk_paths[0], bucket, object)), 1);
 
-        let (_result, error) = heal_storage
-            .heal_object(bucket, object, Some(&v1), &deep_heal_opts())
-            .await
-            .expect("heal_object call must not itself error");
+        let (_result, error) =
+            with_dangling_grace_disabled(heal_storage.heal_object(bucket, object, Some(&v1), &deep_heal_opts()))
+                .await
+                .expect("heal_object call must not itself error");
         // A dangling delete reports the version as gone (FileVersionNotFound),
         // proving the destructive path fired for a genuinely torn write.
         assert!(error.is_some(), "a torn (< data_blocks) version must NOT be silently treated as healed");
@@ -349,7 +342,6 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn deep_heal_restores_subquorum_but_reconstructable_version_wider_set() {
-        disable_dangling_grace();
         let (disk_paths, ecstore, heal_storage) = heal_env_n(8).await;
         let bucket = "b920-reconstruct";
         let object = "obj.bin";
@@ -373,10 +365,10 @@ mod serial_tests {
             "disk-walk must enumerate the reconstructable sub-quorum version"
         );
 
-        let (_result, error) = heal_storage
-            .heal_object(bucket, object, Some(&v1), &deep_heal_opts())
-            .await
-            .expect("heal_object call must not itself error");
+        let (_result, error) =
+            with_dangling_grace_disabled(heal_storage.heal_object(bucket, object, Some(&v1), &deep_heal_opts()))
+                .await
+                .expect("heal_object call must not itself error");
         assert!(error.is_none(), "reconstructable version must heal cleanly: {error:?}");
 
         // part.* + xl.meta physically restored on the 4 wiped disks.
@@ -463,7 +455,6 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn offline_disk_during_walk_does_not_dangling_delete() {
-        disable_dangling_grace();
         let (disk_paths, ecstore, heal_storage) = heal_env_n(4).await;
         let bucket = "b920-offline";
         let object = "obj.bin";
@@ -491,8 +482,7 @@ mod serial_tests {
             remove: false,
             ..Default::default()
         };
-        let (_result, error) = heal_storage
-            .heal_object(bucket, object, Some(&v1), &normal_opts)
+        let (_result, error) = with_dangling_grace_disabled(heal_storage.heal_object(bucket, object, Some(&v1), &normal_opts))
             .await
             .expect("heal_object call must not itself error");
         assert!(error.is_none(), "quorum-present object must not be destroyed: {error:?}");
@@ -510,7 +500,6 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn deep_heal_keeps_present_ec2_plus_2_shards_healthy() {
-        disable_dangling_grace();
         let (disk_paths, ecstore, heal_storage) = heal_env_n(4).await;
         let bucket = "b1044-deep-verify";
         let object = "obj.bin";
@@ -524,10 +513,10 @@ mod serial_tests {
             assert_eq!(count_part_files(&object_dir(disk, bucket, object)), 1, "intact shard must remain present");
         }
 
-        let (_result, error) = heal_storage
-            .heal_object(bucket, object, Some(&v1), &deep_heal_opts())
-            .await
-            .expect("deep heal_object call must not itself error");
+        let (_result, error) =
+            with_dangling_grace_disabled(heal_storage.heal_object(bucket, object, Some(&v1), &deep_heal_opts()))
+                .await
+                .expect("deep heal_object call must not itself error");
         assert!(error.is_none(), "Deep heal must retain the three intact EC2+2 shards: {error:?}");
 
         assert!(
