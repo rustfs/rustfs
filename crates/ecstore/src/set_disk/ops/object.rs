@@ -762,6 +762,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             reader.stream = Box::new(SnapshotLeaseReader {
                 inner: reader.stream,
                 lease: Some(lease),
+                terminal_error: false,
             });
             debug!(bucket, object, "Lock optimization: replaced read lock with snapshot leases");
         }
