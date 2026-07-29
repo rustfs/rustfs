@@ -47,6 +47,7 @@ io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
 manual-test-runners = []
+e2e-test-hooks = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
@@ -124,7 +125,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
-tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-util = { workspace = true, features = ["io", "compat", "time"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
@@ -163,7 +164,7 @@ const-str = { workspace = true, features = ["std", "proc"] }
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 hex-simd.workspace = true
 matchit = { workspace = true }
-md5.workspace = true
+md-5 = { workspace = true }
 mime_guess = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true

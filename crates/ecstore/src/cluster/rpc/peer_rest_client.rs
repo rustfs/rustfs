@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, heal_control_time_out_client, node_service_time_out_client,
-    tier_mutation_control_time_out_client,
+    TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
+    is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
 };
-use crate::cluster::rpc::{set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
+use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -50,6 +50,7 @@ use rustfs_protos::proto_gen::node_service::{
     TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
+pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
@@ -69,9 +70,6 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub const PEER_RESTSIGNAL: &str = "signal";
-pub const PEER_RESTSUB_SYS: &str = "sub-sys";
-pub const PEER_RESTDRY_RUN: &str = "dry-run";
 pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
 pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
@@ -471,26 +469,21 @@ impl PeerRestClient {
         self.offline.store(false, Ordering::Release);
     }
 
+    /// Whether this failure means the peer is unreachable, so it should be
+    /// gated offline and its connection evicted.
+    ///
+    /// RPC failures are classified by their typed gRPC code first
+    /// (`is_network_like_status`); an application error from a live peer must
+    /// never take it offline no matter what its message says. The substring
+    /// fallback only covers failures that exist purely as text, such as the
+    /// dial errors `get_client` wraps.
     fn is_network_like_error(err: &Error) -> bool {
-        let message = err.to_string().to_ascii_lowercase();
-        [
-            "temporarily offline",
-            "transport error",
-            "unavailable",
-            "error trying to connect",
-            "connection refused",
-            "connection reset",
-            "broken pipe",
-            "not connected",
-            "unexpected eof",
-            "timed out",
-            "deadline has elapsed",
-            "connection closed",
-            "connection aborted",
-            "tcp connect error",
-        ]
-        .iter()
-        .any(|needle| message.contains(needle))
+        if let Error::Io(io_err) = err
+            && let Some(status) = embedded_tonic_status(io_err)
+        {
+            return is_network_like_status(status);
+        }
+        message_has_network_needle(&err.to_string())
     }
 
     fn mark_offline_and_spawn_recovery(&self) {
@@ -1165,10 +1158,11 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadBucketMetadataRequest {
+                let mut request = Request::new(LoadBucketMetadataRequest {
                     bucket: bucket.to_string(),
                     scanner_maintenance_change,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_bucket_metadata(request).await?.into_inner();
                 if !response.success {
@@ -1188,9 +1182,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeleteBucketMetadataRequest {
+                let mut request = Request::new(DeleteBucketMetadataRequest {
                     bucket: bucket.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_bucket_metadata(request).await?.into_inner();
                 if !response.success {
@@ -1210,9 +1205,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeletePolicyRequest {
+                let mut request = Request::new(DeletePolicyRequest {
                     policy_name: policy.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_policy(request).await?.into_inner();
                 if !response.success {
@@ -1232,9 +1228,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadPolicyRequest {
+                let mut request = Request::new(LoadPolicyRequest {
                     policy_name: policy.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_policy(request).await?.into_inner();
                 if !response.success {
@@ -1254,11 +1251,12 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadPolicyMappingRequest {
+                let mut request = Request::new(LoadPolicyMappingRequest {
                     user_or_group: user_or_group.to_string(),
                     user_type,
                     is_group,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_policy_mapping(request).await?.into_inner();
                 if !response.success {
@@ -1278,9 +1276,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeleteUserRequest {
+                let mut request = Request::new(DeleteUserRequest {
                     access_key: access_key.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_user(request).await?.into_inner();
                 if !response.success {
@@ -1300,9 +1299,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(DeleteServiceAccountRequest {
+                let mut request = Request::new(DeleteServiceAccountRequest {
                     access_key: access_key.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.delete_service_account(request).await?.into_inner();
                 if !response.success {
@@ -1322,10 +1322,11 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadUserRequest {
+                let mut request = Request::new(LoadUserRequest {
                     access_key: access_key.to_string(),
                     temp,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_user(request).await?.into_inner();
                 if !response.success {
@@ -1345,9 +1346,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadServiceAccountRequest {
+                let mut request = Request::new(LoadServiceAccountRequest {
                     access_key: access_key.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_service_account(request).await?.into_inner();
                 if !response.success {
@@ -1367,9 +1369,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadGroupRequest {
+                let mut request = Request::new(LoadGroupRequest {
                     group: group.to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_group(request).await?.into_inner();
                 if !response.success {
@@ -1389,7 +1392,8 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(ReloadSiteReplicationConfigRequest {});
+                let mut request = Request::new(ReloadSiteReplicationConfigRequest {});
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.reload_site_replication_config(request).await?.into_inner();
                 if !response.success {
@@ -1413,9 +1417,10 @@ impl PeerRestClient {
                 vars.insert(PEER_RESTSIGNAL.to_string(), sig.to_string());
                 vars.insert(PEER_RESTSUB_SYS.to_string(), sub_sys.to_string());
                 vars.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
-                let request = Request::new(SignalServiceRequest {
+                let mut request = Request::new(SignalServiceRequest {
                     vars: Some(Mss { value: vars }),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.signal_service(request).await?.into_inner();
                 if !response.success {
@@ -1484,7 +1489,8 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(ReloadPoolMetaRequest {});
+                let mut request = Request::new(ReloadPoolMetaRequest {});
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.reload_pool_meta(request).await?.into_inner();
                 if !response.success {
@@ -1505,9 +1511,10 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(StopRebalanceRequest {
+                let mut request = Request::new(StopRebalanceRequest {
                     expected_rebalance_id: expected_rebalance_id.unwrap_or_default().to_string(),
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.stop_rebalance(request).await?.into_inner();
                 if !response.success {
@@ -1528,7 +1535,8 @@ impl PeerRestClient {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
-                let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
+                let mut request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.load_rebalance_meta(request).await?.into_inner();
 
@@ -1567,7 +1575,8 @@ impl PeerRestClient {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(StartDecommissionRequest { pool_indices });
+                let mut request = Request::new(StartDecommissionRequest { pool_indices });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.start_decommission(request).await?.into_inner();
                 if !response.success {
@@ -1590,7 +1599,8 @@ impl PeerRestClient {
                 let pool_index = u32::try_from(pool_index)
                     .map_err(|_| Error::other(format!("decommission pool index {pool_index} exceeds RPC range")))?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(CancelDecommissionRequest { pool_index });
+                let mut request = Request::new(CancelDecommissionRequest { pool_index });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.cancel_decommission(request).await?.into_inner();
                 if !response.success {
@@ -1613,7 +1623,8 @@ impl PeerRestClient {
                 let pool_index = u32::try_from(pool_index)
                     .map_err(|_| Error::other(format!("decommission pool index {pool_index} exceeds RPC range")))?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(ClearDecommissionRequest { pool_index });
+                let mut request = Request::new(ClearDecommissionRequest { pool_index });
+                set_tonic_mutation_body_digest(&mut request)?;
 
                 let response = client.clear_decommission(request).await?.into_inner();
                 if !response.success {
@@ -1633,10 +1644,14 @@ impl PeerRestClient {
     pub async fn load_transition_tier_config(&self) -> Result<()> {
         match self.load_transition_tier_config_outcome().await {
             TierConfigReloadOutcome::Success => Ok(()),
-            TierConfigReloadOutcome::TransientReconnect(err) | TierConfigReloadOutcome::TransientRetrySameChannel(err) => {
-                self.finalize_result(Err(err)).await
-            }
-            TierConfigReloadOutcome::Terminal(err) => Err(err),
+            // Only a reconnect-class failure says anything about the channel.
+            // `finalize_result` marks the peer offline and evicts its connection
+            // whenever the message looks network-like, and a peer that answered
+            // and rejected the apply can easily report one ("release RPC failed:
+            // transport error"). Routing those through here would gate a healthy,
+            // responding peer out of every unrelated RPC.
+            TierConfigReloadOutcome::TransientReconnect(err) => self.finalize_result(Err(err)).await,
+            TierConfigReloadOutcome::TransientRetrySameChannel(err) | TierConfigReloadOutcome::Terminal(err) => Err(err),
         }
     }
 
@@ -1662,6 +1677,9 @@ impl PeerRestClient {
             Err(err) => return tier_config_reload_connection_outcome(err),
         };
         let mut request = Request::new(LoadTransitionTierConfigRequest {});
+        if let Err(err) = set_tonic_mutation_body_digest(&mut request) {
+            return TierConfigReloadOutcome::Terminal(Error::other(err));
+        }
         request.set_timeout(rustfs_protos::heal_control_execution_timeout());
 
         let response = match client.load_transition_tier_config(request).await {
@@ -1702,39 +1720,37 @@ fn tier_config_reload_connection_outcome(err: Error) -> TierConfigReloadOutcome 
 }
 
 fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
+    let message = err.to_string();
+    // A bare "unavailable" is only trusted inside the local dial-failure
+    // wrapper from `get_client`, never in application text.
     if message
+        .to_ascii_lowercase()
         .split_once("can not get client, err:")
         .is_some_and(|(_, local_error)| local_error.contains("unavailable"))
     {
         return true;
     }
-    [
-        "temporarily offline",
-        "transport error",
-        "error trying to connect",
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "connection aborted",
-        "broken pipe",
-        "not connected",
-        "unexpected eof",
-        "timed out",
-        "deadline has elapsed",
-        "tcp connect error",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
+    message_has_network_needle(&message)
 }
 
+/// Classifies a reload the peer answered but refused to apply.
+///
+/// The peer replied, so the channel is healthy and only the remote apply
+/// failed. Those failures are transient by nature: the reload reads the tier
+/// mutation intents and takes the distributed tier-config lock, both of which
+/// fail while any other node is restarting or while the lock quorum is briefly
+/// disturbed. Retiring the worker on the first such rejection leaves that peer
+/// pinned to the old configuration with nothing left to heal it, so it answers
+/// `TierNotFound` for a tier the rest of the cluster already committed until a
+/// second admin mutation happens to spawn a fresh worker.
+///
+/// Convergence is the whole point of this path, so a rejection is retried on
+/// the same channel. The worker's exponential backoff caps the cost at one
+/// reload every `TIER_CONFIG_RELOAD_RETRY_CAP`, and `Terminal` stays reachable
+/// for transport and gRPC status failures, which is where a genuinely
+/// unrecoverable peer surfaces.
 fn tier_config_reload_remote_failure(error_info: Option<String>) -> TierConfigReloadOutcome {
-    let error_info = error_info.unwrap_or_default();
-    if matches!(error_info.as_str(), "errServerNotInitialized" | "ServerNotInitialized") {
-        TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info))
-    } else {
-        TierConfigReloadOutcome::Terminal(Error::other(error_info))
-    }
+    TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info.unwrap_or_default()))
 }
 
 fn tier_config_reload_status_outcome(status: tonic::Status) -> TierConfigReloadOutcome {
@@ -1744,6 +1760,14 @@ fn tier_config_reload_status_outcome(status: tonic::Status) -> TierConfigReloadO
         TierConfigReloadOutcome::TransientReconnect(status.into())
     } else if status.code() == Code::Unknown && status.message().starts_with("Service was not ready:") {
         TierConfigReloadOutcome::TransientRetrySameChannel(status.into())
+    } else if status.code() == Code::Unknown
+        && is_tier_config_reload_connection_failure(&Error::other(status.message().to_string()))
+    {
+        // tonic reports a connection dropped mid-call as `Unknown` carrying the
+        // transport error text rather than as `Unavailable`, which is what a peer
+        // restarting under an active mutation produces. Reconnect and retry, so
+        // the restart does not permanently retire this peer's reload worker.
+        TierConfigReloadOutcome::TransientReconnect(status.into())
     } else {
         TierConfigReloadOutcome::Terminal(status.into())
     }
@@ -2152,6 +2176,126 @@ mod tests {
     }
 
     #[test]
+    fn peer_rest_client_network_classifier_uses_typed_status_code() {
+        // The one code that means "nothing is answering on this channel".
+        assert!(PeerRestClient::is_network_like_error(&Error::from(tonic::Status::unavailable(
+            "storage layer is not initialized"
+        ))));
+        // Application statuses from a live peer must not mark it offline,
+        // even when their message contains transport-sounding words.
+        assert!(!PeerRestClient::is_network_like_error(&Error::from(tonic::Status::internal(
+            "failed to reload metadata for bucket \"unavailable-logs\""
+        ))));
+        assert!(!PeerRestClient::is_network_like_error(&Error::from(tonic::Status::unauthenticated(
+            "No valid auth token"
+        ))));
+        // A request-budget expiry answered by a live peer is an application
+        // outcome, not a transport failure.
+        assert!(!PeerRestClient::is_network_like_error(&Error::from(tonic::Status::deadline_exceeded(
+            "heal control request expired"
+        ))));
+        // Unknown is the transport's escape hatch for a cause it could not
+        // map, and our handlers never return it, so there the text decides.
+        assert!(PeerRestClient::is_network_like_error(&Error::from(tonic::Status::unknown(
+            "Service was not ready: transport error"
+        ))));
+        assert!(!PeerRestClient::is_network_like_error(&Error::from(tonic::Status::unknown(
+            "peer response unknown"
+        ))));
+    }
+
+    #[test]
+    fn peer_rest_client_network_classifier_ignores_transport_words_in_application_statuses() {
+        // The reason classification reads the code rather than the text: a
+        // peer that answers is reachable, even when what it says describes a
+        // connection failure of its own. A handler interpolating a local
+        // io::Error into Status::internal, or relaying trouble with its own
+        // downstream, must not cost us the channel to a healthy peer.
+        for status in [
+            tonic::Status::internal("connection refused while dialing downstream backend"),
+            tonic::Status::internal("write failed: broken pipe"),
+            tonic::Status::unauthenticated("connection reset while validating token"),
+            tonic::Status::failed_precondition("scanner lease timed out"),
+            tonic::Status::deadline_exceeded("heal control request timed out"),
+        ] {
+            let rendered = status.to_string();
+            assert!(
+                !PeerRestClient::is_network_like_error(&Error::from(status)),
+                "an answered application status must not mark the peer offline: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_rest_client_network_classifier_keeps_slow_peers_online() {
+        // The per-RPC channel deadline (RUSTFS_INTERNODE_RPC_TIMEOUT, 30s)
+        // surfaces as Cancelled "Timeout expired" carrying the transport
+        // cause as its source. A peer that is merely slow must stay online:
+        // gating it would spend a full recovery cycle fast-failing every RPC
+        // to a host that is still answering, turning load into a partition.
+        let timeout_status = tonic::Status::cancelled("Timeout expired");
+        assert!(!PeerRestClient::is_network_like_error(&Error::from(timeout_status)));
+
+        let sourced = tonic::Status::from_error(Box::new(std::io::Error::other("Timeout expired")));
+        assert!(
+            std::error::Error::source(&sourced).is_some(),
+            "the transport builds this status through Status::from_error, which attaches the cause"
+        );
+        assert!(!PeerRestClient::is_network_like_error(&Error::from(sourced)));
+    }
+
+    #[test]
+    fn rpc_status_errors_keep_their_rendering_and_hide_peer_metadata() {
+        let err = Error::from(tonic::Status::unavailable("peer gone"));
+        assert_eq!(
+            err.to_string(),
+            "Io error: code: 'The service is currently unavailable', message: \"peer gone\""
+        );
+
+        // tonic's own Debug prints the MetadataMap, i.e. every response header
+        // the peer sent; those must not reach a log through this error.
+        let mut status = tonic::Status::unavailable("peer gone");
+        status
+            .metadata_mut()
+            .insert("authorization", "Bearer secret".parse().expect("valid header value"));
+        let rendered = format!("{:?}", Error::from(status));
+        assert!(!rendered.contains("Bearer secret"), "{rendered}");
+        assert!(!rendered.contains("MetadataMap"), "{rendered}");
+    }
+
+    #[test]
+    fn peer_rest_client_network_classifier_ignores_application_text_containing_unavailable() {
+        // Regression: a bare "unavailable" needle used to match application
+        // strings like these and take a healthy peer offline.
+        assert!(!PeerRestClient::is_network_like_error(&Error::other(
+            "peer replication statistics provider is unavailable"
+        )));
+        assert!(!PeerRestClient::is_network_like_error(&Error::other(
+            "bucket \"unavailable-logs\" not found"
+        )));
+        // Anchored renderings of a flattened Unavailable status still match:
+        // tonic >= 0.14 form ...
+        assert!(PeerRestClient::is_network_like_error(&Error::other(
+            "peer tier mutation commit RPC failed: code: 'The service is currently unavailable', message: \"peer gone\""
+        )));
+        // ... which is only anchored as long as tonic renders Unavailable this
+        // way. A tonic bump that reworded it leaves the typed path correct but
+        // this needle stale, so pin the coupling rather than discover it in a
+        // partition.
+        assert!(
+            tonic::Status::unavailable("peer gone")
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("code: 'the service is currently unavailable'"),
+            "tonic reworded Code::Unavailable; update the anchored needle"
+        );
+        // ... and the tonic <= 0.13 form peers may relay in error_info.
+        assert!(PeerRestClient::is_network_like_error(&Error::other(
+            "peer tier mutation commit RPC failed: status: Unavailable, message: \"peer gone\""
+        )));
+    }
+
+    #[test]
     fn tier_config_reload_outcome_keeps_tonic_and_remote_errors_typed() {
         assert!(matches!(
             tier_config_reload_status_outcome(tonic::Status::unavailable("peer offline")),
@@ -2177,9 +2321,12 @@ mod tests {
             tier_config_reload_status_outcome(tonic::Status::cancelled("request cancelled")),
             TierConfigReloadOutcome::Terminal(_)
         ));
+        // A peer that answered and then refused the apply is retried rather than
+        // retired: the channel is healthy, so the rejection reflects remote state
+        // that the next attempt can find healed.
         assert!(matches!(
             tier_config_reload_remote_failure(Some("backend unavailable".to_string())),
-            TierConfigReloadOutcome::Terminal(_)
+            TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
         assert!(matches!(
             tier_config_reload_remote_failure(Some("errServerNotInitialized".to_string())),
@@ -2192,6 +2339,58 @@ mod tests {
         assert!(matches!(
             tier_config_reload_connection_outcome(Error::other("can not get client, err: connection unavailable")),
             TierConfigReloadOutcome::TransientReconnect(_)
+        ));
+        // The bare word is trusted only to the right of the dial-failure
+        // prefix, not anywhere in the message.
+        assert!(matches!(
+            tier_config_reload_connection_outcome(Error::other(
+                "bucket unavailable-logs rejected it, then: can not get client, err: some other reason"
+            )),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+    }
+
+    /// A tier mutation issued while another node restarts must still converge on
+    /// the nodes that stayed up. Those peers answer the reload RPC and reject the
+    /// apply, because reloading reads the tier mutation intents and takes the
+    /// distributed tier-config lock while the lock quorum is still disturbed.
+    /// Classifying those rejections as terminal retired the reload worker on its
+    /// first attempt and pinned the peer to the previous configuration, so it
+    /// served `TierNotFound` for an already-committed tier until an unrelated
+    /// second admin mutation spawned a new worker.
+    #[test]
+    fn tier_config_reload_retries_peers_that_reject_the_apply_mid_restart() {
+        for error_info in [
+            "Lock acquisition timeout for resource '.rustfs.sys/config/tier-config.bin.lock' after 5s",
+            "Resource '.rustfs.sys/config/tier-config.bin.lock' is already locked by node-3",
+            "Internal error: release RPC failed: transport error",
+            "save_config_with_opts: err: PreconditionFailed",
+            "erasure read quorum",
+        ] {
+            assert!(
+                matches!(
+                    tier_config_reload_remote_failure(Some(error_info.to_string())),
+                    TierConfigReloadOutcome::TransientRetrySameChannel(_)
+                ),
+                "a peer that rejected the apply must stay retryable so it converges: {error_info}"
+            );
+        }
+
+        // An absent error message is still a rejection, not a reason to stop.
+        assert!(matches!(
+            tier_config_reload_remote_failure(None),
+            TierConfigReloadOutcome::TransientRetrySameChannel(_)
+        ));
+
+        // tonic surfaces a connection dropped mid-call as `Unknown`, not `Unavailable`.
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unknown("transport error")),
+            TierConfigReloadOutcome::TransientReconnect(_)
+        ));
+        // An `Unknown` that is not transport-shaped stays terminal.
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unknown("peer response unknown")),
+            TierConfigReloadOutcome::Terminal(_)
         ));
     }
 
@@ -2493,6 +2692,39 @@ mod tests {
 
         assert!(matches!(err, Error::VolumeNotFound));
         assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_finalize_result_keeps_online_for_app_errors_mentioning_unavailable() {
+        // Regression: application error text containing "unavailable" (a
+        // remote error_info payload, or a bucket named "unavailable-logs" in
+        // a typed application status) must not take a healthy peer offline.
+        let client = test_peer_client();
+        let err = client
+            .finalize_result::<()>(Err(Error::other("peer replication statistics provider is unavailable")))
+            .await
+            .expect_err("application error should still be returned");
+        assert!(err.to_string().contains("provider is unavailable"));
+        assert!(!client.offline.load(Ordering::Acquire));
+
+        let err = client
+            .finalize_result::<()>(Err(Error::from(tonic::Status::internal(
+                "failed to reload metadata for bucket \"unavailable-logs\"",
+            ))))
+            .await
+            .expect_err("application status should still be returned");
+        assert!(err.to_string().contains("unavailable-logs"));
+        assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_finalize_result_marks_offline_for_typed_unavailable_status() {
+        let client = test_peer_client();
+        client
+            .finalize_result::<()>(Err(Error::from(tonic::Status::unavailable("storage layer is not initialized"))))
+            .await
+            .expect_err("network error should still be returned");
+        assert!(client.offline.load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "current_thread")]

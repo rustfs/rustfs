@@ -156,16 +156,99 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Prepare test evidence
+        run: |
+          mkdir -p artifacts/test-and-lint
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "job=${GITHUB_JOB}"
+            echo "runner=${RUNNER_NAME}"
+            echo "started_at=$(date --utc --iso-8601=seconds)"
+          } > artifacts/test-and-lint/run-metadata.txt
+
       # Clippy runs before the test pass: lint failures are the most common
       # CI-only breakage and should surface in minutes, not after 20+ minutes
       # of tests.
       - name: Run clippy lints
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run tests
+      - name: Run nextest tests
         run: |
-          cargo nextest run --profile ci --all --exclude e2e_test
-          cargo test --all --doc
+          mkdir -p artifacts/test-and-lint
+          # Evidence sampler for issue #5394: the post-mortem pgrep below runs
+          # only after `timeout` has already TERM'd the whole cargo process
+          # group, so it cannot name a wedged process. Sample system and
+          # process state every 60s instead; the last samples before the
+          # timeout show what was stuck (rustc, linker, build script, memory
+          # pressure, ...). The log rides along in the existing artifact.
+          (
+            while true; do
+              {
+                echo "=== $(date --utc --iso-8601=seconds)"
+                echo "--- load";  cat /proc/loadavg
+                echo "--- psi";   grep -H . /proc/pressure/* 2>/dev/null || true
+                echo "--- mem";   free -m
+                echo "--- disk";  df -h / /home/runner 2>/dev/null || df -h /
+                echo "--- top-rss"
+                ps -eo pid,ppid,stat,etime,rss,pcpu,args --sort=-rss | head -15
+                echo "--- build/test processes"
+                ps -eo pid,ppid,stat,etime,rss,pcpu,args | grep -E '[c]argo|[r]ustc|[n]extest|[c]ollect2|rust-ll[d]|[b]uild-script|deps[/]' || true
+                echo "--- d-state (uninterruptible IO)"
+                ps -eo pid,stat,etime,args | awk 'NR > 1 && $2 ~ /D/' || true
+                echo
+              } >> artifacts/test-and-lint/sampler.log 2>&1 || true
+              sleep 60
+            done
+          ) &
+          sampler_pid=$!
+          trap 'kill "${sampler_pid}" 2>/dev/null || true' EXIT
+          set +e
+          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 75m \
+            cargo nextest run --profile ci --all --exclude e2e_test \
+            --status-level all --final-status-level all \
+            2>&1 | tee artifacts/test-and-lint/nextest.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "command=cargo nextest run --profile ci --all --exclude e2e_test"
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|nextest|target/.*/deps/' || true
+            echo
+            echo "Kernel OOM / kill events:"
+            dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -20 || true
+          } > artifacts/test-and-lint/nextest-diagnostics.txt
+          exit "${status}"
+
+      - name: Run documentation tests
+        run: |
+          mkdir -p artifacts/test-and-lint
+          set +e
+          timeout --verbose --signal=TERM --kill-after=30s 15m \
+            cargo test --all --doc \
+            2>&1 | tee artifacts/test-and-lint/doctest.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "command=cargo test --all --doc"
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|rustdoc|target/.*/deps/' || true
+          } > artifacts/test-and-lint/doctest-diagnostics.txt
+          exit "${status}"
+
+      - name: Upload test reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: junit-test-and-lint-${{ github.run_number }}
+          path: |
+            target/nextest/ci/junit.xml
+            artifacts/test-and-lint
+          retention-days: 3
+          if-no-files-found: error
 
       # rustfs/backlog#1289: fail if a seed rule's log anchor no longer exists
       # verbatim in the source tree (log message drifted without updating the
@@ -173,15 +256,6 @@ jobs:
       # bin — is already built by the clippy/test steps above.
       - name: Check log-analyzer rule anchors
         run: ./scripts/check_log_analyzer_rules.sh
-
-      - name: Upload test junit report
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: junit-test-and-lint-${{ github.run_number }}
-          path: target/nextest/ci/junit.xml
-          retention-days: 3
-          if-no-files-found: ignore
 
       # Explicit gate for migration-critical suites. These tests already ran in
       # the full nextest pass above; a single filtered nextest invocation keeps
@@ -328,7 +402,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build debug binary
-        run: cargo build -p rustfs --bins
+        run: cargo build -p rustfs --bins --features e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -358,7 +432,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build debug binary with rio-v2
-        run: cargo build -p rustfs --bins --features rio-v2
+        run: cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

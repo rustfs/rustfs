@@ -84,6 +84,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue};
+use md5::{Digest as Md5Digest, Md5};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
@@ -134,6 +135,16 @@ const SEALED_KEY_IV_SIZE: usize = 32;
 const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 #[cfg(feature = "rio-v2")]
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
+
+fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hasher.finalize().into()
+}
+
+fn md5_base64(input: impl AsRef<[u8]>) -> String {
+    BASE64_STANDARD.encode(md5_bytes(input))
+}
 
 use super::Error;
 use super::get_bucket_sse_config;
@@ -2527,7 +2538,7 @@ pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, A
         )));
     }
 
-    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
+    let computed_md5 = md5_base64(&key_bytes);
     if computed_md5 != params.key_md5 {
         return Err(ssec_invalid_request(
             "The calculated MD5 hash of the key did not match the hash that was provided.",
@@ -2552,9 +2563,9 @@ pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, A
 /// 2. Different objects get different nonces
 pub fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
     let nonce_source = format!("{bucket}-{key}");
-    let nonce_hash = md5::compute(nonce_source.as_bytes());
+    let nonce_hash = md5_bytes(nonce_source.as_bytes());
     let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&nonce_hash.0[..12]);
+    nonce.copy_from_slice(&nonce_hash[..12]);
     nonce
 }
 
@@ -2640,10 +2651,10 @@ mod tests {
         SseDekProvider, SsecParams, StorageError, TestSseDekProvider, apply_managed_decryption_material,
         apply_managed_encryption_material, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
-        kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata,
-        reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption,
-        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        validate_ssec_params, verify_ssec_key_match,
+        kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64,
+        normalize_managed_metadata, reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption,
+        sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write,
+        validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -2882,7 +2893,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_success() {
         let key = BASE64_STANDARD.encode([42u8; 32]);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let key_md5 = md5_base64([42u8; 32]);
 
         let params = SsecParams {
             algorithm: "AES256".to_string(),
@@ -2899,7 +2910,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_wrong_algorithm() {
         let key = BASE64_STANDARD.encode([42u8; 32]);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let key_md5 = md5_base64([42u8; 32]);
 
         let params = SsecParams {
             algorithm: "AES128".to_string(), // Wrong algorithm
@@ -2914,7 +2925,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_wrong_key_length() {
         let key = BASE64_STANDARD.encode([42u8; 16]); // Only 16 bytes
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 16]).0);
+        let key_md5 = md5_base64([42u8; 16]);
 
         let params = SsecParams {
             algorithm: "AES256".to_string(),
@@ -2946,7 +2957,7 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let sse_key = BASE64_STANDARD.encode([42u8; 32]);
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
         let content_size = 1024;
 
         let request_missing_md5 = EncryptionRequest {
@@ -2999,7 +3010,7 @@ mod tests {
     async fn test_sse_prepare_encryption_rejects_partial_ssec_headers() {
         let bucket = "test-bucket";
         let key = "test-key";
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
 
         let request_missing_algorithm = PrepareEncryptionRequest {
             bucket,
@@ -3029,7 +3040,7 @@ mod tests {
     async fn test_sse_prepare_encryption_rejects_ssec_headers_without_customer_key() {
         let bucket = "test-bucket";
         let key = "test-key";
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
 
         let request = PrepareEncryptionRequest {
             bucket,
@@ -3087,7 +3098,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x24u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let metadata_one = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
         let metadata_two = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
@@ -3128,7 +3139,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x24u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -3160,7 +3171,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x51u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
         let plaintext = b"attack at dawn - sse-c round trip".to_vec();
 
         let metadata = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
@@ -3199,7 +3210,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x33u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let material = sse_prepare_encryption(PrepareEncryptionRequest {
             bucket,
@@ -3261,7 +3272,7 @@ mod tests {
         let key = "test-key";
         let customer_key_bytes = [0x24u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let sse_key_md5 = md5_base64(customer_key_bytes);
 
         let request = PrepareEncryptionRequest {
             bucket,
@@ -3356,7 +3367,7 @@ mod tests {
         let key = "test-key";
         let content_size = 1024;
         let sse_key = BASE64_STANDARD.encode([42u8; 32]);
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
 
         let request = EncryptionRequest {
             bucket,
@@ -3745,7 +3756,7 @@ mod tests {
     async fn test_ssec_rio_v2_uses_sealed_object_key_metadata_roundtrip() {
         let customer_key_bytes = [0x42u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let material = sse_encryption(EncryptionRequest {
             bucket: "bucket",
@@ -3825,7 +3836,7 @@ mod tests {
             ssekms_context: None,
             sse_customer_algorithm: Some("AES256".to_string()),
             sse_customer_key: Some(BASE64_STANDARD.encode(key_bytes)),
-            sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute(key_bytes).0)),
+            sse_customer_key_md5: Some(md5_base64(key_bytes)),
             content_size: 1,
         }
     }
@@ -3834,10 +3845,7 @@ mod tests {
         let key_bytes = [key_byte; 32];
         HashMap::from([
             ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
-            (
-                "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                BASE64_STANDARD.encode(md5::compute(key_bytes).0),
-            ),
+            ("x-amz-server-side-encryption-customer-key-md5".to_string(), md5_base64(key_bytes)),
         ])
     }
 
@@ -4446,32 +4454,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_kms_sse_dek_provider_uses_latest_reconfigured_service() {
+        use base64::Engine as _;
         use rustfs_kms::config::KmsConfig;
-        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
-        use tempfile::TempDir;
         let _guard = lock_sse_test_state().await;
 
         let manager = rustfs_kms::init_global_kms_service_manager();
 
-        let first_dir = TempDir::new().expect("first temp dir");
         manager
-            .reconfigure(KmsConfig::local(first_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .reconfigure(KmsConfig::static_kms("first-key".to_string(), BASE64_STANDARD.encode([0x11; 32])))
             .await
             .expect("first KMS reconfigure should succeed");
-        manager
-            .get_encryption_service()
-            .await
-            .expect("first encryption service should exist")
-            .create_key(CreateKeyRequest {
-                key_name: Some("first-key".to_string()),
-                key_usage: KeyUsage::EncryptDecrypt,
-                description: None,
-                policy: None,
-                tags: HashMap::new(),
-                origin: None,
-            })
-            .await
-            .expect("first key should be created");
 
         let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
             .await
@@ -4482,25 +4474,10 @@ mod tests {
             .await
             .expect("provider should use the initial service");
 
-        let second_dir = TempDir::new().expect("second temp dir");
         manager
-            .reconfigure(KmsConfig::local(second_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .reconfigure(KmsConfig::static_kms("second-key".to_string(), BASE64_STANDARD.encode([0x22; 32])))
             .await
             .expect("second KMS reconfigure should succeed");
-        manager
-            .get_encryption_service()
-            .await
-            .expect("second encryption service should exist")
-            .create_key(CreateKeyRequest {
-                key_name: Some("second-key".to_string()),
-                key_usage: KeyUsage::EncryptDecrypt,
-                description: None,
-                policy: None,
-                tags: HashMap::new(),
-                origin: None,
-            })
-            .await
-            .expect("second key should be created");
 
         provider
             .generate_sse_dek(&context, "second-key")
@@ -4578,7 +4555,7 @@ mod tests {
     fn test_validate_ssec_for_read_wrong_key() {
         // Key A is used to "encrypt" the object (stored MD5 is from key A).
         let key_a = [42u8; 32];
-        let stored_md5 = BASE64_STANDARD.encode(md5::compute(key_a).0);
+        let stored_md5 = md5_base64(key_a);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -4587,7 +4564,7 @@ mod tests {
         // Key B is a different key; its MD5 won't match stored MD5.
         let key_b = [99u8; 32];
         let key_b_b64 = BASE64_STANDARD.encode(key_b);
-        let key_b_md5 = BASE64_STANDARD.encode(md5::compute(key_b).0);
+        let key_b_md5 = md5_base64(key_b);
 
         let err = validate_ssec_for_read(&metadata, Some(&key_b_b64), Some(&key_b_md5)).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
@@ -4597,7 +4574,7 @@ mod tests {
     fn test_validate_ssec_for_read_correct_key() {
         let key_bytes = [42u8; 32];
         let key_b64 = BASE64_STANDARD.encode(key_bytes);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute(key_bytes).0);
+        let key_md5 = md5_base64(key_bytes);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -4613,7 +4590,7 @@ mod tests {
         // DIFFERENT key. The server must recompute MD5 from the key bytes and
         // reject the request because the recomputed MD5 won't match the header.
         let real_key = [42u8; 32];
-        let stored_md5 = BASE64_STANDARD.encode(md5::compute(real_key).0);
+        let stored_md5 = md5_base64(real_key);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -4725,7 +4702,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_returns_invalid_request_on_bad_algorithm() {
         let key = BASE64_STANDARD.encode([42u8; 32]);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let key_md5 = md5_base64([42u8; 32]);
         let params = SsecParams {
             algorithm: "AES128".to_string(),
             key,
@@ -4811,7 +4788,7 @@ mod tests {
             ssekms_context: None,
             sse_customer_algorithm: Some("unsupported-algo".to_string()),
             sse_customer_key: Some(sse_key),
-            sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute([42u8; 32]).0)),
+            sse_customer_key_md5: Some(md5_base64([42u8; 32])),
             content_size: 1024,
         };
         let err = sse_encryption(request_unsupported_algorithm).await.unwrap_err();

@@ -60,7 +60,7 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const RESTORE_COPY_BACK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const RESTORE_SUSPENDED_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
 const ENV_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
 const ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
@@ -160,6 +160,23 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
         )
         .await
         .expect("Failed to create test bucket");
+}
+
+async fn suspend_test_bucket(bucket: &str) {
+    DefaultBucketUsecase::from_global()
+        .execute_put_bucket_versioning(build_request(
+            PutBucketVersioningInput::builder()
+                .bucket(bucket.to_string())
+                .versioning_configuration(VersioningConfiguration {
+                    status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                    ..Default::default()
+                })
+                .build()
+                .expect("suspended versioning request should build"),
+            Method::PUT,
+        ))
+        .await
+        .expect("bucket versioning should be suspended");
 }
 
 async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) -> ObjectInfo {
@@ -2097,10 +2114,9 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 /// POST restore(days=1) is accepted and flips the object to
 /// `x-amz-restore: ongoing-request="true"` while the mock tier GET barrier
 /// proves the background copy-back has reached the remote read; a second POST
-/// during that window is rejected with 409 `RestoreAlreadyInProgress`; once the
-/// copy-back completes the object reports `ongoing-request="false"` with a
-/// future expiry-date; and a full GET is then served from the local restored
-/// copy (the mock tier records no further `get` calls).
+/// during that window is rejected with 409 `RestoreAlreadyInProgress`.
+/// Synchronous SetDisks transition tests cover copy-back completion, restore
+/// metadata, and local byte-identical reads.
 ///
 /// Re-enabled in the serial lane by backlog#1304: the accept path now flips
 /// the ongoing flag under a short compare-and-set guard and the copy-back
@@ -2110,7 +2126,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
-async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
+async fn restore_object_usecase_reports_ongoing_conflict() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -2125,9 +2141,9 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
     let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    assert!(uploaded.version_id.is_none(), "fixture must create the null version");
     let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
     backend.clear_op_log().await;
-
     let get_barrier = backend.arm_get_barrier().await;
 
     let restore_request = || RestoreRequest {
@@ -2177,34 +2193,72 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     );
 
     get_barrier.release();
+}
 
-    // Completion: ongoing flips to false and a future expiry-date appears.
-    let completed =
-        wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
-    let completed = completed.unwrap_or_else(|err| panic!("{err}"));
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#4879"]
+async fn restore_object_usecase_completes_suspended_null_version_in_place() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+    let bucket = format!("test-api-restore-suspended-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/restore/suspended-null.bin";
+    let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before unix epoch")
-        .as_secs() as i64;
-    let expires = completed.restore_expires.expect("completed restore carries an expiry");
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    assert!(uploaded.version_id.is_none(), "fixture must create the null version");
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    suspend_test_bucket(bucket.as_str()).await;
+    backend.clear_op_log().await;
+    let tier_gets_before_restore = backend.get_count().await;
+    let get_barrier = backend.arm_get_barrier().await;
+
+    Box::pin(
+        usecase.execute_restore_object(build_request(
+            RestoreObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .restore_request(Some(RestoreRequest {
+                    days: Some(1),
+                    description: None,
+                    glacier_job_parameters: None,
+                    output_location: None,
+                    select_parameters: None,
+                    tier: None,
+                    type_: None,
+                }))
+                .build()
+                .expect("restore request should build"),
+            Method::POST,
+        )),
+    )
+    .await
+    .expect("suspended null-version restore should be accepted");
+
+    get_barrier.wait_until_paused().await;
+    get_barrier.release();
+    let completed = wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_SUSPENDED_WAIT_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+
+    assert!(!completed.restore_ongoing, "the original null version must complete in place");
+    assert!(completed.restore_expires.is_some(), "completed restore must carry an expiry");
     assert!(
-        expires.unix_timestamp() > now_secs,
-        "restore expiry-date must be in the future, got {expires}"
+        completed.version_id.is_none() || completed.version_id.is_some_and(|version_id| version_id.is_nil()),
+        "suspended restore must remain on the null version"
     );
     assert_eq!(
-        completed.transitioned_object.status, "complete",
-        "restore must not clear the transitioned state"
+        live_object_version_count(&ecstore, bucket.as_str(), object).await,
+        1,
+        "suspended restore must not create a UUID version"
     );
-
-    // The restored copy serves GET locally: no further tier GETs.
-    let tier_gets_after_restore = backend.get_count().await;
-    let data = read_object_bytes(&ecstore, bucket.as_str(), object).await;
-    assert_eq!(data, payload, "restored GET must return the original bytes");
     assert_eq!(
-        backend.get_count().await,
-        tier_gets_after_restore,
-        "GET of a restored object must be served locally, not from the tier"
+        backend.get_count().await - tier_gets_before_restore,
+        1,
+        "suspended restore copy-back must fetch the tier exactly once"
     );
 }
 

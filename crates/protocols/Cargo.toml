@@ -25,6 +25,9 @@ description = "Protocol implementations for RustFS (FTPS, SFTP, etc.)"
 keywords = ["ftp", "sftp", "protocol", "storage", "rustfs"]
 categories = ["network-programming", "filesystem"]
 
+[lints]
+workspace = true
+
 [features]
 default = []
 ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime", "dep:subtle"]
@@ -44,7 +47,7 @@ swift = [
     "dep:tokio-util",
     "dep:serde",
     "dep:urlencoding",
-    "dep:md5",
+    "dep:md-5",
     "dep:quick-xml",
     "dep:hmac",
     "dep:sha1",
@@ -108,7 +111,7 @@ http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
-md5 = { workspace = true, optional = true }
+md-5 = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
@@ -134,6 +137,7 @@ socket2 = { workspace = true, optional = true, features = ["all"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
+rustfs-test-utils = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 tokio = { workspace = true, features = ["test-util", "macros", "fs"] }
 

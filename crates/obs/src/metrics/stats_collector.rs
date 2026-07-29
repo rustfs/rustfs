@@ -262,11 +262,11 @@ async fn obs_site_replication_stats() -> ReplicationStats {
 }
 
 fn current_scanner_cycle_age_seconds(
-    current_cycle: u64,
+    current_cycle_active: bool,
     current_started: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
 ) -> u64 {
-    if current_cycle == 0 {
+    if !current_cycle_active {
         0
     } else {
         now.signed_duration_since(current_started).num_seconds().max(0) as u64
@@ -1090,7 +1090,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
     let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
     let active_paths = metrics.active_scan_paths as u64;
-    let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle, metrics.current_started, now);
+    let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle_active, metrics.current_started, now);
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
     let current_cycle_age = current_cycle_age_seconds as f64;
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
@@ -1464,21 +1464,21 @@ mod tests {
     fn current_scanner_cycle_age_seconds_returns_zero_when_idle() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(0, now - chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(false, now - chrono::Duration::seconds(30), now), 0);
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_clamps_future_start() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(4, now + chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now + chrono::Duration::seconds(30), now), 0);
     }
 
     #[test]
-    fn current_scanner_cycle_age_seconds_reports_active_elapsed_time() {
+    fn current_scanner_cycle_age_seconds_reports_active_first_cycle_elapsed_time() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(4, now - chrono::Duration::seconds(45), now), 45);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now - chrono::Duration::seconds(45), now), 45);
     }
 
     #[test]

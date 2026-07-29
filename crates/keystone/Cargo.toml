@@ -25,6 +25,9 @@ keywords = ["rustfs", "openstack", "keystone", "authentication", "s3"]
 categories = ["authentication", "web-programming"]
 authors.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true, features = ["rt", "sync"] }
 reqwest = { workspace = true, features = ["json"] }

@@ -1114,6 +1114,8 @@ pub struct ScannerLastMinute {
 pub struct ScannerMetricsReport {
     pub collected_at: DateTime<Utc>,
     pub current_cycle: u64,
+    #[serde(default)]
+    pub current_cycle_active: bool,
     pub current_started: DateTime<Utc>,
     pub cycles_completed_at: Vec<DateTime<Utc>>,
     pub ongoing_buckets: usize,
@@ -2051,7 +2053,7 @@ impl Metrics {
     pub fn record_scanner_transition_failed(&self, count: u64) {
         self.scanner_transition_failed.fetch_add(count, Ordering::Relaxed);
         self.record_scanner_source_failed(ScannerWorkSource::Lifecycle, count);
-        if !self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+        if !self.current_scan_cycle_work_active.load(Ordering::Acquire) {
             self.record_last_cycle_scanner_source_work(ScannerWorkSource::Lifecycle, ScannerSourceWorkUpdate::failed(count));
         }
     }
@@ -2336,6 +2338,21 @@ impl Metrics {
         *self.cycle_info.write().await = cycle;
     }
 
+    /// Publish a scanner cycle and its work-accounting baseline as one state transition.
+    pub async fn start_scan_cycle_work_with_cycle(&self, cycle: CurrentCycle) -> ScanCycleWorkSnapshot {
+        let mut current_cycle = self.cycle_info.write().await;
+        let snapshot = self.start_scan_cycle_work();
+        *current_cycle = Some(cycle);
+        snapshot
+    }
+
+    /// Publish the completed work snapshot and idle cycle state as one state transition.
+    pub async fn finish_scan_cycle_work_with_cycle(&self, start: ScanCycleWorkSnapshot, cycle: CurrentCycle) {
+        let mut current_cycle = self.cycle_info.write().await;
+        self.finish_scan_cycle_work(start);
+        *current_cycle = Some(cycle);
+    }
+
     /// Read the current cycle record.
     pub async fn get_cycle(&self) -> Option<CurrentCycle> {
         self.cycle_info.read().await.clone()
@@ -2464,7 +2481,7 @@ impl Metrics {
             &self.current_scan_cycle_replication_repair_work_start,
             &replication_repair_snapshot,
         );
-        self.current_scan_cycle_work_active.store(true, Ordering::Relaxed);
+        self.current_scan_cycle_work_active.store(true, Ordering::Release);
         snapshot
     }
 
@@ -2476,11 +2493,11 @@ impl Metrics {
         self.record_scan_cycle_work(work);
         self.record_scan_cycle_source_work(&source_work);
         self.record_scan_cycle_replication_repair_work(&replication_repair_work);
-        self.current_scan_cycle_work_active.store(false, Ordering::Relaxed);
+        self.current_scan_cycle_work_active.store(false, Ordering::Release);
     }
 
     pub fn current_scan_cycle_has_unresolved_heal_work(&self) -> bool {
-        if !self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+        if !self.current_scan_cycle_work_active.load(Ordering::Acquire) {
             return false;
         }
 
@@ -2746,13 +2763,41 @@ impl Metrics {
     pub async fn report(&self) -> ScannerMetricsReport {
         let mut m = ScannerMetricsReport::default();
 
-        let has_cycle = if let Some(cycle) = self.get_cycle().await {
-            m.current_cycle = cycle.current;
-            m.cycles_completed_at = cycle.cycle_completed;
-            m.current_started = cycle.started;
-            true
-        } else {
-            false
+        let has_cycle = {
+            let cycle = self.cycle_info.read().await;
+            let has_cycle = if let Some(cycle) = cycle.as_ref() {
+                m.current_cycle = cycle.current;
+                m.cycles_completed_at = cycle.cycle_completed.clone();
+                m.current_started = cycle.started;
+                true
+            } else {
+                false
+            };
+            m.current_cycle_active = self.current_scan_cycle_work_active.load(Ordering::Acquire);
+            if m.current_cycle_active {
+                let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
+                let current_source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
+                let current_replication_repair_work =
+                    self.scanner_replication_repair_work_since(&self.current_scan_cycle_replication_repair_work_start_values());
+                m.current_cycle_objects_scanned = current_work.objects_scanned;
+                m.current_cycle_directories_scanned = current_work.directories_scanned;
+                m.current_cycle_bucket_drive_scans = current_work.bucket_drive_scans;
+                m.current_cycle_bucket_drive_failures = current_work.bucket_drive_failures;
+                m.current_cycle_yield_events = current_work.yield_events;
+                m.current_cycle_yield_duration_seconds = current_work.yield_duration_millis as f64 / 1000.0;
+                m.current_cycle_throttle_sleep_events = current_work.throttle_sleep_events;
+                m.current_cycle_throttle_sleep_duration_seconds = current_work.throttle_sleep_duration_millis as f64 / 1000.0;
+                m.current_cycle_ilm_actions = current_work.ilm_actions;
+                m.current_cycle_lifecycle_expiry_actions = current_work.lifecycle_expiry_actions;
+                m.current_cycle_lifecycle_transition_actions = current_work.lifecycle_transition_actions;
+                m.current_cycle_heal_objects = current_work.heal_objects;
+                m.current_cycle_replication_checks = current_work.replication_checks;
+                m.current_cycle_usage_saves = current_work.usage_saves;
+                m.current_cycle_source_work = self.scanner_source_work_snapshots(&current_source_work);
+                m.current_cycle_replication_repair =
+                    self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
+            }
+            has_cycle
         };
 
         if !has_cycle && let Some(init_time) = crate::get_global_init_time().await {
@@ -2793,28 +2838,6 @@ impl Metrics {
         m.current_disk_scan_concurrency_limit = disk_scan_concurrency_limit;
         m.current_disk_bucket_scans_queued = disk_bucket_scans_queued;
         m.current_disk_bucket_scans_active = disk_bucket_scans_active;
-        if self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
-            let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
-            let current_source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
-            let current_replication_repair_work =
-                self.scanner_replication_repair_work_since(&self.current_scan_cycle_replication_repair_work_start_values());
-            m.current_cycle_objects_scanned = current_work.objects_scanned;
-            m.current_cycle_directories_scanned = current_work.directories_scanned;
-            m.current_cycle_bucket_drive_scans = current_work.bucket_drive_scans;
-            m.current_cycle_bucket_drive_failures = current_work.bucket_drive_failures;
-            m.current_cycle_yield_events = current_work.yield_events;
-            m.current_cycle_yield_duration_seconds = current_work.yield_duration_millis as f64 / 1000.0;
-            m.current_cycle_throttle_sleep_events = current_work.throttle_sleep_events;
-            m.current_cycle_throttle_sleep_duration_seconds = current_work.throttle_sleep_duration_millis as f64 / 1000.0;
-            m.current_cycle_ilm_actions = current_work.ilm_actions;
-            m.current_cycle_lifecycle_expiry_actions = current_work.lifecycle_expiry_actions;
-            m.current_cycle_lifecycle_transition_actions = current_work.lifecycle_transition_actions;
-            m.current_cycle_heal_objects = current_work.heal_objects;
-            m.current_cycle_replication_checks = current_work.replication_checks;
-            m.current_cycle_usage_saves = current_work.usage_saves;
-            m.current_cycle_source_work = self.scanner_source_work_snapshots(&current_source_work);
-            m.current_cycle_replication_repair = self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
-        }
         let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
         m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
         m.last_cycle_result_code = last_cycle_result as u64;
@@ -4142,6 +4165,8 @@ mod tests {
 
         let report = metrics.report().await;
 
+        assert!(report.current_cycle_active);
+        assert_eq!(report.current_cycle, 0);
         assert_eq!(report.current_cycle_objects_scanned, 7);
         assert_eq!(report.current_cycle_directories_scanned, 3);
         assert_eq!(report.current_cycle_bucket_drive_scans, 2);
@@ -4158,6 +4183,8 @@ mod tests {
         metrics.finish_scan_cycle_work(start);
         let report = metrics.report().await;
 
+        assert!(!report.current_cycle_active);
+        assert_eq!(report.current_cycle, 0);
         assert_eq!(report.current_cycle_objects_scanned, 0);
         assert_eq!(report.current_cycle_directories_scanned, 0);
         assert_eq!(report.current_cycle_bucket_drive_scans, 0);
@@ -4182,6 +4209,91 @@ mod tests {
         assert_eq!(report.last_cycle_heal_objects, 3);
         assert_eq!(report.last_cycle_replication_checks, 6);
         assert_eq!(report.last_cycle_usage_saves, 2);
+    }
+
+    #[tokio::test]
+    async fn scan_cycle_activity_and_cycle_state_publish_together() {
+        let metrics = Metrics::new();
+        let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+        let active_cycle = CurrentCycle {
+            current: 12,
+            next: 13,
+            started: cycle_started,
+            ..Default::default()
+        };
+
+        let cycle_state = metrics.cycle_info.read().await;
+        let mut start_transition = Box::pin(metrics.start_scan_cycle_work_with_cycle(active_cycle));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(start_transition.as_mut().poll(&mut context).is_pending());
+        assert!(!metrics.current_scan_cycle_work_active.load(Ordering::Acquire));
+        drop(cycle_state);
+
+        let start = start_transition.await;
+        let active = metrics.report().await;
+        assert!(active.current_cycle_active);
+        assert_eq!(active.current_cycle, 12);
+        assert_eq!(active.current_started, cycle_started);
+
+        let idle_cycle = CurrentCycle {
+            current: 0,
+            next: 13,
+            started: cycle_started,
+            ..Default::default()
+        };
+        let cycle_state = metrics.cycle_info.read().await;
+        let mut finish_transition = Box::pin(metrics.finish_scan_cycle_work_with_cycle(start, idle_cycle));
+        assert!(finish_transition.as_mut().poll(&mut context).is_pending());
+        assert!(metrics.current_scan_cycle_work_active.load(Ordering::Acquire));
+        drop(cycle_state);
+
+        finish_transition.await;
+        let idle = metrics.report().await;
+        assert!(!idle.current_cycle_active);
+        assert_eq!(idle.current_cycle, 0);
+    }
+
+    #[tokio::test]
+    async fn report_keeps_cycle_identity_and_work_in_one_snapshot() {
+        let metrics = Metrics::new();
+        let cycle_ten = CurrentCycle {
+            current: 10,
+            next: 11,
+            started: Utc::now() - chrono::Duration::seconds(10),
+            ..Default::default()
+        };
+        let cycle_ten_start = metrics.start_scan_cycle_work_with_cycle(cycle_ten.clone()).await;
+        metrics.operations[Metric::ScanObject as usize].store(1, Ordering::Relaxed);
+
+        let paths = metrics.current_paths.write().await;
+        let mut report = Box::pin(metrics.report());
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(report.as_mut().poll(&mut context).is_pending());
+
+        metrics
+            .finish_scan_cycle_work_with_cycle(cycle_ten_start, CurrentCycle { current: 0, ..cycle_ten })
+            .await;
+        let cycle_eleven_start = metrics
+            .start_scan_cycle_work_with_cycle(CurrentCycle {
+                current: 11,
+                next: 12,
+                started: Utc::now(),
+                ..Default::default()
+            })
+            .await;
+        metrics.operations[Metric::ScanObject as usize].store(101, Ordering::Relaxed);
+
+        drop(paths);
+        let snapshot = report.await;
+
+        assert_eq!(snapshot.current_cycle, 10);
+        assert_eq!(snapshot.current_cycle_objects_scanned, 1);
+
+        metrics
+            .finish_scan_cycle_work_with_cycle(cycle_eleven_start, CurrentCycle::default())
+            .await;
     }
 
     #[tokio::test]
