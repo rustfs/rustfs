@@ -2027,11 +2027,15 @@ mod metadata_cache_tests {
         fi.size = 1;
         fi.erasure.index = 1;
         fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi.add_object_part(1, "part-etag".to_string(), 1, fi.mod_time, 1, None, None);
         fi
     }
 
     #[tokio::test]
     async fn get_object_with_fileinfo_rejects_positive_size_without_parts() {
+        let mut fi = valid_test_fileinfo("object");
+        fi.parts.clear();
+
         let mut output = Vec::new();
         let err = SetDisks::get_object_with_fileinfo(
             "bucket",
@@ -2039,7 +2043,7 @@ mod metadata_cache_tests {
             0,
             1,
             &mut output,
-            valid_test_fileinfo("object"),
+            fi,
             Vec::new(),
             &[],
             0,
@@ -2130,12 +2134,6 @@ mod metadata_cache_tests {
 
         let mut invalid_erasure = valid_test_fileinfo(object);
         invalid_erasure.erasure.block_size = 0;
-        invalid_erasure.parts.push(ObjectPartInfo {
-            number: 1,
-            size: 1,
-            actual_size: 1,
-            ..Default::default()
-        });
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
@@ -2170,6 +2168,7 @@ mod metadata_cache_tests {
         let object = "empty";
         let mut fi = valid_test_fileinfo(object);
         fi.size = 0;
+        fi.parts.clear();
 
         let mut output = Vec::new();
         SetDisks::get_object_with_fileinfo(
@@ -2202,12 +2201,6 @@ mod metadata_cache_tests {
         let mut fi = valid_test_fileinfo(object);
         fi.erasure.block_size = 1;
         fi.erasure.distribution = vec![1, 2, 3, 4];
-        fi.parts.push(ObjectPartInfo {
-            number: 1,
-            size: 1,
-            actual_size: 1,
-            ..Default::default()
-        });
 
         let mut output = Vec::new();
         let err = SetDisks::get_object_with_fileinfo(
