@@ -8974,7 +8974,7 @@ mod tests {
         .await
         .expect("first worker result should persist");
         assert_eq!(first.state, ManualTransitionJobState::Running);
-        assert_eq!(first.report.transition_completed, 1);
+        assert_eq!(first.report.transition_completed, 0);
         assert_eq!(first.report.transition_failed, 0);
 
         let duplicate = record_manual_transition_worker_result(
@@ -8987,11 +8987,11 @@ mod tests {
         .await
         .expect("duplicate worker result should be idempotent");
         assert_eq!(duplicate.state, ManualTransitionJobState::Running);
-        assert_eq!(duplicate.report.transition_completed, 1);
+        assert_eq!(duplicate.report.transition_completed, 0);
         assert_eq!(duplicate.report.transition_failed, 0);
 
         let second_key = manual_transition_worker_result_task_key(&bucket, "logs/b", None);
-        let final_record = record_manual_transition_worker_result(
+        let pending_record = record_manual_transition_worker_result(
             ecstore.clone(),
             job_id,
             &second_key,
@@ -9000,7 +9000,14 @@ mod tests {
         )
         .await
         .expect("second distinct worker result should persist");
+        assert_eq!(pending_record.state, ManualTransitionJobState::Running);
+        assert_eq!(pending_record.report.transition_completed, 0);
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record =
+            reconcile_manual_transition_worker_results(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+                .await
+                .expect("worker result journal should reconcile");
         assert_eq!(final_record.state, ManualTransitionJobState::Partial);
         assert_eq!(final_record.report.transition_completed, 1);
         assert_eq!(final_record.report.transition_failed, 1);
@@ -9035,7 +9042,7 @@ mod tests {
             .expect("worker result job record should save");
 
         let task_key = manual_transition_worker_result_task_key(&bucket, "logs/fail", None);
-        let final_record = record_manual_transition_worker_result_with_reason(
+        let pending_record = record_manual_transition_worker_result_with_reason(
             ecstore.clone(),
             job_id,
             &task_key,
@@ -9045,7 +9052,12 @@ mod tests {
         )
         .await
         .expect("worker result with failure reason should persist");
+        assert!(pending_record.report.tier_failure_by_reason.is_empty());
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record = reconcile_manual_transition_worker_results(ecstore, job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("worker failure reason should reconcile");
         assert_eq!(
             final_record
                 .report
@@ -11306,23 +11318,25 @@ mod tests {
 
         // Distinct payloads with distinct sizes: a mixed-generation reassembly
         // would produce bytes matching none of them (or fail the read outright).
-        let candidates: Vec<Vec<u8>> = (0..3)
+        let candidates: Vec<Vec<u8>> = (0..2)
             .map(|g| {
                 let len = 4096 + g * 512;
                 vec![b'a' + g as u8; len]
             })
             .collect();
 
-        let commit_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
-        let start = Arc::new(tokio::sync::Barrier::new(candidates.len() + 1));
+        let commit_barrier = MultipartCommitBarrier::install_for_arrivals(
+            &bucket,
+            object,
+            MultipartCommitPause::PutPartBeforeLockAcquire,
+            candidates.len(),
+        );
         let mut tasks = tokio::task::JoinSet::new();
         for payload in candidates.iter().cloned() {
             let store = ecstore.clone();
             let bucket = bucket.clone();
             let upload_id = upload.upload_id.clone();
-            let start = Arc::clone(&start);
             tasks.spawn(async move {
-                start.wait().await;
                 let mut data = PutObjReader::from_vec(payload.clone());
                 store
                     .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
@@ -11330,11 +11344,10 @@ mod tests {
                     .map(|info| (info, payload))
             });
         }
-        start.wait().await;
 
-        // The first writer holds the uploadId commit lock while the other
-        // resends reach the same critical section. Releasing it proves the
-        // handoff without depending on saturated CI disk latency.
+        // Both writers finish streaming before racing for the uploadId commit
+        // lock. Two generations are sufficient to exercise the mixed-shard
+        // hazard, while each waiter sits behind at most one cross-disk rename.
         commit_barrier.wait_until_paused().await;
         commit_barrier.release();
 

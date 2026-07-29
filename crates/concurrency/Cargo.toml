@@ -10,6 +10,9 @@ description = "Shared concurrency contract types for RustFS - workload admission
 keywords = ["rustfs", "concurrency", "admission", "backpressure", "workers"]
 categories = ["concurrency", "filesystem"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Internal crates
 rustfs-io-core = { workspace = true }

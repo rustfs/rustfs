@@ -443,6 +443,16 @@ pub fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>, canon
     Ok(())
 }
 
+pub fn set_tonic_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
+    request: &mut tonic::Request<T>,
+) -> std::io::Result<()> {
+    let canonical_body = request
+        .get_ref()
+        .canonical_body()
+        .map_err(|_| std::io::Error::other("RPC mutation body length cannot be represented"))?;
+    set_tonic_canonical_body_digest(request, &canonical_body)
+}
+
 pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     let version = request
         .metadata()
@@ -466,7 +476,7 @@ pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canoni
     Ok(())
 }
 
-/// Verify a mutating disk RPC's canonical body digest with a rolling-upgrade fallback.
+/// Verify a mutating RPC's canonical body digest with a rolling-upgrade fallback.
 ///
 /// When the request carries a real (non-`UNSIGNED-PAYLOAD`) content SHA-256 it is verified exactly
 /// like [`verify_tonic_canonical_body_digest`]. The digest value is a member of the signed v2
@@ -497,7 +507,7 @@ fn verify_tonic_mutation_body_digest_with_strictness<T>(
         Some(digest) if digest != UNSIGNED_PAYLOAD => verify_tonic_canonical_body_digest(request, canonical_body),
         _ => {
             // RUSTFS_COMPAT_TODO(disk-mutation-body-digest): accept digestless peers during rolling upgrades. Remove after the
-            // minimum supported RustFS peer version body-binds every mutating disk RPC.
+            // minimum supported RustFS peer version body-binds every mutating RPC.
             if strict {
                 return Err(std::io::Error::other("RPC mutation requires a body-bound v2 signature"));
             }
@@ -677,10 +687,27 @@ mod tests {
     use crate::cluster::rpc::context_propagation::REQUEST_ID_HEADER;
     use crate::runtime::sources as runtime_sources;
     use http::{HeaderMap, Method};
+    use rustfs_protos::{
+        CanonicalMutationBody as _, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        proto_gen::node_service::{Mss, SignalServiceRequest},
+    };
+    use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
     use tracing_subscriber::fmt::MakeWriter;
+
+    fn signal_service_request(signal: &str, sub_system: &str, dry_run: &str) -> SignalServiceRequest {
+        SignalServiceRequest {
+            vars: Some(Mss {
+                value: HashMap::from([
+                    (PEER_RESTSIGNAL.to_string(), signal.to_string()),
+                    (PEER_RESTSUB_SYS.to_string(), sub_system.to_string()),
+                    (PEER_RESTDRY_RUN.to_string(), dry_run.to_string()),
+                ]),
+            }),
+        }
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {
@@ -1594,6 +1621,72 @@ mod tests {
         let stripped = verify_tonic_mutation_body_digest(&request, &tampered_body)
             .expect_err("stripping the msgpack payload to force the JSON fallback decode must fail");
         assert_eq!(stripped.to_string(), "RPC content SHA-256 mismatch");
+    }
+
+    #[test]
+    fn signal_service_mutation_contract_rejects_tampering_and_replay() {
+        ensure_test_rpc_secret();
+        let body = signal_service_request("2", "scanner", "false")
+            .canonical_body()
+            .expect("small signal request should encode");
+        let mut request = tonic::Request::new(());
+        set_tonic_canonical_body_digest(&mut request, &body).expect("canonical body digest should be attached");
+        let content_sha256 = request
+            .metadata()
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "SignalService", content_sha256)
+            .expect("body-bound auth headers should build");
+        request.metadata_mut().as_mut().extend(headers.clone());
+
+        assert!(
+            verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/SignalService", &headers).is_ok(),
+            "the first body-bound signal request must authenticate"
+        );
+        assert!(verify_tonic_mutation_body_digest(&request, &body).is_ok());
+
+        let tampered = signal_service_request("1", "scanner", "false")
+            .canonical_body()
+            .expect("small signal request should encode");
+        let error = verify_tonic_mutation_body_digest(&request, &tampered)
+            .expect_err("changing the signal must invalidate the signed digest");
+        assert_eq!(error.to_string(), "RPC content SHA-256 mismatch");
+
+        let replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/SignalService", &headers)
+            .expect_err("reusing the signal nonce must fail");
+        assert_eq!(replay.to_string(), "RPC request replay detected");
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_body_digest_fallback_counter)]
+    fn signal_service_mutation_contract_preserves_rollout_fallback_and_strictness() {
+        let body = signal_service_request("2", "scanner", "false")
+            .canonical_body()
+            .expect("small signal request should encode");
+        let before = global_internode_metrics().snapshot().body_digest_fallback_total;
+        let digestless = tonic::Request::new(());
+
+        assert!(
+            verify_tonic_mutation_body_digest_with_strictness(&digestless, &body, false).is_ok(),
+            "old peers must remain compatible while the rollout gate is open"
+        );
+        assert_eq!(
+            global_internode_metrics().snapshot().body_digest_fallback_total,
+            before + 1,
+            "accepted digestless signal requests must be visible in the fallback metric"
+        );
+
+        let error = verify_tonic_mutation_body_digest_with_strictness(&digestless, &body, true)
+            .expect_err("strict mode must reject a digestless signal request");
+        assert_eq!(error.to_string(), "RPC mutation requires a body-bound v2 signature");
+
+        let mut bound = tonic::Request::new(());
+        set_tonic_canonical_body_digest(&mut bound, &body).expect("canonical body digest should be attached");
+        bound
+            .metadata_mut()
+            .as_mut()
+            .insert(RPC_AUTH_VERSION_HEADER, HeaderValue::from_static(RPC_AUTH_VERSION_V2));
+        assert!(verify_tonic_mutation_body_digest_with_strictness(&bound, &body, true).is_ok());
     }
 
     #[test]

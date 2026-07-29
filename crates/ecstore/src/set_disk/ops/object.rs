@@ -2322,22 +2322,49 @@ async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCo
 fn persisted_transition_version(
     remote_version: &str,
 ) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
+    persisted_transition_version_with_gate(remote_version, remote_version_state_writer_enabled())
+}
+
+fn remote_version_state_writer_enabled() -> bool {
+    remote_version_state_writer_enabled_for(
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
+            rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
+        ),
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+            rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+        ),
+    )
+}
+
+fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool) -> bool {
+    requested && fleet_confirmed
+}
+
+fn persisted_transition_version_with_gate(
+    remote_version: &str,
+    remote_version_state_writer_enabled: bool,
+) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
     if remote_version.is_empty() {
         return Ok((None, rustfs_filemeta::TransitionVersionState::KnownDisabled));
     }
-    let version_id = Uuid::parse_str(remote_version).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "opaque remote tier versions require the cluster capability gate",
-        )
-    })?;
-    if version_id.is_nil() {
-        return Err(std::io::Error::new(
+
+    match Uuid::parse_str(remote_version) {
+        Ok(version_id) if version_id.is_nil() => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "remote tier returned a nil object version ID",
-        ));
+        )),
+        Ok(_) => Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact)),
+        Err(_) if !remote_version_state_writer_enabled => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "opaque remote tier versions require the operator-attested fleet gate",
+        )),
+        Err(_) if remote_version == "null" => {
+            Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::SuspendedNull))
+        }
+        Err(_) => Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact)),
     }
-    Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact))
 }
 
 #[cfg(test)]
@@ -2575,7 +2602,10 @@ mod transition_upload_completion_tests {
 
 #[cfg(test)]
 mod transition_version_id_tests {
-    use super::{TransitionUploadCandidate, persisted_transition_version};
+    use super::{
+        TransitionUploadCandidate, persisted_transition_version, persisted_transition_version_with_gate,
+        remote_version_state_writer_enabled_for,
+    };
     use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
 
@@ -2612,6 +2642,44 @@ mod transition_version_id_tests {
         assert_eq!(
             TransitionUploadCandidate::from_put_response("opaque-version-token".to_string()).cleanup_version(),
             "opaque-version-token"
+        );
+    }
+
+    #[test]
+    fn remote_version_state_writer_requires_request_and_fleet_confirmation() {
+        for (case, requested, fleet_confirmed, expected) in [
+            ("old defaults", false, false, false),
+            ("missing fleet confirmation", true, false, false),
+            ("missing local opt-in", false, true, false),
+            ("explicitly unconfirmed fleet", true, false, false),
+            ("rolled-back writer", false, true, false),
+            ("fully upgraded fleet", true, true, true),
+        ] {
+            assert_eq!(remote_version_state_writer_enabled_for(requested, fleet_confirmed), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn fleet_gate_enables_null_and_opaque_remote_version_states() {
+        for (remote_version, expected) in [
+            ("null", (Some("null".to_string()), TransitionVersionState::SuspendedNull)),
+            (
+                "opaque-version-token",
+                (Some("opaque-version-token".to_string()), TransitionVersionState::Exact),
+            ),
+        ] {
+            assert!(
+                persisted_transition_version_with_gate(remote_version, false).is_err(),
+                "missing fleet confirmation must reject {remote_version:?}"
+            );
+            assert_eq!(
+                persisted_transition_version_with_gate(remote_version, true).expect("fleet-confirmed state must be persisted"),
+                expected
+            );
+        }
+        assert_eq!(
+            persisted_transition_version_with_gate("", true).expect("empty remote version identifies an unversioned tier"),
+            (None, TransitionVersionState::KnownDisabled)
         );
     }
 }
