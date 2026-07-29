@@ -328,7 +328,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build debug binary
-        run: cargo build -p rustfs --bins
+        run: cargo build -p rustfs --bins --features e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -358,7 +358,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build debug binary with rio-v2
-        run: cargo build -p rustfs --bins --features rio-v2
+        run: cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
