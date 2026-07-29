@@ -11112,6 +11112,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn concurrent_resend_same_part_commits_one_generation() {
+        use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
         use crate::storage_api_contracts::object::ObjectIO as _;
 
         let (_paths, ecstore) = setup_test_env().await;
@@ -11133,51 +11134,36 @@ mod tests {
             })
             .collect();
 
-        // Two independent causes can produce a spurious lock-acquire timeout
-        // here, and both must stay covered:
-        // 1. A lost/stolen fast-lock wakeup could strand a waiter until the
-        //    deadline — fixed for real in fast_lock::shard by bounding each
-        //    notification wait (NOTIFY_WAIT_CAP re-polling).
-        // 2. Under the full nextest suite on loaded CI disks, the
-        //    *legitimately serialized* cross-disk commits can exceed the
-        //    acquire deadline all by themselves — observed on CI at the 5s
-        //    default and the 30s production default with six resends, and
-        //    again at 60s, which is a hard ceiling: fast_lock clamps every
-        //    requested timeout to MAX_ACQUIRE_TIMEOUT (60s), so raising the
-        //    env override higher is a no-op (the Timeout error still reports
-        //    the requested value). Keep the guard about the correctness
-        //    property, not disk latency: request the full 60s ceiling and cap
-        //    the queue depth at three resends, so the last waiter sits behind
-        //    at most two serialized commits (~12s each on the slowest observed
-        //    CI runner, comfortably inside the deadline). Three concurrent
-        //    resends still race the streaming phase and contend on the commit
-        //    lock, which is all the generation-mixing regression needs.
-        //    `#[serial]` keeps the process-wide env override isolated.
-        let results = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60"))], async {
-            let mut tasks = tokio::task::JoinSet::new();
-            for payload in candidates.iter().cloned() {
-                let store = ecstore.clone();
-                let bucket = bucket.clone();
-                let upload_id = upload.upload_id.clone();
-                tasks.spawn(async move {
-                    let mut data = PutObjReader::from_vec(payload.clone());
-                    store
-                        .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
-                        .await
-                        .map(|info| (info, payload))
-                });
-            }
+        let commit_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
+        let start = Arc::new(tokio::sync::Barrier::new(candidates.len() + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for payload in candidates.iter().cloned() {
+            let store = ecstore.clone();
+            let bucket = bucket.clone();
+            let upload_id = upload.upload_id.clone();
+            let start = Arc::clone(&start);
+            tasks.spawn(async move {
+                start.wait().await;
+                let mut data = PutObjReader::from_vec(payload.clone());
+                store
+                    .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
+                    .await
+                    .map(|info| (info, payload))
+            });
+        }
+        start.wait().await;
 
-            // Every concurrent resend must succeed; the commit lock must never
-            // starve a waiter into a timeout.
-            let mut results = Vec::new();
-            while let Some(joined) = tasks.join_next().await {
-                let outcome = joined.expect("put_object_part task should not panic");
-                results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
-            }
-            results
-        })
-        .await;
+        // The first writer holds the uploadId commit lock while the other
+        // resends reach the same critical section. Releasing it proves the
+        // handoff without depending on saturated CI disk latency.
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release();
+
+        let mut results = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let outcome = joined.expect("put_object_part task should not panic");
+            results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
+        }
         assert_eq!(results.len(), candidates.len());
 
         // Exactly one generation is visible after the serialized commits, and its

@@ -25,6 +25,9 @@ keywords = ["file-system", "notification", "real-time", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 
+[features]
+demo-examples = []
+
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-ecstore = { workspace = true }
@@ -70,6 +73,18 @@ workspace = true
 
 [lib]
 doctest = false
+
+[[example]]
+name = "full_demo"
+required-features = ["demo-examples"]
+
+[[example]]
+name = "full_demo_one"
+required-features = ["demo-examples"]
+
+[[example]]
+name = "webhook"
+required-features = ["demo-examples"]
 
 [[bench]]
 name = "snapshot_mode_scan"
