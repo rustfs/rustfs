@@ -7238,12 +7238,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "path-clean"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
-
-[[package]]
 name = "path-dedot"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9096,7 +9090,6 @@ name = "rustfs-data-usage"
 version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
- "path-clean",
  "rmp-serde",
  "rustfs-filemeta",
  "serde",
@@ -9218,6 +9211,8 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "winapi-util",
+ "windows-sys 0.61.2",
  "xxhash-rust",
 ]
 

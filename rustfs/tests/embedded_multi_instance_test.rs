@@ -19,7 +19,22 @@
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
+#[cfg(feature = "e2e-test-hooks")]
+use chrono::Utc;
+#[cfg(feature = "e2e-test-hooks")]
+use hmac::{Hmac, KeyInit, Mac};
+#[cfg(feature = "e2e-test-hooks")]
+use reqwest::StatusCode;
+#[cfg(feature = "e2e-test-hooks")]
+use rustfs::embedded::pause_embedded_startup_after_http_bind;
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+#[cfg(feature = "e2e-test-hooks")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "e2e-test-hooks")]
+use std::time::Duration;
+
+#[cfg(feature = "e2e-test-hooks")]
+type HmacSha256 = Hmac<Sha256>;
 
 fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     let creds = Credentials::new(access_key, secret_key, None, None, "test");
@@ -31,6 +46,62 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
         .behavior_version_latest()
         .build();
     Client::from_conf(config)
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex(Sha256::digest(bytes))
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn hmac(key: &[u8], value: &str) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
+    mac.update(value.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn signed_admin_request(
+    client: &reqwest::Client,
+    endpoint: &str,
+    request_path: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> reqwest::RequestBuilder {
+    let host = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .expect("embedded endpoint scheme");
+    let payload_hash = sha256_hex(b"");
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+    let canonical_headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let (path, query) = request_path.split_once('?').unwrap_or((request_path, ""));
+    let canonical_request = format!("GET\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+    let date_key = hmac(format!("AWS4{secret_key}").as_bytes(), &date);
+    let region_key = hmac(&date_key, "us-east-1");
+    let service_key = hmac(&region_key, "s3");
+    let signing_key = hmac(&service_key, "aws4_request");
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={}",
+        hex(hmac(&signing_key, &string_to_sign))
+    );
+
+    client
+        .get(format!("{endpoint}{request_path}"))
+        .header("host", host)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("x-amz-date", amz_date)
+        .header("authorization", authorization)
 }
 
 // backlog#1052 acceptance: a second embedded server in the same process no
@@ -245,4 +316,113 @@ async fn two_embedded_servers_isolate_auth_and_data_planes() {
 
     server_a.shutdown().await;
     server_b.shutdown().await;
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+#[tokio::test]
+async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed() {
+    let port_a = match find_available_port() {
+        Ok(port) => port,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("find free port for server A: {err}"),
+    };
+    let server_a = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_a}"))
+        .access_key("startup-window-access-a")
+        .secret_key("startup-window-secret-a")
+        .build()
+        .await
+        .expect("start embedded server A");
+    let client_a = s3_client(&server_a.endpoint(), server_a.access_key(), server_a.secret_key());
+    client_a
+        .create_bucket()
+        .bucket("startup-window")
+        .send()
+        .await
+        .expect("server A creates the shared-name bucket");
+    client_a
+        .put_object()
+        .bucket("startup-window")
+        .key("marker.txt")
+        .body(ByteStream::from_static(b"from A"))
+        .send()
+        .await
+        .expect("server A writes its marker");
+
+    let port_b = match find_available_port() {
+        Ok(port) => port,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            server_a.shutdown().await;
+            return;
+        }
+        Err(err) => {
+            server_a.shutdown().await;
+            panic!("find free port for server B: {err}");
+        }
+    };
+    let endpoint_b = format!("http://127.0.0.1:{port_b}");
+    let b_access_key = "startup-window-access-b";
+    let b_secret_key = "startup-window-secret-b";
+    let mut barrier = pause_embedded_startup_after_http_bind(port_b);
+    let startup_b = tokio::spawn(async move {
+        RustFSServerBuilder::new()
+            .address(format!("127.0.0.1:{port_b}"))
+            .access_key(b_access_key)
+            .secret_key(b_secret_key)
+            .build()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_http_bound())
+        .await
+        .expect("server B must bind HTTP before installing its context slot");
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build local admin client without proxy");
+    let inspect_path = "/rustfs/admin/v3/inspect-data?file=marker.txt&volume=startup-window";
+    let before_install = signed_admin_request(&http, &endpoint_b, inspect_path, b_access_key, b_secret_key)
+        .send()
+        .await
+        .expect("server B HTTP listener must accept the paused request");
+    let before_install_status = before_install.status();
+    let before_install_body = before_install.text().await.expect("read paused response body");
+    assert_eq!(before_install_status, StatusCode::SERVICE_UNAVAILABLE, "{before_install_body}");
+    assert!(
+        before_install_body.contains("server context is not ready"),
+        "paused request must not resolve server A: {before_install_body}"
+    );
+
+    barrier.release();
+    let server_b = tokio::time::timeout(Duration::from_secs(20), startup_b)
+        .await
+        .expect("server B startup must complete after releasing the barrier")
+        .expect("server B startup task must not panic")
+        .expect("start embedded server B");
+    let client_b = s3_client(&server_b.endpoint(), server_b.access_key(), server_b.secret_key());
+    client_b
+        .create_bucket()
+        .bucket("startup-window")
+        .send()
+        .await
+        .expect("server B creates its isolated shared-name bucket");
+    client_b
+        .put_object()
+        .bucket("startup-window")
+        .key("marker.txt")
+        .body(ByteStream::from_static(b"from B"))
+        .send()
+        .await
+        .expect("server B writes its marker");
+
+    let after_install = signed_admin_request(&http, &server_b.endpoint(), inspect_path, b_access_key, b_secret_key)
+        .send()
+        .await
+        .expect("server B admin request after context installation");
+    assert_eq!(after_install.status(), StatusCode::OK);
+    assert_eq!(after_install.bytes().await.expect("read server B marker"), b"from B".as_slice());
+
+    server_b.shutdown().await;
+    server_a.shutdown().await;
 }

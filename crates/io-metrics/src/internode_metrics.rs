@@ -67,6 +67,7 @@ const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_inter
 const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
 const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
+const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_replay_scope_fallback_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
@@ -159,6 +160,7 @@ pub struct InternodeMetricsSnapshot {
     pub operation_write_shutdown_errors_total: u64,
     pub signature_v1_fallback_total: u64,
     pub body_digest_fallback_total: u64,
+    pub replay_scope_fallback_total: u64,
     pub replay_cache_overflow_total: u64,
 }
 
@@ -180,6 +182,7 @@ pub struct InternodeMetrics {
     msgpack_json_decode_error_total: AtomicU64,
     signature_v1_fallback_total: AtomicU64,
     body_digest_fallback_total: AtomicU64,
+    replay_scope_fallback_total: AtomicU64,
     replay_cache_overflow_total: AtomicU64,
 }
 
@@ -431,6 +434,13 @@ impl InternodeMetrics {
         counter!(INTERNODE_BODY_DIGEST_FALLBACK_TOTAL).increment(1);
     }
 
+    /// Count an accepted v1/v2 request that does not carry the replay-scoped signature. This is
+    /// the convergence signal for `RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT`.
+    pub fn record_replay_scope_fallback(&self) {
+        self.replay_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL).increment(1);
+    }
+
     /// Count a body-bound internode RPC rejected because the replay-protection nonce cache was
     /// full. Overflow fails closed, so a sustained non-zero rate means
     /// `RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY` is undersized for this node's peak legitimate
@@ -488,6 +498,7 @@ impl InternodeMetrics {
             operation_write_shutdown_errors_total: self.operation_write_shutdown_errors_total.load(Ordering::Relaxed),
             signature_v1_fallback_total: self.signature_v1_fallback_total.load(Ordering::Relaxed),
             body_digest_fallback_total: self.body_digest_fallback_total.load(Ordering::Relaxed),
+            replay_scope_fallback_total: self.replay_scope_fallback_total.load(Ordering::Relaxed),
             replay_cache_overflow_total: self.replay_cache_overflow_total.load(Ordering::Relaxed),
         }
     }
@@ -510,6 +521,7 @@ impl InternodeMetrics {
         self.msgpack_json_decode_error_total.store(0, Ordering::Relaxed);
         self.signature_v1_fallback_total.store(0, Ordering::Relaxed);
         self.body_digest_fallback_total.store(0, Ordering::Relaxed);
+        self.replay_scope_fallback_total.store(0, Ordering::Relaxed);
         self.replay_cache_overflow_total.store(0, Ordering::Relaxed);
     }
 }
@@ -885,6 +897,19 @@ mod tests {
 
         metrics.reset_for_test();
         assert_eq!(metrics.snapshot().signature_v1_fallback_total, 0);
+    }
+
+    #[test]
+    fn replay_scope_fallback_counter_updates_snapshot_and_resets() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.snapshot().replay_scope_fallback_total, 0);
+
+        metrics.record_replay_scope_fallback();
+        metrics.record_replay_scope_fallback();
+        assert_eq!(metrics.snapshot().replay_scope_fallback_total, 2);
+
+        metrics.reset_for_test();
+        assert_eq!(metrics.snapshot().replay_scope_fallback_total, 0);
     }
 
     #[test]

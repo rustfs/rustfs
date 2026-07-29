@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
     is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
@@ -66,7 +66,6 @@ use std::{
 use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -222,6 +221,21 @@ fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8])
         .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
 }
 
+fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
+    let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(result).map_err(Error::other)?;
+    if topology_member != expected_member {
+        return Err(Error::other(
+            "peer returned a remote version state capability for a different topology member",
+        ));
+    }
+    let server_epoch =
+        Uuid::from_slice(process_epoch).map_err(|_| Error::other("peer returned an invalid remote version state epoch"))?;
+    if server_epoch.is_nil() {
+        return Err(Error::other("peer returned a nil remote version state epoch"));
+    }
+    Ok(server_epoch)
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -233,6 +247,7 @@ pub struct PeerLiveEventsBatch {
 pub struct PeerRestClient {
     pub host: XHost,
     pub grid_host: String,
+    topology_member: String,
     offline: Arc<AtomicBool>,
     recovery_running: Arc<AtomicBool>,
 }
@@ -325,9 +340,11 @@ impl PeerRestClient {
     }
 
     pub fn new(host: XHost, grid_host: String) -> Self {
+        let topology_member = host.to_string();
         Self {
             host,
             grid_host,
+            topology_member,
             offline: Arc::new(AtomicBool::new(false)),
             recovery_running: Arc::new(AtomicBool::new(false)),
         }
@@ -347,7 +364,11 @@ impl PeerRestClient {
 
             let client = match grid_host {
                 Some(grid_host) => match XHost::try_from(peer_host_port.clone()) {
-                    Ok(host) => Some(PeerRestClient::new(host, grid_host)),
+                    Ok(host) => {
+                        let mut client = PeerRestClient::new(host, grid_host);
+                        client.topology_member = peer_host_port.clone();
+                        Some(client)
+                    }
                     Err(err) => {
                         warn!(peer = %peer_host_port, "Xhost parse failed while constructing peer client: {err:?}");
                         None
@@ -390,7 +411,7 @@ impl PeerRestClient {
         (remote, all, remote_topology_hosts)
     }
 
-    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
@@ -411,7 +432,7 @@ impl PeerRestClient {
         &self,
     ) -> Result<
         rustfs_protos::proto_gen::node_service::heal_control_service_client::HealControlServiceClient<
-            InterceptedService<Channel, TonicInterceptor>,
+            InterceptedService<AuthenticatedChannel, TonicInterceptor>,
         >,
     > {
         if self.offline.load(Ordering::Acquire) {
@@ -432,7 +453,7 @@ impl PeerRestClient {
 
     async fn get_tier_mutation_control_client(
         &self,
-    ) -> Result<TierMutationControlServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
@@ -1152,6 +1173,15 @@ impl PeerRestClient {
             .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
             .await?;
         validate_heal_control_capability_proof(&canonical_ack, &proof)
+    }
+
+    pub async fn probe_remote_version_state(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::remote_version_state_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
@@ -2470,6 +2500,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_version_state_capability_decoder_fails_closed() {
+        let epoch = Uuid::new_v4();
+        let result = rustfs_protos::encode_remote_version_state_capability("node-a:9000", epoch.as_bytes())
+            .expect("small capability response should encode");
+        assert_eq!(
+            decode_remote_version_state_capability("node-a:9000", &result).expect("valid epoch should decode"),
+            epoch
+        );
+        assert!(decode_remote_version_state_capability("node-b:9000", &result).is_err());
+        assert!(decode_remote_version_state_capability("node-a:9000", &result[..result.len() - 1]).is_err());
+        let nil = rustfs_protos::encode_remote_version_state_capability("node-a:9000", Uuid::nil().as_bytes())
+            .expect("small capability response should encode");
+        assert!(decode_remote_version_state_capability("node-a:9000", &nil).is_err());
+    }
+
     struct TierMutationResponseFixture<'a> {
         version: u32,
         phase: TierMutationRpcPhase,
@@ -2745,7 +2791,7 @@ mod tests {
         // `mark_offline_and_spawn_recovery` path that sibling tests exercise from
         // subscriber-less threads; without this the span can be cached as
         // `Interest::never()` and silently degrade to `Span::none()`.
-        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
 
         let client = test_peer_client();
         let span = tracing::info_span!("request-span", request_id = "req-peer-rest");

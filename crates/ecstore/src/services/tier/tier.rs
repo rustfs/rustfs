@@ -236,6 +236,7 @@ struct TierPublishTransition {
 
 struct PreparedTierDriver {
     tier_name: String,
+    tier_config: TierConfig,
     config_fingerprint: TierDriverFingerprint,
     backend_identity: TierDestinationId,
     exact_get_delete: bool,
@@ -1342,6 +1343,7 @@ fn tier_exact_get_delete(config: &TierConfig) -> bool {
 
 struct TierDriverGeneration {
     tier_name: Arc<str>,
+    tier_config: TierConfig,
     generation: DriverRevision,
     // Process-local only: this may reflect credential changes and must never be persisted or logged.
     config_fingerprint: TierDriverFingerprint,
@@ -1349,6 +1351,9 @@ struct TierDriverGeneration {
     backend_identity: TierDestinationId,
     exact_get_delete: bool,
     driver: SharedWarmBackend,
+    reconciler: tokio::sync::OnceCell<
+        Option<Arc<dyn crate::services::tier::warm_backend::TransitionCandidateReconciler + Send + Sync + 'static>>,
+    >,
     accepting: AtomicBool,
     active_leases: AtomicUsize,
     drained: tokio::sync::Notify,
@@ -1471,6 +1476,35 @@ impl TierOperationLease {
 
     pub(crate) fn backend_identity(&self) -> TierDestinationId {
         self.inner.backend_identity
+    }
+
+    pub(crate) async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        transaction_id: uuid::Uuid,
+    ) -> io::Result<TransitionCandidateProbe> {
+        let Some(reconciler) = self
+            .inner
+            .reconciler
+            .get_or_try_init(|| async {
+                crate::services::tier::warm_backend::new_transition_candidate_reconciler(&self.inner.tier_config)
+                    .await
+                    .map(|reconciler| reconciler.map(Arc::from))
+            })
+            .await
+            .map_err(|err| io::Error::other(err.message))?
+        else {
+            return self.inner.driver.probe_transition_candidate(object).await;
+        };
+        reconciler
+            .probe_transition_candidate_for(
+                object,
+                crate::services::tier::warm_backend::TransitionCandidateIdentity {
+                    transaction_id,
+                    destination_id: self.backend_identity(),
+                },
+            )
+            .await
     }
 
     pub(crate) fn validate_remote_version_id(&self, remote_version_id: &str) -> io::Result<()> {
@@ -2833,6 +2867,7 @@ impl TierConfigMgr {
                     let exact_get_delete = tier_exact_get_delete(config);
                     Some(PreparedTierDriver {
                         tier_name: tier_name.to_string(),
+                        tier_config: config.clone(),
                         config_fingerprint,
                         backend_identity,
                         exact_get_delete,
@@ -2861,11 +2896,13 @@ impl TierConfigMgr {
             })?;
             let entry = Arc::new(TierDriverGeneration {
                 tier_name: Arc::from(prepared.tier_name.as_str()),
+                tier_config: prepared.tier_config.clone(),
                 generation,
                 config_fingerprint: prepared.config_fingerprint,
                 backend_identity: prepared.backend_identity,
                 exact_get_delete: prepared.exact_get_delete,
                 driver: prepared.driver.clone(),
+                reconciler: tokio::sync::OnceCell::new(),
                 accepting: AtomicBool::new(true),
                 active_leases: AtomicUsize::new(0),
                 drained: tokio::sync::Notify::new(),
@@ -3609,11 +3646,13 @@ impl TierConfigMgr {
         let driver: SharedWarmBackend = Arc::from(driver);
         let entry = Arc::new(TierDriverGeneration {
             tier_name: Arc::from(tier_name),
+            tier_config: config.clone(),
             generation,
             config_fingerprint,
             backend_identity,
             exact_get_delete,
             driver: driver.clone(),
+            reconciler: tokio::sync::OnceCell::new(),
             accepting: AtomicBool::new(true),
             active_leases: AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),

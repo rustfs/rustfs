@@ -158,17 +158,33 @@ pub const DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT: bool = false;
 // rolling upgrades until the fleet-wide body-digest fallback counter reads zero.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT);
 
-/// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
-/// one-time consumption of body-bound v2 signatures.
+/// Require the replay-scoped internode RPC signature after the fleet has converged on it.
 ///
-/// The cache retains each nonce for the ~10-minute signature freshness envelope, so the steady
-/// state holds roughly `mutating RPS x 601s` entries; the default sustains ~1,700 body-bound
-/// mutating RPCs per second (about 120 MiB worst case, allocated only under sustained load).
-/// Overflow fails closed — legitimate signed traffic is the only thing that can fill the cache
-/// (replays are rejected before insertion, and an attacker cannot mint valid nonces without the
-/// shared secret) — and increments
+/// The default keeps v1/v2 peers available during a rolling upgrade. Operators may set this only
+/// after `rustfs_system_network_internode_replay_scope_fallback_total` remains zero for a full
+/// release window. The node still accepts a v2-authenticated `Ping` carrying an epoch challenge:
+/// that narrowly scoped bootstrap lets an upgraded client learn the receiving process epoch and
+/// immediately retry with the replay-scoped signature after a peer restart.
+pub const ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT: &str = "RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT";
+pub const DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT: bool = false;
+
+// Compile-time invariant: mixed-version clusters must remain available until operators make the
+// observed fallback counter an explicit strictness decision.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
+
+/// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
+/// one-time consumption of authenticated RPC signatures.
+///
+/// The cache retains each nonce for the ~10-minute signature freshness envelope. Once peers use
+/// replay-scoped v3 authentication, every authenticated RPC consumes one entry, so the steady
+/// state holds roughly `authenticated RPC RPS x 601s` entries. The default sustains about 1,700
+/// authenticated RPCs per second (about 120 MiB worst case, allocated only under sustained load);
+/// operators must size it for the node's aggregate peak RPC rate before enabling strict replay
+/// scope. Overflow fails closed — legitimate signed traffic is the only thing that can fill the
+/// cache (replays are rejected before insertion, and an attacker cannot mint valid nonces without
+/// the shared secret) — and increments
 /// `rustfs_system_network_internode_replay_cache_overflow_total`, so a sustained non-zero overflow
-/// counter means this capacity is undersized for the node's peak mutation rate.
+/// counter means this capacity is undersized for the node's peak authenticated RPC rate.
 pub const ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: &str = "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY";
 pub const DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: usize = 1_048_576;
 
@@ -352,6 +368,12 @@ mod tests {
     fn internode_body_digest_strict_env_name_is_stable() {
         // The fail-open default invariant is asserted at compile time next to the definition.
         assert_eq!(ENV_INTERNODE_RPC_BODY_DIGEST_STRICT, "RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT");
+    }
+
+    #[test]
+    fn internode_replay_scope_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT, "RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT");
     }
 
     #[test]

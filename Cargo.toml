@@ -314,7 +314,9 @@ uuid = { version = "1.24.0" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
+winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
+windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.18" }
 zip = "8.6.0"
 zstd = "0.13.3"

@@ -135,6 +135,20 @@ impl WarmBackend for WarmBackendMinIO {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::services::tier::warm_backend::TransitionCandidateReconciler for WarmBackendMinIO {
+    async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        identity: crate::services::tier::warm_backend::TransitionCandidateIdentity,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        crate::services::tier::warm_backend::TransitionCandidateReconciler::probe_transition_candidate_for(
+            &self.0, object, identity,
+        )
+        .await
+    }
+}
+
 fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
     let mut object_size = object_size;
     if object_size == -1 {

@@ -52,7 +52,7 @@ use std::{
     collections::HashMap,
     io::Cursor,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 use time::OffsetDateTime;
 use tokio::spawn;
@@ -128,6 +128,7 @@ fn remove_heal_control_replay(
 }
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
+static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -466,13 +467,27 @@ pub(crate) async fn initialize_heal_topology_fingerprint(
     cache: Arc<tokio::sync::OnceCell<String>>,
     endpoint_pools: EndpointServerPools,
 ) -> Result<(), String> {
+    initialize_heal_topology_fingerprint_with_probe(
+        cache,
+        endpoint_pools,
+        crate::storage::storage_api::start_remote_version_state_fleet_probe,
+    )
+    .await
+}
+
+async fn initialize_heal_topology_fingerprint_with_probe(
+    cache: Arc<tokio::sync::OnceCell<String>>,
+    endpoint_pools: EndpointServerPools,
+    start_probe: impl FnOnce(String),
+) -> Result<(), String> {
     if cache.get().is_some() {
         return Ok(());
     }
     let fingerprint = tokio::task::spawn_blocking(move || heal::heal_topology_fingerprint(&endpoint_pools))
         .await
         .map_err(|_| "heal control topology calculation task failed".to_string())??;
-    let _ = cache.set(fingerprint);
+    let _ = cache.set(fingerprint.clone());
+    start_probe(fingerprint);
     Ok(())
 }
 
@@ -804,6 +819,35 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
                 result: result.into(),
                 error_info: None,
                 response_proof: Bytes::new(),
+            }));
+        }
+        if rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command) {
+            let topology_member = self
+                .endpoint_pools()
+                .await
+                .ok_or_else(|| Status::failed_precondition("heal control topology is not initialized"))?
+                .peers()
+                .1;
+            if topology_member.is_empty() {
+                return Err(Status::failed_precondition("local topology member identity is unavailable"));
+            }
+            let result =
+                rustfs_protos::encode_remote_version_state_capability(&topology_member, NODE_CAPABILITY_SERVER_EPOCH.as_bytes())
+                    .map_err(|_| Status::internal("remote version state capability length cannot be represented"))?;
+            let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+                request.get_ref().version,
+                &request.get_ref().topology_fingerprint,
+                &request.get_ref().command,
+                &result,
+            )
+            .map_err(|_| Status::internal("heal control response length cannot be represented"))?;
+            let response_proof = sign_tonic_rpc_response_proof(&canonical_response)
+                .map_err(|_| Status::internal("heal control response proof is unavailable"))?;
+            return Ok(Response::new(HealControlResponse {
+                success: true,
+                result: result.into(),
+                error_info: None,
+                response_proof: response_proof.into(),
             }));
         }
         let endpoints = self
@@ -2090,10 +2134,10 @@ mod tests {
         PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
         STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
-        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, legacy_scanner_activity_response,
-        make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
-        make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
-        scanner_activity_response, stop_rebalance_response,
+        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint,
+        initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response, make_heal_control_server,
+        make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
+        previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
@@ -2147,6 +2191,7 @@ mod tests {
     use tokio::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
+    use uuid::Uuid;
 
     const DISK_MUTATION_RPC_METHODS: [&str; 18] = [
         "renamedata",
@@ -3133,6 +3178,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_version_state_probe_authenticates_topology_challenge_and_process_epoch() {
+        let _ = rustfs_credentials::set_global_rpc_secret("remote-version-state-node-service-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+        let probe_command = rustfs_protos::remote_version_state_capability_probe(&[7; 16]);
+        let mut request = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .expect("probe should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .heal_control(request)
+            .await
+            .expect("matching topology should be acknowledged")
+            .into_inner();
+
+        let (topology_member, process_epoch) =
+            rustfs_protos::decode_remote_version_state_capability(&response.result).expect("capability response should decode");
+        assert_eq!(topology_member, "node-a:9000");
+        let server_epoch = Uuid::from_slice(process_epoch).expect("server epoch should be a UUID");
+        assert!(!server_epoch.is_nil());
+        let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &probe_command,
+            &response.result,
+        )
+        .expect("response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
+            .expect("outer proof should bind the response to the request");
+
+        let different_probe = rustfs_protos::remote_version_state_capability_probe(&[8; 16]);
+        let different_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &different_probe,
+            &response.result,
+        )
+        .expect("different response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&different_response, &response.response_proof)
+            .expect_err("proof from one challenge must not be reusable");
+    }
+
+    #[tokio::test]
     async fn heal_control_coordinator_rejects_expired_and_non_admin_starts() {
         let _ = rustfs_credentials::set_global_rpc_secret("heal-control-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
@@ -3194,10 +3293,15 @@ mod tests {
         let topology = heal_control_test_endpoints("node-d");
         let expected = heal_topology_fingerprint(&topology).expect("test topology should hash");
         let cache = Arc::new(tokio::sync::OnceCell::new());
-        initialize_heal_topology_fingerprint(Arc::clone(&cache), topology)
-            .await
-            .expect("valid topology should initialize");
+        let started_probe = Arc::new(std::sync::Mutex::new(None));
+        let started_probe_capture = Arc::clone(&started_probe);
+        initialize_heal_topology_fingerprint_with_probe(Arc::clone(&cache), topology, move |fingerprint| {
+            *started_probe_capture.lock().expect("probe capture should not poison") = Some(fingerprint);
+        })
+        .await
+        .expect("valid topology should initialize");
         assert_eq!(cache.get(), Some(&expected));
+        assert_eq!(started_probe.lock().expect("probe capture should not poison").as_ref(), Some(&expected));
 
         let mut invalid = heal_control_test_endpoints("node-d");
         invalid.as_mut()[0].endpoints.as_mut()[0].pool_idx = -1;

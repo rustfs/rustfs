@@ -13,8 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cross-process replay / tamper acceptance for the internode NodeService v2 RPC
-//! signature (<https://github.com/rustfs/backlog/issues/1327>).
+//! Cross-process replay / tamper acceptance for internode NodeService RPC
+//! signatures (<https://github.com/rustfs/backlog/issues/1327>,
+//! <https://github.com/rustfs/backlog/issues/1542>).
 //!
 //! # Why this exists on top of the in-process tests
 //!
@@ -78,6 +79,8 @@
 //! | mixed version: legacy-only still served, not blocked | [`legacy_only_signature_is_accepted_in_default_posture`] |
 //! | strict flip closes the signature downgrade | [`signature_strict_rejects_legacy_only_downgrade`] |
 //! | strict flip closes the body-digest downgrade, incl. v1 | [`body_digest_strict_rejects_digestless_mutation`] |
+//! | replay scope binds every RPC and rejects restart replay | [`replay_scope_rejects_replay_path_transplant_and_stale_epoch_e2e`] |
+//! | strict replay scope allows only Ping bootstrap before v3 | [`replay_scope_strict_requires_v3_after_ping_bootstrap_e2e`] |
 //!
 //! Two acceptance items are deliberately left to the in-process tests. A stale
 //! timestamp cannot be forged from outside — it is inside the HMAC — so
@@ -88,18 +91,20 @@
 
 use crate::common::{RustFSTestEnvironment, init_logging};
 use crate::storage_api::internode_rpc_signature::{
-    TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_signature_headers, node_service_time_out_client_no_auth,
+    TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+    node_service_time_out_client_no_auth, verify_tonic_boot_epoch_response,
 };
 use http::{HeaderMap, Method};
 use rustfs_config::{
-    ENV_INTERNODE_RPC_BODY_DIGEST_STRICT, ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, ENV_INTERNODE_RPC_SIGNATURE_STRICT,
+    ENV_INTERNODE_RPC_BODY_DIGEST_STRICT, ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
+    ENV_INTERNODE_RPC_SIGNATURE_STRICT,
 };
 use rustfs_protos::canonical_make_volume_request_body;
-use rustfs_protos::proto_gen::node_service::{MakeVolumeRequest, MakeVolumeResponse};
+use rustfs_protos::proto_gen::node_service::{MakeVolumeRequest, MakeVolumeResponse, PingRequest, PingResponse};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Request, Response, Status};
 use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
@@ -115,12 +120,14 @@ const TEST_RPC_SECRET: &str = "rustfs-internode-signature-e2e-secret";
 /// clears authentication stops harmlessly at `find_disk`.
 const ABSENT_DISK: &str = "/nonexistent/rustfs-signature-e2e-disk";
 
-/// Wire names of the two v2 headers these tests edit. They are `pub(crate)` in
-/// ecstore, so they are repeated here rather than imported — [`overwrite_header`]
-/// asserts the header it replaces was actually present, which turns a rename
-/// into a loud failure instead of silently reducing an attack to a no-op.
+/// Wire names of the v2 and replay-scope headers these black-box tests edit. They are
+/// `pub(crate)` in ecstore, so they are repeated here rather than imported.
+/// [`overwrite_header`] asserts the header it replaces was actually present, which turns a
+/// rename into a loud failure instead of silently reducing an attack to a no-op.
 const CONTENT_SHA256_HEADER: &str = "x-rustfs-content-sha256";
 const NONCE_HEADER: &str = "x-rustfs-rpc-nonce";
+const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
+const BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-challenge";
 
 /// gRPC service name carried in the signed scope, i.e. `TONIC_RPC_PREFIX`
 /// without its leading `/`.
@@ -155,17 +162,26 @@ fn align_rpc_secret_with_server() {
 ///
 /// Uses the no-cleanup spawn so a `pkill` pattern cannot reap servers belonging
 /// to other tests running in the same binary.
-async fn start_server(extra_env: &[(&str, &str)]) -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
-    let mut env = RustFSTestEnvironment::new().await?;
+fn server_env(extra_env: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
     let mut child_env = vec![
         ("RUSTFS_RPC_SECRET", TEST_RPC_SECRET),
         (ENV_INTERNODE_RPC_SIGNATURE_STRICT, "false"),
         (ENV_INTERNODE_RPC_BODY_DIGEST_STRICT, "false"),
+        (ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT, "false"),
         (ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, "1048576"),
     ];
     child_env.extend_from_slice(extra_env);
-    env.start_rustfs_server_without_cleanup_with_env(&child_env).await?;
+    child_env
+}
+
+async fn start_server_with_env(child_env: &[(&str, &str)]) -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_without_cleanup_with_env(child_env).await?;
     Ok(env)
+}
+
+async fn start_server(extra_env: &[(&'static str, &'static str)]) -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    start_server_with_env(&server_env(extra_env)).await
 }
 
 /// Stop the child and drop the cached gRPC channel for its address.
@@ -238,12 +254,83 @@ fn overwrite_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
 /// and nothing else — no interceptor adds or rewrites auth metadata, so the
 /// bytes on the wire are the ones the test chose.
 async fn call_make_volume(url: &str, request: MakeVolumeRequest, headers: HeaderMap) -> Result<MakeVolumeResponse, Status> {
+    call_make_volume_response(url, request, headers)
+        .await
+        .map(Response::into_inner)
+}
+
+async fn call_make_volume_response(
+    url: &str,
+    request: MakeVolumeRequest,
+    headers: HeaderMap,
+) -> Result<Response<MakeVolumeResponse>, Status> {
     let mut client = node_service_time_out_client_no_auth(&url.to_string())
         .await
         .map_err(|err| Status::unavailable(format!("cannot reach the node service: {err}")))?;
     let mut rpc_request = Request::new(request);
     rpc_request.metadata_mut().as_mut().extend(headers);
-    client.make_volume(rpc_request).await.map(|response| response.into_inner())
+    client.make_volume(rpc_request).await
+}
+
+async fn call_ping_response(url: &str, headers: HeaderMap) -> Result<Response<PingResponse>, Status> {
+    let mut client = node_service_time_out_client_no_auth(&url.to_string())
+        .await
+        .map_err(|err| Status::unavailable(format!("cannot reach the node service: {err}")))?;
+    let mut rpc_request = Request::new(PingRequest {
+        version: 1,
+        body: bytes::Bytes::new(),
+    });
+    rpc_request.metadata_mut().as_mut().extend(headers);
+    client.ping(rpc_request).await
+}
+
+fn attach_boot_epoch_challenge(headers: &mut HeaderMap) -> Uuid {
+    let challenge = Uuid::new_v4();
+    headers.insert(
+        BOOT_EPOCH_CHALLENGE_HEADER,
+        challenge.to_string().parse().expect("UUID must be a valid header value"),
+    );
+    challenge
+}
+
+fn mint_replay_scope_headers(audience: &str, path: &str, content_sha256: &str, boot_epoch: Uuid) -> HeaderMap {
+    let mut headers = mint_v2_headers(audience, "MakeVolume", Some(content_sha256));
+    let timestamp = headers
+        .get(TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("v2 headers must carry a timestamp")
+        .to_string();
+    headers.extend(
+        gen_tonic_replay_scope_headers(audience, path, &timestamp, content_sha256, boot_epoch)
+            .expect("replay-scope headers must mint with the aligned RPC secret"),
+    );
+    headers
+}
+
+async fn learn_boot_epoch_from_make_volume(url: &str, audience: &str) -> Uuid {
+    let request = make_volume_request("signature-e2e-epoch-bootstrap");
+    let mut headers = mint_v2_headers(audience, "MakeVolume", Some(&canonical_digest(&request)));
+    let challenge = attach_boot_epoch_challenge(&mut headers);
+    let response = call_make_volume_response(url, request, headers)
+        .await
+        .expect("v2 request with epoch challenge must clear default authentication");
+    let boot_epoch = verify_tonic_boot_epoch_response(audience, challenge, response.metadata().as_ref())
+        .expect("server must HMAC-authenticate the advertised boot epoch");
+    assert_authenticated(
+        Ok(response.into_inner()),
+        "a v2 epoch-challenge request in the default replay-scope posture",
+    );
+    boot_epoch
+}
+
+async fn learn_boot_epoch_from_ping(url: &str, audience: &str) -> Uuid {
+    let mut headers = mint_v2_headers(audience, "Ping", None);
+    let challenge = attach_boot_epoch_challenge(&mut headers);
+    let response = call_ping_response(url, headers)
+        .await
+        .expect("v2 Ping with an epoch challenge must bootstrap strict replay scope");
+    verify_tonic_boot_epoch_response(audience, challenge, response.metadata().as_ref())
+        .expect("strict replay-scope Ping must return a valid boot epoch proof")
 }
 
 /// Assert a call cleared authentication.
@@ -327,6 +414,122 @@ async fn internode_rpc_signature_default_posture_e2e() -> TestResult {
     rewriting_the_digest_to_match_a_tampered_body_is_rejected(&url, &audience).await;
     signature_minted_for_another_node_is_rejected(&url).await;
     legacy_only_signature_is_accepted_in_default_posture(&url).await;
+
+    stop_server(env, &url).await;
+    Ok(())
+}
+
+/// A replay-scoped signature is usable exactly once against the exact gRPC path and the server
+/// process epoch that minted it. This crosses the child-process boundary twice: the HMAC-protected
+/// epoch is learned from a real response, then the same server is restarted in place to prove its
+/// replacement epoch rejects the captured request even though the nonce cache is necessarily new.
+#[tokio::test]
+#[serial]
+async fn replay_scope_rejects_replay_path_transplant_and_stale_epoch_e2e() -> TestResult {
+    init_logging();
+    align_rpc_secret_with_server();
+    let child_env = server_env(&[]);
+    let mut env = start_server_with_env(&child_env).await?;
+    let url = env.url.clone();
+    let audience = audience_of(&env);
+    let boot_epoch = learn_boot_epoch_from_make_volume(&url, &audience).await;
+
+    let request = make_volume_request("replay-scope-e2e-once");
+    let captured = mint_replay_scope_headers(
+        &audience,
+        &format!("{TONIC_RPC_PREFIX}/MakeVolume"),
+        &canonical_digest(&request),
+        boot_epoch,
+    );
+    assert_authenticated(
+        call_make_volume(&url, request.clone(), captured.clone()).await,
+        "the first replay-scoped mutation delivery",
+    );
+    assert_rejected(
+        call_make_volume(&url, request.clone(), captured).await,
+        Code::Unauthenticated,
+        None,
+        "the same replay-scoped mutation delivered twice",
+    );
+
+    let transplanted =
+        mint_replay_scope_headers(&audience, &format!("{TONIC_RPC_PREFIX}/Ping"), &canonical_digest(&request), boot_epoch);
+    assert_rejected(
+        call_make_volume(&url, request.clone(), transplanted).await,
+        Code::Unauthenticated,
+        None,
+        "a replay-scoped Ping signature transplanted onto MakeVolume",
+    );
+
+    let stale_epoch = mint_replay_scope_headers(
+        &audience,
+        &format!("{TONIC_RPC_PREFIX}/MakeVolume"),
+        &canonical_digest(&request),
+        boot_epoch,
+    );
+    env.restart_server_preserving_data(Vec::new(), &child_env).await?;
+    rustfs_protos::evict_failed_connection(&url).await;
+    assert_rejected(
+        call_make_volume(&url, request.clone(), stale_epoch).await,
+        Code::Unauthenticated,
+        None,
+        "a replay-scoped signature captured before the receiving process restart",
+    );
+
+    let restarted_epoch = learn_boot_epoch_from_make_volume(&url, &audience).await;
+    assert_ne!(boot_epoch, restarted_epoch, "a restarted child process must advertise a new boot epoch");
+    let fresh_epoch = mint_replay_scope_headers(
+        &audience,
+        &format!("{TONIC_RPC_PREFIX}/MakeVolume"),
+        &canonical_digest(&request),
+        restarted_epoch,
+    );
+    assert_authenticated(
+        call_make_volume(&url, request, fresh_epoch).await,
+        "a replay-scoped mutation signed with the replacement process epoch",
+    );
+
+    stop_server(env, &url).await;
+    Ok(())
+}
+
+/// Strict replay scope leaves one authenticated v2 bootstrap: `Ping` carrying a fresh challenge.
+/// A mutating v2 request cannot use that lane; once the epoch proof is returned, the first v3
+/// mutation succeeds. This protects a server restart without reopening a general downgrade path.
+#[tokio::test]
+#[serial]
+async fn replay_scope_strict_requires_v3_after_ping_bootstrap_e2e() -> TestResult {
+    init_logging();
+    align_rpc_secret_with_server();
+    let env = start_server(&[(ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT, "true")]).await?;
+    let url = env.url.clone();
+    let audience = audience_of(&env);
+
+    let v2_request = make_volume_request("replay-scope-e2e-strict-v2");
+    assert_rejected(
+        call_make_volume(
+            &url,
+            v2_request.clone(),
+            mint_v2_headers(&audience, "MakeVolume", Some(&canonical_digest(&v2_request))),
+        )
+        .await,
+        Code::Unauthenticated,
+        None,
+        "a v2 mutation after replay-scope strictness is enabled",
+    );
+
+    let boot_epoch = learn_boot_epoch_from_ping(&url, &audience).await;
+    let request = make_volume_request("replay-scope-e2e-strict-v3");
+    let replay_scoped = mint_replay_scope_headers(
+        &audience,
+        &format!("{TONIC_RPC_PREFIX}/MakeVolume"),
+        &canonical_digest(&request),
+        boot_epoch,
+    );
+    assert_authenticated(
+        call_make_volume(&url, request, replay_scoped).await,
+        "a replay-scoped mutation after Ping bootstrap under strict replay scope",
+    );
 
     stop_server(env, &url).await;
     Ok(())
