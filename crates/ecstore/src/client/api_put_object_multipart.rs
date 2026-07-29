@@ -417,7 +417,7 @@ impl TransitionClient {
             bucket: complete_multipart_upload_result.bucket,
             key: complete_multipart_upload_result.key,
             etag: trim_etag(&complete_multipart_upload_result.etag),
-            version_id: self.raw_version_id(&h)?.unwrap_or_default().to_string(),
+            version_id: self.legacy_remote_version_id(&h)?,
             location: complete_multipart_upload_result.location,
             expiration: exp_time,
             expiration_rule_id: rule_id,

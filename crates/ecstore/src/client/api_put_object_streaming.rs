@@ -578,7 +578,7 @@ impl TransitionClient {
             key: object_name.to_string(),
             etag: trim_etag(h.get("ETag").and_then(|v| v.to_str().ok()).unwrap_or("")),
 
-            version_id: self.raw_version_id(h)?.unwrap_or_default().to_string(),
+            version_id: self.legacy_remote_version_id(h)?,
             size,
             expiration: exp_time,
             expiration_rule_id: rule_id,
