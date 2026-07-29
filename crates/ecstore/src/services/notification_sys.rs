@@ -1344,8 +1344,11 @@ async fn run_tier_config_reload_worker<F, Fut>(
                 }
                 TierConfigReloadFinish::Pending => retry_attempt = 0,
             },
-            TierConfigReloadOutcome::Terminal(_) => match sys.finish_tier_config_reload_worker(&host) {
+            TierConfigReloadOutcome::Terminal(err) => match sys.finish_tier_config_reload_worker(&host) {
                 TierConfigReloadFinish::Completed => {
+                    // This peer keeps the previous tier configuration for good, so record
+                    // why. Dropping the error here hides the only evidence of a divergent
+                    // node behind an outcome label that cannot be acted on.
                     warn!(
                         event = EVENT_NOTIFICATION_PEER_PROPAGATION,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1353,6 +1356,7 @@ async fn run_tier_config_reload_worker<F, Fut>(
                         action = "reload_transition_tier_config",
                         host,
                         outcome = "terminal",
+                        error = ?err,
                         "tier configuration reload stopped after a terminal outcome"
                     );
                     return;
