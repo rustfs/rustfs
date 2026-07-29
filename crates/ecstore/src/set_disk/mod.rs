@@ -572,8 +572,15 @@ where
                 )))),
                 Err(_) => {
                     tokio::spawn(async move {
-                        if let Ok(Ok(token)) = task.await {
-                            let _ = disk.release_snapshot_lease(&volume, &path, token).await;
+                        match timeout(crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL, &mut task).await {
+                            Ok(Ok(Ok(token))) => {
+                                let _ = disk.release_snapshot_lease(&volume, &path, token).await;
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                task.abort();
+                                let _ = task.await;
+                            }
                         }
                     });
                     Err(DiskError::Timeout)
@@ -5857,6 +5864,54 @@ mod tests {
                 .await
                 .expect("a token acquired after the deadline must be released"),
             crate::disk::DataDirDeleteStatus::Deleted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_lease_acquisition_aborts_permanently_pending_cleanup_at_ttl() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let (_dir, disk) = make_single_local_disk().await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let acquire_probe = Arc::clone(&dropped);
+        let lease = acquire_snapshot_leases_with_timeout(
+            &[Some(disk)],
+            "snapshot-lease-pending-cleanup",
+            "object/11111111-1111-1111-1111-111111111111",
+            1,
+            Duration::from_millis(10),
+            move |_disk, _volume, _path| {
+                let probe = DropProbe(Arc::clone(&acquire_probe));
+                async move {
+                    let _probe = probe;
+                    futures::future::pending().await
+                }
+            },
+        )
+        .await;
+        assert!(lease.is_none(), "a pending candidate must retain the namespace lock");
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "the late cleanup must initially retain the acquire task"
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::cluster::rpc::remote_disk::REMOTE_SNAPSHOT_LEASE_TTL).await;
+        for _ in 0..10 {
+            if dropped.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the TTL fallback must abort and drop a permanently pending acquire task"
         );
     }
 
