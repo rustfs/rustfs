@@ -337,9 +337,54 @@ impl From<DiskError> for std::io::Error {
     }
 }
 
+/// The single in-band representation of a failed internode RPC: it carries the
+/// typed `tonic::Status` so failure classifiers can read the gRPC code instead
+/// of substring-matching the rendered message (see `is_network_like_status`).
+/// Both `DiskError` and `StorageError` wrap statuses in this type, so one
+/// downcast recovers the status regardless of which error the status was
+/// converted into first.
+pub(crate) struct RpcStatusError(tonic::Status);
+
+impl RpcStatusError {
+    pub(crate) fn status(&self) -> &tonic::Status {
+        &self.0
+    }
+}
+
+impl From<tonic::Status> for RpcStatusError {
+    fn from(status: tonic::Status) -> Self {
+        Self(status)
+    }
+}
+
+impl std::fmt::Display for RpcStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `tonic::Status`'s own `Debug` prints its `MetadataMap`, i.e. every response
+/// header and trailer the peer sent. Those are remote-controlled and can carry
+/// credentials injected by a proxy in front of the peer, so keep them out of
+/// anything that reaches a log.
+impl std::fmt::Debug for RpcStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcStatusError")
+            .field("code", &self.0.code())
+            .field("message", &self.0.message())
+            .finish()
+    }
+}
+
+impl StdError for RpcStatusError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.0)
+    }
+}
+
 impl From<tonic::Status> for DiskError {
     fn from(e: tonic::Status) -> Self {
-        DiskError::other(e.message().to_string())
+        DiskError::Io(io::Error::other(RpcStatusError(e)))
     }
 }
 
