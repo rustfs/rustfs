@@ -700,7 +700,7 @@ async fn recover_unknown_upload_outcome(
     .map_err(Error::other)?;
 
     match lease
-        .probe_transition_candidate(&transaction.remote_object)
+        .probe_transition_candidate_for(&transaction.remote_object, transaction.transaction_id)
         .await
         .map_err(Error::other)?
     {

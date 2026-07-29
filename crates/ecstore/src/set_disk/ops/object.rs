@@ -3834,6 +3834,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
         transition_meta.insert("name".to_string(), object.to_string());
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut transition_meta,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            transaction.transaction_id.to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut transition_meta,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(transaction.backend_fingerprint),
+        );
 
         if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
             transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
