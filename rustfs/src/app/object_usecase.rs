@@ -116,7 +116,7 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
-use md5::Context as Md5Context;
+use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
@@ -801,7 +801,7 @@ pin_project! {
     struct ExtractArchiveEtagReader<R> {
         #[pin]
         inner: R,
-        md5: Md5Context,
+        md5: Md5,
         finished: bool,
         etag: Arc<Mutex<Option<String>>>,
     }
@@ -1854,7 +1854,7 @@ impl<R> ExtractArchiveEtagReader<R> {
     fn new(inner: R, etag: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             inner,
-            md5: Md5Context::new(),
+            md5: Md5::new(),
             finished: false,
             etag,
         }
@@ -1870,11 +1870,11 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
             Poll::Ready(Ok(())) => {
                 let filled = &buf.filled()[before..];
                 if !filled.is_empty() {
-                    this.md5.consume(filled);
+                    this.md5.update(filled);
                 } else if !*this.finished {
                     *this.finished = true;
                     if let Ok(mut etag) = this.etag.lock() {
-                        *etag = Some(format!("{:x}", this.md5.clone().finalize()));
+                        *etag = Some(hex_simd::encode_to_string(this.md5.clone().finalize(), hex_simd::AsciiCase::Lower));
                     }
                 }
                 Poll::Ready(Ok(()))

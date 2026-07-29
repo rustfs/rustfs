@@ -30,6 +30,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use http::header::{CONTENT_TYPE, HOST};
+use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
@@ -68,7 +69,9 @@ pub fn skip_if_kms_admin_tool_unavailable(test_name: &str) -> bool {
 }
 
 pub fn sse_customer_key_md5_base64(key: &str) -> String {
-    BASE64.encode(md5::compute(key).0)
+    let mut hasher = Md5::new();
+    hasher.update(key.as_bytes());
+    BASE64.encode(hasher.finalize())
 }
 
 pub async fn kms_admin_request(

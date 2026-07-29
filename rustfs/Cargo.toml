@@ -164,7 +164,7 @@ const-str = { workspace = true, features = ["std", "proc"] }
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 hex-simd.workspace = true
 matchit = { workspace = true }
-md5.workspace = true
+md-5 = { workspace = true }
 mime_guess = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
