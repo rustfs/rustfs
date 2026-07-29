@@ -111,7 +111,7 @@ assert_dependency_direction() {
 }
 
 run_layer_model_self_tests() {
-  local server_source app_source storage_source server_target admin_target app_target
+  local server_source app_source storage_source server_target admin_target app_target storage_target
 
   server_source="$(classify_source_layer rustfs/src/server/http.rs)"
   app_source="$(classify_source_layer rustfs/src/app/bucket_usecase.rs)"
@@ -119,9 +119,11 @@ run_layer_model_self_tests() {
   server_target="$(classify_target_layer server::http)"
   admin_target="$(classify_target_layer admin::router)"
   app_target="$(classify_target_layer app::bucket_usecase)"
+  storage_target="$(classify_target_layer storage::rpc)"
 
   assert_dependency_direction 'allowed' "$server_source" "$admin_target"
   assert_dependency_direction 'allowed' "$server_source" "$app_target"
+  assert_dependency_direction 'allowed' "$server_source" "$storage_target"
   assert_dependency_direction 'reverse' "$app_source" "$server_target"
   assert_dependency_direction 'reverse' "$storage_source" "$server_target"
   assert_dependency_direction 'reverse' "$app_source" "$admin_target"
