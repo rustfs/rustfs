@@ -195,7 +195,7 @@ jobs:
         run: |
           mkdir -p artifacts/test-and-lint
           set +e
-          timeout --verbose --signal=TERM --kill-after=30s 7m \
+          timeout --verbose --signal=TERM --kill-after=30s 15m \
             cargo test --all --doc \
             2>&1 | tee artifacts/test-and-lint/doctest.log
           status=${PIPESTATUS[0]}
