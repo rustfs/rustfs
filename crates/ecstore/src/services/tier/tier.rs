@@ -9274,7 +9274,8 @@ mod tests {
             version_id: "v1".to_string(),
             tier_name: "COLD-A".to_string(),
             backend_identity: Some(current_identity),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         };
         journal_store
             .insert_config_object(

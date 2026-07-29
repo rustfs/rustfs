@@ -120,19 +120,6 @@ fn snapshot_lease_ttl(ttl_ms: u64) -> Result<Duration, Status> {
     Ok(ttl)
 }
 
-#[cfg(test)]
-mod snapshot_lease_tests {
-    use super::{SNAPSHOT_LEASE_MAX_TTL, SNAPSHOT_LEASE_MIN_TTL, snapshot_lease_ttl};
-
-    #[test]
-    fn snapshot_lease_ttl_rejects_values_outside_server_bounds() {
-        assert!(snapshot_lease_ttl(4_999).is_err());
-        assert_eq!(snapshot_lease_ttl(5_000).unwrap(), SNAPSHOT_LEASE_MIN_TTL);
-        assert_eq!(snapshot_lease_ttl(300_000).unwrap(), SNAPSHOT_LEASE_MAX_TTL);
-        assert!(snapshot_lease_ttl(300_001).is_err());
-    }
-}
-
 fn decode_msgpack_or_json<T: DeserializeOwned>(
     binary: &[u8],
     json: &str,
@@ -1605,8 +1592,9 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        compat_response_json, decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_msgpack_named, encode_read_multiple_response_payloads,
+        SNAPSHOT_LEASE_MAX_TTL, SNAPSHOT_LEASE_MIN_TTL, compat_response_json, decode_msgpack_or_json,
+        encode_batch_read_version_response_payloads, encode_msgpack, encode_msgpack_named,
+        encode_read_multiple_response_payloads, snapshot_lease_ttl,
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
@@ -1617,6 +1605,14 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn snapshot_lease_ttl_rejects_values_outside_server_bounds() {
+        assert!(snapshot_lease_ttl(4_999).is_err());
+        assert_eq!(snapshot_lease_ttl(5_000).unwrap(), SNAPSHOT_LEASE_MIN_TTL);
+        assert_eq!(snapshot_lease_ttl(300_000).unwrap(), SNAPSHOT_LEASE_MAX_TTL);
+        assert!(snapshot_lease_ttl(300_001).is_err());
     }
 
     #[test]
