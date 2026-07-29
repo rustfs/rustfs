@@ -428,11 +428,11 @@ impl ECStore {
 }
 
 lazy_static! {
-    static ref enableObjcetLockConfig: ObjectLockConfiguration = ObjectLockConfiguration {
+    static ref ENABLED_OBJECT_LOCK_CONFIG: ObjectLockConfiguration = ObjectLockConfiguration {
         object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
         ..Default::default()
     };
-    static ref enableVersioningConfig: VersioningConfiguration = VersioningConfiguration {
+    static ref ENABLED_VERSIONING_CONFIG: VersioningConfiguration = VersioningConfiguration {
         status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
         ..Default::default()
     };
