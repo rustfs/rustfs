@@ -16,6 +16,7 @@ use crate::bucket::metadata_sys;
 use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
+use crate::cluster::rpc::set_tonic_mutation_body_digest;
 use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
@@ -930,10 +931,11 @@ impl PeerS3Client for RemotePeerS3Client {
             || async {
                 let options: String = serde_json::to_string(opts)?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(HealBucketRequest {
+                let mut request = Request::new(HealBucketRequest {
                     bucket: bucket.to_string(),
                     options,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
                 let response = client.heal_bucket(request).await?.into_inner();
                 if !response.success {
                     return if let Some(err) = response.error {
@@ -986,10 +988,11 @@ impl PeerS3Client for RemotePeerS3Client {
             || async {
                 let options = serde_json::to_string(opts)?;
                 let mut client = self.get_client().await?;
-                let request = Request::new(MakeBucketRequest {
+                let mut request = Request::new(MakeBucketRequest {
                     name: bucket.to_string(),
                     options,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
                 let response = client.make_bucket(request).await?.into_inner();
 
                 if !response.success {
@@ -1040,10 +1043,11 @@ impl PeerS3Client for RemotePeerS3Client {
                 let options = serde_json::to_string(opts)?;
                 let mut client = self.get_client().await?;
 
-                let request = Request::new(DeleteBucketRequest {
+                let mut request = Request::new(DeleteBucketRequest {
                     bucket: bucket.to_string(),
                     options,
                 });
+                set_tonic_mutation_body_digest(&mut request)?;
                 let response = client.delete_bucket(request).await?.into_inner();
                 if !response.success {
                     return if let Some(err) = response.error {
