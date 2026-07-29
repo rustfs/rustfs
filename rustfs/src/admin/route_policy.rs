@@ -434,6 +434,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}",
+        LIST_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v3/audit/target/list",
         GET_BUCKET_TARGET,
         RouteRiskLevel::Sensitive,
@@ -1825,13 +1837,17 @@ mod tests {
     }
 
     #[test]
-    fn route_policy_requires_set_tier_for_manual_transition_routes() {
+    fn route_policy_uses_tier_actions_for_transition_routes() {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
         assert_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", SET_TIER);
         assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SERVER_INFO);
         assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
         assert_not_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
     }
 
     #[test]

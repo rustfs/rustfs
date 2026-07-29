@@ -562,10 +562,12 @@ mod tests {
             },
             tier_sweeper::Jentry,
             transition_transaction::{
-                TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionRemoteVersion,
-                TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit,
-                TransitionTransactionState, load_transition_transaction_record, recover_transition_transaction_records,
-                save_transition_transaction_record,
+                TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionOperatorError,
+                TransitionOperatorProbe, TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode,
+                TransitionTransaction, TransitionTransactionInit, TransitionTransactionState,
+                delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
+                inspect_transition_transaction_for_operator, load_transition_transaction_record,
+                recover_transition_transaction_records, save_transition_transaction_record,
             },
         },
         client::transition_api::ReaderImpl,
@@ -575,6 +577,7 @@ mod tests {
         services::tier::{
             test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::{TIER_CONFIG_FILE, TierConfigMgr},
+            tier_config::{TierConfig, TierType, TierWasabi},
             tier_mutation_intent::{
                 TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
                 TierMutationIntentTarget, advance_tier_mutation_intent_record_idempotent, delete_tier_mutation_intent_record,
@@ -1161,6 +1164,37 @@ mod tests {
             .expect("transition transaction records should be listable")
             .objects
             .len()
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn register_transition_reconcile_test_tier(
+        handle: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+        tier_name: &str,
+    ) -> MockWarmBackend {
+        let backend = MockWarmBackend::new();
+        let mut manager = handle.write().await;
+        manager.tiers.insert(
+            tier_name.to_string(),
+            TierConfig {
+                version: "v1".to_string(),
+                tier_type: TierType::Wasabi,
+                name: tier_name.to_string(),
+                wasabi: Some(TierWasabi {
+                    name: tier_name.to_string(),
+                    endpoint: "https://s3.wasabisys.com".to_string(),
+                    access_key: "test-access-key".to_string(),
+                    secret_key: "test-secret-key".to_string(),
+                    bucket: "mock-tier".to_string(),
+                    prefix: format!("mock/{}/", uuid::Uuid::new_v4()),
+                    region: "us-east-1".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        manager
+            .install_test_driver(tier_name, Box::new(backend.clone()))
+            .expect("mock fallback tier driver should install");
+        backend
     }
 
     #[cfg(feature = "test-util")]
@@ -2738,7 +2772,7 @@ mod tests {
             .await;
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-            let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+            let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
             let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
                 .await
                 .expect("tier lease should resolve")
@@ -2812,6 +2846,157 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn operator_reconcile_deletes_exact_candidate_before_finalizing_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-operator-reconcile", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXOPERATOR";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(transaction.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("transaction should enter unknown upload outcome state");
+
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let candidate = bytes::Bytes::from_static(b"operator-confirmed transition candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let status = inspect_transition_transaction_for_operator(store.clone(), transaction.transaction_id)
+            .await
+            .expect("operator inspection should probe the candidate");
+        assert_eq!(status.probe, TransitionOperatorProbe::VersionedPresent(remote_version.clone()));
+
+        let wrong_version = uuid::Uuid::new_v4().to_string();
+        let err = delete_transition_candidate_for_operator(store.clone(), transaction.transaction_id, &wrong_version)
+            .await
+            .expect_err("a mismatched exact version must fail before deleting a candidate");
+        assert!(matches!(
+            err,
+            TransitionOperatorError::CandidateVersionMismatch {
+                expected,
+                actual: TransitionOperatorProbe::VersionedPresent(ref observed),
+            } if expected == wrong_version && observed == &remote_version
+        ));
+        assert!(backend.contains(&transaction.remote_object).await);
+        assert_eq!(backend.exact_remove_count(), 0);
+        load_transition_transaction_record(store.clone(), transaction.transaction_id)
+            .await
+            .expect("an incorrect exact version must retain the transaction journal");
+
+        let result = delete_transition_candidate_for_operator(store.clone(), transaction.transaction_id, &remote_version)
+            .await
+            .expect("operator-confirmed exact candidate should be deleted");
+        assert_eq!(result.status.probe, TransitionOperatorProbe::Missing);
+        assert!(result.journal_observed_after_delete);
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.remove_versions().await, vec![(transaction.remote_object.clone(), remote_version)]);
+        load_transition_transaction_record(store.clone(), transaction.transaction_id)
+            .await
+            .expect("candidate deletion must retain the transaction journal");
+
+        finalize_missing_transition_transaction_for_operator(store.clone(), transaction.transaction_id)
+            .await
+            .expect("a separately confirmed missing candidate should permit finalization");
+        assert!(matches!(
+            load_transition_transaction_record(store, transaction.transaction_id).await,
+            Err(Error::ConfigNotFound)
+        ));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn operator_finalize_retains_record_without_missing_proof() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-operator-fail-closed", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXOPERATORFAIL";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(transaction.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("transaction should enter unknown upload outcome state");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::Unsupported))
+            .await;
+
+        assert!(matches!(
+            finalize_missing_transition_transaction_for_operator(store.clone(), transaction.transaction_id).await,
+            Err(TransitionOperatorError::CandidateNotMissing(TransitionOperatorProbe::Unsupported))
+        ));
+        load_transition_transaction_record(store, transaction.transaction_id)
+            .await
+            .expect("an unsupported probe must retain the transaction journal");
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn transition_response_loss_persists_unknown_outcome_for_provider_recovery() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (ctx, store, _shutdown) =
@@ -2819,7 +3004,7 @@ mod tests {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
         let tier_name = "TXRESPONSELOSS";
-        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
         let bucket = "transition-response-loss-bucket";
         let object = "source.bin";
         store
