@@ -25,6 +25,9 @@ keywords = ["s3-select", "query-engine", "rustfs", "Minio", "data-retrieval"]
 categories = ["web-programming", "development-tools", "data-structures"]
 documentation = "https://docs.rs/rustfs-s3select-query/latest/rustfs_s3select_query/"
 
+[lints]
+workspace = true
+
 [dependencies]
 rustfs-s3select-api = { workspace = true }
 async-recursion = { workspace = true }
