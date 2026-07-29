@@ -9211,6 +9211,8 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "winapi-util",
+ "windows-sys 0.61.2",
  "xxhash-rust",
 ]
 

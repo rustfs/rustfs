@@ -470,7 +470,7 @@ pub(crate) mod ecstore_metrics {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -834,7 +834,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
     };
 
     for bucket in buckets {
-        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await?;
+        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
         let status = pool.get_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
@@ -959,6 +959,10 @@ pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
 pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_notification::new_global_notification_sys(endpoint_pools).await
+}
+
+pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
+    ecstore_notification::start_remote_version_state_fleet_probe(topology_fingerprint);
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
@@ -1458,8 +1462,8 @@ pub(crate) async fn update_bucket_metadata_config(
     Ok(updated_at)
 }
 
-pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
-    ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await
+pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {
