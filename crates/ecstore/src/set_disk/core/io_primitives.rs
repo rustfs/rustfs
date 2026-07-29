@@ -46,6 +46,7 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
+use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 use crate::disk::{
     DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
     PartTransactionAction, part_transaction_path,
@@ -3950,9 +3951,9 @@ impl SetDisks {
     /// * The set of referenced data dirs is the UNION of `get_data_dirs()` across
     ///   every online disk's `xl.meta`, so a dir named by *any* replica is kept.
     /// * If a disk holds the object directory but its `xl.meta` is missing or
-    ///   unparsable, the object is treated as degraded and NOTHING is removed —
-    ///   the unreadable copy could be the only one naming a live data dir, and a
-    ///   heal must run first.
+    ///   unparsable, the object is treated as degraded and unmarked data dirs are
+    ///   never removed. A data dir carrying a committed delete-transaction marker
+    ///   remains reclaimable after a downgrade/re-upgrade cleanup interruption.
     /// * Only subdirectories whose names parse as a UUID are ever considered;
     ///   removal is non-recursive-safe via a recursive delete of the full stray
     ///   data-dir path only.
@@ -3967,7 +3968,7 @@ impl SetDisks {
         // physical UUID subdirectories present on each disk. Abort on any degraded
         // copy so a healable object is never stripped of a referenced data dir.
         let mut referenced: HashSet<Uuid> = HashSet::new();
-        let mut per_disk_dirs: Vec<(usize, Vec<Uuid>)> = Vec::new();
+        let mut per_disk_dirs: Vec<(usize, Vec<(Uuid, bool)>)> = Vec::new();
         let mut healthy_metas = 0usize;
 
         for (i, disk) in disks.iter().enumerate() {
@@ -4001,6 +4002,22 @@ impl SetDisks {
                     if physical.is_empty() {
                         // Bare directory with no data dirs and no metadata: leave it
                         // to the orphan-dir / dangling-object heal paths.
+                        continue;
+                    }
+                    let mut committed = Vec::with_capacity(physical.len());
+                    for dir in physical {
+                        let data_dir = format!("{object}/{dir}");
+                        let committed_delete = disk.list_dir("", bucket, &data_dir, 0).await.is_ok_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry
+                                    .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
+                                    .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok())
+                            })
+                        });
+                        committed.push((dir, committed_delete));
+                    }
+                    if committed.iter().all(|(_, committed_delete)| *committed_delete) {
+                        per_disk_dirs.push((i, committed));
                         continue;
                     }
                     warn!(
@@ -4039,22 +4056,16 @@ impl SetDisks {
 
             healthy_metas += 1;
             if !physical.is_empty() {
-                per_disk_dirs.push((i, physical));
+                per_disk_dirs.push((i, physical.into_iter().map(|dir| (dir, false)).collect()));
             }
-        }
-
-        // No healthy metadata anywhere: this is not a live object, so surplus dirs
-        // (if any) belong to the dangling-object heal path, not here.
-        if healthy_metas == 0 {
-            return Ok(0);
         }
 
         // Phase 2: delete every physical data dir not referenced by the union.
         let mut removed = 0usize;
         for (i, physical) in per_disk_dirs {
             let Some(disk) = disks[i].as_ref() else { continue };
-            for dir in physical {
-                if referenced.contains(&dir) {
+            for (dir, committed_delete) in physical {
+                if referenced.contains(&dir) || (healthy_metas == 0 && !committed_delete) {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");

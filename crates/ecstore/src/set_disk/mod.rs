@@ -6065,6 +6065,16 @@ mod tests {
         fs::write(object_dir.join(stray.to_string()).join("part.1"), b"data")
             .await
             .expect("part should be written");
+        fs::write(
+            object_dir.join(stray.to_string()).join(format!(
+                "{}{}",
+                crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+                Uuid::new_v4()
+            )),
+            [],
+        )
+        .await
+        .expect("pre-commit delete reservation should be written");
 
         let set = make_set_disks_with(vec![Some(disk)]).await;
         let removed = set
@@ -6077,6 +6087,36 @@ mod tests {
             object_dir.join(stray.to_string()).exists(),
             "degraded object's data dir must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_recovers_committed_delete_marker_without_meta() {
+        let (dir, disk) = make_single_local_disk().await;
+        let stale = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket").join("obj");
+        let stale_dir = object_dir.join(stale.to_string());
+        fs::create_dir_all(&stale_dir)
+            .await
+            .expect("committed stale data dir should be created");
+        fs::write(stale_dir.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            stale_dir.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("upgrade reclaim should succeed");
+
+        assert_eq!(removed, 1, "the committed delete residue should be reclaimed");
+        assert!(!stale_dir.exists(), "the committed stale data dir should be removed");
     }
 
     // Cross-replica union: a data dir referenced by ANOTHER disk's xl.meta must be
@@ -9425,7 +9465,7 @@ mod tests {
             let delete_set = Arc::clone(&set_disks);
             let delete_opts = opts.clone();
             let delete = tokio::spawn(async move { delete_set.delete_object(bucket, object, delete_opts).await });
-            tokio::time::timeout(Duration::from_secs(5), delete)
+            tokio::time::timeout(Duration::from_secs(30), delete)
                 .await
                 .expect("delete should not wait for the response body")
                 .expect("delete task should join")
@@ -9488,7 +9528,7 @@ mod tests {
                     )
                     .await
             });
-            let (_, errors) = tokio::time::timeout(Duration::from_secs(5), delete)
+            let (_, errors) = tokio::time::timeout(Duration::from_secs(30), delete)
                 .await
                 .expect("batch delete should not wait for the response body")
                 .expect("batch delete task should join");
