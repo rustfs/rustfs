@@ -224,6 +224,21 @@ fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8])
         .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
 }
 
+fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
+    let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(result).map_err(Error::other)?;
+    if topology_member != expected_member {
+        return Err(Error::other(
+            "peer returned a remote version state capability for a different topology member",
+        ));
+    }
+    let server_epoch =
+        Uuid::from_slice(process_epoch).map_err(|_| Error::other("peer returned an invalid remote version state epoch"))?;
+    if server_epoch.is_nil() {
+        return Err(Error::other("peer returned a nil remote version state epoch"));
+    }
+    Ok(server_epoch)
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -235,6 +250,7 @@ pub struct PeerLiveEventsBatch {
 pub struct PeerRestClient {
     pub host: XHost,
     pub grid_host: String,
+    topology_member: String,
     offline: Arc<AtomicBool>,
     recovery_running: Arc<AtomicBool>,
 }
@@ -327,9 +343,11 @@ impl PeerRestClient {
     }
 
     pub fn new(host: XHost, grid_host: String) -> Self {
+        let topology_member = host.to_string();
         Self {
             host,
             grid_host,
+            topology_member,
             offline: Arc::new(AtomicBool::new(false)),
             recovery_running: Arc::new(AtomicBool::new(false)),
         }
@@ -349,7 +367,11 @@ impl PeerRestClient {
 
             let client = match grid_host {
                 Some(grid_host) => match XHost::try_from(peer_host_port.clone()) {
-                    Ok(host) => Some(PeerRestClient::new(host, grid_host)),
+                    Ok(host) => {
+                        let mut client = PeerRestClient::new(host, grid_host);
+                        client.topology_member = peer_host_port.clone();
+                        Some(client)
+                    }
                     Err(err) => {
                         warn!(peer = %peer_host_port, "Xhost parse failed while constructing peer client: {err:?}");
                         None
@@ -1159,6 +1181,15 @@ impl PeerRestClient {
             .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
             .await?;
         validate_heal_control_capability_proof(&canonical_ack, &proof)
+    }
+
+    pub async fn probe_remote_version_state(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::remote_version_state_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
@@ -2269,6 +2300,22 @@ mod tests {
                 .expect_err("proof must not authenticate a different command or result");
             assert!(err.to_string().contains("invalid heal control response proof"));
         }
+    }
+
+    #[test]
+    fn remote_version_state_capability_decoder_fails_closed() {
+        let epoch = Uuid::new_v4();
+        let result = rustfs_protos::encode_remote_version_state_capability("node-a:9000", epoch.as_bytes())
+            .expect("small capability response should encode");
+        assert_eq!(
+            decode_remote_version_state_capability("node-a:9000", &result).expect("valid epoch should decode"),
+            epoch
+        );
+        assert!(decode_remote_version_state_capability("node-b:9000", &result).is_err());
+        assert!(decode_remote_version_state_capability("node-a:9000", &result[..result.len() - 1]).is_err());
+        let nil = rustfs_protos::encode_remote_version_state_capability("node-a:9000", Uuid::nil().as_bytes())
+            .expect("small capability response should encode");
+        assert!(decode_remote_version_state_capability("node-a:9000", &nil).is_err());
     }
 
     struct TierMutationResponseFixture<'a> {
