@@ -830,12 +830,9 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
     if cache.info.name.is_empty() {
         return Err(ScannerError::Other("scanner cache root name is empty".to_string()));
     }
-    let entry = if cache.info.name == DATA_USAGE_ROOT {
-        cache.checked_flatten_complete(&cache.info.name)
-    } else {
-        cache.checked_flatten(&cache.info.name)
-    }
-    .ok_or_else(|| ScannerError::Other(format!("scanner cache root is missing or corrupt: {}", cache.info.name)))?;
+    let entry = cache
+        .checked_flatten_complete_scope(&cache.info.name)
+        .ok_or_else(|| ScannerError::Other(format!("scanner cache root is missing or corrupt: {}", cache.info.name)))?;
 
     Ok(DataUsageEntryInfo {
         name: cache.info.name.clone(),
@@ -1556,6 +1553,49 @@ mod publish_gate_tests {
                 invalid_current: None,
             } => {}
             _ => panic!("a legacy key format must enter the rebuild path"),
+        }
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn current_cache_snapshot_rejects_current_bucket_cache_with_detached_entry() {
+        let source = DataUsageCacheSource::new(1, 2);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 10,
+                last_update: Some(SystemTime::UNIX_EPOCH),
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            "bucket".to_string(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            "bucket/detached".to_string(),
+            DataUsageEntry {
+                objects: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cache.checked_flatten("bucket").map(|entry| entry.objects), Some(1));
+
+        match current_cache_root_or_prepare(&mut cache, "bucket", source, 10, 0, TEST_PLAN_DIGEST, true) {
+            DataUsageCacheScanState::Prepared {
+                outcome: DataUsageCachePrepareOutcome::Reset,
+                invalid_current: Some(_),
+            } => {}
+            _ => panic!("a detached complete bucket cache must enter the rebuild path"),
         }
         assert!(cache.cache.is_empty());
         assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
@@ -4863,6 +4903,31 @@ mod tests {
             },
         );
         assert!(cache_root_entry_info(&detached).is_err());
+
+        let mut detached_bucket = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        detached_bucket.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        detached_bucket.replace(
+            "bucket/detached",
+            "",
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        assert!(cache_root_entry_info(&detached_bucket).is_err());
 
         let mut compacted_with_child = DataUsageCache {
             info: DataUsageCacheInfo {

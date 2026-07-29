@@ -511,8 +511,8 @@ impl DataUsageCache {
             && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT;
         let reusable = metadata_is_reusable
             && (self.cache.is_empty()
-                || if name == DATA_USAGE_ROOT {
-                    self.checked_flatten_complete(name).is_some()
+                || if name == DATA_USAGE_ROOT || self.info.snapshot_complete {
+                    self.checked_flatten_complete_scope(name).is_some()
                 } else {
                     self.checked_flatten(name).is_some()
                 });
@@ -602,6 +602,21 @@ impl DataUsageCache {
         self.checked_flatten_inner(path)
             .filter(|(_, visited)| *visited == self.cache.len())
             .map(|(entry, _)| entry)
+    }
+
+    pub(crate) fn checked_flatten_complete_scope(&self, path: &str) -> Option<DataUsageEntry> {
+        if path == DATA_USAGE_ROOT {
+            return self.checked_flatten_complete(path);
+        }
+        let (entry, visited) = self.checked_flatten_inner(path)?;
+        let root_parent_only = {
+            let path_key = hash_path(path).key();
+            self.cache
+                .get(DATA_USAGE_ROOT)
+                .is_some_and(|root| root_is_parent_only(root, &path_key))
+        };
+        let expected_entries = self.cache.len().saturating_sub(usize::from(root_parent_only));
+        (visited == expected_entries).then_some(entry)
     }
 
     fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
@@ -1550,6 +1565,18 @@ fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut Has
             mark_with_depth(duc, ch, found, depth + 1);
         }
     }
+}
+
+fn root_is_parent_only(root: &DataUsageEntry, child: &str) -> bool {
+    root.children.len() == 1
+        && root.children.contains(child)
+        && root.size == 0
+        && root.objects == 0
+        && root.versions == 0
+        && root.delete_markers == 0
+        && root.replication_stats.is_none()
+        && !root.compacted
+        && root.failed_objects == 0
 }
 
 /// Trait for storage-specific operations on DataUsageCache
@@ -2696,6 +2723,48 @@ mod tests {
                 children: HashSet::from([hash_path("bucket/missing").key()]),
                 ..Default::default()
             },
+        );
+
+        let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_resets_complete_bucket_cache_with_detached_entry() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            hash_path("bucket").key(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            hash_path("bucket/detached").key(),
+            DataUsageEntry {
+                objects: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cache.checked_flatten("bucket").map(|entry| entry.objects), Some(1));
+        assert!(
+            cache.checked_flatten_complete("bucket").is_none(),
+            "complete bucket cache reuse must reject detached entries"
         );
 
         let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
