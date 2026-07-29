@@ -20,17 +20,66 @@ use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::service::ObjectEncryptionService;
 use arc_swap::ArcSwap;
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_KMS: &str = "kms";
 const LOG_SUBSYSTEM_SERVICE: &str = "service";
 const EVENT_KMS_SERVICE_STATE: &str = "kms_service_state";
+
+fn local_master_key_fingerprint(master_key: Option<&str>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update([u8::from(master_key.is_some())]);
+    if let Some(master_key) = master_key {
+        digest.update(master_key.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn validate_local_transition(current: Option<&KmsConfig>, new: &KmsConfig) -> Result<()> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let BackendConfig::Local(current_local) = &current.backend_config else {
+        return Ok(());
+    };
+    let BackendConfig::Local(new_local) = &new.backend_config else {
+        return Err(KmsError::configuration_error("Local KMS backend cannot be changed after configuration"));
+    };
+
+    if current_local.key_dir != new_local.key_dir {
+        return Err(KmsError::configuration_error(
+            "Local KMS key directory cannot be changed after configuration",
+        ));
+    }
+    if current_local.file_permissions != new_local.file_permissions {
+        return Err(KmsError::configuration_error(
+            "Local KMS file permissions cannot be changed after configuration",
+        ));
+    }
+    if current.allow_insecure_dev_defaults != new.allow_insecure_dev_defaults {
+        return Err(KmsError::configuration_error(
+            "Local KMS development mode cannot be changed after configuration",
+        ));
+    }
+
+    let current_master_key = local_master_key_fingerprint(current_local.master_key.as_deref());
+    let new_master_key = local_master_key_fingerprint(new_local.master_key.as_deref());
+    if !bool::from(current_master_key.ct_eq(&new_master_key)) {
+        return Err(KmsError::configuration_error(
+            "Local KMS master key cannot be changed after configuration",
+        ));
+    }
+
+    Ok(())
+}
 
 /// KMS service status
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -145,7 +194,9 @@ impl KmsServiceManager {
     {
         new_config.validate()?;
         let _guard = self.lifecycle_mutex.lock().await;
-        if self.state.load().current_service.is_some() {
+        let current = self.state.load_full();
+        validate_local_transition(current.config.as_ref(), &new_config)?;
+        if current.current_service.is_some() {
             return Err(KmsError::configuration_error(
                 "Cannot configure KMS while it is running; use reconfigure instead",
             ));
@@ -327,6 +378,7 @@ impl KmsServiceManager {
             "KMS service reconfiguring"
         );
         new_config.validate()?;
+        validate_local_transition(self.state.load().config.as_ref(), &new_config)?;
 
         // Create new service version without stopping old one
         // This allows existing operations to continue while new operations use new service
@@ -695,5 +747,106 @@ mod tests {
         manager.mark_health_error_if_current(old_version, &KmsError::backend_error("stale failure"));
 
         assert_eq!(manager.get_status().await, KmsServiceStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn forbidden_local_master_key_change_preserves_running_config_and_service() {
+        use crate::types::{CreateKeyRequest, KeyUsage};
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let key_dir = TempDir::new().expect("create local KMS directory");
+        let config = |master_key: &str| {
+            let mut config = KmsConfig::local(key_dir.path().to_path_buf());
+            let BackendConfig::Local(local) = &mut config.backend_config else {
+                panic!("local constructor must create local backend config");
+            };
+            local.master_key = Some(master_key.to_string());
+            config.allow_insecure_dev_defaults = true;
+            config
+        };
+        let manager = KmsServiceManager::new();
+        manager
+            .configure(config("working-master-key"))
+            .await
+            .expect("configure local KMS");
+        manager.start().await.expect("start local KMS");
+        manager
+            .get_manager()
+            .await
+            .expect("running KMS manager")
+            .create_key(CreateKeyRequest {
+                key_name: Some("existing-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("create encrypted key");
+        let service_version = manager.get_service_version().await;
+
+        let error = manager
+            .reconfigure(config("wrong-master-key"))
+            .await
+            .expect_err("local master key change must be rejected");
+
+        assert!(error.to_string().contains("master key cannot be changed"));
+        assert_eq!(manager.get_status().await, KmsServiceStatus::Running);
+        assert_eq!(manager.get_service_version().await, service_version);
+        let current = manager.get_config().await.expect("working config must remain");
+        let BackendConfig::Local(local) = current.backend_config else {
+            panic!("working config must remain local");
+        };
+        assert_eq!(local.master_key.as_deref(), Some("working-master-key"));
+    }
+
+    #[tokio::test]
+    async fn configure_cannot_replace_existing_local_backend() {
+        use base64::Engine as _;
+        use tempfile::TempDir;
+
+        let key_dir = TempDir::new().expect("create local KMS directory");
+        let mut local = KmsConfig::local(key_dir.path().to_path_buf());
+        local.allow_insecure_dev_defaults = true;
+        let manager = KmsServiceManager::new();
+        manager.configure(local.clone()).await.expect("configure local KMS");
+
+        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let error = manager
+            .configure(KmsConfig::static_kms("static-key".to_string(), encoded_key))
+            .await
+            .expect_err("existing local backend must be immutable");
+
+        assert!(error.to_string().contains("backend cannot be changed"));
+        let current = manager.get_config().await.expect("local config must remain");
+        assert!(matches!(current.backend_config, BackendConfig::Local(_)));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_allows_safe_local_runtime_settings_only() {
+        use tempfile::TempDir;
+
+        let key_dir = TempDir::new().expect("create local KMS directory");
+        let mut initial = KmsConfig::local(key_dir.path().to_path_buf());
+        initial.allow_insecure_dev_defaults = true;
+        let manager = KmsServiceManager::new();
+        manager.configure(initial.clone()).await.expect("configure local KMS");
+        manager.start().await.expect("start local KMS");
+
+        let mut updated = initial;
+        updated.default_key_id = Some("evaluation-key".to_string());
+        updated.timeout = std::time::Duration::from_secs(45);
+        updated.enable_cache = false;
+        manager
+            .reconfigure(updated.clone())
+            .await
+            .expect("update safe local settings");
+
+        let current = manager.get_config().await.expect("updated config");
+        assert_eq!(current.default_key_id, updated.default_key_id);
+        assert_eq!(current.timeout, updated.timeout);
+        assert!(!current.enable_cache);
     }
 }

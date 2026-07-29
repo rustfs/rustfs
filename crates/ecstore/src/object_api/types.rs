@@ -180,6 +180,7 @@ pub struct ObjectInfo {
     pub data_dir: Option<Uuid>,
     pub delete_marker: bool,
     pub transitioned_object: TransitionedObject,
+    pub transition_version_state: rustfs_filemeta::TransitionVersionState,
     pub restore_ongoing: bool,
     pub restore_expires: Option<OffsetDateTime>,
     pub user_tags: Arc<String>,
@@ -220,6 +221,7 @@ impl Clone for ObjectInfo {
             data_dir: self.data_dir,
             delete_marker: self.delete_marker,
             transitioned_object: self.transitioned_object.clone(),
+            transition_version_state: self.transition_version_state,
             restore_ongoing: self.restore_ongoing,
             restore_expires: self.restore_expires,
             user_tags: self.user_tags.clone(),
@@ -422,11 +424,11 @@ impl ObjectInfo {
 
         let transitioned_object = TransitionedObject {
             name: fi.transitioned_objname.clone(),
-            version_id: if let Some(transition_version_id) = fi.transition_version_id {
-                transition_version_id.to_string()
-            } else {
-                "".to_string()
-            },
+            version_id: fi
+                .transition_version
+                .clone()
+                .or_else(|| fi.transition_version_id.map(|version_id| version_id.to_string()))
+                .unwrap_or_default(),
             status: fi.transition_status.clone(),
             free_version: fi.tier_free_version(),
             tier: fi.transition_tier.clone(),
@@ -495,6 +497,7 @@ impl ObjectInfo {
             inlined,
             user_defined: Arc::new(metadata),
             transitioned_object,
+            transition_version_state: fi.transition_version_state,
             checksum: fi.checksum.clone(),
             storage_class,
             restore_ongoing,

@@ -20,6 +20,7 @@
 
 use super::container;
 use super::dlo;
+use super::metadata_update::MetadataUpdate;
 use super::object;
 use super::slo;
 use super::tempurl;
@@ -321,32 +322,15 @@ async fn handle_authenticated_request(
                     Err(SwiftError::NotImplemented("Swift Account HEAD operation not yet implemented".to_string()))
                 }
                 Method::POST => {
-                    // Account metadata update - extract headers
-                    let mut metadata = std::collections::HashMap::new();
+                    // Account metadata update. Additive, per Swift: the request
+                    // names the items to set (X-Account-Meta-*) and the items to
+                    // drop (X-Remove-Account-Meta-*, or an empty value), and
+                    // everything it does not name keeps its stored value. The
+                    // TempURL signing key lives here, so a replacing POST would
+                    // invalidate every outstanding signature for the account.
+                    let update = MetadataUpdate::from_account_headers(&headers);
 
-                    // Extract X-Account-Meta-* headers
-                    for (key, value) in &headers {
-                        let key_str = key.as_str();
-                        if let Some(meta_key) = key_str.strip_prefix("x-account-meta-") {
-                            // Strip "x-account-meta-"
-                            if let Ok(value_str) = value.to_str() {
-                                metadata.insert(meta_key.to_string(), value_str.to_string());
-                            }
-                        }
-                    }
-
-                    // Special handling for TempURL key headers
-                    // X-Account-Meta-Temp-URL-Key or X-Account-Meta-Temp-Url-Key
-                    if let Some(tempurl_key) = headers
-                        .get("x-account-meta-temp-url-key")
-                        .or_else(|| headers.get("x-account-meta-temp-Url-key"))
-                        && let Ok(key_str) = tempurl_key.to_str()
-                    {
-                        metadata.insert("temp-url-key".to_string(), key_str.to_string());
-                    }
-
-                    // Update account metadata
-                    super::account::update_account_metadata(&account, &metadata, &credentials_opt).await?;
+                    super::account::update_account_metadata(&account, &update, &credentials_opt).await?;
 
                     let trans_id = generate_trans_id();
                     Response::builder()
@@ -581,17 +565,15 @@ async fn handle_authenticated_request(
                         container::set_container_acl(&account, &container, new_read, new_write, &credentials).await?;
                     }
 
-                    // Update container metadata - now we have access to request headers
-                    let mut metadata = std::collections::HashMap::new();
-                    for (name, value) in headers.iter() {
-                        if let Some(meta_key) = name.as_str().strip_prefix("x-container-meta-")
-                            && let Ok(value_str) = value.to_str()
-                        {
-                            metadata.insert(meta_key.to_string(), value_str.to_string());
-                        }
-                    }
+                    // Update container metadata. Additive, per Swift: items the
+                    // request does not name keep their stored value, and removal
+                    // is explicit (X-Remove-Container-Meta-*, or an empty value).
+                    // Still called when the request named no item — an ACL-only
+                    // or versioning-only POST — because this is what reports 404
+                    // for a container that does not exist.
+                    let update = MetadataUpdate::from_container_headers(&headers);
 
-                    container::update_container_metadata(&account, &container, &credentials, metadata).await?;
+                    container::update_container_metadata(&account, &container, &credentials, update).await?;
 
                     let trans_id = generate_trans_id();
                     Response::builder()

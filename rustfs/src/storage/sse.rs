@@ -4694,32 +4694,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_kms_sse_dek_provider_uses_latest_reconfigured_service() {
+        use base64::Engine as _;
         use rustfs_kms::config::KmsConfig;
-        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
-        use tempfile::TempDir;
         let _guard = lock_sse_test_state().await;
 
         let manager = rustfs_kms::init_global_kms_service_manager();
 
-        let first_dir = TempDir::new().expect("first temp dir");
         manager
-            .reconfigure(KmsConfig::local(first_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .reconfigure(KmsConfig::static_kms("first-key".to_string(), BASE64_STANDARD.encode([0x11; 32])))
             .await
             .expect("first KMS reconfigure should succeed");
-        manager
-            .get_encryption_service()
-            .await
-            .expect("first encryption service should exist")
-            .create_key(CreateKeyRequest {
-                key_name: Some("first-key".to_string()),
-                key_usage: KeyUsage::EncryptDecrypt,
-                description: None,
-                policy: None,
-                tags: HashMap::new(),
-                origin: None,
-            })
-            .await
-            .expect("first key should be created");
 
         let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
             .await
@@ -4730,25 +4714,10 @@ mod tests {
             .await
             .expect("provider should use the initial service");
 
-        let second_dir = TempDir::new().expect("second temp dir");
         manager
-            .reconfigure(KmsConfig::local(second_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .reconfigure(KmsConfig::static_kms("second-key".to_string(), BASE64_STANDARD.encode([0x22; 32])))
             .await
             .expect("second KMS reconfigure should succeed");
-        manager
-            .get_encryption_service()
-            .await
-            .expect("second encryption service should exist")
-            .create_key(CreateKeyRequest {
-                key_name: Some("second-key".to_string()),
-                key_usage: KeyUsage::EncryptDecrypt,
-                description: None,
-                policy: None,
-                tags: HashMap::new(),
-                origin: None,
-            })
-            .await
-            .expect("second key should be created");
 
         provider
             .generate_sse_dek(&context, "second-key")

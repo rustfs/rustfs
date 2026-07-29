@@ -2892,7 +2892,7 @@ fn update_task_running_metric_for_task(active_heals: &HashMap<String, Arc<HealTa
     gauge!(
         "rustfs_heal_task_running",
         "type" => type_label.to_string(),
-        "set" => set_label.clone()
+        "set" => set_label
     )
     .set(count as f64);
 }
@@ -3482,7 +3482,7 @@ mod tests {
         );
 
         assert_eq!(queue.push(blocked), QueuePushOutcome::Accepted);
-        assert_eq!(queue.push(runnable.clone()), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(runnable), QueuePushOutcome::Accepted);
 
         let mut running = HashMap::new();
         running.insert("pool_0_set_1".to_string(), 1);

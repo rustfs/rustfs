@@ -1311,14 +1311,16 @@ mod tests {
             version_id: "version-a".to_string(),
             tier_name: tier_a.to_string(),
             backend_identity: Some(identity_a),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         };
         let entry_b = Jentry {
             obj_name: "remote-b".to_string(),
             version_id: "version-b".to_string(),
             tier_name: tier_b.to_string(),
             backend_identity: Some(identity_b),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         };
         let remove_a = backend_a.arm_failing_remove_barrier().await;
         persist_tier_delete_journal_entry(store_a.clone(), &entry_a)
@@ -2720,10 +2722,12 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn transition_transaction_recovery_deletes_provider_recovered_unknown_upload() {
         let versioned_remote = uuid::Uuid::new_v4().to_string();
+        let nil_remote = uuid::Uuid::nil().to_string();
         for (case, tier_name, remote_version) in [
             ("missing", "TXPROBEMISSING", None),
             ("unversioned", "TXPROBEUNVERSIONED", Some(String::new())),
             ("versioned", "TXPROBEVERSIONED", Some(versioned_remote)),
+            ("nil-version", "TXPROBENILVERSION", Some(nil_remote)),
         ] {
             let temp_dir = tempfile::tempdir().expect("create temp store dir");
             let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
