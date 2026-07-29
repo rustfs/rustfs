@@ -805,8 +805,21 @@ impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
         request: ReadEncryptionRequest<'_>,
     ) -> Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
         let metadata = normalize_encryption_metadata_case(request.metadata)?;
-        let (_, customer_key, customer_key_md5) =
+        let (customer_algorithm, customer_key, customer_key_md5) =
             extract_ssec_params_from_headers(request.headers).map_err(map_encryption_resolution_error)?;
+        if let Some(stored_algorithm) = metadata.get("x-amz-server-side-encryption-customer-algorithm") {
+            let request_algorithm = customer_algorithm.as_ref().ok_or_else(|| {
+                map_encryption_resolution_error(ssec_invalid_request(
+                    "The object was stored using a form of Server Side Encryption. \
+                     The correct parameters must be provided to retrieve the object.",
+                ))
+            })?;
+            if stored_algorithm != request_algorithm.as_str() {
+                return Err(map_encryption_resolution_error(ssec_invalid_request(
+                    "The provided encryption parameters did not match the ones used originally to encrypt the object.",
+                )));
+            }
+        }
         let material = sse_decryption(DecryptionRequest {
             bucket: request.bucket,
             key: request.object,
@@ -2881,6 +2894,47 @@ mod tests {
 
         assert_eq!(material.key_bytes, key);
         assert_eq!(material.mode, ReadEncryptionMode::Direct { base_nonce: nonce });
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_rejects_missing_or_invalid_ssec_algorithm() {
+        let key = [0x31; 32];
+        let key_b64 = BASE64_STANDARD.encode(key);
+        let key_md5 = md5_base64(key);
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+            ("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5.clone()),
+        ]);
+
+        for algorithm in [None, Some("AES128")] {
+            let mut headers = HeaderMap::new();
+            if let Some(algorithm) = algorithm {
+                headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static(algorithm));
+            }
+            headers.insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_str(&key_b64).expect("base64 key is a valid header"),
+            );
+            headers.insert(
+                "x-amz-server-side-encryption-customer-key-md5",
+                HeaderValue::from_str(&key_md5).expect("base64 MD5 is a valid header"),
+            );
+
+            let result = SseObjectEncryptionResolver
+                .resolve_read_material(ReadEncryptionRequest {
+                    bucket: "bucket",
+                    object: "object",
+                    metadata: &metadata,
+                    headers: &headers,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("missing or invalid SSE-C algorithm must fail closed"),
+            };
+
+            assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidRequest);
+        }
     }
 
     #[tokio::test]
