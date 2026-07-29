@@ -254,7 +254,7 @@ where
                     req.headers_mut().insert(REQUEST_ID_HEADER, request_id);
                 }
             }
-            RequestContext::from_headers_without_trace_context(req.headers())
+            RequestContext::from_propagated_headers(req.headers())
         };
         let request_id = if is_s3 {
             HeaderValue::from_str(&request_context.request_id).ok()
@@ -2367,6 +2367,39 @@ mod tests {
             let request = Request::builder().uri(path).body(()).expect("build non-S3 request");
             assert_non_s3_request_id_contract(request, path).await;
         }
+    }
+
+    #[tokio::test]
+    async fn non_s3_request_context_preserves_propagated_trace_context() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let capture = HeaderCaptureService::default();
+        let captured_context = capture.request_context();
+        let mut service = ExternalRequestContextLayer::default().layer(capture);
+        let request = Request::builder()
+            .uri("/rustfs/admin/v3/info")
+            .header(REQUEST_ID_HEADER, "client-request-id")
+            .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .body(())
+            .expect("build admin request");
+
+        let response = service.call(request).await.expect("admin response");
+        let context = captured_context
+            .lock()
+            .expect("captured request context")
+            .clone()
+            .expect("admin request context");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("client-request-id")
+        );
+        assert_eq!(context.request_id, "client-request-id");
+        assert_eq!(context.x_amz_request_id, "client-request-id");
+        assert_eq!(context.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(context.span_id.as_deref(), Some("00f067aa0ba902b7"));
     }
 
     #[test]
