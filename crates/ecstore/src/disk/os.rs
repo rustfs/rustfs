@@ -771,9 +771,26 @@ mod tests {
         }
     }
 
+    /// Holds a `warn_capture()` capture alive: the thread-local subscriber, plus
+    /// the pin that keeps tracing's process-global callsite-interest cache from
+    /// being decided by some other test's thread.
+    struct WarnCaptureGuard {
+        _subscriber: tracing::subscriber::DefaultGuard,
+        _callsite_pin: tracing::Dispatch,
+    }
+
     /// Capture WARN-level output on the current thread; tokio tests here run on
     /// the current-thread runtime, so the guard covers the whole test body.
-    fn warn_capture() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    ///
+    /// The callsite pin matters because `warn_reliable_rename_failure` is a
+    /// single production callsite shared with tests that call `rename_all`
+    /// *without* installing a subscriber — `rename_all_missing_source_returns_file_not_found`
+    /// is one. Whichever thread reaches it first fixes its `Interest`
+    /// process-wide, so without the pin that sibling can cache
+    /// `Interest::never()` and the WARN never fires here at all, leaving the
+    /// "must keep the WARN" assertions staring at empty output. See
+    /// [`crate::test_tracing::pin_callsite_interest_for_test`].
+    fn warn_capture() -> (CapturedLogs, WarnCaptureGuard) {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::WARN)
@@ -781,7 +798,10 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = WarnCaptureGuard {
+            _subscriber: tracing::subscriber::set_default(subscriber),
+            _callsite_pin: crate::test_tracing::pin_callsite_interest_for_test(),
+        };
         (logs, guard)
     }
 

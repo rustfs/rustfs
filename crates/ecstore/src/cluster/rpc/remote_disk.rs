@@ -5336,7 +5336,7 @@ mod tests {
         // production callsites that sibling tests exercise from subscriber-less
         // threads; without this they can be cached as `Interest::never()` and go
         // silently missing here.
-        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
 
         let endpoint = Endpoint {
             url: url::Url::parse("http://127.0.0.1:59996/data").expect("endpoint URL should parse"),
@@ -5395,7 +5395,7 @@ mod tests {
         // production callsites that sibling tests exercise from subscriber-less
         // threads; without this they can be cached as `Interest::never()` and go
         // silently missing here.
-        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
 
         let addr = "http://127.0.0.1:59997".to_string();
         let endpoint = Endpoint {

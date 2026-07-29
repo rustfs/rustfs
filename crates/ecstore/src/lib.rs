@@ -93,3 +93,6 @@ pub(crate) mod ecstore_validation_blackbox;
 
 #[cfg(test)]
 pub(crate) mod test_metrics;
+
+#[cfg(test)]
+pub(crate) mod test_tracing;
