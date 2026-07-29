@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::cluster::rpc::client::{
+    AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client,
+};
 use crate::cluster::rpc::set_tonic_mutation_body_digest;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -29,7 +31,6 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 /// Remote lock client implementation
@@ -78,7 +79,7 @@ impl RemoteClient {
         }
     }
 
-    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         // P3-2 offline bypass (now covering the lock path too): fast-fail a peer already marked
         // offline instead of paying the connect timeout, so dsync reaches quorum sooner. Does not
         // change quorum; the self-healing re-probe keeps the peer recoverable.

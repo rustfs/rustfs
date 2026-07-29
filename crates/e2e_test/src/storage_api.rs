@@ -16,9 +16,12 @@
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{VolumeInfo, WalkDirOptions};
+pub(crate) use rustfs_ecstore::api::rpc::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::rpc::{TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_signature_headers};
-pub(crate) use rustfs_ecstore::api::rpc::{TonicInterceptor, node_service_time_out_client_no_auth};
+pub(crate) use rustfs_ecstore::api::rpc::{
+    TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+    verify_tonic_boot_epoch_response,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{gen_tonic_signature_interceptor, node_service_time_out_client};
 
@@ -30,7 +33,7 @@ pub(crate) mod node_interact {
 }
 
 pub(crate) mod grpc_lock {
-    pub(crate) use super::{TonicInterceptor, node_service_time_out_client_no_auth};
+    pub(crate) use super::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 }
 
 /// Signing/transport surface used by the cross-process internode RPC signature
@@ -40,7 +43,8 @@ pub(crate) mod grpc_lock {
 #[cfg(test)]
 pub(crate) mod internode_rpc_signature {
     pub(crate) use super::{
-        TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_signature_headers, node_service_time_out_client_no_auth,
+        TONIC_RPC_PREFIX, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+        node_service_time_out_client_no_auth, verify_tonic_boot_epoch_response,
     };
 }
 

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
-    node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
+    AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error,
+    node_service_time_out_client, node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::http_auth::set_tonic_canonical_body_digest;
 use crate::cluster::rpc::internode_data_transport::{
@@ -71,7 +71,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
+use tonic::{Code, Request, service::interceptor::InterceptedService};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -1083,7 +1083,7 @@ impl RemoteDisk {
         internode_offline_bypass_reason(&self.addr).map(Error::other)
     }
 
-    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }
@@ -1096,7 +1096,7 @@ impl RemoteDisk {
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
-    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }

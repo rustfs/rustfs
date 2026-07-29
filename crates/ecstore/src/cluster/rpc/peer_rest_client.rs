@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
     is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
@@ -66,7 +66,6 @@ use std::{
 use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -412,7 +411,7 @@ impl PeerRestClient {
         (remote, all, remote_topology_hosts)
     }
 
-    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
@@ -433,7 +432,7 @@ impl PeerRestClient {
         &self,
     ) -> Result<
         rustfs_protos::proto_gen::node_service::heal_control_service_client::HealControlServiceClient<
-            InterceptedService<Channel, TonicInterceptor>,
+            InterceptedService<AuthenticatedChannel, TonicInterceptor>,
         >,
     > {
         if self.offline.load(Ordering::Acquire) {
@@ -454,7 +453,7 @@ impl PeerRestClient {
 
     async fn get_tier_mutation_control_client(
         &self,
-    ) -> Result<TierMutationControlServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
