@@ -58,6 +58,8 @@ const LOG_SUBSYSTEM_ILM_TRANSITION: &str = "ilm_transition";
 const EVENT_ADMIN_ILM_TRANSITION_STATE: &str = "admin_ilm_transition_state";
 
 static ACTIVE_MANUAL_TRANSITION_SCOPES: OnceLock<Mutex<Vec<ManualTransitionRunScope>>> = OnceLock::new();
+#[cfg(feature = "e2e-test-hooks")]
+const E2E_MANUAL_TRANSITION_CANCEL_BARRIER_ENV: &str = "RUSTFS_E2E_MANUAL_TRANSITION_CANCEL_BARRIER";
 static ACTIVE_MANUAL_TRANSITION_JOBS: OnceLock<Mutex<HashMap<Uuid, CancellationToken>>> = OnceLock::new();
 static MANUAL_TRANSITION_OWNER_ID: OnceLock<String> = OnceLock::new();
 
@@ -748,6 +750,10 @@ async fn start_manual_transition_job(
     let job_heartbeat_shutdown_token = heartbeat_shutdown_token.clone();
     spawn_manual_transition_job_heartbeat(store, job_id, scan_cancel_token, heartbeat_shutdown_token);
     tokio::spawn(async move {
+        #[cfg(feature = "e2e-test-hooks")]
+        if std::env::var_os(E2E_MANUAL_TRANSITION_CANCEL_BARRIER_ENV).is_some() {
+            job_scan_cancel_token.cancelled().await;
+        }
         let result = enqueue_transition_for_existing_objects_scoped(run_store.clone(), &bucket, run_options).await;
         if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, result).await
             && final_record.is_terminal()

@@ -737,6 +737,9 @@ impl BucketMetadata {
             }
             BUCKET_TAGGING_CONFIG => {
                 self.tagging_config_xml = data;
+                // Drop the parsed form (like lifecycle above) so clearing the
+                // payload can't leave stale parsed tags to be cached.
+                self.tagging_config = None;
                 self.tagging_config_updated_at = updated;
             }
             BUCKET_QUOTA_CONFIG_FILE => {
@@ -1316,6 +1319,30 @@ mod test {
 
         assert!(bm.lifecycle_config_xml.is_empty());
         assert!(bm.lifecycle_config.is_none());
+    }
+
+    /// Companion to the lifecycle case above. `parse_all_configs` skips empty
+    /// XML rather than clearing, so without the explicit reset a cleared
+    /// tagging config would keep serving the previously parsed tags.
+    #[test]
+    fn tagging_update_config_clears_parsed_config_on_delete() {
+        let mut bm = BucketMetadata::new("test-bucket");
+        let tagging_xml = br#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>"#;
+
+        bm.update_config(BUCKET_TAGGING_CONFIG, tagging_xml.to_vec())
+            .expect("tagging config should update");
+        bm.parse_all_configs().expect("tagging config should parse");
+        assert!(bm.tagging_config.is_some());
+
+        bm.update_config(BUCKET_TAGGING_CONFIG, Vec::new())
+            .expect("tagging config delete should update metadata");
+
+        assert!(bm.tagging_config_xml.is_empty());
+        assert!(bm.tagging_config.is_none());
+
+        // A re-parse must not resurrect them either.
+        bm.parse_all_configs().expect("cleared tagging should parse");
+        assert!(bm.tagging_config.is_none());
     }
 
     #[tokio::test]
