@@ -162,6 +162,23 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
         .expect("Failed to create test bucket");
 }
 
+async fn suspend_test_bucket(bucket: &str) {
+    DefaultBucketUsecase::from_global()
+        .execute_put_bucket_versioning(build_request(
+            PutBucketVersioningInput::builder()
+                .bucket(bucket.to_string())
+                .versioning_configuration(VersioningConfiguration {
+                    status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                    ..Default::default()
+                })
+                .build()
+                .expect("suspended versioning request should build"),
+            Method::PUT,
+        ))
+        .await
+        .expect("bucket versioning should be suspended");
+}
+
 async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) -> ObjectInfo {
     let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
@@ -2125,8 +2142,10 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
     let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    assert!(uploaded.version_id.is_none(), "fixture must create the null version");
     let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
     backend.clear_op_log().await;
+    let tier_gets_before_restore = backend.get_count().await;
 
     let get_barrier = backend.arm_get_barrier().await;
 
@@ -2196,6 +2215,20 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         completed.transitioned_object.status, "complete",
         "restore must not clear the transitioned state"
     );
+    assert!(
+        completed.version_id.is_none() || completed.version_id.is_some_and(|version_id| version_id.is_nil()),
+        "restore must complete on the original null version"
+    );
+    assert_eq!(
+        live_object_version_count(&ecstore, bucket.as_str(), object).await,
+        1,
+        "restore must not create a replacement UUID version"
+    );
+    assert_eq!(
+        backend.get_count().await - tier_gets_before_restore,
+        1,
+        "restore copy-back must fetch the tier exactly once"
+    );
 
     // The restored copy serves GET locally: no further tier GETs.
     let tier_gets_after_restore = backend.get_count().await;
@@ -2205,6 +2238,73 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         backend.get_count().await,
         tier_gets_after_restore,
         "GET of a restored object must be served locally, not from the tier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#4879"]
+async fn restore_object_usecase_completes_suspended_null_version_in_place() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+    let bucket = format!("test-api-restore-suspended-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/restore/suspended-null.bin";
+    let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+    assert!(uploaded.version_id.is_none(), "fixture must create the null version");
+    let _ = transition_uploaded_object_directly(&ecstore, bucket.as_str(), object, &tier_name, &uploaded).await;
+    suspend_test_bucket(bucket.as_str()).await;
+    backend.clear_op_log().await;
+    let tier_gets_before_restore = backend.get_count().await;
+    let get_barrier = backend.arm_get_barrier().await;
+
+    Box::pin(
+        usecase.execute_restore_object(build_request(
+            RestoreObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .restore_request(Some(RestoreRequest {
+                    days: Some(1),
+                    description: None,
+                    glacier_job_parameters: None,
+                    output_location: None,
+                    select_parameters: None,
+                    tier: None,
+                    type_: None,
+                }))
+                .build()
+                .expect("restore request should build"),
+            Method::POST,
+        )),
+    )
+    .await
+    .expect("suspended null-version restore should be accepted");
+
+    get_barrier.wait_until_paused().await;
+    get_barrier.release();
+    let completed = wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+
+    assert!(!completed.restore_ongoing, "the original null version must complete in place");
+    assert!(completed.restore_expires.is_some(), "completed restore must carry an expiry");
+    assert!(
+        completed.version_id.is_none() || completed.version_id.is_some_and(|version_id| version_id.is_nil()),
+        "suspended restore must remain on the null version"
+    );
+    assert_eq!(
+        live_object_version_count(&ecstore, bucket.as_str(), object).await,
+        1,
+        "suspended restore must not create a UUID version"
+    );
+    assert_eq!(
+        backend.get_count().await - tier_gets_before_restore,
+        1,
+        "suspended restore copy-back must fetch the tier exactly once"
     );
 }
 
