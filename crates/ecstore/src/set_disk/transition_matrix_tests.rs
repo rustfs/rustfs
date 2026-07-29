@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::*;
-use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
+use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time};
 use crate::ecstore_validation_blackbox::make_local_set_disks;
 use crate::services::tier::test_util::register_mock_tier;
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
 use tokio::io::AsyncReadExt;
 
 async fn prime_metadata_generation(set_disks: &SetDisks, bucket: &str, object: &str) -> GetObjectMetadataCacheKey {
@@ -83,12 +84,56 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
     let transitioned_generation = prime_metadata_generation(&set_disks, bucket, object).await;
     let mut restore_opts = ObjectOptions::default();
     restore_opts.transition.restore_request.days = Some(1);
-    Arc::clone(&set_disks)
-        .restore_transitioned_object(bucket, object, &restore_opts)
-        .await
-        .expect("restore should succeed");
+    let restore_started = OffsetDateTime::now_utc();
+    let expiry_from_restore_start = temp_env::async_with_vars(
+        [
+            ("RUSTFS_ILM_DEBUG_DAY_SECS", Some("1")),
+            ("RUSTFS_ILM_PROCESS_TIME", Some("1")),
+        ],
+        async {
+            let expiry_from_restore_start = expected_expiry_time(restore_started, 1);
+            let get_barrier = backend.arm_get_barrier().await;
+            let restore_set = Arc::clone(&set_disks);
+            let restore =
+                tokio::spawn(async move { restore_set.restore_transitioned_object(bucket, object, &restore_opts).await });
+            get_barrier.wait_until_paused().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if expected_expiry_time(OffsetDateTime::now_utc(), 1) > expiry_from_restore_start {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("test clock should cross the next accelerated lifecycle boundary");
+            get_barrier.release();
+            restore
+                .await
+                .expect("restore task should join")
+                .expect("restore should succeed");
+            expiry_from_restore_start
+        },
+    )
+    .await;
     assert_generation_reclaimed(&set_disks, &transitioned_generation).await;
     assert_eq!(backend.get_count().await, 1, "restore should read the remote candidate exactly once");
+
+    let restored_info = set_disks
+        .get_object_info(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("restored object metadata should be readable");
+    let restore_status = parse_restore_obj_status(
+        restored_info
+            .user_defined
+            .get(s3s::header::X_AMZ_RESTORE.as_str())
+            .expect("completed restore header should be present"),
+    )
+    .expect("completed restore header should parse");
+    assert!(
+        restore_status.expiry().expect("completed restore should have an expiry") > expiry_from_restore_start,
+        "restore expiry must be based on completion, not the time the remote copy started"
+    );
 
     let mut restored = Vec::new();
     set_disks

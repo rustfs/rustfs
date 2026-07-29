@@ -128,7 +128,7 @@ pub mod bucket {
             get_object_lock_config, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
             init_bucket_metadata_sys, list_bucket_targets, remove_bucket_metadata, set_bucket_metadata, update,
-            update_bucket_targets_under_transaction_lock,
+            update_bucket_targets_under_transaction_lock, update_config_with,
         };
     }
 
