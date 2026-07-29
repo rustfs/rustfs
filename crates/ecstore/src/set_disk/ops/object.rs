@@ -2810,11 +2810,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // rollback dir is present, no-op otherwise). This covers a disk that
             // staged + applied the delete and *then* errored, which the plain
             // `err.is_some()` skip would leave deleted while its peers were restored.
+            // On success only the successful disks' backup dirs need cleaning; errored
+            // disks' residue is reclaimed by heal/scanner.
+            if !should_rollback && err.is_some() {
+                continue;
+            }
+
             let Some(disk) = disks[index].as_ref() else {
                 continue;
             };
 
-            let cleanup_rollback = err.is_none();
             let disk = disk.clone();
             let bucket = bucket.to_string();
             let object = object.to_string();
@@ -2846,31 +2851,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     }
                 } else {
                     let rollback_path = format!("{object}/{rollback_dir}");
-                    if let Err(err) = disk
-                        .delete_version(
-                            &bucket,
-                            &object,
-                            fi,
-                            force_del_marker,
-                            DeleteOptions {
-                                finalize_delete: true,
-                                old_data_dir: Some(rollback_dir),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        warn!(
-                            bucket = %bucket,
-                            object = %object,
-                            rollback_dir = %rollback_dir,
-                            error = ?err,
-                            "failed to finalize lease-aware version delete"
-                        );
-                    }
-                    if !cleanup_rollback {
-                        return;
-                    }
                     if let Err(err) = disk
                         .delete(
                             &bucket,

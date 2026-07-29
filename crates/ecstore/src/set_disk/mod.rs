@@ -9450,6 +9450,61 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn streaming_get_snapshot_survives_concurrent_delete_objects() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "snapshot-streaming-delete-objects";
+            let object = "object";
+            let body = vec![0x41; 2 * 1024 * 1024];
+            let opts = ObjectOptions::default();
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = PutObjReader::from_vec(body.clone());
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("object should be written");
+
+            let mut snapshot = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .expect("snapshot reader should open");
+            let delete_set = Arc::clone(&set_disks);
+            let delete_opts = opts.clone();
+            let delete = tokio::spawn(async move {
+                delete_set
+                    .delete_objects(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: object.to_string(),
+                            ..Default::default()
+                        }],
+                        delete_opts,
+                    )
+                    .await
+            });
+            let (_, errors) = tokio::time::timeout(Duration::from_secs(5), delete)
+                .await
+                .expect("batch delete should not wait for the response body")
+                .expect("batch delete task should join");
+            assert!(errors.iter().all(Option::is_none));
+
+            let mut restored = Vec::new();
+            snapshot
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("leased snapshot should remain readable after batch delete");
+            assert_eq!(restored, body);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn set_level_batched_large_put_get_restores_body() {
         const BATCHED_LARGE_SIZE: usize = 64 * 1024 * 1024;

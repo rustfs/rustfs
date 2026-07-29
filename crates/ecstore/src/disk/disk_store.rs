@@ -886,7 +886,6 @@ impl LocalDiskWrapper {
                     immediate: false,
                     undo_write: false,
                     undo_delete: false,
-                    finalize_delete: false,
                     old_data_dir: None,
                 },
             )

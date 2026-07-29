@@ -1043,8 +1043,6 @@ pub struct DeleteOptions {
     pub undo_write: bool,
     #[serde(default)]
     pub undo_delete: bool,
-    #[serde(default)]
-    pub finalize_delete: bool,
     pub old_data_dir: Option<Uuid>,
 }
 
@@ -1285,7 +1283,6 @@ mod tests {
             immediate: false,
             undo_write: true,
             undo_delete: false,
-            finalize_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
         };
 
