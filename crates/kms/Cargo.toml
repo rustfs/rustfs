@@ -44,6 +44,7 @@ argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
+hex = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true, features = ["derive"] }
@@ -56,7 +57,7 @@ tempfile = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 
 # Additional dependencies
-md5 = { workspace = true }
+md-5 = { workspace = true }
 arc-swap = { workspace = true }
 rustfs-utils = { workspace = true }
 rustfs-security-governance = { workspace = true }
