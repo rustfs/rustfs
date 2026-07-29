@@ -545,6 +545,8 @@ pub struct ScannerMetrics {
     pub collected_at: DateTime<Utc>,
     #[serde(rename = "current_cycle")]
     pub current_cycle: u64,
+    #[serde(rename = "current_cycle_active", default, skip_serializing_if = "Option::is_none")]
+    pub current_cycle_active: Option<bool>,
     #[serde(rename = "current_started")]
     pub current_started: DateTime<Utc>,
     #[serde(rename = "cycle_complete_times")]
@@ -718,7 +720,31 @@ pub struct ScannerMetrics {
 }
 
 impl ScannerMetrics {
+    pub fn is_current_cycle_active(&self) -> bool {
+        self.current_cycle_active.unwrap_or(self.current_cycle > 0)
+    }
+
     pub fn merge(&mut self, other: &Self) {
+        // Legacy nodes omit the activity field and use a non-zero cycle as
+        // their active signal. New nodes publish explicit first-cycle and idle
+        // states, including cycle zero.
+        let self_cycle_active = self.is_current_cycle_active();
+        let other_cycle_active = other.is_current_cycle_active();
+        let self_cycle_authority = (
+            self_cycle_active,
+            self.current_cycle,
+            self.cycles_completed_at.len(),
+            self.cycles_completed_at.as_slice(),
+            self.current_started,
+        );
+        let other_cycle_authority = (
+            other_cycle_active,
+            other.current_cycle,
+            other.cycles_completed_at.len(),
+            other.cycles_completed_at.as_slice(),
+            other.current_started,
+        );
+        let other_cycle_is_authoritative = self_cycle_authority < other_cycle_authority;
         let other_is_newer = self.collected_at < other.collected_at;
         if other_is_newer {
             self.collected_at = other.collected_at;
@@ -854,15 +880,12 @@ impl ScannerMetrics {
             self.ongoing_buckets = other.ongoing_buckets;
         }
 
-        if self.current_cycle < other.current_cycle {
+        if other_cycle_is_authoritative {
             self.current_cycle = other.current_cycle;
             self.cycles_completed_at = other.cycles_completed_at.clone();
             self.current_started = other.current_started;
         }
-
-        if other.cycles_completed_at.len() > self.cycles_completed_at.len() {
-            self.cycles_completed_at = other.cycles_completed_at.clone();
-        }
+        self.current_cycle_active = Some(self_cycle_active || other_cycle_active);
 
         if !other.life_time_ops.is_empty() && self.life_time_ops.is_empty() {
             self.life_time_ops = other.life_time_ops.clone();
@@ -931,7 +954,13 @@ impl Metrics {
         if let Some(scanner) = other.scanner.as_ref() {
             match self.scanner {
                 Some(ref mut s_scanner) => s_scanner.merge(scanner),
-                None => self.scanner = Some(scanner.clone()),
+                None => {
+                    let mut scanner = scanner.clone();
+                    if scanner.current_cycle_active.is_none() {
+                        scanner.current_cycle_active = Some(scanner.is_current_cycle_active());
+                    }
+                    self.scanner = Some(scanner);
+                }
             }
         }
 
@@ -1388,6 +1417,280 @@ pub struct Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_metrics_serializes_cycle_active_presence() {
+        let missing_value = serde_json::to_value(ScannerMetrics::default()).expect("scanner metrics should serialize");
+        assert!(missing_value.get("current_cycle_active").is_none());
+        let missing: ScannerMetrics =
+            serde_json::from_value(missing_value).expect("older scanner metrics without cycle-active should decode");
+        assert_eq!(missing.current_cycle_active, None);
+
+        let explicit_false_value = serde_json::to_value(ScannerMetrics {
+            current_cycle_active: Some(false),
+            ..Default::default()
+        })
+        .expect("scanner metrics with explicit cycle-active should serialize");
+        assert_eq!(explicit_false_value["current_cycle_active"], serde_json::Value::Bool(false));
+        let explicit_false: ScannerMetrics =
+            serde_json::from_value(explicit_false_value).expect("explicit cycle-active should decode");
+        assert_eq!(explicit_false.current_cycle_active, Some(false));
+    }
+
+    #[test]
+    fn scanner_metrics_merge_prefers_an_active_first_cycle() {
+        let collected_at = Utc::now();
+        let idle_started = collected_at - chrono::Duration::hours(1);
+        let active_started = collected_at - chrono::Duration::seconds(5);
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            current_cycle: 0,
+            current_cycle_active: Some(false),
+            current_started: idle_started,
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle: 0,
+            current_cycle_active: Some(true),
+            current_started: active_started,
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 0);
+        assert_eq!(scanner.current_started, active_started);
+    }
+
+    #[test]
+    fn metrics_merge_preserves_explicit_active_first_cycle() {
+        let mut aggregated = Metrics::default();
+        aggregated.merge(&Metrics {
+            scanner: Some(ScannerMetrics {
+                current_cycle_active: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let scanner = aggregated.scanner.expect("aggregated scanner metrics");
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 0);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_legacy_nonzero_active_signal() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle: 7,
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 7);
+    }
+
+    #[test]
+    fn metrics_merge_normalizes_first_legacy_scanner_snapshot() {
+        let legacy = Metrics {
+            scanner: Some(ScannerMetrics {
+                current_cycle: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut aggregated = Metrics::default();
+
+        aggregated.merge(&legacy);
+
+        let scanner = aggregated.scanner.expect("aggregated scanner metrics");
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_explicit_inactive_nonzero_cycle() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics::default();
+
+        scanner.merge(&ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(false),
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.current_cycle_active, Some(false));
+        assert_eq!(scanner.current_cycle, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_cycle_active_is_order_independent() {
+        let collected_at = Utc::now();
+        let legacy_active = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_started: collected_at - chrono::Duration::seconds(10),
+            ..Default::default()
+        };
+        let explicit_idle = ScannerMetrics {
+            collected_at,
+            current_cycle: 0,
+            current_cycle_active: Some(false),
+            current_started: collected_at - chrono::Duration::hours(1),
+            ..Default::default()
+        };
+
+        let mut legacy_first = legacy_active.clone();
+        legacy_first.merge(&explicit_idle);
+        let mut legacy_second = explicit_idle.clone();
+        legacy_second.merge(&legacy_active);
+        assert_eq!(legacy_first.current_cycle_active, Some(true));
+        assert_eq!(legacy_second.current_cycle_active, Some(true));
+        assert_eq!(legacy_first.current_cycle, 7);
+        assert_eq!(legacy_second.current_cycle, 7);
+
+        let explicit_inactive_nonzero = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(false),
+            ..Default::default()
+        };
+        let mut inactive_first = explicit_inactive_nonzero.clone();
+        inactive_first.merge(&explicit_idle);
+        let mut inactive_second = explicit_idle;
+        inactive_second.merge(&explicit_inactive_nonzero);
+        assert_eq!(inactive_first.current_cycle_active, Some(false));
+        assert_eq!(inactive_second.current_cycle_active, Some(false));
+        assert_eq!(inactive_first.current_cycle, 7);
+        assert_eq!(inactive_second.current_cycle, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_cycle_authority_is_order_independent() {
+        let collected_at = Utc::now();
+        let completion = collected_at - chrono::Duration::minutes(1);
+        let earlier_active = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(true),
+            current_started: collected_at - chrono::Duration::seconds(10),
+            cycles_completed_at: vec![completion],
+            ..Default::default()
+        };
+        let later_active = ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle: 7,
+            current_cycle_active: Some(true),
+            current_started: collected_at - chrono::Duration::seconds(5),
+            cycles_completed_at: vec![completion],
+            ..Default::default()
+        };
+
+        let mut earlier_first = earlier_active.clone();
+        earlier_first.merge(&later_active);
+        let mut later_first = later_active.clone();
+        later_first.merge(&earlier_active);
+
+        assert_eq!(earlier_first.current_started, later_active.current_started);
+        assert_eq!(later_first.current_started, later_active.current_started);
+        assert_eq!(earlier_first.cycles_completed_at, later_active.cycles_completed_at);
+        assert_eq!(later_first.cycles_completed_at, later_active.cycles_completed_at);
+
+        let stale_idle = ScannerMetrics {
+            collected_at,
+            current_cycle_active: Some(false),
+            current_started: collected_at - chrono::Duration::hours(1),
+            ..Default::default()
+        };
+        let completed_idle = ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle_active: Some(false),
+            current_started: collected_at - chrono::Duration::seconds(5),
+            cycles_completed_at: vec![completion],
+            ..Default::default()
+        };
+
+        let mut stale_first = stale_idle.clone();
+        stale_first.merge(&completed_idle);
+        let mut completed_first = completed_idle.clone();
+        completed_first.merge(&stale_idle);
+
+        assert_eq!(stale_first.current_started, completed_idle.current_started);
+        assert_eq!(completed_first.current_started, completed_idle.current_started);
+        assert_eq!(stale_first.cycles_completed_at, completed_idle.cycles_completed_at);
+        assert_eq!(completed_first.cycles_completed_at, completed_idle.cycles_completed_at);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_cycle_authority_is_associative() {
+        let collected_at = Utc::now();
+        let older_completion = collected_at - chrono::Duration::minutes(3);
+        let last_completion = collected_at - chrono::Duration::minutes(1);
+        let cycle_seven = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(true),
+            current_started: collected_at - chrono::Duration::seconds(10),
+            cycles_completed_at: vec![older_completion, last_completion],
+            ..Default::default()
+        };
+        let cycle_eight = ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            current_cycle: 8,
+            current_cycle_active: Some(true),
+            current_started: collected_at - chrono::Duration::seconds(5),
+            cycles_completed_at: vec![last_completion],
+            ..Default::default()
+        };
+        let newer_idle = ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::hours(1),
+            current_cycle_active: Some(false),
+            current_started: collected_at - chrono::Duration::hours(1),
+            ..Default::default()
+        };
+
+        let mut left_associative = cycle_seven.clone();
+        left_associative.merge(&cycle_eight);
+        left_associative.merge(&newer_idle);
+
+        let mut right_group = cycle_eight.clone();
+        right_group.merge(&newer_idle);
+        let mut right_associative = cycle_seven.clone();
+        right_associative.merge(&right_group);
+
+        assert_eq!(left_associative.current_cycle, 8);
+        assert_eq!(right_associative.current_cycle, 8);
+        assert_eq!(left_associative.current_started, cycle_eight.current_started);
+        assert_eq!(right_associative.current_started, cycle_eight.current_started);
+        assert_eq!(left_associative.cycles_completed_at, cycle_eight.cycles_completed_at);
+        assert_eq!(right_associative.cycles_completed_at, cycle_eight.cycles_completed_at);
+
+        for order in [
+            [&cycle_seven, &cycle_eight, &newer_idle],
+            [&cycle_seven, &newer_idle, &cycle_eight],
+            [&cycle_eight, &cycle_seven, &newer_idle],
+            [&cycle_eight, &newer_idle, &cycle_seven],
+            [&newer_idle, &cycle_seven, &cycle_eight],
+            [&newer_idle, &cycle_eight, &cycle_seven],
+        ] {
+            let mut merged = ScannerMetrics::default();
+            for scanner in order {
+                merged.merge(scanner);
+            }
+            assert_eq!(merged.current_cycle_active, Some(true));
+            assert_eq!(merged.current_cycle, 8);
+            assert_eq!(merged.current_started, cycle_eight.current_started);
+            assert_eq!(merged.cycles_completed_at, cycle_eight.cycles_completed_at);
+        }
+    }
 
     #[test]
     fn scanner_metrics_merge_aggregates_partial_cycles_by_source() {
