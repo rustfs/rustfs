@@ -836,12 +836,15 @@ impl HttpReader {
 
         let stream_error_url = url.clone();
         let stream_error_method = method.clone();
-        let stream = resp.bytes_stream().map_err(move |e| {
-            record_internode_error(track_internode_metrics, internode_operation);
-            let classified = classify_transport_error(&e, e.is_timeout(), e.is_connect(), true);
-            record_internode_classified_error(track_internode_metrics, internode_operation, classified);
-            internode_reqwest_body_error(&stream_error_method, &stream_error_url, internode_operation, e)
-        });
+        let stream = hotpath::stream!(
+            resp.bytes_stream().map_err(move |e| {
+                record_internode_error(track_internode_metrics, internode_operation);
+                let classified = classify_transport_error(&e, e.is_timeout(), e.is_connect(), true);
+                record_internode_classified_error(track_internode_metrics, internode_operation, classified);
+                internode_reqwest_body_error(&stream_error_method, &stream_error_url, internode_operation, e)
+            }),
+            label = "RIO::HttpReader::response_body"
+        );
 
         Ok(Self {
             inner: StreamReader::new(Box::pin(stream)),
@@ -1008,9 +1011,21 @@ impl HttpWriter {
         let track_internode_metrics = is_internode_rpc_url(&url);
         let internode_operation = internode_rpc_operation(&url);
 
-        let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY);
-        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (sender, receiver) = hotpath::channel!(
+            tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY),
+            label = "RIO::HttpWriter::body_channel",
+            proxy = true
+        );
+        let (err_tx, err_rx) = hotpath::channel!(
+            tokio::sync::oneshot::channel::<io::Error>(),
+            label = "RIO::HttpWriter::error_channel",
+            proxy = true
+        );
+        let (start_tx, start_rx) = hotpath::channel!(
+            tokio::sync::oneshot::channel::<()>(),
+            label = "RIO::HttpWriter::start_channel",
+            proxy = true
+        );
 
         let handle = tokio::spawn(async move {
             if start_rx.await.is_err() {
@@ -1018,11 +1033,14 @@ impl HttpWriter {
             }
             record_internode_outgoing_request(track_internode_metrics, internode_operation);
 
-            let stream = ReceiverStream {
-                receiver,
-                track_internode_metrics,
-                internode_operation,
-            };
+            let stream = hotpath::stream!(
+                ReceiverStream {
+                    receiver,
+                    track_internode_metrics,
+                    internode_operation,
+                },
+                label = "RIO::HttpWriter::request_body"
+            );
             let body = reqwest::Body::wrap_stream(stream);
             // http_log!(
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"

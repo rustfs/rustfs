@@ -215,7 +215,7 @@ where
                 return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader workspace missing"));
             };
 
-            let (tx, rx) = mpsc::channel(1);
+            let (tx, rx) = hotpath::channel!(mpsc::channel(1), label = "ECStore::ErasureReader::fill_worker", proxy = true);
             rustfs_io_metrics::record_get_object_fill_worker_started(self.metrics_path, self.fill_policy.as_str());
             let task = tokio::spawn(run_fill_worker(
                 source,

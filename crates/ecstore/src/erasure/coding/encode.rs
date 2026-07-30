@@ -544,7 +544,11 @@ impl Erasure {
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = erasure_encode_max_inflight_bytes();
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
+        let (tx, mut rx) = hotpath::channel!(
+            mpsc::channel::<Vec<Bytes>>(inflight_blocks),
+            label = "ECStore::Erasure::encode_blocks",
+            proxy = true
+        );
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
@@ -692,7 +696,11 @@ impl Erasure {
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
         let batch_blocks = encode_batch_block_count().min(inflight_blocks);
         let channel_capacity = inflight_blocks.div_ceil(batch_blocks).max(1);
-        let (tx, mut rx) = mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity);
+        let (tx, mut rx) = hotpath::channel!(
+            mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity),
+            label = "ECStore::Erasure::encode_batches",
+            proxy = true
+        );
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
