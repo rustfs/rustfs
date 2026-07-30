@@ -120,6 +120,10 @@ pub enum KmsError {
     /// Persisted key record uses a format version unknown to this build
     #[error("Unsupported key format version {version:?} for key {key_id}")]
     UnsupportedFormatVersion { key_id: String, version: String },
+
+    /// Requested master key version has no persisted material for the key
+    #[error("Key version {version} not found for key {key_id}")]
+    KeyVersionNotFound { key_id: String, version: u32 },
 }
 
 impl KmsError {
@@ -251,6 +255,14 @@ impl KmsError {
         Self::UnsupportedFormatVersion {
             key_id: key_id.into(),
             version: version.into(),
+        }
+    }
+
+    /// Create a key version not found error
+    pub fn key_version_not_found<S: Into<String>>(key_id: S, version: u32) -> Self {
+        Self::KeyVersionNotFound {
+            key_id: key_id.into(),
+            version,
         }
     }
 }

@@ -14,6 +14,7 @@
 
 //! Vault-based KMS backend implementation using vaultrs
 
+use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
 use crate::backends::{BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -24,16 +25,14 @@ use base64::{Engine as _, engine::general_purpose};
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
-use vaultrs::{
-    client::{VaultClient, VaultClientSettingsBuilder},
-    kv2,
-};
+use vaultrs::kv2;
 
 /// Vault KMS client implementation
 pub struct VaultKmsClient {
-    client: VaultClient,
+    credentials: VaultCredentialProvider,
     config: VaultConfig,
     /// Mount path for the KV engine (typically "kv" or "secret")
     kv_mount: String,
@@ -100,49 +99,31 @@ impl VaultKmsClient {
     ///
     /// `attempt_timeout` caps every HTTP request issued through this client.
     pub async fn new(config: VaultConfig, attempt_timeout: Duration) -> Result<Self> {
-        // Create client settings
-        let mut settings_builder = VaultClientSettingsBuilder::default();
-        settings_builder.address(&config.address);
-        // Defense in depth against stalled connections: vaultrs leaves the
-        // underlying reqwest client without any timeout by default, so a hung
-        // request would otherwise wait forever regardless of the
-        // operation-level retry policy.
-        settings_builder.timeout(Some(attempt_timeout));
-
-        // Set authentication token based on method
-        let token = match &config.auth_method {
-            crate::config::VaultAuthMethod::Token { token } => token.clone(),
-            crate::config::VaultAuthMethod::AppRole { .. } => {
-                // For AppRole authentication, we would need to first authenticate
-                // and get a token. For simplicity, we'll require a token for now.
-                return Err(KmsError::backend_error(
-                    "AppRole authentication not yet implemented. Please use token authentication.",
-                ));
-            }
+        let source = token_source_for(&config.auth_method)?;
+        let settings = VaultConnectionSettings {
+            address: config.address.clone(),
+            namespace: config.namespace.clone(),
+            attempt_timeout,
         };
-
-        settings_builder.token(&token);
-
-        if let Some(namespace) = &config.namespace {
-            settings_builder.namespace(Some(namespace.clone()));
-        }
-
-        let settings = settings_builder
-            .build()
-            .map_err(|e| KmsError::backend_error(format!("Failed to build Vault client settings: {e}")))?;
-
-        let client =
-            VaultClient::new(settings).map_err(|e| KmsError::backend_error(format!("Failed to create Vault client: {e}")))?;
+        let credentials = VaultCredentialProvider::new(settings, source).await?;
 
         info!(address = %config.address, "Vault KMS backend connected");
 
         Ok(Self {
-            client,
+            credentials,
             kv_mount: config.kv_mount.clone(),
             key_path_prefix: config.key_path_prefix.clone(),
             config,
             dek_crypto: AesDekCrypto::new(),
         })
+    }
+
+    /// Snapshot the authenticated Vault client for a single request.
+    ///
+    /// Every Vault call takes its own snapshot so a credential rotation
+    /// applies to subsequent calls without interrupting in-flight ones.
+    fn vault(&self) -> Arc<VaultClientHandle> {
+        self.credentials.current()
     }
 
     /// Get the full path for a key in Vault
@@ -193,7 +174,7 @@ impl VaultKmsClient {
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let path = self.key_path(key_id);
 
-        kv2::set(&self.client, &self.kv_mount, &path, key_data)
+        kv2::set(&self.vault().client, &self.kv_mount, &path, key_data)
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to store key in Vault: {e}")))?;
 
@@ -242,11 +223,13 @@ impl VaultKmsClient {
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
         let path = self.key_path(key_id);
 
-        let secret: VaultKeyData = kv2::read(&self.client, &self.kv_mount, &path).await.map_err(|e| match e {
-            vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
-            vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-            _ => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
-        })?;
+        let secret: VaultKeyData = kv2::read(&self.vault().client, &self.kv_mount, &path)
+            .await
+            .map_err(|e| match e {
+                vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
+                vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+                _ => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
+            })?;
 
         debug!("Retrieved key {} from Vault, tags: {:?}", key_id, secret.tags);
         Ok(secret)
@@ -255,7 +238,7 @@ impl VaultKmsClient {
     /// List all keys stored in Vault
     async fn list_vault_keys(&self) -> Result<Vec<String>> {
         // List keys under the prefix
-        match kv2::list(&self.client, &self.kv_mount, &self.key_path_prefix).await {
+        match kv2::list(&self.vault().client, &self.kv_mount, &self.key_path_prefix).await {
             Ok(keys) => {
                 debug!("Found {} keys in Vault", keys.len());
                 Ok(keys)
@@ -279,7 +262,7 @@ impl VaultKmsClient {
 
         // For this specific key path, we can safely delete the metadata
         // since each key has its own unique path under the prefix
-        kv2::delete_metadata(&self.client, &self.kv_mount, &path)
+        kv2::delete_metadata(&self.vault().client, &self.kv_mount, &path)
             .await
             .map_err(|e| match e {
                 vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
@@ -311,6 +294,7 @@ impl KmsClient for VaultKmsClient {
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            master_key_version: None,
         };
 
         // Serialize the envelope as the ciphertext
