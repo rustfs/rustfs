@@ -547,12 +547,6 @@ impl PoolEndpointList {
                                 )
                             })?
                             .to_string();
-                        if canonical_domain != domain {
-                            endpoint
-                                .url
-                                .set_host(Some(&canonical_domain))
-                                .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to canonicalize endpoint host"))?;
-                        }
                         Host::Domain(canonical_domain)
                     }
                     Some(host) => host,
@@ -1041,15 +1035,20 @@ impl StartupTopologyPolicy {
             }
         };
 
-        let retry_max_delay = max_delay_env
-            .and_then(parse_wait_duration)
-            .unwrap_or(Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS));
-        if retry_max_delay.is_zero() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("{ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY} must be greater than zero"),
-            ));
+        let parsed_retry_max_delay = max_delay_env.and_then(parse_wait_duration);
+        if parsed_retry_max_delay.is_some_and(|duration| duration.is_zero()) {
+            // RUSTFS_COMPAT_TODO(rustfs-5416-zero-retry-delay): Keep zero on the safe default during direct upgrades. Remove after supported configurations no longer rely on the historical parser.
+            warn!(
+                event = "startup_topology_zero_retry_delay_defaulted",
+                component = "ecstore",
+                subsystem = "endpoint_topology",
+                state = "compat_default",
+                "zero startup topology retry delay was replaced with the safe default"
+            );
         }
+        let retry_max_delay = parsed_retry_max_delay
+            .filter(|duration| !duration.is_zero())
+            .unwrap_or(Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS));
 
         let wait_timeout = match mode {
             // Effectively unbounded unless the operator sets an explicit cap.
@@ -1187,6 +1186,7 @@ impl EndpointServerPools {
         disks_layout: &DisksLayout,
     ) -> Result<(EndpointServerPools, SetupType)> {
         let mut local_endpoint_host = get_env_opt_str(ENV_LOCAL_ENDPOINT_HOST);
+        let mut policy_override = None;
         let first_endpoint = disks_layout
             .pools
             .iter()
@@ -1221,19 +1221,31 @@ impl EndpointServerPools {
                 .into_string()
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not valid UTF-8"))?;
             let local_port = check_local_server_addr(server_addr)?.port();
-            local_endpoint_host = Some(
-                infer_kubernetes_local_endpoint_host(disks_layout, local_port, &kernel_hostname)?.ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        format!(
-                            "kernel hostname does not identify a distributed endpoint on port {local_port}; \
-set {ENV_LOCAL_ENDPOINT_HOST} explicitly"
-                        ),
-                    )
-                })?,
-            );
+            match infer_kubernetes_local_endpoint_host(disks_layout, local_port, &kernel_hostname)? {
+                Some(inferred_host) => local_endpoint_host = Some(inferred_host),
+                None => {
+                    // RUSTFS_COMPAT_TODO(rustfs-5416-kubernetes-alias-dns): Keep implicit DNS for pre-anchor Kubernetes aliases. Remove after supported charts always provide an explicit local endpoint host.
+                    if matches!(wait_mode.as_deref(), None | Some("") | Some("auto")) {
+                        policy_override = Some(StartupTopologyPolicy::resolve_from(
+                            Some("bounded"),
+                            true,
+                            distributed,
+                            get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT).as_deref(),
+                            get_env_opt_str(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY).as_deref(),
+                            false,
+                        )?);
+                    }
+                    warn!(
+                        event = "kubernetes_endpoint_identity_dns_fallback",
+                        component = "ecstore",
+                        subsystem = "endpoint_topology",
+                        state = "legacy_dns",
+                        "kernel hostname did not match a configured endpoint; using compatibility DNS locality"
+                    );
+                }
+            }
         }
-        Self::create_server_endpoints_with(server_addr, disks_layout, None, local_endpoint_host.as_deref()).await
+        Self::create_server_endpoints_with(server_addr, disks_layout, policy_override, local_endpoint_host.as_deref()).await
     }
 
     /// Same as [`create_server_endpoints`] but lets tests inject an explicit
@@ -1828,11 +1840,15 @@ mod test {
     }
 
     #[test]
-    fn startup_policy_rejects_zero_retry_delay_and_preserves_malformed_fallback() {
-        let err = StartupTopologyPolicy::resolve_from(Some("orchestrated"), true, true, None, Some("0"), false)
-            .expect_err("zero retry delay would create a DNS retry busy-loop");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(err.to_string().contains(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY));
+    fn startup_policy_defaults_zero_and_malformed_retry_delays() {
+        for zero in ["0", "0ms"] {
+            for explicit_local_host in [false, true] {
+                let policy =
+                    StartupTopologyPolicy::resolve_from(Some("orchestrated"), true, true, None, Some(zero), explicit_local_host)
+                        .expect("historical zero retry delays should use the safe default");
+                assert_eq!(policy.retry_max_delay, Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS));
+            }
+        }
 
         let malformed =
             StartupTopologyPolicy::resolve_from(Some("orchestrated"), true, true, None, Some("invalid-duration"), false)
@@ -2044,7 +2060,7 @@ mod test {
     #[tokio::test]
     async fn explicit_local_endpoint_host_selects_only_exact_host_and_server_port() {
         let args = vec![
-            "http://rustfs-0.rustfs-headless.ns.svc.cluster.local/data0",
+            "http://rustfs-0.rustfs-headless.ns.svc.cluster.local./data0",
             "http://rustfs-0.rustfs-headless.ns.svc.cluster.local.:9443/data1",
             "http://rustfs-0.rustfs-headless.ns.svc.cluster.local:9001/data2",
             "http://localhost:9443/data3",
@@ -2056,7 +2072,7 @@ mod test {
             "0.0.0.0:9443",
             &layout,
             Some(orchestrated),
-            Some("RUSTFS-0.RUSTFS-HEADLESS.NS.SVC.CLUSTER.LOCAL."),
+            Some("RUSTFS-0.RUSTFS-HEADLESS.NS.SVC.CLUSTER.LOCAL"),
         )
         .await
         .expect("equivalent FQDN spellings should form one local peer identity");
@@ -2066,7 +2082,7 @@ mod test {
         assert_eq!(setup_type, SetupType::DistErasure);
         assert_eq!(
             server_pools.0[0].endpoints.as_ref()[1].url.host_str(),
-            Some("rustfs-0.rustfs-headless.ns.svc.cluster.local")
+            Some("rustfs-0.rustfs-headless.ns.svc.cluster.local.")
         );
 
         let slots = server_pools.peer_grid_host_slots_sorted();
@@ -2214,12 +2230,13 @@ mod test {
 
     #[serial]
     #[tokio::test]
-    async fn create_server_endpoints_requires_an_unambiguous_kubernetes_identity() {
+    async fn create_server_endpoints_bounds_kubernetes_alias_dns_fallback() {
         async_with_vars(
             [
                 (ENV_LOCAL_ENDPOINT_HOST, None),
                 (ENV_KUBERNETES_SERVICE_HOST, Some("10.0.0.1")),
                 (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("auto")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, Some("0ms")),
             ],
             async {
                 let err = EndpointServerPools::from_volumes(
@@ -2232,8 +2249,37 @@ mod test {
                 .await
                 .unwrap_err();
 
-                assert_eq!(err.kind(), ErrorKind::InvalidInput);
-                assert!(err.to_string().contains(ENV_LOCAL_ENDPOINT_HOST));
+                assert_eq!(err.kind(), ErrorKind::Other);
+                assert!(err.to_string().contains(TOPOLOGY_TIMEOUT_HINT));
+                assert!(!err.to_string().contains(ENV_LOCAL_ENDPOINT_HOST));
+            },
+        )
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn create_server_endpoints_preserves_resolvable_kubernetes_aliases() {
+        async_with_vars(
+            [
+                (ENV_LOCAL_ENDPOINT_HOST, None),
+                (ENV_KUBERNETES_SERVICE_HOST, Some("10.0.0.1")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("auto")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, Some("0ms")),
+            ],
+            async {
+                let (pools, setup_type) = EndpointServerPools::from_volumes(
+                    "0.0.0.0:9000",
+                    vec![
+                        "http://localhost:9000/data0".to_string(),
+                        "http://localhost:9001/data1".to_string(),
+                    ],
+                )
+                .await
+                .expect("legacy DNS locality should preserve resolvable non-Pod aliases");
+
+                assert_eq!(local_flags(&pools.0[0].endpoints), vec![true, false]);
+                assert_eq!(setup_type, SetupType::DistErasure);
             },
         )
         .await;

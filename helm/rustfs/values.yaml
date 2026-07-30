@@ -40,7 +40,8 @@ startupWaitTimeoutSeconds: 300
 # set, because the chart cannot inspect runtime overrides hidden in that
 # Secret. Without injection, the server infers a unique matching domain
 # endpoint from its kernel hostname in Kubernetes auto/orchestrated mode; custom
-# aliases must configure RUSTFS_LOCAL_ENDPOINT_HOST explicitly. Set true for a
+# aliases retain bounded legacy DNS locality when no hostname matches. Configure
+# RUSTFS_LOCAL_ENDPOINT_HOST explicitly for DNS-free startup. Set true for a
 # credentials-only existing Secret or false to suppress chart injection.
 localEndpointHost:
   autoInject: null

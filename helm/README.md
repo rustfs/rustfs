@@ -67,8 +67,11 @@ than credentials, so the chart does not inject an anchor whenever
 then derives a DNS-free identity from the kernel hostname when exactly one
 domain endpoint at the server port has the same full hostname or first label.
 All-IP topologies retain direct IP locality detection. A domain topology with
-zero or multiple hostname matches fails before format initialization and must
-set `RUSTFS_LOCAL_ENDPOINT_HOST` explicitly. For a credentials-only Secret, set
+zero matches retains legacy DNS locality discovery; implicit auto mode bounds
+that compatibility path by `RUSTFS_STARTUP_TOPOLOGY_WAIT_TIMEOUT` (180 seconds
+by default). Multiple matching candidates remain an error. Set
+`RUSTFS_LOCAL_ENDPOINT_HOST` explicitly to avoid DNS discovery. For a
+credentials-only Secret, set
 `localEndpointHost.autoInject=true` to add the chart anchor without changing
 the historical ConfigMap-then-Secret `envFrom` precedence. If injection is
 explicitly enabled with an incompatible hidden `RUSTFS_VOLUMES`,
@@ -79,8 +82,9 @@ topology.
 When `config.rustfs.volumes` is set explicitly, the chart does not infer a
 local endpoint identity. RustFS applies the same kernel-hostname inference to
 custom domain topologies in Kubernetes auto/orchestrated mode; aliases that do
-not match the Pod hostname must provide `RUSTFS_LOCAL_ENDPOINT_HOST` through
-`extraEnv`. An explicit `RUSTFS_VOLUMES`, explicit
+not match the Pod hostname retain legacy DNS locality, with the bounded auto
+fallback described above. They may provide `RUSTFS_LOCAL_ENDPOINT_HOST`
+through `extraEnv` for DNS-free startup. An explicit `RUSTFS_VOLUMES`, explicit
 `RUSTFS_LOCAL_ENDPOINT_HOST`, bounded/dynamic or unrecognized startup mode, or
 `localEndpointHost.autoInject=false`, also disables chart injection. A
 `RUSTFS_ADDRESS` override alone does not disable it; the effective address and
@@ -89,6 +93,9 @@ configurations must resolve to `orchestrated` startup mode and must not receive
 a conflicting mode from an `envFrom` source.
 `startupWaitTimeoutSeconds` is retained for values-file compatibility but is
 deprecated and ignored.
+Historical `RUSTFS_STARTUP_TOPOLOGY_RETRY_MAX_DELAY` values of `0` or `0ms`
+are replaced with the safe default retry cap instead of causing a busy loop or
+blocking a direct upgrade.
 
 Upgrade the chart and RustFS image together. An older image that does not
 recognize `RUSTFS_LOCAL_ENDPOINT_HOST` retains its previous DNS-based startup
