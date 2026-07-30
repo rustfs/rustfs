@@ -18,7 +18,7 @@ Validated baseline: release pattern used in PR `#2957`.
 
 If target version is missing or ambiguous, stop and ask before editing.
 
-Reject any target version containing a `-preview.` suffix: preview identifiers are tag-only (see `rustfs-release-publish`) and must never be written into version files. If asked for one, stop and point to the release pipeline instead of editing.
+Reject any target version containing `-preview`: preview identifiers are tag-only (see `rustfs-release-publish`) and must never be written into version files. If asked for one, stop and point to the release pipeline instead of editing.
 
 ## Read before editing
 
