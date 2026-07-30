@@ -28,8 +28,26 @@ async fn remember_local_disk_id(disk: &DiskStore) -> Option<Uuid> {
 
 async fn remember_local_disk_id_with_instance_ctx(instance_ctx: &Arc<InstanceContext>, disk: &DiskStore) -> Option<Uuid> {
     let disk_id = disk.get_disk_id().await.ok().flatten()?;
-    runtime_sources::record_local_disk_id(instance_ctx, disk_id, disk.endpoint().to_string()).await;
-    Some(disk_id)
+    record_local_disk_id_if_active(instance_ctx, disk, disk_id)
+        .await
+        .then_some(disk_id)
+}
+
+async fn record_local_disk_id_if_active(instance_ctx: &Arc<InstanceContext>, disk: &DiskStore, disk_id: Uuid) -> bool {
+    let endpoint = disk.endpoint().to_string();
+    let local_disk_map = instance_ctx.local_disk_map();
+    let local_disks = local_disk_map.read().await;
+    let Some(active_disk) = local_disks.get(&endpoint).and_then(Option::as_ref) else {
+        return false;
+    };
+    if !Arc::ptr_eq(active_disk, disk) {
+        return false;
+    }
+
+    // Lock order is local_disk_map -> local_disk_id_map so quarantine is the
+    // linearization point for rejecting an in-flight stale disk snapshot.
+    instance_ctx.local_disk_id_map().write().await.insert(disk_id, endpoint);
+    true
 }
 
 pub async fn find_local_disk(disk_path: &str) -> Option<DiskStore> {
@@ -228,6 +246,7 @@ pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::new_disk;
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
 
     fn single_local_disk_pools(dir: &std::path::Path) -> EndpointServerPools {
@@ -313,5 +332,57 @@ mod tests {
                 "a sibling context must not observe another instance's disks"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stale_local_disk_snapshot_cannot_repopulate_the_id_registry() {
+        let temp_dir = tempfile::tempdir().expect("create temp disk dir");
+        let endpoint_pools = single_local_disk_pools(temp_dir.path());
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools)
+            .await
+            .expect("local disk should be registered");
+        let disk = instance_ctx
+            .local_disk_map()
+            .read()
+            .await
+            .values()
+            .find_map(|disk| disk.clone())
+            .expect("registered local disk");
+        let endpoint = disk.endpoint().to_string();
+        let disk_id = Uuid::new_v4();
+
+        let local_disk_map = instance_ctx.local_disk_map();
+        let mut quarantine = local_disk_map.write().await;
+        let replacement = new_disk(
+            &disk.endpoint(),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("replacement disk should initialize");
+        assert!(!Arc::ptr_eq(&disk, &replacement));
+        let task_ctx = instance_ctx.clone();
+        let task_disk = disk.clone();
+        let remember = tokio::spawn(async move { record_local_disk_id_if_active(&task_ctx, &task_disk, disk_id).await });
+        tokio::task::yield_now().await;
+        quarantine.insert(endpoint.clone(), Some(replacement.clone()));
+        drop(quarantine);
+
+        assert!(!remember.await.expect("stale lookup task should complete"));
+        assert!(!instance_ctx.local_disk_id_map().read().await.contains_key(&disk_id));
+        let active = instance_ctx
+            .local_disk_map()
+            .read()
+            .await
+            .get(&endpoint)
+            .cloned()
+            .flatten()
+            .expect("replacement disk should remain registered");
+        assert!(Arc::ptr_eq(&active, &replacement));
+        assert!(record_local_disk_id_if_active(&instance_ctx, &replacement, disk_id).await);
+        assert_eq!(instance_ctx.local_disk_id_map().read().await.get(&disk_id), Some(&endpoint));
     }
 }

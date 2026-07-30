@@ -16,6 +16,8 @@ use crate::config::storageclass;
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
+use crate::runtime::instance::InstanceContext;
+use crate::runtime::sources::{quarantine_local_disks, reconcile_local_disk_ids};
 use crate::{
     disk::{
         DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
@@ -26,7 +28,10 @@ use crate::{
     layout::endpoints::Endpoints,
 };
 use futures::{future::join_all, stream, stream::StreamExt};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -62,7 +67,20 @@ pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskSt
     (res, errors)
 }
 
+#[cfg(test)]
 pub async fn connect_load_init_formats(
+    first_disk: bool,
+    disks: &mut [Option<DiskStore>],
+    set_count: usize,
+    set_drive_count: usize,
+    deployment_id: Option<Uuid>,
+) -> Result<FormatV3> {
+    let instance_ctx = crate::runtime::global::current_ctx();
+    connect_load_init_formats_with_instance_ctx(&instance_ctx, first_disk, disks, set_count, set_drive_count, deployment_id).await
+}
+
+pub(crate) async fn connect_load_init_formats_with_instance_ctx(
+    instance_ctx: &Arc<InstanceContext>,
     first_disk: bool,
     disks: &mut [Option<DiskStore>],
     set_count: usize,
@@ -98,7 +116,7 @@ pub async fn connect_load_init_formats(
         match try_migrate_format(disks, &formats, set_count, set_drive_count).await {
             Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
-                retain_format_quorum_members(disks, &format, &quorum_members, set_drive_count).await?;
+                retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
                 return Ok(*format);
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
@@ -115,7 +133,7 @@ pub async fn connect_load_init_formats(
             Err(e) => return Err(e),
         }
         if all_unformatted {
-            let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
+            let fm = init_format_erasure(instance_ctx, disks, set_count, set_drive_count, deployment_id).await?;
             return Ok(fm);
         }
     }
@@ -140,12 +158,13 @@ pub async fn connect_load_init_formats(
         None => select_format_erasure_in_quorum(&formats, 0)?,
     };
     check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
-    retain_format_quorum_members(disks, &fm, &quorum_members, set_drive_count).await?;
+    retain_format_quorum_members(instance_ctx, disks, &fm, &quorum_members, set_drive_count).await?;
 
     Ok(fm)
 }
 
 async fn retain_format_quorum_members(
+    instance_ctx: &Arc<InstanceContext>,
     disks: &mut [Option<DiskStore>],
     format: &FormatV3,
     quorum_members: &[bool],
@@ -154,26 +173,73 @@ async fn retain_format_quorum_members(
     if set_drive_count == 0 || quorum_members.len() != disks.len() {
         return Err(Error::CorruptedFormat);
     }
-    for (disk, belongs_to_quorum) in disks.iter().zip(quorum_members) {
-        if !belongs_to_quorum && let Some(disk) = disk {
-            disk.set_disk_id(None).await?;
+
+    let pool_idx = disks
+        .iter()
+        .flatten()
+        .map(|disk| disk.endpoint().pool_idx)
+        .find_map(|pool_idx| usize::try_from(pool_idx).ok());
+    let registered_endpoints = if let Some(pool_idx) = pool_idx {
+        instance_ctx
+            .local_disk_set_drives()
+            .read()
+            .await
+            .get(pool_idx)
+            .map(|sets| {
+                sets.iter()
+                    .flat_map(|set| set.iter())
+                    .map(|disk| disk.as_ref().map(|disk| disk.endpoint()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|endpoints| endpoints.len() == disks.len())
+    } else {
+        None
+    };
+    let endpoints = disks
+        .iter()
+        .enumerate()
+        .map(|(index, disk)| {
+            disk.as_ref()
+                .map(|disk| disk.endpoint())
+                .or_else(|| registered_endpoints.as_ref()?.get(index)?.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let mut member_disk_ids = vec![None; disks.len()];
+    let mut local_pool_endpoints = Vec::new();
+    let mut selected_local_disk_ids = Vec::new();
+    let mut quarantined_endpoints = Vec::new();
+    for (index, ((disk, endpoint), belongs_to_quorum)) in disks.iter().zip(&endpoints).zip(quorum_members).enumerate() {
+        if let Some(endpoint) = endpoint.as_ref().filter(|endpoint| endpoint.is_local) {
+            local_pool_endpoints.push(endpoint.to_string());
+            if !belongs_to_quorum {
+                quarantined_endpoints.push(endpoint.clone());
+            }
         }
-    }
-    for (index, (disk, belongs_to_quorum)) in disks.iter().zip(quorum_members).enumerate() {
         if !belongs_to_quorum {
             continue;
         }
+        let disk = disk.as_ref().ok_or(Error::CorruptedFormat)?;
         let disk_id = format
             .erasure
             .sets
             .get(index / set_drive_count)
             .and_then(|set| set.get(index % set_drive_count))
+            .copied()
             .ok_or(Error::CorruptedFormat)?;
-        disk.as_ref()
-            .ok_or(Error::CorruptedFormat)?
-            .set_disk_id(Some(*disk_id))
-            .await?;
+        member_disk_ids[index] = Some(disk_id);
+        if disk.is_local() {
+            selected_local_disk_ids.push((disk_id, disk.endpoint().to_string()));
+        }
     }
+    quarantine_local_disks(instance_ctx, &quarantined_endpoints).await?;
+
+    for (disk, disk_id) in disks.iter().zip(member_disk_ids) {
+        if let Some(disk) = disk {
+            disk.set_disk_id_state(disk_id).await?;
+        }
+    }
+    reconcile_local_disk_ids(instance_ctx, &local_pool_endpoints, &selected_local_disk_ids).await;
     for (disk, belongs_to_quorum) in disks.iter_mut().zip(quorum_members) {
         if !belongs_to_quorum {
             *disk = None;
@@ -207,7 +273,8 @@ pub fn check_disk_fatal_errs(errs: &[Option<DiskError>]) -> disk::error::Result<
 }
 
 async fn init_format_erasure(
-    disks: &[Option<DiskStore>],
+    instance_ctx: &Arc<InstanceContext>,
+    disks: &mut [Option<DiskStore>],
     set_count: usize,
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
@@ -227,9 +294,11 @@ async fn init_format_erasure(
         }
     }
 
-    save_format_file_all(disks, &fms).await?;
-
-    get_format_erasure_in_quorum(&fms, 0)
+    write_format_file_all(disks, &fms).await?;
+    let format = get_format_erasure_in_quorum(&fms, 0)?;
+    let quorum_members = vec![true; disks.len()];
+    retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
+    Ok(format)
 }
 
 /// Outcome of attempting to migrate an on-disk MinIO `format.json`.
@@ -348,44 +417,59 @@ async fn try_migrate_format(
         .iter()
         .zip(&formats_to_write)
         .zip(rustfs_formats)
-        .filter(|&((disk, _), existing)| disk.is_some() && existing.is_none())
-        .map(|((disk, format), _)| save_format_file(disk, format));
+        .filter_map(|((disk, format), existing)| {
+            if existing.is_some() {
+                return None;
+            }
+            Some(write_format_file(disk.as_ref()?, format.as_ref()?))
+        });
     let mut write_error = None;
     for result in join_all(writes).await {
         if let Err(error) = result {
             write_error.get_or_insert(error);
         }
     }
-    for disk in disks.iter().flatten() {
-        disk.set_disk_id(None).await?;
-    }
-
     let (persisted_formats, persisted_errors) = load_format_erasure_all(disks, false).await;
+    let Some((persisted_format, quorum_members)) =
+        select_persisted_migration_format(&persisted_formats, persisted_errors, &format, set_drive_count, write_error)?
+    else {
+        return Ok(LegacyFormatOutcome::Incompatible);
+    };
+
+    Ok(LegacyFormatOutcome::Migrated {
+        format: Box::new(persisted_format),
+        quorum_members,
+    })
+}
+
+fn select_persisted_migration_format(
+    persisted_formats: &[Option<FormatV3>],
+    persisted_errors: Vec<Option<DiskError>>,
+    reference: &FormatV3,
+    set_drive_count: usize,
+    write_error: Option<DiskError>,
+) -> Result<Option<(FormatV3, Vec<bool>)>> {
+    if !formats_match_reference_slots(persisted_formats, reference, 0) {
+        return Ok(None);
+    }
+    let quorum_error = match select_format_erasure_in_quorum(persisted_formats, 0) {
+        Ok((format, quorum_members)) => {
+            check_format_erasure_value_for_topology(&format, persisted_formats.len(), set_drive_count)?;
+            return Ok(Some((format, quorum_members)));
+        }
+        Err(error) => error,
+    };
     if let Some(error) = persisted_errors
         .into_iter()
         .flatten()
         .find(|error| !matches!(error, DiskError::UnformattedDisk | DiskError::DiskNotFound))
     {
         return match error {
-            DiskError::CorruptedFormat | DiskError::CorruptedBackend | DiskError::InconsistentDisk => {
-                Ok(LegacyFormatOutcome::Incompatible)
-            }
+            DiskError::CorruptedFormat | DiskError::CorruptedBackend | DiskError::InconsistentDisk => Ok(None),
             error => Err(error.into()),
         };
     }
-    if !formats_match_reference_slots(&persisted_formats, &format, 0) {
-        return Ok(LegacyFormatOutcome::Incompatible);
-    }
-    let (persisted_format, quorum_members) = match select_format_erasure_in_quorum(&persisted_formats, 0) {
-        Ok(selected) => selected,
-        Err(error) => return Err(write_error.map_or(error, Into::into)),
-    };
-    check_format_erasure_value_for_topology(&persisted_format, disks.len(), set_drive_count)?;
-
-    Ok(LegacyFormatOutcome::Migrated {
-        format: Box::new(persisted_format),
-        quorum_members,
-    })
+    Err(write_error.map_or(quorum_error, Into::into))
 }
 
 fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
@@ -676,13 +760,12 @@ pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> disk::error::R
     Ok(fm)
 }
 
-async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<FormatV3>]) -> disk::error::Result<()> {
-    let mut futures = Vec::with_capacity(disks.len());
-
-    for (i, disk) in disks.iter().enumerate() {
-        futures.push(save_format_file(disk, &formats[i]));
-    }
-
+async fn write_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<FormatV3>]) -> disk::error::Result<()> {
+    let futures = disks.iter().zip(formats).map(|(disk, format)| async move {
+        let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        let format = format.as_ref().ok_or_else(|| DiskError::other("format is none"))?;
+        write_format_file(disk, format).await
+    });
     let mut errors = Vec::with_capacity(disks.len());
 
     let results = join_all(futures).await;
@@ -713,6 +796,13 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
         return Err(DiskError::other("format is none"));
     };
 
+    write_format_file(disk, format).await?;
+    disk.set_disk_id(Some(format.erasure.this)).await?;
+
+    Ok(())
+}
+
+async fn write_format_file(disk: &DiskStore, format: &FormatV3) -> disk::error::Result<()> {
     let json_data = format.to_json()?;
 
     let tmpfile = Uuid::new_v4().to_string();
@@ -722,8 +812,6 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
 
     disk.rename_file(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await?;
-
-    disk.set_disk_id(Some(format.erasure.this)).await?;
 
     Ok(())
 }
@@ -738,7 +826,9 @@ pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::layout::endpoint::Endpoint;
-    use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
+    use crate::runtime::global::{current_ctx, reset_local_disk_test_state};
+    use crate::runtime::sources::{local_disk_path_by_id, record_local_disks};
+    use crate::store::peer::{find_local_disk_by_ref, prewarm_local_disk_id_map_with_instance_ctx};
     use serial_test::serial;
 
     async fn local_disks(count: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
@@ -1045,7 +1135,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn existing_format_load_publishes_only_validated_quorum_disk_ids() {
-        clear_local_disk_id_map_for_test().await;
+        reset_local_disk_test_state().await;
         let (_temp_dir, mut disks) = local_disks(5).await;
         let canonical = FormatV3::new(1, 5);
         for (index, disk) in disks.iter().enumerate().take(3) {
@@ -1055,19 +1145,56 @@ mod tests {
                 .await
                 .expect("canonical format should be written");
         }
-        let mut wrong_slot = canonical.clone();
-        wrong_slot.erasure.this = wrong_slot.erasure.sets[0][0];
-        save_format_file(&disks[3], &Some(wrong_slot))
-            .await
-            .expect("wrong-slot format should be written");
+        let canonical_id = canonical.erasure.sets[0][0];
         let mut foreign = FormatV3::new(1, 5);
         foreign.erasure.this = foreign.erasure.sets[0][4];
         let foreign_id = foreign.erasure.this;
         save_format_file(&disks[4], &Some(foreign))
             .await
             .expect("foreign format should be written");
-        let canonical_id = canonical.erasure.sets[0][0];
+        let mut collision = FormatV3::new(1, 5);
+        collision.erasure.sets[0][3] = canonical_id;
+        collision.erasure.this = canonical_id;
+        save_format_file(&disks[3], &Some(collision))
+            .await
+            .expect("foreign collision format should be written");
         let canonical_endpoint = disks[0].as_ref().expect("canonical disk should exist").endpoint().to_string();
+        let collision_endpoint = disks[3].as_ref().expect("collision disk should exist").endpoint().to_string();
+        let foreign_endpoint = disks[4].as_ref().expect("foreign disk should exist").endpoint().to_string();
+        let prewarm_endpoints = Endpoints::from(
+            disks
+                .iter()
+                .map(|disk| disk.as_ref().expect("test disk should exist").endpoint())
+                .collect::<Vec<_>>(),
+        );
+        for disk in disks.iter().flatten() {
+            disk.set_disk_id(None).await.expect("test disk ID should be reset");
+        }
+        let (prewarm_disks, prewarm_errors) = init_disks(
+            &prewarm_endpoints,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await;
+        assert!(prewarm_errors.iter().all(Option::is_none));
+        let prewarm_disks = prewarm_disks
+            .into_iter()
+            .map(|disk| disk.expect("prewarm disk should exist"))
+            .collect::<Vec<_>>();
+        let instance_ctx = current_ctx();
+        record_local_disks(&instance_ctx, prewarm_disks.clone()).await;
+        *instance_ctx.local_disk_set_drives().write().await = vec![vec![prewarm_disks.into_iter().map(Some).collect()]];
+        prewarm_local_disk_id_map_with_instance_ctx(&instance_ctx).await;
+        instance_ctx
+            .local_disk_id_map()
+            .write()
+            .await
+            .insert(canonical_id, collision_endpoint.clone());
+        assert!(local_disk_path_by_id(&foreign_id).await.is_some(), "foreign ID should be prewarmed");
+        assert_eq!(local_disk_path_by_id(&canonical_id).await, Some(collision_endpoint));
+        disks[4] = None;
 
         connect_load_init_formats(true, &mut disks, 1, 5, None)
             .await
@@ -1075,9 +1202,51 @@ mod tests {
 
         assert!(disks[..3].iter().all(Option::is_some));
         assert!(disks[3..].iter().all(Option::is_none));
-        assert_eq!(local_disk_path_by_id(&canonical_id).await, Some(canonical_endpoint));
+        assert_eq!(local_disk_path_by_id(&canonical_id).await, Some(canonical_endpoint.clone()));
         assert_eq!(local_disk_path_by_id(&foreign_id).await, None);
-        clear_local_disk_id_map_for_test().await;
+        assert!(
+            instance_ctx
+                .local_disk_map()
+                .read()
+                .await
+                .get(&foreign_endpoint)
+                .is_some_and(Option::is_none)
+        );
+        assert!(instance_ctx.local_disk_set_drives().read().await[0][0][4].is_none());
+        assert!(find_local_disk_by_ref(&foreign_id.to_string()).await.is_none());
+        assert_eq!(
+            find_local_disk_by_ref(&canonical_id.to_string())
+                .await
+                .map(|disk| disk.endpoint().to_string()),
+            Some(canonical_endpoint)
+        );
+        reset_local_disk_test_state().await;
+    }
+
+    #[test]
+    fn persisted_migration_quorum_ignores_nonmember_read_errors() {
+        for drive_count in [3, 4] {
+            let reference = FormatV3::new(1, drive_count);
+            let required = drive_count / 2 + 1;
+            let mut formats = vec![None; drive_count];
+            let mut errors = (0..drive_count).map(|_| None).collect::<Vec<Option<DiskError>>>();
+            for (index, format) in formats.iter_mut().enumerate().take(required) {
+                let mut disk_format = reference.clone();
+                disk_format.erasure.this = reference.erasure.sets[0][index];
+                *format = Some(disk_format);
+            }
+            errors[drive_count - 1] = Some(DiskError::FaultyDisk);
+
+            let (selected, members) =
+                select_persisted_migration_format(&formats, errors, &reference, drive_count, Some(DiskError::FaultyDisk))
+                    .expect("a persisted strict majority must outrank a nonmember read error")
+                    .expect("the persisted formats should be compatible");
+
+            assert_eq!(selected.shared_identity(), reference.shared_identity());
+            assert_eq!(members.iter().filter(|member| **member).count(), required);
+            assert!(members[..required].iter().all(|member| *member));
+            assert!(members[required..].iter().all(|member| !*member));
+        }
     }
 
     #[tokio::test]

@@ -132,6 +132,18 @@ pub enum Disk {
     Remote(Box<RemoteDisk>),
 }
 
+impl Disk {
+    pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk.set_disk_id_state(id).await;
+                Ok(())
+            }
+            Disk::Remote(remote_disk) => remote_disk.set_disk_id(id).await,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
     fn to_string(&self) -> String {
@@ -1550,6 +1562,72 @@ mod tests {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_disk_id_state_does_not_publish_to_the_process_registry() {
+        let local_dir = tempfile::tempdir().expect("local disk tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(local_dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let local_disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+        let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
+        let disk_id = Uuid::new_v4();
+
+        disk.set_disk_id_state(Some(disk_id))
+            .await
+            .expect("local wrapper state should accept a disk ID");
+
+        let Disk::Local(local_disk) = &disk else {
+            panic!("test disk should remain local");
+        };
+        assert_eq!(local_disk.get_current_disk_id().await, Some(disk_id));
+        assert!(
+            !crate::runtime::global::current_ctx()
+                .local_disk_id_map()
+                .read()
+                .await
+                .contains_key(&disk_id),
+            "state-only startup publication must not update the process disk-ID registry"
+        );
+
+        disk.set_disk_id_state(None)
+            .await
+            .expect("local wrapper state should clear a disk ID");
+        assert_eq!(local_disk.get_current_disk_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn remote_disk_id_state_delegates_some_and_none() {
+        let mut endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should initialize");
+        let disk = Disk::Remote(Box::new(remote_disk));
+        let disk_id = Uuid::new_v4();
+
+        disk.set_disk_id_state(Some(disk_id))
+            .await
+            .expect("remote state should accept a disk ID");
+        assert_eq!(disk.get_disk_id().await.expect("remote disk ID should be readable"), Some(disk_id));
+
+        disk.set_disk_id_state(None)
+            .await
+            .expect("remote state should clear a disk ID");
+        assert_eq!(disk.get_disk_id().await.expect("remote disk ID should be readable"), None);
     }
 
     #[tokio::test]
