@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, warn};
@@ -74,6 +75,313 @@ const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
 const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
 const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
 
+/// Strict matcher for leftover commit temp files (`<prefix>.tmp-<uuid>`).
+///
+/// Both temp shapes ever produced by this backend are covered: key temps
+/// `<stem>.tmp-<uuid>` (`with_extension` replaced the `.key` suffix) and salt
+/// temps `.master-key.salt.tmp-<uuid>` (suffix appended to the full name).
+/// Published key files always end in `.key` — even a key literally named
+/// `foo.tmp-<uuid>` is stored as `foo.tmp-<uuid>.key` — so the `.key` guard
+/// plus the exact hyphenated-UUID check makes it impossible to match an
+/// authoritative file.
+fn is_orphan_commit_temp_name(file_name: &str) -> bool {
+    if file_name.ends_with(".key") {
+        return false;
+    }
+    let Some((prefix, suffix)) = file_name.rsplit_once(".tmp-") else {
+        return false;
+    };
+    !prefix.is_empty() && suffix.len() == 36 && uuid::Uuid::try_parse(suffix).is_ok()
+}
+
+/// Durable single-file commit protocol for the key directory.
+///
+/// Key material and metadata are unrecoverable state, so every mutation of the
+/// key directory must survive a crash or power loss at any point. All writers
+/// share one protocol: exclusively create a temp file in the destination
+/// directory, write and fsync the content, publish it atomically (`rename` to
+/// replace, `hard_link` to create without clobbering) and fsync the parent
+/// directory so the new directory entry itself is durable. Deletion mirrors
+/// the tail of the protocol (`remove_file` + parent directory fsync) so a
+/// removed key cannot resurface after power loss.
+///
+/// This intentionally mirrors ecstore's fsync helpers without depending on the
+/// ecstore crate: the KMS backend stays decoupled from storage internals.
+mod durable_file {
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+
+    /// How the fully written temp file becomes visible under its final name.
+    pub(super) enum Publish {
+        /// Atomically replace whatever is at the destination via `rename`.
+        Replace,
+        /// Publish via `hard_link`, failing with [`CommitError::AlreadyExists`]
+        /// when the destination exists so concurrent creates stay linearized.
+        NoClobber,
+    }
+
+    #[derive(Debug)]
+    pub(super) enum CommitError {
+        AlreadyExists,
+        Io(io::Error),
+        /// Test-only simulated crash: the protocol stops after the given step
+        /// with no cleanup, exactly as a power loss would.
+        #[cfg(test)]
+        InjectedCrash(CommitStep),
+    }
+
+    impl From<io::Error> for CommitError {
+        fn from(error: io::Error) -> Self {
+            CommitError::Io(error)
+        }
+    }
+
+    impl From<CommitError> for crate::error::KmsError {
+        fn from(error: CommitError) -> Self {
+            match error {
+                // Callers publishing with `NoClobber` are expected to map
+                // `AlreadyExists` to their own domain error before this.
+                CommitError::AlreadyExists => crate::error::KmsError::internal_error("durable commit destination already exists"),
+                CommitError::Io(error) => error.into(),
+                #[cfg(test)]
+                CommitError::InjectedCrash(step) => {
+                    crate::error::KmsError::internal_error(format!("injected crash after {step:?}"))
+                }
+            }
+        }
+    }
+
+    /// Protocol steps in execution order. Tests arm a failpoint after any step
+    /// to prove that every interrupted prefix recovers to either the complete
+    /// old state or the complete new state.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CommitStep {
+        TempWritten,
+        FileSynced,
+        Published,
+        DirSynced,
+    }
+
+    pub(super) async fn commit(
+        temp_path: PathBuf,
+        final_path: PathBuf,
+        content: Vec<u8>,
+        permissions: Option<u32>,
+        publish: Publish,
+    ) -> Result<(), CommitError> {
+        tokio::task::spawn_blocking(move || commit_blocking(&temp_path, &final_path, &content, permissions, &publish))
+            .await
+            .map_err(|join_error| CommitError::Io(io::Error::other(join_error)))?
+    }
+
+    /// Remove a published file durably: without the parent directory fsync a
+    /// deleted key could resurface after power loss.
+    pub(super) async fn remove_durably(path: PathBuf) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            std::fs::remove_file(&path)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("path has no parent directory"))?;
+            fsync_dir(parent)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    fn commit_blocking(
+        temp_path: &Path,
+        final_path: &Path,
+        content: &[u8],
+        permissions: Option<u32>,
+        publish: &Publish,
+    ) -> Result<(), CommitError> {
+        let file = open_temp_exclusive(temp_path, permissions)?;
+        match run_protocol(file, temp_path, final_path, content, permissions, publish) {
+            // A simulated crash must leave the directory exactly as a real one
+            // would: no cleanup.
+            #[cfg(test)]
+            Err(CommitError::InjectedCrash(step)) => Err(CommitError::InjectedCrash(step)),
+            Err(error) => {
+                let _ = std::fs::remove_file(temp_path);
+                Err(error)
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    fn open_temp_exclusive(temp_path: &Path, permissions: Option<u32>) -> io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        // `create_new` refuses to follow anything already at the temp path, so
+        // the temp file is always a fresh regular file owned by this process.
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = permissions {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode & 0o7777);
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
+        options.open(temp_path)
+    }
+
+    fn run_protocol(
+        mut file: std::fs::File,
+        temp_path: &Path,
+        final_path: &Path,
+        content: &[u8],
+        permissions: Option<u32>,
+        publish: &Publish,
+    ) -> Result<(), CommitError> {
+        file.write_all(content)?;
+        crash_if_armed(final_path, CommitStep::TempWritten)?;
+
+        // The umask can only narrow the creation mode, so apply and verify the
+        // exact requested permissions before the content becomes durable.
+        #[cfg(unix)]
+        if let Some(mode) = permissions {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            let actual = file.metadata()?.permissions().mode() & 0o7777;
+            if actual != mode & 0o7777 {
+                return Err(CommitError::Io(io::Error::other(format!(
+                    "temp file permissions {actual:o} do not match requested {mode:o}"
+                ))));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
+
+        file.sync_all()?;
+        #[cfg(test)]
+        fsync_recorder::record_file(final_path);
+        crash_if_armed(final_path, CommitStep::FileSynced)?;
+        drop(file);
+
+        match publish {
+            Publish::Replace => std::fs::rename(temp_path, final_path)?,
+            Publish::NoClobber => {
+                if let Err(error) = std::fs::hard_link(temp_path, final_path) {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        return Err(CommitError::AlreadyExists);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        crash_if_armed(final_path, CommitStep::Published)?;
+
+        let parent = final_path
+            .parent()
+            .ok_or_else(|| io::Error::other("destination has no parent directory"))?;
+        fsync_dir(parent)?;
+        crash_if_armed(final_path, CommitStep::DirSynced)?;
+
+        // The published name is durable at this point; the extra temp link left
+        // by `hard_link` is only cleanup. A crash here leaves an orphan that
+        // startup recovery removes.
+        if matches!(publish, Publish::NoClobber) {
+            let _ = std::fs::remove_file(temp_path);
+        }
+        Ok(())
+    }
+
+    /// Fsync a directory so recently created, renamed or removed entries
+    /// survive power loss. No-op on non-Unix platforms where directories
+    /// cannot be opened for syncing.
+    fn fsync_dir(dir: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        fsync_recorder::record_dir(dir);
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
+        Ok(())
+    }
+
+    fn crash_if_armed(_final_path: &Path, _step: CommitStep) -> Result<(), CommitError> {
+        #[cfg(test)]
+        if failpoint::is_armed(_final_path, _step) {
+            return Err(CommitError::InjectedCrash(_step));
+        }
+        Ok(())
+    }
+
+    /// Test-only recorder mirroring ecstore's `fsync_dir_recorder`: durability
+    /// regressions are invisible to ordinary behavior tests (the data is on
+    /// disk either way), so tests assert directly on which paths were synced.
+    /// File syncs are recorded under the commit's destination path because the
+    /// temp name is randomized. Records are global; tests must match paths
+    /// under their own unique tempdir to stay robust against parallel tests.
+    #[cfg(test)]
+    pub(super) mod fsync_recorder {
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        static FILE_SYNCS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        static DIR_SYNCS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+        pub(super) fn record_file(path: &Path) {
+            FILE_SYNCS.lock().expect("fsync recorder poisoned").push(path.to_path_buf());
+        }
+
+        pub(super) fn record_dir(dir: &Path) {
+            DIR_SYNCS.lock().expect("fsync recorder poisoned").push(dir.to_path_buf());
+        }
+
+        pub(crate) fn file_sync_count(path: &Path) -> usize {
+            FILE_SYNCS
+                .lock()
+                .expect("fsync recorder poisoned")
+                .iter()
+                .filter(|recorded| recorded.as_path() == path)
+                .count()
+        }
+
+        pub(crate) fn dir_sync_count(dir: &Path) -> usize {
+            DIR_SYNCS
+                .lock()
+                .expect("fsync recorder poisoned")
+                .iter()
+                .filter(|recorded| recorded.as_path() == dir)
+                .count()
+        }
+    }
+
+    /// Test-only failpoints simulating a crash after a given commit step.
+    /// Armed per directory so parallel tests never affect each other.
+    #[cfg(test)]
+    pub(super) mod failpoint {
+        use super::CommitStep;
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        static ARMED: Mutex<Vec<(PathBuf, CommitStep)>> = Mutex::new(Vec::new());
+
+        pub(crate) fn arm(dir: &Path, step: CommitStep) {
+            let mut armed = ARMED.lock().expect("commit failpoint poisoned");
+            armed.retain(|(armed_dir, _)| armed_dir != dir);
+            armed.push((dir.to_path_buf(), step));
+        }
+
+        pub(crate) fn disarm(dir: &Path) {
+            ARMED
+                .lock()
+                .expect("commit failpoint poisoned")
+                .retain(|(armed_dir, _)| armed_dir != dir);
+        }
+
+        pub(super) fn is_armed(final_path: &Path, step: CommitStep) -> bool {
+            ARMED
+                .lock()
+                .expect("commit failpoint poisoned")
+                .iter()
+                .any(|(dir, armed_step)| *armed_step == step && final_path.starts_with(dir))
+        }
+    }
+}
+
 /// Local KMS client that stores keys in local files
 pub struct LocalKmsClient {
     config: LocalConfig,
@@ -83,6 +391,9 @@ pub struct LocalKmsClient {
     legacy_master_cipher: Option<Aes256Gcm>,
     /// DEK encryption implementation
     dek_crypto: AesDekCrypto,
+    /// Per-key write locks serializing read-modify-write updates within this
+    /// process (see [`Self::lock_key_for_write`]).
+    key_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +453,7 @@ impl LocalKmsClient {
             master_cipher,
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
+            key_write_locks: Mutex::new(HashMap::new()),
         };
         client.validate_existing_keys().await?;
         Ok(client)
@@ -183,7 +495,23 @@ impl LocalKmsClient {
             master_cipher,
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
+            key_write_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Serialize writers of one key within this process.
+    ///
+    /// Status updates are read-modify-write cycles over the key file, so two
+    /// concurrent writers would silently drop one update or interleave a
+    /// delete with a rewrite. Cross-process writers sharing a key directory
+    /// remain unsupported. Entries live for the client's lifetime; the table
+    /// is bounded by the number of distinct key ids this process touches.
+    async fn lock_key_for_write(&self, key_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.key_write_locks.lock().expect("Local KMS key write lock table poisoned");
+            Arc::clone(locks.entry(key_id.to_string()).or_default())
+        };
+        lock.lock_owned().await
     }
 
     /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
@@ -229,23 +557,27 @@ impl LocalKmsClient {
             });
         }
 
+        Self::ensure_missing_salt_can_be_generated(config).await?;
+
         let mut salt = [0u8; LOCAL_KMS_MASTER_KEY_SALT_LEN];
         rand::rng().fill(&mut salt[..]);
         let temp_path = config
             .key_dir
             .join(format!("{LOCAL_KMS_MASTER_KEY_SALT_FILE}.tmp-{}", uuid::Uuid::new_v4()));
-        fs::write(&temp_path, salt).await?;
-        Self::set_file_permissions(&temp_path, config.file_permissions).await?;
-        match fs::hard_link(&temp_path, &salt_path).await {
+        match durable_file::commit(
+            temp_path,
+            salt_path.clone(),
+            salt.to_vec(),
+            config.file_permissions,
+            durable_file::Publish::NoClobber,
+        )
+        .await
+        {
             Ok(()) => {
-                if let Err(error) = fs::remove_file(&temp_path).await {
-                    warn!(path = ?temp_path, %error, "Failed to remove Local KMS salt temporary file");
-                }
                 debug!(path = ?salt_path, "Local KMS master key salt created");
                 Ok(salt)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&temp_path).await;
+            Err(durable_file::CommitError::AlreadyExists) => {
                 let bytes = fs::read(&salt_path).await?;
                 bytes.try_into().map_err(|_| {
                     KmsError::configuration_error(format!(
@@ -255,27 +587,49 @@ impl LocalKmsClient {
                     ))
                 })
             }
-            Err(error) => {
-                let _ = fs::remove_file(&temp_path).await;
-                Err(error.into())
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Refuse to generate a fresh salt when the directory already holds keys
+    /// explicitly marked `encrypted-master-key`: their KDF output depends on
+    /// the missing salt, so a replacement salt could never decrypt them.
+    /// Failing closed with a salt-specific error points the operator at the
+    /// real problem (restore the salt file or the whole directory) instead of
+    /// a generic decrypt failure.
+    ///
+    /// Files that do not parse are ignored here — startup key validation
+    /// reports them with their own errors right after. Legacy pre-marker files
+    /// are also ignored: pre-beta.9 directories legitimately have no salt file
+    /// yet, and an empty directory must keep initializing as before.
+    async fn ensure_missing_salt_can_be_generated(config: &LocalConfig) -> Result<()> {
+        #[derive(Deserialize)]
+        struct ProtectionProbe {
+            #[serde(default)]
+            at_rest_protection: StoredKeyProtection,
+        }
+
+        let mut entries = fs::read_dir(&config.key_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "key") {
+                continue;
+            }
+            let Ok(content) = fs::read(&path).await else {
+                continue;
+            };
+            let Ok(probe) = serde_json::from_slice::<ProtectionProbe>(&content) else {
+                continue;
+            };
+            if probe.at_rest_protection == StoredKeyProtection::EncryptedMasterKey {
+                return Err(KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing but {} is marked encrypted-master-key; \
+                     restore the salt file from backup instead of generating a new one",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                )));
             }
         }
-    }
-
-    #[cfg(unix)]
-    async fn set_file_permissions(path: &std::path::Path, permissions: Option<u32>) -> Result<()> {
-        if let Some(mode) = permissions {
-            use std::os::unix::fs::PermissionsExt;
-
-            let perms = std::fs::Permissions::from_mode(mode);
-            fs::set_permissions(path, perms).await?;
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    async fn set_file_permissions(_path: &std::path::Path, _permissions: Option<u32>) -> Result<()> {
         Ok(())
     }
 
@@ -392,14 +746,19 @@ impl LocalKmsClient {
         })
     }
 
-    /// Save a master key to disk
+    /// Save a master key to disk, durably replacing any existing file
     async fn save_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
         let key_path = self.master_key_path(&master_key.key_id)?;
         let content = self.encode_master_key(master_key, key_material)?;
         let temp_path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        fs::write(&temp_path, &content).await?;
-        Self::set_file_permissions(&temp_path, self.config.file_permissions).await?;
-        fs::rename(&temp_path, &key_path).await?;
+        durable_file::commit(
+            temp_path,
+            key_path.clone(),
+            content,
+            self.config.file_permissions,
+            durable_file::Publish::Replace,
+        )
+        .await?;
 
         debug!(key_id = %master_key.key_id, path = ?key_path, "Local KMS master key saved");
         Ok(())
@@ -409,25 +768,21 @@ impl LocalKmsClient {
         let key_path = self.master_key_path(&master_key.key_id)?;
         let content = self.encode_master_key(master_key, key_material)?;
         let temp_path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        fs::write(&temp_path, &content).await?;
-        Self::set_file_permissions(&temp_path, self.config.file_permissions).await?;
-
-        match fs::hard_link(&temp_path, &key_path).await {
+        match durable_file::commit(
+            temp_path,
+            key_path.clone(),
+            content,
+            self.config.file_permissions,
+            durable_file::Publish::NoClobber,
+        )
+        .await
+        {
             Ok(()) => {
-                if let Err(error) = fs::remove_file(&temp_path).await {
-                    warn!(path = ?temp_path, %error, "Failed to remove Local KMS key temporary file");
-                }
                 debug!(key_id = %master_key.key_id, path = ?key_path, "Local KMS master key created");
                 Ok(())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&temp_path).await;
-                Err(KmsError::key_already_exists(&master_key.key_id))
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temp_path).await;
-                Err(error.into())
-            }
+            Err(durable_file::CommitError::AlreadyExists) => Err(KmsError::key_already_exists(&master_key.key_id)),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -489,19 +844,45 @@ impl LocalKmsClient {
         Ok(Zeroizing::new(key_material))
     }
 
+    /// Startup recovery and validation for the key directory.
+    ///
+    /// Leftover commit temp files are removed first: publishing is atomic
+    /// (`rename`/`hard_link`), so a strictly matching temp name can only be an
+    /// unpublished remnant of an interrupted commit, never the authoritative
+    /// copy. Every published `.key` file must then decode.
     async fn validate_existing_keys(&self) -> Result<()> {
+        let mut key_ids = Vec::new();
+        let mut orphan_temps = Vec::new();
         let mut entries = fs::read_dir(&self.config.key_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().is_none_or(|extension| extension != "key") {
+            if path.extension().is_some_and(|extension| extension == "key") {
+                let key_id = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| KmsError::configuration_error("Local KMS key file name must be valid UTF-8"))?;
+                key_ids.push(key_id.to_string());
                 continue;
             }
+            if entry.file_type().await?.is_file()
+                && let Some(file_name) = path.file_name().and_then(|name| name.to_str())
+                && is_orphan_commit_temp_name(file_name)
+            {
+                orphan_temps.push(path);
+            }
+        }
 
-            let key_id = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .ok_or_else(|| KmsError::configuration_error("Local KMS key file name must be valid UTF-8"))?;
-            self.decode_stored_key(key_id).await?;
+        for temp_path in orphan_temps {
+            // Best effort: a temp file that cannot be removed is inert, so
+            // startup proceeds and retries on the next initialization.
+            match durable_file::remove_durably(temp_path.clone()).await {
+                Ok(()) => warn!(path = ?temp_path, "Removed orphaned Local KMS commit temp file"),
+                Err(error) => warn!(path = ?temp_path, %error, "Failed to remove orphaned Local KMS commit temp file"),
+            }
+        }
+
+        for key_id in key_ids {
+            self.decode_stored_key(&key_id).await?;
         }
         Ok(())
     }
@@ -698,6 +1079,7 @@ impl KmsClient for LocalKmsClient {
     async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Enabling key: {}", key_id);
 
+        let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
@@ -714,6 +1096,7 @@ impl KmsClient for LocalKmsClient {
     async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Disabling key: {}", key_id);
 
+        let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Disabled;
 
@@ -734,6 +1117,7 @@ impl KmsClient for LocalKmsClient {
     ) -> Result<()> {
         debug!("Scheduling deletion for key: {}", key_id);
 
+        let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::PendingDeletion;
 
@@ -750,6 +1134,7 @@ impl KmsClient for LocalKmsClient {
     async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Canceling deletion for key: {}", key_id);
 
+        let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
@@ -945,6 +1330,10 @@ impl KmsBackend for LocalKmsBackend {
         // unless a pending window is specified
         let key_id = &request.key_id;
 
+        // Deletion is a read-modify-write (or read-then-remove) cycle, so hold
+        // the per-key write lock across it.
+        let _write_guard = self.client.lock_key_for_write(key_id).await;
+
         // First, load the key from disk to get the master key
         let mut master_key = self
             .client
@@ -955,7 +1344,7 @@ impl KmsBackend for LocalKmsBackend {
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
             // For immediate deletion, actually delete the key from filesystem
             let key_path = self.client.master_key_path(key_id)?;
-            tokio::fs::remove_file(&key_path)
+            durable_file::remove_durably(key_path)
                 .await
                 .map_err(|e| KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
 
@@ -1024,6 +1413,9 @@ impl KmsBackend for LocalKmsBackend {
 
     async fn cancel_key_deletion(&self, request: CancelKeyDeletionRequest) -> Result<CancelKeyDeletionResponse> {
         let key_id = &request.key_id;
+
+        // Cancelling is a read-modify-write cycle, so hold the per-key write lock.
+        let _write_guard = self.client.lock_key_for_write(key_id).await;
 
         // Load the key from disk to get the master key
         let mut master_key = self
@@ -1651,5 +2043,379 @@ mod tests {
             .expect("one create must fail");
         assert!(matches!(error, KmsError::KeyAlreadyExists { .. }));
         assert_eq!(first.client.get_key_material("concurrent-key").await.expect("load key").len(), 32);
+    }
+
+    fn test_config(dir: &std::path::Path) -> LocalConfig {
+        LocalConfig {
+            key_dir: dir.to_path_buf(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        }
+    }
+
+    async fn sorted_dir_file_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut entries = fs::read_dir(dir).await.expect("read key directory");
+        while let Some(entry) = entries.next_entry().await.expect("read directory entry") {
+            names.push(entry.file_name().to_str().expect("UTF-8 file name").to_string());
+        }
+        names.sort();
+        names
+    }
+
+    const ALL_COMMIT_STEPS: [durable_file::CommitStep; 4] = [
+        durable_file::CommitStep::TempWritten,
+        durable_file::CommitStep::FileSynced,
+        durable_file::CommitStep::Published,
+        durable_file::CommitStep::DirSynced,
+    ];
+
+    #[test]
+    fn orphan_commit_temp_matcher_is_strict() {
+        let uuid = uuid::Uuid::new_v4();
+        // The two shapes the backend actually produces.
+        assert!(is_orphan_commit_temp_name(&format!("mykey.tmp-{uuid}")));
+        assert!(is_orphan_commit_temp_name(&format!(".master-key.salt.tmp-{uuid}")));
+        // Authoritative files must never match, even with temp-looking names.
+        assert!(!is_orphan_commit_temp_name("mykey.key"));
+        assert!(!is_orphan_commit_temp_name(&format!("decoy.tmp-{uuid}.key")));
+        assert!(!is_orphan_commit_temp_name(".master-key.salt"));
+        // Near misses stay untouched.
+        assert!(!is_orphan_commit_temp_name("mykey.tmp-not-a-uuid"));
+        assert!(!is_orphan_commit_temp_name(&format!("mykey.tmp-{}", uuid.simple())));
+        assert!(!is_orphan_commit_temp_name(&format!(".tmp-{uuid}")));
+        assert!(!is_orphan_commit_temp_name("mykey.tmp-"));
+    }
+
+    #[tokio::test]
+    async fn durable_commit_fsyncs_every_write_path() {
+        use durable_file::fsync_recorder;
+
+        let (client, temp_dir) = create_test_client().await;
+        let dir = temp_dir.path();
+
+        // Salt creation during construction is itself a durable commit.
+        let salt_path = LocalKmsClient::master_key_salt_path(&client.config);
+        assert!(fsync_recorder::file_sync_count(&salt_path) >= 1, "salt file must be fsynced");
+        assert!(fsync_recorder::dir_sync_count(dir) >= 1, "salt publish must fsync the key directory");
+
+        let key_path = client.master_key_path("durable-key").expect("valid key id");
+        let files_before = fsync_recorder::file_sync_count(&key_path);
+        let dirs_before = fsync_recorder::dir_sync_count(dir);
+        client.create_key("durable-key", "AES_256", None).await.expect("create key");
+        assert!(
+            fsync_recorder::file_sync_count(&key_path) > files_before,
+            "create must fsync the key file"
+        );
+        assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "create must fsync the key directory");
+
+        let files_before = fsync_recorder::file_sync_count(&key_path);
+        let dirs_before = fsync_recorder::dir_sync_count(dir);
+        client.disable_key("durable-key", None).await.expect("disable key");
+        assert!(
+            fsync_recorder::file_sync_count(&key_path) > files_before,
+            "update must fsync the key file"
+        );
+        assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "update must fsync the key directory");
+
+        let backend = LocalKmsBackend { client };
+        let dirs_before = fsync_recorder::dir_sync_count(dir);
+        backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "durable-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+            })
+            .await
+            .expect("delete key");
+        assert!(!key_path.exists(), "immediate delete must remove the key file");
+        assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "delete must fsync the key directory");
+    }
+
+    #[tokio::test]
+    async fn interrupted_update_commit_recovers_to_complete_old_or_new_state() {
+        use durable_file::{CommitStep, failpoint};
+
+        for step in ALL_COMMIT_STEPS {
+            let (client, temp_dir) = create_test_client().await;
+            let key_id = "crash-update-key";
+            client.create_key(key_id, "AES_256", None).await.expect("create key");
+            let original_material = client.get_key_material(key_id).await.expect("original material");
+
+            failpoint::arm(temp_dir.path(), step);
+            let error = client
+                .disable_key(key_id, None)
+                .await
+                .expect_err("armed commit must simulate a crash");
+            failpoint::disarm(temp_dir.path());
+            assert!(error.to_string().contains("injected crash"), "unexpected error: {error}");
+            drop(client);
+
+            // Restart on the same directory: recovery must observe either the
+            // complete old state or the complete new state, with temps cleaned.
+            let recovered = LocalKmsClient::new(test_config(temp_dir.path()))
+                .await
+                .expect("recovery after an interrupted update must succeed");
+            let status = recovered
+                .describe_key(key_id, None)
+                .await
+                .expect("key must survive an interrupted update")
+                .status;
+            let expected = if matches!(step, CommitStep::TempWritten | CommitStep::FileSynced) {
+                // Crash before publish: the old state is authoritative.
+                KeyStatus::Active
+            } else {
+                // Crash after publish: the new state is authoritative.
+                KeyStatus::Disabled
+            };
+            assert_eq!(status, expected, "step {step:?} must recover to a complete state");
+            assert_eq!(
+                recovered.get_key_material(key_id).await.expect("material must survive"),
+                original_material,
+                "step {step:?} must preserve key material"
+            );
+            assert_eq!(
+                sorted_dir_file_names(temp_dir.path()).await,
+                vec![".master-key.salt".to_string(), format!("{key_id}.key")],
+                "step {step:?} must leave no commit temps behind"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_create_commit_recovers_to_absent_or_complete_key() {
+        use durable_file::{CommitStep, failpoint};
+
+        for step in ALL_COMMIT_STEPS {
+            let (client, temp_dir) = create_test_client().await;
+            let key_id = "crash-create-key";
+
+            failpoint::arm(temp_dir.path(), step);
+            client
+                .create_key(key_id, "AES_256", None)
+                .await
+                .expect_err("armed commit must simulate a crash");
+            failpoint::disarm(temp_dir.path());
+            drop(client);
+
+            let recovered = LocalKmsClient::new(test_config(temp_dir.path()))
+                .await
+                .expect("recovery after an interrupted create must succeed");
+            if matches!(step, CommitStep::TempWritten | CommitStep::FileSynced) {
+                // Crash before publish: the key was never created.
+                let error = recovered
+                    .describe_key(key_id, None)
+                    .await
+                    .expect_err("unpublished key must not exist after recovery");
+                assert!(matches!(error, KmsError::KeyNotFound { .. }), "step {step:?}: {error:?}");
+                assert_eq!(
+                    sorted_dir_file_names(temp_dir.path()).await,
+                    vec![".master-key.salt".to_string()],
+                    "step {step:?} must remove the unpublished temp"
+                );
+            } else {
+                // Crash after publish: the key is complete and usable.
+                let material = recovered
+                    .get_key_material(key_id)
+                    .await
+                    .expect("published key must survive recovery");
+                assert_eq!(material.len(), 32, "step {step:?} must keep complete key material");
+                assert_eq!(
+                    sorted_dir_file_names(temp_dir.path()).await,
+                    vec![".master-key.salt".to_string(), format!("{key_id}.key")],
+                    "step {step:?} must leave only the published key"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_salt_commit_recovers_cleanly() {
+        use durable_file::{CommitStep, failpoint};
+
+        for step in ALL_COMMIT_STEPS {
+            let temp_dir = TempDir::new().expect("create temp dir");
+            let config = test_config(temp_dir.path());
+            let salt_path = LocalKmsClient::master_key_salt_path(&config);
+
+            failpoint::arm(temp_dir.path(), step);
+            let error = match LocalKmsClient::new(config.clone()).await {
+                Ok(_) => panic!("armed salt commit must fail initialization"),
+                Err(error) => error,
+            };
+            failpoint::disarm(temp_dir.path());
+            assert!(error.to_string().contains("injected crash"), "unexpected error: {error}");
+
+            // If the crash hit after publish, the salt is durable and must be
+            // reused on restart; before publish, a fresh one may be generated.
+            let published_salt = if matches!(step, CommitStep::Published | CommitStep::DirSynced) {
+                Some(fs::read(&salt_path).await.expect("published salt must exist"))
+            } else {
+                assert!(!salt_path.exists(), "step {step:?} must not publish a salt");
+                None
+            };
+
+            let client = LocalKmsClient::new(config).await.expect("recovery must succeed");
+            let salt_now = fs::read(&salt_path).await.expect("salt must exist after recovery");
+            if let Some(published) = published_salt {
+                assert_eq!(salt_now, published, "step {step:?}: a published salt must be reused");
+            }
+            assert_eq!(
+                sorted_dir_file_names(temp_dir.path()).await,
+                vec![".master-key.salt".to_string()],
+                "step {step:?} must leave exactly one salt file"
+            );
+            client
+                .create_key("post-recovery-key", "AES_256", None)
+                .await
+                .expect("create key");
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_removes_only_strictly_matching_commit_temps() {
+        let (client, temp_dir) = create_test_client().await;
+        client.create_key("real-key", "AES_256", None).await.expect("create key");
+        // A key whose name itself looks like a temp is stored with `.key` and
+        // must survive cleanup.
+        let decoy_id = format!("decoy.tmp-{}", uuid::Uuid::new_v4());
+        client.create_key(&decoy_id, "AES_256", None).await.expect("create decoy key");
+        drop(client);
+
+        let key_temp = temp_dir.path().join(format!("real-key.tmp-{}", uuid::Uuid::new_v4()));
+        let salt_temp = temp_dir.path().join(format!(".master-key.salt.tmp-{}", uuid::Uuid::new_v4()));
+        let not_a_uuid = temp_dir.path().join("real-key.tmp-not-a-uuid");
+        let stray = temp_dir.path().join("operator-notes.txt");
+        for path in [&key_temp, &salt_temp, &not_a_uuid, &stray] {
+            fs::write(path, b"leftover").await.expect("seed leftover file");
+        }
+
+        let client = LocalKmsClient::new(test_config(temp_dir.path()))
+            .await
+            .expect("restart with leftover temps must succeed");
+
+        assert!(!key_temp.exists(), "key commit temp must be removed");
+        assert!(!salt_temp.exists(), "salt commit temp must be removed");
+        assert!(not_a_uuid.exists(), "non-UUID suffixes must not match the temp pattern");
+        assert!(stray.exists(), "unrelated files must be left alone");
+        client
+            .describe_key("real-key", None)
+            .await
+            .expect("real key must survive cleanup");
+        client
+            .describe_key(&decoy_id, None)
+            .await
+            .expect("temp-looking key name must survive cleanup");
+    }
+
+    #[tokio::test]
+    async fn missing_salt_with_encrypted_keys_fails_closed_without_generating_a_salt() {
+        let (client, temp_dir) = create_test_client().await;
+        client
+            .create_key("sealed-key", "AES_256", None)
+            .await
+            .expect("create encrypted key");
+        let config = client.config.clone();
+        drop(client);
+
+        let salt_path = LocalKmsClient::master_key_salt_path(&config);
+        fs::remove_file(&salt_path).await.expect("remove salt file");
+
+        let error = match LocalKmsClient::new(config).await {
+            Ok(_) => panic!("missing salt with encrypted keys must fail initialization"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, KmsError::ConfigurationError { .. }),
+            "expected a salt-specific configuration error, got {error:?}"
+        );
+        assert!(error.to_string().contains("salt"), "error must point at the missing salt: {error}");
+        assert!(!salt_path.exists(), "a replacement salt must never be generated");
+        assert_eq!(
+            sorted_dir_file_names(temp_dir.path()).await,
+            vec!["sealed-key.key".to_string()],
+            "the failed startup must not modify the key directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_salt_with_only_plaintext_dev_keys_still_initializes() {
+        let (dev_client, temp_dir) = create_dev_mode_client().await;
+        dev_client
+            .create_key("plain-key", "AES_256", None)
+            .await
+            .expect("create plaintext-dev-only key");
+        drop(dev_client);
+
+        // Enabling a master key over a directory of plaintext-dev-only keys is
+        // a legitimate first-time salt creation, not a lost salt.
+        let client = LocalKmsClient::new(test_config(temp_dir.path()))
+            .await
+            .expect("salt creation must proceed for plaintext-dev-only directories");
+        assert!(LocalKmsClient::master_key_salt_path(&client.config).exists());
+    }
+
+    #[tokio::test]
+    async fn per_key_write_lock_blocks_concurrent_status_updates() {
+        let (client, _temp_dir) = create_test_client().await;
+        let client = Arc::new(client);
+        client.create_key("locked-key", "AES_256", None).await.expect("create key");
+        let key_path = client.master_key_path("locked-key").expect("valid key id");
+
+        let guard = client.lock_key_for_write("locked-key").await;
+        let contender = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.disable_key("locked-key", None).await })
+        };
+        // Drive the runtime through enough polls and blocking-pool round trips
+        // that the contender would have finished if it did not honor the lock.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            let _ = fs::metadata(&key_path).await;
+        }
+        let status = client.describe_key("locked-key", None).await.expect("describe key").status;
+        assert_eq!(
+            status,
+            KeyStatus::Active,
+            "a status update must not proceed while the per-key write lock is held"
+        );
+
+        drop(guard);
+        contender
+            .await
+            .expect("join contender")
+            .expect("disable must succeed once the lock is released");
+        let status = client.describe_key("locked-key", None).await.expect("describe key").status;
+        assert_eq!(status, KeyStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn concurrent_status_updates_preserve_material_and_a_complete_state() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "contended-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+        let original_material = client.get_key_material(key_id).await.expect("original material");
+
+        let (disable, schedule, enable) = tokio::join!(
+            client.disable_key(key_id, None),
+            client.schedule_key_deletion(key_id, 7, None),
+            client.enable_key(key_id, None),
+        );
+        disable.expect("disable");
+        schedule.expect("schedule deletion");
+        enable.expect("enable");
+
+        // Whatever the serialization order, the file must be one writer's
+        // complete output with the original material intact.
+        let info = client.describe_key(key_id, None).await.expect("key file must stay decodable");
+        assert!(matches!(
+            info.status,
+            KeyStatus::Active | KeyStatus::Disabled | KeyStatus::PendingDeletion
+        ));
+        assert_eq!(
+            client.get_key_material(key_id).await.expect("material must stay readable"),
+            original_material,
+            "concurrent status updates must never lose or regenerate key material"
+        );
     }
 }
