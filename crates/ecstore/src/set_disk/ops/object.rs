@@ -42,11 +42,23 @@ use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppress
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
 use futures::FutureExt as _;
+use http::HeaderValue;
 use std::future::Future;
 
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
     coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
         .map_err(Error::from)
+}
+
+async fn get_object_reader_with_context(
+    ctx: &InstanceContext,
+    reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    range: Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    opts: &ObjectOptions,
+    headers: &HeaderMap<HeaderValue>,
+) -> Result<(GetObjectReader, usize, i64)> {
+    GetObjectReader::new_with_resolver(reader, range, object_info, opts, headers, ctx.object_encryption_resolver()).await
 }
 
 /// Length of the full plaintext body when — and only when — this read's output
@@ -713,7 +725,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                             size_bucket,
                         );
                         record_get_object_reader_path_observation(GET_OBJECT_PATH_CODEC_STREAMING, object_class, size_bucket);
-                        let (mut reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                        let (mut reader, _offset, _length) =
+                            get_object_reader_with_context(&self.ctx, stream, range, &object_info, opts, &h).await?;
                         // Carry the hook probe result so the app layer skips its
                         // now-redundant lookup on the streaming miss path (ODC-16).
                         reader.body_source = body_source;
@@ -745,7 +758,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
-        let (mut reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h).await?;
+        let (mut reader, offset, length) =
+            get_object_reader_with_context(&self.ctx, Box::new(rd), range, &object_info, opts, &h).await?;
         // Carry the hook probe result so the app layer skips its now-redundant
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
@@ -2320,13 +2334,25 @@ async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCo
     }
 }
 
+#[cfg(test)]
 fn persisted_transition_version(
     remote_version: &str,
 ) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
     persisted_transition_version_with_gate(remote_version, remote_version_state_writer_enabled())
 }
 
+#[cfg(test)]
 fn remote_version_state_writer_enabled() -> bool {
+    remote_version_state_writer_fleet_proof().is_some()
+}
+
+fn remote_version_state_writer_fleet_proof() -> Option<crate::services::notification_sys::RemoteVersionStateFleetProofToken> {
+    remote_version_state_writer_requested()
+        .then(crate::services::notification_sys::acquire_remote_version_state_fleet_proof)
+        .flatten()
+}
+
+fn remote_version_state_writer_requested() -> bool {
     remote_version_state_writer_enabled_for(
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
@@ -2336,11 +2362,25 @@ fn remote_version_state_writer_enabled() -> bool {
             rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
             rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
         ),
+        true,
     )
 }
 
-fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool) -> bool {
-    requested && fleet_confirmed
+fn remote_version_state_writer_fleet_proof_matches(
+    proof: &crate::services::notification_sys::RemoteVersionStateFleetProofToken,
+) -> bool {
+    remote_version_state_writer_fleet_proof_matches_for(
+        remote_version_state_writer_requested(),
+        crate::services::notification_sys::remote_version_state_fleet_proof_matches(proof),
+    )
+}
+
+fn remote_version_state_writer_fleet_proof_matches_for(requested: bool, fleet_proof_matches: bool) -> bool {
+    requested && fleet_proof_matches
+}
+
+fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool, fleet_proof_valid: bool) -> bool {
+    requested && fleet_confirmed && fleet_proof_valid
 }
 
 fn persisted_transition_version_with_gate(
@@ -2359,7 +2399,7 @@ fn persisted_transition_version_with_gate(
         Ok(_) => Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact)),
         Err(_) if !remote_version_state_writer_enabled => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "opaque remote tier versions require the operator-attested fleet gate",
+            "opaque remote tier versions require the operator-attested live fleet capability gate",
         )),
         Err(_) if remote_version == "null" => {
             Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::SuspendedNull))
@@ -2605,7 +2645,7 @@ mod transition_upload_completion_tests {
 mod transition_version_id_tests {
     use super::{
         TransitionUploadCandidate, persisted_transition_version, persisted_transition_version_with_gate,
-        remote_version_state_writer_enabled_for,
+        remote_version_state_writer_enabled_for, remote_version_state_writer_fleet_proof_matches_for,
     };
     use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
@@ -2648,15 +2688,35 @@ mod transition_version_id_tests {
 
     #[test]
     fn remote_version_state_writer_requires_request_and_fleet_confirmation() {
-        for (case, requested, fleet_confirmed, expected) in [
-            ("old defaults", false, false, false),
-            ("missing fleet confirmation", true, false, false),
-            ("missing local opt-in", false, true, false),
-            ("explicitly unconfirmed fleet", true, false, false),
-            ("rolled-back writer", false, true, false),
-            ("fully upgraded fleet", true, true, true),
+        for (case, requested, fleet_confirmed, fleet_proof_valid, expected) in [
+            ("old defaults", false, false, false, false),
+            ("missing fleet confirmation", true, false, true, false),
+            ("missing local opt-in", false, true, true, false),
+            ("missing fleet proof", true, true, false, false),
+            ("explicitly unconfirmed fleet", true, false, true, false),
+            ("rolled-back writer", false, true, true, false),
+            ("fully upgraded fleet", true, true, true, true),
         ] {
-            assert_eq!(remote_version_state_writer_enabled_for(requested, fleet_confirmed), expected, "{case}");
+            assert_eq!(
+                remote_version_state_writer_enabled_for(requested, fleet_confirmed, fleet_proof_valid),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_version_state_commit_rechecks_operator_gate_and_live_proof() {
+        for (case, requested, fleet_proof_matches, expected) in [
+            ("operator gate closed", false, true, false),
+            ("fleet proof changed", true, false, false),
+            ("current authorization", true, true, true),
+        ] {
+            assert_eq!(
+                remote_version_state_writer_fleet_proof_matches_for(requested, fleet_proof_matches),
+                expected,
+                "{case}"
+            );
         }
     }
 
@@ -3841,6 +3901,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
         transition_meta.insert("name".to_string(), object.to_string());
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut transition_meta,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            transaction.transaction_id.to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut transition_meta,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(transaction.backend_fingerprint),
+        );
 
         if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
             transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
@@ -3951,20 +4021,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err.into());
         }
-        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
-            Ok(version) => version,
-            Err(err) => {
-                let cleanup_api = transition_cleanup_store(&self.ctx).await;
-                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
-                    return Err(StorageError::Io(std::io::Error::other(format!(
-                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
-                    ))));
+        let fleet_proof = remote_version_state_writer_fleet_proof();
+        let remote_version_requires_fleet_proof =
+            !candidate.remote_version().is_empty() && Uuid::parse_str(candidate.remote_version()).is_err();
+        let (transition_version_id, transition_version_state) =
+            match persisted_transition_version_with_gate(candidate.remote_version(), fleet_proof.is_some()) {
+                Ok(version) => version,
+                Err(err) => {
+                    let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                        return Err(StorageError::Io(std::io::Error::other(format!(
+                            "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                        ))));
+                    }
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                        .await;
+                    return Err(err.into());
                 }
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
-                return Err(err.into());
-            }
-        };
+            };
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -4080,6 +4154,21 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         #[cfg(test)]
         pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseValidation).await;
+        // This check is the fleet-proof lease linearization point. Revocation
+        // blocks later commits; an already-authorized local quorum commit is
+        // allowed to finish without holding a synchronous lock across I/O.
+        if remote_version_requires_fleet_proof
+            && !fleet_proof
+                .as_ref()
+                .is_some_and(remote_version_state_writer_fleet_proof_matches)
+        {
+            drop(transition_lock_guard);
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+            }
+            return Err(Error::other("remote version state fleet capability changed during transition"));
+        }
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -4458,6 +4547,61 @@ mod erasure_construction_tests {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
+    }
+}
+
+#[cfg(test)]
+mod object_encryption_resolver_wiring_tests {
+    use super::*;
+    use crate::object_api::{EncryptionResolutionError, ObjectEncryptionResolver, ReadEncryptionMaterial, ReadEncryptionRequest};
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for CountingResolver {
+        async fn resolve_read_material(
+            &self,
+            _request: ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_forwards_instance_resolver() {
+        let resolver = Arc::new(CountingResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let ctx = InstanceContext::new();
+        assert!(
+            ctx.set_object_encryption_resolver(resolver.clone()).is_ok(),
+            "fresh context should accept resolver"
+        );
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            user_defined: Arc::new(HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])),
+            ..Default::default()
+        };
+
+        let result = get_object_reader_with_context(
+            &ctx,
+            Box::new(Cursor::new(Vec::<u8>::new())),
+            None,
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .await;
+
+        assert!(result.is_err(), "resolver returning no material must fail closed");
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
     }
 }
 

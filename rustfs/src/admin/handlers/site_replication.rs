@@ -7205,7 +7205,7 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         return bucket_status;
     };
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let _transaction_guard = match metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await {
+    let _transaction_guard = match metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await {
         Ok(guard) => guard,
         Err(_) => {
             bucket_status.status = "failed".to_string();

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
-    node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
+    AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error,
+    node_service_time_out_client, node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::http_auth::set_tonic_canonical_body_digest;
 use crate::cluster::rpc::internode_data_transport::{
@@ -71,7 +71,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
+use tonic::{Code, Request, service::interceptor::InterceptedService};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -1083,7 +1083,7 @@ impl RemoteDisk {
         internode_offline_bypass_reason(&self.addr).map(Error::other)
     }
 
-    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }
@@ -1096,7 +1096,7 @@ impl RemoteDisk {
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
-    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }
@@ -4814,9 +4814,11 @@ mod tests {
     async fn test_remote_disk_endpoints_with_different_schemes() {
         let test_cases = vec![
             ("http://server:9000", "server:9000"),
-            ("https://secure-server:443", "secure-server"), // Default HTTPS port is omitted
+            ("http://plain-server:80", "plain-server"),
+            ("http://plain-server", "plain-server"),
+            ("https://secure-server:443", "secure-server"),
             ("http://192.168.1.100:8080", "192.168.1.100:8080"),
-            ("https://secure-server", "secure-server"), // No port specified
+            ("https://secure-server", "secure-server"),
         ];
 
         for (url_str, expected_hostname) in test_cases {
@@ -5336,7 +5338,7 @@ mod tests {
         // production callsites that sibling tests exercise from subscriber-less
         // threads; without this they can be cached as `Interest::never()` and go
         // silently missing here.
-        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
 
         let endpoint = Endpoint {
             url: url::Url::parse("http://127.0.0.1:59996/data").expect("endpoint URL should parse"),
@@ -5395,7 +5397,7 @@ mod tests {
         // production callsites that sibling tests exercise from subscriber-less
         // threads; without this they can be cached as `Interest::never()` and go
         // silently missing here.
-        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
 
         let addr = "http://127.0.0.1:59997".to_string();
         let endpoint = Endpoint {

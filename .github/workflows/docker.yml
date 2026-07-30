@@ -82,7 +82,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main')
+       github.event.workflow_run.head_branch != 'main' &&
+       !contains(github.event.workflow_run.head_branch, '-preview'))
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -219,6 +220,13 @@ jobs:
                 build_type="release"
                 create_latest=true
                 echo "🚀 Building with latest stable release version"
+                ;;
+              *-preview*)
+                build_type="preview"
+                is_prerelease=true
+                should_build=false
+                should_push=false
+                echo "⏭️  Preview tags do not publish Docker images"
                 ;;
               # Prerelease versions (must match first, more specific)
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)

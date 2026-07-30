@@ -30,10 +30,21 @@ drivesPerNode: null
 # Provide the DNS root only, without a `svc.` prefix or leading/trailing dots.
 clusterDomain: cluster.local
 
-# Maximum time an init container waits for distributed peers to publish DNS
-# and for earlier peers to start listening. The wait is shared across all
-# peers, not applied once per peer.
+# Deprecated and ignored. Retained so existing values files continue to
+# render after peer startup coordination moved into RustFS.
+# RUSTFS_COMPAT_TODO(rustfs-5416): Keep the removed init-gate setting visible to existing values files. Remove after the minimum supported direct-upgrade chart includes localEndpointHost.autoInject and no longer renders peer gates.
 startupWaitTimeoutSeconds: 300
+
+# Inject a pod-specific endpoint identity for chart-generated distributed
+# topologies. The default enables injection unless secret.existingSecret is
+# set, because the chart cannot inspect runtime overrides hidden in that
+# Secret. Without injection, the server infers a unique matching domain
+# endpoint from its kernel hostname in Kubernetes auto/orchestrated mode; custom
+# aliases retain bounded legacy DNS locality when no hostname matches. Configure
+# RUSTFS_LOCAL_ENDPOINT_HOST explicitly for DNS-free startup. Set true for a
+# credentials-only existing Secret or false to suppress chart injection.
+localEndpointHost:
+  autoInject: null
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
@@ -223,7 +234,18 @@ config:
         default_key: ""
 
 
-extraEnv: [] # This is for setting extra environment variables in the rustfs container. It should be a list of key value pairs. For example:
+# Extra environment variables for the RustFS container.
+# In distributed mode with chart-generated volumes (config.rustfs.volumes is
+# empty), the chart injects a private Downward API pod name and
+# RUSTFS_LOCAL_ENDPOINT_HOST to identify the pod's local endpoints. An explicit
+# RUSTFS_LOCAL_ENDPOINT_HOST or RUSTFS_VOLUMES entry disables automatic anchor
+# injection. An explicit bounded or fail-fast
+# RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE, or an unrecognized static value, also keeps
+# legacy DNS-based locality discovery. Otherwise Kubernetes auto-detection
+# selects orchestrated startup when RustFS consumes the generated anchor.
+# With custom volumes, the chart does not inject them and extraEnv may define
+# the local endpoint identity explicitly.
+extraEnv: []
 # extraEnv:
 #   - name: RUSTFS_ERASURE_SET_DRIVE_COUNT
 #     value: "16"

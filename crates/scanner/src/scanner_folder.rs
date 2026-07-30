@@ -1508,6 +1508,9 @@ impl FolderScanner {
             if entry.children.contains(&child) {
                 continue;
             }
+            if !self.old_cache.cache.contains_key(&child) {
+                continue;
+            }
 
             let child_hash = DataUsageHash(child.clone());
             self.new_cache
@@ -2320,7 +2323,6 @@ impl FolderScanner {
                     }
                     tokio::task::yield_now().await;
 
-                    let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
                     self.record_scan_resume_hint(&folder_item.name);
                     // We scanned a folder, optionally send update.
@@ -2646,7 +2648,7 @@ impl FolderScanner {
                         tokio::task::yield_now().await;
                     } else {
                         let mut dst = DataUsageEntry::default();
-                        let h = DataUsageHash(folder_item.name.clone());
+                        let h = hash_path(&folder_item.name);
 
                         // Use Box::pin for recursive async call
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
@@ -2911,7 +2913,7 @@ mod tests {
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temp_env::{with_var, with_var_unset};
     use uuid::Uuid;
 
@@ -3864,11 +3866,15 @@ mod tests {
     }
 
     async fn write_test_object_metadata(root: &std::path::Path, bucket: &str, object: &str) {
+        write_test_object_metadata_bytes(root, bucket, object, &metadata_for_object(bucket, object)).await;
+    }
+
+    async fn write_test_object_metadata_bytes(root: &std::path::Path, bucket: &str, object: &str, metadata: &[u8]) {
         let object_dir = root.join(bucket).join(object);
         tokio::fs::create_dir_all(&object_dir)
             .await
             .expect("failed to create test object directory");
-        tokio::fs::write(object_dir.join("xl.meta"), metadata_for_object(bucket, object))
+        tokio::fs::write(object_dir.join("xl.meta"), metadata)
             .await
             .expect("failed to write test object metadata");
     }
@@ -4165,27 +4171,28 @@ mod tests {
     async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
-        let _heal_responder = rustfs_common::heal_channel::init_heal_channel().ok().map(|mut heal_rx| {
-            tokio::spawn(async move {
-                while let Some(command) = heal_rx.recv().await {
-                    if let rustfs_common::heal_channel::HealChannelCommand::Start { response_tx, .. } = command {
-                        let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
-                    }
+        let heal_starts = Arc::new(AtomicUsize::new(0));
+        let heal_starts_clone = heal_starts.clone();
+        let mut heal_rx =
+            rustfs_common::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
+        let _heal_responder = tokio::spawn(async move {
+            while let Some(command) = heal_rx.recv().await {
+                if let rustfs_common::heal_channel::HealChannelCommand::Start { response_tx, .. } = command {
+                    heal_starts_clone.fetch_add(1, Ordering::Relaxed);
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
                 }
-            })
+            }
         });
 
         let bucket = "src-archive";
-        tokio::fs::create_dir_all(temp_dir.join(bucket))
-            .await
-            .expect("failed to create bucket directory");
+        let object = "snapshots/37b3f20d941e2f5e6d99114d9bb2f3e67a8a2e5c9c4c5a1b0d6e7f8091a2b3c4";
+        let metadata = metadata_for_object(bucket, object);
+        write_test_object_metadata_bytes(&temp_dir, bucket, object, &metadata).await;
 
         let mut disks = vec![scanner.local_disk.clone()];
         for disk_name in ["disk2", "disk3", "disk4"] {
             let disk_root = temp_dir.join(disk_name);
-            tokio::fs::create_dir_all(disk_root.join(bucket))
-                .await
-                .expect("failed to create extra disk bucket directory");
+            write_test_object_metadata_bytes(&disk_root, bucket, object, &metadata).await;
             let endpoint =
                 Endpoint::try_from(disk_root.to_string_lossy().as_ref()).expect("failed to create extra disk endpoint");
             let disk = new_disk(
@@ -4204,7 +4211,7 @@ mod tests {
         scanner.disks = disks;
         scanner.disks_quorum = 2;
         scanner.old_cache.replace(
-            "src-archive/snapshots/37b3f20d941e2f5e6d99114d9bb2f3e67a8a2e5c9c4c5a1b0d6e7f8091a2b3c4",
+            &format!("{bucket}/{object}"),
             bucket,
             DataUsageEntry {
                 objects: 1,
@@ -4219,13 +4226,17 @@ mod tests {
             object_heal_prob_div: 1,
         };
 
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            scanner.scan_folder(CancellationToken::new(), folder, &mut into),
-        )
-        .await
-        .expect("scan_folder should not hang after list_path_raw finishes")
-        .expect("scan_folder should finish successfully");
+        tokio::time::timeout(Duration::from_secs(2), scanner.scan_folder(CancellationToken::new(), folder, &mut into))
+            .await
+            .expect("scan_folder should not hang after list_path_raw finishes")
+            .expect("scan_folder should finish successfully");
+
+        let root = scanner
+            .new_cache
+            .checked_flatten(bucket)
+            .expect("healed cache must contain canonical child links");
+        assert_eq!(root.objects, 1);
+        assert!(heal_starts.load(Ordering::Relaxed) > 0, "test must execute the heal child-link path");
     }
 
     #[tokio::test]
@@ -4774,7 +4785,7 @@ mod tests {
         .expect("unbounded scan should finish after partial progress");
 
         let root = result
-            .size_recursive("bucket")
+            .checked_flatten("bucket")
             .expect("completed cache should retain bucket usage");
         assert_eq!(root.objects, 5);
         assert!(result.info.snapshot_complete);
@@ -4826,6 +4837,106 @@ mod tests {
             scanner.new_cache.find(&old_leaf_hash.key()).is_none(),
             "carried children would be flattened again by size_recursive"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_partial_entry_does_not_carry_missing_old_child() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir),
+        };
+        let root_hash = hash_path("bucket");
+        scanner.old_cache.cache.insert(
+            root_hash.key(),
+            DataUsageEntry {
+                children: HashSet::from([hash_path("bucket/missing").key()]),
+                ..Default::default()
+            },
+        );
+
+        let mut partial = DataUsageEntry {
+            objects: 2,
+            size: 2,
+            ..Default::default()
+        };
+        scanner.carry_forward_old_children(&root_hash, &mut partial);
+        scanner.new_cache.replace_hashed(&root_hash, &None, &partial);
+
+        assert!(partial.children.is_empty());
+        let flattened = scanner
+            .new_cache
+            .checked_flatten("bucket")
+            .expect("a partial cache must not retain dangling child links");
+        assert_eq!(flattened.objects, 2);
+        assert_eq!(flattened.size, 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_legacy_windows_cache_rebuilds_and_round_trips_portable_keys() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir.clone()),
+        };
+        write_test_object_metadata(&temp_dir, "bucket", "prefix/object").await;
+
+        let source = crate::data_usage_define::DataUsageCacheSource::new(0, 0);
+        let scan_plan_digest = crate::data_usage_define::DataUsageScanPlanDigest([9; 32]);
+        let mut legacy = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                scan_plan_digest: Some(scan_plan_digest),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        legacy.cache.insert(
+            "bucket".to_string(),
+            DataUsageEntry {
+                children: HashSet::from(["bucket\\prefix".to_string()]),
+                ..Default::default()
+            },
+        );
+        legacy.cache.insert(
+            "bucket\\prefix".to_string(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        let encoded = legacy.marshal_msg().expect("legacy cache should serialize");
+        let mut migrated = DataUsageCache::unmarshal(&encoded).expect("legacy cache should deserialize");
+        assert_eq!(
+            migrated.prepare_for_scan("bucket", 8, 0, source, scan_plan_digest, true),
+            crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
+        );
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Default::default());
+        let rebuilt = scan_data_folder(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk,
+            migrated,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await
+        .expect("portable cache rebuild should complete");
+        let persisted = rebuilt.marshal_msg().expect("rebuilt cache should serialize");
+        let decoded = DataUsageCache::unmarshal(&persisted).expect("rebuilt cache should deserialize");
+
+        assert_eq!(decoded.info.cache_key_format, crate::data_usage_define::DATA_USAGE_CACHE_KEY_FORMAT);
+        assert!(decoded.cache.keys().all(|key| !key.contains('\\')));
+        let root = decoded
+            .checked_flatten("bucket")
+            .expect("rebuilt persisted cache should have a complete root");
+        assert_eq!(root.objects, 1);
     }
 
     #[tokio::test]

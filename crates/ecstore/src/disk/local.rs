@@ -381,6 +381,291 @@ fn classify_delete_volume_error(err: std::io::Error) -> DiskError {
     }
 }
 
+#[cfg(unix)]
+struct EmptyDirectoryFrame {
+    path: PathBuf,
+    name_in_parent: std::ffi::CString,
+    entries: rustix::fs::Dir,
+}
+
+#[cfg(unix)]
+fn empty_tree_io_error(err: rustix::io::Errno) -> std::io::Error {
+    match err {
+        rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => std::io::Error::from(ErrorKind::DirectoryNotEmpty),
+        _ => err.into(),
+    }
+}
+
+#[cfg(unix)]
+fn remove_empty_directory_tree_unix_with(
+    root: &Path,
+    mut before_descend: impl FnMut(&Path) -> std::io::Result<()>,
+    mut before_remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use rustix::{
+        fs::{AtFlags, Dir, Mode, OFlags, fstat, open, openat, statat, unlinkat},
+        io::Errno,
+    };
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let root_parent_path = root
+        .parent()
+        .ok_or_else(|| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?
+        .as_bytes();
+    let root_name = std::ffi::CString::new(root_name).map_err(|_| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
+    let root_parent = open(root_parent_path, flags, Mode::empty()).map_err(empty_tree_io_error)?;
+    let root_fd = openat(&root_parent, root_name.as_c_str(), flags, Mode::empty()).map_err(empty_tree_io_error)?;
+    // Each frame owns one directory iterator/FD, so memory and descriptors are
+    // bounded by path depth rather than by the number of empty remnants.
+    let mut stack = vec![EmptyDirectoryFrame {
+        path: root.to_path_buf(),
+        name_in_parent: root_name,
+        entries: Dir::new(root_fd).map_err(empty_tree_io_error)?,
+    }];
+
+    while let Some(mut frame) = stack.pop() {
+        let next_child = loop {
+            let Some(entry) = frame.entries.next() else {
+                break None;
+            };
+            let entry = entry.map_err(std::io::Error::from)?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+
+            let name = name.to_owned();
+            let child_path = frame.path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+            before_descend(&child_path)?;
+            break Some((child_path, name));
+        };
+
+        if let Some((child_path, name)) = next_child {
+            let parent = frame.entries.fd().map_err(std::io::Error::from)?;
+            let child = match openat(parent, name.as_c_str(), flags, Mode::empty()) {
+                Ok(child) => child,
+                // A concurrent cleanup may remove an empty child after readdir
+                // returns it. Resume the parent instead of treating the whole
+                // bucket as missing and leaving its root behind.
+                Err(Errno::NOENT) => {
+                    stack.push(frame);
+                    continue;
+                }
+                Err(err) => return Err(empty_tree_io_error(err)),
+            };
+            stack.push(frame);
+            stack.push(EmptyDirectoryFrame {
+                path: child_path,
+                name_in_parent: name,
+                entries: Dir::new(child).map_err(empty_tree_io_error)?,
+            });
+            continue;
+        }
+        before_remove(&frame.path)?;
+        let parent = if let Some(parent) = stack.last() {
+            parent.entries.fd().map_err(std::io::Error::from)?
+        } else {
+            root_parent.as_fd()
+        };
+        let expected = fstat(frame.entries.fd().map_err(std::io::Error::from)?).map_err(empty_tree_io_error)?;
+        let current = statat(parent, frame.name_in_parent.as_c_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(empty_tree_io_error)?;
+        if current.st_dev != expected.st_dev || current.st_ino != expected.st_ino {
+            return Err(std::io::Error::from(ErrorKind::DirectoryNotEmpty));
+        }
+        match unlinkat(parent, frame.name_in_parent.as_c_str(), AtFlags::REMOVEDIR).map_err(empty_tree_io_error) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn remove_empty_directory_tree_with(
+    root: &Path,
+    before_descend: impl FnMut(&Path) -> std::io::Result<()>,
+    before_remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    remove_empty_directory_tree_unix_with(root, before_descend, before_remove)
+}
+
+#[cfg(unix)]
+async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_empty_directory_tree_unix_with(&root, |_| Ok(()), |_| Ok(()))).await?
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct LockedEmptyDirectory {
+    handle: winapi_util::Handle,
+}
+
+#[cfg(windows)]
+fn validate_windows_empty_directory(file_attributes: u64) -> std::io::Result<()> {
+    const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u64 = 0x400;
+
+    if file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::from(ErrorKind::DirectoryNotEmpty));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn lock_windows_empty_directory(path: &Path, canonical_root: Option<&Path>) -> std::io::Result<LockedEmptyDirectory> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{DELETE, FILE_SHARE_READ},
+    };
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let path = path.to_path_buf();
+    let canonical_root = canonical_root.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        let handle = winapi_util::Handle::from_file(file);
+        let info = winapi_util::file::information(&handle)?;
+        validate_windows_empty_directory(info.file_attributes())?;
+        if let Some(canonical_root) = canonical_root {
+            let canonical_path = std::fs::canonicalize(path)?;
+            if !canonical_path.starts_with(canonical_root) {
+                return Err(std::io::Error::from(ErrorKind::DirectoryNotEmpty));
+            }
+        }
+        Ok::<_, std::io::Error>(LockedEmptyDirectory { handle })
+    })
+    .await?
+}
+
+#[cfg(windows)]
+// SAFETY: This helper only passes an owned live handle and one initialized
+// FILE_DISPOSITION_INFO to the synchronous Windows deletion API.
+#[allow(unsafe_code)]
+async fn remove_windows_empty_directory(directory: LockedEmptyDirectory) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle};
+
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let disposition_size = u32::try_from(std::mem::size_of_val(&disposition))
+            .map_err(|_| std::io::Error::other("FILE_DISPOSITION_INFO size exceeds the Win32 API limit"))?;
+        let handle = directory.handle.as_raw_handle();
+        // SAFETY: `handle` is owned by `directory` and stays live for this synchronous
+        // call. `disposition` is initialized with the exact structure and byte size
+        // required by `FileDispositionInfo`; Windows does not retain the pointer.
+        let deleted = unsafe {
+            SetFileInformationByHandle(handle, FileDispositionInfo, std::ptr::from_ref(&disposition).cast(), disposition_size)
+        };
+        if deleted == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+    .await?
+}
+
+#[cfg(windows)]
+struct WindowsEmptyDirectoryFrame {
+    path: PathBuf,
+    directory: LockedEmptyDirectory,
+    entries: fs::ReadDir,
+}
+
+#[cfg(windows)]
+async fn remove_empty_directory_tree_with(
+    root: &Path,
+    mut before_descend: impl FnMut(&Path) -> std::io::Result<()>,
+    mut before_remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let root_directory = lock_windows_empty_directory(root, None).await?;
+    let canonical_root = fs::canonicalize(root).await?;
+    let root_entries = fs::read_dir(root).await?;
+
+    // Holding each validated directory without delete sharing keeps its path
+    // generation stable until handle-relative deletion. State is O(depth).
+    let mut stack = vec![WindowsEmptyDirectoryFrame {
+        path: root.to_path_buf(),
+        directory: root_directory,
+        entries: root_entries,
+    }];
+
+    while let Some(mut frame) = stack.pop() {
+        match frame.entries.next_entry().await {
+            Ok(Some(entry)) => {
+                let child = entry.path();
+                before_descend(&child)?;
+                let child_directory = match lock_windows_empty_directory(&child, Some(&canonical_root)).await {
+                    Ok(directory) => directory,
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        stack.push(frame);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                let child_entries = match fs::read_dir(&child).await {
+                    Ok(entries) => entries,
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        stack.push(frame);
+                        continue;
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotADirectory => {
+                        return Err(std::io::Error::from(ErrorKind::DirectoryNotEmpty));
+                    }
+                    Err(err) => return Err(err),
+                };
+                stack.push(frame);
+                stack.push(WindowsEmptyDirectoryFrame {
+                    path: child,
+                    directory: child_directory,
+                    entries: child_entries,
+                });
+            }
+            Ok(None) => {
+                before_remove(&frame.path)?;
+                drop(frame.entries);
+                match remove_windows_empty_directory(frame.directory).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == ErrorKind::NotADirectory => {
+                        return Err(std::io::Error::from(ErrorKind::DirectoryNotEmpty));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
+    remove_empty_directory_tree_with(root, |_| Ok(()), |_| Ok(())).await
+}
+
+#[cfg(all(not(unix), not(windows)))]
+async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
+    fs::remove_dir(root).await
+}
+
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DISK_LOCAL: &str = "disk_local";
 const EVENT_DISK_LOCAL_STARTUP_CLEANUP: &str = "disk_local_startup_cleanup";
@@ -1556,6 +1841,8 @@ static RENAME_DATA_FAIL_COMMIT_RENAME: std::sync::Mutex<Option<String>> = std::s
 #[cfg(test)]
 static LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 #[cfg(test)]
+static RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT: std::sync::Mutex<Option<(String, PathBuf)>> = std::sync::Mutex::new(None);
+#[cfg(test)]
 static DELETE_VERSION_FAIL_AFTER_DATA_STAGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 static DELETE_VERSION_FAIL_AFTER_COMMIT: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
@@ -1586,6 +1873,13 @@ fn set_local_inline_rollback_hardlink_failure(dst_path: &Path) {
     *LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE
         .lock()
         .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_path_buf());
+}
+
+#[cfg(test)]
+fn set_rename_data_remove_dst_base_before_commit(dst_path: &str, dst_base: &Path) {
+    *RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
+        .lock()
+        .expect("test failpoint lock should not be poisoned") = Some((dst_path.to_string(), dst_base.to_path_buf()));
 }
 
 #[cfg(test)]
@@ -1657,6 +1951,19 @@ fn should_fail_local_inline_rollback_hardlink(dst_path: &Path) -> bool {
 }
 
 #[cfg(test)]
+fn remove_dst_base_before_commit(dst_path: &str) -> std::io::Result<()> {
+    let mut target = RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
+        .lock()
+        .expect("test failpoint lock should not be poisoned");
+    let Some((_, base)) = target.as_ref().filter(|(target_path, _)| target_path == dst_path) else {
+        return Ok(());
+    };
+    std::fs::remove_dir_all(base)?;
+    target.take();
+    Ok(())
+}
+
+#[cfg(test)]
 fn should_fail_after_delete_data_staged(path: &str) -> bool {
     let mut targets = DELETE_VERSION_FAIL_AFTER_DATA_STAGED
         .lock()
@@ -1703,6 +2010,11 @@ fn should_fail_commit_rename(_dst_path: &str) -> bool {
 #[cfg(not(test))]
 fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
     false
+}
+
+#[cfg(not(test))]
+fn remove_dst_base_before_commit(_dst_path: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -4243,9 +4555,11 @@ impl LocalDisk {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
-        rename_all(&tmp_path, &tmp_old_path, root).await.inspect_err(|err| {
-            log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
-        })?;
+        rename_all_ignore_missing_source(&tmp_path, &tmp_old_path, root)
+            .await
+            .inspect_err(|err| {
+                log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
+            })?;
 
         let tmp_deleted_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET);
         tokio::fs::create_dir_all(&tmp_deleted_path).await.inspect_err(|err| {
@@ -7359,6 +7673,10 @@ impl DiskAPI for LocalDisk {
         dst_path: &str,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
+        // A non-force DeleteBucket must not remove a directory while a local
+        // object commit is publishing into it. The peer's empty scan remains
+        // optimistic; this guard establishes the local commit/delete order.
+        let _volume_mutation_guard = os::disk_volume_mutation_lock(&self.root, dst_volume).read_owned().await;
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
         }
@@ -7555,6 +7873,7 @@ impl DiskAPI for LocalDisk {
             // sequential version did.
             tmp_meta_res?;
             shard_sync_res?;
+            remove_dst_base_before_commit(dst_path).map_err(to_file_error)?;
 
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
@@ -7814,6 +8133,7 @@ impl DiskAPI for LocalDisk {
                 xlmeta.add_version(fi)?;
                 let version_signature = rename_data_versions_signature(&xlmeta);
                 let new_buf = xlmeta.marshal_msg()?;
+                remove_dst_base_before_commit(&dst_path_for_failpoint).map_err(to_file_error)?;
 
                 // Write new xl.meta + rename. Inline objects carry their data
                 // inside xl.meta, so this whole sequence is a metadata commit:
@@ -7838,9 +8158,11 @@ impl DiskAPI for LocalDisk {
                 {
                     let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
                     let old_parent = old_path.parent().map(|p| p.to_path_buf());
-                    if let Some(ref old_parent) = old_parent {
-                        std::fs::create_dir_all(old_parent)?;
-                    }
+                    let _old_parent_guard = old_parent
+                        .as_deref()
+                        .map(|parent| os::mkdir_all_below_existing_base_std(parent, &bucket_dir))
+                        .transpose()
+                        .map_err(to_file_error)?;
                     // This rollback backup is the sole restore source for a later
                     // undo_write when the set-level write quorum fails. Persist it as
                     // durably as the new xl.meta written above (and as the non-inline
@@ -7866,6 +8188,12 @@ impl DiskAPI for LocalDisk {
                     local_rollback_path = Some(create_local_inline_rollback_backup(&dst, &src, old_metadata)?);
                 }
 
+                #[cfg(windows)]
+                let _commit_parent_guard = if let Some(parent) = dst.parent() {
+                    Some(os::mkdir_all_below_existing_base_std(parent, &bucket_dir).map_err(to_file_error)?)
+                } else {
+                    None
+                };
                 let commit_result = if should_fail_commit_rename(&dst_path_for_failpoint) {
                     Err(std::io::Error::other("test fail during metadata commit rename"))
                 } else {
@@ -7874,7 +8202,8 @@ impl DiskAPI for LocalDisk {
                         Err(err) if err.kind() == ErrorKind::NotFound && !src.exists() => Ok(()),
                         Err(err) if err.kind() == ErrorKind::NotFound => {
                             if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent)?;
+                                let _parent_guard =
+                                    os::mkdir_all_below_existing_base_std(parent, &bucket_dir).map_err(to_file_error)?;
                             }
                             std::fs::rename(&src, &dst).map_err(to_file_error)?;
                             Ok(())
@@ -8791,18 +9120,16 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
+        let _volume_mutation_guard = os::disk_volume_mutation_lock(&self.root, volume).write_owned().await;
 
-        // Non-force is non-recursive: `remove_dir` (rmdir) fails atomically with
-        // `DirectoryNotEmpty` -> VolumeNotEmpty if the bucket still holds any
-        // object data, so a misclassified "dangling" bucket on the heal path
-        // (or a non-force S3 DeleteBucket on a populated bucket) can never be
-        // recursively wiped. Only an explicit `force_delete` (e.g. S3 force
-        // bucket delete) removes recursively. Mirrors MinIO's
-        // xlStorage.DeleteVol (Remove vs RemoveAll). (backlog#799 B1)
+        // Non-force removes empty directory remnants children-first with
+        // non-recursive rmdir calls. A file that exists during the scan, or
+        // appears before its parent is removed, fails closed with
+        // VolumeNotEmpty. Only an explicit force delete removes recursively.
         let res = if force_delete {
             fs::remove_dir_all(&p).await
         } else {
-            fs::remove_dir(&p).await
+            remove_empty_directory_tree(&p).await
         };
 
         if let Err(err) = res {
@@ -9059,6 +9386,35 @@ mod test {
                 DiskError::VolumeNotEmpty
             ));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_empty_tree_requires_non_reparse_directory() {
+        validate_windows_empty_directory(0x10).expect("ordinary directories should be accepted");
+        assert!(validate_windows_empty_directory(0).is_err());
+        assert!(validate_windows_empty_directory(0x10 | 0x400).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_empty_tree_blocks_replacement_at_final_delete_boundary() {
+        let root = tempfile::tempdir().expect("temporary root should be created");
+        let bucket_path = root.path().join("bucket");
+        let child_path = bucket_path.join("child");
+        fs::create_dir_all(&child_path).await.expect("bucket child should be created");
+        let canonical_root = fs::canonicalize(&bucket_path).await.expect("bucket path should canonicalize");
+        let directory = lock_windows_empty_directory(&child_path, Some(&canonical_root))
+            .await
+            .expect("child directory should be locked");
+
+        std::fs::rename(&child_path, bucket_path.join("replacement"))
+            .expect_err("the locked directory must not be replaceable at the final deletion boundary");
+        remove_windows_empty_directory(directory)
+            .await
+            .expect("handle-relative deletion should remove the locked directory");
+
+        assert!(!child_path.exists(), "the exact locked directory should be removed");
     }
 
     async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {
@@ -10784,6 +11140,72 @@ mod test {
         assert!(
             os::fsync_dir_recorder::was_fsynced(&bucket_dir),
             "the bucket dir must be fsynced on an inline first PUT"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_data_deleted_bucket)]
+    async fn rename_data_non_inline_does_not_recreate_bucket_deleted_before_commit() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "deleted-before-non-inline-commit";
+        let object = "prefix/object";
+        let tmp_object = "tmp-non-inline-delete-race";
+        let data_dir = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("data dir should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let staged_data = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}/part.1"))
+            .expect("staged data path should resolve");
+        fs::create_dir_all(staged_data.parent().expect("staged data should have a parent"))
+            .await
+            .expect("staged data parent should be created");
+        fs::write(&staged_data, b"payload")
+            .await
+            .expect("staged shard should be written");
+
+        let bucket_path = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        set_rename_data_remove_dst_base_before_commit(object, &bucket_path);
+        let fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+            .await
+            .expect_err("commit must fail after the destination bucket is deleted");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(!bucket_path.exists(), "rename_data must not recreate the deleted bucket");
+        assert!(staged_data.exists(), "failed commit must preserve the staged shard");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_data_deleted_bucket)]
+    async fn rename_data_inline_does_not_recreate_bucket_deleted_before_commit() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "deleted-before-inline-commit";
+        let object = "prefix/object";
+        let tmp_object = "tmp-inline-delete-race";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let bucket_path = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        set_rename_data_remove_dst_base_before_commit(object, &bucket_path);
+        let fi = test_file_info(object, Uuid::new_v4(), None, Some(Bytes::from_static(b"inline payload")));
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+            .await
+            .expect_err("inline commit must fail after the destination bucket is deleted");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(!bucket_path.exists(), "inline rename_data must not recreate the deleted bucket");
+        assert!(
+            disk.get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
+                .expect("staged metadata path should resolve")
+                .exists(),
+            "failed inline commit must preserve staged metadata"
         );
     }
 
@@ -12643,6 +13065,19 @@ mod test {
         assert!(format_info.data.is_empty(), "cached format bytes should be cleared");
         assert!(format_info.file_info.is_none(), "cached file metadata should be cleared");
         assert!(format_info.last_check.is_none(), "cached format timestamp should be cleared");
+    }
+
+    #[tokio::test]
+    async fn cleanup_tmp_on_startup_allows_missing_tmp_directory() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+
+        LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
+            .await
+            .expect("missing temporary directory should already be clean");
+
+        assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
     }
 
     #[tokio::test]
@@ -14515,6 +14950,154 @@ mod test {
         assert!(disk.stat_volume("b1-bucket").await.is_err(), "bucket must be gone after force delete");
 
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn delete_volume_non_force_removes_nested_empty_directories() {
+        let root = tempfile::tempdir().expect("temporary disk root should be created");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "nested-empty-bucket";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+        fs::create_dir_all(disk.path().join(bucket).join("a/b/c"))
+            .await
+            .expect("nested empty directories should be created");
+
+        disk.delete_volume(bucket, false)
+            .await
+            .expect("non-force delete should remove an empty directory tree");
+
+        assert!(matches!(disk.stat_volume(bucket).await, Err(DiskError::VolumeNotFound)));
+    }
+
+    #[tokio::test]
+    async fn empty_tree_delete_preserves_xlmeta_published_after_scan() {
+        let root = tempfile::tempdir().expect("temporary disk root should be created");
+        let bucket_path = root.path().join("bucket");
+        let object_path = bucket_path.join("object").join(STORAGE_FORMAT_FILE);
+        fs::create_dir_all(object_path.parent().expect("object path should have a parent"))
+            .await
+            .expect("empty object directory should be created");
+
+        let data = b"committed object metadata";
+        let mut published = false;
+        let err = remove_empty_directory_tree_with(
+            &bucket_path,
+            |_| Ok(()),
+            |directory| {
+                if !published && directory == object_path.parent().expect("object path should have a parent") {
+                    std::fs::write(&object_path, data)?;
+                    published = true;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("rmdir should refuse metadata published after the directory scan");
+
+        assert!(published, "test barrier should publish metadata before rmdir");
+        assert!(matches!(classify_delete_volume_error(err), DiskError::VolumeNotEmpty));
+        assert_eq!(std::fs::read(&object_path).expect("object metadata should be preserved"), data);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_tree_delete_rejects_child_replaced_with_external_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary root should be created");
+        let bucket_path = root.path().join("bucket");
+        let child_path = bucket_path.join("child");
+        let outside_path = root.path().join("outside");
+        let outside_empty = outside_path.join("must-remain");
+        fs::create_dir_all(&child_path).await.expect("bucket child should be created");
+        fs::create_dir_all(&outside_empty)
+            .await
+            .expect("outside directory should be created");
+
+        let mut replaced = false;
+        let err = remove_empty_directory_tree_with(
+            &bucket_path,
+            |child| {
+                if !replaced && child == child_path {
+                    std::fs::remove_dir(&child_path)?;
+                    symlink(&outside_path, &child_path)?;
+                    replaced = true;
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("a replaced child must fail closed");
+
+        assert!(replaced, "test barrier should replace the child before it is opened");
+        assert!(matches!(classify_delete_volume_error(err), DiskError::VolumeNotEmpty));
+        assert!(outside_empty.exists(), "bucket deletion must not remove directories outside the bucket");
+        assert!(
+            std::fs::symlink_metadata(&child_path)
+                .expect("replacement symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_tree_delete_rechecks_parent_after_child_disappears() {
+        let root = tempfile::tempdir().expect("temporary root should be created");
+        let bucket_path = root.path().join("bucket");
+        let child_path = bucket_path.join("child");
+        fs::create_dir_all(&child_path).await.expect("bucket child should be created");
+
+        let mut removed = false;
+        remove_empty_directory_tree_with(
+            &bucket_path,
+            |child| {
+                if !removed && child == child_path {
+                    std::fs::remove_dir(&child_path)?;
+                    removed = true;
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("a vanished empty child should not leave the bucket root behind");
+
+        assert!(removed, "test hook should remove the child before openat");
+        assert!(!bucket_path.exists(), "parent should be rechecked and removed after the child disappears");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_tree_delete_rejects_root_generation_replacement() {
+        let root = tempfile::tempdir().expect("temporary root should be created");
+        let bucket_path = root.path().join("bucket");
+        let moved_path = root.path().join("bucket-before-replacement");
+        fs::create_dir(&bucket_path).await.expect("bucket should be created");
+
+        let mut replaced = false;
+        let err = remove_empty_directory_tree_with(
+            &bucket_path,
+            |_| Ok(()),
+            |directory| {
+                if !replaced && directory == bucket_path {
+                    std::fs::rename(&bucket_path, &moved_path)?;
+                    std::fs::create_dir(&bucket_path)?;
+                    replaced = true;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a replacement root directory must fail closed");
+
+        assert!(replaced, "test hook should replace the root generation before rmdir");
+        assert!(matches!(classify_delete_volume_error(err), DiskError::VolumeNotEmpty));
+        assert!(moved_path.exists(), "the originally scanned root should not be removed by its old name");
+        assert!(bucket_path.exists(), "the replacement root should remain after identity validation fails");
     }
 
     #[tokio::test]

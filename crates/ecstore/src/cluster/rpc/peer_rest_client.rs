@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
     is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
@@ -58,7 +58,7 @@ use std::{
     collections::HashMap,
     io::Cursor,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::SystemTime,
@@ -66,7 +66,6 @@ use std::{
 use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -222,6 +221,21 @@ fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8])
         .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
 }
 
+fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
+    let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(result).map_err(Error::other)?;
+    if topology_member != expected_member {
+        return Err(Error::other(
+            "peer returned a remote version state capability for a different topology member",
+        ));
+    }
+    let server_epoch =
+        Uuid::from_slice(process_epoch).map_err(|_| Error::other("peer returned an invalid remote version state epoch"))?;
+    if server_epoch.is_nil() {
+        return Err(Error::other("peer returned a nil remote version state epoch"));
+    }
+    Ok(server_epoch)
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -233,6 +247,7 @@ pub struct PeerLiveEventsBatch {
 pub struct PeerRestClient {
     pub host: XHost,
     pub grid_host: String,
+    topology_member: String,
     offline: Arc<AtomicBool>,
     recovery_running: Arc<AtomicBool>,
 }
@@ -325,12 +340,52 @@ impl PeerRestClient {
     }
 
     pub fn new(host: XHost, grid_host: String) -> Self {
+        let topology_member = host.to_string();
         Self {
             host,
             grid_host,
+            topology_member,
             offline: Arc::new(AtomicBool::new(false)),
             recovery_running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn parse_topology_host(peer_host_port: &str, grid_host: &str) -> Result<XHost> {
+        let url = url::Url::parse(grid_host).map_err(|_| Error::other("peer grid host is not a valid URL"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return Err(Error::other("peer grid host has an invalid URL shape"));
+        }
+        let url_host = url.host().ok_or_else(|| Error::other("peer grid host is missing a host"))?;
+        let topology_host = match url.port() {
+            Some(port) => format!("{url_host}:{port}"),
+            None => url_host.to_string(),
+        };
+        let explicit_port = url.port();
+        let name = match url_host {
+            url::Host::Domain(domain) => domain.to_string(),
+            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv6(address) if explicit_port.is_none() => format!("[{address}]"),
+            url::Host::Ipv6(address) => address.to_string(),
+        };
+        let port = url
+            .port_or_known_default()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| Error::other("peer grid host is missing a valid port"))?;
+        let host = XHost {
+            name,
+            port,
+            is_port_set: explicit_port.is_some(),
+        };
+        if topology_host != peer_host_port {
+            return Err(Error::other("peer topology host does not match its grid URL"));
+        }
+        Ok(host)
     }
 
     fn build_clients_from_slots(
@@ -346,10 +401,14 @@ impl PeerRestClient {
             }
 
             let client = match grid_host {
-                Some(grid_host) => match XHost::try_from(peer_host_port.clone()) {
-                    Ok(host) => Some(PeerRestClient::new(host, grid_host)),
+                Some(grid_host) => match Self::parse_topology_host(&peer_host_port, &grid_host) {
+                    Ok(host) => {
+                        let mut client = PeerRestClient::new(host, grid_host);
+                        client.topology_member = peer_host_port.clone();
+                        Some(client)
+                    }
                     Err(err) => {
-                        warn!(peer = %peer_host_port, "Xhost parse failed while constructing peer client: {err:?}");
+                        warn!(peer = %peer_host_port, "peer topology host parse failed while constructing peer client: {err:?}");
                         None
                     }
                 },
@@ -390,7 +449,7 @@ impl PeerRestClient {
         (remote, all, remote_topology_hosts)
     }
 
-    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
@@ -411,7 +470,7 @@ impl PeerRestClient {
         &self,
     ) -> Result<
         rustfs_protos::proto_gen::node_service::heal_control_service_client::HealControlServiceClient<
-            InterceptedService<Channel, TonicInterceptor>,
+            InterceptedService<AuthenticatedChannel, TonicInterceptor>,
         >,
     > {
         if self.offline.load(Ordering::Acquire) {
@@ -432,7 +491,7 @@ impl PeerRestClient {
 
     async fn get_tier_mutation_control_client(
         &self,
-    ) -> Result<TierMutationControlServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+    ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
@@ -498,9 +557,8 @@ impl PeerRestClient {
         }
 
         let grid_host = self.grid_host.clone();
-        let offline = Arc::clone(&self.offline);
-        let recovery_running = Arc::clone(&self.recovery_running);
-        let span = Self::recovery_monitor_span(&grid_host);
+        let offline = Arc::downgrade(&self.offline);
+        let recovery_running = Arc::downgrade(&self.recovery_running);
         // The offline flag and its recovery are the silent half of
         // rustfs/backlog#888: log the monitor's start and its success so an
         // "offline then back" episode leaves a trace on the observing node.
@@ -509,13 +567,34 @@ impl PeerRestClient {
             grid_host = %self.grid_host,
             "peer RPC connection marked offline after a network-like failure; starting background recovery monitor"
         );
+        drop(Self::spawn_recovery_monitor(grid_host, offline, recovery_running));
+    }
+
+    fn spawn_recovery_monitor(
+        grid_host: String,
+        offline: Weak<AtomicBool>,
+        recovery_running: Weak<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let span = Self::recovery_monitor_span(&grid_host);
         super::spawn_background_monitor(span, async move {
             let mut delay = get_drive_active_check_interval();
             let connect_timeout = get_drive_active_check_timeout();
 
             for attempt in 1..=PEER_REST_RECOVERY_MAX_ATTEMPTS {
+                if offline.strong_count() == 0 || recovery_running.strong_count() == 0 {
+                    return;
+                }
                 tokio::time::sleep(delay).await;
+                if offline.strong_count() == 0 || recovery_running.strong_count() == 0 {
+                    return;
+                }
                 if Self::perform_connectivity_check(&grid_host, connect_timeout).await.is_ok() {
+                    let Some(offline) = offline.upgrade() else {
+                        return;
+                    };
+                    let Some(recovery_running) = recovery_running.upgrade() else {
+                        return;
+                    };
                     offline.store(false, Ordering::Release);
                     recovery_running.store(false, Ordering::Release);
                     info!(
@@ -535,8 +614,10 @@ impl PeerRestClient {
                 attempts = PEER_REST_RECOVERY_MAX_ATTEMPTS,
                 "peer recovery monitor reached max attempts; will retry on next request"
             );
-            recovery_running.store(false, Ordering::Release);
-        });
+            if let Some(recovery_running) = recovery_running.upgrade() {
+                recovery_running.store(false, Ordering::Release);
+            }
+        })
     }
 
     #[cfg(test)]
@@ -1152,6 +1233,15 @@ impl PeerRestClient {
             .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
             .await?;
         validate_heal_control_capability_proof(&canonical_ack, &proof)
+    }
+
+    pub async fn probe_remote_version_state(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::remote_version_state_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
@@ -1777,9 +1867,13 @@ fn tier_config_reload_status_outcome(status: tonic::Status) -> TierConfigReloadO
 mod tests {
     use super::*;
     use crate::config::com::STORAGE_CLASS_SUB_SYS;
+    use crate::layout::{disks_layout::DisksLayout, endpoints::SetupType};
+    use rustfs_config::{ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_STARTUP_TOPOLOGY_WAIT_MODE};
     use serde_json::Value;
+    use serial_test::serial;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
+    use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
 
     #[test]
@@ -1897,30 +1991,115 @@ mod tests {
     fn build_clients_from_slots_preserves_missing_remote_topology_slots() {
         let slots = vec![
             ("127.0.0.1:9000".to_string(), None, true),
-            ("127.0.0.1:9001".to_string(), Some("http://127.0.0.1:9001".to_string()), false),
+            (
+                "rustfs-1.invalid:9001".to_string(),
+                Some("http://rustfs-1.invalid:9001".to_string()),
+                false,
+            ),
+            ("rustfs-2.invalid".to_string(), Some("http://rustfs-2.invalid".to_string()), false),
             ("127.0.0.1:notaport".to_string(), Some("http://127.0.0.1:notaport".to_string()), false),
             ("127.0.0.1:9003".to_string(), None, false),
         ];
 
         let (remote, all, remote_topology_hosts) = PeerRestClient::build_clients_from_slots(slots);
 
-        assert_eq!(remote.len(), 3, "local node is excluded but remote slots are not compacted away");
-        assert_eq!(all.len(), 4, "all slots preserve the sorted cluster topology shape");
+        assert_eq!(remote.len(), 4, "local node is excluded but remote slots are not compacted away");
+        assert_eq!(all.len(), 5, "all slots preserve the sorted cluster topology shape");
         assert_eq!(
             remote_topology_hosts,
             vec![
-                "127.0.0.1:9001".to_string(),
+                "rustfs-1.invalid:9001".to_string(),
+                "rustfs-2.invalid".to_string(),
                 "127.0.0.1:notaport".to_string(),
                 "127.0.0.1:9003".to_string()
             ]
         );
-        assert!(remote[0].is_some(), "valid remote peer should get a client");
-        assert!(remote[1].is_none(), "unparseable remote peer should remain observable as a missing slot");
-        assert!(remote[2].is_none(), "missing grid host should remain observable as a missing slot");
+        let unresolved = remote[0]
+            .as_ref()
+            .expect("temporarily unresolved remote peer should retain a client");
+        assert_eq!(unresolved.host.to_string(), "rustfs-1.invalid:9001");
+        let default_port = remote[1]
+            .as_ref()
+            .expect("temporarily unresolved scheme-default remote peer should retain a client");
+        assert_eq!(default_port.host.to_string(), "rustfs-2.invalid");
+        assert_eq!(default_port.host.port, 80);
+        assert!(!default_port.host.is_port_set);
+        assert!(remote[2].is_none(), "unparseable remote peer should remain observable as a missing slot");
+        assert!(remote[3].is_none(), "missing grid host should remain observable as a missing slot");
         assert!(all[0].is_none(), "local node is represented by the local server_info row");
         assert!(all[1].is_some());
-        assert!(all[2].is_none());
+        assert!(all[2].is_some());
         assert!(all[3].is_none());
+        assert!(all[4].is_none());
+    }
+
+    #[test]
+    fn topology_host_parser_preserves_names_and_bracketed_ipv6() {
+        let domain = PeerRestClient::parse_topology_host("rustfs-1.invalid", "https://rustfs-1.invalid")
+            .expect("unresolved HTTPS topology host should parse without DNS");
+        assert_eq!(domain.to_string(), "rustfs-1.invalid");
+        assert_eq!(domain.port, 443);
+        assert!(!domain.is_port_set);
+
+        let ipv6 = PeerRestClient::parse_topology_host("[2001:db8::1]:9000", "http://[2001:db8::1]:9000")
+            .expect("bracketed IPv6 topology host should parse without changing its identity");
+        assert_eq!(ipv6.to_string(), "[2001:db8::1]:9000");
+
+        let default_port_ipv6 = PeerRestClient::parse_topology_host("[2001:db8::2]", "http://[2001:db8::2]")
+            .expect("scheme-default IPv6 topology host should parse without DNS");
+        assert_eq!(default_port_ipv6.to_string(), "[2001:db8::2]");
+        assert_eq!(default_port_ipv6.port, 80);
+        assert!(!default_port_ipv6.is_port_set);
+
+        assert!(PeerRestClient::parse_topology_host("peer.invalid:0", "http://peer.invalid:0").is_err());
+        assert!(PeerRestClient::parse_topology_host("peer-a.invalid:9000", "http://peer-b.invalid:9000").is_err());
+        assert!(PeerRestClient::parse_topology_host("peer.invalid:9000", "http://peer.invalid:9000/unexpected").is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unresolved_default_port_endpoint_topology_retains_all_peer_clients() {
+        let volumes = (0..4)
+            .map(|index| format!("http://rustfs-{index}.invalid:80/data{index}"))
+            .collect::<Vec<_>>();
+        let layout = DisksLayout::from_volumes(&volumes).expect("distributed default-port topology should parse");
+
+        async_with_vars(
+            [
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("orchestrated")),
+                (ENV_LOCAL_ENDPOINT_HOST, Some("rustfs-0.invalid")),
+                (ENV_KUBERNETES_SERVICE_HOST, None),
+            ],
+            async {
+                let (server_pools, setup_type) = EndpointServerPools::create_server_endpoints("0.0.0.0:80", &layout)
+                    .await
+                    .expect("explicit local identity should avoid peer DNS during endpoint construction");
+                assert_eq!(setup_type, SetupType::DistErasure);
+
+                let (remote, all, remote_topology_hosts) =
+                    PeerRestClient::build_clients_from_slots(server_pools.peer_grid_host_slots_sorted());
+                assert_eq!(remote.len(), 3);
+                assert!(
+                    remote.iter().all(Option::is_some),
+                    "unresolved remote peers must retain reconnectable clients"
+                );
+                assert_eq!(all.len(), 4);
+                assert_eq!(all.iter().filter(|client| client.is_none()).count(), 1);
+                assert_eq!(remote_topology_hosts.len(), 3);
+                assert!(
+                    remote_topology_hosts.iter().all(|host| !host.contains(':')),
+                    "scheme-default ports must preserve the legacy topology identity"
+                );
+                assert!(
+                    remote
+                        .iter()
+                        .flatten()
+                        .all(|client| client.host.port == 80 && !client.host.is_port_set),
+                    "scheme-default peers must retain the effective dial port"
+                );
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -2470,6 +2649,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_version_state_capability_decoder_fails_closed() {
+        let epoch = Uuid::new_v4();
+        let result = rustfs_protos::encode_remote_version_state_capability("node-a:9000", epoch.as_bytes())
+            .expect("small capability response should encode");
+        assert_eq!(
+            decode_remote_version_state_capability("node-a:9000", &result).expect("valid epoch should decode"),
+            epoch
+        );
+        assert!(decode_remote_version_state_capability("node-b:9000", &result).is_err());
+        assert!(decode_remote_version_state_capability("node-a:9000", &result[..result.len() - 1]).is_err());
+        let nil = rustfs_protos::encode_remote_version_state_capability("node-a:9000", Uuid::nil().as_bytes())
+            .expect("small capability response should encode");
+        assert!(decode_remote_version_state_capability("node-a:9000", &nil).is_err());
+    }
+
     struct TierMutationResponseFixture<'a> {
         version: u32,
         phase: TierMutationRpcPhase,
@@ -2694,6 +2889,31 @@ mod tests {
         assert!(!client.offline.load(Ordering::Acquire));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn dropped_peer_client_releases_and_stops_its_recovery_monitor() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+        client.recovery_running.store(true, Ordering::Release);
+        let offline = Arc::downgrade(&client.offline);
+        let recovery_running = Arc::downgrade(&client.recovery_running);
+        let handle = PeerRestClient::spawn_recovery_monitor(client.grid_host.clone(), offline.clone(), recovery_running.clone());
+        let started = tokio::time::Instant::now();
+
+        drop(client);
+
+        assert!(offline.upgrade().is_none(), "detached recovery must not retain offline state");
+        assert!(
+            recovery_running.upgrade().is_none(),
+            "detached recovery must not retain its running state"
+        );
+        handle.await.expect("recovery monitor should not panic");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "recovery monitor should stop before advancing to its first delayed probe"
+        );
+    }
+
     #[tokio::test]
     async fn peer_rest_client_finalize_result_keeps_online_for_app_errors_mentioning_unavailable() {
         // Regression: application error text containing "unavailable" (a
@@ -2745,7 +2965,7 @@ mod tests {
         // `mark_offline_and_spawn_recovery` path that sibling tests exercise from
         // subscriber-less threads; without this the span can be cached as
         // `Interest::never()` and silently degrade to `Span::none()`.
-        let _callsite_pin = crate::cluster::rpc::pin_callsite_interest_for_test();
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
 
         let client = test_peer_client();
         let span = tracing::info_span!("request-span", request_id = "req-peer-rest");

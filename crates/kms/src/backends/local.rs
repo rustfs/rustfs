@@ -36,6 +36,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 /// Reject key identifiers that would not name a single file directly inside the key
 /// directory.
@@ -144,6 +145,45 @@ impl LocalKmsClient {
         };
         client.validate_existing_keys().await?;
         Ok(client)
+    }
+
+    /// Open a Local KMS key directory without creating or modifying any files.
+    ///
+    /// This constructor is restricted to explicit key-export tooling. Normal
+    /// backend operation must use [`Self::new`].
+    pub async fn new_for_key_export(config: LocalConfig) -> Result<Self> {
+        if !fs::try_exists(&config.key_dir).await? {
+            return Err(KmsError::configuration_error("Local KMS key directory does not exist"));
+        }
+
+        let (master_cipher, legacy_master_cipher) = if let Some(ref master_key) = config.master_key {
+            let legacy_key = Self::derive_legacy_master_key(master_key)?;
+            let legacy_master_cipher = Aes256Gcm::new(&legacy_key);
+            let salt_path = Self::master_key_salt_path(&config);
+            let master_cipher = if fs::try_exists(&salt_path).await? {
+                let salt = fs::read(&salt_path).await?;
+                let salt: [u8; LOCAL_KMS_MASTER_KEY_SALT_LEN] = salt.try_into().map_err(|_| {
+                    KmsError::configuration_error(format!(
+                        "Local KMS master key salt at {} must be exactly {} bytes",
+                        salt_path.display(),
+                        LOCAL_KMS_MASTER_KEY_SALT_LEN
+                    ))
+                })?;
+                Aes256Gcm::new(&Self::derive_master_key(master_key, &salt)?)
+            } else {
+                Aes256Gcm::new(&legacy_key)
+            };
+            (Some(master_cipher), Some(legacy_master_cipher))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            config,
+            master_cipher,
+            legacy_master_cipher,
+            dek_crypto: AesDekCrypto::new(),
+        })
     }
 
     /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
@@ -433,6 +473,20 @@ impl LocalKmsClient {
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
         let (_stored_key, key_material) = self.decode_stored_key(key_id).await?;
         Ok(key_material)
+    }
+
+    /// Decrypt an AES-256 Local KMS key for explicit migration tooling.
+    ///
+    /// The returned buffer is zeroized on drop. Callers must treat the value as
+    /// plaintext key material and avoid logging or persisting it.
+    pub async fn decrypt_key_material_for_export(&self, key_id: &str) -> Result<Zeroizing<[u8; 32]>> {
+        let (stored_key, key_material) = self.decode_stored_key(key_id).await?;
+        if stored_key.algorithm != "AES_256" {
+            return Err(KmsError::unsupported_algorithm(stored_key.algorithm));
+        }
+        let actual = key_material.len();
+        let key_material = key_material.try_into().map_err(|_| KmsError::invalid_key_size(32, actual))?;
+        Ok(Zeroizing::new(key_material))
     }
 
     async fn validate_existing_keys(&self) -> Result<()> {
@@ -1206,6 +1260,52 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(wrong_master_error, KmsError::CryptographicError { .. }));
+    }
+
+    #[tokio::test]
+    async fn key_export_uses_existing_local_decryption_path_without_writing_files() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "export-key";
+        client
+            .create_key(key_id, "AES_256", None)
+            .await
+            .expect("create encrypted key");
+        let expected = client.get_key_material(key_id).await.expect("load expected key material");
+        let salt_path = LocalKmsClient::master_key_salt_path(&client.config);
+        let salt_before = fs::read(&salt_path).await.expect("read existing salt");
+
+        let export_client = LocalKmsClient::new_for_key_export(client.config.clone())
+            .await
+            .expect("open read-only export client");
+        let exported = export_client
+            .decrypt_key_material_for_export(key_id)
+            .await
+            .expect("decrypt key for export");
+
+        assert_eq!(exported.as_ref(), expected.as_slice());
+        assert_eq!(fs::read(&salt_path).await.expect("read unchanged salt"), salt_before);
+    }
+
+    #[tokio::test]
+    async fn key_export_accepts_plaintext_dev_only_key_without_master_key() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
+        let key_id = "plaintext-export-key";
+        client
+            .create_key(key_id, "AES_256", None)
+            .await
+            .expect("create plaintext-dev-only key");
+        let expected = client.get_key_material(key_id).await.expect("load expected key material");
+
+        let export_client = LocalKmsClient::new_for_key_export(client.config.clone())
+            .await
+            .expect("open read-only export client");
+        let exported = export_client
+            .decrypt_key_material_for_export(key_id)
+            .await
+            .expect("export plaintext-dev-only key");
+
+        assert_eq!(exported.as_ref(), expected.as_slice());
+        assert!(!LocalKmsClient::master_key_salt_path(&client.config).exists());
     }
 
     #[tokio::test]

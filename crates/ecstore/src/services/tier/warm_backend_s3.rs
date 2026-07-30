@@ -37,7 +37,10 @@ use crate::error::ErrorResponse;
 use crate::error::error_resp_to_object_err;
 use crate::services::tier::{
     tier_config::TierS3,
-    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{
+        TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
+        build_transition_put_options,
+    },
 };
 use http::HeaderMap;
 use rustfs_utils::egress::validate_outbound_url;
@@ -219,6 +222,92 @@ impl WarmBackendS3 {
             advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
         }
     }
+
+    async fn probe_transition_candidate_identity(
+        &self,
+        object: &str,
+        identity: TransitionCandidateIdentity,
+        bucket_versioning: RemoteBucketVersioning,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let remote_object = self.get_dest(object);
+        let mut opts = ListObjectsOptions::default();
+        opts.set("prefix", &remote_object);
+        opts.set("max-keys", "1000");
+        let mut key_marker = String::new();
+        let mut version_id_marker = String::new();
+        let mut matched_version = None;
+        let mut saw_unproven_candidate = false;
+
+        loop {
+            let versions = self
+                .client
+                .list_object_versions_query(&self.bucket, &opts, &key_marker, &version_id_marker, "")
+                .await?;
+            for version in versions.versions.iter().filter(|version| version.key == remote_object) {
+                let mut stat_opts = GetObjectOptions::default();
+                stat_opts.version_id.clone_from(&version.version_id);
+                let info = self.client.stat_object(&self.bucket, &remote_object, &stat_opts).await?;
+                let mut metadata = info.user_metadata;
+                for (name, value) in &info.metadata {
+                    if (name
+                        .as_str()
+                        .starts_with(rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX)
+                        || name
+                            .as_str()
+                            .starts_with(rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX))
+                        && let Ok(value) = value.to_str()
+                    {
+                        metadata.insert(name.as_str().to_string(), value.to_string());
+                    }
+                }
+                if transition_candidate_metadata_matches(&metadata, identity)? {
+                    if matched_version.is_some() {
+                        return Ok(TransitionCandidateProbe::Ambiguous);
+                    }
+                    matched_version = Some(version.version_id.clone());
+                } else {
+                    saw_unproven_candidate = true;
+                }
+            }
+            if !versions.is_truncated {
+                if matched_version.is_none() && saw_unproven_candidate {
+                    return Ok(TransitionCandidateProbe::Unsupported);
+                }
+                let candidates = TransitionCandidateVersions {
+                    version_id: matched_version,
+                    ambiguous: false,
+                };
+                return classify_transition_candidates(candidates, bucket_versioning);
+            }
+            advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
+        }
+    }
+}
+
+fn transition_candidate_metadata_matches(
+    metadata: &HashMap<String, String>,
+    identity: TransitionCandidateIdentity,
+) -> Result<bool, std::io::Error> {
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITION_TRANSACTION_ID, contains_key_str, get_consistent_str,
+    };
+
+    let transaction_id = get_consistent_str(metadata, SUFFIX_TRANSITION_TRANSACTION_ID);
+    let destination_id = get_consistent_str(metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID);
+    if transaction_id.is_none() || destination_id.is_none() {
+        if contains_key_str(metadata, SUFFIX_TRANSITION_TRANSACTION_ID)
+            || contains_key_str(metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transition candidate identity metadata is empty or conflicting",
+            ));
+        }
+        return Ok(false);
+    }
+    let expected_transaction_id = identity.transaction_id.to_string();
+    let expected_destination_id = rustfs_utils::crypto::hex(identity.destination_id);
+    Ok(transaction_id == Some(expected_transaction_id.as_str()) && destination_id == Some(expected_destination_id.as_str()))
 }
 
 fn classify_transition_candidates(
@@ -340,6 +429,60 @@ mod tests {
             candidates.extend("archive/object", page);
         }
         candidates.classify(bucket_versioning)
+    }
+
+    fn candidate_identity() -> TransitionCandidateIdentity {
+        TransitionCandidateIdentity {
+            transaction_id: uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            destination_id: [0x5a; 32],
+        }
+    }
+
+    fn candidate_metadata(identity: TransitionCandidateIdentity) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            identity.transaction_id.to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity.destination_id),
+        );
+        metadata
+    }
+
+    #[test]
+    fn transition_candidate_identity_requires_exact_compatible_metadata() {
+        let identity = candidate_identity();
+        let metadata = candidate_metadata(identity);
+        assert!(transition_candidate_metadata_matches(&metadata, identity).unwrap());
+
+        let mut adjacent = metadata;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut adjacent,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+                .unwrap()
+                .to_string(),
+        );
+        assert!(!transition_candidate_metadata_matches(&adjacent, identity).unwrap());
+
+        assert!(!transition_candidate_metadata_matches(&HashMap::new(), identity).unwrap());
+    }
+
+    #[test]
+    fn transition_candidate_identity_rejects_conflicting_compatibility_keys() {
+        let identity = candidate_identity();
+        let mut metadata = candidate_metadata(identity);
+        metadata.insert(
+            rustfs_utils::http::metadata_compat::internal_key_rustfs(
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            ),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        assert!(transition_candidate_metadata_matches(&metadata, identity).is_err());
     }
 
     #[test]
@@ -501,5 +644,18 @@ impl WarmBackend for WarmBackendS3 {
             .await?;
 
         Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)
+    }
+}
+
+#[async_trait::async_trait]
+impl TransitionCandidateReconciler for WarmBackendS3 {
+    async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        identity: TransitionCandidateIdentity,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let bucket_versioning = self.remote_bucket_versioning().await?;
+        self.probe_transition_candidate_identity(object, identity, bucket_versioning)
+            .await
     }
 }

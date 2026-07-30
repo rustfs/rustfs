@@ -174,7 +174,7 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
-    pub(crate) use super::super::helper::{OperationHelper, spawn_background_with_context};
+    pub(crate) use super::super::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
@@ -203,9 +203,7 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{
-        RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
-    };
+    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 }
 
 pub(crate) mod rpc_consumer {
@@ -472,7 +470,7 @@ pub(crate) mod ecstore_metrics {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -497,8 +495,9 @@ pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature,
+        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -510,10 +509,19 @@ pub(crate) mod ecstore_object {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
+        ObjectEncryptionResolver, ObjectMutationHook, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
+}
+
+#[cfg(all(test, feature = "rio-v2"))]
+pub(crate) mod ecstore_test_support {
+    pub(crate) use rustfs_ecstore::api::bitrot::create_bitrot_reader;
+    pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::erasure::Erasure;
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions};
 }
 
 pub(crate) mod ecstore_set_disk {
@@ -836,7 +844,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
     };
 
     for bucket in buckets {
-        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await?;
+        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
         let status = pool.get_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
@@ -946,13 +954,21 @@ pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Res
 /// The process-level bootstrap instance context that single-instance startup
 /// threads through the storage foundation (Phase 5 follow-up, backlog#1052).
 pub(crate) fn bootstrap_instance_ctx() -> Arc<InstanceContext> {
-    ecstore_runtime::bootstrap_ctx()
+    let context = ecstore_runtime::bootstrap_ctx();
+    configure_object_encryption_resolver(&context);
+    context
 }
 
 /// Construct a fresh per-server instance context (backlog#1052 S5): a second
 /// embedded server owns its own erasure/region/endpoint/deployment id cells.
 pub(crate) fn new_instance_ctx() -> Arc<InstanceContext> {
-    Arc::new(InstanceContext::new())
+    let context = Arc::new(InstanceContext::new());
+    configure_object_encryption_resolver(&context);
+    context
+}
+
+fn configure_object_encryption_resolver(context: &InstanceContext) {
+    let _ = context.set_object_encryption_resolver(Arc::new(super::sse::SseObjectEncryptionResolver));
 }
 
 pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
@@ -961,6 +977,10 @@ pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
 pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_notification::new_global_notification_sys(endpoint_pools).await
+}
+
+pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
+    ecstore_notification::start_remote_version_state_fleet_probe(topology_fingerprint);
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
@@ -1460,8 +1480,8 @@ pub(crate) async fn update_bucket_metadata_config(
     Ok(updated_at)
 }
 
-pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
-    ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await
+pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {
@@ -1603,8 +1623,21 @@ pub(crate) fn sign_ns_scanner_capability(challenge: uuid::Uuid, server_epoch: uu
     ecstore_rpc::sign_ns_scanner_capability(challenge, server_epoch)
 }
 
-pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {
-    ecstore_rpc::verify_tonic_rpc_signature(audience, path, headers)
+pub(crate) fn verify_tonic_rpc_signature_with_bootstrap(
+    audience: &str,
+    path: &str,
+    headers: &http::HeaderMap,
+    allow_replay_scope_bootstrap: bool,
+) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(audience, path, headers, allow_replay_scope_bootstrap)
+}
+
+pub(crate) fn tonic_boot_epoch_challenge(headers: &http::HeaderMap) -> std::io::Result<Option<uuid::Uuid>> {
+    ecstore_rpc::tonic_boot_epoch_challenge(headers)
+}
+
+pub(crate) fn tonic_boot_epoch_response_headers(audience: &str, challenge: uuid::Uuid) -> std::io::Result<http::HeaderMap> {
+    ecstore_rpc::tonic_boot_epoch_response_headers(audience, challenge)
 }
 
 pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
@@ -1730,7 +1763,7 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 mod tests {
     use super::{
         apply_active_resync_intents, bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata,
-        scanner_maintenance_config_file,
+        new_instance_ctx, scanner_maintenance_config_file,
     };
     use std::time::Duration;
 
@@ -1759,6 +1792,16 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn fresh_instance_context_installs_object_encryption_resolver() {
+        assert!(new_instance_ctx().object_encryption_resolver().is_some());
+    }
+
+    #[test]
+    fn bootstrap_instance_context_installs_object_encryption_resolver() {
+        assert!(super::bootstrap_instance_ctx().object_encryption_resolver().is_some());
     }
 
     #[test]

@@ -24,7 +24,7 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::system_drive::*;
-use crate::metrics::schema::system_process::PROCESS_DISK_IO_MD;
+use crate::metrics::schema::system_process::{DIRECTION_LABEL, PROCESS_DISK_IO_MD};
 use std::borrow::Cow;
 
 /// Detailed drive statistics for a single drive.
@@ -223,8 +223,8 @@ pub fn collect_process_disk_metrics(
     let mut read_metric = PrometheusMetric::from_descriptor(&PROCESS_DISK_IO_MD, stats.read_bytes as f64);
     let mut write_metric = PrometheusMetric::from_descriptor(&PROCESS_DISK_IO_MD, stats.written_bytes as f64);
 
-    read_metric.labels.push(("direction", Cow::Borrowed("read")));
-    write_metric.labels.push(("direction", Cow::Borrowed("write")));
+    read_metric.labels.push((DIRECTION_LABEL, Cow::Borrowed("read")));
+    write_metric.labels.push((DIRECTION_LABEL, Cow::Borrowed("write")));
 
     if let Some(l) = labels {
         read_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
@@ -238,6 +238,7 @@ pub fn collect_process_disk_metrics(
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
     use std::collections::BTreeSet;
 
     fn assert_metric_label_keys(
@@ -370,5 +371,33 @@ mod tests {
         let offline = metrics.iter().find(|m| m.name == offline_name);
         assert!(offline.is_some());
         assert_eq!(offline.map(|m| m.value), Some(2.0));
+    }
+
+    #[test]
+    fn test_collect_process_disk_metrics_with_node_and_process_labels() {
+        let stats = ProcessDiskStats {
+            read_bytes: 1024,
+            written_bytes: 2048,
+        };
+        let labels = vec![
+            (SERVER_LABEL, Cow::Borrowed("node1:9000")),
+            (PROCESS_PID_LABEL, Cow::Borrowed("12345")),
+            (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Borrowed("rustfs")),
+        ];
+
+        let metrics = collect_process_disk_metrics(&stats, Some(&labels));
+
+        assert_eq!(metrics.len(), 2);
+        assert_metric_label_keys(
+            &metrics,
+            &PROCESS_DISK_IO_MD,
+            1024.0,
+            &[
+                DIRECTION_LABEL,
+                SERVER_LABEL,
+                PROCESS_PID_LABEL,
+                PROCESS_EXECUTABLE_NAME_LABEL,
+            ],
+        );
     }
 }

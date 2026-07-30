@@ -173,6 +173,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run nextest tests
+        env:
+          # Three concurrent workspace test links saturate the self-hosted
+          # runner's overlay I/O and can wedge Cargo until the 75m timeout.
+          CARGO_BUILD_JOBS: "2"
         run: |
           mkdir -p artifacts/test-and-lint
           # Evidence sampler for issue #5394: the post-mortem pgrep below runs

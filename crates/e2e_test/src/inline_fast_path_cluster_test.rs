@@ -2136,11 +2136,20 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
     assert_eq!(terminal["prefix"].as_str(), Some(prefix));
     assert_eq!(terminal["dry_run"].as_bool(), Some(false));
-    assert_eq!(
-        terminal["status"].as_str(),
-        Some("partial"),
+    let terminal_status = terminal["status"].as_str();
+    assert!(
+        matches!(terminal_status, Some("partial" | "unknown")),
         "small transition queue should surface terminal backpressure: {terminal}"
     );
+    if terminal_status == Some("unknown") {
+        let failure_reason = terminal["failure_reason"]
+            .as_str()
+            .ok_or_else(|| format!("unknown terminal status omitted failure_reason: {terminal}"))?;
+        assert!(
+            failure_reason.contains("worker result was not persisted before the transition queue drained"),
+            "unknown terminal status should identify lost worker-result persistence: {terminal}"
+        );
+    }
     let skipped_queue_full = terminal["report"]["skipped_queue_full"]
         .as_u64()
         .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?;
