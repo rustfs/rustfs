@@ -32,6 +32,15 @@ pub const ENV_KMS_STATIC_SECRET_KEY_FILE: &str = "RUSTFS_KMS_STATIC_SECRET_KEY_F
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 
+/// Upper bound applied to `KmsConfig::timeout` when deriving backend behavior.
+///
+/// Out-of-range values are clamped at use rather than rejected so existing
+/// deployments with oversized settings keep starting after an upgrade.
+pub(crate) const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Upper bound applied to `KmsConfig::retry_attempts` when deriving backend behavior.
+pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 10;
+
 fn default_vault_transit_metadata_kv_mount() -> String {
     DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string()
 }
@@ -117,9 +126,15 @@ pub struct KmsConfig {
     /// Allow development-only insecure defaults such as plaintext local keys or HTTP Vault.
     #[serde(default)]
     pub allow_insecure_dev_defaults: bool,
-    /// Operation timeout
+    /// Timeout for a single backend attempt.
+    ///
+    /// This bounds one outbound request, not the whole operation: the operation
+    /// policy owns the total deadline across retries. Values above 300 seconds
+    /// are clamped at use (see `KmsConfig::effective_timeout`).
     pub timeout: Duration,
-    /// Number of retry attempts
+    /// Number of retry attempts.
+    ///
+    /// Values above 10 are clamped at use (see `KmsConfig::effective_retry_attempts`).
     pub retry_attempts: u32,
     /// Enable caching
     pub enable_cache: bool,
@@ -536,6 +551,16 @@ impl KmsConfig {
         self
     }
 
+    /// Per-attempt timeout with the configured value clamped to the supported maximum.
+    pub(crate) fn effective_timeout(&self) -> Duration {
+        self.timeout.min(MAX_OPERATION_TIMEOUT)
+    }
+
+    /// Retry attempts with the configured value clamped to the supported maximum.
+    pub(crate) fn effective_retry_attempts(&self) -> u32 {
+        self.retry_attempts.min(MAX_RETRY_ATTEMPTS)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         // Validate timeout
@@ -546,6 +571,23 @@ impl KmsConfig {
         // Validate retry attempts
         if self.retry_attempts == 0 {
             return Err(KmsError::configuration_error("Retry attempts must be greater than 0"));
+        }
+
+        // Oversized values are clamped at use (not rejected) so pre-existing
+        // configurations cannot keep the service from starting after upgrade.
+        if self.timeout > MAX_OPERATION_TIMEOUT {
+            tracing::warn!(
+                configured_secs = self.timeout.as_secs(),
+                max_secs = MAX_OPERATION_TIMEOUT.as_secs(),
+                "KMS timeout exceeds the supported maximum; backend operations clamp it to the maximum"
+            );
+        }
+        if self.retry_attempts > MAX_RETRY_ATTEMPTS {
+            tracing::warn!(
+                configured = self.retry_attempts,
+                max = MAX_RETRY_ATTEMPTS,
+                "KMS retry_attempts exceeds the supported maximum; backend operations clamp it to the maximum"
+            );
         }
 
         // Validate backend-specific configuration
@@ -853,6 +895,31 @@ mod tests {
 
         let local_config = config.local_config().expect("Should have local config");
         assert_eq!(local_config.key_dir, temp_dir.path());
+    }
+
+    #[test]
+    fn test_oversized_timeout_and_retries_clamped_not_rejected() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig {
+            timeout: Duration::from_secs(3_600),
+            retry_attempts: 50,
+            ..KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults()
+        };
+
+        // Out-of-range values must not keep the service from starting.
+        assert!(config.validate().is_ok());
+        assert_eq!(config.effective_timeout(), MAX_OPERATION_TIMEOUT);
+        assert_eq!(config.effective_retry_attempts(), MAX_RETRY_ATTEMPTS);
+
+        // In-range values pass through unchanged.
+        let config = KmsConfig {
+            timeout: Duration::from_secs(45),
+            retry_attempts: 5,
+            ..config
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.effective_timeout(), Duration::from_secs(45));
+        assert_eq!(config.effective_retry_attempts(), 5);
     }
 
     #[test]
