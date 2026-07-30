@@ -146,6 +146,7 @@ impl AuthZPlugin {
                 reqwest::Client::new()
             });
 
+        #[cfg(feature = "hotpath")]
         let client = hotpath::http!(client, label = "Policy::OPA");
 
         Self { client, args: config }
