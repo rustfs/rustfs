@@ -1,35 +1,44 @@
 # Layer dependency baseline for the rustfs binary crate.
 #
-# These are intra-crate module references within rustfs/ that cross the
-# conceptual layer boundaries (app, infra/server, interface/admin).
-# Since they live inside one Cargo crate, Rust doesn't enforce separation.
-# The list is maintained for architectural awareness during code review.
+# The guard models production imports as:
+#   composition -> interface -> app -> infra
 #
-# Format for dependency entries:
-#   status|source_file|direction|imported_symbol|reason
+# Canonical dependency entry:
+#   dep|source_file|source_layer->target_layer|crate::imported_symbol
 #
-# Format for conceptual cycles:
-#   status|cycle|direction_pair|reason
-#
-# Status:
-#   accepted - reviewed and intentionally allowed
-#   todo     - should be resolved in a future refactor
-
+# Canonical conceptual cycle entry:
+#   cycle|left_layer<->right_layer
 cycle|app<->infra
 cycle|app<->interface
+cycle|composition<->infra
+cycle|composition<->interface
 cycle|infra<->interface
+dep|rustfs/src/admin/handlers/scanner.rs|interface->composition|crate::startup_background::ENV_SCANNER_ENABLED
+dep|rustfs/src/admin/handlers/scanner.rs|interface->composition|crate::startup_background::scanner_enabled_from_env
+dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::DependencyReadiness
+dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::collect_dependency_readiness_report
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_bucket_meta_hook
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_make_bucket_hook
-dep|rustfs/src/init.rs|infra->interface|crate::admin
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::server::RemoteAddr
+dep|rustfs/src/app/object_usecase.rs|app->interface|crate::server::convert_ecstore_object_info
+dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::DependencyReadiness
+dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::DependencyReadinessReport
+dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::ReadinessDegradedReason
+dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::snapshot_dependency_readiness_report
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
-dep|rustfs/src/server/http.rs|infra->interface|crate::admin
-dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path
+dep|rustfs/src/storage/access.rs|infra->interface|crate::server::RemoteAddr
+dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::server::cors
 dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery
-dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::FS
-dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::validate_object_lock_configuration_input
-dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_initiator
-dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_owner
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::convert_ecstore_object_info
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::is_audit_module_enabled
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::is_notify_module_enabled
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_audit_module_enabled
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_notify_module_enabled
+dep|rustfs/src/storage/rpc/http_service.rs|infra->interface|crate::server::RPC_PREFIX
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM
+dep|rustfs/src/storage/rpc/node_service/heal.rs|infra->composition|crate::startup_background::heal_enabled_from_env
+dep|rustfs/src/storage/rpc/node_service/heal.rs|infra->composition|crate::startup_background::scanner_enabled_from_env
