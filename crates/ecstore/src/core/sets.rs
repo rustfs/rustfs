@@ -37,7 +37,9 @@ use crate::{
     runtime::instance::{InstanceContext, bootstrap_ctx},
     runtime::sources as runtime_sources,
     set_disk::{PreparedGetObjectMetadata, SetDisks},
-    store::init_format::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
+    store::init_format::{
+        check_format_erasure_values, load_format_erasure_all, save_format_file, select_format_erasure_in_quorum,
+    },
 };
 use futures::{
     future::join_all,
@@ -947,7 +949,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        let (disks, _) = init_storage_disks_with_errors(
+        let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
             &DiskOption {
                 cleanup: false,
@@ -955,16 +957,36 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             },
         )
         .await;
-        let (formats, errs) = load_format_erasure_all(&disks, true).await;
+        let (formats, mut errs) = load_format_erasure_all(&disks, true).await;
+        for (err, init_err) in errs.iter_mut().zip(init_errs) {
+            if init_err.is_some() {
+                *err = init_err;
+            }
+        }
+        if errs.iter().any(|err| {
+            matches!(
+                err,
+                Some(DiskError::InconsistentDisk | DiskError::CorruptedFormat | DiskError::CorruptedBackend)
+            )
+        }) {
+            return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat)));
+        }
         if let Err(err) = check_format_erasure_values(&formats, self.set_drive_count) {
             info!("failed to check formats erasure values: {}", err);
             return Ok((HealResultItem::default(), Some(err)));
         }
-        let ref_format = match get_format_erasure_in_quorum(&formats, 0) {
-            Ok(format) if format.shared_identity() == self.format.shared_identity() => format,
+        let (ref_format, quorum_members) = match select_format_erasure_in_quorum(&formats, 0) {
+            Ok((format, members)) if format.shared_identity() == self.format.shared_identity() => (format, members),
             Ok(_) => return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat))),
             Err(err) => return Ok((HealResultItem::default(), Some(err))),
         };
+        if formats
+            .iter()
+            .zip(quorum_members)
+            .any(|(format, member)| format.is_some() && !member)
+        {
+            return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat)));
+        }
         let mut res = HealResultItem {
             heal_item_type: HealItemType::Metadata.to_string(),
             detail: "disk-format".to_string(),
@@ -1385,34 +1407,8 @@ mod tests {
 
     #[tokio::test]
     async fn format_heal_rejects_foreign_majorities_at_set_and_pool_scopes() {
-        let (_temp_dirs, canonical_format, sets) = setup_heal_format_sets(2, true).await;
-        let endpoints = sets.endpoints.endpoints.as_ref().clone();
-        let mut disks = Vec::with_capacity(endpoints.len());
-        for endpoint in &endpoints {
-            disks.push(Some(
-                new_disk(
-                    endpoint,
-                    &DiskOption {
-                        cleanup: false,
-                        health_check: false,
-                    },
-                )
-                .await
-                .expect("fresh set-level disk handle should open"),
-            ));
-        }
-        let set_disks = SetDisks::new(
-            "test-owner".to_string(),
-            Arc::new(RwLock::new(disks)),
-            endpoints.len(),
-            1,
-            0,
-            0,
-            endpoints,
-            canonical_format,
-            Vec::new(),
-        )
-        .await;
+        let (_temp_dirs, _canonical_format, sets) = setup_heal_format_sets(2, true).await;
+        let set_disks = set_level_heal_view(&sets).await;
 
         let (_, set_err) = set_disks
             .heal_format(false)
@@ -1430,6 +1426,71 @@ mod tests {
         assert!(
             matches!(pool_err, Some(StorageError::CorruptedFormat)),
             "foreign pool majority must not replace the cached format: {pool_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_format_heal_rejects_a_wrong_slot_minority() {
+        let (_temp_dirs, canonical_format, sets) = setup_heal_format_sets(3, false).await;
+        let mut poisoned_format = canonical_format.clone();
+        poisoned_format.erasure.this = canonical_format.erasure.sets[0][0];
+        replace_heal_test_format(&sets, 2, &poisoned_format).await;
+        let probe_err = new_disk(
+            &sets.endpoints.endpoints.as_ref()[2],
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect_err("a wrong-slot local format must fail disk initialization");
+        assert_eq!(probe_err, DiskError::InconsistentDisk);
+
+        let (_, pool_err) = sets
+            .heal_format(false)
+            .await
+            .expect("pool format heal should report a typed slot mismatch");
+        assert!(
+            matches!(pool_err, Some(StorageError::CorruptedFormat)),
+            "a wrong-slot minority must not be reported as no-heal-required: {pool_err:?}"
+        );
+        assert_eq!(
+            read_heal_test_format(&sets, 2).await,
+            poisoned_format,
+            "format heal must not overwrite a wrong-slot disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_heal_rejects_a_foreign_minority_at_set_and_pool_scopes() {
+        let (_temp_dirs, canonical_format, sets) = setup_heal_format_sets(3, false).await;
+        let mut poisoned_format = canonical_format.clone();
+        poisoned_format.id = Uuid::new_v4();
+        poisoned_format.erasure.this = poisoned_format.erasure.sets[0][2];
+        replace_heal_test_format(&sets, 2, &poisoned_format).await;
+        let set_disks = set_level_heal_view(&sets).await;
+
+        let (_, set_err) = set_disks
+            .heal_format(false)
+            .await
+            .expect("set format heal should report a typed identity mismatch");
+        assert!(
+            matches!(set_err, Some(StorageError::CorruptedFormat)),
+            "a foreign minority must not be reported as no-heal-required: {set_err:?}"
+        );
+
+        let (_, pool_err) = sets
+            .heal_format(false)
+            .await
+            .expect("pool format heal should report a typed identity mismatch");
+        assert!(
+            matches!(pool_err, Some(StorageError::CorruptedFormat)),
+            "a foreign minority must not be reported as no-heal-required: {pool_err:?}"
+        );
+        assert_eq!(
+            read_heal_test_format(&sets, 2).await,
+            poisoned_format,
+            "format heal must not overwrite a foreign disk"
         );
     }
 
@@ -1676,8 +1737,8 @@ mod tests {
     // formatting the first `num_formatted` of them against a shared reference
     // format and leaving the rest unformatted. Returns the live TempDir handles
     // (must be kept alive), the reference format, and the assembled `Sets`.
-    // `disk_set` is intentionally empty: these tests only drive `heal_format`
-    // with `dry_run == true`, which never touches `disk_set`.
+    // `disk_set` is intentionally empty: these tests only exercise paths that
+    // return before pool-level healing delegates into a set.
     async fn setup_heal_format_sets(num_formatted: usize, foreign_identity: bool) -> (Vec<tempfile::TempDir>, FormatV3, Sets) {
         const SET_DRIVE_COUNT: usize = 3;
         let ref_format = FormatV3::new(1, SET_DRIVE_COUNT);
@@ -1739,6 +1800,60 @@ mod tests {
         };
 
         (dirs, ref_format, sets)
+    }
+
+    async fn set_level_heal_view(sets: &Sets) -> Arc<SetDisks> {
+        let endpoints = sets.endpoints.endpoints.as_ref().clone();
+        let mut disks = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
+            disks.push(Some(
+                new_disk(
+                    endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("fresh set-level disk handle should open"),
+            ));
+        }
+
+        SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            endpoints.len(),
+            1,
+            0,
+            0,
+            endpoints,
+            sets.format.clone(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn replace_heal_test_format(sets: &Sets, disk_index: usize, format: &FormatV3) {
+        let disk = new_disk(
+            &sets.endpoints.endpoints.as_ref()[disk_index],
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("heal test disk should open");
+        save_format_file(&Some(disk.clone()), &Some(format.clone()))
+            .await
+            .expect("poisoned test format should be written");
+    }
+
+    async fn read_heal_test_format(sets: &Sets, disk_index: usize) -> FormatV3 {
+        let path = std::path::Path::new(&sets.endpoints.endpoints.as_ref()[disk_index].get_file_path())
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(crate::disk::FORMAT_CONFIG_FILE);
+        let data = tokio::fs::read(path).await.expect("test format should be readable");
+        FormatV3::try_from(data.as_slice()).expect("test format should parse")
     }
 
     // Regression for #956 (NoHealRequired path): with every disk already
