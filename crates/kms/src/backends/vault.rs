@@ -66,12 +66,48 @@ struct VaultKeyData {
     encrypted_key_material: String,
 }
 
+/// Decode and validate the stored master key material of a [`VaultKeyData`] record.
+///
+/// This is the single read-side gate for KV2 key material: missing or undecodable
+/// material must fail closed with a typed error and must never be regenerated or
+/// written back (regenerating would orphan every DEK wrapped by the original key).
+/// Kept synchronous and free of Vault I/O so the poison matrix is unit-testable
+/// without a live Vault.
+fn decode_stored_key_material(key_id: &str, encrypted_material: &str) -> Result<Vec<u8>> {
+    if encrypted_material.is_empty() {
+        return Err(KmsError::material_missing(key_id));
+    }
+
+    // Mirrors `decrypt_key_material`: stored material is currently base64 without an
+    // additional encryption layer.
+    let key_material = general_purpose::STANDARD
+        .decode(encrypted_material)
+        .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key material is not valid base64: {e}")))?;
+
+    // Key material must be exactly 32 bytes for AES-256.
+    if key_material.len() != 32 {
+        return Err(KmsError::material_corrupt(
+            key_id,
+            format!("stored key material has invalid length ({} bytes, expected 32)", key_material.len()),
+        ));
+    }
+
+    Ok(key_material)
+}
+
 impl VaultKmsClient {
     /// Create a new Vault KMS client
-    pub async fn new(config: VaultConfig) -> Result<Self> {
+    ///
+    /// `attempt_timeout` caps every HTTP request issued through this client.
+    pub async fn new(config: VaultConfig, attempt_timeout: Duration) -> Result<Self> {
         // Create client settings
         let mut settings_builder = VaultClientSettingsBuilder::default();
         settings_builder.address(&config.address);
+        // Defense in depth against stalled connections: vaultrs leaves the
+        // underlying reqwest client without any timeout by default, so a hung
+        // request would otherwise wait forever regardless of the
+        // operation-level retry policy.
+        settings_builder.timeout(Some(attempt_timeout));
 
         // Set authentication token based on method
         let token = match &config.auth_method {
@@ -114,17 +150,18 @@ impl VaultKmsClient {
         format!("{}/{}", self.key_path_prefix, key_id)
     }
 
-    /// Encrypt key material using Vault's transit engine
+    /// Encode key material for KV2 storage.
+    ///
+    /// This is plain Base64 encoding, not encryption: the KV2 backend stores master key
+    /// material as-is and relies on Vault ACLs plus KV2 at-rest encryption for
+    /// confidentiality. Any identity with KV read access to the key path can recover the
+    /// plaintext master key.
     async fn encrypt_key_material(&self, key_material: &[u8]) -> Result<String> {
-        // For simplicity, we'll base64 encode the key material
-        // In a production setup, you would use Vault's transit engine for additional encryption
         Ok(general_purpose::STANDARD.encode(key_material))
     }
 
-    /// Decrypt key material
+    /// Decode key material from KV2 storage (plain Base64, see `encrypt_key_material`).
     async fn decrypt_key_material(&self, encrypted_material: &str) -> Result<Vec<u8>> {
-        // For simplicity, we'll base64 decode the key material
-        // In a production setup, you would use Vault's transit engine for decryption
         general_purpose::STANDARD
             .decode(encrypted_material)
             .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))
@@ -132,47 +169,10 @@ impl VaultKmsClient {
 
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
-        let mut key_data = self.get_key_data(key_id).await?;
-
-        // If encrypted_key_material is empty, generate and store it (fix for old keys)
-        if key_data.encrypted_key_material.is_empty() {
-            warn!(key_id, "Vault KMS key material missing; regenerating");
-            let key_material = generate_key_material(&key_data.algorithm)?;
-            key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
-            // Store the updated key data back to Vault
-            self.store_key_data(key_id, &key_data).await?;
-            return Ok(key_material);
-        }
-
-        let key_material = match self.decrypt_key_material(&key_data.encrypted_key_material).await {
-            Ok(km) => km,
-            Err(e) => {
-                // Never regenerate/overwrite the master key on a decrypt failure: that would
-                // destroy the original material and make every DEK wrapped by this key
-                // permanently undecryptable. Surface the error so the read fails recoverably
-                // instead of causing silent data loss.
-                warn!(key_id, error = %e, "Vault KMS key material could not be decoded");
-                return Err(KmsError::cryptographic_error(
-                    "decrypt",
-                    format!("Stored key material for {key_id} is corrupted: {e}"),
-                ));
-            }
-        };
-
-        // Validate key material length (should be 32 bytes for AES-256).
-        if key_material.len() != 32 {
-            // As above: do not overwrite the stored key. Report the fault instead.
-            warn!(key_id, len = key_material.len(), "Vault KMS key material has invalid length");
-            return Err(KmsError::cryptographic_error(
-                "decrypt",
-                format!(
-                    "Stored key material for {key_id} has invalid length ({} bytes, expected 32)",
-                    key_material.len()
-                ),
-            ));
-        }
-
-        Ok(key_material)
+        let key_data = self.get_key_data(key_id).await?;
+        decode_stored_key_material(key_id, &key_data.encrypted_key_material).inspect_err(|error| {
+            warn!(key_id, %error, "Vault KMS key material failed validation");
+        })
     }
 
     /// Encrypt data using a master key
@@ -206,14 +206,15 @@ impl VaultKmsClient {
 
         // Get existing key data to preserve encrypted_key_material and other fields
         // This is called after create_key, so the key should already exist
-        let mut existing_key_data = self.get_key_data(key_id).await?;
+        let existing_key_data = self.get_key_data(key_id).await?;
 
-        // If encrypted_key_material is empty, generate it (this handles the case where
-        // an old key was created without proper key material)
+        // A key that was just created must already carry material; an empty value means
+        // the create flow failed to persist it. Fail closed instead of minting replacement
+        // material: silently generating a new key here would mask the broken create and
+        // orphan any DEK already wrapped by a different copy of this key.
         if existing_key_data.encrypted_key_material.is_empty() {
             warn!(key_id, "Vault KMS key metadata missing encrypted key material");
-            let key_material = generate_key_material(&existing_key_data.algorithm)?;
-            existing_key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
+            return Err(KmsError::material_missing(key_id));
         }
 
         // Update only the metadata fields, preserving the encrypted_key_material
@@ -529,33 +530,13 @@ impl KmsClient for VaultKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
-        debug!("Rotating key: {}", key_id);
-
-        let mut key_data = self.get_key_data(key_id).await?;
-        key_data.version += 1;
-
-        // Generate new key material
-        let key_material = generate_key_material(&key_data.algorithm)?;
-        key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
-
-        self.store_key_data(key_id, &key_data).await?;
-
-        let master_key = MasterKeyInfo {
-            key_id: key_id.to_string(),
-            version: key_data.version,
-            algorithm: key_data.algorithm,
-            usage: key_data.usage,
-            status: key_data.status,
-            description: None, // Rotate preserves existing description (would need key lookup)
-            metadata: key_data.metadata,
-            created_at: key_data.created_at,
-            rotated_at: Some(Zoned::now()),
-            created_by: None,
-        };
-
-        debug!(key_id, "Vault KMS key rotated");
-        Ok(master_key)
+    async fn rotate_key(&self, _key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+        // Rotation previously overwrote the stored master key with fresh material, which
+        // permanently orphaned every DEK wrapped by the prior version. Reject before any
+        // storage access so existing material can never be touched.
+        Err(KmsError::invalid_operation(
+            "Vault KV2 rotation is unavailable until versioned key material retention lands",
+        ))
     }
 
     async fn health_check(&self) -> Result<()> {
@@ -585,6 +566,9 @@ impl KmsClient for VaultKmsClient {
         BackendInfo::new("vault-kv2".to_string(), "0.1.0".to_string(), self.config.address.clone(), true)
             .with_metadata("kv_mount".to_string(), self.kv_mount.clone())
             .with_metadata("key_prefix".to_string(), self.key_path_prefix.clone())
+            // Master key material is protected only by Vault ACLs and KV2 at-rest
+            // encryption; there is no additional cryptographic wrapping.
+            .with_metadata("at_rest_protection".to_string(), "vault-kv2-acl".to_string())
     }
 }
 
@@ -607,7 +591,7 @@ impl VaultKmsBackend {
             }
         };
 
-        let client = VaultKmsClient::new(vault_config).await?;
+        let client = VaultKmsClient::new(vault_config, config.effective_timeout()).await?;
         Ok(Self { client })
     }
 
@@ -615,6 +599,14 @@ impl VaultKmsBackend {
     async fn update_key_metadata_in_storage(&self, key_id: &str, metadata: &KeyMetadata) -> Result<()> {
         // Get the current key data from Vault
         let mut key_data = self.client.get_key_data(key_id).await?;
+
+        // This is a read-modify-write of the whole VaultKeyData document. Refuse to write
+        // back a record whose key material is missing: persisting it would cement the
+        // empty-material state under a fresh document version. A damaged key must go
+        // through an explicit repair operation, not a metadata update.
+        if key_data.encrypted_key_material.is_empty() {
+            return Err(KmsError::material_missing(key_id));
+        }
 
         // Update the status based on the new metadata
         key_data.status = match metadata.key_state {
@@ -836,6 +828,46 @@ mod tests {
     use super::*;
     use crate::config::{VaultAuthMethod, VaultConfig};
 
+    /// Poison matrix for the read-side material gate. Every corruption class must fail
+    /// closed with its typed error; reintroducing any "self-heal" (regenerate on empty or
+    /// undecodable material) turns one of these expected errors into an Ok and fails the
+    /// test. Offline on purpose: `decode_stored_key_material` has no Vault I/O.
+    #[test]
+    fn decode_stored_key_material_fails_closed_on_poisoned_values() {
+        // Empty material means the record lost its key, not that a new one may be minted.
+        assert!(matches!(
+            decode_stored_key_material("poisoned", ""),
+            Err(KmsError::MaterialMissing { key_id }) if key_id == "poisoned"
+        ));
+
+        // Invalid base64.
+        assert!(matches!(
+            decode_stored_key_material("poisoned", "!!!not-base64!!!"),
+            Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
+        ));
+
+        // Truncated material: valid base64 of fewer than 32 bytes.
+        let truncated = general_purpose::STANDARD.encode([0x42u8; 16]);
+        assert!(matches!(
+            decode_stored_key_material("poisoned", &truncated),
+            Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
+        ));
+
+        // Oversized material: valid base64 of more than 32 bytes.
+        let oversized = general_purpose::STANDARD.encode([0x42u8; 33]);
+        assert!(matches!(
+            decode_stored_key_material("poisoned", &oversized),
+            Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
+        ));
+
+        // Well-formed material still decodes.
+        let valid = general_purpose::STANDARD.encode([0x42u8; 32]);
+        assert_eq!(
+            decode_stored_key_material("healthy", &valid).expect("valid material must decode"),
+            vec![0x42u8; 32]
+        );
+    }
+
     #[tokio::test]
     #[ignore] // Requires a running Vault instance
     async fn test_vault_client_integration() {
@@ -851,7 +883,9 @@ mod tests {
             tls: None,
         };
 
-        let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
+        let client = VaultKmsClient::new(config, Duration::from_secs(30))
+            .await
+            .expect("Failed to create Vault client");
 
         // Test key operations
         let key_id = "test-key-vault";
@@ -901,12 +935,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vault_kv2_rotate_key_rejected_without_touching_storage() {
+        // No Vault instance needed: rotation must be rejected before any storage access,
+        // so the call cannot read or overwrite key material.
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let err = client
+            .rotate_key("any-key", None)
+            .await
+            .expect_err("Vault KV2 rotation must be rejected");
+        assert!(matches!(err, KmsError::InvalidOperation { .. }), "expected InvalidOperation, got {err:?}");
+        assert!(err.to_string().contains("rotation is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_vault_kv2_backend_info_reports_at_rest_protection() {
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let info = client.backend_info();
+        assert_eq!(info.backend_type, "vault-kv2");
+        assert_eq!(info.metadata.get("at_rest_protection").map(String::as_str), Some("vault-kv2-acl"));
+        // The KV2 backend must not present itself as Transit-backed.
+        assert!(!format!("{info:?}").contains("Transit"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn test_vault_kv2_rotate_rejected_and_material_untouched() {
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let key_id = format!("rotate-{}", uuid::Uuid::new_v4());
+        client.create_key(&key_id, "AES_256", None).await.expect("create");
+        let before = client.get_key_data(&key_id).await.expect("read");
+
+        let err = client
+            .rotate_key(&key_id, None)
+            .await
+            .expect_err("Vault KV2 rotation must be rejected");
+        assert!(matches!(err, KmsError::InvalidOperation { .. }));
+
+        let after = client.get_key_data(&key_id).await.expect("reread");
+        assert_eq!(
+            after.encrypted_key_material, before.encrypted_key_material,
+            "rejected rotation must leave stored key material untouched"
+        );
+        assert_eq!(after.version, before.version, "rejected rotation must not bump the key version");
+    }
+
+    #[tokio::test]
     #[ignore] // Requires a running Vault instance (dev mode)
     async fn test_corrupted_key_material_does_not_regenerate() {
         // Regression: get_key_material previously "self-healed" a decrypt/length failure by
         // minting a fresh random master key and overwriting the stored value — destroying the
         // original key and making every DEK wrapped by it permanently undecryptable.
-        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
 
         let key_id = format!("corrupt-{}", uuid::Uuid::new_v4());
         client.create_key(&key_id, "AES_256", None).await.expect("create");
@@ -917,9 +1001,13 @@ mod tests {
         client.store_key_data(&key_id, &key_data).await.expect("store corrupt");
 
         // Reading the material must now ERROR, not silently regenerate + overwrite.
+        let error = client
+            .get_key_material(&key_id)
+            .await
+            .expect_err("corrupted key material must yield an error, not a fresh key");
         assert!(
-            client.get_key_material(&key_id).await.is_err(),
-            "corrupted key material must yield an error, not a fresh key"
+            matches!(error, KmsError::MaterialCorrupt { .. }),
+            "expected MaterialCorrupt, got {error:?}"
         );
 
         // And the stored (corrupted) material must be UNCHANGED.
@@ -927,6 +1015,41 @@ mod tests {
         assert_eq!(
             after.encrypted_key_material, "!!!not-base64!!!",
             "get_key_material must not overwrite stored master key material on failure"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn test_empty_key_material_does_not_regenerate() {
+        // Regression: get_key_material previously treated empty stored material as a
+        // bootstrap case and silently generated + persisted a fresh master key on the
+        // read path. Empty material must instead fail closed as MaterialMissing and
+        // leave the stored record untouched.
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
+
+        let key_id = format!("empty-{}", uuid::Uuid::new_v4());
+        client.create_key(&key_id, "AES_256", None).await.expect("create");
+
+        let mut key_data = client.get_key_data(&key_id).await.expect("read");
+        key_data.encrypted_key_material = String::new();
+        client.store_key_data(&key_id, &key_data).await.expect("store empty");
+
+        let error = client
+            .get_key_material(&key_id)
+            .await
+            .expect_err("empty key material must yield an error, not a fresh key");
+        assert!(
+            matches!(error, KmsError::MaterialMissing { .. }),
+            "expected MaterialMissing, got {error:?}"
+        );
+
+        // The stored record must still hold the empty value: no regeneration, no write.
+        let after = client.get_key_data(&key_id).await.expect("reread");
+        assert!(
+            after.encrypted_key_material.is_empty(),
+            "get_key_material must not backfill missing master key material"
         );
     }
 

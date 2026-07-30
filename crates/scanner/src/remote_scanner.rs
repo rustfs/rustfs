@@ -14,8 +14,8 @@
 
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    ScannerDiskScanOutcome, ScannerIODisk, cache_root_entry_info, cache_snapshot_is_current, scanner_cache_lock_resource,
-    scanner_cache_lock_timeout, scanner_set_disk_inventory,
+    DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, cache_root_entry_info, current_cache_root_or_prepare,
+    scanner_cache_lock_resource, scanner_cache_lock_timeout, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::storage_api::scan::NamespaceLocking as _;
@@ -966,32 +966,34 @@ async fn scan_and_persist_local_bucket(
     let revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
-    if cache_snapshot_is_current(&cache, &bucket, source, next_cycle, leader_epoch, scan_plan_digest) {
-        if guard.is_lock_lost() {
-            return Err(RemoteScannerServerError::worker(
-                "remote namespace scanner cache lock was lost before reusing the current snapshot",
-            ));
+    let scan_state = current_cache_root_or_prepare(&mut cache, &bucket, source, next_cycle, leader_epoch, scan_plan_digest, true);
+    match scan_state {
+        DataUsageCacheScanState::Current(usage) => {
+            if guard.is_lock_lost() {
+                return Err(RemoteScannerServerError::worker(
+                    "remote namespace scanner cache lock was lost before reusing the current snapshot",
+                ));
+            }
+            return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
+                source,
+                scan_plan_digest,
+                usage: *usage,
+                pending_maintenance_work: !cache.info.pending_heals.is_empty(),
+            })));
         }
-        return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
-            source,
-            scan_plan_digest,
-            usage: cache_root_entry_info(&cache)
-                .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache is corrupt: {err}")))?,
-            pending_maintenance_work: !cache.info.pending_heals.is_empty(),
-        })));
-    }
-    match cache.prepare_for_scan(&bucket, next_cycle, leader_epoch, source, scan_plan_digest, true) {
-        DataUsageCachePrepareOutcome::RejectedNewerCycle => {
-            return Ok(RemoteScannerFrameResult::CycleAhead {
-                required_cycle: cache.info.next_cycle,
-            });
-        }
-        DataUsageCachePrepareOutcome::RejectedNewerLeader => {
-            return Err(RemoteScannerServerError::worker(
-                "remote namespace scanner rejected work from an older leader epoch",
-            ));
-        }
-        DataUsageCachePrepareOutcome::Reused | DataUsageCachePrepareOutcome::Reset => {}
+        DataUsageCacheScanState::Prepared { outcome, .. } => match outcome {
+            DataUsageCachePrepareOutcome::RejectedNewerCycle => {
+                return Ok(RemoteScannerFrameResult::CycleAhead {
+                    required_cycle: cache.info.next_cycle,
+                });
+            }
+            DataUsageCachePrepareOutcome::RejectedNewerLeader => {
+                return Err(RemoteScannerServerError::worker(
+                    "remote namespace scanner rejected work from an older leader epoch",
+                ));
+            }
+            DataUsageCachePrepareOutcome::Reused | DataUsageCachePrepareOutcome::Reset => {}
+        },
     }
     cache.info.skip_healing = skip_healing;
 
@@ -1971,6 +1973,7 @@ mod tests {
 
     #[test]
     fn request_rejects_empty_truncated_oversized_and_wrong_version_payloads() {
+        assert_eq!(NS_SCANNER_PROTOCOL_VERSION, 3);
         assert!(decode_remote_scanner_request(&[]).is_err());
 
         let mut body = rmp_serde::to_vec_named(&test_request(Uuid::new_v4())).expect("request should encode");
@@ -1980,7 +1983,7 @@ mod tests {
         let oversized = vec![0_u8; NS_SCANNER_MAX_REQUEST_BODY_SIZE + 1];
         assert!(decode_remote_scanner_request(&oversized).is_err());
 
-        for version in [NS_SCANNER_PROTOCOL_VERSION - 1, NS_SCANNER_PROTOCOL_VERSION + 1] {
+        for version in [2, 4] {
             let mut wrong_version = test_request(Uuid::new_v4());
             wrong_version.version = version;
             let body = rmp_serde::to_vec_named(&wrong_version).expect("request should encode");
@@ -2885,14 +2888,15 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_frame_version_and_sequence_are_rejected() {
+        assert_eq!(NS_SCANNER_PROTOCOL_VERSION, 3);
         let request_id = Uuid::new_v4();
         let auth = FrameAuthenticator::for_test(request_id);
         let frame = RemoteScannerFrame::progress(RemoteScannerProgress::default());
         let payload = rmp_serde::to_vec_named(&frame).expect("frame should encode");
 
         for (version, sequence, expected_error) in [
-            (NS_SCANNER_PROTOCOL_VERSION - 1, 0, "unsupported remote namespace scanner frame version"),
-            (NS_SCANNER_PROTOCOL_VERSION + 1, 0, "unsupported remote namespace scanner frame version"),
+            (2, 0, "unsupported remote namespace scanner frame version"),
+            (4, 0, "unsupported remote namespace scanner frame version"),
             (NS_SCANNER_PROTOCOL_VERSION, 1, "frame sequence is invalid"),
         ] {
             let envelope = RemoteScannerFrameEnvelope {

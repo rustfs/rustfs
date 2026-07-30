@@ -2098,14 +2098,20 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &arn).await else {
+            // Deliberately debug: this fires once per object per ARN, so a target that
+            // stays unreachable would flood the log from the replication hot path. The
+            // condition is reported once per pass by the site-replication reconciler and
+            // once per rebuild by `update_all_targets`, which is where an operator can act
+            // on it; the per-object event below still records each dropped object.
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                 bucket = %bucket,
+                object = %object,
                 arn = %arn,
                 reason = "target_client_missing",
-                "Skipping replication object target"
+                "Replication rule has no bucket target for its destination ARN; object not replicated"
             );
             send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),

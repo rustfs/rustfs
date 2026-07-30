@@ -87,18 +87,17 @@ pub struct QuotaConfig {
 impl QuotaConfig {
     /// Load quota configuration from container metadata
     pub async fn load(account: &str, container_name: &str, credentials: &Credentials) -> SwiftResult<Self> {
-        // Get container metadata
-        let container_info = container::get_container_metadata(account, container_name, credentials).await?;
+        let custom_metadata = container::get_container_custom_metadata(account, container_name, credentials).await?;
 
         let mut config = QuotaConfig::default();
 
         // Parse Quota-Bytes
-        if let Some(quota_bytes_str) = container_info.custom_metadata.get("x-container-meta-quota-bytes") {
+        if let Some(quota_bytes_str) = custom_metadata.get("x-container-meta-quota-bytes") {
             config.quota_bytes = quota_bytes_str.parse().ok();
         }
 
         // Parse Quota-Count
-        if let Some(quota_count_str) = container_info.custom_metadata.get("x-container-meta-quota-count") {
+        if let Some(quota_count_str) = custom_metadata.get("x-container-meta-quota-count") {
             config.quota_count = quota_count_str.parse().ok();
         }
 
@@ -113,9 +112,12 @@ impl QuotaConfig {
     /// Check if adding an object would exceed quotas
     ///
     /// Returns Ok(()) if within quota, Err with 413 if exceeded
-    pub fn check_quota(&self, current_bytes: u64, current_count: u64, additional_bytes: u64) -> SwiftResult<()> {
+    pub fn check_quota(&self, current_bytes: u64, current_count: u64, additional_bytes: Option<u64>) -> SwiftResult<()> {
         // Check byte quota
         if let Some(max_bytes) = self.quota_bytes {
+            let additional_bytes = additional_bytes.ok_or_else(|| {
+                SwiftError::LengthRequired("Content-Length is required when a byte quota is configured".to_string())
+            })?;
             let new_bytes = current_bytes.saturating_add(additional_bytes);
             if new_bytes > max_bytes {
                 return Err(SwiftError::RequestEntityTooLarge(format!(
@@ -147,7 +149,7 @@ impl QuotaConfig {
 pub async fn check_upload_quota(
     account: &str,
     container_name: &str,
-    object_size: u64,
+    object_size: Option<u64>,
     credentials: &Credentials,
 ) -> SwiftResult<()> {
     // Load quota config
@@ -157,7 +159,6 @@ pub async fn check_upload_quota(
     if !quota.is_enabled() {
         return Ok(());
     }
-
     // Get current container usage
     let metadata = container::get_container_metadata(account, container_name, credentials).await?;
 
@@ -173,7 +174,7 @@ pub async fn check_upload_quota(
         quota_bytes = ?quota.quota_bytes,
         current_count = metadata.object_count,
         quota_count = ?quota.quota_count,
-        object_size,
+        object_size = ?object_size,
         "swift quota state changed"
     );
 
@@ -235,7 +236,7 @@ mod tests {
         };
 
         // Current: 500 bytes, adding 400 bytes = 900 total (within 1000 limit)
-        let result = config.check_quota(500, 0, 400);
+        let result = config.check_quota(500, 0, Some(400));
         assert!(result.is_ok());
     }
 
@@ -247,7 +248,7 @@ mod tests {
         };
 
         // Current: 500 bytes, adding 600 bytes = 1100 total (exceeds 1000 limit)
-        let result = config.check_quota(500, 0, 600);
+        let result = config.check_quota(500, 0, Some(600));
         assert!(result.is_err());
         match result {
             Err(SwiftError::RequestEntityTooLarge(msg)) => {
@@ -265,7 +266,7 @@ mod tests {
         };
 
         // Current: 500 bytes, adding 500 bytes = 1000 total (exactly at limit)
-        let result = config.check_quota(500, 0, 500);
+        let result = config.check_quota(500, 0, Some(500));
         assert!(result.is_ok());
     }
 
@@ -277,7 +278,7 @@ mod tests {
         };
 
         // Current: 5 objects, adding 1 = 6 total (within 10 limit)
-        let result = config.check_quota(0, 5, 100);
+        let result = config.check_quota(0, 5, Some(100));
         assert!(result.is_ok());
     }
 
@@ -289,7 +290,7 @@ mod tests {
         };
 
         // Current: 10 objects, adding 1 = 11 total (exceeds 10 limit)
-        let result = config.check_quota(0, 10, 100);
+        let result = config.check_quota(0, 10, Some(100));
         assert!(result.is_err());
         match result {
             Err(SwiftError::RequestEntityTooLarge(msg)) => {
@@ -307,7 +308,7 @@ mod tests {
         };
 
         // Current: 9 objects, adding 1 = 10 total (exactly at limit)
-        let result = config.check_quota(0, 9, 100);
+        let result = config.check_quota(0, 9, Some(100));
         assert!(result.is_ok());
     }
 
@@ -319,7 +320,7 @@ mod tests {
         };
 
         // Both within limits
-        let result = config.check_quota(500, 5, 400);
+        let result = config.check_quota(500, 5, Some(400));
         assert!(result.is_ok());
     }
 
@@ -331,7 +332,7 @@ mod tests {
         };
 
         // Bytes exceeded, count within
-        let result = config.check_quota(500, 5, 600);
+        let result = config.check_quota(500, 5, Some(600));
         assert!(result.is_err());
     }
 
@@ -343,7 +344,7 @@ mod tests {
         };
 
         // Count exceeded, bytes within
-        let result = config.check_quota(500, 10, 100);
+        let result = config.check_quota(500, 10, Some(100));
         assert!(result.is_err());
     }
 
@@ -355,7 +356,7 @@ mod tests {
         };
 
         // No limits, should always pass
-        let result = config.check_quota(999999, 999999, 999999);
+        let result = config.check_quota(999999, 999999, Some(999999));
         assert!(result.is_ok());
     }
 
@@ -367,7 +368,7 @@ mod tests {
         };
 
         // Zero limit means no uploads allowed
-        let result = config.check_quota(0, 0, 1);
+        let result = config.check_quota(0, 0, Some(1));
         assert!(result.is_err());
     }
 
@@ -379,7 +380,7 @@ mod tests {
         };
 
         // Zero limit means no objects allowed
-        let result = config.check_quota(0, 0, 100);
+        let result = config.check_quota(0, 0, Some(100));
         assert!(result.is_err());
     }
 
@@ -391,8 +392,28 @@ mod tests {
         };
 
         // Test saturating_add protection
-        let result = config.check_quota(u64::MAX - 100, 0, 200);
+        let result = config.check_quota(u64::MAX - 100, 0, Some(200));
         // Should saturate to u64::MAX and compare against quota
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn byte_quota_rejects_upload_without_content_length() {
+        let config = QuotaConfig {
+            quota_bytes: Some(1000),
+            quota_count: None,
+        };
+
+        assert!(matches!(config.check_quota(500, 0, None), Err(SwiftError::LengthRequired(_))));
+    }
+
+    #[test]
+    fn count_only_quota_checks_upload_without_content_length() {
+        let config = QuotaConfig {
+            quota_bytes: None,
+            quota_count: Some(10),
+        };
+
+        assert!(matches!(config.check_quota(0, 10, None), Err(SwiftError::RequestEntityTooLarge(_))));
     }
 }

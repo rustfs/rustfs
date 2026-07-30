@@ -36,6 +36,8 @@ mod ecfs_extend;
 mod ecfs_test;
 pub(crate) mod head_prefix;
 #[cfg(test)]
+mod minio_generated_read_test;
+#[cfg(test)]
 mod multi_factor_scheduler_integration_test;
 pub(crate) mod runtime_sources;
 #[cfg(test)]
@@ -69,9 +71,9 @@ pub(crate) use storage_api::{
     get_lock_acquire_timeout, get_public_access_block_config, head_prefix_consumer, helper_consumer, init_background_replication,
     init_bucket_metadata_sys, init_ecstore_config, init_local_disks_with_instance_ctx, init_lock_clients,
     is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, is_valid_storage_class,
-    load_bucket_metadata, options_consumer, prewarm_local_disk_id_map_with_instance_ctx, read_config, record_replication_proxy,
-    rpc_consumer, runtime_sources_consumer, s3_api_consumer, serialize, set_bucket_metadata, table_catalog_path_hash,
-    to_s3s_etag, topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
+    options_consumer, prewarm_local_disk_id_map_with_instance_ctx, read_config, record_replication_proxy, rpc_consumer,
+    runtime_sources_consumer, s3_api_consumer, serialize, table_catalog_path_hash, to_s3s_etag,
+    topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
     try_migrate_server_config, update_bucket_metadata_config, verify_rpc_signature, wrap_reader,
 };
 

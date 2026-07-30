@@ -14,11 +14,12 @@
 
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
+    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
+    validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::verify_tonic_mutation_body_digest;
+use crate::storage::storage_api::{PartTransactionAction, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -28,13 +29,96 @@ use rustfs_io_metrics::internode_metrics::{
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
-use std::io::Cursor;
+use std::{collections::HashMap, io::Cursor, time::Duration};
+use tokio::sync::mpsc;
+use tokio_util::time::DelayQueue;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
 /// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
 /// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
+const SNAPSHOT_LEASE_MIN_TTL: Duration = Duration::from_secs(5);
+const SNAPSHOT_LEASE_MAX_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct SnapshotLeaseExpiry {
+    disk: DiskStore,
+    volume: String,
+    path: String,
+    token: SnapshotLeaseToken,
+}
+
+pub(super) struct SnapshotLeaseExpiryScheduler {
+    tx: mpsc::UnboundedSender<SnapshotLeaseExpiryCommand>,
+}
+
+enum SnapshotLeaseExpiryCommand {
+    Schedule(SnapshotLeaseExpiry, Duration),
+    Cancel(SnapshotLeaseToken),
+}
+
+impl SnapshotLeaseExpiryScheduler {
+    pub(super) fn new() -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut expirations: DelayQueue<SnapshotLeaseExpiry> = DelayQueue::new();
+            let mut keys = HashMap::new();
+            loop {
+                tokio::select! {
+                    Some(command) = rx.recv() => {
+                        match command {
+                            SnapshotLeaseExpiryCommand::Schedule(expiry, ttl) => {
+                                if let Some(key) = keys.remove(&expiry.token) {
+                                    expirations.remove(&key);
+                                }
+                                let token = expiry.token;
+                                let key = expirations.insert(expiry, ttl);
+                                keys.insert(token, key);
+                            }
+                            SnapshotLeaseExpiryCommand::Cancel(token) => {
+                                if let Some(key) = keys.remove(&token) {
+                                    expirations.remove(&key);
+                                }
+                            }
+                        }
+                    }
+                    Some(expired) = futures_util::StreamExt::next(&mut expirations), if !expirations.is_empty() => {
+                        let expiry = expired.into_inner();
+                        keys.remove(&expiry.token);
+                        let _ = expiry
+                            .disk
+                            .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
+                            .await;
+                    }
+                    else => break,
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn schedule(&self, expiry: SnapshotLeaseExpiry, ttl: Duration) -> Result<(), SnapshotLeaseExpiry> {
+        self.tx
+            .send(SnapshotLeaseExpiryCommand::Schedule(expiry, ttl))
+            .map_err(|err| match err.0 {
+                SnapshotLeaseExpiryCommand::Schedule(expiry, _) => expiry,
+                SnapshotLeaseExpiryCommand::Cancel(_) => unreachable!(),
+            })
+    }
+
+    fn cancel(&self, token: SnapshotLeaseToken) {
+        let _ = self.tx.send(SnapshotLeaseExpiryCommand::Cancel(token));
+    }
+}
+
+fn snapshot_lease_ttl(ttl_ms: u64) -> Result<Duration, Status> {
+    let ttl = Duration::from_millis(ttl_ms);
+    if !(SNAPSHOT_LEASE_MIN_TTL..=SNAPSHOT_LEASE_MAX_TTL).contains(&ttl) {
+        return Err(Status::invalid_argument("snapshot lease TTL is outside the supported range"));
+    }
+    Ok(ttl)
+}
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(
     binary: &[u8],
@@ -43,27 +127,47 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
 ) -> std::result::Result<T, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer).map_err(|err| {
-            global_internode_metrics().record_msgpack_json_decode_error(
-                INTERNODE_MSGPACK_DIRECTION_REQUEST,
-                value_name,
-                INTERNODE_MSGPACK_CODEC_MSGPACK,
-            );
-            DiskError::other(format!("decode {value_name} msgpack failed: {err}"))
-        });
+        return match T::deserialize(&mut deserializer) {
+            Ok(value) => {
+                global_internode_metrics().record_msgpack_json_decode(
+                    INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                    value_name,
+                    INTERNODE_MSGPACK_CODEC_MSGPACK,
+                );
+                Ok(value)
+            }
+            Err(err) => {
+                global_internode_metrics().record_msgpack_json_decode_error(
+                    INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                    value_name,
+                    INTERNODE_MSGPACK_CODEC_MSGPACK,
+                );
+                Err(DiskError::other(format!("decode {value_name} msgpack failed: {err}")))
+            }
+        };
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, value_name);
-    serde_json::from_str(json).map_err(|err| {
-        global_internode_metrics().record_msgpack_json_decode_error(
-            INTERNODE_MSGPACK_DIRECTION_REQUEST,
-            value_name,
-            INTERNODE_MSGPACK_CODEC_JSON,
-        );
-        DiskError::other(format!("decode {value_name} failed: {err}"))
-    })
+    match serde_json::from_str(json) {
+        Ok(value) => {
+            global_internode_metrics().record_msgpack_json_decode(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                value_name,
+                INTERNODE_MSGPACK_CODEC_JSON,
+            );
+            Ok(value)
+        }
+        Err(err) => {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                value_name,
+                INTERNODE_MSGPACK_CODEC_JSON,
+            );
+            Err(DiskError::other(format!("decode {value_name} failed: {err}")))
+        }
+    }
 }
 
 fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
@@ -145,6 +249,146 @@ fn encode_batch_read_version_response_payloads(
 }
 
 impl NodeService {
+    pub(super) async fn handle_acquire_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()),
+            "acquire_snapshot_lease",
+        )?;
+        let request = request.into_inner();
+        let ttl = snapshot_lease_ttl(request.ttl_ms)?;
+        let Some(disk) = self.find_disk(&request.disk).await else {
+            return Ok(Response::new(SnapshotLeaseResponse {
+                success: false,
+                token: Bytes::new(),
+                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+                error: Some(DiskError::other("cannot find disk").into()),
+            }));
+        };
+        match disk.acquire_snapshot_lease(&request.volume, &request.path).await {
+            Ok(token) => {
+                if let Err(expiry) = self.snapshot_lease_expiry.schedule(
+                    SnapshotLeaseExpiry {
+                        disk,
+                        volume: request.volume,
+                        path: request.path,
+                        token,
+                    },
+                    ttl,
+                ) {
+                    let _ = expiry
+                        .disk
+                        .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
+                        .await;
+                    return Err(Status::internal("snapshot lease expiry scheduler is unavailable"));
+                }
+                Ok(Response::new(SnapshotLeaseResponse {
+                    success: true,
+                    token: Bytes::copy_from_slice(token.as_bytes()),
+                    protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+                    error: None,
+                }))
+            }
+            Err(err) => Ok(Response::new(SnapshotLeaseResponse {
+                success: false,
+                token: Bytes::new(),
+                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+                error: Some(err.into()),
+            })),
+        }
+    }
+
+    pub(super) async fn handle_renew_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseRenewRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_snapshot_lease_renew_request_body(request.get_ref()),
+            "renew_snapshot_lease",
+        )?;
+        let request = request.into_inner();
+        let ttl = snapshot_lease_ttl(request.ttl_ms)?;
+        let token =
+            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
+        let Some(disk) = self.find_disk(&request.disk).await else {
+            return Ok(Response::new(SnapshotLeaseResponse {
+                success: false,
+                token: Bytes::new(),
+                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+                error: Some(DiskError::other("cannot find disk").into()),
+            }));
+        };
+        match disk.renew_snapshot_lease(&request.volume, &request.path, token).await {
+            Ok(renewed) => {
+                if let Err(expiry) = self.snapshot_lease_expiry.schedule(
+                    SnapshotLeaseExpiry {
+                        disk,
+                        volume: request.volume,
+                        path: request.path,
+                        token: renewed,
+                    },
+                    ttl,
+                ) {
+                    let _ = expiry
+                        .disk
+                        .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
+                        .await;
+                    return Err(Status::internal("snapshot lease expiry scheduler is unavailable"));
+                }
+                self.snapshot_lease_expiry.cancel(token);
+                Ok(Response::new(SnapshotLeaseResponse {
+                    success: true,
+                    token: Bytes::copy_from_slice(renewed.as_bytes()),
+                    protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+                    error: None,
+                }))
+            }
+            Err(err) => Ok(Response::new(SnapshotLeaseResponse {
+                success: false,
+                token: Bytes::new(),
+                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+                error: Some(err.into()),
+            })),
+        }
+    }
+
+    pub(super) async fn handle_release_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref()),
+            "release_snapshot_lease",
+        )?;
+        let request = request.into_inner();
+        let token =
+            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
+        let Some(disk) = self.find_disk(&request.disk).await else {
+            return Ok(Response::new(SnapshotLeaseMutationResponse {
+                success: false,
+                error: Some(DiskError::other("cannot find disk").into()),
+            }));
+        };
+        match disk.release_snapshot_lease(&request.volume, &request.path, token).await {
+            Ok(()) => {
+                self.snapshot_lease_expiry.cancel(token);
+                Ok(Response::new(SnapshotLeaseMutationResponse {
+                    success: true,
+                    error: None,
+                }))
+            }
+            Err(err) => Ok(Response::new(SnapshotLeaseMutationResponse {
+                success: false,
+                error: Some(err.into()),
+            })),
+        }
+    }
+
     pub(super) async fn handle_disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -1018,6 +1262,78 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_prepare_part_transaction(
+        &self,
+        request: Request<PreparePartTransactionRequest>,
+    ) -> Result<Response<PreparePartTransactionResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_prepare_part_transaction_request_body(request.get_ref()),
+            "prepare_part_transaction",
+        )?;
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk
+                .prepare_part_transaction(
+                    &request.src_volume,
+                    &request.src_path,
+                    &request.dst_volume,
+                    &request.dst_path,
+                    request.meta,
+                )
+                .await
+            {
+                Ok(()) => Ok(Response::new(PreparePartTransactionResponse {
+                    success: true,
+                    error: None,
+                })),
+                Err(err) => Ok(Response::new(PreparePartTransactionResponse {
+                    success: false,
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(PreparePartTransactionResponse {
+                success: false,
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
+    pub(super) async fn handle_settle_part_transaction(
+        &self,
+        request: Request<SettlePartTransactionRequest>,
+    ) -> Result<Response<SettlePartTransactionResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_settle_part_transaction_request_body(request.get_ref()),
+            "settle_part_transaction",
+        )?;
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let action = if request.rollback {
+                PartTransactionAction::Rollback
+            } else {
+                PartTransactionAction::Commit
+            };
+            match disk.settle_part_transaction(&request.volume, &request.path, action).await {
+                Ok(()) => Ok(Response::new(SettlePartTransactionResponse {
+                    success: true,
+                    error: None,
+                })),
+                Err(err) => Ok(Response::new(SettlePartTransactionResponse {
+                    success: false,
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(SettlePartTransactionResponse {
+                success: false,
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
     pub(super) async fn handle_check_parts(
         &self,
         request: Request<CheckPartsRequest>,
@@ -1276,8 +1592,9 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        compat_response_json, decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_msgpack_named, encode_read_multiple_response_payloads,
+        SNAPSHOT_LEASE_MAX_TTL, SNAPSHOT_LEASE_MIN_TTL, compat_response_json, decode_msgpack_or_json,
+        encode_batch_read_version_response_payloads, encode_msgpack, encode_msgpack_named,
+        encode_read_multiple_response_payloads, snapshot_lease_ttl,
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
@@ -1291,6 +1608,14 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_lease_ttl_rejects_values_outside_server_bounds() {
+        assert!(snapshot_lease_ttl(4_999).is_err());
+        assert_eq!(snapshot_lease_ttl(5_000).unwrap(), SNAPSHOT_LEASE_MIN_TTL);
+        assert_eq!(snapshot_lease_ttl(300_000).unwrap(), SNAPSHOT_LEASE_MAX_TTL);
+        assert!(snapshot_lease_ttl(300_001).is_err());
+    }
+
+    #[test]
     fn decode_msgpack_or_json_prefers_binary_payload() {
         let payload = SamplePayload {
             name: "rustfs".to_string(),
@@ -1298,15 +1623,20 @@ mod tests {
         };
 
         let binary = encode_msgpack(&payload, "SamplePayload").unwrap();
+        let before = global_internode_metrics().msgpack_json_decode_total_for_test();
         let decoded =
             decode_msgpack_or_json::<SamplePayload>(&binary, r#"{"name":"ignored","count":1}"#, "SamplePayload").unwrap();
+        let after = global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(decoded, payload);
+        assert!(after > before, "successful request msgpack decode should increment traffic metrics");
     }
 
     #[test]
     fn decode_msgpack_or_json_falls_back_to_json() {
+        let before = global_internode_metrics().msgpack_json_decode_total_for_test();
         let decoded = decode_msgpack_or_json::<SamplePayload>(&[], r#"{"name":"compat","count":7}"#, "SamplePayload").unwrap();
+        let after = global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(
             decoded,
@@ -1315,6 +1645,7 @@ mod tests {
                 count: 7,
             }
         );
+        assert!(after > before, "successful request JSON fallback decode should increment traffic metrics");
     }
 
     fn with_internode_msgpack_env<R>(vars: [(&'static str, Option<&'static str>); 2], f: impl FnOnce() -> R) -> R {

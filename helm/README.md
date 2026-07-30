@@ -47,6 +47,60 @@ without manual intervention:
 If you previously set `replicaCount=16` and now want a different topology,
 set both `replicaCount` and `drivesPerNode` explicitly.
 
+For distributed deployments that use the chart-generated
+`RUSTFS_VOLUMES`, `localEndpointHost.autoInject` defaults to automatic
+selection. Without `secret.existingSecret`, the chart injects a private
+Downward API variable, `RUSTFS_CHART_POD_NAME`, and uses it to build the pod's
+fully qualified hostname in
+`RUSTFS_LOCAL_ENDPOINT_HOST`. RustFS can then identify local drives without
+waiting for every peer's DNS record or TCP listener. A user-defined `POD_NAME`
+is preserved and does not interfere with the private chart variable. Setting
+`RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE` explicitly to `bounded`, `fail-fast`,
+`failfast`, or `strict` also keeps legacy DNS-based locality discovery. A
+dynamically sourced wait mode keeps the legacy path because its value cannot be
+validated while rendering. Otherwise, Kubernetes auto-detection selects
+orchestrated startup when RustFS consumes the generated anchor.
+
+An existing Secret is opaque to the chart and may historically contain more
+than credentials, so the chart does not inject an anchor whenever
+`secret.existingSecret` is set. In Kubernetes auto/orchestrated mode, RustFS
+then derives a DNS-free identity from the kernel hostname when exactly one
+domain endpoint at the server port has the same full hostname or first label.
+All-IP topologies retain direct IP locality detection. A domain topology with
+zero matches retains legacy DNS locality discovery; implicit auto mode bounds
+that compatibility path by `RUSTFS_STARTUP_TOPOLOGY_WAIT_TIMEOUT` (180 seconds
+by default). Multiple matching candidates remain an error. Set
+`RUSTFS_LOCAL_ENDPOINT_HOST` explicitly to avoid DNS discovery. For a
+credentials-only Secret, set
+`localEndpointHost.autoInject=true` to add the chart anchor without changing
+the historical ConfigMap-then-Secret `envFrom` precedence. If injection is
+explicitly enabled with an incompatible hidden `RUSTFS_VOLUMES`,
+`RUSTFS_ADDRESS`, or `RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE`, RustFS also fails
+during endpoint construction; it does not silently fall back to a different
+topology.
+
+When `config.rustfs.volumes` is set explicitly, the chart does not infer a
+local endpoint identity. RustFS applies the same kernel-hostname inference to
+custom domain topologies in Kubernetes auto/orchestrated mode; aliases that do
+not match the Pod hostname retain legacy DNS locality, with the bounded auto
+fallback described above. They may provide `RUSTFS_LOCAL_ENDPOINT_HOST`
+through `extraEnv` for DNS-free startup. An explicit `RUSTFS_VOLUMES`, explicit
+`RUSTFS_LOCAL_ENDPOINT_HOST`, bounded/dynamic or unrecognized startup mode, or
+`localEndpointHost.autoInject=false`, also disables chart injection. A
+`RUSTFS_ADDRESS` override alone does not disable it; the effective address and
+generated topology must agree on the endpoint port. Custom anchor-based
+configurations must resolve to `orchestrated` startup mode and must not receive
+a conflicting mode from an `envFrom` source.
+`startupWaitTimeoutSeconds` is retained for values-file compatibility but is
+deprecated and ignored.
+Historical `RUSTFS_STARTUP_TOPOLOGY_RETRY_MAX_DELAY` values of `0` or `0ms`
+are replaced with the safe default retry cap instead of causing a busy loop or
+blocking a direct upgrade.
+
+Upgrade the chart and RustFS image together. An older image that does not
+recognize `RUSTFS_LOCAL_ENDPOINT_HOST` retains its previous DNS-based startup
+behavior.
+
 ---
 
 # Parameters Overview
@@ -57,6 +111,7 @@ set both `replicaCount` and `drivesPerNode` explicitly.
 | affinity.podAntiAffinity.enabled | bool | `true` |  |
 | affinity.podAntiAffinity.topologyKey | string | `"kubernetes.io/hostname"` |  |
 | clusterDomain | string | `"cluster.local"` | Kubernetes cluster DNS domain used to build in-cluster FQDNs for `RUSTFS_VOLUMES` (distributed mode) and mTLS server certificate SANs. Override for clusters not using the default `cluster.local`. Provide the DNS root only, without a `svc.` prefix or leading/trailing dots. |
+| localEndpointHost.autoInject | bool or null | `null` | Automatically inject `RUSTFS_LOCAL_ENDPOINT_HOST` for chart-generated distributed topologies unless `secret.existingSecret` is set. Use `true` for a credentials-only existing Secret or `false` to preserve legacy DNS locality explicitly. |
 | commonLabels | object | `{}` | Labels to add to all deployed objects. |
 | config.rustfs.address | string | `":9000"` |  |
 | config.rustfs.console_address | string | `":9001"` |  |
@@ -66,7 +121,7 @@ set both `replicaCount` and `drivesPerNode` explicitly.
 | config.rustfs.obs_environment | string | `"development"` |  |
 | config.rustfs.obs_log_directory | string | `"/logs"` | Log directory inside the RustFS container. Set to `""` to disable log PVCs and mounts. |
 | config.rustfs.region | string | `"us-east-1"` |  |
-| config.rustfs.volumes | string | `""` |  |
+| config.rustfs.volumes | string | `""` | Explicit distributed volume topology. When empty, the chart generates the topology and normally injects `RUSTFS_LOCAL_ENDPOINT_HOST`; custom topologies must configure local endpoint identity explicitly when needed. |
 | config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
 | config.rustfs.log_rotation.time | string | `"hour"` | Default log rotation time for rustfs. |
 | config.rustfs.log_rotation.keep_files | int | `"30"` | Default log keep files for rustfs.  |
@@ -104,10 +159,10 @@ set both `replicaCount` and `drivesPerNode` explicitly.
 | config.rustfs.kms.type | string | `vault`| The kms type that RustFS supported. |
 | config.rustfs.kms.vault.vault_backend | string | `""`| The vault backend, `vault-kv2` or `vault-transit`. |
 | config.rustfs.kms.vault.vault_address | string | `""`| The vault address. |
-| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. |
+| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. Rendered into a dedicated Secret (`<fullname>-kms-secret`), never into the ConfigMap. |
 | config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
 | config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
-| extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
+| extraEnv | list | `[]` | Extra environment variables for the RustFS container. An explicit `RUSTFS_LOCAL_ENDPOINT_HOST` or `RUSTFS_VOLUMES`, or a bounded, dynamic, or unrecognized startup mode, disables generated anchor injection. `POD_NAME` and `RUSTFS_ADDRESS` remain independent overrides. |
 | extraVolumes | list | `[]` | Extra volumes to add to the pod spec. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
 | extraVolumeMounts | list | `[]` | Extra volume mounts to add to the RustFS container. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
@@ -190,7 +245,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | resources.limits.memory | string | `"512Mi"` |  |
 | resources.requests.cpu | string | `"100m"` |  |
 | resources.requests.memory | string | `"128Mi"` |  |
-| secret.existingSecret | string | `""` | Use existing secret with a credentials. |
+| secret.existingSecret | string | `""` | Use an existing Secret. Automatic endpoint-anchor injection is disabled because the Secret is opaque; set `localEndpointHost.autoInject=true` only after confirming it contains credentials rather than runtime topology, address, or startup-mode overrides. |
 | secret.rustfs.access_key | string | `"rustfsadmin"` | RustFS Access Key ID |
 | secret.rustfs.secret_key | string | `"rustfsadmin"` | RustFS Secret Key ID |
 | service.type | string | `"ClusterIP"` |  |
@@ -202,6 +257,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | serviceAccount.automount | bool | `true` |  |
 | serviceAccount.create | bool | `true` |  |
 | serviceAccount.name | string | `""` |  |
+| startupWaitTimeoutSeconds | int | `300` | Deprecated and ignored; retained for values-file compatibility. |
 | storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
@@ -291,20 +347,17 @@ Notes:
 * **Pools are append-only.** The list index determines the StatefulSet name —
   never remove or reorder entries. Retire a pool with
   `rc admin decommission` before removing it from the list.
-* During the expansion rollout, pods restart until every pod of every pool is
-  resolvable — the server refuses to start with unresolvable peers, so expect
-  a few crash/restart cycles before the cluster converges. This is harmless.
+* With chart-generated volumes, each pod receives an explicit local endpoint
+  identity. An unavailable peer no longer blocks a pod from reaching RustFS's
+  own startup and quorum checks.
 * After the cluster converges, run `rc admin rebalance start <alias>` to
   spread existing objects across the new pool.
 * Pod anti-affinity in pool mode is scoped per pool and **preferred**
   (soft), not required: two pools can share nodes, and each pool's own pods
-  spread across distinct nodes when capacity allows. Soft affinity is
-  load-bearing for in-place expansion — with required rules, the
-  not-yet-rolled pods of the existing pool block the new pool's pods from
-  their nodes while the rolled pods crash on the unresolvable (Pending)
-  peers, deadlocking the rollout on any cluster with fewer nodes than the
-  total pod count. Single-pool deployments (`pools.enabled=false`) keep the
-  chart's existing required anti-affinity unchanged.
+  spread across distinct nodes when capacity allows. Preferred affinity keeps
+  additional pools schedulable when the cluster has fewer nodes than total
+  pods. Single-pool deployments (`pools.enabled=false`) keep the chart's
+  existing required anti-affinity unchanged.
 * The PodDisruptionBudget spans all pools: with the default
   `pdb.maxUnavailable: 1`, at most one pod of the whole cluster may be
   evicted at a time. This is deliberately conservative — quorum safety
@@ -315,7 +368,8 @@ Notes:
 ## Requirement
 
 * Helm V3
-* RustFS >= 1.0.0-alpha.69
+* The RustFS image from the same release as the chart. If `image.rustfs.tag`
+  is overridden, that image must support `RUSTFS_LOCAL_ENDPOINT_HOST`.
 
 Due to the traefik and ingress has different session sticky/affinity annotations, and rustfs support both those two controller, you should specify parameter `ingress.className` to select the right one which suits for you.
 

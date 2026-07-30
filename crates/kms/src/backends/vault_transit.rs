@@ -138,9 +138,17 @@ pub struct VaultTransitKmsClient {
 }
 
 impl VaultTransitKmsClient {
-    pub async fn new(config: VaultTransitConfig) -> Result<Self> {
+    /// Create a new Vault Transit KMS client
+    ///
+    /// `attempt_timeout` caps every HTTP request issued through this client.
+    pub async fn new(config: VaultTransitConfig, attempt_timeout: Duration) -> Result<Self> {
         let mut settings_builder = VaultClientSettingsBuilder::default();
         settings_builder.address(&config.address);
+        // Defense in depth against stalled connections: vaultrs leaves the
+        // underlying reqwest client without any timeout by default, so a hung
+        // request would otherwise wait forever regardless of the
+        // operation-level retry policy.
+        settings_builder.timeout(Some(attempt_timeout));
 
         let token = match &config.auth_method {
             crate::config::VaultAuthMethod::Token { token } => token.clone(),
@@ -299,10 +307,17 @@ impl VaultTransitKmsClient {
             return Ok(persisted);
         }
 
+        // Deliberate exemption from the "read paths never write" rule (rustfs#4256 /
+        // rustfs#4262): transit keys created before metadata persistence existed have no
+        // KV record at all, so failing closed here would brick every pre-existing transit
+        // key. The synthesised record only describes metadata — key material lives solely
+        // inside Vault's transit engine and is never generated or written by this path.
+        //
         // Verify the transit key actually exists in Vault before synthesising.
         self.read_transit_key(key_id).await?;
         let metadata = TransitKeyMetadata::synthesized();
-        // Persist the synthesised metadata so future cache misses pick it up.
+        // Persist the synthesised metadata so future cache misses pick it up (best
+        // effort: the KV write failing must not fail the read).
         let _ = self.write_metadata_to_kv(key_id, &metadata).await;
         self.metadata_cache.write().await.insert(key_id.to_string(), metadata.clone());
         Ok(metadata)
@@ -607,7 +622,7 @@ impl VaultTransitKmsBackend {
             }
         };
 
-        let client = VaultTransitKmsClient::new(vault_config).await?;
+        let client = VaultTransitKmsClient::new(vault_config, config.effective_timeout()).await?;
         Ok(Self { client })
     }
 }
@@ -788,7 +803,7 @@ mod tests {
         let config = test_vault_transit_config();
 
         // --- First "process": create a key and disable it ---
-        let client1 = VaultTransitKmsClient::new(config.clone())
+        let client1 = VaultTransitKmsClient::new(config.clone(), Duration::from_secs(30))
             .await
             .expect("Failed to create VaultTransit client");
 
@@ -811,7 +826,7 @@ mod tests {
         assert_eq!(info_after_disable.status, KeyStatus::Disabled, "key must be Disabled after disable_key");
 
         // --- Simulate restart: create a brand new client with empty cache ---
-        let client2 = VaultTransitKmsClient::new(config)
+        let client2 = VaultTransitKmsClient::new(config, Duration::from_secs(30))
             .await
             .expect("Failed to create second VaultTransit client (restart simulation)");
 
@@ -841,7 +856,7 @@ mod tests {
     async fn test_transit_pending_deletion_survives_restart_simulation() {
         let config = test_vault_transit_config();
 
-        let client1 = VaultTransitKmsClient::new(config.clone())
+        let client1 = VaultTransitKmsClient::new(config.clone(), Duration::from_secs(30))
             .await
             .expect("Failed to create VaultTransit client");
 
@@ -865,7 +880,7 @@ mod tests {
             "key must be PendingDeletion after schedule_key_deletion"
         );
 
-        let client2 = VaultTransitKmsClient::new(config)
+        let client2 = VaultTransitKmsClient::new(config, Duration::from_secs(30))
             .await
             .expect("Failed to create second VaultTransit client (restart simulation)");
 

@@ -70,6 +70,10 @@
 //! ```
 
 use super::StorageError;
+use super::storage_api::ecstore_object::{
+    EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
+    ReadEncryptionMode, ReadEncryptionRequest,
+};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -84,6 +88,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue};
+use md5::{Digest as Md5Digest, Md5};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
@@ -91,6 +96,7 @@ use rustfs_kms::{DataKey, KmsUnavailableError, is_data_key_envelope, types::Obje
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "rio-v2")]
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -134,6 +140,16 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 #[cfg(feature = "rio-v2")]
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
+fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hasher.finalize().into()
+}
+
+fn md5_base64(input: impl AsRef<[u8]>) -> String {
+    BASE64_STANDARD.encode(md5_bytes(input))
+}
+
 use super::Error;
 use super::get_bucket_sse_config;
 use crate::error::ApiError;
@@ -143,6 +159,7 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
+use std::borrow::Cow;
 
 // ============================================================================
 // High-Level SSE Configuration
@@ -640,6 +657,23 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
 }
 
 pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
+    if let StorageError::Io(io_error) = &err
+        && let Some(resolution_error) = io_error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<EncryptionResolutionError>())
+    {
+        let code = match resolution_error.kind() {
+            EncryptionResolutionErrorKind::InvalidRequest => S3ErrorCode::InvalidRequest,
+            EncryptionResolutionErrorKind::ServiceUnavailable => S3ErrorCode::ServiceUnavailable,
+            _ => S3ErrorCode::InternalError,
+        };
+        return ApiError {
+            code,
+            message: resolution_error.to_string(),
+            source: Some(Box::new(err)),
+        };
+    }
+
     if let Some(message) = map_ssec_get_object_reader_error_message(&err) {
         return ApiError {
             code: S3ErrorCode::InvalidRequest,
@@ -760,6 +794,117 @@ pub enum SSEType {
 pub enum EncryptionKeyKind {
     Direct,
     Object,
+}
+
+pub(crate) struct SseObjectEncryptionResolver;
+
+#[async_trait]
+impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
+    async fn resolve_read_material(
+        &self,
+        request: ReadEncryptionRequest<'_>,
+    ) -> Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+        let metadata = normalize_encryption_metadata_case(request.metadata)?;
+        let (customer_algorithm, customer_key, customer_key_md5) =
+            extract_ssec_params_from_headers(request.headers).map_err(map_encryption_resolution_error)?;
+        if let Some(stored_algorithm) = metadata.get("x-amz-server-side-encryption-customer-algorithm") {
+            let request_algorithm = customer_algorithm.as_ref().ok_or_else(|| {
+                map_encryption_resolution_error(ssec_invalid_request(
+                    "The object was stored using a form of Server Side Encryption. \
+                     The correct parameters must be provided to retrieve the object.",
+                ))
+            })?;
+            if stored_algorithm != request_algorithm.as_str() {
+                return Err(map_encryption_resolution_error(ssec_invalid_request(
+                    "The provided encryption parameters did not match the ones used originally to encrypt the object.",
+                )));
+            }
+        }
+        let material = sse_decryption(DecryptionRequest {
+            bucket: request.bucket,
+            key: request.object,
+            metadata: &metadata,
+            sse_customer_key: customer_key.as_ref(),
+            sse_customer_key_md5: customer_key_md5.as_ref(),
+        })
+        .await
+        .map_err(map_encryption_resolution_error)?;
+
+        Ok(material.map(|material| ReadEncryptionMaterial {
+            key_bytes: material.key_bytes,
+            mode: match material.key_kind {
+                EncryptionKeyKind::Direct => ReadEncryptionMode::Direct {
+                    base_nonce: material.base_nonce,
+                },
+                EncryptionKeyKind::Object => ReadEncryptionMode::Object,
+            },
+        }))
+    }
+}
+
+fn normalize_encryption_metadata_case(
+    metadata: &HashMap<String, String>,
+) -> Result<Cow<'_, HashMap<String, String>>, EncryptionResolutionError> {
+    const CANONICAL_KEYS: &[&str] = &[
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        SSEC_ORIGINAL_SIZE_HEADER,
+        INTERNAL_ENCRYPTION_KEY_ID_HEADER,
+        INTERNAL_ENCRYPTION_KEY_HEADER,
+        INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        INTERNAL_ENCRYPTION_IV_HEADER,
+        "x-rustfs-encryption-context",
+        "x-rustfs-encryption-tag",
+        INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
+    ];
+
+    let needs_normalization = metadata.keys().any(|key| {
+        CANONICAL_KEYS
+            .iter()
+            .any(|canonical| key != canonical && key.eq_ignore_ascii_case(canonical))
+    });
+    if !needs_normalization {
+        return Ok(Cow::Borrowed(metadata));
+    }
+
+    let mut normalized = metadata.clone();
+    for canonical in CANONICAL_KEYS {
+        let mut matching_values = metadata
+            .iter()
+            .filter_map(|(key, value)| key.eq_ignore_ascii_case(canonical).then_some(value));
+        let Some(value) = matching_values.next() else {
+            continue;
+        };
+        if matching_values.any(|candidate| candidate != value) {
+            return Err(EncryptionResolutionError::new(
+                EncryptionResolutionErrorKind::InvalidMetadata,
+                format!("conflicting object encryption metadata for {canonical}"),
+            ));
+        }
+        if !normalized.contains_key(*canonical) {
+            normalized.insert((*canonical).to_string(), value.clone());
+        }
+    }
+    Ok(Cow::Owned(normalized))
+}
+
+fn map_encryption_resolution_error(error: ApiError) -> EncryptionResolutionError {
+    let kind = match error.code {
+        S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => EncryptionResolutionErrorKind::InvalidRequest,
+        S3ErrorCode::ServiceUnavailable => EncryptionResolutionErrorKind::ServiceUnavailable,
+        _ => EncryptionResolutionErrorKind::DecryptionFailed,
+    };
+    EncryptionResolutionError::new(kind, error.message)
 }
 
 #[derive(Debug, Clone)]
@@ -1885,6 +2030,10 @@ struct KmsSseDekProvider {
     service_manager: Option<Arc<rustfs_kms::KmsServiceManager>>,
 }
 
+fn kms_operation_error(error: rustfs_kms::KmsError) -> ApiError {
+    ApiError::from(StorageError::other(error))
+}
+
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
@@ -1936,7 +2085,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let (data_key, encrypted_data_key) = service
             .create_data_key(&kms_key_option, context)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {}", e))))?;
+            .map_err(kms_operation_error)?;
 
         Ok((data_key, encrypted_data_key))
     }
@@ -1954,7 +2103,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_data_key(encrypted_dek, context)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+            .map_err(kms_operation_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -1973,7 +2122,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_legacy_data_key(encrypted_dek)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt legacy data key: {e}"))))?;
+            .map_err(kms_operation_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -1996,6 +2145,16 @@ impl SseDekProvider for KmsSseDekProvider {
 /// ```
 pub(crate) struct LocalSseDekProvider {
     master_key: [u8; 32],
+}
+
+const LOCAL_SSE_DEK_FORMAT_VERSION: u8 = 1;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalSseDekEnvelope<'a> {
+    version: u8,
+    nonce: &'a str,
+    ciphertext: &'a str,
 }
 
 /// Test-only alias so existing test code that references `TestSseDekProvider`
@@ -2099,22 +2258,51 @@ impl LocalSseDekProvider {
             .encrypt(&nonce, dek.as_slice())
             .map_err(|_| ApiError::from(StorageError::other("Failed to encrypt DEK")))?;
 
-        // nonce:ciphertext
-        Ok(format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext)))
+        let nonce = BASE64_STANDARD.encode(nonce);
+        let ciphertext = BASE64_STANDARD.encode(ciphertext);
+        serde_json::to_string(&LocalSseDekEnvelope {
+            version: LOCAL_SSE_DEK_FORMAT_VERSION,
+            nonce: &nonce,
+            ciphertext: &ciphertext,
+        })
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to serialize encrypted DEK: {e}"))))
     }
 
     // Simple decryption of DEK
     pub(crate) fn decrypt_dek(encrypted_dek: &str, cmk_value: [u8; 32]) -> Result<[u8; 32], ApiError> {
-        let parts: Vec<&str> = encrypted_dek.split(':').collect();
-        if parts.len() != 2 {
-            return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
-        }
-
+        let envelope = serde_json::from_str::<LocalSseDekEnvelope<'_>>(encrypted_dek);
+        let (nonce, ciphertext) = match envelope {
+            Ok(envelope) => {
+                if envelope.version != LOCAL_SSE_DEK_FORMAT_VERSION {
+                    return Err(ApiError::from(StorageError::other(format!(
+                        "Unsupported encrypted DEK format version: {}",
+                        envelope.version
+                    ))));
+                }
+                (envelope.nonce, envelope.ciphertext)
+            }
+            Err(json_error) if encrypted_dek.trim_start().starts_with('{') => {
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Invalid encrypted DEK JSON format: {json_error}"
+                ))));
+            }
+            Err(_) => {
+                // DEPRECATED: read-only compatibility for persisted colon-delimited DEKs.
+                // RUSTFS_COMPAT_TODO(sse-local-dek-json-v1): Remove after all supported upgrades have rewritten legacy DEKs.
+                let Some((nonce, ciphertext)) = encrypted_dek.split_once(':') else {
+                    return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
+                };
+                if ciphertext.contains(':') {
+                    return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
+                }
+                (nonce, ciphertext)
+            }
+        };
         let nonce_vec = BASE64_STANDARD
-            .decode(parts[0])
+            .decode(nonce)
             .map_err(|_| ApiError::from(StorageError::other("Invalid nonce format")))?;
         let ciphertext = BASE64_STANDARD
-            .decode(parts[1])
+            .decode(ciphertext)
             .map_err(|_| ApiError::from(StorageError::other("Invalid ciphertext format")))?;
 
         let key = Key::<Aes256Gcm>::from(cmk_value);
@@ -2483,7 +2671,7 @@ pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, A
         )));
     }
 
-    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
+    let computed_md5 = md5_base64(&key_bytes);
     if computed_md5 != params.key_md5 {
         return Err(ssec_invalid_request(
             "The calculated MD5 hash of the key did not match the hash that was provided.",
@@ -2508,9 +2696,9 @@ pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, A
 /// 2. Different objects get different nonces
 pub fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
     let nonce_source = format!("{bucket}-{key}");
-    let nonce_hash = md5::compute(nonce_source.as_bytes());
+    let nonce_hash = md5_bytes(nonce_source.as_bytes());
     let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&nonce_hash.0[..12]);
+    nonce.copy_from_slice(&nonce_hash[..12]);
     nonce
 }
 
@@ -2587,19 +2775,20 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 mod tests {
     use super::{
         ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
-        INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
-        INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider, KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_IV_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, PrepareEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER, SSEType,
-        SseDekProvider, SsecParams, StorageError, TestSseDekProvider, apply_managed_decryption_material,
-        apply_managed_encryption_material, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
-        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
-        map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata, reset_sse_dek_provider,
-        resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
-        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params,
-        verify_ssec_key_match,
+        EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
+        INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider, KmsUnavailableError,
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
+        SSEType, SseDekProvider, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
+        apply_managed_decryption_material, apply_managed_encryption_material, encryption_material_to_metadata,
+        extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
+        generate_ssec_nonce, is_managed_sse, kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+        md5_base64, normalize_managed_metadata, reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption,
+        sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
+        validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -2620,6 +2809,15 @@ mod tests {
         // All-zero 32-byte key is rejected.
         let zero = BASE64_STANDARD.encode([0u8; 32]);
         assert!(super::parse_simple_sse_cmk(&zero).is_err());
+    }
+
+    #[test]
+    fn kms_operation_errors_preserve_retryability_classification() {
+        let unavailable = kms_operation_error(rustfs_kms::KmsError::backend_error("connection refused"));
+        let corrupt = kms_operation_error(rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"));
+
+        assert_eq!(unavailable.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(corrupt.code, S3ErrorCode::InternalError);
     }
 
     #[test]
@@ -2645,9 +2843,152 @@ mod tests {
     use tokio::sync::Mutex;
 
     static SSE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static SSE_TEST_KMS_KEY_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
     async fn lock_sse_test_state() -> tokio::sync::MutexGuard<'static, ()> {
         SSE_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+
+    async fn configure_test_global_local_kms() -> Arc<rustfs_kms::KmsServiceManager> {
+        let key_dir = SSE_TEST_KMS_KEY_DIR.get_or_init(|| tempfile::TempDir::new().expect("create KMS key directory"));
+        let manager = rustfs_kms::init_global_kms_service_manager();
+        manager
+            .reconfigure(rustfs_kms::KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .await
+            .expect("configure test KMS service");
+        manager
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_returns_ssec_read_material() {
+        let key = [0x31; 32];
+        let key_b64 = BASE64_STANDARD.encode(key);
+        let key_md5 = md5_base64(key);
+        let nonce = [0x42; 12];
+        let metadata = HashMap::from([
+            ("X-Amz-Server-Side-Encryption-Customer-Algorithm".to_string(), "AES256".to_string()),
+            ("X-Amz-Server-Side-Encryption-Customer-Key-Md5".to_string(), key_md5.clone()),
+            ("X-Rustfs-Encryption-Iv".to_string(), BASE64_STANDARD.encode(nonce)),
+        ]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_str(&key_b64).expect("base64 key is a valid header"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_str(&key_md5).expect("base64 MD5 is a valid header"),
+        );
+
+        let material = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &headers,
+            })
+            .await
+            .expect("SSE-C material should resolve")
+            .expect("SSE-C metadata should produce material");
+
+        assert_eq!(material.key_bytes, key);
+        assert_eq!(material.mode, ReadEncryptionMode::Direct { base_nonce: nonce });
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_rejects_missing_or_invalid_ssec_algorithm() {
+        let key = [0x31; 32];
+        let key_b64 = BASE64_STANDARD.encode(key);
+        let key_md5 = md5_base64(key);
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+            ("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5.clone()),
+        ]);
+
+        for algorithm in [None, Some("AES128")] {
+            let mut headers = HeaderMap::new();
+            if let Some(algorithm) = algorithm {
+                headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static(algorithm));
+            }
+            headers.insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_str(&key_b64).expect("base64 key is a valid header"),
+            );
+            headers.insert(
+                "x-amz-server-side-encryption-customer-key-md5",
+                HeaderValue::from_str(&key_md5).expect("base64 MD5 is a valid header"),
+            );
+
+            let result = SseObjectEncryptionResolver
+                .resolve_read_material(ReadEncryptionRequest {
+                    bucket: "bucket",
+                    object: "object",
+                    metadata: &metadata,
+                    headers: &headers,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("missing or invalid SSE-C algorithm must fail closed"),
+            };
+
+            assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidRequest);
+        }
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_classifies_missing_ssec_key_as_invalid_request() {
+        let metadata = HashMap::from([("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string())]);
+        let result = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &HeaderMap::new(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing SSE-C key must fail closed"),
+        };
+
+        assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_rejects_conflicting_metadata_case_variants() {
+        let metadata = HashMap::from([
+            ("x-rustfs-encryption-key".to_string(), "first".to_string()),
+            ("X-Rustfs-Encryption-Key".to_string(), "second".to_string()),
+        ]);
+        let result = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &HeaderMap::new(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting metadata aliases must fail closed"),
+        };
+
+        assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
+    }
+
+    #[test]
+    fn normalize_encryption_metadata_case_accepts_lowercase_minio_internal_keys() {
+        let lowercase_key = MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_ascii_lowercase();
+        let metadata = HashMap::from([(lowercase_key, "sealed-key".to_string())]);
+
+        let normalized = super::normalize_encryption_metadata_case(&metadata).expect("metadata aliases should normalize");
+
+        assert_eq!(
+            normalized.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER),
+            Some(&"sealed-key".to_string())
+        );
     }
 
     struct UnavailableSseDekProvider;
@@ -2829,7 +3170,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_success() {
         let key = BASE64_STANDARD.encode([42u8; 32]);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let key_md5 = md5_base64([42u8; 32]);
 
         let params = SsecParams {
             algorithm: "AES256".to_string(),
@@ -2846,7 +3187,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_wrong_algorithm() {
         let key = BASE64_STANDARD.encode([42u8; 32]);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let key_md5 = md5_base64([42u8; 32]);
 
         let params = SsecParams {
             algorithm: "AES128".to_string(), // Wrong algorithm
@@ -2861,7 +3202,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_wrong_key_length() {
         let key = BASE64_STANDARD.encode([42u8; 16]); // Only 16 bytes
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 16]).0);
+        let key_md5 = md5_base64([42u8; 16]);
 
         let params = SsecParams {
             algorithm: "AES256".to_string(),
@@ -2893,7 +3234,7 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let sse_key = BASE64_STANDARD.encode([42u8; 32]);
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
         let content_size = 1024;
 
         let request_missing_md5 = EncryptionRequest {
@@ -2946,7 +3287,7 @@ mod tests {
     async fn test_sse_prepare_encryption_rejects_partial_ssec_headers() {
         let bucket = "test-bucket";
         let key = "test-key";
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
 
         let request_missing_algorithm = PrepareEncryptionRequest {
             bucket,
@@ -2976,7 +3317,7 @@ mod tests {
     async fn test_sse_prepare_encryption_rejects_ssec_headers_without_customer_key() {
         let bucket = "test-bucket";
         let key = "test-key";
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
 
         let request = PrepareEncryptionRequest {
             bucket,
@@ -3034,7 +3375,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x24u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let metadata_one = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
         let metadata_two = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
@@ -3075,7 +3416,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x24u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -3107,7 +3448,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x51u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
         let plaintext = b"attack at dawn - sse-c round trip".to_vec();
 
         let metadata = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
@@ -3146,7 +3487,7 @@ mod tests {
         let key = "object";
         let customer_key_bytes = [0x33u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let material = sse_prepare_encryption(PrepareEncryptionRequest {
             bucket,
@@ -3208,7 +3549,7 @@ mod tests {
         let key = "test-key";
         let customer_key_bytes = [0x24u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let sse_key_md5 = md5_base64(customer_key_bytes);
 
         let request = PrepareEncryptionRequest {
             bucket,
@@ -3303,7 +3644,7 @@ mod tests {
         let key = "test-key";
         let content_size = 1024;
         let sse_key = BASE64_STANDARD.encode([42u8; 32]);
-        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let sse_key_md5 = md5_base64([42u8; 32]);
 
         let request = EncryptionRequest {
             bucket,
@@ -3369,18 +3710,11 @@ mod tests {
     #[cfg(feature = "rio-v2")]
     #[tokio::test]
     async fn test_sse_kms_roundtrip_persists_and_uses_minio_context() {
-        use rustfs_kms::config::KmsConfig;
         use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
-        use tempfile::TempDir;
         let _guard = lock_sse_test_state().await;
 
         reset_sse_dek_provider();
-        let manager = rustfs_kms::init_global_kms_service_manager();
-        let temp_dir = TempDir::new().expect("temp dir");
-        manager
-            .reconfigure(KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults())
-            .await
-            .expect("kms reconfigure should succeed");
+        let manager = configure_test_global_local_kms().await;
         manager
             .get_encryption_service()
             .await
@@ -3672,6 +4006,19 @@ mod tests {
 
                 assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
                 assert_eq!(decrypted.key_bytes, material.key_bytes);
+
+                let resolved = SseObjectEncryptionResolver
+                    .resolve_read_material(ReadEncryptionRequest {
+                        bucket: "bucket",
+                        object: "object",
+                        metadata: &metadata,
+                        headers: &HeaderMap::new(),
+                    })
+                    .await
+                    .expect("managed resolver")
+                    .expect("managed material");
+                assert_eq!(resolved.mode, ReadEncryptionMode::Object);
+                assert_eq!(resolved.key_bytes, material.key_bytes);
             },
         )
         .await;
@@ -3692,7 +4039,7 @@ mod tests {
     async fn test_ssec_rio_v2_uses_sealed_object_key_metadata_roundtrip() {
         let customer_key_bytes = [0x42u8; 32];
         let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
-        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
 
         let material = sse_encryption(EncryptionRequest {
             bucket: "bucket",
@@ -3732,6 +4079,29 @@ mod tests {
 
         assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
         assert_eq!(decrypted.key_bytes, material.key_bytes);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_str(&customer_key).expect("customer key header"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_str(&customer_key_md5).expect("customer key MD5 header"),
+        );
+        let resolved = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &headers,
+            })
+            .await
+            .expect("SSE-C resolver")
+            .expect("SSE-C material");
+        assert_eq!(resolved.mode, ReadEncryptionMode::Object);
+        assert_eq!(resolved.key_bytes, material.key_bytes);
     }
 
     #[cfg(feature = "rio-v2")]
@@ -3772,7 +4142,7 @@ mod tests {
             ssekms_context: None,
             sse_customer_algorithm: Some("AES256".to_string()),
             sse_customer_key: Some(BASE64_STANDARD.encode(key_bytes)),
-            sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute(key_bytes).0)),
+            sse_customer_key_md5: Some(md5_base64(key_bytes)),
             content_size: 1,
         }
     }
@@ -3781,10 +4151,7 @@ mod tests {
         let key_bytes = [key_byte; 32];
         HashMap::from([
             ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
-            (
-                "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                BASE64_STANDARD.encode(md5::compute(key_bytes).0),
-            ),
+            ("x-amz-server-side-encryption-customer-key-md5".to_string(), md5_base64(key_bytes)),
         ])
     }
 
@@ -4023,17 +4390,25 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_dek_uses_random_nonce_prefixes() {
+    fn test_encrypt_dek_writes_json_with_random_nonces() {
         let dek = [0x11u8; 32];
         let cmk = [0x22u8; 32];
 
         let encrypted_a = TestSseDekProvider::encrypt_dek(dek, cmk).expect("first DEK wrap should succeed");
         let encrypted_b = TestSseDekProvider::encrypt_dek(dek, cmk).expect("second DEK wrap should succeed");
 
-        let nonce_a = encrypted_a.split(':').next().expect("wrapped DEK should contain nonce");
-        let nonce_b = encrypted_b.split(':').next().expect("wrapped DEK should contain nonce");
+        let envelope_a: super::LocalSseDekEnvelope =
+            serde_json::from_str(&encrypted_a).expect("first wrapped DEK should be a JSON envelope");
+        let envelope_b: super::LocalSseDekEnvelope =
+            serde_json::from_str(&encrypted_b).expect("second wrapped DEK should be a JSON envelope");
 
-        assert_ne!(nonce_a, nonce_b, "each DEK wrap should use a distinct nonce prefix");
+        assert_eq!(envelope_a.version, super::LOCAL_SSE_DEK_FORMAT_VERSION);
+        assert_eq!(envelope_b.version, super::LOCAL_SSE_DEK_FORMAT_VERSION);
+        assert_ne!(envelope_a.nonce, envelope_b.nonce, "each DEK wrap should use a distinct nonce");
+        assert_eq!(
+            TestSseDekProvider::decrypt_dek(&encrypted_a, cmk).expect("first JSON envelope should decrypt"),
+            dek
+        );
     }
 
     #[test]
@@ -4049,6 +4424,20 @@ mod tests {
 
         let decrypted = TestSseDekProvider::decrypt_dek(&legacy_payload, cmk).expect("legacy payload should remain decryptable");
         assert_eq!(decrypted, dek);
+    }
+
+    #[test]
+    fn test_decrypt_dek_rejects_unknown_json_version() {
+        let envelope = serde_json::json!({
+            "version": super::LOCAL_SSE_DEK_FORMAT_VERSION + 1,
+            "nonce": BASE64_STANDARD.encode([0u8; 12]),
+            "ciphertext": BASE64_STANDARD.encode([0u8; 48]),
+        })
+        .to_string();
+
+        let error = TestSseDekProvider::decrypt_dek(&envelope, [0x55u8; 32])
+            .expect_err("unknown JSON envelope versions must fail closed");
+        assert!(error.message.contains("Unsupported encrypted DEK format version"));
     }
 
     #[tokio::test]
@@ -4187,17 +4576,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_managed_decryption_selects_provider_from_persisted_dek() {
-        use rustfs_kms::config::KmsConfig;
-        use tempfile::TempDir;
-
         let _guard = lock_sse_test_state().await;
         reset_sse_dek_provider();
-        let manager = rustfs_kms::init_global_kms_service_manager();
-        let key_dir = TempDir::new().expect("create KMS key directory");
-        manager
-            .reconfigure(KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
-            .await
-            .expect("start test KMS service");
+        let manager = configure_test_global_local_kms().await;
 
         let local_master_key = [7u8; 32];
         let local_provider = TestSseDekProvider::new_with_key(local_master_key);
@@ -4265,9 +4646,6 @@ mod tests {
     /// the local-provider cache.
     #[tokio::test]
     async fn test_kms_envelope_never_routes_to_cached_local_provider() {
-        use rustfs_kms::config::KmsConfig;
-        use tempfile::TempDir;
-
         let _guard = lock_sse_test_state().await;
         reset_sse_dek_provider();
 
@@ -4279,12 +4657,7 @@ mod tests {
             .expect("write local provider into local cache") = Some(Arc::new(TestSseDekProvider::new_with_key(local_master_key)));
 
         // 2. Start a KMS service (dynamic enable).
-        let manager = rustfs_kms::init_global_kms_service_manager();
-        let key_dir = TempDir::new().expect("create KMS key directory");
-        manager
-            .reconfigure(KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
-            .await
-            .expect("start test KMS service");
+        let manager = configure_test_global_local_kms().await;
 
         // 3. Construct a KMS JSON envelope — the persisted format of a KMS-wrapped DEK.
         //    is_data_key_envelope() will return true for this payload.
@@ -4371,32 +4744,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_kms_sse_dek_provider_uses_latest_reconfigured_service() {
+        use base64::Engine as _;
         use rustfs_kms::config::KmsConfig;
-        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
-        use tempfile::TempDir;
         let _guard = lock_sse_test_state().await;
 
-        let manager = rustfs_kms::init_global_kms_service_manager();
+        let manager = Arc::new(rustfs_kms::KmsServiceManager::new());
 
-        let first_dir = TempDir::new().expect("first temp dir");
         manager
-            .reconfigure(KmsConfig::local(first_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .reconfigure(KmsConfig::static_kms("first-key".to_string(), BASE64_STANDARD.encode([0x11; 32])))
             .await
             .expect("first KMS reconfigure should succeed");
-        manager
-            .get_encryption_service()
-            .await
-            .expect("first encryption service should exist")
-            .create_key(CreateKeyRequest {
-                key_name: Some("first-key".to_string()),
-                key_usage: KeyUsage::EncryptDecrypt,
-                description: None,
-                policy: None,
-                tags: HashMap::new(),
-                origin: None,
-            })
-            .await
-            .expect("first key should be created");
 
         let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
             .await
@@ -4407,25 +4764,10 @@ mod tests {
             .await
             .expect("provider should use the initial service");
 
-        let second_dir = TempDir::new().expect("second temp dir");
         manager
-            .reconfigure(KmsConfig::local(second_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .reconfigure(KmsConfig::static_kms("second-key".to_string(), BASE64_STANDARD.encode([0x22; 32])))
             .await
             .expect("second KMS reconfigure should succeed");
-        manager
-            .get_encryption_service()
-            .await
-            .expect("second encryption service should exist")
-            .create_key(CreateKeyRequest {
-                key_name: Some("second-key".to_string()),
-                key_usage: KeyUsage::EncryptDecrypt,
-                description: None,
-                policy: None,
-                tags: HashMap::new(),
-                origin: None,
-            })
-            .await
-            .expect("second key should be created");
 
         provider
             .generate_sse_dek(&context, "second-key")
@@ -4503,7 +4845,7 @@ mod tests {
     fn test_validate_ssec_for_read_wrong_key() {
         // Key A is used to "encrypt" the object (stored MD5 is from key A).
         let key_a = [42u8; 32];
-        let stored_md5 = BASE64_STANDARD.encode(md5::compute(key_a).0);
+        let stored_md5 = md5_base64(key_a);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -4512,7 +4854,7 @@ mod tests {
         // Key B is a different key; its MD5 won't match stored MD5.
         let key_b = [99u8; 32];
         let key_b_b64 = BASE64_STANDARD.encode(key_b);
-        let key_b_md5 = BASE64_STANDARD.encode(md5::compute(key_b).0);
+        let key_b_md5 = md5_base64(key_b);
 
         let err = validate_ssec_for_read(&metadata, Some(&key_b_b64), Some(&key_b_md5)).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
@@ -4522,7 +4864,7 @@ mod tests {
     fn test_validate_ssec_for_read_correct_key() {
         let key_bytes = [42u8; 32];
         let key_b64 = BASE64_STANDARD.encode(key_bytes);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute(key_bytes).0);
+        let key_md5 = md5_base64(key_bytes);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -4538,7 +4880,7 @@ mod tests {
         // DIFFERENT key. The server must recompute MD5 from the key bytes and
         // reject the request because the recomputed MD5 won't match the header.
         let real_key = [42u8; 32];
-        let stored_md5 = BASE64_STANDARD.encode(md5::compute(real_key).0);
+        let stored_md5 = md5_base64(real_key);
 
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
@@ -4641,6 +4983,15 @@ mod tests {
     }
 
     #[test]
+    fn test_map_get_object_reader_error_preserves_typed_service_unavailable() {
+        let resolution_error =
+            super::EncryptionResolutionError::new(EncryptionResolutionErrorKind::ServiceUnavailable, "KMS unavailable");
+        let err = map_get_object_reader_error(StorageError::other(resolution_error));
+        assert_eq!(err.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.message, "KMS unavailable");
+    }
+
+    #[test]
     fn test_map_get_object_reader_error_leaves_non_ssec_errors_unchanged() {
         let err = map_get_object_reader_error(StorageError::other("plain io failure"));
         assert_eq!(err.code, S3ErrorCode::InternalError);
@@ -4650,7 +5001,7 @@ mod tests {
     #[test]
     fn test_validate_ssec_params_returns_invalid_request_on_bad_algorithm() {
         let key = BASE64_STANDARD.encode([42u8; 32]);
-        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let key_md5 = md5_base64([42u8; 32]);
         let params = SsecParams {
             algorithm: "AES128".to_string(),
             key,
@@ -4736,7 +5087,7 @@ mod tests {
             ssekms_context: None,
             sse_customer_algorithm: Some("unsupported-algo".to_string()),
             sse_customer_key: Some(sse_key),
-            sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute([42u8; 32]).0)),
+            sse_customer_key_md5: Some(md5_base64([42u8; 32])),
             content_size: 1024,
         };
         let err = sse_encryption(request_unsupported_algorithm).await.unwrap_err();

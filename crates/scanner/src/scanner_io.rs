@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage_define::DATA_USAGE_CACHE_KEY_FORMAT;
 use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
@@ -830,7 +831,7 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
         return Err(ScannerError::Other("scanner cache root name is empty".to_string()));
     }
     let entry = cache
-        .checked_flatten(&cache.info.name)
+        .checked_flatten_complete_scope(&cache.info.name)
         .ok_or_else(|| ScannerError::Other(format!("scanner cache root is missing or corrupt: {}", cache.info.name)))?;
 
     Ok(DataUsageEntryInfo {
@@ -846,13 +847,13 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
 }
 
 fn should_publish_completed_snapshot(completed_count: usize, total_count: usize, budget_elapsed: bool, cancelled: bool) -> bool {
-    total_count > 0 && completed_count == total_count && !budget_elapsed && !cancelled
+    completed_count == total_count && !budget_elapsed && !cancelled
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NamespaceScannerWorkerMode {
     Coordinator,
-    RemoteV3(uuid::Uuid),
+    RemoteV4(uuid::Uuid),
 }
 
 fn namespace_scanner_workers<T>(
@@ -868,7 +869,7 @@ fn namespace_scanner_workers<T>(
     workers.extend(
         remote_disks
             .into_iter()
-            .map(|(disk, server_epoch)| (disk, NamespaceScannerWorkerMode::RemoteV3(server_epoch))),
+            .map(|(disk, server_epoch)| (disk, NamespaceScannerWorkerMode::RemoteV4(server_epoch))),
     );
     workers
 }
@@ -958,7 +959,57 @@ where
     let _ = tokio::time::timeout(SCANNER_CACHE_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan).await;
 }
 
-pub(crate) fn cache_snapshot_is_current(
+pub(crate) fn current_cache_root_entry(
+    cache: &DataUsageCache,
+    name: &str,
+    source: DataUsageCacheSource,
+    next_cycle: u64,
+    leader_epoch: u64,
+    scan_plan_digest: DataUsageScanPlanDigest,
+) -> std::result::Result<Option<DataUsageEntryInfo>, ScannerError> {
+    let metadata_is_current = cache.info.name == name
+        && cache.info.source == Some(source)
+        && cache.info.snapshot_complete
+        && cache.info.scan_plan_digest == Some(scan_plan_digest)
+        && cache.info.last_update.is_some()
+        && cache.info.next_cycle == next_cycle
+        && cache.info.leader_epoch == leader_epoch
+        && cache.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT;
+    if !metadata_is_current {
+        return Ok(None);
+    }
+
+    cache_root_entry_info(cache).map(Some)
+}
+
+pub(crate) enum DataUsageCacheScanState {
+    Current(Box<DataUsageEntryInfo>),
+    Prepared {
+        outcome: DataUsageCachePrepareOutcome,
+        invalid_current: Option<ScannerError>,
+    },
+}
+
+pub(crate) fn current_cache_root_or_prepare(
+    cache: &mut DataUsageCache,
+    name: &str,
+    source: DataUsageCacheSource,
+    next_cycle: u64,
+    leader_epoch: u64,
+    scan_plan_digest: DataUsageScanPlanDigest,
+    require_source: bool,
+) -> DataUsageCacheScanState {
+    match current_cache_root_entry(cache, name, source, next_cycle, leader_epoch, scan_plan_digest) {
+        Ok(Some(root)) => DataUsageCacheScanState::Current(Box::new(root)),
+        current => DataUsageCacheScanState::Prepared {
+            invalid_current: current.err(),
+            outcome: cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, require_source),
+        },
+    }
+}
+
+#[cfg(test)]
+fn cache_snapshot_is_current(
     cache: &DataUsageCache,
     name: &str,
     source: DataUsageCacheSource,
@@ -966,13 +1017,10 @@ pub(crate) fn cache_snapshot_is_current(
     leader_epoch: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
 ) -> bool {
-    cache.info.name == name
-        && cache.info.source == Some(source)
-        && cache.info.snapshot_complete
-        && cache.info.scan_plan_digest == Some(scan_plan_digest)
-        && cache.info.last_update.is_some()
-        && cache.info.next_cycle == next_cycle
-        && cache.info.leader_epoch == leader_epoch
+    matches!(
+        current_cache_root_entry(cache, name, source, next_cycle, leader_epoch, scan_plan_digest),
+        Ok(Some(_))
+    )
 }
 
 fn completed_data_usage_info(
@@ -1015,6 +1063,10 @@ fn completed_data_usage_info(
     }
 
     let merged_last_update = results.iter().filter_map(|result| result.info.last_update).max()?;
+    let bucket_sizes = buckets_usage
+        .iter()
+        .map(|(bucket, usage)| (bucket.clone(), usage.size))
+        .collect();
     let data_usage_info = DataUsageInfo {
         last_update: Some(merged_last_update),
         scanner_cycle: Some(results.first()?.info.next_cycle),
@@ -1023,7 +1075,9 @@ fn completed_data_usage_info(
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
         objects_total_size: u64::try_from(total.size).ok()?,
         buckets_count: u64::try_from(all_buckets.len()).ok()?,
+        bucket_sizes,
         buckets_usage,
+        usage_snapshot_complete: true,
         ..Default::default()
     };
     Some((data_usage_info, merged_last_update))
@@ -1042,7 +1096,10 @@ mod publish_gate_tests {
         assert!(!should_publish_completed_snapshot(2, 3, false, false));
         assert!(!should_publish_completed_snapshot(3, 3, true, false));
         assert!(!should_publish_completed_snapshot(3, 3, false, true));
-        assert!(!should_publish_completed_snapshot(0, 0, false, false));
+        assert!(
+            should_publish_completed_snapshot(0, 0, false, false),
+            "a completed empty namespace is an authoritative zero snapshot"
+        );
     }
 
     fn incomplete_scope_cache(source: DataUsageCacheSource) -> DataUsageCache {
@@ -1052,6 +1109,7 @@ mod publish_gate_tests {
                 source: Some(source),
                 snapshot_complete: false,
                 scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                 ..Default::default()
             },
             ..Default::default()
@@ -1093,6 +1151,7 @@ mod publish_gate_tests {
                 source: Some(source),
                 snapshot_complete: true,
                 scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                 ..Default::default()
             },
             ..Default::default()
@@ -1121,11 +1180,13 @@ mod publish_gate_tests {
 
     #[test]
     fn completed_data_usage_info_requires_every_set_before_publish() {
-        let all_buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let all_buckets = vec!["bucket-a".to_string(), "bucket-b".to_string(), "bucket-empty".to_string()];
         let mut first_set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
         first_set.replace("bucket-b", DATA_USAGE_ROOT, DataUsageEntry::default());
+        first_set.replace("bucket-empty", DATA_USAGE_ROOT, DataUsageEntry::default());
         let mut second_set = completed_root_cache("bucket-b", 2, 20, DataUsageCacheSource::new(1, 0));
         second_set.replace("bucket-a", DATA_USAGE_ROOT, DataUsageEntry::default());
+        second_set.replace("bucket-empty", DATA_USAGE_ROOT, DataUsageEntry::default());
 
         assert!(
             completed_data_usage_info_for_test(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false)
@@ -1144,7 +1205,38 @@ mod publish_gate_tests {
         assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         assert_eq!(data_usage_info.scanner_cycle, Some(0));
         assert_eq!(data_usage_info.objects_total_count, 3);
-        assert_eq!(data_usage_info.buckets_usage.len(), 2);
+        assert_eq!(data_usage_info.buckets_usage.len(), 3);
+        assert!(data_usage_info.usage_snapshot_complete);
+        assert_eq!(
+            data_usage_info
+                .buckets_usage
+                .get("bucket-empty")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
+        let mut completed_set = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+                source: Some(DataUsageCacheSource::new(0, 0)),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        completed_set.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+
+        let (data_usage_info, _) = completed_data_usage_info_for_test(&[completed_set], &[], false, false)
+            .expect("a completed empty namespace should produce an authoritative snapshot");
+
+        assert!(data_usage_info.is_complete_bucket_usage_snapshot());
+        assert_eq!(data_usage_info.buckets_count, 0);
+        assert!(data_usage_info.buckets_usage.is_empty());
     }
 
     #[test]
@@ -1382,16 +1474,144 @@ mod publish_gate_tests {
     }
 
     #[test]
+    fn current_cache_snapshot_rejects_persisted_windows_key_mismatch() {
+        let source = DataUsageCacheSource::new(1, 2);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 10,
+                last_update: Some(SystemTime::UNIX_EPOCH),
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            "bucket".to_string(),
+            DataUsageEntry {
+                children: HashSet::from(["bucket/prefix".to_string()]),
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            "bucket\\prefix".to_string(),
+            DataUsageEntry {
+                objects: 3,
+                ..Default::default()
+            },
+        );
+
+        assert!(!cache_snapshot_is_current(&cache, "bucket", source, 10, 0, TEST_PLAN_DIGEST));
+        match current_cache_root_or_prepare(&mut cache, "bucket", source, 10, 0, TEST_PLAN_DIGEST, true) {
+            DataUsageCacheScanState::Prepared {
+                outcome: DataUsageCachePrepareOutcome::Reset,
+                invalid_current: Some(_),
+            } => {}
+            _ => panic!("an invalid current cache must enter the rebuild path"),
+        }
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn current_cache_snapshot_rejects_structurally_valid_legacy_key_format() {
+        let source = DataUsageCacheSource::new(1, 2);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 10,
+                last_update: Some(SystemTime::UNIX_EPOCH),
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            "bucket".to_string(),
+            DataUsageEntry {
+                children: HashSet::from(["bucket\\prefix".to_string()]),
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            "bucket\\prefix".to_string(),
+            DataUsageEntry {
+                objects: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cache.checked_flatten("bucket").map(|entry| entry.objects), Some(3));
+
+        match current_cache_root_or_prepare(&mut cache, "bucket", source, 10, 0, TEST_PLAN_DIGEST, true) {
+            DataUsageCacheScanState::Prepared {
+                outcome: DataUsageCachePrepareOutcome::Reset,
+                invalid_current: None,
+            } => {}
+            _ => panic!("a legacy key format must enter the rebuild path"),
+        }
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn current_cache_snapshot_rejects_current_bucket_cache_with_detached_entry() {
+        let source = DataUsageCacheSource::new(1, 2);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 10,
+                last_update: Some(SystemTime::UNIX_EPOCH),
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            "bucket".to_string(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            "bucket/detached".to_string(),
+            DataUsageEntry {
+                objects: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cache.checked_flatten("bucket").map(|entry| entry.objects), Some(1));
+
+        match current_cache_root_or_prepare(&mut cache, "bucket", source, 10, 0, TEST_PLAN_DIGEST, true) {
+            DataUsageCacheScanState::Prepared {
+                outcome: DataUsageCachePrepareOutcome::Reset,
+                invalid_current: Some(_),
+            } => {}
+            _ => panic!("a detached complete bucket cache must enter the rebuild path"),
+        }
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
     fn namespace_scanner_worker_selection_keeps_coordinator_fallback_disks() {
         let server_epoch = uuid::Uuid::new_v4();
-        let workers = namespace_scanner_workers(vec!["local", "legacy-remote"], vec![("v3", server_epoch)]);
+        let workers = namespace_scanner_workers(vec!["local", "legacy-remote"], vec![("v4", server_epoch)]);
 
         assert_eq!(
             workers,
             vec![
                 ("local", NamespaceScannerWorkerMode::Coordinator),
                 ("legacy-remote", NamespaceScannerWorkerMode::Coordinator),
-                ("v3", NamespaceScannerWorkerMode::RemoteV3(server_epoch)),
+                ("v4", NamespaceScannerWorkerMode::RemoteV4(server_epoch)),
             ]
         );
         assert!(namespace_scanner_workers::<()>(Vec::new(), Vec::new()).is_empty());
@@ -1465,6 +1685,7 @@ mod publish_gate_tests {
                 source: Some(source),
                 snapshot_complete: true,
                 scan_plan_digest: Some(first),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                 ..Default::default()
             },
             ..Default::default()
@@ -1553,6 +1774,15 @@ async fn send_cache_root_entry_info(
     pending_maintenance_work: &AtomicBool,
 ) -> std::result::Result<(), ScannerError> {
     let root = cache_root_entry_info(cache)?;
+    send_cache_root_entry(bucket_result_tx, root, cache, pending_maintenance_work).await
+}
+
+async fn send_cache_root_entry(
+    bucket_result_tx: &mpsc::Sender<DataUsageEntryInfo>,
+    root: DataUsageEntryInfo,
+    cache: &DataUsageCache,
+    pending_maintenance_work: &AtomicBool,
+) -> std::result::Result<(), ScannerError> {
     record_bucket_pending_maintenance_work(cache, pending_maintenance_work);
     bucket_result_tx
         .send(root)
@@ -1648,13 +1878,16 @@ async fn persist_and_publish_cache_snapshot(
         );
         return None;
     }
-    if cache_snapshot_is_current(
-        &persisted,
-        DATA_USAGE_ROOT,
-        source,
-        cache_snapshot.info.next_cycle,
-        cache_snapshot.info.leader_epoch,
-        scan_plan_digest,
+    if matches!(
+        current_cache_root_entry(
+            &persisted,
+            DATA_USAGE_ROOT,
+            source,
+            cache_snapshot.info.next_cycle,
+            cache_snapshot.info.leader_epoch,
+            scan_plan_digest,
+        ),
+        Ok(Some(_))
     ) {
         cache_snapshot = persisted;
     } else {
@@ -2000,6 +2233,7 @@ impl ScannerIOCycle for ECStore {
             let empty_usage = DataUsageInfo {
                 last_update: Some(SystemTime::now()),
                 scanner_cycle: Some(want_cycle),
+                usage_snapshot_complete: true,
                 ..Default::default()
             };
             send_data_usage_update(&updates, empty_usage).await?;
@@ -2286,6 +2520,7 @@ impl ScannerIOCache for SetDisks {
                     source: Some(source),
                     snapshot_complete: true,
                     scan_plan_digest: Some(scan_plan_digest),
+                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                     ..Default::default()
                 },
                 cache: HashMap::new(),
@@ -2407,7 +2642,7 @@ impl ScannerIOCache for SetDisks {
                 subsystem = LOG_SUBSYSTEM_IO,
                 pool = self.pool_index,
                 set = self.set_index,
-                v3_disks = remote_disk_count,
+                v4_disks = remote_disk_count,
                 unsupported_remote_disks,
                 state = "unsupported_remote_disks_using_coordinator",
                 "Scanner set assigned remote disks without namespace scanner support to coordinator-driven workers"
@@ -2504,6 +2739,7 @@ impl ScannerIOCache for SetDisks {
                 source: Some(source),
                 snapshot_complete: false,
                 scan_plan_digest: Some(scan_plan_digest),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                 ..Default::default()
             },
             cache: HashMap::new(),
@@ -2595,7 +2831,7 @@ impl ScannerIOCache for SetDisks {
             let dirty_usage_buckets_clone = dirty_usage_buckets.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
             let remote_server_epoch = match worker_mode {
-                NamespaceScannerWorkerMode::RemoteV3(server_epoch) => Some(server_epoch),
+                NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
             };
             futs.push(tokio::spawn(async move {
@@ -2905,48 +3141,71 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
-                    if cache_snapshot_is_current(&cache, &bucket.name, source, want_cycle, leader_epoch, bucket_scan_plan_digest)
-                    {
-                        if cache_guard.is_lock_lost() {
-                            record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
-                            error!(
-                                target: "rustfs::scanner::io",
-                                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_IO,
-                                bucket = %bucket.name,
-                                cache_name = %cache_name,
-                                state = "lock_lost_before_reuse",
-                                "Current scanner bucket cache root publish skipped after lock loss"
-                            );
-                            continue;
-                        }
-                        if let Err(e) =
-                            send_cache_root_entry_info(&bucket_result_tx_clone, &cache, &pending_maintenance_work_clone).await
-                        {
-                            record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
-                            error!(
-                                target: "rustfs::scanner::io",
-                                event = EVENT_SCANNER_DATA_USAGE_STREAM,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_IO,
-                                bucket = %bucket.name,
-                                state = "send_current_root_failed",
-                                error = %e,
-                                "Current scanner bucket cache root entry publish failed"
-                            );
-                        }
-                        continue;
-                    }
-
-                    match cache.prepare_for_scan(
+                    let scan_state = current_cache_root_or_prepare(
+                        &mut cache,
                         &bucket.name,
+                        source,
                         want_cycle,
                         leader_epoch,
-                        source,
                         bucket_scan_plan_digest,
                         require_cache_source,
-                    ) {
+                    );
+                    let outcome = match scan_state {
+                        DataUsageCacheScanState::Current(root) => {
+                            if cache_guard.is_lock_lost() {
+                                record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                error!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    cache_name = %cache_name,
+                                    state = "lock_lost_before_reuse",
+                                    "Current scanner bucket cache root publish skipped after lock loss"
+                                );
+                                continue;
+                            }
+                            if let Err(e) =
+                                send_cache_root_entry(&bucket_result_tx_clone, *root, &cache, &pending_maintenance_work_clone)
+                                    .await
+                            {
+                                record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                error!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_DATA_USAGE_STREAM,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    state = "send_current_root_failed",
+                                    error = %e,
+                                    "Current scanner bucket cache root entry publish failed"
+                                );
+                            }
+                            continue;
+                        }
+                        DataUsageCacheScanState::Prepared {
+                            outcome,
+                            invalid_current,
+                        } => {
+                            if let Some(e) = invalid_current {
+                                warn!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    cache_name = %cache_name,
+                                    state = "current_cache_invalid",
+                                    error = %e,
+                                    "Current scanner bucket cache is invalid; rebuilding"
+                                );
+                            }
+                            outcome
+                        }
+                    };
+
+                    match outcome {
                         DataUsageCachePrepareOutcome::RejectedNewerCycle => {
                             cache_cycle_floor_clone.fetch_max(cache.info.next_cycle, Ordering::AcqRel);
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
@@ -3318,6 +3577,7 @@ impl ScannerIOCache for SetDisks {
                     source: Some(source),
                     snapshot_complete: false,
                     scan_plan_digest: Some(scan_plan_digest),
+                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                     ..Default::default()
                 },
                 cache: HashMap::new(),
@@ -4625,6 +4885,67 @@ mod tests {
         root.add_child(&crate::hash_path("bucket/missing"));
         dangling.replace("bucket", DATA_USAGE_ROOT, root);
         assert!(cache_root_entry_info(&dangling).is_err());
+
+        let mut detached = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        detached.replace("bucket", DATA_USAGE_ROOT, DataUsageEntry::default());
+        detached.replace(
+            "bucket/detached",
+            "",
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        assert!(cache_root_entry_info(&detached).is_err());
+
+        let mut detached_bucket = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        detached_bucket.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        detached_bucket.replace(
+            "bucket/detached",
+            "",
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        assert!(cache_root_entry_info(&detached_bucket).is_err());
+
+        let mut compacted_with_child = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        compacted_with_child.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                compacted: true,
+                ..Default::default()
+            },
+        );
+        compacted_with_child.replace("bucket/prefix", "bucket", DataUsageEntry::default());
+        assert!(cache_root_entry_info(&compacted_with_child).is_err());
     }
 
     #[test]

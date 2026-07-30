@@ -21,11 +21,15 @@
 use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
+use md5::{Digest as Md5Digest, Md5};
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
+
+/// Maximum accepted size of an SLO manifest document
+const MAX_SLO_MANIFEST_SIZE: usize = 2 * 1024 * 1024;
 
 /// SLO manifest segment descriptor
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,9 +82,9 @@ impl SLOManifest {
             etag_concat.push_str(etag);
         }
 
-        // Calculate MD5 hash
-        let hash = md5::compute(etag_concat.as_bytes());
-        format!("\"{:x}-{}\"", hash, self.segments.len())
+        let mut hasher = Md5::new();
+        hasher.update(etag_concat.as_bytes());
+        format!("\"{}-{}\"", hex::encode(hasher.finalize()), self.segments.len())
     }
 
     /// Validate manifest against actual segments
@@ -274,13 +278,13 @@ pub async fn handle_slo_put(
         .map_err(|e| SwiftError::BadRequest(format!("Failed to read manifest: {}", e)))?
         .to_bytes();
 
-    // 2. Parse manifest
-    let manifest = SLOManifest::from_json(&manifest_bytes)?;
-
-    // 3. Validate manifest size (2MB limit)
-    if manifest_bytes.len() > 2 * 1024 * 1024 {
+    // 2. Validate manifest size (2MB limit)
+    if manifest_bytes.len() > MAX_SLO_MANIFEST_SIZE {
         return Err(SwiftError::BadRequest("Manifest exceeds 2MB".to_string()));
     }
+
+    // 3. Parse manifest
+    let manifest = SLOManifest::from_json(&manifest_bytes)?;
 
     // 4. Validate segments exist and match ETags/sizes
     manifest.validate(account, creds).await?;
@@ -326,6 +330,30 @@ pub async fn handle_slo_put(
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
+/// Read a stored SLO manifest without buffering more than [`MAX_SLO_MANIFEST_SIZE`].
+///
+/// The manifest lives at a caller-predictable `<object>.slo-manifest` key, so its content
+/// is attacker-controlled: the read must be bounded rather than sized by the stored object.
+async fn read_manifest_bytes<R>(reader: R) -> Result<Vec<u8>, SwiftError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut manifest_bytes = Vec::new();
+    reader
+        .take(MAX_SLO_MANIFEST_SIZE as u64 + 1)
+        .read_to_end(&mut manifest_bytes)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
+
+    if manifest_bytes.len() > MAX_SLO_MANIFEST_SIZE {
+        return Err(SwiftError::BadRequest("Manifest exceeds 2MB".to_string()));
+    }
+
+    Ok(manifest_bytes)
+}
+
 /// Handle GET /v1/{account}/{container}/{object} for SLO
 pub async fn handle_slo_get(
     account: &str,
@@ -341,16 +369,9 @@ pub async fn handle_slo_get(
 
     // 1. Load manifest
     let manifest_key = format!("{}.slo-manifest", object);
-    let mut manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
+    let manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
 
-    // Read manifest bytes
-    let mut manifest_bytes = Vec::new();
-    use tokio::io::AsyncReadExt;
-    manifest_reader
-        .stream
-        .read_to_end(&mut manifest_bytes)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
+    let manifest_bytes = read_manifest_bytes(manifest_reader.stream).await?;
 
     let manifest = SLOManifest::from_json(&manifest_bytes)?;
 
@@ -472,16 +493,9 @@ pub async fn handle_slo_get_manifest(
 
     // Load and return the manifest JSON directly
     let manifest_key = format!("{}.slo-manifest", object);
-    let mut manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
+    let manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
 
-    // Read manifest bytes
-    let mut manifest_bytes = Vec::new();
-    use tokio::io::AsyncReadExt;
-    manifest_reader
-        .stream
-        .read_to_end(&mut manifest_bytes)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
+    let manifest_bytes = read_manifest_bytes(manifest_reader.stream).await?;
 
     let trans_id = generate_trans_id();
     Response::builder()
@@ -508,16 +522,9 @@ pub async fn handle_slo_delete(
 
     // 1. Load manifest
     let manifest_key = format!("{}.slo-manifest", object);
-    let mut manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
+    let manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
 
-    // Read manifest bytes
-    let mut manifest_bytes = Vec::new();
-    use tokio::io::AsyncReadExt;
-    manifest_reader
-        .stream
-        .read_to_end(&mut manifest_bytes)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
+    let manifest_bytes = read_manifest_bytes(manifest_reader.stream).await?;
 
     let manifest = SLOManifest::from_json(&manifest_bytes)?;
 
@@ -970,5 +977,48 @@ mod tests {
 
         // Empty path
         assert!(parse_segment_path("").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_bytes_accepts_manifest_at_size_limit() {
+        let source = std::io::Cursor::new(vec![b'x'; MAX_SLO_MANIFEST_SIZE]);
+        let bytes = read_manifest_bytes(source).await.expect("manifest at the limit is accepted");
+        assert_eq!(bytes.len(), MAX_SLO_MANIFEST_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_bytes_rejects_oversized_manifest() {
+        let source = std::io::Cursor::new(vec![b'x'; MAX_SLO_MANIFEST_SIZE + 1]);
+        let result = read_manifest_bytes(source).await.map(|bytes| bytes.len());
+        assert!(
+            matches!(result, Err(SwiftError::BadRequest(_))),
+            "manifest above the limit must be rejected, got {:?}",
+            result
+        );
+    }
+
+    /// A stored manifest is attacker-controlled, so the read must stop at the limit
+    /// instead of buffering the whole object.
+    #[tokio::test]
+    async fn test_read_manifest_bytes_stops_reading_oversized_manifest() {
+        use tokio::io::AsyncReadExt;
+
+        let total = 32 * 1024 * 1024u64;
+        let mut source = tokio::io::repeat(b'x').take(total);
+
+        let result = read_manifest_bytes(&mut source).await.map(|bytes| bytes.len());
+        assert!(
+            matches!(result, Err(SwiftError::BadRequest(_))),
+            "oversized manifest must be rejected, got {:?}",
+            result
+        );
+
+        let consumed = total - source.limit();
+        assert!(
+            consumed <= MAX_SLO_MANIFEST_SIZE as u64 + 1,
+            "read {} bytes, expected at most {}",
+            consumed,
+            MAX_SLO_MANIFEST_SIZE + 1
+        );
     }
 }

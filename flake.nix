@@ -30,7 +30,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -60,7 +59,7 @@
         {
           default = rustPlatform.buildRustPackage {
             pname = "rustfs";
-            version = "1.0.0-beta.11";
+            version = "1.0.0-beta.12";
 
             src = ./.;
 

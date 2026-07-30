@@ -317,6 +317,8 @@ pub struct ErasureSetInfo {
     pub versions_count: u64,
     #[serde(rename = "deleteMarkersCount")]
     pub delete_markers_count: u64,
+    #[serde(rename = "usageError", default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<String>,
     #[serde(rename = "healDisks")]
     pub heal_disks: i32,
 }
@@ -1107,6 +1109,7 @@ mod tests {
         assert_eq!(erasure_set.objects_count, 0);
         assert_eq!(erasure_set.versions_count, 0);
         assert_eq!(erasure_set.delete_markers_count, 0);
+        assert!(erasure_set.usage_error.is_none());
         assert_eq!(erasure_set.heal_disks, 0);
     }
 
@@ -1120,6 +1123,7 @@ mod tests {
             objects_count: 10000,
             versions_count: 15000,
             delete_markers_count: 500,
+            usage_error: None,
             heal_disks: 2,
         };
 
@@ -1131,6 +1135,38 @@ mod tests {
         assert_eq!(erasure_set.versions_count, 15000);
         assert_eq!(erasure_set.delete_markers_count, 500);
         assert_eq!(erasure_set.heal_disks, 2);
+    }
+
+    #[test]
+    fn erasure_set_usage_error_is_additive_on_the_wire() {
+        #[derive(Deserialize)]
+        struct LegacyErasureSetInfo {
+            id: i32,
+            usage: u64,
+        }
+
+        let legacy = r#"{"id":1,"rawUsage":2,"rawCapacity":3,"usage":4,"objectsCount":5,"versionsCount":6,"deleteMarkersCount":7,"healDisks":8}"#;
+        let decoded: ErasureSetInfo = serde_json::from_str(legacy).expect("legacy erasure set payload should decode");
+        assert!(decoded.usage_error.is_none());
+
+        let encoded = serde_json::to_value(decoded).expect("erasure set payload should encode");
+        assert!(
+            encoded.get("usageError").is_none(),
+            "an absent usage error must not change the legacy wire shape"
+        );
+
+        let current = ErasureSetInfo {
+            id: 9,
+            usage: 10,
+            usage_error: Some("data usage unavailable".to_string()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(current).expect("current erasure set payload should encode");
+        let legacy: LegacyErasureSetInfo =
+            serde_json::from_value(encoded).expect("legacy erasure set reader should ignore additive fields");
+
+        assert_eq!(legacy.id, 9);
+        assert_eq!(legacy.usage, 10);
     }
 
     #[test]

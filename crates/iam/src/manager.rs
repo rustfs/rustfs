@@ -556,7 +556,7 @@ where
         Ok(now)
     }
 
-    pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+    pub async fn list_policies(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
         let mut m = HashMap::new();
 
         self.api.load_policy_docs(&mut m).await?;
@@ -586,6 +586,15 @@ where
             .collect();
 
         Ok(filtered)
+    }
+
+    /// Backward-compatible misspelling retained until the next breaking release.
+    #[deprecated(
+        since = "1.0.0",
+        note = "use list_policies instead; this alias will be removed in the next breaking release"
+    )]
+    pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+        self.list_policies(bucket_name).await
     }
 
     pub async fn merge_policies(&self, name: &str) -> (String, Policy) {
@@ -822,6 +831,15 @@ where
             cr.secret_key = secret;
         }
 
+        if let Some(parent_user) = opts.parent_user {
+            // Same gate as the account itself: a rebind grants the account whatever the new
+            // parent can do, so only the site-replication repair path may ask for one.
+            if parent_user.is_empty() || !opts.allow_site_replicator_account || name != SITE_REPLICATOR_SERVICE_ACCOUNT {
+                return Err(Error::IAMActionNotAllowed);
+            }
+            cr.parent_user = parent_user;
+        }
+
         if opts.name.is_some() {
             cr.name = opts.name;
         }
@@ -889,6 +907,10 @@ where
         if name == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
             m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
         }
+        // The parent lives in the token as well, and `prepare_service_account_auth` denies the
+        // request when the two disagree — a rebind that updated only the credential would
+        // lock the account out.
+        m.insert("parent".to_owned(), Value::String(cr.parent_user.clone()));
 
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
 
@@ -907,7 +929,41 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        let (policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        self.policy_db_get_with_groups(policies, groups).await
+    }
+
+    pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let cache = self.cache.snapshot();
+        let sts_policies = Arc::clone(&cache.sts_policies);
+        drop(cache);
+        let mapped_policy = match sts_policies.get(name) {
+            Some(policy) => policy.clone(),
+            None => {
+                let mut policies = HashMap::new();
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Sts, false, &mut policies).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(err);
+                }
+                match policies.get(name) {
+                    Some(policy) => {
+                        self.cache.add_or_update_sts_policy(name, policy, OffsetDateTime::now_utc());
+                        policy.clone()
+                    }
+                    None => MappedPolicy::default(),
+                }
+            }
+        };
+
+        self.policy_db_get_with_groups(mapped_policy.to_slice(), groups).await
+    }
+
+    async fn policy_db_get_with_groups(&self, mut policies: Vec<String>, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         let present = !policies.is_empty();
 
         if let Some(groups) = groups {
@@ -2137,7 +2193,7 @@ where
     }
 }
 
-pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
+pub fn get_default_policies() -> HashMap<String, PolicyDoc> {
     let default_policies = &DEFAULT_POLICIES;
     default_policies
         .iter()
@@ -2152,6 +2208,15 @@ pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
             )
         })
         .collect()
+}
+
+/// Backward-compatible misspelling retained until the next breaking release.
+#[deprecated(
+    since = "1.0.0",
+    note = "use get_default_policies instead; this alias will be removed in the next breaking release"
+)]
+pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
+    get_default_policies()
 }
 
 fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
@@ -2586,6 +2651,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sts_policy_lookup_ignores_colliding_regular_user_mapping() {
+        let iam = build_test_iam_cache(FailingInitialLoadStore);
+        let parent = "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA";
+        let user = UserIdentity::new(Credentials {
+            access_key: parent.to_string(),
+            secret_key: "regular-user-secret".to_string(),
+            status: STATUS_ENABLED.to_string(),
+            ..Default::default()
+        });
+        let now = OffsetDateTime::now_utc();
+        iam.cache.add_or_update_user(parent, &user, now);
+        iam.cache
+            .add_or_update_user_policy(parent, &MappedPolicy::new("regular-policy"), now);
+        iam.cache
+            .add_or_update_sts_policy(parent, &MappedPolicy::new("oidc-policy"), now);
+
+        assert_eq!(
+            iam.policy_db_get(parent, &None).await.expect("regular lookup should succeed"),
+            vec!["regular-policy"]
+        );
+        assert_eq!(
+            iam.sts_policy_db_get(parent, &None).await.expect("STS lookup should succeed"),
+            vec!["oidc-policy"]
+        );
+    }
+
+    #[tokio::test]
     async fn set_temp_user_retries_until_sts_identity_becomes_visible() {
         let store = DelayedTempUserVisibilityStore::new(2);
         let cache = build_test_iam_cache(store.clone());
@@ -2674,6 +2766,7 @@ mod tests {
                             description: Some("new".to_string()),
                             expiration: None,
                             status: None,
+                            parent_user: None,
                             allow_site_replicator_account: false,
                         },
                     )
@@ -2825,7 +2918,7 @@ mod tests {
 
     #[test]
     fn test_get_default_policies() {
-        let policies = get_default_policyes();
+        let policies = get_default_policies();
 
         // Should contain some default policies
         assert!(!policies.is_empty());
@@ -2836,6 +2929,12 @@ mod tests {
             // PolicyDoc.version is i64, not String
             assert!(policy_doc.version >= 0);
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_get_default_policyes_matches_current_api() {
+        assert_eq!(get_default_policyes().len(), get_default_policies().len());
     }
 
     #[test]
@@ -3036,6 +3135,7 @@ mod tests {
             description: Some("Updated service account".to_string()),
             expiration: None,
             session_policy: Some(policy),
+            parent_user: None,
             allow_site_replicator_account: false,
         };
 

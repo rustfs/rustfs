@@ -649,7 +649,7 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn default_timestamps(&mut self) {
+    pub(crate) fn default_timestamps(&mut self) {
         if self.policy_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.policy_config_updated_at = self.created
         }
@@ -737,6 +737,9 @@ impl BucketMetadata {
             }
             BUCKET_TAGGING_CONFIG => {
                 self.tagging_config_xml = data;
+                // Drop the parsed form (like lifecycle above) so clearing the
+                // payload can't leave stale parsed tags to be cached.
+                self.tagging_config = None;
                 self.tagging_config_updated_at = updated;
             }
             BUCKET_QUOTA_CONFIG_FILE => {
@@ -1093,16 +1096,25 @@ pub async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<Buc
 }
 
 pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: bool) -> Result<BucketMetadata> {
-    let mut bm = match read_bucket_metadata(api.clone(), bucket).await {
-        Ok(res) => res,
+    Ok(load_bucket_metadata_parse_with_presence(api, bucket, parse).await?.0)
+}
+
+/// The returned `bool` reports whether the metadata was actually read from
+/// persisted storage; `false` means no metadata exists for this bucket on this
+/// store and the returned value is a fabricated in-memory default.
+pub(crate) async fn load_bucket_metadata_parse_with_presence(
+    api: Arc<ECStore>,
+    bucket: &str,
+    parse: bool,
+) -> Result<(BucketMetadata, bool)> {
+    let (mut bm, persisted) = match read_bucket_metadata(api.clone(), bucket).await {
+        Ok(res) => (res, true),
         Err(err) => {
             if err != Error::ConfigNotFound {
                 return Err(err);
             }
 
-            // info!("bucketmeta {} not found with err {:?}, start to init ", bucket, &err);
-
-            BucketMetadata::new(bucket)
+            (BucketMetadata::new(bucket), false)
         }
     };
 
@@ -1112,7 +1124,7 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
         bm.parse_all_configs()?;
     }
 
-    Ok(bm)
+    Ok((bm, persisted))
 }
 
 async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
@@ -1307,6 +1319,30 @@ mod test {
 
         assert!(bm.lifecycle_config_xml.is_empty());
         assert!(bm.lifecycle_config.is_none());
+    }
+
+    /// Companion to the lifecycle case above. `parse_all_configs` skips empty
+    /// XML rather than clearing, so without the explicit reset a cleared
+    /// tagging config would keep serving the previously parsed tags.
+    #[test]
+    fn tagging_update_config_clears_parsed_config_on_delete() {
+        let mut bm = BucketMetadata::new("test-bucket");
+        let tagging_xml = br#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>"#;
+
+        bm.update_config(BUCKET_TAGGING_CONFIG, tagging_xml.to_vec())
+            .expect("tagging config should update");
+        bm.parse_all_configs().expect("tagging config should parse");
+        assert!(bm.tagging_config.is_some());
+
+        bm.update_config(BUCKET_TAGGING_CONFIG, Vec::new())
+            .expect("tagging config delete should update metadata");
+
+        assert!(bm.tagging_config_xml.is_empty());
+        assert!(bm.tagging_config.is_none());
+
+        // A re-parse must not resurrect them either.
+        bm.parse_all_configs().expect("cleared tagging should parse");
+        assert!(bm.tagging_config.is_none());
     }
 
     #[tokio::test]

@@ -170,6 +170,13 @@ where
         bucket: &str,
         session_context: &crate::common::session::SessionContext,
     ) -> Result<()> {
+        // SECURITY: s3:DeleteBucket does not imply the right to destroy the
+        // bucket contents. Enumerating and deleting each object are separate
+        // authorization boundaries and must be cleared on their own.
+        authorize_operation(session_context, &S3Action::ListBucket, bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -196,6 +203,10 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
+                            authorize_operation(session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                                .await
+                                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
                             let _ = self
                                 .storage
                                 .delete_object(
@@ -368,9 +379,7 @@ where
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        let prefix_with_slash = prefix
-            .clone()
-            .map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
+        let prefix_with_slash = prefix.clone().map(|p| if p.ends_with('/') { p } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
             .bucket(bucket)
@@ -926,6 +935,48 @@ mod tests {
         assert!(
             result.is_err(),
             "MKD must fail closed when authorization denies s3:CreateBucket, even though the backend was primed to succeed"
+        );
+    }
+
+    /// RMD deletes every object in the bucket, so `s3:DeleteBucket` alone must
+    /// not be enough: each object needs its own `s3:DeleteObject` boundary. The
+    /// backend is primed so that the whole recursive delete would succeed if the
+    /// per-object check were removed again.
+    #[tokio::test]
+    async fn ftps_rmd_denied_per_object_does_not_delete_bucket_contents() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::{S3Action, with_test_auth_override};
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_list_objects_v2_ok_with_keys(&["secret.txt"]);
+        backend.queue_delete_object_ok();
+        backend.queue_delete_bucket_ok();
+
+        let driver = FtpsDriver::new(backend.clone());
+        let user = super::super::server::FtpsUser {
+            username: "bucket-only-user".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let result = with_test_auth_override(
+            |action, _bucket, _object| !matches!(action, S3Action::DeleteObject),
+            driver.rmd(&user, "/victim-bucket"),
+        )
+        .await;
+
+        assert!(result.is_err(), "RMD must fail closed when s3:DeleteObject is denied for a bucket member");
+        assert!(
+            backend.delete_object_calls().is_empty(),
+            "no object may be deleted once s3:DeleteObject is denied, got {:?}",
+            backend.delete_object_calls()
+        );
+        assert!(
+            backend.delete_bucket_calls().is_empty(),
+            "the bucket must survive when its contents could not be authorized for deletion"
         );
     }
 

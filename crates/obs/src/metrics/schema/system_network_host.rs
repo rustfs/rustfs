@@ -14,6 +14,7 @@
 
 #![allow(dead_code)]
 
+use crate::node_identity::SERVER_LABEL;
 use crate::{MetricDescriptor, MetricName, new_counter_md, subsystems};
 use std::sync::LazyLock;
 
@@ -25,7 +26,7 @@ pub static HOST_NETWORK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::HostNetworkIO,
         "Network bytes transferred across system network interfaces",
-        &[DIRECTION_LABEL],
+        &[SERVER_LABEL, DIRECTION_LABEL],
         subsystems::SYSTEM_NETWORK_HOST,
     )
 });
@@ -35,7 +36,7 @@ pub static HOST_NETWORK_IO_PER_INTERFACE_MD: LazyLock<MetricDescriptor> = LazyLo
     new_counter_md(
         MetricName::HostNetworkIOPerInterface,
         "Network bytes transferred across system network interfaces (per interface)",
-        &[INTERFACE_LABEL, DIRECTION_LABEL],
+        &[SERVER_LABEL, INTERFACE_LABEL, DIRECTION_LABEL],
         subsystems::SYSTEM_NETWORK_HOST,
     )
 });
@@ -48,12 +49,19 @@ mod tests {
     #[test]
     fn host_network_descriptors_export_counter_labels() {
         assert_eq!(HOST_NETWORK_IO_MD.metric_type, MetricType::Counter);
-        assert_eq!(HOST_NETWORK_IO_MD.variable_labels, vec![DIRECTION_LABEL.to_string()]);
+        assert_eq!(
+            HOST_NETWORK_IO_MD.variable_labels,
+            vec![SERVER_LABEL.to_string(), DIRECTION_LABEL.to_string()]
+        );
 
         assert_eq!(HOST_NETWORK_IO_PER_INTERFACE_MD.metric_type, MetricType::Counter);
         assert_eq!(
             HOST_NETWORK_IO_PER_INTERFACE_MD.variable_labels,
-            vec![INTERFACE_LABEL.to_string(), DIRECTION_LABEL.to_string()]
+            vec![
+                SERVER_LABEL.to_string(),
+                INTERFACE_LABEL.to_string(),
+                DIRECTION_LABEL.to_string()
+            ]
         );
     }
 }

@@ -22,6 +22,7 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::process_resource::*;
+use crate::node_identity::SERVER_LABEL;
 
 /// Resource statistics for metrics collection.
 ///
@@ -30,6 +31,8 @@ use crate::metrics::schema::process_resource::*;
 /// this struct from their available data sources.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceStats {
+    /// Stable local node identity for labeling node-local process resource metrics
+    pub server: String,
     /// CPU usage as a percentage (can exceed 100% on multi-core systems)
     pub cpu_percent: f64,
     /// Resident memory usage in bytes
@@ -43,10 +46,14 @@ pub struct ResourceStats {
 /// Uses the metric descriptors from `metrics_type::process_resource` module.
 /// Returns a vector of Prometheus metrics for resource statistics.
 pub fn collect_resource_metrics(stats: &ResourceStats) -> Vec<PrometheusMetric> {
+    let server_label = stats.server.as_str();
     vec![
-        PrometheusMetric::from_descriptor(&PROCESS_CPU_PERCENT_MD, stats.cpu_percent),
-        PrometheusMetric::from_descriptor(&PROCESS_MEMORY_BYTES_MD, stats.memory_bytes as f64),
-        PrometheusMetric::from_descriptor(&PROCESS_UPTIME_SECONDS_MD, stats.uptime_seconds as f64),
+        PrometheusMetric::from_descriptor(&PROCESS_CPU_PERCENT_MD, stats.cpu_percent)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&PROCESS_MEMORY_BYTES_MD, stats.memory_bytes as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&PROCESS_UPTIME_SECONDS_MD, stats.uptime_seconds as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
     ]
 }
 
@@ -58,6 +65,7 @@ mod tests {
     #[test]
     fn test_collect_resource_metrics() {
         let stats = ResourceStats {
+            server: "node1:9000".to_string(),
             cpu_percent: 45.5,
             memory_bytes: 1024 * 1024 * 256,
             uptime_seconds: 7200,
@@ -67,6 +75,11 @@ mod tests {
         report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 3);
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"))
+        );
 
         // Verify CPU metric
         let cpu_metric_name = PROCESS_CPU_PERCENT_MD.get_full_metric_name();
@@ -97,13 +110,16 @@ mod tests {
 
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
-            assert!(metric.labels.is_empty());
+            assert_eq!(metric.labels.len(), 1);
+            assert_eq!(metric.labels[0].0, SERVER_LABEL);
+            assert!(metric.labels[0].1.is_empty());
         }
     }
 
     #[test]
     fn test_collect_resource_metrics_high_cpu() {
         let stats = ResourceStats {
+            server: "node1:9000".to_string(),
             cpu_percent: 150.0, // Can exceed 100% on multi-core systems
             memory_bytes: 0,
             uptime_seconds: 0,

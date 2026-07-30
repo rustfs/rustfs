@@ -25,6 +25,9 @@ description = "Protocol implementations for RustFS (FTPS, SFTP, etc.)"
 keywords = ["ftp", "sftp", "protocol", "storage", "rustfs"]
 categories = ["network-programming", "filesystem"]
 
+[lints]
+workspace = true
+
 [features]
 default = []
 ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime", "dep:subtle"]
@@ -44,11 +47,13 @@ swift = [
     "dep:tokio-util",
     "dep:serde",
     "dep:urlencoding",
-    "dep:md5",
+    "dep:md-5",
     "dep:quick-xml",
     "dep:hmac",
     "dep:sha1",
     "dep:hex",
+    "dep:ipnetwork",
+    "dep:rustfs-trusted-proxies",
     "dep:astral-tokio-tar",
     "dep:base64",
     "dep:async-compression",
@@ -106,11 +111,13 @@ http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
-md5 = { workspace = true, optional = true }
+md-5 = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+ipnetwork = { workspace = true, optional = true }
+rustfs-trusted-proxies = { workspace = true, optional = true }
 astral-tokio-tar = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
@@ -130,6 +137,7 @@ socket2 = { workspace = true, optional = true, features = ["all"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
+rustfs-test-utils = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 tokio = { workspace = true, features = ["test-util", "macros", "fs"] }
 

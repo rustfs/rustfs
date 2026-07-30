@@ -245,6 +245,21 @@ impl From<StorageError> for ApiError {
             };
         }
 
+        if let StorageError::Io(ref io_err) = err
+            && matches!(
+                io_err
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<rustfs_kms::KmsError>()),
+                Some(rustfs_kms::KmsError::BackendError { .. })
+            )
+        {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                source: Some(Box::new(err)),
+            };
+        }
+
         let code = match &err {
             StorageError::NotImplemented => S3ErrorCode::NotImplemented,
             StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
@@ -358,6 +373,7 @@ impl From<QuotaError> for ApiError {
         let code = match &err {
             QuotaError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             QuotaError::ConfigNotFound { .. } => S3ErrorCode::NoSuchBucket,
+            QuotaError::UsageUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             QuotaError::InvalidConfig { .. } => S3ErrorCode::InvalidArgument,
             QuotaError::StorageError(_) => S3ErrorCode::InternalError,
         };
@@ -479,11 +495,70 @@ mod tests {
     }
 
     #[test]
+    fn policy_metadata_read_failure_maps_to_internal_error() {
+        let api_error = ApiError::from(StorageError::Io(IoError::other("policy read failed")));
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert!(api_error.source.is_some());
+    }
+
+    #[test]
     fn test_kms_service_unavailable_maps_to_retryable_error() {
         let api_error = ApiError::from(StorageError::other(KmsUnavailableError));
 
         assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
+    fn test_kms_backend_unavailable_maps_to_retryable_error() {
+        let api_error = ApiError::from(StorageError::other(rustfs_kms::KmsError::backend_error("Vault connection refused")));
+
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
+    fn test_unknown_authoritative_quota_usage_maps_to_retryable_error() {
+        let api_error = ApiError::from(QuotaError::UsageUnavailable {
+            bucket: "bucket".to_string(),
+        });
+
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
+    fn test_kms_cryptographic_error_is_not_retryable() {
+        let api_error = ApiError::from(StorageError::other(rustfs_kms::KmsError::cryptographic_error(
+            "decrypt",
+            "authentication failed",
+        )));
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn test_kms_material_faults_map_to_internal_error_not_retryable_or_not_found() {
+        // Missing/corrupt key material is a persistent integrity fault of an existing key.
+        // It must not be disguised as a retryable backend outage (503 invites pointless
+        // retries) nor as NoSuchKey/404 (which suggests the key can be recreated —
+        // recreating it would orphan every DEK wrapped by the original material).
+        let material_faults = [
+            rustfs_kms::KmsError::material_missing("key-a"),
+            rustfs_kms::KmsError::material_corrupt("key-a", "truncated record"),
+            rustfs_kms::KmsError::material_authentication_failed("key-a"),
+            rustfs_kms::KmsError::unsupported_format_version("key-a", "v99"),
+        ];
+
+        for fault in material_faults {
+            let description = fault.to_string();
+            let api_error = ApiError::from(StorageError::other(fault));
+
+            assert_eq!(api_error.code, S3ErrorCode::InternalError, "wrong code for: {description}");
+            assert_ne!(api_error.code, S3ErrorCode::ServiceUnavailable, "must not be retryable: {description}");
+            assert_ne!(api_error.code, S3ErrorCode::NoSuchKey, "must not report key-not-found: {description}");
+        }
     }
 
     #[test]

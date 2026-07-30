@@ -482,7 +482,7 @@ impl HealChannelProcessor {
                     request_id: client_token,
                     success: false,
                     data: None,
-                    error: Some(error_text.clone()),
+                    error: Some(error_text),
                 };
                 let _ = response_tx.send(Ok(response.clone()));
                 self.publish_response(response);

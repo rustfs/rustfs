@@ -16,6 +16,7 @@
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
+use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -36,7 +37,9 @@ use crate::{
     runtime::instance::{InstanceContext, bootstrap_ctx},
     runtime::sources as runtime_sources,
     set_disk::{PreparedGetObjectMetadata, SetDisks},
-    store::init_format::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
+    store::init_format::{
+        check_format_erasure_values, load_format_erasure_all, save_format_file, select_format_erasure_in_quorum,
+    },
 };
 use futures::{
     future::join_all,
@@ -49,7 +52,10 @@ use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
@@ -62,6 +68,8 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -799,9 +807,52 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
         delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        self.get_disks_by_key(prefix)
-            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
-            .await
+        let per_set_limit = max_uploads.saturating_add(1);
+        let results = futures::stream::iter(self.disk_set.iter().cloned())
+            .map(|set| {
+                let key_marker = key_marker.clone();
+                let upload_id_marker = upload_id_marker.clone();
+                let delimiter = delimiter.clone();
+                async move {
+                    set.list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, per_set_limit)
+                        .await
+                }
+            })
+            .buffer_unordered(LIST_MULTIPART_SETS_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut uploads = Vec::new();
+        let mut common_prefixes = HashSet::new();
+        let mut source_truncated = false;
+        for result in results {
+            let page = result?;
+            uploads.extend(page.uploads);
+            common_prefixes.extend(page.common_prefixes);
+            source_truncated |= page.is_truncated;
+        }
+
+        let page = paginate_multipart_listing(
+            uploads,
+            common_prefixes.into_iter().collect(),
+            key_marker.as_deref(),
+            key_marker.as_ref().and(upload_id_marker.as_deref()),
+            max_uploads,
+            source_truncated,
+        );
+
+        Ok(ListMultipartsInfo {
+            key_marker,
+            upload_id_marker,
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
+            max_uploads,
+            is_truncated: page.is_truncated,
+            uploads: page.uploads,
+            common_prefixes: page.common_prefixes,
+            prefix: prefix.to_owned(),
+            delimiter,
+        })
     }
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
@@ -898,7 +949,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        let (disks, _) = init_storage_disks_with_errors(
+        let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
             &DiskOption {
                 cleanup: false,
@@ -906,15 +957,36 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             },
         )
         .await;
-        let (formats, errs) = load_format_erasure_all(&disks, true).await;
+        let (formats, mut errs) = load_format_erasure_all(&disks, true).await;
+        for (err, init_err) in errs.iter_mut().zip(init_errs) {
+            if init_err.is_some() {
+                *err = init_err;
+            }
+        }
+        if errs.iter().any(|err| {
+            matches!(
+                err,
+                Some(DiskError::InconsistentDisk | DiskError::CorruptedFormat | DiskError::CorruptedBackend)
+            )
+        }) {
+            return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat)));
+        }
         if let Err(err) = check_format_erasure_values(&formats, self.set_drive_count) {
             info!("failed to check formats erasure values: {}", err);
             return Ok((HealResultItem::default(), Some(err)));
         }
-        let ref_format = match get_format_erasure_in_quorum(&formats) {
-            Ok(format) => format,
+        let (ref_format, quorum_members) = match select_format_erasure_in_quorum(&formats, 0) {
+            Ok((format, members)) if format.shared_identity() == self.format.shared_identity() => (format, members),
+            Ok(_) => return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat))),
             Err(err) => return Ok((HealResultItem::default(), Some(err))),
         };
+        if formats
+            .iter()
+            .zip(quorum_members)
+            .any(|(format, member)| format.is_some() && !member)
+        {
+            return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat)));
+        }
         let mut res = HealResultItem {
             heal_item_type: HealItemType::Metadata.to_string(),
             detail: "disk-format".to_string(),
@@ -935,11 +1007,6 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             info!("disk formats success, NoHealRequired, errs: {:?}", errs);
             return Ok((res, Some(StorageError::NoHealRequired)));
         }
-
-        // if !self.format.eq(&ref_format) {
-        //     info!("format ({:?}) not eq ref_format ({:?})", self.format, ref_format);
-        //     return Ok((res, Some(Error::new(DiskError::CorruptedFormat))));
-        // }
 
         let (new_format_sets, _) = new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
         if !dry_run {
@@ -1111,6 +1178,7 @@ mod tests {
     use crate::layout::endpoints::SetupType;
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::list::ListOperations as _;
+    use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use rustfs_lock::client::local::LocalClient;
     use serial_test::serial;
 
@@ -1248,6 +1316,297 @@ mod tests {
         assert_eq!(result, (Some(3), Some(1), Some(0)));
     }
 
+    async fn two_set_test_sets() -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+        let format = FormatV3::new(2, 2);
+        let mut temp_dirs = Vec::new();
+        let mut all_endpoints = Vec::new();
+        let mut disk_sets = Vec::new();
+
+        for set_index in 0..2 {
+            let mut endpoints = Vec::new();
+            let mut disks = Vec::new();
+            for disk_index in 0..2 {
+                let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+                let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
+                    .expect("endpoint should parse");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(set_index);
+                endpoint.set_disk_index(disk_index);
+                let disk = new_disk(
+                    &endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("disk should be created");
+                let mut disk_format = format.clone();
+                disk_format.erasure.this = format.erasure.sets[set_index][disk_index];
+                save_format_file(&Some(disk.clone()), &Some(disk_format))
+                    .await
+                    .expect("format should be saved");
+                temp_dirs.push(temp_dir);
+                all_endpoints.push(endpoint.clone());
+                endpoints.push(endpoint);
+                disks.push(Some(disk));
+            }
+            disk_sets.push(
+                SetDisks::new(
+                    "test-owner".to_string(),
+                    Arc::new(RwLock::new(disks)),
+                    2,
+                    1,
+                    set_index,
+                    0,
+                    endpoints,
+                    format.clone(),
+                    vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
+                )
+                .await,
+            );
+        }
+
+        let sets = Arc::new(Sets {
+            id: format.id,
+            disk_set: disk_sets,
+            pool_idx: 0,
+            endpoints: PoolEndpoints {
+                legacy: false,
+                set_count: 2,
+                drives_per_set: 2,
+                endpoints: Endpoints::from(all_endpoints),
+                cmd_line: String::new(),
+                platform: String::new(),
+            },
+            format,
+            parity_count: 1,
+            set_count: 2,
+            set_drive_count: 2,
+            default_parity_count: 1,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+            ctx: bootstrap_ctx(),
+        });
+        (temp_dirs, sets)
+    }
+
+    #[tokio::test]
+    async fn set_format_heal_accepts_quorum_from_a_nonzero_set() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+
+        let (result, err) = sets.disk_set[1]
+            .heal_format(false)
+            .await
+            .expect("the second erasure set should load its own format quorum");
+
+        assert!(matches!(err, Some(StorageError::NoHealRequired)), "unexpected heal result: {err:?}");
+        assert_eq!(result.disk_count, 2);
+        assert_eq!(result.set_count, 1);
+    }
+
+    #[tokio::test]
+    async fn format_heal_rejects_foreign_majorities_at_set_and_pool_scopes() {
+        let (_temp_dirs, _canonical_format, sets) = setup_heal_format_sets(2, true).await;
+        let set_disks = set_level_heal_view(&sets).await;
+
+        let (_, set_err) = set_disks
+            .heal_format(false)
+            .await
+            .expect("set format heal should report a typed mismatch");
+        assert!(
+            matches!(set_err, Some(StorageError::CorruptedFormat)),
+            "foreign set majority must not replace the cached format: {set_err:?}"
+        );
+
+        let (_, pool_err) = sets
+            .heal_format(false)
+            .await
+            .expect("pool format heal should report a typed mismatch");
+        assert!(
+            matches!(pool_err, Some(StorageError::CorruptedFormat)),
+            "foreign pool majority must not replace the cached format: {pool_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_format_heal_rejects_a_wrong_slot_minority() {
+        let (_temp_dirs, canonical_format, sets) = setup_heal_format_sets(3, false).await;
+        let mut poisoned_format = canonical_format.clone();
+        poisoned_format.erasure.this = canonical_format.erasure.sets[0][0];
+        replace_heal_test_format(&sets, 2, &poisoned_format).await;
+        let probe_err = new_disk(
+            &sets.endpoints.endpoints.as_ref()[2],
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect_err("a wrong-slot local format must fail disk initialization");
+        assert_eq!(probe_err, DiskError::InconsistentDisk);
+
+        let (_, pool_err) = sets
+            .heal_format(false)
+            .await
+            .expect("pool format heal should report a typed slot mismatch");
+        assert!(
+            matches!(pool_err, Some(StorageError::CorruptedFormat)),
+            "a wrong-slot minority must not be reported as no-heal-required: {pool_err:?}"
+        );
+        assert_eq!(
+            read_heal_test_format(&sets, 2).await,
+            poisoned_format,
+            "format heal must not overwrite a wrong-slot disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_heal_rejects_a_foreign_minority_at_set_and_pool_scopes() {
+        let (_temp_dirs, canonical_format, sets) = setup_heal_format_sets(3, false).await;
+        let mut poisoned_format = canonical_format.clone();
+        poisoned_format.id = Uuid::new_v4();
+        poisoned_format.erasure.this = poisoned_format.erasure.sets[0][2];
+        replace_heal_test_format(&sets, 2, &poisoned_format).await;
+        let set_disks = set_level_heal_view(&sets).await;
+
+        let (_, set_err) = set_disks
+            .heal_format(false)
+            .await
+            .expect("set format heal should report a typed identity mismatch");
+        assert!(
+            matches!(set_err, Some(StorageError::CorruptedFormat)),
+            "a foreign minority must not be reported as no-heal-required: {set_err:?}"
+        );
+
+        let (_, pool_err) = sets
+            .heal_format(false)
+            .await
+            .expect("pool format heal should report a typed identity mismatch");
+        assert!(
+            matches!(pool_err, Some(StorageError::CorruptedFormat)),
+            "a foreign minority must not be reported as no-heal-required: {pool_err:?}"
+        );
+        assert_eq!(
+            read_heal_test_format(&sets, 2).await,
+            poisoned_format,
+            "format heal must not overwrite a foreign disk"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn list_multipart_uploads_merges_all_sets_without_pagination_loss() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let bucket = format!("multipart-list-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut keys_by_set = [Vec::new(), Vec::new()];
+        for index in 0..100 {
+            let key = format!("logs/{index:03}.bin");
+            let set_index = sets.get_hashed_set_index(&key);
+            if keys_by_set[set_index].len() < 2 {
+                keys_by_set[set_index].push(key);
+            }
+            if keys_by_set.iter().all(|keys| keys.len() == 2) {
+                break;
+            }
+        }
+        assert!(keys_by_set.iter().all(|keys| keys.len() == 2), "test keys must span both sets");
+
+        let repeated_key = keys_by_set[0][0].clone();
+        let mut expected = Vec::new();
+        for key in keys_by_set.iter().flatten() {
+            let upload = sets
+                .new_multipart_upload(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            expected.push((key.clone(), upload.upload_id));
+        }
+        let second = sets
+            .new_multipart_upload(&bucket, &repeated_key, &ObjectOptions::default())
+            .await
+            .expect("second upload for the same key should be created");
+        expected.push((repeated_key, second.upload_id));
+        expected.sort();
+
+        let mut actual = Vec::new();
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        for _ in 0..expected.len() + 1 {
+            let page = sets
+                .list_multipart_uploads(&bucket, "logs/", key_marker.clone(), upload_id_marker.clone(), None, 2)
+                .await
+                .expect("multipart page should list across every set");
+            assert!(page.uploads.len() <= 2);
+            actual.extend(
+                page.uploads
+                    .iter()
+                    .map(|upload| (upload.object.clone(), upload.upload_id.clone())),
+            );
+            if !page.is_truncated {
+                break;
+            }
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
+        }
+
+        assert_eq!(actual, expected, "set-level merge must return every upload exactly once");
+        let mut deduped = actual.clone();
+        deduped.dedup();
+        assert_eq!(deduped.len(), actual.len(), "set-level pagination must not duplicate uploads");
+
+        let mut nested_by_set = [None, None];
+        for index in 0..100 {
+            let key = format!("nested/group-{index:03}/file.bin");
+            let set_index = sets.get_hashed_set_index(&key);
+            nested_by_set[set_index].get_or_insert(key);
+            if nested_by_set.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        for key in nested_by_set.iter().flatten() {
+            sets.new_multipart_upload(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("nested multipart upload should be created");
+        }
+        let mut expected_prefixes = nested_by_set
+            .iter()
+            .flatten()
+            .map(|key| {
+                key.rsplit_once('/')
+                    .expect("nested key should contain a delimiter")
+                    .0
+                    .to_string()
+                    + "/"
+            })
+            .collect::<Vec<_>>();
+        expected_prefixes.sort();
+
+        let first = sets
+            .list_multipart_uploads(&bucket, "nested/", None, None, Some("/".to_string()), 1)
+            .await
+            .expect("first delimiter page should list across every set");
+        assert!(first.is_truncated);
+        assert_eq!(first.common_prefixes, expected_prefixes[..1]);
+        let second = sets
+            .list_multipart_uploads(
+                &bucket,
+                "nested/",
+                first.next_key_marker,
+                first.next_upload_id_marker,
+                Some("/".to_string()),
+                1,
+            )
+            .await
+            .expect("second delimiter page should list across every set");
+        assert!(!second.is_truncated);
+        assert_eq!(second.common_prefixes, expected_prefixes[1..]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn sets_list_objects_v2_lists_objects_within_the_pool() {
@@ -1378,11 +1737,15 @@ mod tests {
     // formatting the first `num_formatted` of them against a shared reference
     // format and leaving the rest unformatted. Returns the live TempDir handles
     // (must be kept alive), the reference format, and the assembled `Sets`.
-    // `disk_set` is intentionally empty: these tests only drive `heal_format`
-    // with `dry_run == true`, which never touches `disk_set`.
-    async fn setup_heal_format_sets(num_formatted: usize) -> (Vec<tempfile::TempDir>, FormatV3, Sets) {
+    // `disk_set` is intentionally empty: these tests only exercise paths that
+    // return before pool-level healing delegates into a set.
+    async fn setup_heal_format_sets(num_formatted: usize, foreign_identity: bool) -> (Vec<tempfile::TempDir>, FormatV3, Sets) {
         const SET_DRIVE_COUNT: usize = 3;
         let ref_format = FormatV3::new(1, SET_DRIVE_COUNT);
+        let mut stored_format = ref_format.clone();
+        if foreign_identity {
+            stored_format.id = Uuid::new_v4();
+        }
 
         let mut dirs = Vec::with_capacity(SET_DRIVE_COUNT);
         let mut endpoints = Vec::with_capacity(SET_DRIVE_COUNT);
@@ -1407,8 +1770,8 @@ mod tests {
             )
             .await
             .expect("disk should be created");
-            let mut disk_format = ref_format.clone();
-            disk_format.erasure.this = ref_format.erasure.sets[0][i];
+            let mut disk_format = stored_format.clone();
+            disk_format.erasure.this = stored_format.erasure.sets[0][i];
             save_format_file(&Some(disk), &Some(disk_format))
                 .await
                 .expect("format should be saved");
@@ -1439,6 +1802,60 @@ mod tests {
         (dirs, ref_format, sets)
     }
 
+    async fn set_level_heal_view(sets: &Sets) -> Arc<SetDisks> {
+        let endpoints = sets.endpoints.endpoints.as_ref().clone();
+        let mut disks = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
+            disks.push(Some(
+                new_disk(
+                    endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("fresh set-level disk handle should open"),
+            ));
+        }
+
+        SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            endpoints.len(),
+            1,
+            0,
+            0,
+            endpoints,
+            sets.format.clone(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn replace_heal_test_format(sets: &Sets, disk_index: usize, format: &FormatV3) {
+        let disk = new_disk(
+            &sets.endpoints.endpoints.as_ref()[disk_index],
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("heal test disk should open");
+        save_format_file(&Some(disk.clone()), &Some(format.clone()))
+            .await
+            .expect("poisoned test format should be written");
+    }
+
+    async fn read_heal_test_format(sets: &Sets, disk_index: usize) -> FormatV3 {
+        let path = std::path::Path::new(&sets.endpoints.endpoints.as_ref()[disk_index].get_file_path())
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(crate::disk::FORMAT_CONFIG_FILE);
+        let data = tokio::fs::read(path).await.expect("test format should be readable");
+        FormatV3::try_from(data.as_slice()).expect("test format should parse")
+    }
+
     // Regression for #956 (NoHealRequired path): with every disk already
     // formatted, `heal_format` reports exactly one drive record per disk
     // (N = set_count * set_drive_count), each carrying a real endpoint. Before
@@ -1447,7 +1864,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn heal_format_no_heal_required_reports_one_record_per_disk() {
-        let (_dirs, _ref_format, sets) = setup_heal_format_sets(3).await;
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(3, false).await;
 
         let (res, err) = sets.heal_format(true).await.expect("heal_format should succeed");
         // All disks formatted -> NoHealRequired early return, still returns `res`.
@@ -1477,7 +1894,7 @@ mod tests {
     #[serial]
     async fn heal_format_heal_path_reports_one_record_per_disk_aligned() {
         // Disks 0 and 1 formatted (quorum), disk 2 unformatted.
-        let (_dirs, _ref_format, sets) = setup_heal_format_sets(2).await;
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(2, false).await;
 
         let (res, err) = sets.heal_format(true).await.expect("heal_format should succeed");
         // Unformatted disk present -> heal path, not NoHealRequired.

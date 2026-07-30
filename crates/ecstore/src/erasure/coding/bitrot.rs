@@ -443,7 +443,9 @@ pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorith
     size.div_ceil(shard_size) * algo.size() + size
 }
 
-/// Verify an interleaved per-block bitrot shard file.
+/// Verify an interleaved per-block bitrot shard file and consume the reader
+/// through EOF. Bytes beyond the encoded length are corruption, even when every
+/// expected block has a valid hash.
 ///
 /// The read loop below assumes every block on disk is `[hash][data]` (streaming
 /// bitrot). It is therefore only valid for the streaming Highway variants, whose
@@ -485,6 +487,11 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
         }
 
         left -= read;
+    }
+
+    let mut trailing = [0u8; 1];
+    if r.read(&mut trailing).await? != 0 {
+        return Err(std::io::Error::other("bitrot shard file has trailing data"));
     }
 
     Ok(())
@@ -860,12 +867,19 @@ mod tests {
             .await
             .expect("valid bitrot shard file should verify");
 
+        let mut truncated = written.clone();
+        truncated.pop();
+        let err = bitrot_verify(Cursor::new(truncated), written.len(), data.len(), algo.clone(), shard_size)
+            .await
+            .expect_err("one-byte-short shard file must be rejected while reading");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
         let err = bitrot_verify(Cursor::new(written.clone()), written.len() - 1, data.len(), algo.clone(), shard_size)
             .await
             .expect_err("wrong file size must be rejected before reading data");
         assert!(err.to_string().contains("size mismatch"));
 
-        let mut corrupt = written;
+        let mut corrupt = written.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x80;
         let err = bitrot_verify(
@@ -878,6 +892,21 @@ mod tests {
         .await
         .expect_err("hash mismatch must reject corrupted data");
         assert!(err.to_string().contains("hash mismatch"));
+
+        for trailing in [vec![0xa5], vec![0xa5; 17]] {
+            let mut oversized = written.clone();
+            oversized.extend_from_slice(&trailing);
+            let err = bitrot_verify(
+                Cursor::new(oversized),
+                written.len(),
+                data.len(),
+                HashAlgorithm::HighwayHash256S,
+                shard_size,
+            )
+            .await
+            .expect_err("trailing bytes after a valid encoded shard must be rejected");
+            assert!(err.to_string().contains("trailing data"));
+        }
     }
 
     #[tokio::test]
@@ -907,6 +936,22 @@ mod tests {
         .await
         .expect_err("final block hash mismatch must be rejected");
         assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[tokio::test]
+    async fn bitrot_verify_accepts_exact_legacy_streaming_layout() {
+        let data = b"legacy streaming bitrot";
+        let shard_size = 8;
+        let algo = HashAlgorithm::HighwayHash256SLegacy;
+        let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, algo.clone());
+        for chunk in data.chunks(shard_size) {
+            writer.write(chunk).await.expect("legacy streaming shard should encode");
+        }
+        let written = writer.into_inner().into_inner();
+
+        bitrot_verify(Cursor::new(written.clone()), written.len(), data.len(), algo, shard_size)
+            .await
+            .expect("exact legacy streaming shard should remain valid");
     }
 
     #[tokio::test]

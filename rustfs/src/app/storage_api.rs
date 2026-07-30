@@ -409,20 +409,24 @@ pub(crate) mod bucket {
                 versioned: bool,
                 suspended: bool,
                 transitioned: &super::super::super::storage_contracts::TransitionedObject,
+                transition_version_state: rustfs_filemeta::TransitionVersionState,
             ) -> Option<Jentry> {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
                     version_id,
                     versioned,
                     suspended,
                     transitioned,
+                    transition_version_state,
                 )
             }
 
             pub(crate) fn transitioned_force_delete_journal_entry(
                 transitioned: &super::super::super::storage_contracts::TransitionedObject,
+                transition_version_state: rustfs_filemeta::TransitionVersionState,
             ) -> Option<Jentry> {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
                     transitioned,
+                    transition_version_state,
                 )
             }
         }
@@ -849,7 +853,9 @@ pub(crate) mod head_prefix {
 }
 
 pub(crate) mod helper {
-    pub(crate) use crate::storage::storage_api::helper_consumer::{OperationHelper, spawn_background_with_context};
+    pub(crate) use crate::storage::storage_api::helper_consumer::{
+        OperationHelper, build_event_resp_elements, spawn_background_with_context,
+    };
 }
 
 pub(crate) mod object_utils {
@@ -865,11 +871,13 @@ pub(crate) mod io {
 }
 
 pub(crate) mod options {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::options_consumer::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use crate::storage::storage_api::options_consumer::{
-        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime,
-        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
-        parse_copy_source_range, put_opts, validate_archive_content_encoding,
+        bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
+        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
+        get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
+        normalize_content_encoding_for_storage, parse_copy_source_range, put_opts, validate_archive_content_encoding,
     };
 }
 
@@ -929,6 +937,10 @@ pub(crate) mod s3_api {
 
 pub(crate) mod admin_usecase {
     pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
+        }
+
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 
@@ -993,8 +1005,8 @@ pub(crate) mod object_usecase {
     pub(crate) use crate::storage::storage_api::{
         ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
-        get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
-        parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
+        has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
+        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists,
         validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write,
         validate_ssec_for_read, wrap_response_with_cors,
     };
@@ -1074,6 +1086,8 @@ pub(crate) mod test {
         }
     }
 
+    pub(crate) use super::access::ReqInfo;
+    pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use super::{bucket, data_usage, ecfs, object_utils, runtime};
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,

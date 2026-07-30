@@ -32,12 +32,25 @@ pub const ENV_KMS_STATIC_SECRET_KEY_FILE: &str = "RUSTFS_KMS_STATIC_SECRET_KEY_F
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 
+/// Upper bound applied to `KmsConfig::timeout` when deriving backend behavior.
+///
+/// Out-of-range values are clamped at use rather than rejected so existing
+/// deployments with oversized settings keep starting after an upgrade.
+pub(crate) const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Upper bound applied to `KmsConfig::retry_attempts` when deriving backend behavior.
+pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 10;
+
 fn default_vault_transit_metadata_kv_mount() -> String {
     DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string()
 }
 
 fn default_vault_transit_metadata_key_prefix() -> String {
     DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string()
+}
+
+fn default_vault_kv2_mount_path() -> String {
+    "transit".to_string()
 }
 
 pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
@@ -91,7 +104,9 @@ pub(crate) fn redacted_secret_option(value: Option<&str>) -> Option<&'static str
 /// KMS backend types
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KmsBackend {
-    /// Vault KV v2 + Transit backend (key metadata in KV, wrapping via Transit)
+    /// Vault KV v2 storage backend: master key material is stored directly in KV v2.
+    /// Confidentiality relies on Vault ACLs, KV v2 at-rest encryption, and TLS; the
+    /// backend performs no Transit wrapping of key material.
     #[serde(rename = "VaultKV2", alias = "Vault")]
     VaultKv2,
     /// Vault Transit backend using Vault as the cryptographic source of truth
@@ -117,9 +132,15 @@ pub struct KmsConfig {
     /// Allow development-only insecure defaults such as plaintext local keys or HTTP Vault.
     #[serde(default)]
     pub allow_insecure_dev_defaults: bool,
-    /// Operation timeout
+    /// Timeout for a single backend attempt.
+    ///
+    /// This bounds one outbound request, not the whole operation: the operation
+    /// policy owns the total deadline across retries. Values above 300 seconds
+    /// are clamped at use (see `KmsConfig::effective_timeout`).
     pub timeout: Duration,
-    /// Number of retry attempts
+    /// Number of retry attempts.
+    ///
+    /// Values above 10 are clamped at use (see `KmsConfig::effective_retry_attempts`).
     pub retry_attempts: u32,
     /// Enable caching
     pub enable_cache: bool,
@@ -147,7 +168,7 @@ impl Default for KmsConfig {
 pub enum BackendConfig {
     /// Local backend configuration
     Local(LocalConfig),
-    /// Vault KV v2 + Transit backend configuration
+    /// Vault KV v2 storage backend configuration
     #[serde(rename = "VaultKV2", alias = "Vault")]
     VaultKv2(Box<VaultConfig>),
     /// Vault Transit backend configuration
@@ -214,7 +235,16 @@ pub struct StaticConfig {
     /// Key identifier (name) for the single configured key
     pub key_id: String,
     /// Base64-encoded 32-byte AES-256 key material (zeroed on drop)
+    #[serde(skip_serializing, default)]
     pub secret_key: String,
+}
+
+impl Drop for StaticConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        self.secret_key.zeroize();
+    }
 }
 
 impl fmt::Debug for StaticConfig {
@@ -246,7 +276,11 @@ impl StaticConfig {
     }
 }
 
-/// Vault KV v2 + Transit backend configuration (metadata in KV, key wrapping via Transit)
+/// Vault KV v2 backend configuration.
+///
+/// Key material and metadata are stored directly in KV v2; any identity with KV read
+/// access to the key path can recover plaintext master key material. Use the Vault
+/// Transit backend when cryptographic isolation of key material is required.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
     /// Vault server URL
@@ -255,7 +289,10 @@ pub struct VaultConfig {
     pub auth_method: VaultAuthMethod,
     /// Vault namespace (Vault Enterprise)
     pub namespace: Option<String>,
-    /// Transit engine mount path
+    /// Deprecated: legacy Transit engine mount path. The Vault KV2 backend never calls
+    /// the Transit engine, so this value is unused; the field is retained (and
+    /// defaulted) only so previously persisted configurations keep deserializing.
+    #[serde(default = "default_vault_kv2_mount_path")]
     pub mount_path: String,
     /// KV engine mount path for storing keys
     pub kv_mount: String,
@@ -415,7 +452,12 @@ impl KmsConfig {
         }
     }
 
-    /// Create a new KMS configuration for Vault backend with token authentication (recommended for production)
+    /// Create a new KMS configuration for the Vault KV v2 backend with token authentication.
+    ///
+    /// Master key material is stored directly in Vault KV v2: confidentiality relies on
+    /// Vault ACLs, KV v2 at-rest encryption, and TLS. KV read access to the key path is
+    /// equivalent to holding the plaintext master keys. Use [`KmsConfig::vault_transit`]
+    /// when key material must never be readable through Vault storage APIs.
     pub fn vault(address: Url, token: String) -> Self {
         Self {
             backend: KmsBackend::VaultKv2,
@@ -428,7 +470,10 @@ impl KmsConfig {
         }
     }
 
-    /// Create a new KMS configuration for Vault backend with AppRole authentication (recommended for production)
+    /// Create a new KMS configuration for the Vault KV v2 backend with AppRole authentication.
+    ///
+    /// Shares the security boundary described on [`KmsConfig::vault`]: key material lives
+    /// in KV v2 and is protected only by Vault ACLs and KV v2 at-rest encryption.
     pub fn vault_approle(address: Url, role_id: String, secret_id: String) -> Self {
         Self {
             backend: KmsBackend::VaultKv2,
@@ -527,6 +572,16 @@ impl KmsConfig {
         self
     }
 
+    /// Per-attempt timeout with the configured value clamped to the supported maximum.
+    pub(crate) fn effective_timeout(&self) -> Duration {
+        self.timeout.min(MAX_OPERATION_TIMEOUT)
+    }
+
+    /// Retry attempts with the configured value clamped to the supported maximum.
+    pub(crate) fn effective_retry_attempts(&self) -> u32 {
+        self.retry_attempts.min(MAX_RETRY_ATTEMPTS)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         // Validate timeout
@@ -537,6 +592,23 @@ impl KmsConfig {
         // Validate retry attempts
         if self.retry_attempts == 0 {
             return Err(KmsError::configuration_error("Retry attempts must be greater than 0"));
+        }
+
+        // Oversized values are clamped at use (not rejected) so pre-existing
+        // configurations cannot keep the service from starting after upgrade.
+        if self.timeout > MAX_OPERATION_TIMEOUT {
+            tracing::warn!(
+                configured_secs = self.timeout.as_secs(),
+                max_secs = MAX_OPERATION_TIMEOUT.as_secs(),
+                "KMS timeout exceeds the supported maximum; backend operations clamp it to the maximum"
+            );
+        }
+        if self.retry_attempts > MAX_RETRY_ATTEMPTS {
+            tracing::warn!(
+                configured = self.retry_attempts,
+                max = MAX_RETRY_ATTEMPTS,
+                "KMS retry_attempts exceeds the supported maximum; backend operations clamp it to the maximum"
+            );
         }
 
         // Validate backend-specific configuration
@@ -569,9 +641,8 @@ impl KmsConfig {
                     validate_vault_development_defaults("Vault KV2", &config.address, &config.auth_method, config.tls.as_ref())?;
                 }
 
-                if config.mount_path.is_empty() {
-                    return Err(KmsError::configuration_error("Vault KV2 mount path cannot be empty"));
-                }
+                // `mount_path` is deprecated and unused by this backend, so an empty value
+                // is deliberately not an error.
 
                 // Validate TLS configuration if using HTTPS
                 if config.address.starts_with("https://")
@@ -696,11 +767,21 @@ impl KmsConfig {
                 let token = get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token");
                 let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
 
+                let mount_path = match get_env_opt_str("RUSTFS_KMS_VAULT_MOUNT_PATH") {
+                    Some(path) => {
+                        tracing::warn!(
+                            "RUSTFS_KMS_VAULT_MOUNT_PATH is deprecated for the Vault KV2 backend: it never calls the Transit engine and the value is stored but unused"
+                        );
+                        path
+                    }
+                    None => default_vault_kv2_mount_path(),
+                };
+
                 config.backend_config = BackendConfig::VaultKv2(Box::new(VaultConfig {
                     address,
                     auth_method: VaultAuthMethod::Token { token },
                     namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
-                    mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
+                    mount_path,
                     kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
                     key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
                     tls: vault_tls_config(skip_tls_verify),
@@ -847,6 +928,31 @@ mod tests {
     }
 
     #[test]
+    fn test_oversized_timeout_and_retries_clamped_not_rejected() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig {
+            timeout: Duration::from_secs(3_600),
+            retry_attempts: 50,
+            ..KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults()
+        };
+
+        // Out-of-range values must not keep the service from starting.
+        assert!(config.validate().is_ok());
+        assert_eq!(config.effective_timeout(), MAX_OPERATION_TIMEOUT);
+        assert_eq!(config.effective_retry_attempts(), MAX_RETRY_ATTEMPTS);
+
+        // In-range values pass through unchanged.
+        let config = KmsConfig {
+            timeout: Duration::from_secs(45),
+            retry_attempts: 5,
+            ..config
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.effective_timeout(), Duration::from_secs(45));
+        assert_eq!(config.effective_retry_attempts(), 5);
+    }
+
+    #[test]
     fn test_local_development_defaults_require_opt_in() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = KmsConfig::local(temp_dir.path().to_path_buf());
@@ -969,6 +1075,73 @@ mod tests {
     }
 
     #[test]
+    fn test_persisted_vault_kv2_config_without_mount_path_deserializes() {
+        // Configurations persisted after mount_path was deprecated may omit the field;
+        // it must default instead of failing deserialization.
+        let raw = r#"{
+            "backend": "VaultKV2",
+            "backend_config": {
+                "VaultKV2": {
+                    "address": "http://127.0.0.1:8200",
+                    "auth_method": { "Token": { "token": "t" } },
+                    "namespace": null,
+                    "kv_mount": "secret",
+                    "key_path_prefix": "rustfs/kms/keys",
+                    "tls": null
+                }
+            },
+            "default_key_id": null,
+            "timeout": {"secs": 30, "nanos": 0},
+            "retry_attempts": 3,
+            "enable_cache": true,
+            "cache_config": {
+                "max_keys": 1000,
+                "ttl": {"secs": 3600, "nanos": 0},
+                "enable_metrics": true
+            }
+        }"#;
+        let config: KmsConfig = serde_json::from_str(raw).expect("persisted kms config without mount_path");
+        assert_eq!(config.backend, KmsBackend::VaultKv2);
+        let vault = config.vault_config().expect("vault-kv2 config");
+        assert_eq!(vault.mount_path, "transit");
+    }
+
+    #[test]
+    fn test_vault_kv2_empty_mount_path_passes_validation() {
+        let address = Url::parse("https://vault.example.com:8200").expect("Valid URL");
+        let mut config = KmsConfig::vault(address, "test-token".to_string());
+        if let BackendConfig::VaultKv2(vault) = &mut config.backend_config {
+            vault.mount_path = String::new();
+        }
+        assert!(config.validate().is_ok(), "deprecated mount_path must not be required");
+    }
+
+    #[test]
+    fn test_vault_kv2_sources_do_not_claim_transit_wrapping() {
+        let sources = [
+            ("config.rs", include_str!("config.rs")),
+            ("api_types.rs", include_str!("api_types.rs")),
+            ("backends/vault.rs", include_str!("backends/vault.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+        ];
+        // Assemble the needles at runtime so this guard does not match its own source.
+        let needles = [
+            format!("wrapping via {}", "Transit"),
+            format!("KV v2 + {}", "Transit"),
+            format!("KV2+{}", "Transit"),
+            format!("you would use Vault's {} engine", "transit"),
+        ];
+        for (name, source) in sources {
+            for needle in &needles {
+                assert!(
+                    !source.contains(needle.as_str()),
+                    "{name} still describes the Vault KV2 backend with `{needle}`"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_legacy_persisted_vault_transit_config_uses_metadata_defaults() {
         let raw = r#"{
             "backend": "VaultTransit",
@@ -1052,6 +1225,21 @@ mod tests {
         let serialized = serde_json::to_string(&config).expect("kms config should serialize for persistence");
 
         assert!(serialized.contains("persisted-token-secret"));
+    }
+
+    #[test]
+    fn static_kms_config_serialization_does_not_expose_key_material() {
+        use base64::Engine as _;
+
+        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let config = KmsConfig::static_kms("static-key".to_string(), encoded_key.clone());
+
+        let serialized = serde_json::to_string(&config).expect("static KMS config should serialize");
+
+        assert!(
+            !serialized.contains(&encoded_key),
+            "persisted static KMS configuration must not contain plaintext key material"
+        );
     }
 
     #[test]

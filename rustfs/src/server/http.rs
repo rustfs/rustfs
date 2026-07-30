@@ -23,21 +23,22 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
-        HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer,
-        RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer,
-        redact_sensitive_uri_query,
+        ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
+        PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
+        StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     tls_material::{
-        TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
+        TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
+        load_tls_material, spawn_reload_loop,
     },
 };
 use crate::storage_api::server::http as storage;
-use crate::storage_api::server::http::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::{
-    ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+    ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
+    tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
 };
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response, Uri};
@@ -152,13 +153,17 @@ impl<S> RpcRequestPathService<S> {
     }
 }
 
-impl<S, B> Service<HttpRequest<B>> for RpcRequestPathService<S>
+impl<S, B, ResBody> Service<HttpRequest<B>> for RpcRequestPathService<S>
 where
-    S: Service<HttpRequest<B>>,
+    S: Service<HttpRequest<B>, Response = Response<ResBody>>,
+    S::Error: Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+    ResBody: Send + 'static,
 {
-    type Response = S::Response;
+    type Response = Response<ResBody>;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -170,7 +175,22 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
-        self.inner.call(req)
+        let response_headers = tonic_boot_epoch_challenge(req.headers())
+            .ok()
+            .flatten()
+            .and_then(|challenge| {
+                storage::try_current_local_node_name()
+                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
+                    .and_then(|audience| tonic_boot_epoch_response_headers(&audience, challenge).ok())
+            });
+        let future = self.inner.call(req);
+        Box::pin(async move {
+            let mut response = future.await?;
+            if let Some(headers) = response_headers {
+                response.headers_mut().extend(headers);
+            }
+            Ok(response)
+        })
     }
 }
 
@@ -230,6 +250,18 @@ fn log_tls_handshake_failure(peer_addr: &str, kind: TlsHandshakeFailureKind, err
                 failure_type = kind.as_str(),
                 error = %err,
                 result = "client_error",
+                "TLS handshake failed"
+            );
+        }
+        TlsHandshakeFailureKind::Timeout => {
+            warn!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "client_timeout",
                 "TLS handshake failed"
             );
         }
@@ -1049,6 +1081,7 @@ pub async fn start_http_server(
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
                 rate_limit_layer: api_rate_limit_layer.clone(),
                 server_ctx: Arc::clone(&server_ctx),
+                tls_handshake_timeout: Duration::from_secs(http1_header_read_timeout),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher(), connection_permit);
@@ -1109,53 +1142,16 @@ struct ConnectionContext {
     /// All clones share one limiter, keeping budgets global across connections.
     rate_limit_layer: Option<RateLimitLayer>,
     server_ctx: Arc<ServerContextSlot>,
+    /// Deadline for the TLS handshake of this connection. Reuses the HTTP/1 header-read budget,
+    /// the existing slow-client bound for the pre-request phase, and is pre-computed with the
+    /// other transport parameters to avoid a per-connection env read.
+    tls_handshake_timeout: Duration,
 }
 
 #[derive(Clone)]
 struct PathDispatchService<A, B> {
     external: A,
     internode: B,
-}
-
-#[derive(Clone, Default)]
-struct InternodeRequestContextLiteLayer;
-
-impl<S> tower::Layer<S> for InternodeRequestContextLiteLayer {
-    type Service = InternodeRequestContextLiteService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        InternodeRequestContextLiteService { inner }
-    }
-}
-
-#[derive(Clone)]
-struct InternodeRequestContextLiteService<S> {
-    inner: S,
-}
-
-impl<S, B> Service<HttpRequest<B>> for InternodeRequestContextLiteService<S>
-where
-    S: Service<HttpRequest<B>> + Clone,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
-        let request_id = extract_request_id_from_headers(req.headers());
-        req.extensions_mut().insert(RequestContext {
-            x_amz_request_id: request_id.clone(),
-            request_id,
-            trace_id: None,
-            span_id: None,
-            start_time: std::time::Instant::now(),
-        });
-        self.inner.call(req)
-    }
 }
 
 impl<A, B> PathDispatchService<A, B> {
@@ -1299,6 +1295,7 @@ fn process_connection(
             trusted_proxy_layer,
             rate_limit_layer,
             server_ctx,
+            tls_handshake_timeout,
         } = context;
 
         // Build the hybrid service per-connection.
@@ -1369,8 +1366,8 @@ fn process_connection(
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
-        //  4. SetRequestIdLayer                       — generates X-Request-ID
-        //  5. RequestContextLayer                    — creates RequestContext in extensions
+        //  4. ExternalRequestContextLayer            — S3 canonical ID / control-plane propagated ID
+        //  5. StsQueryApiCompatLayer                 — route-scoped STS envelopes, including outer short-circuit errors
         //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
         //  7. CatchPanicLayer                        — panic → 500
         //  8. RateLimitLayer                         — conditional (external stack only), per-client 429 throttling
@@ -1378,24 +1375,19 @@ fn process_connection(
         // 10. KeystoneAuthLayer                      — X-Auth-Token validation
         // 11. TraceLayer                             — request span creation + metrics
         // 12. RequestLoggingLayer                    — single completion event per request
-        // 13. PropagateRequestIdLayer                — X-Request-ID → response
-        // 14. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 15. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 16. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 17. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        // 18. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 19. ConditionalCorsLayer                   — S3 API CORS
-        // 20. RedirectLayer                          — console redirect (conditional)
-        // 21. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 22. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 23. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 24. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 25. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 18. ConditionalCorsLayer                   — S3 API CORS
+        // 19. RedirectLayer                          — console redirect (conditional)
+        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
+        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
         // ─────────────────────────────────────────────────────────────
-        // Batch 1 intentionally keeps the external and internode stacks behaviorally
-        // identical while giving each path family a named construction boundary.
-        // Later batches will trim internode-only middleware without risking drift in
-        // the public HTTP stack.
         let build_external_stack = |service| {
             ServiceBuilder::new()
                 // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -1410,8 +1402,8 @@ fn process_connection(
                 // This should be placed before TraceLayer so that logs reflect the real client IP
                 // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
                 .option_layer(trusted_proxy_layer.clone())
-                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-                .layer(InternodeRequestContextLiteLayer)
+                .layer(ExternalRequestContextLayer::new(is_console))
+                .layer(StsQueryApiCompatLayer)
                 .layer(EmptyBodyContentLengthCompatLayer)
                 .layer(CatchPanicLayer::new())
                 // Per-client API rate limit (backlog#1191): rejects over-limit
@@ -1563,7 +1555,6 @@ fn process_connection(
                         }),
                 )
                 .layer(RequestLoggingLayer)
-                .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
                 .layer(PathCategoryInjectionLayer)
                 .layer(S3ErrorMessageCompatLayer)
@@ -1752,7 +1743,7 @@ fn process_connection(
                 .ok()
                 .map_or_else(|| "unknown".to_string(), |addr| addr.to_string());
             let acceptor = holder.get();
-            match acceptor.accept(socket).await {
+            match accept_tls_with_deadline(&acceptor, socket, tls_handshake_timeout).await {
                 Ok(tls_socket) => {
                     trace!("TLS handshake successful");
                     let stream = TokioIo::new(tls_socket);
@@ -1761,7 +1752,15 @@ fn process_connection(
                         handle_connection_error(Some(peer_addr.as_str()), &*err);
                     }
                 }
-                Err(err) => {
+                Err(TlsAcceptFailure::Timeout) => {
+                    let kind = TlsHandshakeFailureKind::Timeout;
+                    let err = format!("TLS handshake did not complete within {}s", tls_handshake_timeout.as_secs());
+                    log_tls_handshake_failure(&peer_addr, kind, &err);
+                    counter!("rustfs_tls_handshake_failures", &[("failure_type", kind.as_str())]).increment(1);
+
+                    return;
+                }
+                Err(TlsAcceptFailure::Handshake(err)) => {
                     let err_str = err.to_string();
                     let kind = TlsHandshakeFailureKind::classify(&err_str);
                     log_tls_handshake_failure(&peer_addr, kind, &err);
@@ -1883,7 +1882,15 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .filter(|method| !method.is_empty() && !method.contains('/'))
         .ok_or_else(|| Status::unauthenticated("Invalid RPC request path"))?;
     debug_assert!(!rpc_method.is_empty());
-    verify_tonic_rpc_signature(&audience, target.uri.path(), req.metadata().as_ref()).map_err(|e| {
+    let allow_replay_scope_bootstrap = target.uri.path() == "/node_service.NodeService/Ping"
+        && tonic_boot_epoch_challenge(req.metadata().as_ref()).is_ok_and(|challenge| challenge.is_some());
+    verify_tonic_rpc_signature_with_bootstrap(
+        &audience,
+        target.uri.path(),
+        req.metadata().as_ref(),
+        allow_replay_scope_bootstrap,
+    )
+    .map_err(|e| {
         error!(
             event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
             component = LOG_COMPONENT_SERVER,

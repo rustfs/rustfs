@@ -76,7 +76,7 @@ impl ContextProviderExtension for MetadataProvider {
 
         let table_handle = self.build_table_handle()?;
 
-        Ok(Arc::new(TableSourceAdapter::try_new(table_ref.clone(), table_name, table_handle)?))
+        Ok(Arc::new(TableSourceAdapter::try_new(table_ref, table_name, table_handle)?))
     }
 }
 

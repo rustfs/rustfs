@@ -33,6 +33,7 @@ use crate::metrics::{
     obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_replication_site_stats_snapshot,
     obs_resolve_object_store_handle,
 };
+use crate::node_identity::current_local_node_identity;
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
@@ -41,7 +42,11 @@ use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource_and_system,
     snapshot_process_resource_and_system_with,
 };
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::SystemTime,
+};
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
@@ -52,8 +57,10 @@ const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
 type ObsBackendInfo = <ObsStore as StorageAdminApi>::BackendInfo;
 
+#[derive(Default)]
 struct ObsDataUsageInfo {
     last_update: Option<SystemTime>,
+    usage_snapshot_complete: bool,
     buckets_count: u64,
     objects_total_count: u64,
     versions_total_count: u64,
@@ -62,6 +69,7 @@ struct ObsDataUsageInfo {
     buckets_usage: HashMap<String, ObsBucketUsageInfo>,
 }
 
+#[derive(Default)]
 struct ObsBucketUsageInfo {
     size: u64,
     objects_count: u64,
@@ -85,9 +93,11 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreResult<ObsDataUsageInfo> {
     let data_usage = obs_load_data_usage_from_backend(store).await?;
+    let usage_snapshot_complete = data_usage.is_complete_bucket_usage_snapshot();
 
     Ok(ObsDataUsageInfo {
         last_update: data_usage.last_update,
+        usage_snapshot_complete,
         buckets_count: data_usage.buckets_count,
         objects_total_count: data_usage.objects_total_count,
         versions_total_count: data_usage.versions_total_count,
@@ -111,6 +121,21 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreRes
             })
             .collect(),
     })
+}
+
+fn bucket_usage_metric_values(data_usage: Option<&ObsDataUsageInfo>, bucket: &str) -> (Option<u64>, Option<u64>) {
+    data_usage
+        .filter(|usage| usage.usage_snapshot_complete)
+        .and_then(|usage| usage.buckets_usage.get(bucket))
+        .map(|usage| (Some(usage.size), Some(usage.objects_count)))
+        .unwrap_or((None, None))
+}
+
+fn data_usage_snapshot_covers_bucket_namespace(data_usage: &ObsDataUsageInfo, buckets: &HashSet<String>) -> bool {
+    data_usage.usage_snapshot_complete
+        && u64::try_from(buckets.len()).ok() == Some(data_usage.buckets_count)
+        && buckets.len() == data_usage.buckets_usage.len()
+        && buckets.iter().all(|bucket| data_usage.buckets_usage.contains_key(bucket))
 }
 
 fn resolve_obs_object_store_handle() -> Option<Arc<ObsStore>> {
@@ -238,11 +263,11 @@ async fn obs_site_replication_stats() -> ReplicationStats {
 }
 
 fn current_scanner_cycle_age_seconds(
-    current_cycle: u64,
+    current_cycle_active: bool,
     current_started: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
 ) -> u64 {
-    if current_cycle == 0 {
+    if !current_cycle_active {
         0
     } else {
         now.signed_duration_since(current_started).num_seconds().max(0) as u64
@@ -365,25 +390,16 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         })
         .count() as u64;
 
-    // Get bucket and object counts from data usage info.
-    let (buckets_count, objects_count) = match load_obs_data_usage_from_backend(store.clone()).await {
-        Ok(data_usage) => (data_usage.buckets_count, data_usage.objects_total_count),
-        Err(e) => {
-            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
-            // Fall back to bucket list for buckets_count, objects_count stays 0.
-            let buckets = store
-                .list_bucket(&BucketOptions {
-                    cached: true,
-                    ..Default::default()
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "bucket_list_failed", error = %err, "metrics collector state changed");
-                    Vec::new()
-                });
-            (buckets.len() as u64, 0)
+    let data_usage = match load_obs_data_usage_from_backend(store).await {
+        Ok(data_usage) if data_usage.usage_snapshot_complete => Some(data_usage),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %error, "metrics collector state changed");
+            None
         }
     };
+    let buckets_count = data_usage.as_ref().map(|usage| usage.buckets_count);
+    let objects_count = data_usage.as_ref().map(|usage| usage.objects_total_count);
 
     let mut online = 0u64;
     let mut offline = 0u64;
@@ -428,10 +444,12 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
 }
 
 /// Collect bucket statistics from the storage layer.
-pub async fn collect_bucket_stats() -> Vec<BucketStats> {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return Vec::new();
-    };
+///
+/// `None` means the bucket namespace could not be observed. Callers must keep
+/// their prior metric-series state instead of treating that failure as an
+/// authoritative empty namespace.
+pub async fn collect_bucket_stats() -> Option<Vec<BucketStats>> {
+    let store = resolve_obs_object_store_handle()?;
 
     // Load data usage info from backend to get bucket sizes and object counts
     let data_usage = match load_obs_data_usage_from_backend(store.clone()).await {
@@ -453,7 +471,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
         Ok(buckets) => buckets,
         Err(e) => {
             warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "bucket_list_failed", error = %e, "metrics collector state changed");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -465,11 +483,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
         }
 
         // Get size and objects_count from data usage info
-        let (size_bytes, objects_count) = data_usage
-            .as_ref()
-            .and_then(|du| du.buckets_usage.get(&bucket.name))
-            .map(|bui| (bui.size, bui.objects_count))
-            .unwrap_or((0, 0));
+        let (size_bytes, objects_count) = bucket_usage_metric_values(data_usage.as_ref(), &bucket.name);
 
         // Get quota from bucket metadata
         let quota_bytes = obs_bucket_quota_limit_bytes(&bucket.name).await;
@@ -482,7 +496,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
         });
     }
 
-    stats
+    Some(stats)
 }
 
 /// Collect bucket replication bandwidth stats from the global monitor.
@@ -526,12 +540,13 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
     disk_stats
 }
 
-fn build_system_cpu_stats(system: &System) -> CpuStats {
+fn build_system_cpu_stats(system: &System, server: &str) -> CpuStats {
     let cpu_usage = system.global_cpu_usage() as f64;
     let cpu_count = system.cpus().len().max(1) as f64;
     let load_avg = System::load_average().one;
 
     CpuStats {
+        server: server.to_string(),
         avg_idle: (100.0 - cpu_usage).max(0.0),
         load_avg,
         load_avg_perc: (load_avg / cpu_count) * 100.0,
@@ -539,11 +554,12 @@ fn build_system_cpu_stats(system: &System) -> CpuStats {
     }
 }
 
-fn build_system_memory_stats(system: &System) -> MemoryStats {
+fn build_system_memory_stats(system: &System, server: &str) -> MemoryStats {
     let total = system.total_memory();
     let used = system.used_memory();
 
     MemoryStats {
+        server: server.to_string(),
         total,
         used,
         used_perc: if total > 0 {
@@ -569,7 +585,8 @@ pub fn collect_system_cpu_and_memory_stats() -> (CpuStats, MemoryStats) {
 pub fn collect_system_cpu_and_memory_stats_with(system: &mut System) -> (CpuStats, MemoryStats) {
     system.refresh_cpu_all();
     system.refresh_memory();
-    (build_system_cpu_stats(system), build_system_memory_stats(system))
+    let server = current_local_node_identity();
+    (build_system_cpu_stats(system, &server), build_system_memory_stats(system, &server))
 }
 
 /// Collect system CPU statistics from the current host.
@@ -679,6 +696,7 @@ fn process_metric_bundle_from_snapshots(
     resource_snapshot: ProcessResourceSnapshot,
     process_snapshot: ProcessSystemSnapshot,
 ) -> ProcessMetricBundle {
+    let server = current_local_node_identity();
     let status = match process_snapshot.status {
         ProcessStatusSnapshot::Running => ProcessStatusType::Running,
         ProcessStatusSnapshot::Sleeping => ProcessStatusType::Sleeping,
@@ -687,11 +705,13 @@ fn process_metric_bundle_from_snapshots(
     };
 
     let resource_stats = ResourceStats {
+        server: server.clone(),
         cpu_percent: resource_snapshot.cpu_percent,
         memory_bytes: resource_snapshot.memory_bytes,
         uptime_seconds: resource_snapshot.uptime_seconds,
     };
     let process_stats = ProcessStats {
+        server,
         locks_read_total: process_snapshot.locks_read_total,
         locks_write_total: process_snapshot.locks_write_total,
         cpu_total_seconds: process_snapshot.cpu_total_seconds,
@@ -757,6 +777,7 @@ pub fn collect_host_network_stats_with(networks: &Networks) -> HostNetworkStats 
     }
 
     HostNetworkStats {
+        server: current_local_node_identity(),
         total_received,
         total_transmitted,
         per_interface,
@@ -781,6 +802,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
     let snapshot = global_internode_metrics().snapshot();
 
     Some(NetworkStats {
+        server: current_local_node_identity(),
         internode_errors_total: snapshot.errors_total,
         internode_dial_errors_total: snapshot.dial_errors_total,
         internode_dial_avg_time_nanos: snapshot.dial_avg_time_nanos,
@@ -935,6 +957,29 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
     let store = resolve_obs_object_store_handle()?;
     let data_usage = load_obs_data_usage_from_backend(store.clone()).await.ok()?;
+    let bucket_namespace = store
+        .list_bucket(&BucketOptions {
+            cached: true,
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|bucket| !bucket.name.starts_with('.'))
+        .map(|bucket| bucket.name)
+        .collect::<HashSet<_>>();
+    collect_cluster_usage_metric_stats_from_data_usage(data_usage, &bucket_namespace).await
+}
+
+async fn collect_cluster_usage_metric_stats_from_data_usage(
+    data_usage: ObsDataUsageInfo,
+    bucket_namespace: &HashSet<String>,
+) -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
+    if !data_usage_snapshot_covers_bucket_namespace(&data_usage, bucket_namespace) {
+        return None;
+    }
+
     let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
 
     for (bucket_name, usage) in &data_usage.buckets_usage {
@@ -1054,7 +1099,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
     let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
     let active_paths = metrics.active_scan_paths as u64;
-    let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle, metrics.current_started, now);
+    let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle_active, metrics.current_started, now);
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
     let current_cycle_age = current_cycle_age_seconds as f64;
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
@@ -1188,6 +1233,65 @@ mod tests {
     }
 
     #[test]
+    fn bucket_usage_metrics_distinguish_unknown_from_confirmed_zero() {
+        assert_eq!(bucket_usage_metric_values(None, "bucket"), (None, None));
+
+        let mut data_usage = ObsDataUsageInfo {
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        data_usage
+            .buckets_usage
+            .insert("bucket".to_string(), ObsBucketUsageInfo::default());
+
+        assert_eq!(bucket_usage_metric_values(Some(&data_usage), "bucket"), (Some(0), Some(0)));
+        assert_eq!(bucket_usage_metric_values(Some(&data_usage), "missing"), (None, None));
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_skip_incomplete_snapshot() {
+        assert!(
+            collect_cluster_usage_metric_stats_from_data_usage(ObsDataUsageInfo::default(), &HashSet::new())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_publish_complete_empty_snapshot() {
+        let (cluster, buckets) = collect_cluster_usage_metric_stats_from_data_usage(
+            ObsDataUsageInfo {
+                usage_snapshot_complete: true,
+                ..Default::default()
+            },
+            &HashSet::new(),
+        )
+        .await
+        .expect("complete empty usage should remain publishable");
+
+        assert_eq!(cluster.buckets_count, 0);
+        assert_eq!(cluster.objects_count, 0);
+        assert_eq!(cluster.total_bytes, 0);
+        assert!(buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_skip_snapshot_for_a_different_bucket_namespace() {
+        let data_usage = ObsDataUsageInfo {
+            usage_snapshot_complete: true,
+            buckets_count: 1,
+            buckets_usage: HashMap::from([("stale-bucket".to_string(), ObsBucketUsageInfo::default())]),
+            ..Default::default()
+        };
+
+        assert!(
+            collect_cluster_usage_metric_stats_from_data_usage(data_usage, &HashSet::from(["live-bucket".to_string()]))
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
     fn cluster_config_stats_accept_homogeneous_backend_parities() {
         let stats = cluster_config_stats_from_backend_parities(Some(1), Some(2))
             .expect("homogeneous scalar parities should produce cluster config metrics");
@@ -1210,6 +1314,27 @@ mod tests {
 
         assert!(cluster_config_stats_from_backend_parities(Some(overflow), Some(2)).is_none());
         assert!(cluster_config_stats_from_backend_parities(Some(1), Some(overflow)).is_none());
+    }
+
+    #[tokio::test]
+    async fn node_local_resource_stats_use_stable_local_node_identity() {
+        let _guard = crate::node_identity::local_node_identity_test_guard().await;
+        let previous = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("node1:9000").await;
+
+        let mut system = System::new_all();
+        let (cpu, memory) = collect_system_cpu_and_memory_stats_with(&mut system);
+        let host_network = collect_host_network_stats_with(&Networks::new());
+        let process_bundle =
+            process_metric_bundle_from_snapshots(ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default());
+
+        assert_eq!(cpu.server, "node1:9000");
+        assert_eq!(memory.server, "node1:9000");
+        assert_eq!(host_network.server, "node1:9000");
+        assert_eq!(process_bundle.resource.server, "node1:9000");
+        assert_eq!(process_bundle.process.server, "node1:9000");
+
+        rustfs_common::set_global_local_node_name(&previous).await;
     }
 
     #[test]
@@ -1369,21 +1494,21 @@ mod tests {
     fn current_scanner_cycle_age_seconds_returns_zero_when_idle() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(0, now - chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(false, now - chrono::Duration::seconds(30), now), 0);
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_clamps_future_start() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(4, now + chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now + chrono::Duration::seconds(30), now), 0);
     }
 
     #[test]
-    fn current_scanner_cycle_age_seconds_reports_active_elapsed_time() {
+    fn current_scanner_cycle_age_seconds_reports_active_first_cycle_elapsed_time() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(4, now - chrono::Duration::seconds(45), now), 45);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now - chrono::Duration::seconds(45), now), 45);
     }
 
     #[test]

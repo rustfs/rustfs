@@ -17,7 +17,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskError, StoragePeerS3ClientExt as _, load_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
+    DiskError, StoragePeerS3ClientExt as _, reload_bucket_metadata, remove_bucket_metadata,
 };
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_protos::proto_gen::node_service::*;
@@ -73,14 +73,8 @@ impl NodeService {
             }));
         };
 
-        match load_bucket_metadata(store, &bucket).await {
-            Ok(meta) => {
-                if let Err(err) = set_bucket_metadata(bucket.clone(), meta).await {
-                    return Ok(Response::new(LoadBucketMetadataResponse {
-                        success: false,
-                        error_info: Some(err.to_string()),
-                    }));
-                };
+        match reload_bucket_metadata(store, &bucket).await {
+            Ok(()) => {
                 if scanner_maintenance_change {
                     rustfs_scanner::record_scanner_maintenance_change(&bucket);
                 }

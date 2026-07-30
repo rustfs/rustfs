@@ -13,110 +13,13 @@
 // limitations under the License.
 
 use super::*;
-#[cfg(feature = "rio-v2")]
-use aes_gcm::aead::Payload;
-use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
-};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-#[cfg(feature = "rio-v2")]
-use chacha20poly1305::ChaCha20Poly1305;
-#[cfg(feature = "rio-v2")]
-use hmac::{Hmac, Mac};
-use md5::{Digest, Md5};
-use rustfs_kms::{KmsUnavailableError, is_data_key_envelope, types::ObjectEncryptionContext};
-use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-use rustfs_utils::path::path_join_buf;
-#[cfg(feature = "rio-v2")]
-use serde::Deserialize;
-#[cfg(feature = "rio-v2")]
-use sha2::Sha256;
-use std::collections::HashMap;
-use std::env;
 
 use crate::io_support::rio::Index;
 
-const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
-const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
-const INTERNAL_ENCRYPTION_CONTEXT_HEADER: &str = "x-rustfs-encryption-context";
-const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
-const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
-const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
-const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 #[cfg(feature = "rio-v2")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
 #[cfg(feature = "rio-v2")]
 const DARE_PACKAGE_SIZE: i64 = DARE_PAYLOAD_SIZE + 32;
-const MINIO_INTERNAL_ENCRYPTION_IV_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Iv";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Kms-Sealed-Key";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
-#[cfg(feature = "rio-v2")]
-const DARE_VERSION_20: u8 = 0x20;
-#[cfg(feature = "rio-v2")]
-const DARE_CIPHER_AES_256_GCM: u8 = 0x00;
-#[cfg(feature = "rio-v2")]
-const DARE_CIPHER_CHACHA20_POLY1305: u8 = 0x01;
-#[cfg(feature = "rio-v2")]
-const DARE_HEADER_SIZE: usize = 16;
-#[cfg(feature = "rio-v2")]
-const DARE_TAG_SIZE: usize = 16;
-#[cfg(feature = "rio-v2")]
-const SEALED_KEY_IV_SIZE: usize = 32;
-#[cfg(feature = "rio-v2")]
-const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
-#[cfg(feature = "rio-v2")]
-const MINIO_SECRET_KEY_RANDOM_SIZE: usize = 28;
-#[cfg(feature = "rio-v2")]
-const MINIO_SECRET_KEY_IV_SIZE: usize = 16;
-#[cfg(feature = "rio-v2")]
-const MINIO_SECRET_KEY_NONCE_SIZE: usize = 12;
-
-#[cfg(feature = "rio-v2")]
-type HmacSha256 = Hmac<Sha256>;
-
-fn canonical_kms_bucket_path(bucket: &str, object: &str) -> String {
-    path_join_buf(&[bucket, object])
-}
-
-fn build_object_encryption_context(
-    bucket: &str,
-    object: &str,
-    provided_context: Option<&HashMap<String, String>>,
-) -> ObjectEncryptionContext {
-    let mut context = provided_context.cloned().unwrap_or_default();
-    context
-        .entry(bucket.to_string())
-        .or_insert_with(|| canonical_kms_bucket_path(bucket, object));
-
-    let mut object_context = ObjectEncryptionContext::new(bucket.to_string(), object.to_string());
-    for (ctx_key, ctx_value) in context {
-        object_context = object_context.with_encryption_context(ctx_key, ctx_value);
-    }
-    object_context
-}
-
-#[cfg(feature = "rio-v2")]
-fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool {
-    metadata_get(metadata, INTERNAL_ENCRYPTION_KEY_HEADER).is_some()
-        && metadata_get(metadata, INTERNAL_ENCRYPTION_IV_HEADER).is_some()
-        && metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER).is_none()
-        && metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER).is_none()
-}
 
 fn part_plaintext_size(part: &ObjectPartInfo) -> i64 {
     if part.actual_size > 0 {
@@ -544,21 +447,6 @@ impl GetObjectReader {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct EncryptionMaterial {
-    key_bytes: [u8; 32],
-    base_nonce: [u8; 12],
-    key_kind: EncryptionKeyKind,
-    reader_backend: crate::io_support::rio::ReadEncryptionBackend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncryptionKeyKind {
-    Direct,
-    Object,
-}
-
-#[derive(Debug, Clone)]
 enum ReadTransform {
     Plain {
         visible_offset: usize,
@@ -572,7 +460,7 @@ enum ReadTransform {
         total_plaintext_size: usize,
     },
     Encrypted {
-        material: EncryptionMaterial,
+        material: ReadEncryptionMaterial,
         is_multipart: bool,
         part_numbers: Vec<usize>,
         sequence_number: u32,
@@ -584,7 +472,6 @@ enum ReadTransform {
     },
 }
 
-#[derive(Debug, Clone)]
 struct ReadPlan {
     storage_offset: usize,
     storage_length: i64,
@@ -593,7 +480,18 @@ struct ReadPlan {
 }
 
 impl ReadPlan {
+    #[cfg(test)]
     async fn build(rs: Option<HTTPRangeSpec>, oi: &ObjectInfo, opts: &ObjectOptions, h: &HeaderMap<HeaderValue>) -> Result<Self> {
+        Self::build_with_resolver(rs, oi, opts, h, Some(&tests::TEST_RESOLVER)).await
+    }
+
+    async fn build_with_resolver(
+        rs: Option<HTTPRangeSpec>,
+        oi: &ObjectInfo,
+        opts: &ObjectOptions,
+        h: &HeaderMap<HeaderValue>,
+        resolver: Option<&dyn ObjectEncryptionResolver>,
+    ) -> Result<Self> {
         let mut rs = rs;
         if let Some(part_number) = opts.part_number
             && rs.is_none()
@@ -657,9 +555,20 @@ impl ReadPlan {
         }
 
         if is_encrypted {
-            let material = resolve_encryption_material(oi, h).await?;
+            let resolver = resolver.ok_or_else(|| Error::other("object encryption resolver is unavailable"))?;
+            let resolved = resolver
+                .resolve_read_material(ReadEncryptionRequest {
+                    bucket: &oi.bucket,
+                    object: &oi.name,
+                    metadata: &oi.user_defined,
+                    headers: h,
+                })
+                .await
+                .map_err(Error::other)?
+                .ok_or_else(|| Error::other("encrypted object metadata is incomplete"))?;
+            let material = resolved;
             #[cfg(feature = "rio-v2")]
-            let encryption_backend = material.reader_backend;
+            let uses_legacy_encryption = matches!(material.mode, ReadEncryptionMode::Direct { .. });
             let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref());
             let recorded_plaintext_size = oi.encryption_original_size()?;
             let plaintext_size = encrypted_plaintext_size(oi, is_multipart, is_compressed, recorded_plaintext_size)?;
@@ -678,7 +587,7 @@ impl ReadPlan {
                 let (requested_offset, requested_length) = rs.get_offset_length(plaintext_size)?;
                 #[cfg(feature = "rio-v2")]
                 {
-                    if encryption_backend == crate::io_support::rio::ReadEncryptionBackend::Legacy {
+                    if uses_legacy_encryption {
                         legacy_encrypted_range_plan(
                             oi,
                             is_multipart,
@@ -869,32 +778,32 @@ impl ReadPlan {
                 #[cfg(not(feature = "rio-v2"))]
                 let _ = sequence_number;
                 let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
-                    match material.key_kind {
-                        EncryptionKeyKind::Object => crate::io_support::rio::decrypt_multipart_reader_with_object_key(
+                    match material.mode {
+                        ReadEncryptionMode::Object => crate::io_support::rio::decrypt_multipart_reader_with_object_key(
                             reader,
                             material.key_bytes,
                             part_numbers,
                             sequence_number,
                         ),
-                        EncryptionKeyKind::Direct => crate::io_support::rio::decrypt_multipart_reader(
+                        ReadEncryptionMode::Direct { base_nonce } => crate::io_support::rio::decrypt_multipart_reader(
                             reader,
                             material.key_bytes,
-                            material.base_nonce,
+                            base_nonce,
                             part_numbers,
-                            material.reader_backend,
+                            crate::io_support::rio::ReadEncryptionBackend::Legacy,
                             sequence_number,
                         ),
                     }
                 } else {
-                    match material.key_kind {
-                        EncryptionKeyKind::Object => {
+                    match material.mode {
+                        ReadEncryptionMode::Object => {
                             crate::io_support::rio::decrypt_reader_with_object_key(reader, material.key_bytes, sequence_number)
                         }
-                        EncryptionKeyKind::Direct => crate::io_support::rio::decrypt_reader(
+                        ReadEncryptionMode::Direct { base_nonce } => crate::io_support::rio::decrypt_reader(
                             reader,
                             material.key_bytes,
-                            material.base_nonce,
-                            material.reader_backend,
+                            base_nonce,
+                            crate::io_support::rio::ReadEncryptionBackend::Legacy,
                             sequence_number,
                         ),
                     }
@@ -962,14 +871,28 @@ impl ReadPlan {
 }
 
 impl GetObjectReader {
-    pub async fn new(
+    #[cfg(test)]
+    pub(crate) async fn new(
         reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
         rs: Option<HTTPRangeSpec>,
         oi: &ObjectInfo,
         opts: &ObjectOptions,
         h: &HeaderMap<HeaderValue>,
     ) -> Result<(Self, usize, i64)> {
-        ReadPlan::build(rs, oi, opts, h).await?.into_reader(reader, oi)
+        Self::new_with_resolver(reader, rs, oi, opts, h, Some(&tests::TEST_RESOLVER)).await
+    }
+
+    pub async fn new_with_resolver(
+        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        rs: Option<HTTPRangeSpec>,
+        oi: &ObjectInfo,
+        opts: &ObjectOptions,
+        h: &HeaderMap<HeaderValue>,
+        resolver: Option<&dyn ObjectEncryptionResolver>,
+    ) -> Result<(Self, usize, i64)> {
+        ReadPlan::build_with_resolver(rs, oi, opts, h, resolver)
+            .await?
+            .into_reader(reader, oi)
     }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
@@ -1327,581 +1250,101 @@ fn multipart_part_numbers(parts: &[ObjectPartInfo]) -> Vec<usize> {
     parts.iter().map(|part| part.number).collect()
 }
 
-fn metadata_get<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
-    metadata.get(key).map(String::as_str).or_else(|| {
-        metadata
-            .iter()
-            .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value.as_str()))
-    })
-}
-
-#[cfg(feature = "rio-v2")]
-fn is_supported_sealed_object_key_cipher(cipher: u8) -> bool {
-    matches!(cipher, DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305)
-}
-
-#[cfg(feature = "rio-v2")]
-fn decrypt_sealed_object_key_payload(sealing_key: [u8; 32], header: &[u8], sealed_key: &[u8]) -> Result<Vec<u8>> {
-    let nonce = &header[4..16];
-    let ciphertext = &sealed_key[DARE_HEADER_SIZE..];
-    let aad = &header[..4];
-    match header[1] {
-        DARE_CIPHER_AES_256_GCM => {
-            let cipher = Aes256Gcm::new_from_slice(&sealing_key)
-                .map_err(|err| Error::other(format!("invalid AES-GCM sealing key: {err}")))?;
-            let nonce = Nonce::try_from(nonce).map_err(|_| Error::other("invalid sealed object-key package nonce"))?;
-            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
-        }
-        DARE_CIPHER_CHACHA20_POLY1305 => {
-            let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key)
-                .map_err(|err| Error::other(format!("invalid ChaCha20-Poly1305 sealing key: {err}")))?;
-            let nonce =
-                chacha20poly1305::Nonce::try_from(nonce).map_err(|_| Error::other("invalid sealed object-key package nonce"))?;
-            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
-        }
-        _ => return Err(Error::other("unsupported sealed object-key DARE header")),
-    }
-    .map_err(|err| Error::other(format!("failed to unseal object key: {err}")))
-}
-
-async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
-    if metadata_get(&oi.user_defined, SSEC_ALGORITHM_HEADER).is_some() {
-        return resolve_ssec_material(oi, headers);
-    }
-
-    if contains_managed_encryption_metadata(&oi.user_defined) {
-        return resolve_managed_material(&oi.bucket, &oi.name, &oi.user_defined).await;
-    }
-
-    Err(Error::other("encrypted object metadata is incomplete"))
-}
-
-fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
-    if metadata_get(metadata, INTERNAL_ENCRYPTION_KEY_HEADER).is_some() {
-        return true;
-    }
-
-    #[cfg(feature = "rio-v2")]
-    {
-        metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER).is_some()
-            || metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER).is_some()
-            || metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER).is_some()
-    }
-
-    #[cfg(not(feature = "rio-v2"))]
-    {
-        false
-    }
-}
-
-#[cfg(feature = "rio-v2")]
-fn canonical_sse_path(bucket: &str, object: &str) -> String {
-    let bucket = bucket.trim_matches('/');
-    let object = object.trim_matches('/');
-    if object.is_empty() {
-        bucket.to_string()
-    } else if bucket.is_empty() {
-        object.to_string()
-    } else {
-        format!("{bucket}/{object}")
-    }
-}
-
-#[cfg(feature = "rio-v2")]
-fn managed_sse_domain(metadata: &HashMap<String, String>) -> &'static str {
-    if metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER).is_some()
-        || metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER).is_some()
-        || matches!(metadata_get(metadata, "x-amz-server-side-encryption"), Some("aws:kms"))
-    {
-        "SSE-KMS"
-    } else if metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER).is_some() {
-        "SSE-C"
-    } else {
-        "SSE-S3"
-    }
-}
-
-#[cfg(feature = "rio-v2")]
-fn derive_sealing_key(
-    external_key: [u8; 32],
-    iv: [u8; SEALED_KEY_IV_SIZE],
-    domain: &str,
-    bucket: &str,
-    object: &str,
-) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
-    mac.update(&iv);
-    mac.update(domain.as_bytes());
-    mac.update(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.as_bytes());
-    mac.update(canonical_sse_path(bucket, object).as_bytes());
-
-    let mut sealing_key = [0u8; 32];
-    sealing_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    sealing_key
-}
-
-#[cfg(feature = "rio-v2")]
-fn try_decode_minio_sealed_key(bytes: &str) -> Result<Option<[u8; SEALED_KEY_SIZE]>> {
-    let decoded = BASE64_STANDARD
-        .decode(bytes)
-        .map_err(|e| Error::other(format!("failed to decode sealed object key: {e}")))?;
-    match decoded.as_slice().try_into() {
-        Ok(sealed_key) => Ok(Some(sealed_key)),
-        Err(_) => Ok(None),
-    }
-}
-
-#[cfg(feature = "rio-v2")]
-fn try_decode_minio_sealing_iv(bytes: &str) -> Result<Option<[u8; SEALED_KEY_IV_SIZE]>> {
-    let decoded = BASE64_STANDARD
-        .decode(bytes)
-        .map_err(|e| Error::other(format!("failed to decode sealing IV: {e}")))?;
-    match decoded.as_slice().try_into() {
-        Ok(iv) => Ok(Some(iv)),
-        Err(_) => Ok(None),
-    }
-}
-
-#[cfg(feature = "rio-v2")]
-fn try_unseal_minio_object_key(
-    metadata: &HashMap<String, String>,
-    bucket: &str,
-    object: &str,
-    external_key: [u8; 32],
-) -> Result<Option<[u8; 32]>> {
-    let Some(algorithm) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER) else {
-        return Ok(None);
-    };
-    if algorithm != MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM {
-        return Ok(None);
-    }
-
-    let Some(iv_b64) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_IV_HEADER) else {
-        return Ok(None);
-    };
-    let Some(iv) = try_decode_minio_sealing_iv(iv_b64)? else {
-        return Ok(None);
-    };
-
-    let sealed_key_b64 = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-        .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
-        .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
-    let Some(sealed_key_b64) = sealed_key_b64 else {
-        return Ok(None);
-    };
-    let Some(sealed_key) = try_decode_minio_sealed_key(sealed_key_b64)? else {
-        return Ok(None);
-    };
-    let header = &sealed_key[..DARE_HEADER_SIZE];
-    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
-        return Err(Error::other("unsupported sealed object-key DARE header"));
-    }
-    if u16::from_le_bytes([header[2], header[3]]) != 31 || header[4] & 0x80 == 0 {
-        return Err(Error::other("invalid sealed object-key payload header"));
-    }
-
-    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(metadata), bucket, object);
-    let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed_key)?;
-    let object_key: [u8; 32] = plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("sealed object key must decrypt to 32 bytes"))?;
-    Ok(Some(object_key))
-}
-
-fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
-    let algorithm = headers
-        .get(SSEC_ALGORITHM_HEADER)
-        .ok_or_else(|| Error::other("missing SSE-C algorithm header"))?
-        .to_str()
-        .map_err(|_| Error::other("invalid SSE-C algorithm header"))?;
-    if algorithm != DEFAULT_SSE_ALGORITHM {
-        return Err(Error::other(format!("unsupported SSE-C algorithm {algorithm}")));
-    }
-
-    let key_b64 = headers
-        .get(SSEC_KEY_HEADER)
-        .ok_or_else(|| Error::other("missing SSE-C key header"))?
-        .to_str()
-        .map_err(|_| Error::other("invalid SSE-C key header"))?;
-    let key_md5 = headers
-        .get(SSEC_KEY_MD5_HEADER)
-        .ok_or_else(|| Error::other("missing SSE-C key md5 header"))?
-        .to_str()
-        .map_err(|_| Error::other("invalid SSE-C key md5 header"))?;
-
-    let key_bytes_vec = BASE64_STANDARD
-        .decode(key_b64)
-        .map_err(|_| Error::other("failed to decode SSE-C key"))?;
-    let key_bytes: [u8; 32] = key_bytes_vec
-        .try_into()
-        .map_err(|_| Error::other("SSE-C key must be 32 bytes"))?;
-
-    let expected_md5 = BASE64_STANDARD.encode(md5_bytes(key_bytes));
-    if expected_md5 != key_md5 {
-        return Err(Error::other("SSE-C key MD5 mismatch"));
-    }
-
-    let stored_md5 =
-        metadata_get(&oi.user_defined, SSEC_KEY_MD5_HEADER).ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
-    if stored_md5 != expected_md5 {
-        return Err(Error::other("SSE-C key does not match object metadata"));
-    }
-
-    #[cfg(feature = "rio-v2")]
-    if let Some(object_key) = try_unseal_minio_object_key(&oi.user_defined, &oi.bucket, &oi.name, key_bytes)? {
-        return Ok(EncryptionMaterial {
-            key_bytes: object_key,
-            base_nonce: [0u8; 12],
-            key_kind: EncryptionKeyKind::Object,
-            reader_backend: crate::io_support::rio::ReadEncryptionBackend::V2,
-        });
-    }
-
-    Ok(EncryptionMaterial {
-        key_bytes,
-        base_nonce: read_stored_ssec_nonce(&oi.user_defined, &oi.bucket, &oi.name),
-        key_kind: EncryptionKeyKind::Direct,
-        reader_backend: crate::io_support::rio::ReadEncryptionBackend::Legacy,
-    })
-}
-
-/// Resolve the SSE-C Direct base nonce for decryption.
-///
-/// Since #4576 the encrypt side uses a fresh random nonce per encryption and
-/// persists it under `x-rustfs-encryption-iv` (plus the MinIO interop key);
-/// this reader-side resolver must read that stored value back or every SSE-C
-/// GET fails its first AEAD block. Legacy objects written before random
-/// nonces were persisted carry no stored IV and were encrypted with the
-/// deterministic `(bucket, key)` nonce, so fall back to recomputing it. Must
-/// stay in lockstep with `read_stored_ssec_nonce` in rustfs/src/storage/sse.rs
-/// (the API-layer twin of this resolver).
-fn read_stored_ssec_nonce(metadata: &HashMap<String, String>, bucket: &str, key: &str) -> [u8; 12] {
-    metadata_get(metadata, INTERNAL_ENCRYPTION_IV_HEADER)
-        .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_IV_HEADER))
-        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
-        .and_then(|bytes| <[u8; 12]>::try_from(bytes.as_slice()).ok())
-        .unwrap_or_else(|| generate_ssec_nonce(bucket, key))
-}
-
-async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
-    let normalized_metadata = normalize_managed_metadata(metadata);
-    let encrypted_dek = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_KEY_HEADER)
-        .ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
-    let encrypted_dek = BASE64_STANDARD
-        .decode(encrypted_dek)
-        .map_err(|e| Error::other(format!("failed to decode managed encrypted DEK: {e}")))?;
-
-    let kms_key_id = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_KEY_ID_HEADER).unwrap_or("default");
-    #[cfg(feature = "rio-v2")]
-    let kms_context = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_CONTEXT_HEADER)
-        .map(|value| {
-            serde_json::from_str::<HashMap<String, String>>(value)
-                .map_err(|e| Error::other(format!("failed to parse managed KMS context: {e}")))
-        })
-        .transpose()?;
-    #[cfg(not(feature = "rio-v2"))]
-    let kms_context: Option<HashMap<String, String>> = None;
-    let object_context = build_object_encryption_context(bucket, object, kms_context.as_ref());
-
-    // Persisted wrapping format is the read-side source of truth. The
-    // advertised SSE scheme and current KMS availability are write policy
-    // and runtime state, neither of which identifies the historical provider.
-    let decrypted_key = if is_data_key_envelope(&encrypted_dek) {
-        let service = crate::runtime::sources::object_encryption_service()
-            .await
-            .ok_or_else(|| Error::other(KmsUnavailableError))?;
-        #[cfg(feature = "rio-v2")]
-        let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
-            service.decrypt_legacy_data_key(&encrypted_dek).await
-        } else {
-            service.decrypt_data_key(&encrypted_dek, &object_context).await
-        };
-        #[cfg(not(feature = "rio-v2"))]
-        let data_key = service.decrypt_data_key(&encrypted_dek, &object_context).await;
-
-        data_key
-            .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
-            .plaintext_key
-    } else {
-        decrypt_local_sse_dek(&encrypted_dek, kms_key_id, &object_context)?
-    };
-
-    #[cfg(feature = "rio-v2")]
-    if let Some(object_key) = try_unseal_minio_object_key(&normalized_metadata, bucket, object, decrypted_key)? {
-        return Ok(EncryptionMaterial {
-            key_bytes: object_key,
-            base_nonce: [0u8; 12],
-            key_kind: EncryptionKeyKind::Object,
-            reader_backend: crate::io_support::rio::ReadEncryptionBackend::V2,
-        });
-    }
-
-    let iv_b64 = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_IV_HEADER)
-        .ok_or_else(|| Error::other("missing managed encryption IV"))?;
-    let iv = BASE64_STANDARD
-        .decode(iv_b64)
-        .map_err(|e| Error::other(format!("failed to decode managed encryption IV: {e}")))?;
-    let base_nonce: [u8; 12] = iv
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("managed encryption IV must be 12 bytes"))?;
-
-    Ok(EncryptionMaterial {
-        key_bytes: decrypted_key,
-        base_nonce,
-        key_kind: EncryptionKeyKind::Direct,
-        reader_backend: crate::io_support::rio::ReadEncryptionBackend::Legacy,
-    })
-}
-
-fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<String, String> {
-    #[cfg(feature = "rio-v2")]
-    {
-        let mut normalized = metadata.clone();
-        if metadata_get(&normalized, INTERNAL_ENCRYPTION_KEY_HEADER).is_none()
-            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
-                .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER))
-                .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
-        {
-            normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.to_string());
-        }
-
-        if metadata_get(&normalized, INTERNAL_ENCRYPTION_IV_HEADER).is_none()
-            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_IV_HEADER)
-        {
-            normalized.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), value.to_string());
-        }
-
-        if metadata_get(&normalized, INTERNAL_ENCRYPTION_KEY_ID_HEADER).is_none()
-            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER)
-        {
-            normalized.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), value.to_string());
-        }
-
-        if metadata_get(&normalized, INTERNAL_ENCRYPTION_CONTEXT_HEADER).is_none()
-            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
-            && let Ok(decoded) = BASE64_STANDARD.decode(value)
-            && let Ok(context) = serde_json::from_slice::<HashMap<String, String>>(&decoded)
-            && let Ok(encoded) = serde_json::to_string(&context)
-        {
-            normalized.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), encoded);
-        }
-
-        normalized
-    }
-
-    #[cfg(not(feature = "rio-v2"))]
-    {
-        metadata.clone()
-    }
-}
-
-fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str, object_context: &ObjectEncryptionContext) -> Result<[u8; 32]> {
-    if let Ok(plaintext) = decrypt_rustfs_local_sse_dek(encrypted_dek) {
-        return Ok(plaintext);
-    }
-
-    #[cfg(feature = "rio-v2")]
-    {
-        decrypt_minio_secret_key_dek(encrypted_dek, object_context)
-    }
-
-    #[cfg(not(feature = "rio-v2"))]
-    {
-        let _ = object_context;
-        Err(Error::other("invalid managed DEK format"))
-    }
-}
-
-fn decrypt_rustfs_local_sse_dek(encrypted_dek: &[u8]) -> Result<[u8; 32]> {
-    let encrypted_dek = std::str::from_utf8(encrypted_dek).map_err(|_| Error::other("managed DEK is not valid UTF-8"))?;
-    let parts: Vec<&str> = encrypted_dek.split(':').collect();
-    if parts.len() != 2 {
-        return Err(Error::other("invalid managed DEK format"));
-    }
-
-    let nonce_vec = BASE64_STANDARD
-        .decode(parts[0])
-        .map_err(|_| Error::other("invalid managed DEK nonce"))?;
-    let ciphertext = BASE64_STANDARD
-        .decode(parts[1])
-        .map_err(|_| Error::other("invalid managed DEK ciphertext"))?;
-
-    let nonce_array: [u8; 12] = nonce_vec
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("invalid managed DEK nonce length"))?;
-
-    let key = Key::<Aes256Gcm>::from(local_sse_master_key()?);
-    let cipher = Aes256Gcm::new(&key);
-    let plaintext = cipher
-        .decrypt(&Nonce::from(nonce_array), ciphertext.as_slice())
-        .map_err(|e| Error::other(format!("failed to decrypt managed DEK: {e}")))?;
-
-    plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("managed DEK has invalid plaintext length"))
-}
-
-#[cfg(feature = "rio-v2")]
-#[derive(Deserialize)]
-struct MinioLegacyCiphertext {
-    #[serde(rename = "aead")]
-    algorithm: String,
-    iv: Vec<u8>,
-    nonce: Vec<u8>,
-    bytes: Vec<u8>,
-}
-
-#[cfg(feature = "rio-v2")]
-fn decrypt_minio_secret_key_dek(encrypted_dek: &[u8], object_context: &ObjectEncryptionContext) -> Result<[u8; 32]> {
-    let key = local_sse_master_key()?;
-    let (ciphertext, iv, nonce) = parse_minio_secret_key_ciphertext(encrypted_dek)?;
-    let associated_data = marshal_minio_kms_context(&object_context.encryption_context);
-
-    let mut mac = HmacSha256::new_from_slice(&key).map_err(|err| Error::other(format!("invalid local SSE master key: {err}")))?;
-    mac.update(&iv);
-    let sealing_key = mac.finalize().into_bytes();
-    let cipher = Aes256Gcm::new_from_slice(sealing_key.as_slice())
-        .map_err(|err| Error::other(format!("invalid MinIO sealing key: {err}")))?;
-    let nonce = Nonce::try_from(&nonce[..]).map_err(|_| Error::other("invalid MinIO managed DEK nonce"))?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: &ciphertext,
-                aad: &associated_data,
-            },
-        )
-        .map_err(|err| Error::other(format!("failed to decrypt MinIO managed DEK: {err}")))?;
-
-    plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("MinIO managed DEK has invalid plaintext length"))
-}
-
-#[cfg(feature = "rio-v2")]
-fn parse_minio_secret_key_ciphertext(
-    encrypted_dek: &[u8],
-) -> Result<(Vec<u8>, [u8; MINIO_SECRET_KEY_IV_SIZE], [u8; MINIO_SECRET_KEY_NONCE_SIZE])> {
-    if encrypted_dek.first() == Some(&b'{') && encrypted_dek.last() == Some(&b'}') {
-        let legacy: MinioLegacyCiphertext = serde_json::from_slice(encrypted_dek)
-            .map_err(|err| Error::other(format!("failed to parse MinIO legacy managed DEK: {err}")))?;
-        if legacy.algorithm != "AES-256-GCM-HMAC-SHA-256" {
-            return Err(Error::other(format!(
-                "unsupported MinIO legacy managed DEK algorithm {}",
-                legacy.algorithm
-            )));
-        }
-        let iv = legacy
-            .iv
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::other("invalid MinIO legacy managed DEK IV length"))?;
-        let nonce = legacy
-            .nonce
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::other("invalid MinIO legacy managed DEK nonce length"))?;
-        return Ok((legacy.bytes, iv, nonce));
-    }
-
-    if encrypted_dek.len() <= MINIO_SECRET_KEY_RANDOM_SIZE {
-        return Err(Error::other("invalid MinIO managed DEK length"));
-    }
-
-    let split_at = encrypted_dek.len() - MINIO_SECRET_KEY_RANDOM_SIZE;
-    let (ciphertext, random) = encrypted_dek.split_at(split_at);
-    let iv = random[..MINIO_SECRET_KEY_IV_SIZE]
-        .try_into()
-        .map_err(|_| Error::other("invalid MinIO managed DEK IV length"))?;
-    let nonce = random[MINIO_SECRET_KEY_IV_SIZE..]
-        .try_into()
-        .map_err(|_| Error::other("invalid MinIO managed DEK nonce length"))?;
-    Ok((ciphertext.to_vec(), iv, nonce))
-}
-
-#[cfg(feature = "rio-v2")]
-fn marshal_minio_kms_context(context: &HashMap<String, String>) -> Vec<u8> {
-    let mut entries: Vec<_> = context.iter().collect();
-    entries.sort_by_key(|(left, _)| *left);
-
-    let mut json = String::from("{");
-    for (index, (key, value)) in entries.into_iter().enumerate() {
-        if index > 0 {
-            json.push(',');
-        }
-        json.push_str(&serde_json::to_string(key).expect("string key serializes"));
-        json.push(':');
-        json.push_str(&serde_json::to_string(value).expect("string value serializes"));
-    }
-    json.push('}');
-    json.into_bytes()
-}
-
-fn local_sse_master_key() -> Result<[u8; 32]> {
-    if let Some(key) = decode_master_key_env("__RUSTFS_SSE_SIMPLE_CMK")? {
-        return Ok(key);
-    }
-
-    if let Some(key) = decode_master_key_env("RUSTFS_SSE_S3_MASTER_KEY")? {
-        return Ok(key);
-    }
-
-    Ok([0u8; 32])
-}
-
-fn decode_master_key_env(name: &str) -> Result<Option<[u8; 32]>> {
-    let Ok(value) = env::var(name) else {
-        return Ok(None);
-    };
-
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-
-    let decoded = BASE64_STANDARD
-        .decode(value)
-        .map_err(|e| Error::other(format!("{name} is not valid base64: {e}")))?;
-    let key =
-        <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| Error::other(format!("{name} must decode to exactly 32 bytes")))?;
-
-    Ok(Some(key))
-}
-
-fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
-    let digest = md5_bytes(format!("{bucket}-{key}").as_bytes());
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&digest[..12]);
-    nonce
-}
-
-fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
-    let digest = Md5::digest(data.as_ref());
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use md5::{Digest, Md5};
+    use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
+    use std::collections::HashMap;
     use std::io::Cursor;
     use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
+
+    const TEST_DIRECT_KEY_HEADER: &str = "x-rustfs-test-direct-key";
+    const TEST_OBJECT_KEY_HEADER: &str = "x-rustfs-test-object-key";
+    const TEST_NONCE_HEADER: &str = "x-rustfs-test-nonce";
+
+    pub(super) static TEST_RESOLVER: TestObjectEncryptionResolver = TestObjectEncryptionResolver;
+
+    pub(super) struct TestObjectEncryptionResolver;
+
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for TestObjectEncryptionResolver {
+        async fn resolve_read_material(
+            &self,
+            request: ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            if let Some(encoded) = request.metadata.get(TEST_OBJECT_KEY_HEADER) {
+                let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| {
+                    EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidMetadata, "invalid test object key")
+                })?;
+                let key_bytes = decoded.try_into().map_err(|_| {
+                    EncryptionResolutionError::new(
+                        EncryptionResolutionErrorKind::InvalidMetadata,
+                        "invalid test object key length",
+                    )
+                })?;
+                return Ok(Some(ReadEncryptionMaterial {
+                    key_bytes,
+                    mode: ReadEncryptionMode::Object,
+                }));
+            }
+
+            let encoded = request
+                .headers
+                .get(TEST_DIRECT_KEY_HEADER)
+                .ok_or_else(|| {
+                    EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidRequest, "missing test direct key")
+                })?
+                .to_str()
+                .map_err(|_| {
+                    EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidRequest, "invalid test encryption key")
+                })?;
+            let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| {
+                EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidRequest, "invalid test encryption key")
+            })?;
+            let key_bytes = decoded.try_into().map_err(|_| {
+                EncryptionResolutionError::new(
+                    EncryptionResolutionErrorKind::InvalidRequest,
+                    "invalid test encryption key length",
+                )
+            })?;
+            let base_nonce = request
+                .metadata
+                .get(TEST_NONCE_HEADER)
+                .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+                .and_then(|bytes| bytes.try_into().ok())
+                .unwrap_or_else(|| fixture_nonce(request.bucket, request.object));
+            Ok(Some(ReadEncryptionMaterial {
+                key_bytes,
+                mode: ReadEncryptionMode::Direct { base_nonce },
+            }))
+        }
+    }
 
     fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
         let digest = Md5::digest(data.as_ref());
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&digest);
         bytes
+    }
+
+    fn fixture_nonce(bucket: &str, object: &str) -> [u8; 12] {
+        let digest = md5_bytes(format!("{bucket}-{object}"));
+        let mut nonce = [0; 12];
+        nonce.copy_from_slice(&digest[..12]);
+        nonce
+    }
+
+    fn ssec_headers_from_key(key_bytes: [u8; 32]) -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TEST_DIRECT_KEY_HEADER,
+            HeaderValue::from_str(&BASE64_STANDARD.encode(key_bytes)).expect("test key header is valid"),
+        );
+        headers
     }
 
     #[tokio::test]
@@ -1936,104 +1379,6 @@ mod tests {
             .await
             .expect("cache body should stream");
         assert_eq!(restored, body);
-    }
-
-    /// Regression for the #4576 fallout: the encrypt side persists a random
-    /// SSE-C nonce, and this reader-side resolver must read it back — falling
-    /// back to the deterministic legacy nonce only when no IV was stored.
-    /// Reverting the stored-nonce lookup breaks the first two cases.
-    #[test]
-    fn read_stored_ssec_nonce_prefers_persisted_iv_and_falls_back_for_legacy() {
-        let stored = [7u8; 12];
-        let deterministic = generate_ssec_nonce("bucket", "object");
-        assert_ne!(stored, deterministic, "test nonce must differ from the deterministic value");
-
-        let mut metadata = HashMap::new();
-        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(stored));
-        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), stored);
-
-        // MinIO interop key only, in non-canonical casing: the lookup is
-        // case-insensitive like every other internal-metadata read here.
-        let mut metadata = HashMap::new();
-        metadata.insert(MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_ascii_lowercase(), BASE64_STANDARD.encode(stored));
-        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), stored);
-
-        // Legacy object: no stored IV → deterministic fallback.
-        assert_eq!(read_stored_ssec_nonce(&HashMap::new(), "bucket", "object"), deterministic);
-
-        // Corrupt values (bad base64 / wrong length) also fall back instead of erroring.
-        let mut metadata = HashMap::new();
-        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "not-base64!!".to_string());
-        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), deterministic);
-        let mut metadata = HashMap::new();
-        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([1u8; 8]));
-        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), deterministic);
-    }
-
-    fn ssec_headers_from_key(key_bytes: [u8; 32]) -> HeaderMap<HeaderValue> {
-        let mut headers = HeaderMap::new();
-        headers.insert(SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        headers.insert(
-            SSEC_KEY_HEADER,
-            HeaderValue::from_str(&BASE64_STANDARD.encode(key_bytes)).expect("valid base64 header"),
-        );
-        headers.insert(
-            SSEC_KEY_MD5_HEADER,
-            HeaderValue::from_str(&BASE64_STANDARD.encode(md5_bytes(key_bytes))).expect("valid md5 header"),
-        );
-        headers
-    }
-
-    #[cfg(feature = "rio-v2")]
-    #[test]
-    fn test_legacy_managed_metadata_excludes_sealed_keys() {
-        let legacy_metadata = HashMap::from([
-            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
-            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
-        ]);
-        assert!(is_legacy_rustfs_managed_metadata(&legacy_metadata));
-
-        let sealed_metadata = HashMap::from([
-            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
-            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
-            (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(), "sealed-key".to_string()),
-        ]);
-
-        assert!(!is_legacy_rustfs_managed_metadata(&sealed_metadata));
-    }
-
-    #[cfg(feature = "rio-v2")]
-    fn seal_ssec_object_key_for_test(
-        bucket: &str,
-        object: &str,
-        customer_key: [u8; 32],
-        object_key: [u8; 32],
-    ) -> ([u8; 32], Vec<u8>) {
-        let iv = [0x23u8; SEALED_KEY_IV_SIZE];
-        let sealing_key = derive_sealing_key(customer_key, iv, "SSE-C", bucket, object);
-        let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("valid sealing key");
-
-        let mut header = [0u8; DARE_HEADER_SIZE];
-        header[0] = DARE_VERSION_20;
-        header[1] = DARE_CIPHER_AES_256_GCM;
-        header[2..4].copy_from_slice(&31u16.to_le_bytes());
-        header[4] = 0x80;
-        header[5..16].copy_from_slice(&[0x45u8; 11]);
-
-        let nonce = Nonce::try_from(&header[4..16]).expect("valid nonce");
-        let mut sealed = header.to_vec();
-        sealed.extend_from_slice(
-            &cipher
-                .encrypt(
-                    &nonce,
-                    aes_gcm::aead::Payload {
-                        msg: &object_key,
-                        aad: &header[..4],
-                    },
-                )
-                .expect("seal object key"),
-        );
-        (iv, sealed)
     }
 
     #[tokio::test]
@@ -2319,234 +1664,6 @@ mod tests {
         assert_eq!(actual, b"fghijkl");
     }
 
-    fn encrypt_managed_dek_for_test(dek: [u8; 32], master_key: [u8; 32]) -> String {
-        let key = Key::<Aes256Gcm>::from(master_key);
-        let cipher = Aes256Gcm::new(&key);
-        let nonce = Nonce::from([0u8; 12]);
-        let ciphertext = cipher.encrypt(&nonce, dek.as_slice()).expect("encrypt managed dek");
-        format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext))
-    }
-
-    #[cfg(feature = "rio-v2")]
-    fn seal_managed_s3_object_key_for_test(
-        bucket: &str,
-        object: &str,
-        data_key: [u8; 32],
-        object_key: [u8; 32],
-    ) -> ([u8; 32], Vec<u8>) {
-        seal_managed_s3_object_key_for_test_with_cipher(bucket, object, data_key, object_key, DARE_CIPHER_AES_256_GCM)
-    }
-
-    #[cfg(feature = "rio-v2")]
-    fn seal_managed_s3_object_key_for_test_with_cipher(
-        bucket: &str,
-        object: &str,
-        data_key: [u8; 32],
-        object_key: [u8; 32],
-        cipher_id: u8,
-    ) -> ([u8; 32], Vec<u8>) {
-        let iv = [0x24u8; SEALED_KEY_IV_SIZE];
-        let sealing_key = derive_sealing_key(data_key, iv, "SSE-S3", bucket, object);
-
-        let mut header = [0u8; DARE_HEADER_SIZE];
-        header[0] = DARE_VERSION_20;
-        header[1] = cipher_id;
-        header[2..4].copy_from_slice(&31u16.to_le_bytes());
-        header[4] = 0x80;
-        header[5..16].copy_from_slice(&[0x46u8; 11]);
-
-        let ciphertext = match cipher_id {
-            DARE_CIPHER_AES_256_GCM => {
-                let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("valid sealing key");
-                let nonce = Nonce::try_from(&header[4..16]).expect("valid nonce");
-                cipher
-                    .encrypt(
-                        &nonce,
-                        Payload {
-                            msg: &object_key,
-                            aad: &header[..4],
-                        },
-                    )
-                    .expect("seal managed object key")
-            }
-            DARE_CIPHER_CHACHA20_POLY1305 => {
-                let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key).expect("valid sealing key");
-                let nonce = chacha20poly1305::Nonce::try_from(&header[4..16]).expect("valid nonce");
-                cipher
-                    .encrypt(
-                        &nonce,
-                        Payload {
-                            msg: &object_key,
-                            aad: &header[..4],
-                        },
-                    )
-                    .expect("seal managed object key")
-            }
-            _ => panic!("unsupported test cipher"),
-        };
-        let mut sealed = header.to_vec();
-        sealed.extend_from_slice(&ciphertext);
-        (iv, sealed)
-    }
-
-    #[cfg(feature = "rio-v2")]
-    #[test]
-    fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value() {
-        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_AES_256_GCM));
-        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_CHACHA20_POLY1305));
-        assert!(!is_supported_sealed_object_key_cipher(0x02));
-    }
-
-    #[tokio::test]
-    async fn resolve_managed_material_accepts_case_insensitive_metadata_keys() {
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
-            let data_key = [0x24; 32];
-            let base_nonce = [0x14; 12];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-            let metadata = HashMap::from([
-                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
-            ]);
-
-            let material = resolve_managed_material("", "", &metadata)
-                .await
-                .expect("managed material should resolve mixed-case metadata keys");
-
-            assert_eq!(material.key_bytes, data_key);
-            assert_eq!(material.base_nonce, base_nonce);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn resolve_managed_material_selects_provider_from_persisted_dek() {
-        use rustfs_kms::KmsConfig;
-        use tempfile::TempDir;
-
-        let key_dir = TempDir::new().expect("create KMS key directory");
-        let manager = rustfs_kms::init_global_kms_service_manager();
-        manager
-            .reconfigure(KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
-            .await
-            .expect("start test KMS service");
-
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([7u8; 32])))], async {
-            let data_key = [0x24; 32];
-            let base_nonce = [0x14; 12];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [7u8; 32]);
-            let metadata = HashMap::from([
-                (
-                    INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
-                ),
-                (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(base_nonce)),
-                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "legacy-local-key".to_string()),
-            ]);
-
-            let material = resolve_managed_material("bucket", "object", &metadata)
-                .await
-                .expect("legacy local DEK should not be routed to the running KMS");
-            assert_eq!(material.key_bytes, data_key);
-            assert_eq!(material.base_nonce, base_nonce);
-        })
-        .await;
-
-        manager.stop().await.expect("stop test KMS service");
-
-        let kms_envelope = br#"{
-            "key_id": "test-key-id",
-            "master_key_id": "master-key-id",
-            "key_spec": "AES_256",
-            "encrypted_key": [1, 2, 3, 4],
-            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-            "encryption_context": {},
-            "created_at": "2024-01-01T00:00:00+00:00"
-        }"#;
-        let metadata = HashMap::from([
-            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode(kms_envelope)),
-            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([0x14; 12])),
-            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key-id".to_string()),
-        ]);
-        let error = match resolve_managed_material("bucket", "object", &metadata).await {
-            Ok(_) => panic!("KMS envelope must not fall back to the local provider"),
-            Err(error) => error,
-        };
-        let Error::Io(io_error) = error else {
-            panic!("KMS absence should retain its typed source");
-        };
-        assert!(
-            io_error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<KmsUnavailableError>())
-                .is_some()
-        );
-    }
-
-    #[cfg(feature = "rio-v2")]
-    #[tokio::test]
-    async fn resolve_managed_material_accepts_chacha20_poly1305_header_variant() {
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
-            let data_key = [0x24; 32];
-            let object_key = [0x33; 32];
-            let (iv, sealed_key) = seal_managed_s3_object_key_for_test_with_cipher(
-                "bucket",
-                "object",
-                data_key,
-                object_key,
-                DARE_CIPHER_CHACHA20_POLY1305,
-            );
-
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-            let metadata = HashMap::from([
-                (
-                    MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode(sealed_key),
-                ),
-                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(iv)),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                ),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
-                ),
-                (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
-            ]);
-
-            let material = resolve_managed_material("bucket", "object", &metadata)
-                .await
-                .expect("managed material should accept current MinIO header variant");
-            assert_eq!(material.key_kind, EncryptionKeyKind::Object);
-            assert_eq!(material.key_bytes, object_key);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn resolve_encryption_material_accepts_case_insensitive_metadata_keys() {
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
-            let data_key = [0x24; 32];
-            let base_nonce = [0x14; 12];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-            let metadata = HashMap::from([
-                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
-            ]);
-            let object_info = ObjectInfo {
-                user_defined: Arc::new(metadata),
-                ..Default::default()
-            };
-            let material = resolve_encryption_material(&object_info, &HeaderMap::new())
-                .await
-                .expect("resolve_encryption_material should accept mixed-case managed metadata");
-
-            assert_eq!(material.key_bytes, data_key);
-            assert_eq!(material.base_nonce, base_nonce);
-        })
-        .await;
-    }
-
     #[tokio::test]
     async fn test_get_object_reader_rejects_ssec_read_without_headers() {
         let object_info = ObjectInfo {
@@ -2739,310 +1856,6 @@ mod tests {
                 visible_length: 256
             }
         ));
-    }
-
-    #[tokio::test]
-    async fn test_get_object_reader_allows_encrypted_full_object_passthrough() {
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
-            let plaintext = b"managed-full-object".to_vec();
-            let data_key = [0x21; 32];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-            let bucket = "bucket";
-            let object = "managed-full-object";
-
-            let mut encrypted = Vec::new();
-            #[cfg(feature = "rio-v2")]
-            let user_defined = {
-                let object_key = [0x41; 32];
-                let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-                crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
-                    .read_to_end(&mut encrypted)
-                    .await
-                    .expect("encrypt managed object");
-                HashMap::from([
-                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                    ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                    ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                        MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                    ),
-                    (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
-                        BASE64_STANDARD.encode(sealed_key),
-                    ),
-                ])
-            };
-            #[cfg(not(feature = "rio-v2"))]
-            let user_defined = {
-                let base_nonce = [0x11; 12];
-                crate::io_support::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
-                    .read_to_end(&mut encrypted)
-                    .await
-                    .expect("encrypt managed object");
-                HashMap::from([
-                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                    ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                    ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
-                    ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                ])
-            };
-
-            let object_info = ObjectInfo {
-                bucket: bucket.to_string(),
-                name: object.to_string(),
-                size: encrypted.len() as i64,
-                user_defined: Arc::new(user_defined),
-                ..Default::default()
-            };
-
-            let (mut reader, offset, length) = GetObjectReader::new(
-                Box::new(Cursor::new(encrypted.clone())),
-                None,
-                &object_info,
-                &ObjectOptions::default(),
-                &HeaderMap::new(),
-            )
-            .await
-            .expect("managed encrypted full-object reads should decrypt inside ecstore");
-
-            let mut actual = Vec::new();
-            reader.read_to_end(&mut actual).await.expect("read managed plaintext");
-
-            assert_eq!(offset, 0);
-            assert_eq!(length, object_info.size);
-            assert_eq!(reader.object_info.size, plaintext.len() as i64);
-            assert_eq!(actual, plaintext);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_get_object_reader_decrypts_managed_sse_range_on_plaintext_semantics() {
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
-            let plaintext = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
-            let data_key = [0x23; 32];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-            let bucket = "bucket";
-            let object = "managed-range-object";
-
-            let mut encrypted = Vec::new();
-            #[cfg(feature = "rio-v2")]
-            let user_defined = {
-                let object_key = [0x43; 32];
-                let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-                crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
-                    .read_to_end(&mut encrypted)
-                    .await
-                    .expect("encrypt managed ranged object");
-                HashMap::from([
-                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                    ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                    ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                        MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                    ),
-                    (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
-                        BASE64_STANDARD.encode(sealed_key),
-                    ),
-                ])
-            };
-            #[cfg(not(feature = "rio-v2"))]
-            let user_defined = {
-                let base_nonce = [0x13; 12];
-                crate::io_support::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
-                    .read_to_end(&mut encrypted)
-                    .await
-                    .expect("encrypt managed ranged object");
-                HashMap::from([
-                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                    ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                    ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
-                    ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                ])
-            };
-
-            let object_info = ObjectInfo {
-                bucket: bucket.to_string(),
-                name: object.to_string(),
-                size: encrypted.len() as i64,
-                user_defined: Arc::new(user_defined),
-                ..Default::default()
-            };
-            let range = HTTPRangeSpec {
-                is_suffix_length: false,
-                start: 5,
-                end: 11,
-            };
-
-            let (mut reader, offset, length) = GetObjectReader::new(
-                Box::new(Cursor::new(encrypted.clone())),
-                Some(range),
-                &object_info,
-                &ObjectOptions::default(),
-                &HeaderMap::new(),
-            )
-            .await
-            .expect("managed encrypted range reads should decrypt inside ecstore");
-
-            let mut actual = Vec::new();
-            reader.read_to_end(&mut actual).await.expect("read managed ranged plaintext");
-
-            assert_eq!(offset, 0);
-            assert_eq!(length, encrypted.len() as i64);
-            assert_eq!(reader.object_info.size, 7);
-            assert_eq!(actual, b"56789ab");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_get_object_reader_uses_local_managed_fallback_with_explicit_sse_s3_key() {
-        async_with_vars(
-            [
-                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
-                ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode([0u8; 32]))),
-            ],
-            async {
-                let plaintext = b"managed-local-fallback".to_vec();
-                let data_key = [0x22; 32];
-                let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-                let bucket = "bucket";
-                let object = "managed-local-fallback";
-
-                let mut encrypted = Vec::new();
-                #[cfg(feature = "rio-v2")]
-                let user_defined = {
-                    let object_key = [0x42; 32];
-                    let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-                    crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
-                        .read_to_end(&mut encrypted)
-                        .await
-                        .expect("encrypt managed object with local fallback key");
-                    HashMap::from([
-                        ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                        ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                        ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                        (
-                            MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                            MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                        ),
-                        (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                        (
-                            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
-                            BASE64_STANDARD.encode(sealed_key),
-                        ),
-                    ])
-                };
-                #[cfg(not(feature = "rio-v2"))]
-                let user_defined = {
-                    let base_nonce = [0x12; 12];
-                    crate::io_support::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
-                        .read_to_end(&mut encrypted)
-                        .await
-                        .expect("encrypt managed object with local fallback key");
-                    HashMap::from([
-                        ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                        ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                        ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
-                        ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                    ])
-                };
-
-                let object_info = ObjectInfo {
-                    bucket: bucket.to_string(),
-                    name: object.to_string(),
-                    size: encrypted.len() as i64,
-                    user_defined: Arc::new(user_defined),
-                    ..Default::default()
-                };
-
-                let (mut reader, _, _) = GetObjectReader::new(
-                    Box::new(Cursor::new(encrypted)),
-                    None,
-                    &object_info,
-                    &ObjectOptions::default(),
-                    &HeaderMap::new(),
-                )
-                .await
-                .expect("managed encrypted reads should use the configured local SSE-S3 key");
-
-                let mut actual = Vec::new();
-                reader.read_to_end(&mut actual).await.expect("read managed plaintext");
-
-                assert_eq!(reader.object_info.size, plaintext.len() as i64);
-                assert_eq!(actual, plaintext);
-            },
-        )
-        .await;
-    }
-
-    #[cfg(feature = "rio-v2")]
-    #[tokio::test]
-    async fn test_get_object_reader_accepts_minio_only_managed_metadata() {
-        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
-            let plaintext = b"managed-minio-metadata".to_vec();
-            let data_key = [0x23; 32];
-            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-            let bucket = "bucket";
-            let object = "managed-minio-metadata";
-            let object_key = [0x44; 32];
-            let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-
-            let mut encrypted = Vec::new();
-            crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
-                .read_to_end(&mut encrypted)
-                .await
-                .expect("encrypt managed object");
-
-            let object_info = ObjectInfo {
-                bucket: bucket.to_string(),
-                name: object.to_string(),
-                size: encrypted.len() as i64,
-                user_defined: Arc::new(HashMap::from([
-                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(),
-                        BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
-                    ),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
-                        BASE64_STANDARD.encode(sealed_key),
-                    ),
-                    (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                    (
-                        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                        MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                    ),
-                    (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
-                    ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
-                ])),
-                ..Default::default()
-            };
-
-            let (mut reader, offset, length) = GetObjectReader::new(
-                Box::new(Cursor::new(encrypted.clone())),
-                None,
-                &object_info,
-                &ObjectOptions::default(),
-                &HeaderMap::new(),
-            )
-            .await
-            .expect("managed encrypted reads should accept MinIO-style metadata");
-
-            let mut actual = Vec::new();
-            reader.read_to_end(&mut actual).await.expect("read managed plaintext");
-
-            assert_eq!(offset, 0);
-            assert_eq!(length, object_info.size);
-            assert_eq!(reader.object_info.size, plaintext.len() as i64);
-            assert_eq!(actual, plaintext);
-        })
-        .await;
     }
 
     #[tokio::test]
@@ -3334,8 +2147,6 @@ mod tests {
         let object_key = [0x67; 32];
         let bucket = "bucket";
         let object = "sealed-object";
-        let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
-
         let mut encrypted = Vec::new();
         crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
             .read_to_end(&mut encrypted)
@@ -3347,6 +2158,7 @@ mod tests {
             name: object.to_string(),
             size: encrypted.len() as i64,
             user_defined: Arc::new(HashMap::from([
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode(object_key)),
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -3355,15 +2167,6 @@ mod tests {
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
-                ),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                ),
-                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode(sealed_key),
                 ),
             ])),
             ..Default::default()
@@ -3573,10 +2376,7 @@ mod tests {
                 "x-amz-server-side-encryption-customer-original-size".to_string(),
                 total_plaintext.to_string(),
             ),
-            (
-                INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                BASE64_STANDARD.encode(LEGACY_FIXTURE_BASE_NONCE),
-            ),
+            (TEST_NONCE_HEADER.to_string(), BASE64_STANDARD.encode(LEGACY_FIXTURE_BASE_NONCE)),
         ])
     }
 
@@ -3956,65 +2756,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_managed_multipart_range_seek_byte_exact() {
-        async_with_vars(
-            [
-                ("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32]))),
-                (ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true".to_string())),
-            ],
-            async {
-                let data_key = [0x74; 32];
-                let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
-                let total_plaintext: usize = 20_000 + 9_000 + 5_000;
-                let metadata = HashMap::from([
-                    (
-                        INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
-                        BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
-                    ),
-                    (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "default".to_string()),
-                    (
-                        INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-                        BASE64_STANDARD.encode(LEGACY_FIXTURE_BASE_NONCE),
-                    ),
-                    (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(), total_plaintext.to_string()),
-                ]);
-                let fixture =
-                    build_legacy_multipart_fixture("bucket", "managed-multipart", data_key, &[20_000, 9_000, 5_000], metadata)
-                        .await;
-                let headers = HeaderMap::new();
-                let opts = ObjectOptions::default();
-
-                for (rs, expected_offset, expected_length, label) in [
-                    (
-                        range(33_900, 33_999),
-                        fixture.physical_part_start(2),
-                        fixture.part_physical_sizes[2] as i64,
-                        "managed tail range",
-                    ),
-                    (
-                        range(19_990, 20_010),
-                        0,
-                        (fixture.part_physical_sizes[0] + fixture.part_physical_sizes[1]) as i64,
-                        "managed boundary straddle",
-                    ),
-                ] {
-                    let (start, len) = rs.get_offset_length(total_plaintext as i64).expect("valid managed range");
-                    let expected_body =
-                        &fixture.plaintext[start..start + usize::try_from(len).expect("valid managed range length fits usize")];
-
-                    let (body, offset, length, reported_size) = read_via_seek_window(&fixture, Some(rs), &opts, &headers).await;
-
-                    assert_eq!(offset, expected_offset, "{label}: physical offset");
-                    assert_eq!(length, expected_length, "{label}: physical length");
-                    assert_eq!(reported_size, len, "{label}: reported plaintext size");
-                    assert_eq!(body, expected_body, "{label}: body bytes");
-                }
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_legacy_single_part_multipart_object_keeps_full_read_shape() {
         async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
             let key_bytes = [0x75; 32];
@@ -4250,50 +2991,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_ssec_multipart_range_rejects_wrong_or_missing_key() {
-        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
-            let key_bytes = [0x79; 32];
-            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
-            let rs = range(33_900, 33_999);
-
-            let missing = match GetObjectReader::new(
-                Box::new(Cursor::new(fixture.ciphertext.clone())),
-                Some(rs.clone()),
-                &fixture.object_info,
-                &ObjectOptions::default(),
-                &HeaderMap::new(),
-            )
-            .await
-            {
-                Ok(_) => panic!("missing SSE-C key must fail before any body is produced"),
-                Err(err) => err,
-            };
-            assert!(
-                missing.to_string().contains("SSE-C"),
-                "missing-key failure must come from SSE-C validation: {missing}"
-            );
-
-            let wrong = match GetObjectReader::new(
-                Box::new(Cursor::new(fixture.ciphertext.clone())),
-                Some(rs),
-                &fixture.object_info,
-                &ObjectOptions::default(),
-                &ssec_headers_from_key([0x00; 32]),
-            )
-            .await
-            {
-                Ok(_) => panic!("wrong SSE-C key must fail before any body is produced"),
-                Err(err) => err,
-            };
-            assert!(
-                wrong.to_string().contains("SSE-C key does not match object metadata"),
-                "wrong-key failure must come from the stored key check: {wrong}"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_legacy_ssec_multipart_seek_tamper_fails_hard_with_no_plaintext() {
         async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
             let key_bytes = [0x7A; 32];
@@ -4344,8 +3041,6 @@ mod tests {
         let object_key = [0x68; 32];
         let bucket = "bucket";
         let object = "large-range-object";
-        let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
-
         let mut encrypted = Vec::new();
         crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
             .read_to_end(&mut encrypted)
@@ -4357,6 +3052,7 @@ mod tests {
             name: object.to_string(),
             size: encrypted.len() as i64,
             user_defined: Arc::new(HashMap::from([
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode(object_key)),
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -4365,15 +3061,6 @@ mod tests {
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
-                ),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                ),
-                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode(sealed_key),
                 ),
             ])),
             ..Default::default()
@@ -4486,7 +3173,6 @@ mod tests {
         let object_key = [0x74; 32];
         let bucket = "bucket";
         let object = "compressed-large-object";
-        let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
         let mut compressor = crate::io_support::rio::CompressReader::with_encrypted_padding(
             Cursor::new(plaintext.clone()),
             CompressionAlgorithm::default(),
@@ -4579,6 +3265,7 @@ mod tests {
                 ..Default::default()
             }]),
             user_defined: Arc::new(HashMap::from([
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode(object_key)),
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -4587,15 +3274,6 @@ mod tests {
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
-                ),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
-                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
-                ),
-                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
-                (
-                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
-                    BASE64_STANDARD.encode(sealed_key),
                 ),
                 (
                     "x-minio-internal-compression".to_string(),
@@ -4630,7 +3308,7 @@ mod tests {
                 assert_eq!(plaintext_offset as i64, range.start - uncomp_off);
                 assert_eq!(plaintext_length, 64);
             }
-            other => panic!("expected encrypted read plan, got {other:?}"),
+            _ => panic!("expected encrypted read plan"),
         }
 
         let (mut reader, offset, length) = GetObjectReader::new(

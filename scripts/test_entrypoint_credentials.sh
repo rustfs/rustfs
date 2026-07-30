@@ -226,7 +226,11 @@ run_cli_expect_failure \
 
 # Non-server commands skip credential validation entirely.
 cargo_log="$TMP_DIR/cargo.log"
-if ! env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= sh "$ENTRYPOINT" cargo --version >"$cargo_log" 2>&1; then
+toolchain_env=(PATH="$PATH")
+[ "${HOME+x}" = x ] && toolchain_env+=(HOME="$HOME")
+[ "${CARGO_HOME+x}" = x ] && toolchain_env+=(CARGO_HOME="$CARGO_HOME")
+[ "${RUSTUP_HOME+x}" = x ] && toolchain_env+=(RUSTUP_HOME="$RUSTUP_HOME")
+if ! env -i "${toolchain_env[@]}" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= sh "$ENTRYPOINT" cargo --version >"$cargo_log" 2>&1; then
   echo "Expected cargo passthrough to skip server credential checks" >&2
   cat "$cargo_log" >&2
   exit 1

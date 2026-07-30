@@ -38,6 +38,16 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
+pub const PART_TRANSACTION_NEW_META: &str = "new.meta";
+pub const PART_TRANSACTION_OLD_META: &str = "old.meta";
+pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
+
+pub fn part_transaction_path(part_path: &str) -> String {
+    match part_path.rsplit_once('/') {
+        Some((parent, name)) => format!("{parent}/.{name}.rustfs-txn"),
+        None => format!(".{part_path}.rustfs-txn"),
+    }
+}
 
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
@@ -62,6 +72,45 @@ pub type DiskStore = Arc<Disk>;
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotLeaseToken(Uuid);
+
+impl SnapshotLeaseToken {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let uuid = Uuid::from_slice(bytes).map_err(|_| Error::other("invalid snapshot lease token"))?;
+        if uuid.is_nil() {
+            return Err(Error::other("invalid snapshot lease token"));
+        }
+        Ok(Self(uuid))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+}
+
+impl Default for SnapshotLeaseToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataDirDeleteStatus {
+    Deleted,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PartTransactionAction {
+    Commit,
+    Rollback,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MmapCopyStageMetrics {
     pub(crate) path: &'static str,
@@ -81,6 +130,18 @@ pub struct MmapCopyStageMetrics {
 pub enum Disk {
     Local(Box<LocalDiskWrapper>),
     Remote(Box<RemoteDisk>),
+}
+
+impl Disk {
+    pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk.set_disk_id_state(id).await;
+                Ok(())
+            }
+            Disk::Remote(remote_disk) => remote_disk.set_disk_id(id).await,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -233,6 +294,34 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.acquire_snapshot_lease(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.acquire_snapshot_lease(volume, path).await,
+        }
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.release_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.release_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.renew_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.renew_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        match self {
+            Disk::Local(local_disk) => local_disk.delete_data_dir(volume, path, opts).await,
+            Disk::Remote(remote_disk) => remote_disk.delete_data_dir(volume, path, opts).await,
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         match self {
@@ -378,6 +467,35 @@ impl DiskAPI for Disk {
                     .rename_part(src_volume, src_path, dst_volume, dst_path, meta)
                     .await
             }
+        }
+    }
+
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: Bytes,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            }
+        }
+    }
+
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.settle_part_transaction(volume, path, action).await,
+            Disk::Remote(remote_disk) => remote_disk.settle_part_transaction(volume, path, action).await,
         }
     }
 
@@ -601,6 +719,19 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<()>;
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()>;
+    async fn acquire_snapshot_lease(&self, _volume: &str, _path: &str) -> Result<SnapshotLeaseToken> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn release_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<()> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn renew_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        self.delete(volume, path, opts).await?;
+        Ok(DataDirDeleteStatus::Deleted)
+    }
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
     async fn read_version(
@@ -659,6 +790,19 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
+    async fn prepare_part_transaction(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _dst_volume: &str,
+        _dst_path: &str,
+        _meta: Bytes,
+    ) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn settle_part_transaction(&self, _volume: &str, _path: &str, _action: PartTransactionAction) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
@@ -1418,6 +1562,72 @@ mod tests {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_disk_id_state_does_not_publish_to_the_process_registry() {
+        let local_dir = tempfile::tempdir().expect("local disk tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(local_dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let local_disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+        let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
+        let disk_id = Uuid::new_v4();
+
+        disk.set_disk_id_state(Some(disk_id))
+            .await
+            .expect("local wrapper state should accept a disk ID");
+
+        let Disk::Local(local_disk) = &disk else {
+            panic!("test disk should remain local");
+        };
+        assert_eq!(local_disk.get_current_disk_id().await, Some(disk_id));
+        assert!(
+            !crate::runtime::global::current_ctx()
+                .local_disk_id_map()
+                .read()
+                .await
+                .contains_key(&disk_id),
+            "state-only startup publication must not update the process disk-ID registry"
+        );
+
+        disk.set_disk_id_state(None)
+            .await
+            .expect("local wrapper state should clear a disk ID");
+        assert_eq!(local_disk.get_current_disk_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn remote_disk_id_state_delegates_some_and_none() {
+        let mut endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should initialize");
+        let disk = Disk::Remote(Box::new(remote_disk));
+        let disk_id = Uuid::new_v4();
+
+        disk.set_disk_id_state(Some(disk_id))
+            .await
+            .expect("remote state should accept a disk ID");
+        assert_eq!(disk.get_disk_id().await.expect("remote disk ID should be readable"), Some(disk_id));
+
+        disk.set_disk_id_state(None)
+            .await
+            .expect("remote state should clear a disk ID");
+        assert_eq!(disk.get_disk_id().await.expect("remote disk ID should be readable"), None);
     }
 
     #[tokio::test]

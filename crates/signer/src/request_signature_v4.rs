@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::LazyLock;
 use time::{OffsetDateTime, macros::format_description};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
@@ -135,6 +135,8 @@ fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
     Ok(hashed_payload.to_string())
 }
 
+/// The headers signed here carry credential material (`x-amz-security-token`, SSE-C keys),
+/// so neither the names nor the values may be written to any log sink.
 fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
@@ -165,9 +167,6 @@ fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &Has
         headers.push("host".to_string());
     }
     headers.sort();
-
-    debug!("get_canonical_headers vals: {:?}", vals);
-    debug!("get_canonical_headers headers: {:?}", headers);
 
     let mut buf = BytesMut::new();
     for k in headers {
@@ -216,7 +215,6 @@ fn header_exists(key: &str, headers: &[String]) -> bool {
 fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> String {
     let mut headers = Vec::<String>::new();
     let headers_ref = req.headers();
-    debug!("get_signed_headers headers: {:?}", headers_ref);
     for (k, _) in headers_ref {
         if ignored_headers.contains(k.as_str()) {
             continue;
@@ -1236,5 +1234,71 @@ mod tests {
     fn format_yyyymmdd_is_zero_padded() {
         let t = datetime!(0001-01-02 03:04:05 UTC);
         assert_eq!(format_yyyymmdd(t), "00010102");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedWriter(CapturedLogs);
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.output.lock().expect("log buffer lock poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(self.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        fn output(&self) -> String {
+            String::from_utf8(self.output.lock().expect("log buffer lock poisoned").clone()).expect("logs should be UTF-8")
+        }
+    }
+
+    #[test]
+    fn signing_never_logs_signed_header_material() {
+        const MARKER: &str = "CS_TEST_SECRET_DO_NOT_LOG";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .expect("test request should build");
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-security-token", HeaderValue::from_static(MARKER));
+        headers.insert("x-amz-server-side-encryption-customer-key", HeaderValue::from_static(MARKER));
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(logs.clone())
+            .finish();
+
+        let (canonical_headers, signed_headers) = tracing::subscriber::with_default(subscriber, || {
+            let canonical_headers = try_get_canonical_headers(&req, &V4_IGNORED_HEADERS).expect("request should canonicalize");
+            let signed_headers = get_signed_headers(&req, &V4_IGNORED_HEADERS);
+            (canonical_headers, signed_headers)
+        });
+
+        assert!(canonical_headers.contains(MARKER), "the header must still take part in signing");
+        assert!(signed_headers.contains("x-amz-security-token"));
+
+        let output = logs.output();
+        assert!(!output.contains(MARKER), "signed header value leaked into logs: {output}");
+        assert!(!output.contains("x-amz-security-token"), "signed header name leaked into logs: {output}");
     }
 }

@@ -20,11 +20,11 @@ otherwise a rolling upgrade with mixed node versions could read an emptied field
 
 ```
 rustfs_system_network_internode_msgpack_json_fallback_total{direction, message}
+rustfs_system_network_internode_msgpack_json_decode_total{direction, message, codec}
 rustfs_system_network_internode_msgpack_json_decode_error_total{direction, message, codec}
 ```
 
-Incremented whenever a decode falls back to the JSON field because the msgpack payload was
-absent.
+The decode counter increments after a successful msgpack or JSON compatibility decode. The fallback counter increments whenever a decode falls back to the JSON field because the msgpack payload was absent. The decode-error counter increments whenever either codec fails to decode.
 
 - `direction="request"` — a server decoding a peer's request (`node_service/disk.rs`).
 - `direction="response"` — a client decoding a peer's response (`cluster/rpc/remote_disk.rs`),
@@ -34,8 +34,18 @@ absent.
 
 ## Stage 0 — Observe (current stage)
 
-Ship the current release (which contains the counter) and let it run for **at least one
-full release window** across the whole fleet. The counter must stay at **zero**.
+Ship the current release (which contains these counters) and let it run for **at least one
+full release window** across the whole fleet. The fallback and decode-error counters must stay at **zero**.
+
+First confirm each expected message/direction has real traffic in the observation window:
+
+```promql
+sum by (direction, message, codec) (
+  increase(rustfs_system_network_internode_msgpack_json_decode_total[30d])
+)
+```
+
+For every convergence-ready message/direction below, the `codec="msgpack"` series must be non-zero before a zero fallback result is meaningful. Missing series, zero traffic, counter reset, or scrape gaps make the gate inconclusive rather than passed.
 
 Confirm zero across the observation window (adjust `[30d]` to the window length):
 

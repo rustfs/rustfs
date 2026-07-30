@@ -53,7 +53,7 @@ use super::account::validate_account_access;
 use super::container::ContainerMapper;
 use super::expiration_worker::{track_object_expiration, untrack_object_expiration};
 use super::storage_api::object::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
-use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle};
+use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle, validate_metadata};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_rio::HashReader;
@@ -67,12 +67,6 @@ const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
 const EVENT_SWIFT_OBJECT_STORAGE_STATE: &str = "swift_object_storage_state";
 const SWIFT_DELETE_AT_METADATA: &str = "x-delete-at";
-
-/// Maximum number of metadata headers allowed per object (Swift standard)
-const MAX_METADATA_COUNT: usize = 90;
-
-/// Maximum size in bytes for a single metadata value (Swift standard)
-const MAX_METADATA_VALUE_SIZE: usize = 256;
 
 /// Maximum object size in bytes (5GB - Swift default)
 const MAX_OBJECT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
@@ -212,10 +206,9 @@ impl ObjectKeyMapper {
     #[allow(dead_code)] // Used in: object operations
     pub fn normalize_path(object: &str) -> String {
         // Split by '/', filter out empty segments (except if it's the end)
-        let segments: Vec<&str> = object.split('/').collect();
         let has_trailing_slash = object.ends_with('/');
 
-        let normalized_segments: Vec<&str> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+        let normalized_segments: Vec<&str> = object.split('/').filter(|s| !s.is_empty()).collect();
 
         let mut result = normalized_segments.join("/");
 
@@ -232,38 +225,6 @@ impl Default for ObjectKeyMapper {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Validate metadata against Swift limits
-///
-/// Checks that:
-/// - Total number of metadata entries doesn't exceed MAX_METADATA_COUNT
-/// - Individual metadata values don't exceed MAX_METADATA_VALUE_SIZE
-///
-/// Returns error if limits are exceeded.
-fn validate_metadata(metadata: &HashMap<String, String>) -> SwiftResult<()> {
-    // Check total metadata count
-    if metadata.len() > MAX_METADATA_COUNT {
-        return Err(SwiftError::BadRequest(format!(
-            "Too many metadata headers: {} (max: {})",
-            metadata.len(),
-            MAX_METADATA_COUNT
-        )));
-    }
-
-    // Check individual value sizes
-    for (key, value) in metadata.iter() {
-        if value.len() > MAX_METADATA_VALUE_SIZE {
-            return Err(SwiftError::BadRequest(format!(
-                "Metadata value for '{}' too large: {} bytes (max: {} bytes)",
-                key,
-                value.len(),
-                MAX_METADATA_VALUE_SIZE
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 fn metadata_delete_at(metadata: &HashMap<String, String>) -> Option<u64> {

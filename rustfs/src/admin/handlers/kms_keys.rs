@@ -851,6 +851,13 @@ impl Operation for DeleteKmsKeyHandler {
                 let status = match &e {
                     KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
                     KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
+                    // Damaged or missing key material is an integrity fault of an existing
+                    // key: it must surface as a server error, never as NOT_FOUND (the key
+                    // exists) and never as a retryable backend outage.
+                    KmsError::MaterialMissing { .. }
+                    | KmsError::MaterialCorrupt { .. }
+                    | KmsError::MaterialAuthenticationFailed { .. }
+                    | KmsError::UnsupportedFormatVersion { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 let response = DeleteKmsKeyResponse {
@@ -1265,6 +1272,13 @@ impl Operation for DescribeKmsKeyHandler {
                 let status = match &e {
                     KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
                     KmsError::InvalidOperation { .. } => StatusCode::BAD_REQUEST,
+                    // Damaged or missing key material is an integrity fault of an existing
+                    // key: it must surface as a server error, never as NOT_FOUND (the key
+                    // exists) and never as a retryable backend outage.
+                    KmsError::MaterialMissing { .. }
+                    | KmsError::MaterialCorrupt { .. }
+                    | KmsError::MaterialAuthenticationFailed { .. }
+                    | KmsError::UnsupportedFormatVersion { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
 

@@ -14,7 +14,7 @@ WARP_BIN="warp"
 WARP_MODE="get"
 DURATION="60s"
 CONCURRENCIES="1,64"
-SIZES="0B,16383B,16384B,16385B,32767B,32768B,32769B,131071B,131072B,131073B,262143B,262144B,262145B,1048575B,1048576B,1048577B,4194304B"
+SIZES="1B,16383B,16384B,16385B,32767B,32768B,32769B,131071B,131072B,131073B,262143B,262144B,262145B,1048575B,1048576B,1048577B,4194304B"
 ROUNDS_PER_LEG=5
 COOLDOWN_SECS=20
 BUCKET_PREFIX="rustfs-1432-paired"
@@ -50,7 +50,7 @@ Options:
   --warp-mode <get|put|mixed>             Default: get
   --duration <dur>                        Default: 60s
   --concurrencies <csv>                   Default: 1,64
-  --sizes <csv>                           Default: #1432 boundary matrix
+  --sizes <csv>                           Default: #1432 positive-size boundary matrix
   --rounds-per-leg <n>                    Default: 5
   --cooldown-secs <n>                     Default: 20
   --bucket-prefix <prefix>                Default: rustfs-1432-paired
@@ -108,6 +108,19 @@ validate_ack_contract() {
     strict|relaxed) ;;
     *) die "$name must be strict or relaxed" ;;
   esac
+}
+
+validate_warp_sizes_supported() {
+  local raw
+  local -a raw_sizes
+  IFS=',' read -r -a raw_sizes <<< "$SIZES"
+  for raw in "${raw_sizes[@]}"; do
+    case "$raw" in
+      0|0B|0b|0K|0KB|0KiB|0k|0kb|0kib|0M|0MB|0MiB|0m|0mb|0mib|0G|0GB|0GiB|0g|0gb|0gib)
+        die "--sizes contains $raw, but warp requires object size > 0; run zero-byte compatibility as a separate functional probe"
+        ;;
+    esac
+  done
 }
 
 validate_label() {
@@ -185,6 +198,9 @@ validate_args() {
   validate_ack_contract "$MINIO_ACK_CONTRACT" "--minio-ack-contract"
   validate_csv_nonempty "$CONCURRENCIES" "--concurrencies"
   validate_csv_nonempty "$SIZES" "--sizes"
+  if [[ "$TOOL" == "warp" ]]; then
+    validate_warp_sizes_supported
+  fi
   validate_positive_int "$ROUNDS_PER_LEG" "--rounds-per-leg"
   validate_nonnegative_int "$COOLDOWN_SECS" "--cooldown-secs"
   [[ "$TOOL" == "warp" || "$TOOL" == "s3bench" ]] || die "--tool must be warp or s3bench"

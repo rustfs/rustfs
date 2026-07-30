@@ -28,7 +28,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
-use crate::storage::storage_api::{sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest};
+use crate::storage::storage_api::{
+    sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -40,6 +42,7 @@ use rustfs_filemeta::MetacacheReader;
 use rustfs_iam::store::UserType;
 use rustfs_lock::LockClient;
 use rustfs_protos::{
+    CanonicalMutationBody,
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
@@ -49,7 +52,7 @@ use std::{
     collections::HashMap,
     io::Cursor,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 use time::OffsetDateTime;
 use tokio::spawn;
@@ -87,6 +90,15 @@ fn signal_service_response(success: bool, error_info: Option<String>) -> Respons
     })
 }
 
+fn verify_node_mutation_body<T: CanonicalMutationBody>(request: &Request<T>, operation: &'static str) -> Result<(), Status> {
+    let canonical_body = request
+        .get_ref()
+        .canonical_body()
+        .map_err(|_| Status::invalid_argument(format!("{operation} request length cannot be represented")))?;
+    verify_tonic_mutation_body_digest(request, &canonical_body)
+        .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
+}
+
 fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
     NOTIFY_SUB_SYSTEMS.contains(&sub_system)
         || matches!(
@@ -116,6 +128,7 @@ fn remove_heal_control_replay(
 }
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
+static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -343,6 +356,7 @@ mod metrics;
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
     context: Option<Arc<runtime_sources::AppContext>>,
+    snapshot_lease_expiry: disk::SnapshotLeaseExpiryScheduler,
 }
 
 impl std::fmt::Debug for NodeService {
@@ -361,7 +375,11 @@ pub fn make_server() -> NodeService {
 
 pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer, context }
+    NodeService {
+        local_peer,
+        context,
+        snapshot_lease_expiry: disk::SnapshotLeaseExpiryScheduler::new(),
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -449,13 +467,27 @@ pub(crate) async fn initialize_heal_topology_fingerprint(
     cache: Arc<tokio::sync::OnceCell<String>>,
     endpoint_pools: EndpointServerPools,
 ) -> Result<(), String> {
+    initialize_heal_topology_fingerprint_with_probe(
+        cache,
+        endpoint_pools,
+        crate::storage::storage_api::start_remote_version_state_fleet_probe,
+    )
+    .await
+}
+
+async fn initialize_heal_topology_fingerprint_with_probe(
+    cache: Arc<tokio::sync::OnceCell<String>>,
+    endpoint_pools: EndpointServerPools,
+    start_probe: impl FnOnce(String),
+) -> Result<(), String> {
     if cache.get().is_some() {
         return Ok(());
     }
     let fingerprint = tokio::task::spawn_blocking(move || heal::heal_topology_fingerprint(&endpoint_pools))
         .await
         .map_err(|_| "heal control topology calculation task failed".to_string())??;
-    let _ = cache.set(fingerprint);
+    let _ = cache.set(fingerprint.clone());
+    start_probe(fingerprint);
     Ok(())
 }
 
@@ -789,6 +821,35 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
                 response_proof: Bytes::new(),
             }));
         }
+        if rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command) {
+            let topology_member = self
+                .endpoint_pools()
+                .await
+                .ok_or_else(|| Status::failed_precondition("heal control topology is not initialized"))?
+                .peers()
+                .1;
+            if topology_member.is_empty() {
+                return Err(Status::failed_precondition("local topology member identity is unavailable"));
+            }
+            let result =
+                rustfs_protos::encode_remote_version_state_capability(&topology_member, NODE_CAPABILITY_SERVER_EPOCH.as_bytes())
+                    .map_err(|_| Status::internal("remote version state capability length cannot be represented"))?;
+            let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+                request.get_ref().version,
+                &request.get_ref().topology_fingerprint,
+                &request.get_ref().command,
+                &result,
+            )
+            .map_err(|_| Status::internal("heal control response length cannot be represented"))?;
+            let response_proof = sign_tonic_rpc_response_proof(&canonical_response)
+                .map_err(|_| Status::internal("heal control response proof is unavailable"))?;
+            return Ok(Response::new(HealControlResponse {
+                success: true,
+                result: result.into(),
+                error_info: None,
+                response_proof: response_proof.into(),
+            }));
+        }
         let endpoints = self
             .endpoint_pools()
             .await
@@ -885,6 +946,7 @@ impl Node for NodeService {
     }
 
     async fn heal_bucket(&self, request: Request<HealBucketRequest>) -> Result<Response<HealBucketResponse>, Status> {
+        verify_node_mutation_body(&request, "heal bucket")?;
         self.handle_heal_bucket(request).await
     }
 
@@ -893,6 +955,7 @@ impl Node for NodeService {
     }
 
     async fn make_bucket(&self, request: Request<MakeBucketRequest>) -> Result<Response<MakeBucketResponse>, Status> {
+        verify_node_mutation_body(&request, "make bucket")?;
         self.handle_make_bucket(request).await
     }
 
@@ -901,6 +964,7 @@ impl Node for NodeService {
     }
 
     async fn delete_bucket(&self, request: Request<DeleteBucketRequest>) -> Result<Response<DeleteBucketResponse>, Status> {
+        verify_node_mutation_body(&request, "delete bucket")?;
         self.handle_delete_bucket(request).await
     }
 
@@ -926,8 +990,22 @@ impl Node for NodeService {
         self.handle_check_parts(request).await
     }
 
+    async fn prepare_part_transaction(
+        &self,
+        request: Request<PreparePartTransactionRequest>,
+    ) -> Result<Response<PreparePartTransactionResponse>, Status> {
+        self.handle_prepare_part_transaction(request).await
+    }
+
     async fn rename_part(&self, request: Request<RenamePartRequest>) -> Result<Response<RenamePartResponse>, Status> {
         self.handle_rename_part(request).await
+    }
+
+    async fn settle_part_transaction(
+        &self,
+        request: Request<SettlePartTransactionRequest>,
+    ) -> Result<Response<SettlePartTransactionResponse>, Status> {
+        self.handle_settle_part_transaction(request).await
     }
 
     async fn rename_file(&self, request: Request<RenameFileRequest>) -> Result<Response<RenameFileResponse>, Status> {
@@ -1110,6 +1188,24 @@ impl Node for NodeService {
     async fn delete_paths(&self, request: Request<DeletePathsRequest>) -> Result<Response<DeletePathsResponse>, Status> {
         self.handle_delete_paths(request).await
     }
+    async fn acquire_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        self.handle_acquire_snapshot_lease(request).await
+    }
+    async fn renew_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseRenewRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        self.handle_renew_snapshot_lease(request).await
+    }
+    async fn release_snapshot_lease(
+        &self,
+        request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        self.handle_release_snapshot_lease(request).await
+    }
     async fn read_metadata(&self, request: Request<ReadMetadataRequest>) -> Result<Response<ReadMetadataResponse>, Status> {
         self.handle_read_metadata(request).await
     }
@@ -1158,18 +1254,22 @@ impl Node for NodeService {
     }
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        verify_node_mutation_body(&request, "lock")?;
         self.handle_lock(request).await
     }
 
     async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        verify_node_mutation_body(&request, "unlock")?;
         self.handle_un_lock(request).await
     }
 
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        verify_node_mutation_body(&request, "force unlock")?;
         self.handle_force_un_lock(request).await
     }
 
     async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        verify_node_mutation_body(&request, "refresh lock")?;
         self.handle_refresh(request).await
     }
 
@@ -1177,6 +1277,7 @@ impl Node for NodeService {
         &self,
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        verify_node_mutation_body(&request, "lock batch")?;
         self.handle_lock_batch(request).await
     }
 
@@ -1184,6 +1285,7 @@ impl Node for NodeService {
         &self,
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        verify_node_mutation_body(&request, "unlock batch")?;
         self.handle_un_lock_batch(request).await
     }
 
@@ -1303,6 +1405,7 @@ impl Node for NodeService {
         &self,
         request: Request<LoadBucketMetadataRequest>,
     ) -> Result<Response<LoadBucketMetadataResponse>, Status> {
+        verify_node_mutation_body(&request, "load bucket metadata")?;
         self.handle_load_bucket_metadata(request).await
     }
 
@@ -1310,10 +1413,12 @@ impl Node for NodeService {
         &self,
         request: Request<DeleteBucketMetadataRequest>,
     ) -> Result<Response<DeleteBucketMetadataResponse>, Status> {
+        verify_node_mutation_body(&request, "delete bucket metadata")?;
         self.handle_delete_bucket_metadata(request).await
     }
 
     async fn delete_policy(&self, request: Request<DeletePolicyRequest>) -> Result<Response<DeletePolicyResponse>, Status> {
+        verify_node_mutation_body(&request, "delete policy")?;
         let request = request.into_inner();
         let policy = request.policy_name;
         if policy.is_empty() {
@@ -1344,6 +1449,7 @@ impl Node for NodeService {
     }
 
     async fn load_policy(&self, request: Request<LoadPolicyRequest>) -> Result<Response<LoadPolicyResponse>, Status> {
+        verify_node_mutation_body(&request, "load policy")?;
         let request = request.into_inner();
         let policy = request.policy_name;
         if policy.is_empty() {
@@ -1376,6 +1482,7 @@ impl Node for NodeService {
         &self,
         request: Request<LoadPolicyMappingRequest>,
     ) -> Result<Response<LoadPolicyMappingResponse>, Status> {
+        verify_node_mutation_body(&request, "load policy mapping")?;
         let request = request.into_inner();
         let user_or_group = request.user_or_group;
         if user_or_group.is_empty() {
@@ -1411,6 +1518,7 @@ impl Node for NodeService {
     }
 
     async fn delete_user(&self, request: Request<DeleteUserRequest>) -> Result<Response<DeleteUserResponse>, Status> {
+        verify_node_mutation_body(&request, "delete user")?;
         let request = request.into_inner();
         let access_key = request.access_key;
         if access_key.is_empty() {
@@ -1443,6 +1551,7 @@ impl Node for NodeService {
         &self,
         request: Request<DeleteServiceAccountRequest>,
     ) -> Result<Response<DeleteServiceAccountResponse>, Status> {
+        verify_node_mutation_body(&request, "delete service account")?;
         let request = request.into_inner();
         let access_key = request.access_key;
         if access_key.is_empty() {
@@ -1478,6 +1587,7 @@ impl Node for NodeService {
     }
 
     async fn load_user(&self, request: Request<LoadUserRequest>) -> Result<Response<LoadUserResponse>, Status> {
+        verify_node_mutation_body(&request, "load user")?;
         let request = request.into_inner();
         let access_key = request.access_key;
         let temp = request.temp;
@@ -1515,6 +1625,7 @@ impl Node for NodeService {
         &self,
         request: Request<LoadServiceAccountRequest>,
     ) -> Result<Response<LoadServiceAccountResponse>, Status> {
+        verify_node_mutation_body(&request, "load service account")?;
         let request = request.into_inner();
         let access_key = request.access_key;
         if access_key.is_empty() {
@@ -1546,6 +1657,7 @@ impl Node for NodeService {
     }
 
     async fn load_group(&self, request: Request<LoadGroupRequest>) -> Result<Response<LoadGroupResponse>, Status> {
+        verify_node_mutation_body(&request, "load group")?;
         let request = request.into_inner();
         let group = request.group;
         if group.is_empty() {
@@ -1577,8 +1689,9 @@ impl Node for NodeService {
 
     async fn reload_site_replication_config(
         &self,
-        _request: Request<ReloadSiteReplicationConfigRequest>,
+        request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
+        verify_node_mutation_body(&request, "reload site replication config")?;
         let Some(_store) = self.resolve_object_store() else {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
@@ -1598,6 +1711,7 @@ impl Node for NodeService {
     }
 
     async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
+        verify_node_mutation_body(&request, "signal service")?;
         let request = request.into_inner();
         let vars = match request.vars {
             Some(vars) => vars.value,
@@ -1798,8 +1912,9 @@ impl Node for NodeService {
 
     async fn reload_pool_meta(
         &self,
-        _request: Request<ReloadPoolMetaRequest>,
+        request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
+        verify_node_mutation_body(&request, "reload pool metadata")?;
         let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
@@ -1825,6 +1940,7 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
+        verify_node_mutation_body(&request, "stop rebalance")?;
         let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
@@ -1845,6 +1961,7 @@ impl Node for NodeService {
         &self,
         request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
+        verify_node_mutation_body(&request, "load rebalance metadata")?;
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
         let Some(store) = self.resolve_object_store() else {
             log_load_rebalance_meta_rejected!("server_not_initialized", start_rebalance);
@@ -1890,6 +2007,7 @@ impl Node for NodeService {
         &self,
         request: Request<StartDecommissionRequest>,
     ) -> Result<Response<StartDecommissionResponse>, Status> {
+        verify_node_mutation_body(&request, "start decommission")?;
         let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(Response::new(StartDecommissionResponse {
                 success: false,
@@ -1921,6 +2039,7 @@ impl Node for NodeService {
         &self,
         request: Request<CancelDecommissionRequest>,
     ) -> Result<Response<CancelDecommissionResponse>, Status> {
+        verify_node_mutation_body(&request, "cancel decommission")?;
         let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(Response::new(CancelDecommissionResponse {
                 success: false,
@@ -1953,6 +2072,7 @@ impl Node for NodeService {
         &self,
         request: Request<ClearDecommissionRequest>,
     ) -> Result<Response<ClearDecommissionResponse>, Status> {
+        verify_node_mutation_body(&request, "clear decommission")?;
         let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(Response::new(ClearDecommissionResponse {
                 success: false,
@@ -1983,8 +2103,9 @@ impl Node for NodeService {
 
     async fn load_transition_tier_config(
         &self,
-        _request: Request<LoadTransitionTierConfigRequest>,
+        request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
+        verify_node_mutation_body(&request, "load transition tier config")?;
         let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: false,
@@ -2013,10 +2134,10 @@ mod tests {
         PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
         STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
-        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, legacy_scanner_activity_response,
-        make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
-        make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
-        scanner_activity_response, stop_rebalance_response,
+        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint,
+        initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response, make_heal_control_server,
+        make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
+        previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
@@ -2035,35 +2156,105 @@ mod tests {
         sys::NewServiceAccountOpts,
     };
     use rustfs_kms::KmsServiceManager;
+    use rustfs_protos::CanonicalMutationBody as _;
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
-        BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
-        DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
-        DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
-        GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
-        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
-        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
-        HealBucketRequest, HealControlRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest,
-        LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        BackgroundHealStatusRequest, BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest,
+        ClearDecommissionRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest,
+        DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest,
+        DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest,
+        GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest,
+        GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
+        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, HealControlRequest,
+        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
-        ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
-        RenamePartRequest, ScannerActivityRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest,
-        StatVolumeRequest, StopRebalanceRequest, TierMutationPeerState, TierMutationPrepareRequest,
-        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-        WriteRequest,
+        MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
+        ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ServerInfoRequest, SettlePartTransactionRequest,
+        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationPeerState,
+        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
         node_service_server::NodeServiceServer,
         tier_mutation_control_service_server::TierMutationControlService as _,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
     use time::OffsetDateTime;
     use tokio::net::TcpListener;
     use tokio::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
+    use uuid::Uuid;
+
+    const DISK_MUTATION_RPC_METHODS: [&str; 18] = [
+        "renamedata",
+        "deleteversion",
+        "deleteversions",
+        "writemetadata",
+        "updatemetadata",
+        "writeall",
+        "delete",
+        "deletepaths",
+        "renamefile",
+        "renamepart",
+        "prepareparttransaction",
+        "settleparttransaction",
+        "deletevolume",
+        "makevolume",
+        "makevolumes",
+        "acquiresnapshotlease",
+        "renewsnapshotlease",
+        "releasesnapshotlease",
+    ];
+
+    fn normalized_rpc_method(method: &str) -> String {
+        method.replace('_', "").to_ascii_lowercase()
+    }
+
+    fn node_service_auth_policies() -> HashMap<String, &'static str> {
+        const POLICY_MARKER: &str = "// auth-policy: ";
+
+        let schema = include_str!("../../../../crates/protos/src/node.proto");
+        let service = schema
+            .split_once("service NodeService {")
+            .expect("NodeService must exist in node.proto")
+            .1
+            .split_once("\n}")
+            .expect("NodeService must have a closing brace")
+            .0;
+        let mut policies = HashMap::new();
+        for declaration in service.lines().filter_map(|line| line.trim().strip_prefix("rpc ")) {
+            let (rpc, policy) = declaration
+                .split_once(POLICY_MARKER)
+                .expect("every NodeService RPC must declare an auth-policy beside its proto definition");
+            let method = rpc.split_once('(').expect("RPC declaration must have a request type").0;
+            assert!(
+                policies.insert(normalized_rpc_method(method), policy.trim()).is_none(),
+                "duplicate NodeService RPC {method}",
+            );
+        }
+        assert!(!policies.is_empty(), "NodeService must declare RPC methods");
+        policies
+    }
+
+    #[test]
+    fn every_node_service_rpc_declares_an_auth_policy() {
+        const VALID_POLICIES: [&str; 4] = ["body-bound", "read-only", "streaming", "unimplemented"];
+
+        for (method, policy) in node_service_auth_policies() {
+            assert!(
+                VALID_POLICIES.contains(&policy),
+                "NodeService RPC {method} has unsupported auth-policy {policy:?}",
+            );
+        }
+    }
 
     struct HealControlMockStorage;
 
@@ -2448,9 +2639,14 @@ mod tests {
     async fn every_mutating_handler_enforces_its_body_digest() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
+        let mut covered_methods = HashSet::new();
 
         macro_rules! assert_gated {
             ($method:ident, $msg:expr, $canonical:path) => {{
+                assert!(
+                    covered_methods.insert(normalized_rpc_method(stringify!($method))),
+                    concat!("duplicate disk mutation test for ", stringify!($method)),
+                );
                 let msg = $msg;
 
                 // Correct digest: the gate passes and the handler proceeds to the (unknown) disk
@@ -2567,6 +2763,37 @@ mod tests {
             rustfs_protos::canonical_delete_request_body
         );
         assert_gated!(
+            acquire_snapshot_lease,
+            SnapshotLeaseRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                ttl_ms: 60_000,
+            },
+            rustfs_protos::canonical_snapshot_lease_request_body
+        );
+        assert_gated!(
+            renew_snapshot_lease,
+            SnapshotLeaseRenewRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                token: vec![1; 16].into(),
+                ttl_ms: 60_000,
+            },
+            rustfs_protos::canonical_snapshot_lease_renew_request_body
+        );
+        assert_gated!(
+            release_snapshot_lease,
+            SnapshotLeaseReleaseRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                token: vec![1; 16].into(),
+            },
+            rustfs_protos::canonical_snapshot_lease_release_request_body
+        );
+        assert_gated!(
             delete_paths,
             DeletePathsRequest {
                 disk: disk.clone(),
@@ -2599,6 +2826,28 @@ mod tests {
             rustfs_protos::canonical_rename_part_request_body
         );
         assert_gated!(
+            prepare_part_transaction,
+            PreparePartTransactionRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                meta: vec![0x04].into(),
+            },
+            rustfs_protos::canonical_prepare_part_transaction_request_body
+        );
+        assert_gated!(
+            settle_part_transaction,
+            SettlePartTransactionRequest {
+                disk: disk.clone(),
+                volume: "dst".into(),
+                path: "dp".into(),
+                rollback: true,
+            },
+            rustfs_protos::canonical_settle_part_transaction_request_body
+        );
+        assert_gated!(
             delete_volume,
             DeleteVolumeRequest {
                 disk: disk.clone(),
@@ -2622,6 +2871,12 @@ mod tests {
                 volumes: vec!["v".into()],
             },
             rustfs_protos::canonical_make_volumes_request_body
+        );
+
+        let expected_methods = DISK_MUTATION_RPC_METHODS.into_iter().map(String::from).collect();
+        assert_eq!(
+            covered_methods, expected_methods,
+            "the disk mutation exclusion set must exactly match handlers exercised by the independent digest test",
         );
     }
 
@@ -2923,6 +3178,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_version_state_probe_authenticates_topology_challenge_and_process_epoch() {
+        let _ = rustfs_credentials::set_global_rpc_secret("remote-version-state-node-service-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+        let probe_command = rustfs_protos::remote_version_state_capability_probe(&[7; 16]);
+        let mut request = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .expect("probe should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .heal_control(request)
+            .await
+            .expect("matching topology should be acknowledged")
+            .into_inner();
+
+        let (topology_member, process_epoch) =
+            rustfs_protos::decode_remote_version_state_capability(&response.result).expect("capability response should decode");
+        assert_eq!(topology_member, "node-a:9000");
+        let server_epoch = Uuid::from_slice(process_epoch).expect("server epoch should be a UUID");
+        assert!(!server_epoch.is_nil());
+        let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &probe_command,
+            &response.result,
+        )
+        .expect("response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
+            .expect("outer proof should bind the response to the request");
+
+        let different_probe = rustfs_protos::remote_version_state_capability_probe(&[8; 16]);
+        let different_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &different_probe,
+            &response.result,
+        )
+        .expect("different response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&different_response, &response.response_proof)
+            .expect_err("proof from one challenge must not be reusable");
+    }
+
+    #[tokio::test]
     async fn heal_control_coordinator_rejects_expired_and_non_admin_starts() {
         let _ = rustfs_credentials::set_global_rpc_secret("heal-control-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
@@ -2984,10 +3293,15 @@ mod tests {
         let topology = heal_control_test_endpoints("node-d");
         let expected = heal_topology_fingerprint(&topology).expect("test topology should hash");
         let cache = Arc::new(tokio::sync::OnceCell::new());
-        initialize_heal_topology_fingerprint(Arc::clone(&cache), topology)
-            .await
-            .expect("valid topology should initialize");
+        let started_probe = Arc::new(std::sync::Mutex::new(None));
+        let started_probe_capture = Arc::clone(&started_probe);
+        initialize_heal_topology_fingerprint_with_probe(Arc::clone(&cache), topology, move |fingerprint| {
+            *started_probe_capture.lock().expect("probe capture should not poison") = Some(fingerprint);
+        })
+        .await
+        .expect("valid topology should initialize");
         assert_eq!(cache.get(), Some(&expected));
+        assert_eq!(started_probe.lock().expect("probe capture should not poison").as_ref(), Some(&expected));
 
         let mut invalid = heal_control_test_endpoints("node-d");
         invalid.as_mut()[0].endpoints.as_mut()[0].pool_idx = -1;
@@ -3314,6 +3628,39 @@ mod tests {
         let rename_response = response.unwrap().into_inner();
         assert!(!rename_response.success);
         assert!(rename_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_part_transaction_invalid_disk() {
+        let service = create_test_node_service();
+
+        let prepare = service
+            .prepare_part_transaction(Request::new(PreparePartTransactionRequest {
+                disk: "invalid-disk-path".to_string(),
+                src_volume: "src-volume".to_string(),
+                src_path: "src-path".to_string(),
+                dst_volume: "dst-volume".to_string(),
+                dst_path: "dst-path".to_string(),
+                meta: Bytes::new(),
+            }))
+            .await
+            .expect("prepare RPC should return a structured disk error")
+            .into_inner();
+        assert!(!prepare.success);
+        assert!(prepare.error.is_some());
+
+        let settle = service
+            .settle_part_transaction(Request::new(SettlePartTransactionRequest {
+                disk: "invalid-disk-path".to_string(),
+                volume: "dst-volume".to_string(),
+                path: "dst-path".to_string(),
+                rollback: true,
+            }))
+            .await
+            .expect("settle RPC should return a structured disk error")
+            .into_inner();
+        assert!(!settle.success);
+        assert!(settle.error.is_some());
     }
 
     #[tokio::test]
@@ -4348,6 +4695,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_bucket_metadata_failure_skips_scanner_maintenance() {
+        let service = create_test_node_service();
+        let maintenance_generation = rustfs_scanner::scanner_maintenance_generation();
+
+        let request = Request::new(LoadBucketMetadataRequest {
+            bucket: "reload-miss-scanner-guard-bucket".to_string(),
+            scanner_maintenance_change: true,
+        });
+
+        let response = service.load_bucket_metadata(request).await.expect("rpc should reply");
+        let load_response = response.into_inner();
+
+        // Whether the reload fails on missing server state or on the absent
+        // persisted metadata, a failed reload must report failure and must
+        // not tell the scanner a maintenance change landed.
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert_eq!(
+            rustfs_scanner::scanner_maintenance_generation(),
+            maintenance_generation,
+            "a failed metadata reload must not advance scanner maintenance activity"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
         let service = create_test_node_service();
@@ -4658,6 +5030,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signal_service_body_digest_gate_runs_before_request_handling() {
+        let service = create_test_node_service();
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), "99".to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), "scanner".to_string());
+        vars.insert(PEER_RESTDRY_RUN.to_string(), "false".to_string());
+        let message = SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        };
+
+        let mut other = message.clone();
+        other
+            .vars
+            .as_mut()
+            .expect("signal vars should exist")
+            .value
+            .insert(PEER_RESTSIGNAL.to_string(), "1".to_string());
+        let mut tampered = Request::new(message.clone());
+        let other_body = other.canonical_body().expect("small signal request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &other_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut tampered);
+        let error = service
+            .signal_service(tampered)
+            .await
+            .expect_err("a tampered signal request must fail before handler logic");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut signed = Request::new(message);
+        let body = signed.get_ref().canonical_body().expect("small signal request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let response = service
+            .signal_service(signed)
+            .await
+            .expect("a correctly body-bound signal request must reach handler logic")
+            .into_inner();
+        assert!(!response.success);
+        assert_eq!(response.error_info.as_deref(), Some("unsupported service signal: 99"));
+    }
+
+    #[tokio::test]
+    async fn every_non_disk_mutation_rejects_a_mismatched_body_digest() {
+        let service = create_test_node_service();
+        let mut covered_methods = HashSet::new();
+
+        macro_rules! assert_tampered {
+            ($method:ident, $message:expr) => {{
+                assert!(
+                    covered_methods.insert(normalized_rpc_method(stringify!($method))),
+                    concat!("duplicate non-disk mutation test for ", stringify!($method)),
+                );
+                let mut request = Request::new($message);
+                set_tonic_canonical_body_digest(&mut request, b"unrelated-canonical-body")
+                    .expect("digest metadata should encode");
+                mark_v2_authenticated(&mut request);
+                let error = service
+                    .$method(request)
+                    .await
+                    .expect_err(concat!(stringify!($method), " must reject a mismatched body digest"));
+                assert_eq!(
+                    error.code(),
+                    tonic::Code::PermissionDenied,
+                    concat!(stringify!($method), " must authenticate before any mutation"),
+                );
+            }};
+        }
+
+        assert_tampered!(heal_bucket, HealBucketRequest::default());
+        assert_tampered!(make_bucket, MakeBucketRequest::default());
+        assert_tampered!(delete_bucket, DeleteBucketRequest::default());
+        assert_tampered!(lock, GenerallyLockRequest::default());
+        assert_tampered!(un_lock, GenerallyLockRequest::default());
+        assert_tampered!(force_un_lock, GenerallyLockRequest::default());
+        assert_tampered!(refresh, GenerallyLockRequest::default());
+        assert_tampered!(lock_batch, BatchGenerallyLockRequest::default());
+        assert_tampered!(un_lock_batch, BatchGenerallyLockRequest::default());
+        assert_tampered!(load_bucket_metadata, LoadBucketMetadataRequest::default());
+        assert_tampered!(delete_bucket_metadata, DeleteBucketMetadataRequest::default());
+        assert_tampered!(delete_policy, DeletePolicyRequest::default());
+        assert_tampered!(load_policy, LoadPolicyRequest::default());
+        assert_tampered!(load_policy_mapping, LoadPolicyMappingRequest::default());
+        assert_tampered!(delete_user, DeleteUserRequest::default());
+        assert_tampered!(delete_service_account, DeleteServiceAccountRequest::default());
+        assert_tampered!(load_user, LoadUserRequest::default());
+        assert_tampered!(load_service_account, LoadServiceAccountRequest::default());
+        assert_tampered!(load_group, LoadGroupRequest::default());
+        assert_tampered!(reload_site_replication_config, ReloadSiteReplicationConfigRequest::default());
+        assert_tampered!(signal_service, SignalServiceRequest::default());
+        assert_tampered!(
+            scanner_activity,
+            ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+                acknowledge_instance_id: String::new(),
+                acknowledge_dirty_usage_generation: 0,
+            }
+        );
+        assert_tampered!(reload_pool_meta, ReloadPoolMetaRequest::default());
+        assert_tampered!(stop_rebalance, StopRebalanceRequest::default());
+        assert_tampered!(load_rebalance_meta, LoadRebalanceMetaRequest::default());
+        assert_tampered!(start_decommission, StartDecommissionRequest::default());
+        assert_tampered!(cancel_decommission, CancelDecommissionRequest::default());
+        assert_tampered!(clear_decommission, ClearDecommissionRequest::default());
+        assert_tampered!(load_transition_tier_config, LoadTransitionTierConfigRequest::default());
+
+        let body_bound_methods: HashSet<_> = node_service_auth_policies()
+            .into_iter()
+            .filter_map(|(method, policy)| (policy == "body-bound").then_some(method))
+            .collect();
+        let disk_methods: HashSet<_> = DISK_MUTATION_RPC_METHODS.into_iter().map(String::from).collect();
+        assert!(
+            disk_methods.is_subset(&body_bound_methods),
+            "every independently tested disk mutation must remain declared body-bound",
+        );
+        let expected_methods: HashSet<_> = body_bound_methods.difference(&disk_methods).cloned().collect();
+        assert_eq!(
+            covered_methods, expected_methods,
+            "proto body-bound non-disk RPCs must exactly match handlers exercised by mismatch tests",
+        );
+    }
+
+    #[tokio::test]
     async fn test_scanner_activity_requires_body_bound_auth_before_storage_lookup() {
         let service = create_test_node_service();
 
@@ -4720,26 +5214,6 @@ mod tests {
             .await
             .expect_err("a signed malformed challenge must fail before storage lookup");
         assert_eq!(malformed_current.code(), tonic::Code::InvalidArgument);
-
-        let mut tampered = Request::new(ScannerActivityRequest {
-            challenge: vec![7; 16].into(),
-            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
-            acknowledge_instance_id: String::new(),
-            acknowledge_dirty_usage_generation: 0,
-        });
-        let other = ScannerActivityRequest {
-            challenge: vec![8; 16].into(),
-            ..tampered.get_ref().clone()
-        };
-        let other_canonical =
-            rustfs_protos::canonical_scanner_activity_request_body(&other).expect("scanner activity request should encode");
-        set_tonic_canonical_body_digest(&mut tampered, &other_canonical).expect("digest metadata should encode");
-        mark_v2_authenticated(&mut tampered);
-        let tampered = service
-            .scanner_activity(tampered)
-            .await
-            .expect_err("tampered activity challenge must fail before storage lookup");
-        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
 
         let mut downgraded = Request::new(ScannerActivityRequest {
             challenge: vec![7; 16].into(),

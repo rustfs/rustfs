@@ -20,12 +20,19 @@ use crate::manager::KmsManager;
 use crate::types::*;
 use base64::Engine;
 use jiff::Zoned;
+use md5::{Digest as Md5Digest, Md5};
 use rand::random;
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::debug;
 use zeroize::Zeroize;
+
+fn md5_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hex::encode(hasher.finalize())
+}
 
 /// Data key for object encryption
 /// SECURITY: This struct automatically zeros sensitive key material when dropped
@@ -350,11 +357,7 @@ impl ObjectEncryptionService {
             encryption_context: context.clone(),
         };
 
-        let data_key = self
-            .kms_manager
-            .generate_data_key(request)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to generate data key: {e}")))?;
+        let data_key = self.kms_manager.generate_data_key(request).await?;
 
         let plaintext_key = data_key.plaintext_key;
 
@@ -431,11 +434,7 @@ impl ObjectEncryptionService {
             grant_tokens: Vec::new(),
         };
 
-        let decrypt_response = self
-            .kms_manager
-            .decrypt(decrypt_request)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data key: {e}")))?;
+        let decrypt_response = self.kms_manager.decrypt(decrypt_request).await?;
 
         // Create cipher
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;
@@ -494,8 +493,7 @@ impl ObjectEncryptionService {
 
         // Validate key MD5 if provided
         if let Some(expected_md5) = customer_key_md5 {
-            let actual_md5 = md5::compute(customer_key);
-            let actual_md5_hex = format!("{actual_md5:x}");
+            let actual_md5_hex = md5_hex(customer_key);
             if actual_md5_hex != expected_md5.to_lowercase() {
                 return Err(KmsError::validation_error("Customer key MD5 mismatch"));
             }

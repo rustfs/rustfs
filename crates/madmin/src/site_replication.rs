@@ -509,6 +509,13 @@ pub struct SRBucketInfo {
     pub cors_config_updated_at: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub location: String,
+    /// Whether every `site-repl-*` rule on the reporting site resolves to a usable bucket
+    /// target. A rule without one silently drops every object, and the rule set alone cannot
+    /// reveal it — the config is well-formed, the endpoint behind it is not reachable.
+    ///
+    /// `None` means the peer predates this field: treat it as "unknown", never as a fault.
+    #[serde(rename = "replicationTargetsOnline", default, skip_serializing_if = "Option::is_none")]
+    pub replication_targets_online: Option<bool>,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
 }

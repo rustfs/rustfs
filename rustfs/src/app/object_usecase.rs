@@ -72,7 +72,7 @@ use super::storage_api::object_usecase::error::{
     is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use super::storage_api::object_usecase::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
@@ -81,9 +81,9 @@ use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cac
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
-    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
-    normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
+    bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
+    extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
+    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -99,9 +99,9 @@ use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
-    RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
-    parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
-    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
+    RFC1123, check_preconditions, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
+    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
+    validate_bucket_exists, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
@@ -116,7 +116,7 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
-use md5::Context as Md5Context;
+use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
@@ -130,9 +130,7 @@ use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_targets::{
-    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-};
+use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
@@ -501,7 +499,7 @@ fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
 /// Map a bucket-quota checker outcome onto the S3 admission result.
 ///
 /// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
-fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<()> {
+pub(super) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<QuotaCheckResult> {
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -513,13 +511,17 @@ fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, Quota
         )),
         Err(e) => {
             counter!("rustfs_bucket_quota_check_failed_total").increment(1);
-            warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check failed closed");
+            if matches!(&e, QuotaError::UsageUnavailable { .. }) {
+                debug!(bucket, error = %e, state = "usage_pending", "Bucket quota check waiting for authoritative usage");
+            } else {
+                warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check failed closed");
+            }
             Err(S3Error::with_message(
                 S3ErrorCode::ServiceUnavailable,
                 "Bucket quota check temporarily unavailable, please retry".to_string(),
             ))
         }
-        _ => Ok(()),
+        Ok(result) => Ok(result),
     }
 }
 
@@ -607,6 +609,16 @@ struct GetObjectRequestContext {
     part_number: Option<usize>,
     rs: Option<HTTPRangeSpec>,
     opts: ObjectOptions,
+}
+
+/// Request fields that passed the cheap GET validations, ready for the
+/// bucket-metadata work in [`DefaultObjectUsecase::prepare_get_object_request_context`].
+struct GetObjectValidatedRequest {
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    part_number: Option<usize>,
+    rs: Option<HTTPRangeSpec>,
 }
 
 struct GetObjectReadSetup {
@@ -749,7 +761,7 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object, existing.transition_version_state)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
         tier_sweeper::transitioned_delete_journal_entry(
@@ -757,6 +769,7 @@ async fn enqueue_transitioned_delete_cleanup(
             opts.versioned,
             opts.version_suspended,
             &existing.transitioned_object,
+            existing.transition_version_state,
         )
     };
     let Some(mut je) = je else {
@@ -786,7 +799,7 @@ pin_project! {
     struct ExtractArchiveEtagReader<R> {
         #[pin]
         inner: R,
-        md5: Md5Context,
+        md5: Md5,
         finished: bool,
         etag: Arc<Mutex<Option<String>>>,
     }
@@ -1839,7 +1852,7 @@ impl<R> ExtractArchiveEtagReader<R> {
     fn new(inner: R, etag: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             inner,
-            md5: Md5Context::new(),
+            md5: Md5::new(),
             finished: false,
             etag,
         }
@@ -1855,11 +1868,11 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
             Poll::Ready(Ok(())) => {
                 let filled = &buf.filled()[before..];
                 if !filled.is_empty() {
-                    this.md5.consume(filled);
+                    this.md5.update(filled);
                 } else if !*this.finished {
                     *this.finished = true;
                     if let Ok(mut etag) = this.etag.lock() {
-                        *etag = Some(format!("{:x}", this.md5.clone().finalize()));
+                        *etag = Some(hex_simd::encode_to_string(this.md5.clone().finalize(), hex_simd::AsciiCase::Lower));
                     }
                 }
                 Poll::Ready(Ok(()))
@@ -3037,6 +3050,25 @@ fn can_skip_delete_objects_pre_stat(
     !bucket_lock_enabled && !replicate_deletes && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
 }
 
+fn complete_delete_noop(
+    helper: OperationHelper,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+) -> (S3Result<S3Response<DeleteObjectOutput>>, OperationHelper) {
+    let helper = helper
+        .event_name(EventName::ObjectRemovedNoOP)
+        .object(ObjectInfo {
+            name: key,
+            bucket,
+            ..Default::default()
+        })
+        .version_id(version_id.unwrap_or_default());
+    let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+    let helper = helper.complete(&result);
+    (result, helper)
+}
+
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .map(|value| normalize_snowball_prefix(&value))
@@ -3253,7 +3285,7 @@ impl DefaultObjectUsecase {
             return Ok(());
         };
         let quota_checker = QuotaChecker::new(metadata_sys);
-        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await)
+        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(|_| ())
     }
 
     fn build_memory_bytes_blob(
@@ -3552,7 +3584,9 @@ impl DefaultObjectUsecase {
         }
     }
 
-    async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
+    /// Cheap request-shape validations, run before the bucket-existence store
+    /// lookup so invalid requests keep their InvalidArgument precedence.
+    fn validate_get_object_request(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectValidatedRequest> {
         // Clone only the fields this path needs instead of the whole input.
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
@@ -3570,7 +3604,28 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, &req.headers)
+        Ok(GetObjectValidatedRequest {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            rs,
+        })
+    }
+
+    async fn prepare_get_object_request_context(
+        validated: GetObjectValidatedRequest,
+        headers: &HeaderMap,
+    ) -> S3Result<GetObjectRequestContext> {
+        let GetObjectValidatedRequest {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            rs,
+        } = validated;
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, headers)
             .await
             .map_err(ApiError::from)?;
 
@@ -3588,6 +3643,7 @@ impl DefaultObjectUsecase {
         &self,
         req: &S3Request<GetObjectInput>,
         manager: &'static ConcurrencyManager,
+        store: Arc<ECStore>,
         wrapper: &RequestTimeoutWrapper,
         timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
@@ -3596,17 +3652,6 @@ impl DefaultObjectUsecase {
         opts: &ObjectOptions,
         part_number: Option<usize>,
     ) -> S3Result<GetObjectPreparedRead> {
-        // SF05: Store lookup first (cached via SF01 moka cache).
-        let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let store = get_validated_store(bucket).await?;
-        if let Some(store_lookup_start) = store_lookup_start {
-            rustfs_io_metrics::record_get_object_stage_duration(
-                "s3_handler",
-                "store_lookup",
-                store_lookup_start.elapsed().as_secs_f64(),
-            );
-        }
-
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let cache_adapter = self.object_data_cache();
@@ -4730,7 +4775,13 @@ impl DefaultObjectUsecase {
             use_large_put_concurrency_tuning,
         );
 
-        let store = get_validated_store(&bucket).await?;
+        // Resolve the store through the request-bound server context
+        // (backlog#1052 S6), not the process-global handle, so an embedded
+        // second server never writes into the first server's store.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        validate_bucket_exists(&store, &bucket).await?;
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         debug!(
@@ -5513,8 +5564,40 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
+        // Cheap request-shape validations run first so invalid requests keep
+        // their InvalidArgument precedence over bucket existence.
+        let validated = match Self::validate_get_object_request(&req) {
+            Ok(validated) => validated,
+            Err(err) => {
+                lifecycle.finish_err();
+                return Err(err);
+            }
+        };
+
+        // SF05: Store lookup next (5s-TTL bucket-validation cache). Bucket
+        // existence is established before any bucket-metadata work, so requests
+        // naming nonexistent buckets fail before the versioning lookup in
+        // get_opts. The store comes from the request-bound server context
+        // (backlog#1052 S6), not the process-global handle.
+        let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let Some(store) = self.object_store() else {
+            lifecycle.finish_err();
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        if let Err(err) = validate_bucket_exists(&store, &req.input.bucket).await {
+            lifecycle.finish_err();
+            return Err(err);
+        }
+        if let Some(store_lookup_start) = store_lookup_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "store_lookup",
+                store_lookup_start.elapsed().as_secs_f64(),
+            );
+        }
+
         let request_context_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let request_context = match Self::prepare_get_object_request_context(&req).await {
+        let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
             Ok(request_context) => request_context,
             Err(err) => {
                 lifecycle.finish_err();
@@ -5540,7 +5623,18 @@ impl DefaultObjectUsecase {
         let manager = get_concurrency_manager();
 
         let prepared_read = match self
-            .prepare_get_object_read_execution(&req, manager, &wrapper, &timeout_config, &bucket, &key, rs, &opts, part_number)
+            .prepare_get_object_read_execution(
+                &req,
+                manager,
+                store,
+                &wrapper,
+                &timeout_config,
+                &bucket,
+                &key,
+                rs,
+                &opts,
+                part_number,
+            )
             .await
         {
             Ok(prepared_read) => prepared_read,
@@ -6444,6 +6538,7 @@ impl DefaultObjectUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects).suppress_event();
+        let request_context = helper.request_context_or_from_request(&req);
         let (bucket, delete) = {
             let bucket = req.input.bucket.clone();
             let delete = req.input.delete.clone();
@@ -6474,7 +6569,7 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
+        let version_cfg = bucket_versioning_config(&bucket).await;
         let bypass_governance = has_bypass_governance_header(&req.headers);
         let bucket_lock_enabled = bucket_object_locking_enabled(&bucket).await;
 
@@ -6561,14 +6656,16 @@ impl DefaultObjectUsecase {
             };
 
             let metadata = extract_metadata(&req.headers);
-            let opts: ObjectOptions = del_opts(
+            // Reuse the request-level versioning config fetched above instead of
+            // re-resolving it per key (up to 1000 identical lookups per request).
+            let opts: ObjectOptions = del_opts_with_versioning(
                 &bucket,
                 &object.object_name,
                 object.version_id.map(|f| f.to_string()),
                 &req.headers,
                 metadata,
+                &version_cfg,
             )
-            .await
             .map_err(ApiError::from)?;
 
             // backlog#929 (HP-8): the accounting branch after the store delete
@@ -6850,10 +6947,12 @@ impl DefaultObjectUsecase {
 
         let req_headers = req.headers.clone();
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let req_params = rustfs_targets::extract_params_header(&req_headers);
+        let resp_elements =
+            build_event_resp_elements(&S3Response::new(DeleteObjectsOutput::default()), &request_context.request_id);
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
         let notify_bucket = bucket.clone();
-        spawn_background_with_context(request_context, async move {
+        spawn_background_with_context(Some(request_context), async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
@@ -6868,8 +6967,8 @@ impl DefaultObjectUsecase {
                         }),
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                    .req_params(extract_params_header(&req_headers))
-                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .req_params(req_params.clone())
+                    .resp_elements(resp_elements.clone())
                     .host(get_request_host(&req_headers))
                     .user_agent(get_request_user_agent(&req_headers))
                     .build();
@@ -6915,6 +7014,16 @@ impl DefaultObjectUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
         }
 
+        // Establish bucket existence before any bucket-metadata work (matches
+        // PUT/GET): nonexistent buckets fail here instead of paying the
+        // versioning lookups in del_opts/get_opts first. Resolve the store
+        // through the request-bound server context (backlog#1052 S6), not the
+        // process-global handle.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        validate_bucket_exists(&store, &bucket).await?;
+
         let metadata = extract_metadata(&req.headers);
         // Clone version_id before it's moved
         let version_id_clone = version_id.clone();
@@ -6952,9 +7061,6 @@ impl DefaultObjectUsecase {
             ));
         }
         validate_undo_delete_version(expected_current_version_id.as_deref(), opts.version_id.as_deref())?;
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
         opts.expected_current_version_id = expected_current_version_id.clone();
 
         let replicate_force_delete = force_delete
@@ -6972,7 +7078,7 @@ impl DefaultObjectUsecase {
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
         // 1. Add a lightweight get_object_lock_info() that only fetches retention metadata
         // 2. Or use combined get-and-delete in storage layer with retention check callback
-        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
+        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
@@ -7015,9 +7121,8 @@ impl DefaultObjectUsecase {
                     }
 
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                        // TODO: send event
-
-                        return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+                        let (result, _helper) = complete_delete_noop(helper, bucket, key, version_id_clone);
+                        return result;
                     }
 
                     return Err(ApiError::from(err).into());
@@ -7176,13 +7281,20 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
 
+        // Establish bucket existence before any bucket-metadata work (matches
+        // PUT/GET): nonexistent buckets fail here instead of paying the
+        // versioning lookup in get_opts first. Resolve the store through the
+        // request-bound server context (backlog#1052 S6), not the
+        // process-global handle.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        validate_bucket_exists(&store, &bucket).await?;
+
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -7672,7 +7784,12 @@ impl DefaultObjectUsecase {
         let bucket_clone = bucket.clone();
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
-        let version_id_clone = obj_info_.version_id.map(|v| v.to_string());
+        let version_id_clone = obj_info_
+            .version_id
+            .map(|v| v.to_string())
+            .or_else(|| (opts.versioned || opts.version_suspended).then(|| Uuid::nil().to_string()));
+        let versioned = opts.versioned;
+        let version_suspended = opts.version_suspended;
         let mut restore_operation_metadata = HashMap::new();
         if let Some(id) = restore_operation_id {
             insert_str(&mut restore_operation_metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
@@ -7686,6 +7803,8 @@ impl DefaultObjectUsecase {
                     ..Default::default()
                 },
                 version_id: version_id_clone,
+                versioned,
+                version_suspended,
                 user_defined: restore_operation_metadata,
                 ..Default::default()
             };
@@ -7731,6 +7850,7 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
+        let request_context = helper.request_context_or_from_request(&req);
         let auth_method = req.method.clone();
         let auth_uri = req.uri.clone();
         let auth_headers = req.headers.clone();
@@ -7895,25 +8015,9 @@ impl DefaultObjectUsecase {
         let extract_limits = put_object_extract_limits();
         let extract_quota_snapshot = if let Some(metadata_sys) = self.bucket_metadata_sys() {
             let quota_checker = QuotaChecker::new(metadata_sys);
-            match quota_checker.get_quota_config(&bucket).await {
-                Ok(quota) => {
-                    if let Some(limit) = quota.quota {
-                        match quota_checker.get_real_time_usage(&bucket).await {
-                            Ok(current_usage) => Some((current_usage, limit)),
-                            Err(err) => {
-                                warn!(bucket, error = %err, state = "extract_usage_snapshot_failed", "Bucket quota snapshot degraded to allow");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Err(err) => {
-                    warn!(bucket, error = %err, state = "extract_quota_snapshot_failed", "Bucket quota snapshot degraded to allow");
-                    None
-                }
-            }
+            let check_result =
+                map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+            check_result.current_usage.zip(check_result.quota_limit)
         } else {
             None
         };
@@ -7923,7 +8027,7 @@ impl DefaultObjectUsecase {
         };
 
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let req_params = extract_params_header(&req.headers);
+        let req_params = rustfs_targets::extract_params_header(&req.headers);
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
@@ -8103,8 +8207,11 @@ impl DefaultObjectUsecase {
             let cache_adapter = self.object_data_cache();
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
 
-            let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
-                Ok(info) => info,
+            let (obj_info, backfilled_old_current_size) = match store
+                .put_object_with_old_current_size(&bucket, &fpath, &mut reader, &opts)
+                .await
+            {
+                Ok(result) => result,
                 Err(e) => {
                     if extract_options.ignore_errors {
                         warn!(error = %e, "Archive object write skipped due to ignore-errors");
@@ -8113,6 +8220,21 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            let extract_versioned = BucketVersioningSys::prefix_enabled(&bucket, &fpath).await;
+            match previous_current_size_from_backfill(backfilled_old_current_size) {
+                Some(previous_current_size) => {
+                    if extract_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
+                            .await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                    }
+                }
+                None => {
+                    record_bucket_object_write_unknown_previous_memory(&bucket, obj_info.size.max(0) as u64, extract_versioned)
+                        .await;
+                }
+            }
             let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
             if !wrote_any_entry {
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
@@ -8134,7 +8256,7 @@ impl DefaultObjectUsecase {
                 bucket_name: bucket.clone(),
                 object: convert_ecstore_object_info(obj_info.clone()),
                 req_params: req_params.clone(),
-                resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
+                resp_elements: build_event_resp_elements(&S3Response::new(output.clone()), &request_context.request_id),
                 version_id: version_id.clone(),
                 host: host.clone(),
                 port,
@@ -8142,8 +8264,7 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
+            spawn_background_with_context(Some(request_context.clone()), async move {
                 notify.notify(event_args).await;
             });
         }
@@ -9571,7 +9692,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn transitioned_delete_cleanup_persists_identity_bound_and_legacy_journals() {
+    async fn transitioned_delete_cleanup_persists_known_state_and_rejects_unknown_state() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         if current_app_context().is_none() {
             crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
@@ -9591,8 +9712,9 @@ mod tests {
         current.transitioned_object.tier = "WARM".to_string();
         current.transitioned_object.name = "remote/identity-bound".to_string();
         current.transitioned_object.version_id = "remote-version".to_string();
+        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
 
-        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>| {
+        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>, version_id_exact: bool| {
             use sha2::{Digest, Sha256};
 
             let mut hasher = Sha256::new();
@@ -9605,6 +9727,10 @@ mod tests {
                 hasher.update([0]);
                 hasher.update(backend_identity);
             }
+            if version_id_exact {
+                hasher.update([0]);
+                hasher.update(b"exact-version-id");
+            }
             format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
         };
 
@@ -9614,7 +9740,7 @@ mod tests {
         let mut identity_bound = store
             .get_object_reader(
                 ".rustfs.sys",
-                &journal_name("remote/identity-bound", Some(identity)),
+                &journal_name("remote/identity-bound", Some(identity), true),
                 None,
                 http::HeaderMap::new(),
                 &ObjectOptions::default(),
@@ -9627,11 +9753,14 @@ mod tests {
             .expect("identity-bound journal body should be readable");
         let identity_bound: serde_json::Value =
             serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
-        assert_eq!(identity_bound["version"], serde_json::json!(2));
+        assert_eq!(identity_bound["version"], serde_json::json!(4));
         assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
+        assert_eq!(identity_bound["version_id_exact"], serde_json::json!(true));
+        assert_eq!(identity_bound["version_state"], serde_json::json!("exact"));
 
         current.user_defined = Arc::new(HashMap::new());
         current.transitioned_object.name = "remote/legacy".to_string();
+        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
         enqueue_transitioned_delete_cleanup(
             store.clone(),
             "bucket",
@@ -9643,24 +9772,31 @@ mod tests {
             Some(&current),
         )
         .await
-        .expect("legacy force-delete cleanup should persist a fail-closed v1 journal");
-        let mut legacy = store
+        .expect("unknown force-delete cleanup should fail closed without a journal");
+        let legacy_err = match store
             .get_object_reader(
                 ".rustfs.sys",
-                &journal_name("remote/legacy", None),
+                &journal_name("remote/legacy", None, false),
                 None,
                 http::HeaderMap::new(),
                 &ObjectOptions::default(),
             )
             .await
-            .expect("legacy journal should be readable");
-        let mut legacy_data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut legacy.stream, &mut legacy_data)
-            .await
-            .expect("legacy journal body should be readable");
-        let legacy: serde_json::Value = serde_json::from_slice(&legacy_data).expect("legacy journal should decode as JSON");
-        assert_eq!(legacy["version"], serde_json::json!(1));
-        assert_eq!(legacy["backend_identity"], serde_json::Value::Null);
+        {
+            Ok(_) => panic!("unknown remote version state must not persist a delete journal"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                &legacy_err,
+                StorageError::FileNotFound
+                    | StorageError::ObjectNotFound(_, _)
+                    | StorageError::FileVersionNotFound
+                    | StorageError::VersionNotFound(_, _, _)
+                    | StorageError::VolumeNotFound
+            ),
+            "unknown remote version state must leave no journal, got {legacy_err:?}"
+        );
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
@@ -12994,6 +13130,40 @@ mod tests {
     }
 
     #[test]
+    fn delete_not_found_completes_noop_event_with_version_context() {
+        temp_env::with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
+            crate::server::refresh_notify_module_enabled();
+            for (version_id, expected_version) in [(None, ""), (Some("requested-version".to_string()), "requested-version")] {
+                let input = DeleteObjectInput::builder()
+                    .bucket("test-bucket".to_string())
+                    .key("missing-key".to_string())
+                    .version_id(version_id.clone())
+                    .build()
+                    .expect("delete input should build");
+                let mut req = build_request(input, Method::DELETE);
+                req.extensions.insert(crate::storage::access::ReqInfo {
+                    bucket: Some("test-bucket".to_string()),
+                    object: Some("missing-key".to_string()),
+                    version_id: version_id.clone(),
+                    ..Default::default()
+                });
+                let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
+
+                let (result, helper) =
+                    complete_delete_noop(helper, "test-bucket".to_string(), "missing-key".to_string(), version_id);
+                let event = helper.event_args().expect("successful no-op delete should retain an event");
+
+                assert_eq!(result.expect("no-op delete should succeed").status, Some(StatusCode::NO_CONTENT));
+                assert_eq!(event.event_name, EventName::ObjectRemovedNoOP);
+                assert_eq!(event.bucket_name, "test-bucket");
+                assert_eq!(event.object.name, "missing-key");
+                assert_eq!(event.version_id, expected_version);
+            }
+        });
+        crate::server::refresh_notify_module_enabled();
+    }
+
+    #[test]
     fn expected_current_version_header_normalizes_uuid_and_null() {
         let version = Uuid::new_v4();
         let mut headers = HeaderMap::new();
@@ -13976,7 +14146,12 @@ mod tests {
 
     #[test]
     fn quota_admission_allows_within_limit() {
-        map_quota_check_outcome("bucket", Ok(quota_result(true))).expect("an allowed result admits the write");
+        let result = map_quota_check_outcome("bucket", Ok(quota_result(true))).expect("an allowed result admits the write");
+
+        assert_eq!(result.current_usage, Some(1024));
+        assert_eq!(result.quota_limit, Some(2048));
+        assert_eq!(result.operation_size, 512);
+        assert_eq!(result.remaining, Some(512));
     }
 
     #[test]
@@ -13995,6 +14170,18 @@ mod tests {
             }),
         )
         .expect_err("a checker fault must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn quota_admission_fails_closed_on_unknown_authoritative_usage() {
+        let err = map_quota_check_outcome(
+            "bucket",
+            Err(QuotaError::UsageUnavailable {
+                bucket: "bucket".to_string(),
+            }),
+        )
+        .expect_err("unknown authoritative usage must not admit a quota-controlled write");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 }

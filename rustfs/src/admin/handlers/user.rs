@@ -27,7 +27,7 @@ use crate::{
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_EXPANDED_SIZE, MAX_IAM_IMPORT_SIZE};
 use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
@@ -118,6 +118,22 @@ fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> b
         return temp_identity_parent(requester).is_some_and(|p| p == target_access_key);
     }
     target_access_key == requester.access_key && requester.parent_user.is_empty()
+}
+
+/// Returns `true` when a derived credential (Console/STS session or service account) targets the
+/// long-term IAM user it was minted from.
+///
+/// SECURITY: [`should_check_deny_only`] relaxes the admin policy check to deny-only for exactly
+/// this target, so without this guard an AddUser call could rewrite the parent's stored secret key
+/// and status, turning a short-lived session into permanent control of the account. The parent is
+/// resolved the same way [`should_check_deny_only`] resolves it, since some stores persist the
+/// parent only inside the session token.
+fn add_user_targets_requester_parent(target_access_key: &str, requester: &Credentials) -> bool {
+    if !requester.is_temp() && !requester.is_service_account() {
+        return false;
+    }
+
+    temp_identity_parent(requester).is_some_and(|parent| parent == target_access_key)
 }
 
 fn should_reject_group_import_name(group_name: &str, group_lookup: &rustfs_iam::error::Error) -> bool {
@@ -249,6 +265,13 @@ impl Operation for AddUser {
 
         if from_utf8(ak.as_bytes()).is_err() {
             return Err(s3_error!(InvalidArgument, "access key is not valid UTF-8"));
+        }
+
+        if add_user_targets_requester_parent(ak, &cred) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "cannot change the credentials of the parent user of this session"
+            ));
         }
 
         let check_deny_only = should_check_deny_only(ak, &cred);
@@ -701,7 +724,7 @@ impl Operation for ExportIam {
             match file {
                 ALL_POLICIES_FILE => {
                     let policies: HashMap<String, rustfs_policy::policy::Policy> = iam_store
-                        .list_polices("")
+                        .list_policies("")
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                     let json_str = serde_json::to_vec(&policies)
@@ -885,6 +908,31 @@ impl Operation for ExportIam {
     }
 }
 
+/// Read one member of an IAM import archive, drawing from a shared expansion budget.
+///
+/// `MAX_IAM_IMPORT_SIZE` bounds the compressed upload only. Deflate ratios well above
+/// 100:1 are easy to construct, so reading members with `read_to_end` lets a small
+/// archive expand without bound. The budget is shared across every member so the
+/// archive as a whole is capped, not each member independently.
+fn read_import_member(file: &mut impl std::io::Read, budget: &mut u64) -> S3Result<Vec<u8>> {
+    let mut file_content = Vec::new();
+    // Read one byte past the budget: if it arrives, the member exceeded what is left.
+    let read = file
+        .take(budget.saturating_add(1))
+        .read_to_end(&mut file_content)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))? as u64;
+
+    if read > *budget {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "IAM import archive expands beyond the {MAX_IAM_IMPORT_EXPANDED_SIZE} byte limit"
+        ));
+    }
+
+    *budget -= read;
+    Ok(file_content)
+}
+
 pub struct ImportIam {}
 #[async_trait::async_trait]
 impl Operation for ImportIam {
@@ -926,6 +974,10 @@ impl Operation for ImportIam {
         let mut zip_reader =
             ZipArchive::new(Cursor::new(body)).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
+        // Shared across every member below, so the archive as a whole is bounded rather
+        // than each member being allowed the full limit.
+        let mut expansion_budget = MAX_IAM_IMPORT_EXPANDED_SIZE;
+
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
@@ -942,10 +994,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -982,10 +1031,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1024,10 +1070,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1068,10 +1111,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1158,6 +1198,7 @@ impl Operation for ImportIam {
                                         description: None,
                                         expiration: None,
                                         status: Some(status),
+                                        parent_user: None,
                                         allow_site_replicator_account: false,
                                     },
                                 )
@@ -1182,10 +1223,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1233,10 +1271,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1274,10 +1309,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1341,10 +1373,11 @@ impl Operation for ImportIam {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
+        GROUP_POLICY_MAPPING_USER_TYPE, MAX_IAM_IMPORT_EXPANDED_SIZE, MAX_IAM_IMPORT_SIZE,
+        SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR, add_user_targets_requester_parent,
         imported_service_account_access_key_failure, imported_service_account_parent_allowed,
         imported_service_account_parent_scope_failure, imported_service_account_status, map_add_user_create_error,
-        should_check_deny_only, should_reject_group_import_name, should_restore_group_as_disabled,
+        read_import_member, should_check_deny_only, should_reject_group_import_name, should_restore_group_as_disabled,
     };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
@@ -1454,6 +1487,78 @@ mod tests {
             ..Default::default()
         };
         assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_add_user_rejects_sts_session_targeting_its_parent() {
+        let cred = Credentials {
+            access_key: "VV0V3VYJK2PV6EG45X2Y".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "alice".to_string(),
+            ..Default::default()
+        };
+
+        // The relaxed deny-only admin check is reachable for exactly this target, so a guard on the
+        // write itself is what keeps the session from rewriting alice's long-term secret.
+        assert!(should_check_deny_only("alice", &cred));
+        assert!(add_user_targets_requester_parent("alice", &cred));
+        assert!(!add_user_targets_requester_parent("bob", &cred));
+    }
+
+    #[test]
+    fn test_add_user_rejects_sts_session_with_parent_only_in_jwt_claims() {
+        let mut claims = HashMap::new();
+        claims.insert("parent".to_string(), Value::String("alice".to_string()));
+        let cred = Credentials {
+            access_key: "39KNO04Z34D6T4AGL6E6".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+
+        assert!(add_user_targets_requester_parent("alice", &cred));
+    }
+
+    #[test]
+    fn test_add_user_rejects_service_account_targeting_its_parent() {
+        let mut claims = HashMap::new();
+        claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), Value::String("policy".to_string()));
+        let cred = Credentials {
+            access_key: "service-account".to_string(),
+            parent_user: "alice".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+
+        assert!(add_user_targets_requester_parent("alice", &cred));
+        assert!(!add_user_targets_requester_parent("bob", &cred));
+    }
+
+    #[test]
+    fn test_add_user_allows_long_term_credentials_to_manage_other_users() {
+        let cred = Credentials {
+            access_key: "admin".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!add_user_targets_requester_parent("alice", &cred));
+        assert!(!add_user_targets_requester_parent("admin", &cred));
+    }
+
+    #[test]
+    fn test_add_user_operation_guards_requester_parent_target() {
+        let guard_call = concat!("add_user_targets_requester_", "parent(ak, &cred)");
+        let source = include_str!("user.rs");
+        let guard_at = source
+            .find(guard_call)
+            .expect("AddUser must reject requests that target the requester's parent user");
+        let sink_at = source
+            .find("iam_store.create_user(ak, &args)")
+            .expect("AddUser create_user sink moved; re-anchor this guard test");
+        assert!(guard_at < sink_at, "the parent-user guard must run before the create_user write");
     }
 
     #[test]
@@ -1627,5 +1732,49 @@ mod tests {
     #[test]
     fn test_group_policy_mappings_use_regular_user_type() {
         assert_eq!(GROUP_POLICY_MAPPING_USER_TYPE, rustfs_iam::store::UserType::Reg);
+    }
+
+    /// A single member must not be able to exhaust the archive's expansion budget:
+    /// `MAX_IAM_IMPORT_SIZE` bounds the compressed upload only, so an unbounded
+    /// `read_to_end` here would let a small archive expand without limit.
+    #[test]
+    fn import_member_read_is_bounded_by_the_expansion_budget() {
+        let oversized = vec![b'a'; 1024];
+        let mut budget: u64 = 512;
+
+        let err = read_import_member(&mut oversized.as_slice(), &mut budget)
+            .expect_err("a member larger than the remaining budget must be rejected");
+        assert!(
+            matches!(*err.code(), S3ErrorCode::EntityTooLarge),
+            "expected EntityTooLarge, got {:?}",
+            err.code()
+        );
+    }
+
+    /// The budget is shared across members, so successive reads draw it down and the
+    /// archive as a whole is capped rather than each member independently.
+    #[test]
+    fn import_member_budget_is_shared_across_members() {
+        let member = vec![b'a'; 400];
+        let mut budget: u64 = 1000;
+
+        let first = read_import_member(&mut member.as_slice(), &mut budget).expect("first member fits");
+        assert_eq!(first.len(), 400);
+        assert_eq!(budget, 600, "budget must be drawn down by what was read");
+
+        read_import_member(&mut member.as_slice(), &mut budget).expect("second member still fits");
+        assert_eq!(budget, 200);
+
+        read_import_member(&mut member.as_slice(), &mut budget)
+            .expect_err("third member must be rejected once the shared budget is exhausted");
+    }
+
+    /// Guards the bound from being set so tight that ordinary imports break.
+    #[test]
+    fn import_expansion_budget_leaves_headroom_over_the_compressed_cap() {
+        assert!(
+            MAX_IAM_IMPORT_EXPANDED_SIZE >= MAX_IAM_IMPORT_SIZE as u64,
+            "expanded budget must not be smaller than the compressed upload cap"
+        );
     }
 }

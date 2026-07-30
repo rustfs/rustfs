@@ -14,8 +14,9 @@
 
 use super::{
     module_switch::{resolve_notify_module_state, validate_notify_module_env, with_refreshed_notify_module_state_from},
-    refresh_persisted_module_switches_from_store, runtime_sources,
+    refresh_persisted_module_switches_from, runtime_sources,
 };
+use crate::init::reconcile_persisted_bucket_notification_configurations;
 use crate::storage_api::server::event::{
     EventArgs as EcstoreEventArgs, StorageObjectInfo, read_existing_server_config_no_lock, register_event_dispatch_hook,
     with_server_config_read_lock,
@@ -38,6 +39,7 @@ use tracing::{info, instrument, warn};
 
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
 static NOTIFY_RUNTIME_RECONCILED: AtomicBool = AtomicBool::new(false);
+static NOTIFY_BUCKET_RULES_RECONCILED: AtomicBool = AtomicBool::new(false);
 static ECSTORE_EVENT_DISPATCH_HOOK: OnceLock<()> = OnceLock::new();
 
 const EVENT_NOTIFIER_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -54,6 +56,19 @@ pub(crate) fn mark_event_notifier_reconciled() {
 
 pub(crate) fn mark_event_notifier_unreconciled() {
     NOTIFY_RUNTIME_RECONCILED.store(false, Ordering::Release);
+    NOTIFY_BUCKET_RULES_RECONCILED.store(false, Ordering::Release);
+}
+
+fn are_bucket_notification_rules_reconciled() -> bool {
+    NOTIFY_BUCKET_RULES_RECONCILED.load(Ordering::Acquire)
+}
+
+fn mark_bucket_notification_rules_reconciled() {
+    NOTIFY_BUCKET_RULES_RECONCILED.store(true, Ordering::Release);
+}
+
+fn should_reconcile_bucket_notification_rules(runtime_changed: bool, notify_enabled: bool) -> bool {
+    notify_enabled && (runtime_changed || !are_bucket_notification_rules_reconciled())
 }
 
 pub fn refresh_notify_module_enabled() -> bool {
@@ -180,7 +195,7 @@ pub(crate) async fn reconcile_event_notifier_from_store(
         let system = ensure_live_events_initialized();
         let transition_system = system.clone();
         let transition_store = store.clone();
-        let transition = with_refreshed_notify_module_state_from(store, move |resolution| async move {
+        let transition = with_refreshed_notify_module_state_from(store.clone(), move |resolution| async move {
             NOTIFY_MODULE_ENABLED.store(resolution.enabled, Ordering::Relaxed);
             let read_store = transition_store.clone();
             let config_system = transition_system.clone();
@@ -208,11 +223,25 @@ pub(crate) async fn reconcile_event_notifier_from_store(
         .await
         .map_err(|err| NotificationError::Initialization(format!("failed to refresh notify module switch: {err}")))??;
 
+        let runtime_changed = transition.is_some();
         if let Some(transition) = transition {
             transition.wait().await?;
         }
 
-        ensure_event_notifier_converged(&system)
+        ensure_event_notifier_converged(&system)?;
+        if should_reconcile_bucket_notification_rules(runtime_changed, is_notify_module_enabled()) {
+            let configured_bucket_count = reconcile_persisted_bucket_notification_configurations(store).await?;
+            mark_bucket_notification_rules_reconciled();
+            info!(
+                event = EVENT_NOTIFY_RUNTIME_RECONCILE,
+                component = "notify",
+                subsystem = "bucket_rules",
+                configured_bucket_count,
+                "Persisted bucket notification rules reconciled"
+            );
+        }
+
+        Ok(())
     }
     .await;
 
@@ -309,30 +338,36 @@ pub async fn shutdown_event_notifier() -> Result<(), NotificationError> {
 
 #[instrument]
 pub async fn init_event_notifier() -> Result<(), NotificationError> {
+    init_event_notifier_with_store(runtime_sources::current_object_store_handle).await
+}
+
+async fn init_event_notifier_with_store<CurrentStore>(current_store: CurrentStore) -> Result<(), NotificationError>
+where
+    CurrentStore: FnOnce() -> Option<std::sync::Arc<rustfs_notify::NotifyStore>>,
+{
     mark_event_notifier_unreconciled();
     validate_notify_module_env().map_err(NotificationError::Initialization)?;
     let system = ensure_live_events_initialized();
-    refresh_persisted_module_switches_from_store()
+
+    let Some(store) = current_store() else {
+        let enabled = refresh_notify_module_enabled();
+        if enabled {
+            return Err(NotificationError::Initialization(
+                "failed to refresh notify module switch: storage layer not initialized".to_string(),
+            ));
+        }
+        initialize_live_event_support(&system, None).await?;
+        return Ok(());
+    };
+
+    refresh_persisted_module_switches_from(store.clone())
         .await
         .map_err(|err| NotificationError::Initialization(format!("failed to refresh notify module switch: {err}")))?;
 
     let enabled = refresh_notify_module_enabled();
 
     if !enabled {
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "Notify module is disabled, initializing live event stream support only. Set {}=true to enable notification targets.",
-            rustfs_config::ENV_NOTIFY_ENABLE
-        );
-        if system.runtime_lifecycle_state() != NotificationRuntimeState::LiveOnly {
-            system.set_targets_enabled(false, None).await?;
-        }
-        system.reload_persisted_config().await?;
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "Live event stream support initialized successfully."
-        );
-        ensure_event_notifier_converged(&system)?;
+        initialize_live_event_support(&system, Some(store)).await?;
         mark_event_notifier_reconciled();
         return Ok(());
     }
@@ -347,7 +382,7 @@ pub async fn init_event_notifier() -> Result<(), NotificationError> {
         "Event notifier configuration found, proceeding with initialization."
     );
 
-    system.reload_persisted_config().await?;
+    system.reload_persisted_config_from_store(store).await?;
     let runtime_state = system.runtime_lifecycle_state();
     if !matches!(runtime_state, NotificationRuntimeState::TargetsEnabled { .. }) {
         system.set_targets_enabled(true, None).await?;
@@ -361,13 +396,54 @@ pub async fn init_event_notifier() -> Result<(), NotificationError> {
     Ok(())
 }
 
+async fn initialize_live_event_support(
+    system: &NotificationSystem,
+    store: Option<std::sync::Arc<rustfs_notify::NotifyStore>>,
+) -> Result<(), NotificationError> {
+    if store.is_some() {
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "Notify module is disabled, initializing live event stream support only. Set {}=true to enable notification targets.",
+            rustfs_config::ENV_NOTIFY_ENABLE
+        );
+    } else {
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "Notify module is disabled, initializing live event stream support only. Persisted notification target reconciliation is deferred until storage is initialized. Set {}=true to enable notification targets.",
+            rustfs_config::ENV_NOTIFY_ENABLE
+        );
+    }
+
+    if system.runtime_lifecycle_state() != NotificationRuntimeState::LiveOnly {
+        system.set_targets_enabled(false, None).await?;
+    }
+    if let Some(store) = store {
+        system.reload_persisted_config_from_store(store).await?;
+    }
+    info!(
+        target: "rustfs::main::init_event_notifier",
+        "Live event stream support initialized successfully."
+    );
+    ensure_event_notifier_converged(system)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{convert_ecstore_object_info, parse_host_and_port, run_persisted_event_notifier_reconciler};
+    use super::super::module_switch::{
+        PersistedModuleSwitches, current_persisted_module_switches, persisted_module_switches_configured,
+        set_persisted_module_switches,
+    };
+    use super::{
+        convert_ecstore_object_info, init_event_notifier_with_store, mark_bucket_notification_rules_reconciled,
+        parse_host_and_port, run_persisted_event_notifier_reconciler, should_reconcile_bucket_notification_rules,
+    };
+    use crate::server::is_event_notifier_reconciled;
     use crate::storage_api::server::event::StorageObjectInfo;
     use crate::storage_api::server::event::contract::lifecycle::TransitionedObject;
     use chrono::{DateTime, Utc};
     use rustfs_notify::NotificationError;
+    use rustfs_notify::NotificationRuntimeState;
+    use serial_test::serial;
     use std::{
         collections::HashMap,
         future::pending,
@@ -380,6 +456,48 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    #[serial]
+    async fn disabled_notify_without_storage_initializes_live_events_without_reconcile() {
+        temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("false"))], async {
+            let previous = current_persisted_module_switches();
+            let previous_configured = persisted_module_switches_configured();
+            set_persisted_module_switches(PersistedModuleSwitches::default(), false);
+
+            init_event_notifier_with_store(|| None)
+                .await
+                .expect("disabled notify should not require storage during early bootstrap");
+
+            let system = rustfs_notify::notification_system().expect("live event container should be initialized");
+            assert_eq!(system.runtime_lifecycle_state(), NotificationRuntimeState::LiveOnly);
+            assert!(
+                !is_event_notifier_reconciled(),
+                "early live-only bootstrap must not claim persisted notify config is reconciled"
+            );
+
+            set_persisted_module_switches(previous, previous_configured);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enabled_notify_without_storage_still_fails_visible() {
+        temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"))], async {
+            let previous = current_persisted_module_switches();
+            let previous_configured = persisted_module_switches_configured();
+            set_persisted_module_switches(PersistedModuleSwitches::default(), false);
+
+            let err = init_event_notifier_with_store(|| None)
+                .await
+                .expect_err("enabled notify should still fail when storage is unavailable");
+            assert!(err.to_string().contains("storage layer not initialized"));
+
+            set_persisted_module_switches(previous, previous_configured);
+        })
+        .await;
+    }
 
     #[test]
     fn parse_host_and_port_with_ipv4_and_port() {
@@ -443,6 +561,30 @@ mod tests {
         assert_eq!(converted.restore_expires, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
         assert_eq!(converted.storage_class.as_deref(), Some("GLACIER"));
         assert_eq!(converted.transitioned_tier.as_deref(), Some("DEEP_ARCHIVE"));
+    }
+
+    #[test]
+    fn bucket_rule_reconcile_runs_once_and_after_runtime_change() {
+        super::mark_event_notifier_unreconciled();
+
+        assert!(
+            should_reconcile_bucket_notification_rules(false, true),
+            "enabled notify must restore bucket rules until the first successful replay"
+        );
+
+        mark_bucket_notification_rules_reconciled();
+        assert!(
+            !should_reconcile_bucket_notification_rules(false, true),
+            "steady-state reconcile must not rescan buckets every tick"
+        );
+        assert!(
+            should_reconcile_bucket_notification_rules(true, true),
+            "target runtime changes must replay persisted bucket rules"
+        );
+        assert!(
+            !should_reconcile_bucket_notification_rules(true, false),
+            "disabled notify must not load external target rules"
+        );
     }
 
     #[tokio::test(start_paused = true)]

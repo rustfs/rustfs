@@ -20,7 +20,7 @@
 //!
 //! ## Features
 //!
-//! - **Multiple Backends**: Local file storage, Vault KV2+Transit, and Vault Transit (optional)
+//! - **Multiple Backends**: Local file storage, Vault KV2 (plain KV storage), and Vault Transit (optional)
 //! - **Object Encryption**: Transparent S3-compatible object encryption
 //! - **Streaming Encryption**: Memory-efficient encryption for large files
 //! - **Key Management**: Full lifecycle management of encryption keys
@@ -71,6 +71,10 @@ pub mod config;
 mod encryption;
 mod error;
 pub mod manager;
+// The executor is wired into the Vault backends in a follow-up change; until
+// then the module is only exercised by its own tests.
+#[allow(dead_code)]
+mod policy;
 pub mod service;
 pub mod service_manager;
 mod time_serde;
@@ -89,7 +93,7 @@ pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{
-    KmsServiceManager, KmsServiceStatus, get_global_encryption_service, get_global_kms_service_manager,
+    KmsServiceManager, KmsServiceStatus, KmsStartOutcome, get_global_encryption_service, get_global_kms_service_manager,
     init_global_kms_service_manager,
 };
 pub use types::*;
@@ -177,8 +181,8 @@ mod tests {
         let service1 = manager.get_encryption_service().await.expect("Service should be available");
 
         // Reconfigure to new service (zero-downtime)
-        let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
-        let config2 = KmsConfig::local(temp_dir2.path().to_path_buf()).with_insecure_development_defaults();
+        let mut config2 = config1;
+        config2.timeout = std::time::Duration::from_secs(45);
         manager.reconfigure(config2).await.expect("Reconfiguration should succeed");
 
         // Verify version 2

@@ -87,7 +87,7 @@ fn bucket_deleted_marker_volume(bucket: &str) -> String {
     format!("{RUSTFS_META_BUCKET}/{}", bucket_deleted_marker_prefix(bucket))
 }
 
-async fn await_bucket_namespace_operation<T, F>(
+pub(crate) async fn await_bucket_namespace_operation<T, F>(
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
     bucket: &str,
     operation: &'static str,
@@ -310,12 +310,13 @@ impl ECStore {
         meta.set_created(opts.created_at);
 
         if opts.lock_enabled {
-            meta.object_lock_config_xml = crate::bucket::utils::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
-            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.object_lock_config_xml =
+                crate::bucket::utils::serialize::<ObjectLockConfiguration>(&ENABLED_OBJECT_LOCK_CONFIG)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
         if opts.versioning_enabled {
-            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
         await_bucket_namespace_operation(
@@ -325,6 +326,13 @@ impl ECStore {
             metadata_sys::set_bucket_metadata_in(&self.ctx, meta),
         )
         .await?;
+
+        if confirmed_missing && !is_meta_bucketname(bucket) {
+            // A scanner may have sampled the first fence before the bucket
+            // became visible. Fence again after metadata initialization so
+            // that snapshot cannot publish as complete.
+            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
 
         Ok(())
     }
@@ -545,6 +553,9 @@ impl ECStore {
                 "physical bucket deletion succeeded but metadata cleanup remains pending"
             );
         }
+        // A scanner may have sampled the first fence before the physical
+        // namespace disappeared. The completion fence invalidates that scan.
+        crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
         Ok(())
     }
 }
@@ -558,6 +569,7 @@ mod tests {
     };
     use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::bucket::metadata_sys;
+    use crate::cluster::rpc::peer_s3_client::install_delete_bucket_empty_scan_barrier;
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
     use crate::error::StorageError;
     use crate::object_api::{ObjectOptions, PutObjReader};
@@ -579,6 +591,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::{Notify, OnceCell};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -839,8 +852,8 @@ mod tests {
             .expect("bucket should be created");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_make.saturating_add(1),
-            "successful bucket creation should advance scanner namespace activity"
+            generation_before_make.saturating_add(2),
+            "successful bucket creation should fence scanner namespace activity before and after creation"
         );
 
         let generation_before_put = ecstore.scanner_namespace_mutation_generation();
@@ -1038,7 +1051,7 @@ mod tests {
             .await
             .expect("bucket should be created");
         for disk_path in &disk_paths {
-            tokio::fs::create_dir_all(disk_path.join(&bucket).join("empty-directory"))
+            tokio::fs::create_dir_all(disk_path.join(&bucket).join("empty-directory/nested/leaf"))
                 .await
                 .expect("empty directory remnant should be created");
         }
@@ -1057,8 +1070,8 @@ mod tests {
             .expect("MarkDelete should remove an empty bucket");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_delete.saturating_add(1),
-            "successful bucket deletion should advance scanner namespace activity"
+            generation_before_delete.saturating_add(2),
+            "successful bucket deletion should fence scanner namespace activity before and after deletion"
         );
 
         assert!(
@@ -1179,8 +1192,8 @@ mod tests {
             .expect("Purge should force-delete bucket data");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_delete.saturating_add(1),
-            "successful bucket purge should advance scanner namespace activity"
+            generation_before_delete.saturating_add(2),
+            "successful bucket purge should fence scanner namespace activity before and after deletion"
         );
 
         assert!(!any_disk_path_exists(&disk_paths, &bucket).await, "Purge should remove the bucket volume");
@@ -1249,7 +1262,56 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn bucket_delete_finishes_usage_cleanup_before_same_name_recreation() {
+    async fn bucket_delete_preserves_put_committed_after_empty_scan() {
+        let (_, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-empty-scan-race-{}", Uuid::new_v4().simple());
+        let object = "committed-after-empty-scan";
+        let payload = b"object committed after DeleteBucket empty scan".to_vec();
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let barrier = install_delete_bucket_empty_scan_barrier();
+        let delete_store = ecstore.clone();
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_bucket(&delete_bucket, &DeleteBucketOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        ecstore
+            .put_object(&bucket, object, &mut put_reader, &ObjectOptions::default())
+            .await
+            .expect("PUT should commit while DeleteBucket is paused after its empty scan");
+
+        barrier.release();
+        let err = delete
+            .await
+            .expect("DeleteBucket task should join")
+            .expect_err("DeleteBucket must reject a PUT committed after its empty scan");
+        assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed object should remain readable after DeleteBucket fails");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("object body should remain readable");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_recreation_does_not_publish_unverified_usage() {
         let (_, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-usage-generation-{}", Uuid::new_v4().simple());
         ecstore
@@ -1271,6 +1333,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        snapshot.usage_snapshot_complete = true;
         snapshot.bucket_sizes.insert(bucket.clone(), 42);
         snapshot.calculate_totals();
         crate::data_usage::store_data_usage_in_backend(snapshot, ecstore.clone())
@@ -1296,13 +1359,11 @@ mod tests {
             .await
             .expect("recreated bucket usage base should load");
         crate::data_usage::apply_bucket_usage_memory_overlay(&mut recreated).await;
-        assert_eq!(
-            recreated
-                .buckets_usage
-                .get(&bucket)
-                .map(|usage| (usage.objects_count, usage.versions_count, usage.size)),
-            Some((1, 1, 84))
+        assert!(
+            !recreated.buckets_usage.contains_key(&bucket),
+            "a request-path delta without an authoritative baseline must remain unavailable"
         );
+        assert_eq!(crate::data_usage::get_bucket_usage_memory(&bucket).await, None);
     }
 
     #[tokio::test]
@@ -1324,6 +1385,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        snapshot.usage_snapshot_complete = true;
         snapshot.bucket_sizes.insert(bucket.clone(), 42);
         snapshot.calculate_totals();
         crate::data_usage::store_data_usage_in_backend(snapshot, ecstore.clone())
@@ -1373,6 +1435,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        snapshot.usage_snapshot_complete = true;
         snapshot.bucket_sizes.insert(bucket.clone(), 42);
         snapshot.calculate_totals();
         crate::data_usage::store_data_usage_in_backend(snapshot, ecstore.clone())

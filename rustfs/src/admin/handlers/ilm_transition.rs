@@ -20,8 +20,10 @@ use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::lifecycle::{
     ManualTransitionCancelCheck, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressSink,
     ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission,
-    ManualTransitionScopeAdmissionClaim, claim_manual_transition_scope_admission,
-    delete_manual_transition_scope_admission_if_current, enqueue_transition_for_existing_objects_scoped,
+    ManualTransitionScopeAdmissionClaim, TransitionOperatorDeleteResult, TransitionOperatorError,
+    claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
+    delete_transition_candidate_for_operator, enqueue_transition_for_existing_objects_scoped,
+    finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
     load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
     manual_transition_job_lease_expired, manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
     persist_manual_transition_job_progress, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
@@ -33,6 +35,7 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::{
     MaskedAccessKey,
@@ -56,8 +59,11 @@ const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_ILM_TRANSITION: &str = "ilm_transition";
 const EVENT_ADMIN_ILM_TRANSITION_STATE: &str = "admin_ilm_transition_state";
+const EVENT_ADMIN_ILM_TRANSITION_RECONCILE: &str = "admin_ilm_transition_reconcile";
 
 static ACTIVE_MANUAL_TRANSITION_SCOPES: OnceLock<Mutex<Vec<ManualTransitionRunScope>>> = OnceLock::new();
+#[cfg(feature = "e2e-test-hooks")]
+const E2E_MANUAL_TRANSITION_CANCEL_BARRIER_ENV: &str = "RUSTFS_E2E_MANUAL_TRANSITION_CANCEL_BARRIER";
 static ACTIVE_MANUAL_TRANSITION_JOBS: OnceLock<Mutex<HashMap<Uuid, CancellationToken>>> = OnceLock::new();
 static MANUAL_TRANSITION_OWNER_ID: OnceLock<String> = OnceLock::new();
 
@@ -215,6 +221,16 @@ pub fn register_ilm_transition_route(r: &mut S3Router<AdminOperation>) -> std::i
         Method::DELETE,
         format!("{ADMIN_PREFIX}/v3/ilm/transition/jobs/{{job_id}}").as_str(),
         AdminOperation(&ManualTransitionJobCancelHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/reconcile/{{transaction_id}}").as_str(),
+        AdminOperation(&TransitionReconcileInspectHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/reconcile/{{transaction_id}}").as_str(),
+        AdminOperation(&TransitionReconcileApplyHandler {}),
     )?;
     Ok(())
 }
@@ -387,6 +403,10 @@ fn log_manual_transition_completed(
 }
 
 async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<String> {
+    authorize_transition_admin_request(req, AdminAction::SetTierAction).await
+}
+
+async fn authorize_transition_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
@@ -399,17 +419,120 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
         .get::<Option<RemoteAddr>>()
         .and_then(|opt| opt.map(|addr| addr.0));
 
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::SetTierAction)],
-        remote_addr,
-    )
-    .await?;
+    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
 
     Ok(actor)
+}
+
+fn transition_transaction_id_from_params(params: &Params<'_, '_>) -> S3Result<Uuid> {
+    Uuid::parse_str(params.get("transaction_id").unwrap_or(""))
+        .map_err(|_| s3_error!(InvalidArgument, "invalid transition transaction id"))
+}
+
+fn map_transition_operator_error(err: TransitionOperatorError) -> S3Error {
+    match err {
+        TransitionOperatorError::NotFound => s3_error!(NoSuchKey, "transition transaction not found"),
+        TransitionOperatorError::NotExpired => {
+            s3_error!(OperationAborted, "transition transaction is still inside its active ownership window")
+        }
+        TransitionOperatorError::InvalidState(_) => {
+            s3_error!(OperationAborted, "transition transaction is not eligible for operator reconciliation")
+        }
+        TransitionOperatorError::RemoteVersionRequired => {
+            s3_error!(InvalidArgument, "an exact non-empty remote version is required")
+        }
+        TransitionOperatorError::CandidateNotMissing(_) => {
+            s3_error!(OperationAborted, "remote candidate is not proven missing")
+        }
+        TransitionOperatorError::CandidateVersionMismatch { .. } => {
+            s3_error!(OperationAborted, "remote candidate version does not match requested exact version")
+        }
+        TransitionOperatorError::Store(_) | TransitionOperatorError::Remote(_) => {
+            s3_error!(InternalError, "transition reconciliation failed")
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransitionReconcileAction {
+    DeleteCandidate,
+    FinalizeMissing,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransitionReconcileRequest {
+    action: TransitionReconcileAction,
+    confirm: bool,
+    #[serde(default)]
+    remote_version_id: Option<String>,
+}
+
+enum ValidatedTransitionReconcileAction<'a> {
+    DeleteCandidate(&'a str),
+    FinalizeMissing,
+}
+
+fn validate_transition_reconcile_request(
+    request: &TransitionReconcileRequest,
+) -> S3Result<ValidatedTransitionReconcileAction<'_>> {
+    if !request.confirm {
+        return Err(s3_error!(
+            InvalidRequest,
+            "transition reconciliation requires confirm=true; use GET to inspect without changes"
+        ));
+    }
+    match request.action {
+        TransitionReconcileAction::DeleteCandidate => request
+            .remote_version_id
+            .as_deref()
+            .filter(|version_id| !version_id.is_empty())
+            .map(ValidatedTransitionReconcileAction::DeleteCandidate)
+            .ok_or_else(|| s3_error!(InvalidArgument, "delete_candidate requires remote_version_id")),
+        TransitionReconcileAction::FinalizeMissing if request.remote_version_id.is_none() => {
+            Ok(ValidatedTransitionReconcileAction::FinalizeMissing)
+        }
+        TransitionReconcileAction::FinalizeMissing => {
+            Err(s3_error!(InvalidArgument, "finalize_missing must not include remote_version_id"))
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TransitionCandidateDeleteResponse {
+    outcome: &'static str,
+    result: TransitionOperatorDeleteResult,
+}
+
+#[derive(Debug, Serialize)]
+struct TransitionFinalizeMissingResponse {
+    outcome: &'static str,
+    journal_retained: bool,
+    transaction_id: Uuid,
+}
+
+fn log_transition_reconcile_applied(
+    transaction_id: Uuid,
+    action: &str,
+    outcome: &str,
+    request_id: &str,
+    actor: &str,
+    remote_addr: &str,
+) {
+    info!(
+        event = EVENT_ADMIN_ILM_TRANSITION_RECONCILE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_ILM_TRANSITION,
+        operation = "transition_operator_reconcile",
+        transaction_id = %transaction_id,
+        action,
+        outcome,
+        request_id = %request_id,
+        actor = %actor,
+        remote_addr = %remote_addr,
+        "admin transition reconciliation applied"
+    );
 }
 
 fn response_state(report: &ManualTransitionRunReport) -> &'static str {
@@ -748,6 +871,10 @@ async fn start_manual_transition_job(
     let job_heartbeat_shutdown_token = heartbeat_shutdown_token.clone();
     spawn_manual_transition_job_heartbeat(store, job_id, scan_cancel_token, heartbeat_shutdown_token);
     tokio::spawn(async move {
+        #[cfg(feature = "e2e-test-hooks")]
+        if std::env::var_os(E2E_MANUAL_TRANSITION_CANCEL_BARRIER_ENV).is_some() {
+            job_scan_cancel_token.cancelled().await;
+        }
         let result = enqueue_transition_for_existing_objects_scoped(run_store.clone(), &bucket, run_options).await;
         if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, result).await
             && final_record.is_terminal()
@@ -896,6 +1023,81 @@ impl Operation for ManualTransitionJobCancelHandler {
     }
 }
 
+pub struct TransitionReconcileInspectHandler {}
+
+#[async_trait::async_trait]
+impl Operation for TransitionReconcileInspectHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
+        let transaction_id = transition_transaction_id_from_params(&params)?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(s3_error!(InternalError, "object store is not initialized"));
+        };
+        let status = inspect_transition_transaction_for_operator(store, transaction_id)
+            .await
+            .map_err(map_transition_operator_error)?;
+        json_response(&status, StatusCode::OK)
+    }
+}
+
+pub struct TransitionReconcileApplyHandler {}
+
+#[async_trait::async_trait]
+impl Operation for TransitionReconcileApplyHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
+        let actor = authorize_transition_admin_request(&req, AdminAction::SetTierAction).await?;
+        let transaction_id = transition_transaction_id_from_params(&params)?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(s3_error!(InternalError, "object store is not initialized"));
+        };
+        let mut input = req.input;
+        let body = input
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "transition reconciliation body is too large or unreadable"))?;
+        let request: TransitionReconcileRequest = serde_json::from_slice(&body)
+            .map_err(|_| s3_error!(InvalidRequest, "transition reconciliation request must be valid JSON"))?;
+
+        match validate_transition_reconcile_request(&request)? {
+            ValidatedTransitionReconcileAction::DeleteCandidate(remote_version_id) => {
+                let result = delete_transition_candidate_for_operator(store, transaction_id, remote_version_id)
+                    .await
+                    .map_err(map_transition_operator_error)?;
+                let outcome = if result.journal_observed_after_delete {
+                    "exact_delete_completed_journal_observed"
+                } else {
+                    "exact_delete_completed_journal_already_finalized"
+                };
+                log_transition_reconcile_applied(transaction_id, "delete_candidate", outcome, &request_id, &actor, &remote_addr);
+                json_response(&TransitionCandidateDeleteResponse { outcome, result }, StatusCode::OK)
+            }
+            ValidatedTransitionReconcileAction::FinalizeMissing => {
+                finalize_missing_transition_transaction_for_operator(store, transaction_id)
+                    .await
+                    .map_err(map_transition_operator_error)?;
+                log_transition_reconcile_applied(
+                    transaction_id,
+                    "finalize_missing",
+                    "journal_deleted_after_missing_probe",
+                    &request_id,
+                    &actor,
+                    &remote_addr,
+                );
+                json_response(
+                    &TransitionFinalizeMissingResponse {
+                        outcome: "journal_finalized",
+                        journal_retained: false,
+                        transaction_id,
+                    },
+                    StatusCode::OK,
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +1125,65 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[test]
+    fn transition_reconcile_request_is_explicit_and_fail_closed() {
+        let unconfirmed: TransitionReconcileRequest =
+            serde_json::from_slice(br#"{"action":"delete_candidate","confirm":false,"remote_version_id":"v1"}"#)
+                .expect("request should decode");
+        assert!(validate_transition_reconcile_request(&unconfirmed).is_err());
+
+        let missing_version: TransitionReconcileRequest =
+            serde_json::from_slice(br#"{"action":"delete_candidate","confirm":true}"#).expect("request should decode");
+        assert!(validate_transition_reconcile_request(&missing_version).is_err());
+
+        let unsafe_finalize: TransitionReconcileRequest =
+            serde_json::from_slice(br#"{"action":"finalize_missing","confirm":true,"remote_version_id":"v1"}"#)
+                .expect("request should decode");
+        assert!(validate_transition_reconcile_request(&unsafe_finalize).is_err());
+
+        let delete: TransitionReconcileRequest =
+            serde_json::from_slice(br#"{"action":"delete_candidate","confirm":true,"remote_version_id":"opaque-v1"}"#)
+                .expect("request should decode");
+        assert!(matches!(
+            validate_transition_reconcile_request(&delete),
+            Ok(ValidatedTransitionReconcileAction::DeleteCandidate("opaque-v1"))
+        ));
+
+        let finalize: TransitionReconcileRequest =
+            serde_json::from_slice(br#"{"action":"finalize_missing","confirm":true}"#).expect("request should decode");
+        assert!(matches!(
+            validate_transition_reconcile_request(&finalize),
+            Ok(ValidatedTransitionReconcileAction::FinalizeMissing)
+        ));
+
+        assert!(
+            serde_json::from_slice::<TransitionReconcileRequest>(
+                br#"{"action":"finalize_missing","confirm":true,"unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn transition_reconcile_routes_use_read_and_write_tier_actions() {
+        let src = include_str!("ilm_transition.rs");
+        let inspect = src
+            .split("impl Operation for TransitionReconcileInspectHandler")
+            .nth(1)
+            .and_then(|block| block.split("impl Operation for TransitionReconcileApplyHandler").next())
+            .expect("inspect handler block");
+        assert!(inspect.contains("AdminAction::ListTierAction"));
+        assert!(!inspect.contains("AdminAction::SetTierAction"));
+
+        let apply = src
+            .split("impl Operation for TransitionReconcileApplyHandler")
+            .nth(1)
+            .and_then(|block| block.split("#[cfg(test)]").next())
+            .expect("apply handler block");
+        assert!(apply.contains("AdminAction::SetTierAction"));
+        assert!(!apply.contains("AdminAction::ListTierAction"));
     }
 
     #[test]
@@ -1149,6 +1410,16 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_response_reports_partial_for_in_flight_skip() {
+        let report = ManualTransitionRunReport {
+            skipped_already_in_flight: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(response_state(&report), "partial");
+    }
+
+    #[test]
     fn manual_transition_response_reports_partial_for_duration_budget() {
         let report = ManualTransitionRunReport {
             truncated_by_duration: true,
@@ -1234,6 +1505,47 @@ mod tests {
         assert_eq!(response.mode, "durable_job");
         assert!(response.status_endpoint.ends_with(&response.job_id));
         assert_eq!(response.cancel_endpoint, response.status_endpoint);
+    }
+
+    #[test]
+    fn manual_transition_job_response_reads_back_terminal_queue_pressure_snapshot() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("WARM".to_string()),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, "owner-a");
+        let queue_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            queued: 2,
+            active: 1,
+            workers: 2,
+            queue_full: 3,
+            queue_send_timeout: 5,
+            compensation_pending: 7,
+            compensation_running: 1,
+        };
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                prefix: options.prefix,
+                tier: options.tier,
+                skipped_queue_full: 3,
+                skipped_queue_timeout: 5,
+                ..Default::default()
+            },
+            queue_snapshot,
+        );
+
+        let response = manual_transition_job_response(record);
+
+        assert_eq!(response.status, ManualTransitionJobState::Partial);
+        assert_eq!(response.report.skipped_queue_full, 3);
+        assert_eq!(response.report.skipped_queue_timeout, 5);
+        assert_eq!(response.queue_snapshot, queue_snapshot);
+        assert!(response.completed_at_unix_nanos.is_some());
+        assert_eq!(response.failure_reason, None);
     }
 
     #[test]

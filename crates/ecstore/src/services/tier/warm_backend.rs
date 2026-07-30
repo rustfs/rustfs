@@ -73,6 +73,21 @@ pub enum TransitionCandidateProbe {
     Unsupported,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TransitionCandidateIdentity {
+    pub transaction_id: uuid::Uuid,
+    pub destination_id: [u8; 32],
+}
+
+#[async_trait::async_trait]
+pub(crate) trait TransitionCandidateReconciler {
+    async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        identity: TransitionCandidateIdentity,
+    ) -> Result<TransitionCandidateProbe, std::io::Error>;
+}
+
 #[async_trait::async_trait]
 pub trait WarmBackend {
     async fn validate(&self) -> Result<(), std::io::Error> {
@@ -187,6 +202,20 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
         X_AMZ_STORAGE_CLASS.as_str(),
     ] {
         metadata.remove(key);
+    }
+
+    for suffix in [
+        rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+        rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+    ] {
+        for key in [
+            rustfs_utils::http::metadata_compat::internal_key_rustfs(suffix),
+            format!("{}{}", rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX, suffix),
+        ] {
+            if let Some(value) = metadata.remove(&key) {
+                metadata.insert(format!("x-amz-meta-{key}"), value);
+            }
+        }
     }
 
     opts.user_metadata = metadata;
@@ -444,6 +473,51 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         d.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
     }
     Ok(d)
+}
+
+pub(crate) async fn new_transition_candidate_reconciler(
+    tier: &TierConfig,
+) -> Result<Option<Box<dyn TransitionCandidateReconciler + Send + Sync + 'static>>, AdminError> {
+    let reconciler: Box<dyn TransitionCandidateReconciler + Send + Sync + 'static> = match tier.tier_type {
+        TierType::S3 => Box::new(
+            WarmBackendS3::new(tier.s3.as_ref().ok_or_else(|| ERR_TIER_INVALID_CONFIG.clone())?, &tier.name)
+                .await
+                .map_err(|err| {
+                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                    admin_err.message = err.to_string();
+                    admin_err
+                })?,
+        ),
+        TierType::MinIO => Box::new(
+            WarmBackendMinIO::new(tier.minio.as_ref().ok_or_else(|| ERR_TIER_INVALID_CONFIG.clone())?, &tier.name)
+                .await
+                .map_err(|err| {
+                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                    admin_err.message = err.to_string();
+                    admin_err
+                })?,
+        ),
+        TierType::RustFS => Box::new(
+            WarmBackendRustFS::new(tier.rustfs.as_ref().ok_or_else(|| ERR_TIER_INVALID_CONFIG.clone())?, &tier.name)
+                .await
+                .map_err(|err| {
+                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                    admin_err.message = err.to_string();
+                    admin_err
+                })?,
+        ),
+        TierType::R2 => Box::new(
+            WarmBackendR2::new(tier.r2.as_ref().ok_or_else(|| ERR_TIER_INVALID_CONFIG.clone())?, &tier.name)
+                .await
+                .map_err(|err| {
+                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                    admin_err.message = err.to_string();
+                    admin_err
+                })?,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(reconciler))
 }
 
 #[cfg(test)]
@@ -773,6 +847,37 @@ mod tests {
         assert!(!opts.user_metadata.contains_key(CONTENT_TYPE));
         assert!(!opts.user_metadata.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()));
         assert!(!opts.user_metadata.contains_key(X_AMZ_REPLICATION_STATUS.as_str()));
+    }
+
+    #[test]
+    fn build_transition_put_options_persists_both_candidate_identity_keys_as_s3_metadata() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "5a".repeat(32),
+        );
+
+        let opts = build_transition_put_options("COLD".to_string(), metadata);
+
+        for suffix in [
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+        ] {
+            assert!(opts.user_metadata.contains_key(&format!(
+                "x-amz-meta-{}",
+                rustfs_utils::http::metadata_compat::internal_key_rustfs(suffix)
+            )));
+            assert!(opts.user_metadata.contains_key(&format!(
+                "x-amz-meta-{}{suffix}",
+                rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX
+            )));
+        }
     }
 
     #[test]

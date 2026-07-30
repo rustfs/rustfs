@@ -14,6 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::ScannerObjectIO;
@@ -38,8 +40,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
-    emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult, ScannerWorkSource,
+    emit_scan_cycle_complete, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -50,9 +52,12 @@ use rustfs_config::{
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_api::scan::{
@@ -61,8 +66,9 @@ use crate::storage_api::scan::{
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
-    save_config_shared_with_preconditions, save_config_with_preconditions, scanner_is_erasure_sd,
+    get_lifecycle_config, get_replication_config, invalidate_data_usage_snapshot_cache, read_config,
+    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
+    scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -92,6 +98,44 @@ const SCANNER_CYCLE_STATE_MAGIC: &[u8; 8] = b"RSCYC001";
 const SCANNER_CYCLE_STATE_HEADER_LEN: usize = 24;
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
+#[cfg(test)]
+type ScannerCycleStatePersistTestHook = (u64, Arc<Notify>);
+#[cfg(test)]
+static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<ScannerCycleStatePersistTestHook>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+struct ScannerCycleStatePersistTestHookGuard;
+
+#[cfg(test)]
+impl Drop for ScannerCycleStatePersistTestHookGuard {
+    fn drop(&mut self) {
+        *SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn set_scanner_cycle_state_persist_test_hook(leader_epoch: u64, reached: Arc<Notify>) -> ScannerCycleStatePersistTestHookGuard {
+    *SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((leader_epoch, reached));
+    ScannerCycleStatePersistTestHookGuard
+}
+
+#[cfg(test)]
+fn notify_scanner_cycle_state_persist_test_hook(leader_epoch: u64) {
+    let reached = SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(expected_epoch, _)| *expected_epoch == leader_epoch)
+        .map(|(_, reached)| reached.clone());
+    if let Some(reached) = reached {
+        reached.notify_one();
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum ScannerCycleStateError {
@@ -985,7 +1029,7 @@ fn initial_scanner_delay_for_startup(
 }
 
 fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
-    info.last_update.is_none() || (info.buckets_usage.is_empty() && info.bucket_sizes.is_empty())
+    !info.is_complete_bucket_usage_snapshot()
 }
 
 async fn read_data_usage_config_for_startup(storeapi: &Arc<impl ScannerObjectIO>) -> Result<Option<Vec<u8>>, EcstoreError> {
@@ -1004,10 +1048,12 @@ async fn read_data_usage_config_for_startup(storeapi: &Arc<impl ScannerObjectIO>
         }
     }
 
-    match read_pair(storeapi, DATA_USAGE_OBJ_NAME_PATH.as_str()).await? {
-        Some(data) => Ok(Some(data)),
-        None => read_pair(storeapi, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()).await,
+    for path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()] {
+        if let Some(data) = read_pair(storeapi, path).await? {
+            return Ok(Some(data));
+        }
     }
+    Ok(None)
 }
 
 fn data_usage_backup_due(data_usage_info: &DataUsageInfo) -> bool {
@@ -1688,10 +1734,10 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
-async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
+async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard: &mut ScannerCycleMetricsGuard) {
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
-    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
 }
 
 fn encode_scanner_cycle_state(cycle_info: &CurrentCycle, leader_epoch: u64) -> Result<Vec<u8>, ScannerCycleStateError> {
@@ -2215,6 +2261,8 @@ async fn persist_scanner_cycle_state(
             return false;
         }
 
+        #[cfg(test)]
+        notify_scanner_cycle_state_persist_test_hook(leader_epoch);
         match save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf.clone(), revision.preconditions())
             .await
         {
@@ -2337,7 +2385,6 @@ async fn persist_scanner_cycle_state(
 
                     if persisted_cycle.next >= cycle_info.next {
                         *cycle_info = persisted_cycle;
-                        global_metrics().set_cycle(Some(cycle_info.clone())).await;
                         debug!(
                             target: "rustfs::scanner",
                             event = EVENT_SCANNER_PERSIST_STATE,
@@ -2403,6 +2450,7 @@ async fn finalize_partial_scan_cycle(
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
+    cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
 ) -> bool {
     // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
     // must still advance (and persist) because per-bucket next_cycle is stamped from
@@ -2419,11 +2467,14 @@ async fn finalize_partial_scan_cycle(
             error = %err,
             "Scanner partial cycle could not advance"
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, cycle_metrics_guard).await;
         return false;
     }
-    mark_scan_cycle_idle(cycle_info).await;
-    persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await
+    cycle_info.current = 0;
+    global_metrics().clear_current_scan_mode();
+    let persisted = persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await;
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
+    persisted
 }
 
 async fn persist_required_scanner_cycle_floor(
@@ -2433,6 +2484,7 @@ async fn persist_required_scanner_cycle_floor(
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
     required_cycle: u64,
+    cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
 ) -> bool {
     if required_cycle <= cycle_info.current || required_cycle == u64::MAX {
         error!(
@@ -2445,13 +2497,16 @@ async fn persist_required_scanner_cycle_floor(
             state = "invalid_cache_cycle_floor",
             "Scanner cache cycle floor is invalid"
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, cycle_metrics_guard).await;
         return false;
     }
 
     cycle_info.next = cycle_info.next.max(required_cycle);
-    mark_scan_cycle_idle(cycle_info).await;
-    persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await
+    cycle_info.current = 0;
+    global_metrics().clear_current_scan_mode();
+    let persisted = persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await;
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
+    persisted
 }
 
 async fn await_scanner_cycle_with_lock_fence<Cycle, LockLost>(
@@ -2510,7 +2565,7 @@ async fn run_data_scanner_cycle(
     let now = Instant::now();
     cycle_info.started = Utc::now();
 
-    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
     let mut background_heal_info = read_background_heal_info(storeapi.clone()).await;
 
@@ -2561,14 +2616,14 @@ async fn run_data_scanner_cycle(
                 "Scanner cycle could not capture the data usage persistence baseline"
             );
             emit_scan_cycle_complete(false, cycle_start.elapsed());
-            mark_scan_cycle_idle(cycle_info).await;
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
     };
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
     let storeapi_clone = storeapi.clone();
     let ctx_clone = ctx.clone();
-    let mut usage_persist_task = tokio::spawn(async move {
+    let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
         store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
             ctx_clone,
             storeapi_clone,
@@ -2577,10 +2632,9 @@ async fn run_data_scanner_cycle(
             Some(usage_persist_baseline),
         )
         .await
-    });
+    }));
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
-    let cycle_work_start = global_metrics().start_scan_cycle_work();
     let cycle_budget = ScannerCycleBudget::new(ctx, cycle_budget_config);
     let scan_result = storeapi
         .clone()
@@ -2637,7 +2691,6 @@ async fn run_data_scanner_cycle(
         }
     };
     let unresolved_heal_work = global_metrics().current_scan_cycle_has_unresolved_heal_work();
-    global_metrics().finish_scan_cycle_work(cycle_work_start);
 
     let scan_cycle_result = match scan_result {
         Ok(result) => result,
@@ -2660,7 +2713,7 @@ async fn run_data_scanner_cycle(
             {
                 save_background_heal_info(storeapi.clone(), new_heal_info).await;
             }
-            mark_scan_cycle_idle(cycle_info).await;
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
     };
@@ -2675,7 +2728,7 @@ async fn run_data_scanner_cycle(
             "Scanner cycle stopped before committing cycle state"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
     if let Some(required_cycle) = scan_cycle_result.required_cycle_floor() {
@@ -2697,6 +2750,7 @@ async fn run_data_scanner_cycle(
             cycle_revision,
             leader_epoch,
             required_cycle,
+            &mut cycle_metrics_guard,
         )
         .await
         {
@@ -2716,7 +2770,7 @@ async fn run_data_scanner_cycle(
             "Scanner cycle completed without a durable data usage snapshot"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
     if budget_elapsed {
@@ -2740,7 +2794,16 @@ async fn run_data_scanner_cycle(
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        return if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+        return if finalize_partial_scan_cycle(
+            ctx,
+            storeapi.clone(),
+            cycle_info,
+            cycle_revision,
+            leader_epoch,
+            &mut cycle_metrics_guard,
+        )
+        .await
+        {
             ScannerCycleOutcome::Partial
         } else {
             ScannerCycleOutcome::Failed
@@ -2789,7 +2852,7 @@ async fn run_data_scanner_cycle(
                 "Scanner cycle completed without a durable data usage snapshot"
             );
             emit_scan_cycle_complete(false, cycle_start.elapsed());
-            mark_scan_cycle_idle(cycle_info).await;
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
         }
         ScannerCycleOutcome::Partial => {
@@ -2815,7 +2878,16 @@ async fn run_data_scanner_cycle(
                 );
             }
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            return if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+            return if finalize_partial_scan_cycle(
+                ctx,
+                storeapi.clone(),
+                cycle_info,
+                cycle_revision,
+                leader_epoch,
+                &mut cycle_metrics_guard,
+            )
+            .await
+            {
                 ScannerCycleOutcome::Partial
             } else {
                 ScannerCycleOutcome::Failed
@@ -2831,7 +2903,16 @@ async fn run_data_scanner_cycle(
                 state = "superseded",
                 "Scanner cycle usage snapshot was superseded by concurrent namespace activity"
             );
-            if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+            if finalize_partial_scan_cycle(
+                ctx,
+                storeapi.clone(),
+                cycle_info,
+                cycle_revision,
+                leader_epoch,
+                &mut cycle_metrics_guard,
+            )
+            .await
+            {
                 emit_scan_cycle_superseded(cycle_start.elapsed());
                 return ScannerCycleOutcome::Superseded;
             }
@@ -2850,7 +2931,7 @@ async fn run_data_scanner_cycle(
             error = %err,
             "Scanner completed cycle could not advance"
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
     }
@@ -2859,9 +2940,8 @@ async fn run_data_scanner_cycle(
     global_metrics().clear_current_scan_mode();
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
-    global_metrics().set_cycle(Some(cycle_info.clone())).await;
     if !persist_scanner_cycle_state(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
-        mark_scan_cycle_idle(cycle_info).await;
+        cycle_metrics_guard.finish(cycle_info.clone()).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
     }
@@ -2885,7 +2965,35 @@ async fn run_data_scanner_cycle(
         "Scanner cycle completed"
     );
 
+    cycle_metrics_guard.finish(cycle_info.clone()).await;
     scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, pending_maintenance_work)
+}
+
+struct ScannerCycleMetricsGuard {
+    start: Option<ScanCycleWorkSnapshot>,
+}
+
+impl ScannerCycleMetricsGuard {
+    async fn new(cycle: CurrentCycle) -> Self {
+        Self {
+            start: Some(global_metrics().start_scan_cycle_work_with_cycle(cycle).await),
+        }
+    }
+
+    async fn finish(&mut self, cycle: CurrentCycle) {
+        if let Some(start) = self.start {
+            global_metrics().finish_scan_cycle_work_with_cycle(start, cycle).await;
+            self.start = None;
+        }
+    }
+}
+
+impl Drop for ScannerCycleMetricsGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            global_metrics().finish_scan_cycle_work(start);
+        }
+    }
 }
 
 async fn record_scanner_leader_lock_lost(message: &'static str) {
@@ -3440,7 +3548,7 @@ enum DataUsagePersistTaskResult {
 
 async fn wait_for_data_usage_persist_task(
     ctx: &CancellationToken,
-    task: &mut tokio::task::JoinHandle<DataUsagePersistOutcome>,
+    task: &mut AbortOnDropHandle<DataUsagePersistOutcome>,
     timeout: Duration,
 ) -> DataUsagePersistTaskResult {
     tokio::select! {
@@ -3611,6 +3719,21 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
             data_usage_info.scanner_epoch = Some(leader_epoch);
         }
 
+        if !data_usage_info.is_complete_bucket_usage_snapshot() {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "reject_incomplete_snapshot",
+                "Scanner refused to persist an incomplete data usage snapshot"
+            );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+            outcome = DataUsagePersistOutcome::Failed;
+            continue;
+        }
+
         let data = match serde_json::to_vec(&data_usage_info) {
             Ok(data) => data,
             Err(e) => {
@@ -3767,16 +3890,19 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
 
         match save_outcome {
             DataUsagePersistOutcome::Current => {
+                invalidate_data_usage_snapshot_cache().await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
                 outcome = DataUsagePersistOutcome::Current;
                 continue;
             }
             DataUsagePersistOutcome::AlreadyDurable => {
+                invalidate_data_usage_snapshot_cache().await;
                 replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 outcome = DataUsagePersistOutcome::AlreadyDurable;
             }
             DataUsagePersistOutcome::PriorCycleDurable => {
+                invalidate_data_usage_snapshot_cache().await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 outcome = DataUsagePersistOutcome::PriorCycleDurable;
             }
@@ -3786,6 +3912,7 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
                 continue;
             }
             DataUsagePersistOutcome::Saved => {
+                invalidate_data_usage_snapshot_cache().await;
                 replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 outcome = DataUsagePersistOutcome::Saved;
@@ -3818,8 +3945,9 @@ mod tests {
     use super::*;
     use crate::EcstoreResult;
     use crate::{
-        ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
-        ScannerPutObjReader as PutObjReader,
+        Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerGetObjectReader as GetObjectReader,
+        ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
+        init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
     };
     use serial_test::serial;
     use std::collections::HashMap;
@@ -3830,6 +3958,47 @@ mod tests {
     use tokio::sync::Mutex;
 
     const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+
+    async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
+        init_ecstore_config_for_scanner_tests();
+        let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
+        let mut endpoints = Vec::new();
+        for disk_index in 0..4 {
+            let disk_path = temp_dir.path().join(format!("disk{disk_index}"));
+            tokio::fs::create_dir_all(&disk_path)
+                .await
+                .expect("scanner cycle test disk should be created");
+            let mut endpoint =
+                Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+        let endpoint_pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "scanner-cycle-metrics".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("scanner cycle test disks should initialize");
+        let store = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address should parse"),
+            endpoint_pools,
+            CancellationToken::new(),
+            instance_ctx,
+        )
+        .await
+        .expect("scanner cycle test ECStore should initialize");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+
+        (temp_dir, store)
+    }
 
     fn assert_run_data_scanner_signature<F, Fut>(_run: F)
     where
@@ -4290,9 +4459,9 @@ mod tests {
         };
 
         global_metrics().set_current_scan_mode(HealScanMode::Deep);
-        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        mark_scan_cycle_idle(&mut cycle_info).await;
+        mark_scan_cycle_idle(&mut cycle_info, &mut cycle_metrics_guard).await;
 
         let published = global_metrics()
             .get_cycle()
@@ -4310,6 +4479,123 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
+        let cycle_started = Utc::now() - chrono::Duration::seconds(5);
+        let mut cycle_info = CurrentCycle {
+            current: 0,
+            next: 1,
+            started: cycle_started,
+            ..Default::default()
+        };
+        let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+        let setup_report = global_metrics().report().await;
+        assert!(setup_report.current_cycle_active);
+        assert_eq!(setup_report.current_cycle, 0);
+        assert_eq!(setup_report.current_started, cycle_started);
+
+        mark_scan_cycle_idle(&mut cycle_info, &mut guard).await;
+        let idle_report = global_metrics().report().await;
+        assert!(!idle_report.current_cycle_active);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finalization() {
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 13,
+            started: Utc::now(),
+            ..Default::default()
+        };
+        let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+
+        cycle_info.current = 0;
+        tokio::task::yield_now().await;
+        let finalizing_report = global_metrics().report().await;
+        assert!(finalizing_report.current_cycle_active);
+        assert_eq!(finalizing_report.current_cycle, 12);
+
+        guard.finish(cycle_info).await;
+        let idle_report = global_metrics().report().await;
+        assert!(!idle_report.current_cycle_active);
+        assert_eq!(idle_report.current_cycle, 0);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cycle_metrics_guard_drop_clears_activity() {
+        let guard = ScannerCycleMetricsGuard::new(CurrentCycle {
+            current: 12,
+            next: 13,
+            started: Utc::now(),
+            ..Default::default()
+        })
+        .await;
+        assert!(global_metrics().report().await.current_cycle_active);
+
+        drop(guard);
+
+        assert!(!global_metrics().report().await.current_cycle_active);
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
+        let (_temp_dir, store) = setup_scanner_cycle_store().await;
+        let ctx = CancellationToken::new();
+        let mut cycle_info = CurrentCycle::default();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let leader_epoch = u64::MAX - 1;
+        let state_persist_reached = Arc::new(Notify::new());
+        let _state_persist_hook = set_scanner_cycle_state_persist_test_hook(leader_epoch, state_persist_reached.clone());
+        let state_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str())
+            .await
+            .expect("scanner cycle state lock should be created");
+        let state_guard = state_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("scanner cycle state lock should be acquired");
+        let mut cycle = Box::pin(run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, leader_epoch));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+
+        assert!(cycle.as_mut().poll(&mut context).is_pending());
+        let active = global_metrics().report().await;
+        assert!(active.current_cycle_active);
+        assert_eq!(active.current_cycle, 0);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                outcome = &mut cycle => panic!("scanner cycle finished before state persistence was released: {outcome:?}"),
+                _ = state_persist_reached.notified() => {}
+            }
+        })
+        .await
+        .expect("scanner cycle should reach state persistence");
+        let finalizing = global_metrics().report().await;
+        assert!(finalizing.current_cycle_active);
+
+        drop(state_guard);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), cycle)
+            .await
+            .expect("scanner cycle should finish");
+        assert!(matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ));
+        assert!(!global_metrics().report().await.current_cycle_active);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         let store = Arc::new(MemoryConfigStore::default());
         let ctx = CancellationToken::new();
@@ -4320,8 +4606,11 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1).await);
+        assert!(
+            finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await
+        );
 
         assert_eq!(cycle_info.next, 13);
         assert_eq!(cycle_info.current, 0);
@@ -4355,8 +4644,20 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(persist_required_scanner_cycle_floor(&ctx, store.clone(), &mut cycle_info, &mut revision, 7, 19).await);
+        assert!(
+            persist_required_scanner_cycle_floor(
+                &ctx,
+                store.clone(),
+                &mut cycle_info,
+                &mut revision,
+                7,
+                19,
+                &mut cycle_metrics_guard,
+            )
+            .await
+        );
         assert_eq!(cycle_info.current, 0);
         assert_eq!(cycle_info.next, 19);
 
@@ -4383,22 +4684,37 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(!persist_required_scanner_cycle_floor(&ctx, store.clone(), &mut cycle_info, &mut revision, 7, 12).await);
-        assert_eq!(cycle_info.next, 12);
-        assert_eq!(revision, DataUsageCacheRevision::Missing);
         assert!(
             !persist_required_scanner_cycle_floor(
                 &ctx,
                 store.clone(),
-                &mut CurrentCycle {
-                    current: 12,
-                    next: 12,
-                    ..Default::default()
-                },
+                &mut cycle_info,
+                &mut revision,
+                7,
+                12,
+                &mut cycle_metrics_guard,
+            )
+            .await
+        );
+        assert_eq!(cycle_info.next, 12);
+        assert_eq!(revision, DataUsageCacheRevision::Missing);
+        let mut max_cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            ..Default::default()
+        };
+        let mut max_cycle_metrics_guard = ScannerCycleMetricsGuard::new(max_cycle_info.clone()).await;
+        assert!(
+            !persist_required_scanner_cycle_floor(
+                &ctx,
+                store.clone(),
+                &mut max_cycle_info,
                 &mut revision,
                 7,
                 u64::MAX,
+                &mut max_cycle_metrics_guard,
             )
             .await
         );
@@ -4485,8 +4801,25 @@ mod tests {
         assert_eq!(epoch, 11);
     }
 
+    #[test]
+    fn scanner_startup_treats_incomplete_usage_snapshot_as_cold() {
+        let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::now()), 1);
+        legacy.usage_snapshot_complete = false;
+
+        assert!(data_usage_info_is_cold(&legacy));
+        assert!(!data_usage_info_is_cold(&complete_usage_with_bucket_count(
+            Some(std::time::SystemTime::now()),
+            1,
+        )));
+        assert!(!data_usage_info_is_cold(&DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        }));
+    }
+
     #[tokio::test]
-    async fn scanner_startup_migrates_legacy_usage_only_until_v2_exists() {
+    async fn scanner_startup_prefers_v2_over_legacy_usage() {
         let store = Arc::new(MemoryConfigStore::default());
         let legacy = DataUsageInfo {
             scanner_epoch: Some(19),
@@ -4517,9 +4850,10 @@ mod tests {
         );
 
         let authoritative = DataUsageInfo {
-            scanner_epoch: Some(7),
-            scanner_cycle: Some(11),
+            scanner_epoch: Some(23),
+            scanner_cycle: Some(51),
             last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
             ..Default::default()
         };
         let authoritative_data = serde_json::to_vec(&authoritative).expect("v2 usage snapshot should encode");
@@ -4539,8 +4873,8 @@ mod tests {
                 .await
                 .expect("v2 usage floor should be authoritative"),
             PersistedUsageFloor {
-                next_cycle: 12,
-                leader_epoch: 7,
+                next_cycle: 52,
+                leader_epoch: 23,
             }
         );
 
@@ -4594,7 +4928,7 @@ mod tests {
                     scanner_epoch: Some(1),
                     scanner_cycle: Some(cycle),
                     last_update: Some(std::time::SystemTime::now()),
-                    ..Default::default()
+                    ..complete_usage_with_bucket_count(None, 0)
                 })
                 .await
                 .expect("usage update should queue");
@@ -4645,8 +4979,9 @@ mod tests {
             cycle_completed: vec![],
             started: Utc::now(),
         };
+        let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-        assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1).await);
+        assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
         assert_eq!(cycle_info.next, 13);
         assert_eq!(cycle_info.current, 0);
         assert_eq!(revision, DataUsageCacheRevision::Missing);
@@ -4959,16 +5294,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel(2);
         let ctx = CancellationToken::new();
 
-        let newer = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let older = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
-            buckets_count: 1,
-            ..Default::default()
-        };
+        let newer = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 2);
+        let older = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 1);
 
         sender.send(newer).await.expect("newer usage snapshot should enqueue");
         sender.send(older).await.expect("older usage snapshot should enqueue");
@@ -4993,16 +5320,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let ctx = CancellationToken::new();
         let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
-        let newer = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let stale = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
-            buckets_count: 1,
-            ..Default::default()
-        };
+        let newer = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 2);
+        let stale = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 1);
         store
             .interleaving_puts
             .lock()
@@ -5045,6 +5364,7 @@ mod tests {
         initial.bucket_sizes.insert("bucket-a".to_string(), 84);
         initial.buckets_count = 1;
         initial.calculate_totals();
+        mark_usage_snapshot_complete(&mut initial);
         let initial_data = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
         store.objects.lock().await.insert(key.clone(), initial_data.clone());
         store.revisions.lock().await.insert(key.clone(), 1);
@@ -5054,6 +5374,7 @@ mod tests {
         deleted.bucket_sizes.clear();
         deleted.buckets_count = 0;
         deleted.calculate_totals();
+        mark_usage_snapshot_complete(&mut deleted);
         store
             .interleaving_puts
             .lock()
@@ -5102,7 +5423,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(1),
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 0)
         };
         store.objects.lock().await.insert(
             backup_key.clone(),
@@ -5129,6 +5450,7 @@ mod tests {
             incoming.bucket_sizes.insert("bucket-a".to_string(), 84);
             incoming.buckets_count = 1;
             incoming.calculate_totals();
+            mark_usage_snapshot_complete(&mut incoming);
             sender.send(incoming).await.expect("usage snapshot should enqueue");
         }
         drop(sender);
@@ -5162,7 +5484,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(10),
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 0)
         };
         let encoded = serde_json::to_vec(&durable).expect("usage snapshot should encode");
         store.objects.lock().await.insert(main_key.clone(), encoded.clone());
@@ -5205,6 +5527,7 @@ mod tests {
         incoming.bucket_sizes.insert("bucket-a".to_string(), 84);
         incoming.buckets_count = 1;
         incoming.calculate_totals();
+        mark_usage_snapshot_complete(&mut incoming);
 
         let mut deleted = incoming.clone();
         deleted.last_update = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(31));
@@ -5212,6 +5535,7 @@ mod tests {
         deleted.bucket_sizes.clear();
         deleted.buckets_count = 0;
         deleted.calculate_totals();
+        mark_usage_snapshot_complete(&mut deleted);
         store.replace_after_successful_puts.lock().await.insert(
             main_key.clone(),
             (1, serde_json::to_vec(&deleted).expect("deleted primary snapshot should encode")),
@@ -5251,21 +5575,9 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let ctx = CancellationToken::new();
         let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
-        let initial = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
-            buckets_count: 1,
-            ..Default::default()
-        };
-        let stale_winner = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let current = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
-            buckets_count: 3,
-            ..Default::default()
-        };
+        let initial = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 3);
+        let stale_winner = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 3);
+        let current = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)), 3);
         store
             .objects
             .lock()
@@ -5298,21 +5610,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_data_usage_in_backend_rejects_untimestamped_stale_snapshot() {
+    async fn test_store_data_usage_in_backend_rejects_untimestamped_complete_snapshot() {
         let store = Arc::new(MemoryConfigStore::default());
         let (sender, receiver) = mpsc::channel(2);
         let ctx = CancellationToken::new();
 
-        let timestamped = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let untimestamped = DataUsageInfo {
-            last_update: None,
-            buckets_count: 1,
-            ..Default::default()
-        };
+        let timestamped = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 2);
+        let untimestamped = complete_usage_with_bucket_count(None, 1);
 
         sender
             .send(timestamped)
@@ -5334,7 +5638,7 @@ mod tests {
 
         assert_eq!(saved.buckets_count, 2);
         assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
-        assert_eq!(outcome, DataUsagePersistOutcome::Current);
+        assert_eq!(outcome, DataUsagePersistOutcome::Failed);
     }
 
     #[tokio::test]
@@ -5346,8 +5650,7 @@ mod tests {
         let snapshot = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5377,8 +5680,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5392,8 +5694,7 @@ mod tests {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
                 scanner_epoch: Some(8),
                 scanner_cycle: Some(12),
-                buckets_count: 3,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 3)
             })
             .await
             .expect("changed retry snapshot should enqueue");
@@ -5426,8 +5727,7 @@ mod tests {
         let existing = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5440,8 +5740,7 @@ mod tests {
         let older = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
             scanner_cycle: Some(11),
-            buckets_count: 1,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 1)
         };
         older_sender.send(older).await.expect("older-cycle snapshot should enqueue");
         drop(older_sender);
@@ -5454,8 +5753,7 @@ mod tests {
         let newer = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
             scanner_cycle: Some(13),
-            buckets_count: 3,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 3)
         };
         newer_sender
             .send(newer.clone())
@@ -5490,8 +5788,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5506,8 +5803,7 @@ mod tests {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
                 scanner_epoch: Some(7),
                 scanner_cycle: Some(99),
-                buckets_count: 1,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 1)
             })
             .await
             .expect("old-epoch snapshot should enqueue");
@@ -5523,8 +5819,7 @@ mod tests {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
                 scanner_epoch: None,
                 scanner_cycle: Some(1),
-                buckets_count: 3,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 3)
             })
             .await
             .expect("replacement-epoch snapshot should enqueue");
@@ -5554,8 +5849,7 @@ mod tests {
         let existing = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5569,8 +5863,7 @@ mod tests {
             .send(DataUsageInfo {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
                 scanner_cycle: Some(12),
-                buckets_count: 3,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 3)
             })
             .await
             .expect("conflicting same-cycle snapshot should enqueue");
@@ -5595,11 +5888,59 @@ mod tests {
         );
     }
 
-    fn usage_with_last_update(last_update: Option<std::time::SystemTime>) -> DataUsageInfo {
-        DataUsageInfo {
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_rejects_incomplete_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let complete_update = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+
+        sender
+            .send(complete_usage_with_bucket_count(Some(complete_update), 1))
+            .await
+            .expect("complete usage snapshot should enqueue");
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(complete_update + Duration::from_secs(1)),
+                buckets_count: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("incomplete usage snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .expect("complete data usage snapshot should remain saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+        assert_eq!(saved.last_update, Some(complete_update));
+        assert!(saved.is_complete_bucket_usage_snapshot());
+        assert_eq!(outcome, DataUsagePersistOutcome::Failed);
+    }
+
+    fn mark_usage_snapshot_complete(info: &mut DataUsageInfo) {
+        info.usage_snapshot_complete = true;
+    }
+
+    fn complete_usage_with_bucket_count(last_update: Option<std::time::SystemTime>, buckets_count: u64) -> DataUsageInfo {
+        let mut info = DataUsageInfo {
             last_update,
+            buckets_count,
+            usage_snapshot_complete: true,
             ..Default::default()
+        };
+        for index in 0..buckets_count {
+            let bucket = format!("bucket-{index}");
+            info.buckets_usage.insert(bucket.clone(), Default::default());
+            info.bucket_sizes.insert(bucket, 0);
         }
+        info
+    }
+
+    fn usage_with_last_update(last_update: Option<std::time::SystemTime>) -> DataUsageInfo {
+        complete_usage_with_bucket_count(last_update, 0)
     }
 
     #[test]
@@ -5681,11 +6022,10 @@ mod tests {
 
         for idx in 1_u64..=11 {
             sender
-                .send(DataUsageInfo {
-                    last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(idx)),
-                    buckets_count: idx,
-                    ..Default::default()
-                })
+                .send(complete_usage_with_bucket_count(
+                    Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(idx)),
+                    idx,
+                ))
                 .await
                 .expect("usage snapshot should enqueue");
         }
@@ -5898,10 +6238,10 @@ mod tests {
     #[tokio::test]
     async fn data_usage_persist_wait_aborts_when_scanner_is_cancelled() {
         let ctx = CancellationToken::new();
-        let mut task = tokio::spawn(async {
+        let mut task = AbortOnDropHandle::new(tokio::spawn(async {
             std::future::pending::<()>().await;
             DataUsagePersistOutcome::Saved
-        });
+        }));
         ctx.cancel();
 
         let result = wait_for_data_usage_persist_task(&ctx, &mut task, Duration::from_secs(60)).await;
@@ -5913,10 +6253,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn data_usage_persist_wait_aborts_after_timeout() {
         let ctx = CancellationToken::new();
-        let mut task = tokio::spawn(async {
+        let mut task = AbortOnDropHandle::new(tokio::spawn(async {
             std::future::pending::<()>().await;
             DataUsagePersistOutcome::Saved
-        });
+        }));
 
         let result = wait_for_data_usage_persist_task(&ctx, &mut task, Duration::from_secs(30)).await;
 

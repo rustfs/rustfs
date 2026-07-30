@@ -14,14 +14,13 @@
 
 //! Swift account operations and validation
 
+use super::metadata_update::{ACCOUNT_META_TAG_PREFIX, MetadataUpdate};
 use super::storage_api::account::{BucketOperations, MakeBucketOptions};
 use super::{SwiftError, SwiftResult};
-use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
+use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, update_swift_bucket_tagging};
 use rustfs_credentials::Credentials;
-use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use time;
 
 /// Validate that the authenticated user has access to the requested account
 ///
@@ -132,9 +131,8 @@ pub async fn get_account_metadata(account: &str, _credentials: &Option<Credentia
     if let Some(tagging) = &bucket_meta.tagging_config {
         for tag in &tagging.tag_set {
             if let (Some(key), Some(value)) = (&tag.key, &tag.value)
-                && let Some(meta_key) = key.strip_prefix("swift-account-meta-")
+                && let Some(meta_key) = key.strip_prefix(ACCOUNT_META_TAG_PREFIX)
             {
-                // Strip "swift-account-meta-" prefix
                 metadata.insert(meta_key.to_string(), value.clone());
             }
         }
@@ -148,15 +146,46 @@ pub async fn get_account_metadata(account: &str, _credentials: &Option<Credentia
 /// Updates account-level metadata such as TempURL keys.
 /// Only updates swift-account-meta-* tags, preserving other tags.
 ///
+/// Swift account POST is additive: `update` names the items to write and the
+/// items to drop, and everything else keeps its stored value. Replacing the
+/// whole set instead would make an unrelated POST — setting a quota, say —
+/// delete the account's TempURL signing key, permanently invalidating every
+/// outstanding TempURL and FormPost signature for the account.
+///
+/// The caller must own the account: this metadata holds the account's TempURL
+/// signing key, so writing it for someone else's account would let the writer
+/// mint valid pre-signed URLs against that account's objects. Reads
+/// ([`get_account_metadata`]) stay unauthenticated on purpose — TempURL
+/// signature validation has to resolve the key before any credentials exist.
+///
 /// # Arguments
 /// * `account` - Account identifier
-/// * `metadata` - Metadata key-value pairs to store (keys will be prefixed with `swift-account-meta-`)
-/// * `credentials` - S3 credentials
+/// * `update` - Metadata items to set and to remove (names are prefixed with `swift-account-meta-`)
+/// * `credentials` - Keystone credentials of the caller
 pub async fn update_account_metadata(
     account: &str,
-    metadata: &HashMap<String, String>,
-    _credentials: &Option<Credentials>,
+    update: &MetadataUpdate,
+    credentials: &Option<Credentials>,
 ) -> SwiftResult<()> {
+    let Some(credentials) = credentials.as_ref() else {
+        return Err(SwiftError::Unauthorized(
+            "Keystone authentication required to update account metadata".to_string(),
+        ));
+    };
+    validate_account_access(account, credentials)?;
+
+    // These tags are persisted into the bucket metadata file, which every
+    // later config write rewrites in full — so unbounded metadata inflates
+    // the cost of unrelated writes for the life of the account. The item
+    // count is capped against the merged result, inside the rewrite.
+    update.validate()?;
+
+    // An update that names no item changes nothing, so there is no reason to
+    // bring the account's metadata bucket into existence for it.
+    if update.is_empty() {
+        return Ok(());
+    }
+
     let bucket_name = get_account_metadata_bucket_name(account);
 
     let Some(store) = resolve_swift_object_store_handle() else {
@@ -173,59 +202,10 @@ pub async fn update_account_metadata(
             .map_err(|e| SwiftError::InternalServerError(format!("Failed to create account metadata bucket: {}", e)))?;
     }
 
-    // Load current bucket metadata
-    let bucket_meta = get_swift_bucket_metadata(&bucket_name)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
-
-    let mut bucket_meta_clone = (*bucket_meta).clone();
-
-    // Get existing tags, preserving non-Swift tags
-    let mut existing_tagging = bucket_meta_clone
-        .tagging_config
-        .clone()
-        .unwrap_or_else(|| Tagging { tag_set: vec![] });
-
-    // Remove old swift-account-meta-* tags while preserving other tags
-    existing_tagging.tag_set.retain(|tag| {
-        if let Some(key) = &tag.key {
-            !key.starts_with("swift-account-meta-")
-        } else {
-            true
-        }
-    });
-
-    // Add new metadata tags
-    for (key, value) in metadata {
-        existing_tagging.tag_set.push(Tag {
-            key: Some(format!("swift-account-meta-{}", key)),
-            value: Some(value.clone()),
-        });
-    }
-
-    let now = time::OffsetDateTime::now_utc();
-
-    if existing_tagging.tag_set.is_empty() {
-        // No tags remain; clear tagging config
-        bucket_meta_clone.tagging_config_xml = Vec::new();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = None;
-    } else {
-        // Serialize tags to XML
-        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
-
-        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = Some(existing_tagging);
-    }
-
-    // Save updated metadata
-    set_swift_bucket_metadata(bucket_name.clone(), bucket_meta_clone)
-        .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
-
-    Ok(())
+    // Merge into the persisted tags: only the swift-account-meta-* items this
+    // update names change, and non-Swift tags are left alone. An empty result
+    // clears the tagging config.
+    update_swift_bucket_tagging(bucket_name, |current| update.apply_to_tags(current, ACCOUNT_META_TAG_PREFIX)).await
 }
 
 /// Get TempURL key for account

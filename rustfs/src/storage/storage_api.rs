@@ -91,8 +91,8 @@ pub(crate) use super::ecfs_extend::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, get_buffer_size_opt_in,
     get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
     parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
-    validate_object_key, wrap_response_with_cors,
+    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled,
+    validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers, sse_decryption,
@@ -174,17 +174,19 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
-    pub(crate) use super::super::helper::{OperationHelper, spawn_background_with_context};
+    pub(crate) use super::super::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
 
 pub(crate) mod options_consumer {
+    #[cfg(test)]
+    pub(crate) use super::super::options::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use super::super::options::{
-        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime,
-        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
-        parse_copy_source_range, put_opts, validate_archive_content_encoding,
+        bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
+        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
+        get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
+        normalize_content_encoding_for_storage, parse_copy_source_range, put_opts, validate_archive_content_encoding,
     };
 
     pub(crate) mod contract {
@@ -201,9 +203,7 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{
-        RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
-    };
+    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 }
 
 pub(crate) mod rpc_consumer {
@@ -234,8 +234,8 @@ pub(crate) mod rpc_consumer {
             ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
             ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
             StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata, set_bucket_metadata, validate_batch_read_version_item_count,
+            find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
+            remove_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -428,9 +428,9 @@ pub(crate) mod ecstore_data_usage {
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, OldCurrentSize, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
-        ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
-        validate_batch_read_version_item_count,
+        FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
+        ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
@@ -470,7 +470,7 @@ pub(crate) mod ecstore_metrics {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -495,8 +495,9 @@ pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature,
+        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -508,10 +509,19 @@ pub(crate) mod ecstore_object {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
+        ObjectEncryptionResolver, ObjectMutationHook, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
+}
+
+#[cfg(all(test, feature = "rio-v2"))]
+pub(crate) mod ecstore_test_support {
+    pub(crate) use rustfs_ecstore::api::bitrot::create_bitrot_reader;
+    pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
+    pub(crate) use rustfs_ecstore::api::erasure::Erasure;
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions};
 }
 
 pub(crate) mod ecstore_set_disk {
@@ -604,6 +614,7 @@ pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::E
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
+pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
@@ -627,6 +638,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
+pub(crate) type PartTransactionAction = ecstore_disk::PartTransactionAction;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
@@ -832,7 +844,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
     };
 
     for bucket in buckets {
-        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await?;
+        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
         let status = pool.get_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
@@ -942,13 +954,21 @@ pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Res
 /// The process-level bootstrap instance context that single-instance startup
 /// threads through the storage foundation (Phase 5 follow-up, backlog#1052).
 pub(crate) fn bootstrap_instance_ctx() -> Arc<InstanceContext> {
-    ecstore_runtime::bootstrap_ctx()
+    let context = ecstore_runtime::bootstrap_ctx();
+    configure_object_encryption_resolver(&context);
+    context
 }
 
 /// Construct a fresh per-server instance context (backlog#1052 S5): a second
 /// embedded server owns its own erasure/region/endpoint/deployment id cells.
 pub(crate) fn new_instance_ctx() -> Arc<InstanceContext> {
-    Arc::new(InstanceContext::new())
+    let context = Arc::new(InstanceContext::new());
+    configure_object_encryption_resolver(&context);
+    context
+}
+
+fn configure_object_encryption_resolver(context: &InstanceContext) {
+    let _ = context.set_object_encryption_resolver(Arc::new(super::sse::SseObjectEncryptionResolver));
 }
 
 pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
@@ -957,6 +977,10 @@ pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
 pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_notification::new_global_notification_sys(endpoint_pools).await
+}
+
+pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
+    ecstore_notification::start_remote_version_state_fleet_probe(topology_fingerprint);
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
@@ -1072,6 +1096,9 @@ pub(crate) trait StorageDiskRpcExt {
     ) -> DiskResult<()>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken>;
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken>;
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()>;
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo>;
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
@@ -1095,6 +1122,15 @@ pub(crate) trait StorageDiskRpcExt {
         dst_path: &str,
         meta: bytes::Bytes,
     ) -> DiskResult<()>;
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: bytes::Bytes,
+    ) -> DiskResult<()>;
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> DiskResult<()>;
     async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()>;
     async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
     async fn check_parts(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
@@ -1189,6 +1225,18 @@ where
         ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
     }
 
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::acquire_snapshot_lease(self, volume, path).await
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::renew_snapshot_lease(self, volume, path, token).await
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::release_snapshot_lease(self, volume, path, token).await
+    }
+
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo> {
         ecstore_disk::DiskAPI::stat_volume(self, volume).await
     }
@@ -1237,6 +1285,21 @@ where
         meta: bytes::Bytes,
     ) -> DiskResult<()> {
         ecstore_disk::DiskAPI::rename_part(self, src_volume, src_path, dst_volume, dst_path, meta).await
+    }
+
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: bytes::Bytes,
+    ) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::prepare_part_transaction(self, src_volume, src_path, dst_volume, dst_path, meta).await
+    }
+
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::settle_part_transaction(self, volume, path, action).await
     }
 
     async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()> {
@@ -1322,10 +1385,6 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
     }
 }
 
-pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
-    ecstore_bucket::metadata::load_bucket_metadata(api, bucket).await
-}
-
 #[cfg(test)]
 pub(crate) fn bucket_metadata_sys_initialized() -> bool {
     ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
@@ -1398,8 +1457,13 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
     ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
+#[cfg(test)]
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
+}
+
+pub(crate) async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<()> {
+    ecstore_bucket::metadata_sys::reload_bucket_metadata(api, bucket).await
 }
 
 pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
@@ -1416,8 +1480,8 @@ pub(crate) async fn update_bucket_metadata_config(
     Ok(updated_at)
 }
 
-pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
-    ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await
+pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {
@@ -1559,8 +1623,21 @@ pub(crate) fn sign_ns_scanner_capability(challenge: uuid::Uuid, server_epoch: uu
     ecstore_rpc::sign_ns_scanner_capability(challenge, server_epoch)
 }
 
-pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {
-    ecstore_rpc::verify_tonic_rpc_signature(audience, path, headers)
+pub(crate) fn verify_tonic_rpc_signature_with_bootstrap(
+    audience: &str,
+    path: &str,
+    headers: &http::HeaderMap,
+    allow_replay_scope_bootstrap: bool,
+) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(audience, path, headers, allow_replay_scope_bootstrap)
+}
+
+pub(crate) fn tonic_boot_epoch_challenge(headers: &http::HeaderMap) -> std::io::Result<Option<uuid::Uuid>> {
+    ecstore_rpc::tonic_boot_epoch_challenge(headers)
+}
+
+pub(crate) fn tonic_boot_epoch_response_headers(audience: &str, challenge: uuid::Uuid) -> std::io::Result<http::HeaderMap> {
+    ecstore_rpc::tonic_boot_epoch_response_headers(audience, challenge)
 }
 
 pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
@@ -1686,7 +1763,7 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 mod tests {
     use super::{
         apply_active_resync_intents, bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata,
-        scanner_maintenance_config_file,
+        new_instance_ctx, scanner_maintenance_config_file,
     };
     use std::time::Duration;
 
@@ -1715,6 +1792,16 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn fresh_instance_context_installs_object_encryption_resolver() {
+        assert!(new_instance_ctx().object_encryption_resolver().is_some());
+    }
+
+    #[test]
+    fn bootstrap_instance_context_installs_object_encryption_resolver() {
+        assert!(super::bootstrap_instance_ctx().object_encryption_resolver().is_some());
     }
 
     #[test]

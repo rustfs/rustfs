@@ -97,7 +97,8 @@ pub(crate) mod server {
 
     pub(crate) mod http {
         pub(crate) use crate::storage::storage_api::{
-            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
+            tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -124,9 +125,7 @@ pub(crate) mod server {
         }
 
         pub(crate) mod request_context {
-            pub(crate) use crate::storage::storage_api::request_context_consumer::{
-                RequestContext, extract_request_id_from_headers,
-            };
+            pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         }
 
         pub(crate) mod rpc {
@@ -149,7 +148,7 @@ pub(crate) mod server {
 
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
-                RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
+                RequestContext, extract_request_id_from_headers, spawn_traced,
             };
         }
     }

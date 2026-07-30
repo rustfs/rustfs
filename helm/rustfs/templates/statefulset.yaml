@@ -1,11 +1,36 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
 {{- $poolsEnabled := and .Values.pools .Values.pools.enabled }}
+{{- $generatedVolumes := empty .Values.config.rustfs.volumes }}
+{{- $localEndpointHostAutoInject := empty .Values.secret.existingSecret }}
+{{- with .Values.localEndpointHost }}
+{{- if and (hasKey . "autoInject") (ne .autoInject nil) }}
+{{- if not (kindIs "bool" .autoInject) }}
+{{- fail "localEndpointHost.autoInject must be a boolean or null" }}
+{{- end }}
+{{- $localEndpointHostAutoInject = .autoInject }}
+{{- end }}
+{{- end }}
+{{- $injectLocalEndpointHost := and $generatedVolumes $localEndpointHostAutoInject }}
+{{- range $env := .Values.extraEnv -}}
+{{- $name := default "" $env.name -}}
+{{- if eq $name "RUSTFS_VOLUMES" -}}
+{{- $injectLocalEndpointHost = false -}}
+{{- else if eq $name "RUSTFS_LOCAL_ENDPOINT_HOST" -}}
+{{- $injectLocalEndpointHost = false -}}
+{{- else if eq $name "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE" -}}
+{{- if hasKey $env "value" -}}
+{{- $mode := lower (trim (toString $env.value)) -}}
+{{- if and (ne $mode "") (ne $mode "auto") (ne $mode "orchestrated") -}}
+{{- $injectLocalEndpointHost = false -}}
+{{- end -}}
+{{- else -}}
+{{- $injectLocalEndpointHost = false -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.mode.distributed.enabled (le (int .Values.replicaCount) 1) -}}
 {{- fail "Distributed mode requires replicaCount >= 2" -}}
-{{- end -}}
-{{- if and .Values.mode.distributed.enabled (le (int .Values.startupWaitTimeoutSeconds) 0) -}}
-{{- fail "startupWaitTimeoutSeconds must be greater than 0 in distributed mode" -}}
 {{- end -}}
 
 {{- if .Values.mode.distributed.enabled }}
@@ -74,13 +99,10 @@ spec:
         {{- if $.Values.affinity.podAntiAffinity.enabled }}
         podAntiAffinity:
           {{- if $poolsEnabled }}
-          {{- /* Pool-scoped and PREFERRED, not required: during in-place
-                 expansion the not-yet-rolled pods' required rules block new
-                 pods from their nodes, while the new pods' DNS must resolve
-                 before the roll can proceed - required rules deadlock
-                 expansion whenever the cluster has fewer nodes than total
-                 pods. Soft anti-affinity converges (the scheduler still
-                 spreads when capacity allows). */}}
+          {{- /* Pool-scoped and PREFERRED, not required: additional pools
+                 must remain schedulable when the cluster has fewer nodes
+                 than total pods. The scheduler still spreads them when
+                 capacity allows. */}}
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               podAffinityTerm:
@@ -127,10 +149,6 @@ spec:
           env:
             - name: DRIVES_PER_NODE
               value: {{ $drivesPerNode | quote }}
-            - name: ENDPOINT_PORT
-              value: {{ $.Values.service.endpoint.port | quote }}
-            - name: STARTUP_WAIT_TIMEOUT_SECONDS
-              value: {{ $.Values.startupWaitTimeoutSeconds | quote }}
           command:
             - sh
             - -c
@@ -145,44 +163,6 @@ spec:
               {{- if $logDirEnabled }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
-              {{- end }}
-              deadline=$(($(date +%s) + STARTUP_WAIT_TIMEOUT_SECONDS))
-              wait_for_peer() {
-                description=$1
-                shift
-                until "$@" >/dev/null 2>&1; do
-                  if [ "$(date +%s)" -ge "$deadline" ]; then
-                    echo "Timed out after ${STARTUP_WAIT_TIMEOUT_SECONDS}s waiting for ${description}" >&2
-                    exit 1
-                  fi
-                  sleep 2
-                done
-              }
-
-              echo "Waiting for distributed peer DNS records"
-              {{- range $peerPool := $pools }}
-              {{- range $i := until (int $peerPool.replicaCount) }}
-              wait_for_peer "DNS for {{ $peerPool.fullname }}-{{ $i }}" \
-                nslookup "{{ $peerPool.fullname }}-{{ $i }}.{{ include "rustfs.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ include "rustfs.clusterDomain" $ }}"
-              {{- end }}
-              {{- end }}
-
-              ordinal=${HOSTNAME##*-}
-              echo "Waiting for earlier distributed peers to listen on port ${ENDPOINT_PORT}"
-              {{- range $peerPool := $pools }}
-              {{- if lt (int $peerPool.index) (int $pool.index) }}
-              {{- range $i := until (int $peerPool.replicaCount) }}
-              wait_for_peer "{{ $peerPool.fullname }}-{{ $i }}:${ENDPOINT_PORT}" \
-                nc -z -w 2 "{{ $peerPool.fullname }}-{{ $i }}.{{ include "rustfs.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ include "rustfs.clusterDomain" $ }}" "$ENDPOINT_PORT"
-              {{- end }}
-              {{- else if eq (int $peerPool.index) (int $pool.index) }}
-              i=0
-              while [ "$i" -lt "$ordinal" ]; do
-                wait_for_peer "{{ $peerPool.fullname }}-${i}:${ENDPOINT_PORT}" \
-                  nc -z -w 2 "{{ $peerPool.fullname }}-${i}.{{ include "rustfs.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ include "rustfs.clusterDomain" $ }}" "$ENDPOINT_PORT"
-                i=$((i + 1))
-              done
-              {{- end }}
               {{- end }}
           volumeMounts:
             {{- if gt $drivesPerNode 1 }}
@@ -210,15 +190,29 @@ spec:
               containerPort: {{ $.Values.service.endpoint.port }}
             - name: console
               containerPort: {{ $.Values.service.console.port }}
-          {{- with $.Values.extraEnv }}
+          {{- if or $injectLocalEndpointHost (not (empty $.Values.extraEnv)) }}
           env:
+            {{- if $injectLocalEndpointHost }}
+            - name: RUSTFS_CHART_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUSTFS_LOCAL_ENDPOINT_HOST
+              value: {{ printf "$(RUSTFS_CHART_POD_NAME).%s-headless.%s.svc.%s" (include "rustfs.fullname" $) $.Release.Namespace (include "rustfs.clusterDomain" $) | quote }}
+            {{- end }}
+            {{- with $.Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" $ }}-config
             - secretRef:
                 name: {{ include "rustfs.secretName" $ }}
+            {{- if include "rustfs.kmsVaultToken" $ }}
+            - secretRef:
+                name: {{ include "rustfs.kmsSecretName" $ }}
+            {{- end }}
           resources:
             {{- toYaml $.Values.resources | nindent 12 }}
           {{- include "rustfs.probes" $ | nindent 10 }}

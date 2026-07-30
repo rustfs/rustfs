@@ -58,7 +58,9 @@ use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
 };
-use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::app::object_usecase::{
+    build_put_like_object_lock_metadata, map_quota_check_outcome, validate_existing_object_lock_for_write,
+};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
@@ -438,6 +440,12 @@ impl DefaultMultipartUsecase {
         }
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
+        let Some(parts) = multipart_upload.parts.filter(|parts| !parts.is_empty()) else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "You must specify at least one part".to_string(),
+            ));
+        };
 
         let mut opts = get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
@@ -447,12 +455,7 @@ impl DefaultMultipartUsecase {
         let capacity_scope_token = Uuid::new_v4();
         opts.capacity_scope_token = Some(capacity_scope_token);
 
-        let uploaded_parts_vec = multipart_upload
-            .parts
-            .unwrap_or_default()
-            .into_iter()
-            .map(complete_part_from_s3)
-            .collect::<Vec<_>>();
+        let uploaded_parts_vec = parts.into_iter().map(complete_part_from_s3).collect::<Vec<_>>();
 
         let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
 
@@ -516,6 +519,12 @@ impl DefaultMultipartUsecase {
             _ => None,
         };
 
+        let quota_metadata_sys = self.bucket_metadata_sys();
+        if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+        }
+
         let obj_info = store
             .clone()
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
@@ -524,17 +533,18 @@ impl DefaultMultipartUsecase {
         let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
         record_capacity_write(Some(capacity_scope_token)).await;
 
-        // check quota after completing multipart upload
-        if let Some(metadata_sys) = self.bucket_metadata_sys() {
+        if let Some(metadata_sys) = quota_metadata_sys {
             let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
+                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size.max(0) as u64)
                 .await
             {
                 Ok(check_result) => {
                     if !check_result.allowed {
-                        // Quota exceeded, delete the completed object
+                        // Preserve the established compensation behavior for
+                        // a known over-quota result. Unknown usage is rejected
+                        // by the preflight check before the upload is committed.
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
                         let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
                         return Err(S3Error::with_message(
@@ -546,17 +556,16 @@ impl DefaultMultipartUsecase {
                             ),
                         ));
                     }
-                    // Update quota tracking after successful multipart upload
-                    if versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
-                            .await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
-                    }
                 }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                Err(err) => {
+                    warn!("Quota check failed for bucket {} after multipart completion: {}", bucket, err);
                 }
+            }
+
+            if versioned {
+                record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+            } else {
+                record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
             }
         }
 
@@ -1783,6 +1792,127 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_rejects_missing_parts_list() {
+        use s3s::xml::Deserialize as _;
+
+        let mut deserializer = s3s::xml::Deserializer::new(b"<CompleteMultipartUpload/>");
+        let multipart_upload =
+            CompletedMultipartUpload::deserialize(&mut deserializer).expect("empty multipart XML should decode");
+        deserializer
+            .expect_eof()
+            .expect("empty multipart XML should be fully consumed");
+        assert!(multipart_upload.parts.is_none());
+
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .multipart_upload(Some(multipart_upload))
+            .build()
+            .expect("complete multipart input should build");
+        let req = build_request(input, Method::POST);
+
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .expect_err("missing parts list must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rejected_empty_parts_preserve_existing_object_and_staging() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+
+        let bucket = format!("empty-complete-{}", Uuid::new_v4());
+        let object = "existing-object";
+        let existing_payload = b"existing object must survive";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create multipart regression bucket");
+
+        let mut existing_reader = PutObjReader::from_vec(existing_payload.to_vec());
+        let existing_info = store
+            .put_object(&bucket, object, &mut existing_reader, &ObjectOptions::default())
+            .await
+            .expect("write existing object");
+
+        let upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create multipart staging upload");
+        let mut part_reader = PutObjReader::from_vec(b"staged part".to_vec());
+        let staged_part = store
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("write staged multipart part");
+
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .upload_id(upload.upload_id.clone())
+            .multipart_upload(Some(CompletedMultipartUpload { parts: Some(Vec::new()) }))
+            .build()
+            .expect("complete multipart input should build");
+        let err = DefaultMultipartUsecase::from_global()
+            .execute_complete_multipart_upload(build_request(input, Method::POST))
+            .await
+            .expect_err("empty parts list must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let current_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("existing object should remain readable");
+        assert_eq!(current_info.size, existing_info.size);
+        assert_eq!(current_info.etag, existing_info.etag);
+
+        let staged = store
+            .list_object_parts(&bucket, object, &upload.upload_id, None, 1000, &ObjectOptions::default())
+            .await
+            .expect("multipart staging should remain available");
+        assert_eq!(staged.parts.len(), 1);
+        assert_eq!(staged.parts[0].part_num, 1);
+        assert_eq!(staged.parts[0].etag, staged_part.etag);
+
+        let staged_etag = staged_part.etag.expect("staged part should have an ETag");
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket)
+            .key(object.to_string())
+            .upload_id(upload.upload_id)
+            .multipart_upload(Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: Some(to_s3s_etag(&staged_etag)),
+                    ..Default::default()
+                }]),
+            }))
+            .build()
+            .expect("complete multipart input should build");
+        let completed = DefaultMultipartUsecase::from_global()
+            .execute_complete_multipart_upload(build_request(input, Method::POST))
+            .await
+            .expect("staged part should remain completable after empty request rejection");
+        assert!(completed.output.e_tag.is_some());
+        let completed_info = store
+            .get_object_info(
+                completed
+                    .output
+                    .bucket
+                    .as_deref()
+                    .expect("complete response should include bucket"),
+                object,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("completed object should be readable");
+        assert_eq!(completed_info.size, b"staged part".len() as i64);
     }
 
     #[tokio::test]

@@ -48,6 +48,7 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+pub(crate) const DATA_USAGE_CACHE_KEY_FORMAT: u16 = 1;
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
 const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
 const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
@@ -437,6 +438,8 @@ pub struct DataUsageCacheInfo {
     pub snapshot_complete: bool,
     #[serde(default)]
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
+    #[serde(default)]
+    pub cache_key_format: u16,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -446,7 +449,7 @@ impl Serialize for DataUsageCacheInfo {
     {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
-        let mut state = serializer.serialize_map(Some(15))?;
+        let mut state = serializer.serialize_map(Some(16))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
         state.serialize_entry("leader_epoch", &self.leader_epoch)?;
@@ -462,6 +465,7 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("source", &self.source)?;
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;
+        state.serialize_entry("cache_key_format", &self.cache_key_format)?;
         state.end()
     }
 }
@@ -500,19 +504,34 @@ impl DataUsageCache {
 
         let source_matches = self.info.source == Some(source);
         let plan_matches = self.info.scan_plan_digest == Some(scan_plan_digest);
-        let reusable = self.info.name == name
+        let metadata_is_reusable = self.info.name == name
             && self.info.leader_epoch == leader_epoch
             && plan_matches
-            && (source_matches || (!require_source && self.info.source.is_none()));
+            && (source_matches || (!require_source && self.info.source.is_none()))
+            && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT;
+        let reusable = metadata_is_reusable
+            && (self.cache.is_empty()
+                || if name == DATA_USAGE_ROOT || self.info.snapshot_complete {
+                    self.checked_flatten_complete_scope(name).is_some()
+                } else {
+                    self.checked_flatten(name).is_some()
+                });
         if !reusable {
+            let pending_heals = if self.info.name == name {
+                std::mem::take(&mut self.info.pending_heals)
+            } else {
+                Vec::new()
+            };
             *self = Self::default();
             self.info.name = name.to_string();
+            self.info.pending_heals = pending_heals;
         }
 
         self.info.next_cycle = next_cycle;
         self.info.leader_epoch = leader_epoch;
         self.info.source = Some(source);
         self.info.scan_plan_digest = Some(scan_plan_digest);
+        self.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
         self.info.snapshot_complete = false;
         if reusable {
             DataUsageCachePrepareOutcome::Reused
@@ -576,36 +595,60 @@ impl DataUsageCache {
     }
 
     pub(crate) fn checked_flatten(&self, path: &str) -> Option<DataUsageEntry> {
+        self.checked_flatten_inner(path).map(|(entry, _)| entry)
+    }
+
+    pub(crate) fn checked_flatten_complete(&self, path: &str) -> Option<DataUsageEntry> {
+        self.checked_flatten_inner(path)
+            .filter(|(_, visited)| *visited == self.cache.len())
+            .map(|(entry, _)| entry)
+    }
+
+    pub(crate) fn checked_flatten_complete_scope(&self, path: &str) -> Option<DataUsageEntry> {
+        if path == DATA_USAGE_ROOT {
+            return self.checked_flatten_complete(path);
+        }
+        let (entry, visited) = self.checked_flatten_inner(path)?;
+        let root_parent_only = {
+            let path_key = hash_path(path).key();
+            self.cache
+                .get(DATA_USAGE_ROOT)
+                .is_some_and(|root| root_is_parent_only(root, &path_key))
+        };
+        let expected_entries = self.cache.len().saturating_sub(usize::from(root_parent_only));
+        (visited == expected_entries).then_some(entry)
+    }
+
+    fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
         let root_key = hash_path(path).key();
-        let root = self.cache.get(&root_key)?;
-        let mut visited = HashSet::from([root_key]);
-        let mut pending = root.children.iter().map(|child| (child.clone(), 1usize)).collect::<Vec<_>>();
+        let (root_key, root) = self.cache.get_key_value(&root_key)?;
+        if root.compacted && !root.children.is_empty() {
+            return None;
+        }
+        let mut visited = HashSet::from([root_key.as_str()]);
+        let mut pending = root.children.iter().map(|child| (child.as_str(), 1usize)).collect::<Vec<_>>();
         let mut flattened = DataUsageEntry::default();
-        let mut root_entry = root.clone();
-        root_entry.children.clear();
-        if !flattened.checked_merge(&root_entry) {
+        if !flattened.checked_merge(root) {
             return None;
         }
         flattened.compacted = root.compacted;
 
         while let Some((key, depth)) = pending.pop() {
-            if depth > MAX_DATA_USAGE_CACHE_DEPTH || !visited.insert(key.clone()) {
+            if depth > MAX_DATA_USAGE_CACHE_DEPTH || !visited.insert(key) {
                 return None;
             }
-            let entry = self.cache.get(&key)?;
-            if depth == MAX_DATA_USAGE_CACHE_DEPTH && !entry.children.is_empty() {
+            let entry = self.cache.get(key)?;
+            if (entry.compacted || depth == MAX_DATA_USAGE_CACHE_DEPTH) && !entry.children.is_empty() {
                 return None;
             }
-            pending.extend(entry.children.iter().map(|child| (child.clone(), depth + 1)));
+            pending.extend(entry.children.iter().map(|child| (child.as_str(), depth + 1)));
 
-            let mut child_entry = entry.clone();
-            child_entry.children.clear();
-            if !flattened.checked_merge(&child_entry) {
+            if !flattened.checked_merge(entry) {
                 return None;
             }
         }
 
-        Some(flattened)
+        Some((flattened, visited.len()))
     }
 
     fn flatten_with_guard(&self, root: &DataUsageEntry, visited: &mut HashSet<String>, depth: usize) -> DataUsageEntry {
@@ -698,7 +741,7 @@ impl DataUsageCache {
                 let mut visited = HashSet::new();
                 visited.insert(hash_path(path).key());
                 let mut flat = self.flatten_with_guard(root, &mut visited, 0);
-                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.is_empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -1524,6 +1567,18 @@ fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut Has
     }
 }
 
+fn root_is_parent_only(root: &DataUsageEntry, child: &str) -> bool {
+    root.children.len() == 1
+        && root.children.contains(child)
+        && root.size == 0
+        && root.objects == 0
+        && root.versions == 0
+        && root.delete_markers == 0
+        && root.replication_stats.is_none()
+        && !root.compacted
+        && root.failed_objects == 0
+}
+
 /// Trait for storage-specific operations on DataUsageCache
 #[async_trait::async_trait]
 pub trait DataUsageCacheStorage {
@@ -1574,6 +1629,7 @@ mod tests {
     use super::*;
     use crate::storage_api::scanner_io::{HTTPRangeSpec, ObjectIO};
     use crate::{ScannerGetObjectReader, ScannerPutObjReader};
+    use rustfs_data_usage::{ReplicationAllStats, ReplicationStats};
     use serde_json::Value;
     use std::io::Cursor;
     use std::pin::Pin;
@@ -2286,6 +2342,7 @@ mod tests {
         assert!(decoded.source.is_none());
         assert!(!decoded.snapshot_complete);
         assert!(decoded.scan_plan_digest.is_none());
+        assert_eq!(decoded.cache_key_format, 0);
     }
 
     #[test]
@@ -2327,6 +2384,7 @@ mod tests {
         assert!(decoded.source.is_none());
         assert!(!decoded.snapshot_complete);
         assert!(decoded.scan_plan_digest.is_none());
+        assert_eq!(decoded.cache_key_format, 0);
     }
 
     #[test]
@@ -2362,6 +2420,7 @@ mod tests {
                 source: Some(DataUsageCacheSource::new(1, 2)),
                 snapshot_complete: true,
                 scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                 ..Default::default()
             },
             ..Default::default()
@@ -2380,6 +2439,7 @@ mod tests {
         assert_eq!(current.info.source, Some(DataUsageCacheSource::new(1, 2)));
         assert!(current.info.snapshot_complete);
         assert_eq!(current.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+        assert_eq!(current.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
         assert_eq!(current.find("bucket").map(|entry| entry.objects), Some(3));
 
         let decoded: OldDataUsageCache = rmp_serde::from_slice(&buf).expect("Old reader failed to deserialize new cache");
@@ -2441,6 +2501,7 @@ mod tests {
                 source: Some(source),
                 snapshot_complete: false,
                 scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                 ..Default::default()
             },
             ..Default::default()
@@ -2463,6 +2524,254 @@ mod tests {
         assert_eq!(cache.info.source, Some(source));
         assert_eq!(cache.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
         assert!(!cache.info.snapshot_complete);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_preserves_pending_heal_only_progress() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let pending_heal = PendingScannerHeal {
+            kind: PendingScannerHealKind::Object,
+            bucket: "bucket".to_string(),
+            object: Some("prefix/object".to_string()),
+            version_id: Some("version-a".to_string()),
+            scan_mode: HealScanMode::Deep,
+            first_seen: 1,
+            last_attempt: 2,
+            attempts: 3,
+            last_admission_result: "full".to_string(),
+            last_admission_reason: "queue_full".to_string(),
+        };
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                pending_heals: vec![pending_heal.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reused);
+        assert_eq!(cache.info.pending_heals, vec![pending_heal]);
+        assert!(cache.cache.is_empty());
+        assert!(!cache.info.snapshot_complete);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_preserves_namespace_pending_heals_during_key_format_rebuild() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let pending_heal = PendingScannerHeal {
+            kind: PendingScannerHealKind::Object,
+            bucket: "bucket".to_string(),
+            object: Some("prefix/object".to_string()),
+            version_id: Some("version-a".to_string()),
+            scan_mode: HealScanMode::Deep,
+            first_seen: 1,
+            last_attempt: 2,
+            attempts: 3,
+            last_admission_result: "full".to_string(),
+            last_admission_reason: "queue_full".to_string(),
+        };
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                pending_heals: vec![pending_heal.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+
+        let outcome = cache.prepare_for_scan(DATA_USAGE_ROOT, 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert_eq!(cache.info.pending_heals, vec![pending_heal]);
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_drops_pending_heals_from_a_different_scope() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "old-bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                pending_heals: vec![PendingScannerHeal {
+                    kind: PendingScannerHealKind::Object,
+                    bucket: "old-bucket".to_string(),
+                    object: Some("prefix/object".to_string()),
+                    version_id: None,
+                    scan_mode: HealScanMode::Normal,
+                    first_seen: 1,
+                    last_attempt: 2,
+                    attempts: 3,
+                    last_admission_result: "full".to_string(),
+                    last_admission_reason: "queue_full".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let outcome = cache.prepare_for_scan("new-bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert_eq!(cache.info.name, "new-bucket");
+        assert!(cache.info.pending_heals.is_empty());
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_resets_unknown_key_format() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT + 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                objects: 3,
+                ..Default::default()
+            },
+        );
+
+        let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_resets_persisted_windows_key_mismatch() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let root_key = hash_path("bucket").key();
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            root_key,
+            DataUsageEntry {
+                children: HashSet::from(["bucket/prefix".to_string()]),
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            "bucket\\prefix".to_string(),
+            DataUsageEntry {
+                objects: 3,
+                ..Default::default()
+            },
+        );
+
+        let encoded = cache.marshal_msg().expect("legacy Windows cache should serialize");
+        let mut decoded = DataUsageCache::unmarshal(&encoded).expect("legacy Windows cache should deserialize");
+        let outcome = decoded.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert!(decoded.cache.is_empty());
+        assert_eq!(decoded.info.name, "bucket");
+        assert_eq!(decoded.info.next_cycle, 8);
+        assert_eq!(decoded.info.source, Some(source));
+        assert!(!decoded.info.snapshot_complete);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_resets_current_cache_with_dangling_child() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            hash_path("bucket").key(),
+            DataUsageEntry {
+                children: HashSet::from([hash_path("bucket/missing").key()]),
+                ..Default::default()
+            },
+        );
+
+        let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    }
+
+    #[test]
+    fn data_usage_cache_prepare_for_scan_resets_complete_bucket_cache_with_detached_entry() {
+        let source = DataUsageCacheSource::new(1, 0);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.cache.insert(
+            hash_path("bucket").key(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            hash_path("bucket/detached").key(),
+            DataUsageEntry {
+                objects: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cache.checked_flatten("bucket").map(|entry| entry.objects), Some(1));
+        assert!(
+            cache.checked_flatten_complete("bucket").is_none(),
+            "complete bucket cache reuse must reject detached entries"
+        );
+
+        let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+        assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+        assert!(cache.cache.is_empty());
+        assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
     }
 
     #[test]
@@ -2768,6 +3077,55 @@ mod tests {
     }
 
     #[test]
+    fn size_recursive_prunes_empty_and_preserves_threshold_replication_stats() {
+        let root = hash_path("bucket");
+        let child = hash_path("bucket/child");
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats::default()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cache
+                .size_recursive("bucket")
+                .expect("scanner bucket usage should flatten")
+                .replication_stats
+                .is_none()
+        );
+
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats {
+                    targets: HashMap::from([(
+                        "arn:test:threshold".to_string(),
+                        ReplicationStats {
+                            after_threshold_count: 1,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let flattened = cache.size_recursive("bucket").expect("scanner bucket usage should flatten");
+        let replication = flattened
+            .replication_stats
+            .expect("threshold-only replication stats must survive pruning");
+
+        assert_eq!(replication.targets["arn:test:threshold"].after_threshold_count, 1);
+    }
+
+    #[test]
     fn checked_flatten_rejects_dangling_child() {
         let root_key = hash_path("bucket").key();
         let mut cache = DataUsageCache::default();
@@ -2783,6 +3141,98 @@ mod tests {
         assert!(
             cache.checked_flatten("bucket").is_none(),
             "a missing child must invalidate an exact usage snapshot"
+        );
+    }
+
+    #[test]
+    fn checked_flatten_complete_rejects_detached_entries() {
+        let mut cache = DataUsageCache::default();
+        cache.cache.insert(
+            hash_path("bucket").key(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            hash_path("bucket/detached").key(),
+            DataUsageEntry {
+                objects: 2,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            cache.checked_flatten("bucket").map(|entry| entry.objects),
+            Some(1),
+            "subtree flattening may ignore entries outside the requested subtree"
+        );
+        assert!(
+            cache.checked_flatten_complete("bucket").is_none(),
+            "an authoritative cache root must reach every persisted entry"
+        );
+    }
+
+    #[test]
+    fn checked_flatten_rejects_compacted_entries_with_children() {
+        let root_key = hash_path("bucket").key();
+        let child_key = hash_path("bucket/prefix").key();
+        let mut cache = DataUsageCache::default();
+        cache.cache.insert(
+            root_key,
+            DataUsageEntry {
+                children: HashSet::from([child_key.clone()]),
+                compacted: true,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            child_key,
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cache.checked_flatten_complete("bucket").is_none(),
+            "a compacted entry cannot retain child links without double-counting"
+        );
+    }
+
+    #[test]
+    fn checked_flatten_rejects_compacted_descendants_with_children() {
+        let root_key = hash_path("bucket").key();
+        let child_key = hash_path("bucket/prefix").key();
+        let grandchild_key = hash_path("bucket/prefix/object").key();
+        let mut cache = DataUsageCache::default();
+        cache.cache.insert(
+            root_key,
+            DataUsageEntry {
+                children: HashSet::from([child_key.clone()]),
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            child_key,
+            DataUsageEntry {
+                objects: 1,
+                children: HashSet::from([grandchild_key.clone()]),
+                compacted: true,
+                ..Default::default()
+            },
+        );
+        cache.cache.insert(
+            grandchild_key,
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cache.checked_flatten("bucket").is_none(),
+            "a compacted descendant cannot retain child links without double-counting"
         );
     }
 

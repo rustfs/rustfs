@@ -33,11 +33,12 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::auth::{check_key_valid, get_session_token};
+use crate::auth::{check_key_valid, constant_time_eq, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
+    is_sts_query_request,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -904,7 +905,9 @@ fn validate_object_lambda_response_auth_headers(headers: &HeaderMap, output_rout
         .and_then(|value| value.to_str().ok())
         .map(str::trim);
 
-    if route == Some(output_route) && token == Some(output_token) {
+    if route.is_some_and(|route| constant_time_eq(route, output_route))
+        && token.is_some_and(|token| constant_time_eq(token, output_token))
+    {
         return Ok(());
     }
 
@@ -2475,7 +2478,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
     };
 
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let _transaction_guard = metadata_sys::acquire_bucket_targets_transaction_lock(bucket)
+    let _transaction_guard = metadata_sys::acquire_bucket_metadata_transaction_lock(bucket)
         .await
         .map_err(ApiError::from)?;
     let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
@@ -2652,6 +2655,10 @@ fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
+fn server_context_not_ready_error() -> S3Error {
+    s3_error!(ServiceUnavailable, "server context is not ready")
+}
+
 fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
     if method != Method::GET {
         return false;
@@ -2769,15 +2776,7 @@ where
         }
 
         // AssumeRole
-        if method == Method::POST
-            && path == "/"
-            && headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.split(';').next().unwrap_or("").trim().to_lowercase())
-                .map(|ct| ct == "application/x-www-form-urlencoded")
-                .unwrap_or(false)
-        {
+        if is_sts_query_request(method, uri, headers) {
             return true;
         }
 
@@ -2788,6 +2787,9 @@ where
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
+            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
+                return Err(server_context_not_ready_error());
+            }
         }
         if parse_replication_extension_request(&req.method, &req.uri).is_some()
             || parse_misc_extension_request(&req.method, &req.uri).is_some()
@@ -2827,22 +2829,7 @@ where
         // The handler dispatches on the Action parameter: AssumeRole will reject if
         // credentials are missing, AssumeRoleWithWebIdentity will validate the JWT.
         // Require application/x-www-form-urlencoded Content-Type to narrow the bypass.
-        if req.method == Method::POST
-            && path == "/"
-            && req.credentials.is_none()
-            && req
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| {
-                    ct.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                })
-                .unwrap_or(false)
-        {
+        if req.credentials.is_none() && is_sts_query_request(&req.method, &req.uri, &req.headers) {
             return Ok(());
         }
 
@@ -2856,6 +2843,9 @@ where
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
+            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
+                return Err(server_context_not_ready_error());
+            }
         }
         if let Some(ext_req) = parse_replication_extension_request(&req.method, &req.uri) {
             return handle_replication_extension_request(&mut req, &ext_req).await;
@@ -4373,6 +4363,39 @@ mod tests {
         let err = validate_object_lambda_response_auth_headers(&mismatched, "route-123", "token-456")
             .expect_err("mismatched auth headers should fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        for (route, token) in [
+            ("Route-123", "token-456"),
+            ("route-124", "token-456"),
+            ("route-1234", "token-456"),
+            ("route-123", "Token-456"),
+            ("route-123", "token-457"),
+            ("route-123", "token-4567"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-amz-request-route",
+                HeaderValue::try_from(route).expect("test route must be a valid header"),
+            );
+            headers.insert(
+                "x-amz-request-token",
+                HeaderValue::try_from(token).expect("test token must be a valid header"),
+            );
+            assert!(
+                validate_object_lambda_response_auth_headers(&headers, "route-123", "token-456").is_err(),
+                "first-byte, last-byte, and length mismatches must fail: {route}/{token}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_lambda_auth_headers_use_constant_time_helper() {
+        let source = include_str!("router.rs");
+        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        assert!(!production.contains("route == Some(output_route)"));
+        assert!(!production.contains("token == Some(output_token)"));
+        assert!(production.contains("constant_time_eq(route, output_route)"));
+        assert!(production.contains("constant_time_eq(token, output_token)"));
     }
 
     #[test]
@@ -4792,6 +4815,43 @@ mod tests {
             .await
             .expect_err("anonymous profile request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_limits_anonymous_sts_exemption_to_form_content_type() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let request = |content_type: Option<&'static str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            }
+            S3Request {
+                input: Body::from(String::from("Action=AssumeRoleWithWebIdentity")),
+                method: Method::POST,
+                uri: Uri::from_static("/"),
+                headers,
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            }
+        };
+
+        for content_type in [None, Some("application/json")] {
+            let mut req = request(content_type);
+            let err = router
+                .check_access(&mut req)
+                .await
+                .expect_err("anonymous STS request without form content type must be denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        }
+
+        let mut req = request(Some("application/x-www-form-urlencoded"));
+        router
+            .check_access(&mut req)
+            .await
+            .expect("anonymous form-encoded STS request should reach identity validation");
     }
 
     #[tokio::test]

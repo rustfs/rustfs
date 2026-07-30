@@ -31,19 +31,25 @@ use tokio::sync::RwLock;
 pub struct KmsManager {
     backend: Arc<dyn KmsBackend>,
     cache: Arc<RwLock<KmsCache>>,
-    config: KmsConfig,
+    default_key_id: Option<String>,
+    enable_cache: bool,
 }
 
 impl KmsManager {
     /// Create a new KMS manager with the given backend and config
     pub fn new(backend: Arc<dyn KmsBackend>, config: KmsConfig) -> Self {
         let cache = Arc::new(RwLock::new(KmsCache::new(config.cache_config.max_keys as u64)));
-        Self { backend, cache, config }
+        Self {
+            backend,
+            cache,
+            default_key_id: config.default_key_id,
+            enable_cache: config.enable_cache,
+        }
     }
 
     /// Get the default key ID if configured
     pub fn get_default_key_id(&self) -> Option<&String> {
-        self.config.default_key_id.as_ref()
+        self.default_key_id.as_ref()
     }
 
     /// Create a new master key
@@ -51,7 +57,7 @@ impl KmsManager {
         let response = self.backend.create_key(request).await?;
 
         // Cache the key metadata if enabled
-        if self.config.enable_cache {
+        if self.enable_cache {
             let mut cache = self.cache.write().await;
             cache.put_key_metadata(&response.key_id, &response.key_metadata).await;
         }
@@ -77,7 +83,7 @@ impl KmsManager {
     /// Describe a key
     pub async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse> {
         // Check cache first if enabled
-        if self.config.enable_cache {
+        if self.enable_cache {
             let cache = self.cache.read().await;
             if let Some(cached_metadata) = cache.get_key_metadata(&request.key_id).await {
                 return Ok(DescribeKeyResponse {
@@ -89,7 +95,7 @@ impl KmsManager {
         // Get from backend and cache
         let response = self.backend.describe_key(request).await?;
 
-        if self.config.enable_cache {
+        if self.enable_cache {
             let mut cache = self.cache.write().await;
             cache
                 .put_key_metadata(&response.key_metadata.key_id, &response.key_metadata)
@@ -106,7 +112,7 @@ impl KmsManager {
 
     /// Get cache statistics
     pub async fn cache_stats(&self) -> Option<(u64, u64)> {
-        if self.config.enable_cache {
+        if self.enable_cache {
             let cache = self.cache.read().await;
             Some(cache.stats())
         } else {
@@ -116,7 +122,7 @@ impl KmsManager {
 
     /// Clear the cache
     pub async fn clear_cache(&self) -> Result<()> {
-        if self.config.enable_cache {
+        if self.enable_cache {
             let mut cache = self.cache.write().await;
             cache.clear().await;
         }
@@ -128,7 +134,7 @@ impl KmsManager {
         let response = self.backend.delete_key(request).await?;
 
         // Remove from cache if enabled and key is being deleted
-        if self.config.enable_cache {
+        if self.enable_cache {
             let mut cache = self.cache.write().await;
             cache.remove_key_metadata(&response.key_id).await;
         }
@@ -141,7 +147,7 @@ impl KmsManager {
         let response = self.backend.cancel_key_deletion(request).await?;
 
         // Update cache if enabled
-        if self.config.enable_cache {
+        if self.enable_cache {
             let mut cache = self.cache.write().await;
             cache.put_key_metadata(&response.key_id, &response.key_metadata).await;
         }

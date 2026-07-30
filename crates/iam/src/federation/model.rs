@@ -18,7 +18,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub const OIDC_VIRTUAL_PARENT_CLAIM: &str = "x-rustfs-internal-oidc-parent";
-const OIDC_VIRTUAL_PARENT_PREFIX: &str = "openid=";
 
 #[derive(Debug, Clone)]
 pub struct FederatedClaims {
@@ -65,18 +64,13 @@ impl FederatedAuthorization {
             return None;
         }
 
-        let subject_len = u64::try_from(subject.len()).ok()?;
-        let issuer_len = u64::try_from(issuer.len()).ok()?;
-        let mut source = Vec::with_capacity(16 + subject.len() + issuer.len());
-        source.extend_from_slice(&subject_len.to_be_bytes());
+        let mut source = Vec::with_capacity(8 + subject.len() + issuer.len());
+        source.extend_from_slice(b"openid:");
         source.extend_from_slice(subject.as_bytes());
-        source.extend_from_slice(&issuer_len.to_be_bytes());
+        source.push(b':');
         source.extend_from_slice(issuer.as_bytes());
         let digest = HashAlgorithm::SHA256.hash_encode(&source);
-        Some(format!(
-            "{OIDC_VIRTUAL_PARENT_PREFIX}{}",
-            base64_simd::URL_SAFE_NO_PAD.encode_to_string(digest.as_ref())
-        ))
+        Some(base64_simd::URL_SAFE_NO_PAD.encode_to_string(digest.as_ref()))
     }
 }
 
@@ -151,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn oidc_virtual_parent_is_stable_and_issuer_scoped() {
+    fn oidc_virtual_parent_matches_minio_and_is_issuer_scoped() {
         let first = authorization(Vec::new(), Vec::new());
         let mut second = first.clone();
         second
@@ -161,9 +155,9 @@ mod tests {
 
         assert_eq!(
             first.oidc_virtual_parent().as_deref(),
-            Some("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I")
+            Some("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA")
         );
-        assert!(rustfs_policy::auth::contains_reserved_chars(
+        assert!(!rustfs_policy::auth::contains_reserved_chars(
             first.oidc_virtual_parent().as_deref().expect("virtual parent")
         ));
         assert_ne!(first.oidc_virtual_parent(), second.oidc_virtual_parent());
@@ -187,23 +181,5 @@ mod tests {
         padded.claims.sub = format!(" {} ", plain.claims.sub);
 
         assert_ne!(plain.oidc_virtual_parent(), padded.oidc_virtual_parent());
-    }
-
-    #[test]
-    fn oidc_virtual_parent_encoding_is_unambiguous() {
-        let mut first = authorization(Vec::new(), Vec::new());
-        first.claims.sub = "subject".to_string();
-        first.claims.raw.insert(
-            "iss".to_string(),
-            Value::String("https://issuer.example/path:https://other.example".to_string()),
-        );
-        let mut second = authorization(Vec::new(), Vec::new());
-        second.claims.sub = "subject:https://issuer.example/path".to_string();
-        second
-            .claims
-            .raw
-            .insert("iss".to_string(), Value::String("https://other.example".to_string()));
-
-        assert_ne!(first.oidc_virtual_parent(), second.oidc_virtual_parent());
     }
 }

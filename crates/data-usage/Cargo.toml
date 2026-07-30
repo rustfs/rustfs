@@ -29,7 +29,6 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-path-clean = { workspace = true }
 rmp-serde = { workspace = true }
 async-trait = { workspace = true }
 rustfs-filemeta = { workspace = true }

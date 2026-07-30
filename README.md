@@ -116,7 +116,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.11
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.12
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
@@ -163,6 +163,7 @@ docker run -d --name rustfs -p 9000:9000 \
   -e RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY=on \
   -e RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://<host-ip>:3020/webhook \
   -e RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY=/tmp/rustfs-events \
+  -e RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://<host-ip>:3020 \
   rustfs/rustfs:latest
 ```
 
@@ -171,6 +172,11 @@ Notes:
 - For ARN `arn:rustfs:sqs::primary:webhook`, use instance-scoped env vars with `_PRIMARY`.
 - If queue dir is omitted, default is `/opt/rustfs/events`; ensure it is writable by the container runtime user.
 - `RUSTFS_NOTIFY_WEBHOOK_SKIP_TLS_VERIFY_PRIMARY` defaults to `false`; enabling it skips webhook TLS certificate verification, allows MITM attacks, and emits a startup warning. Prefer `RUSTFS_NOTIFY_WEBHOOK_CLIENT_CA_PRIMARY` for private CAs.
+- Since `1.0.0-beta.11`, webhook endpoints on private or container networks
+  (`Docker Compose service names`, `host.docker.internal`, RFC 1918 addresses) are
+  blocked unless their exact `scheme://host:port` origin is listed in
+  `RUSTFS_OUTBOUND_ALLOW_ORIGINS` (the origin only, without the path). See
+  [Outbound Connection Policy](docs/operations/outbound-connection-policy.md).
 
 **NOTE**: We recommend reviewing the `docker-compose.yml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
 

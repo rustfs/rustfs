@@ -57,14 +57,14 @@ fn apply_data_usage_result(
     usage: &mut rustfs_madmin::Usage,
 ) {
     match result {
-        Ok(info) => {
+        Ok(info) if info.is_complete_bucket_usage_snapshot() => {
             buckets.count = info.buckets_count;
             objects.count = info.objects_total_count;
             versions.count = info.versions_total_count;
             delete_markers.count = info.delete_markers_total_count;
             usage.size = info.objects_total_size;
         }
-        Err(_) => {
+        Ok(_) | Err(_) => {
             buckets.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
             objects.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
             versions.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
@@ -649,18 +649,15 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
 
         if erasure_set.id == 0 {
             erasure_set.id = d.set_index;
-            if let Ok(cache) = load_data_usage_cache(
+            match load_data_usage_cache(
                 &store.pools[d.pool_index as usize].disk_set[d.set_index as usize].clone(),
                 DATA_USAGE_CACHE_NAME,
             )
             .await
             {
-                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &Vec::<String>::new());
-                erasure_set.objects_count = data_usage_info.objects_total_count;
-                erasure_set.versions_count = data_usage_info.versions_total_count;
-                erasure_set.delete_markers_count = data_usage_info.delete_markers_total_count;
-                erasure_set.usage = data_usage_info.objects_total_size;
-            };
+                Ok(cache) => apply_erasure_set_usage(&cache, erasure_set),
+                Err(_) => erasure_set.usage_error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
+            }
         }
 
         erasure_set.raw_capacity += d.total_space;
@@ -670,6 +667,20 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
         }
     }
     Ok(pools_info)
+}
+
+fn apply_erasure_set_usage(cache: &rustfs_data_usage::DataUsageCache, erasure_set: &mut ErasureSetInfo) {
+    let data_usage_info = cache.dui(DATA_USAGE_ROOT, &[]);
+    if !data_usage_info.is_complete_bucket_usage_snapshot() {
+        erasure_set.usage_error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
+        return;
+    }
+
+    erasure_set.objects_count = data_usage_info.objects_total_count;
+    erasure_set.versions_count = data_usage_info.versions_total_count;
+    erasure_set.delete_markers_count = data_usage_info.delete_markers_total_count;
+    erasure_set.usage = data_usage_info.objects_total_size;
+    erasure_set.usage_error = None;
 }
 
 #[allow(clippy::const_is_empty)]
@@ -697,8 +708,9 @@ mod tests {
     use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, ServerProperties};
 
     use super::{
-        DATA_USAGE_UNAVAILABLE_ERROR, apply_data_usage_result, get_local_server_property, get_online_offline_disks_stats,
-        get_server_info, reconcile_servers_with_endpoint_topology, server_topology_completeness_report,
+        DATA_USAGE_ROOT, DATA_USAGE_UNAVAILABLE_ERROR, apply_data_usage_result, apply_erasure_set_usage,
+        get_local_server_property, get_online_offline_disks_stats, get_server_info, reconcile_servers_with_endpoint_topology,
+        server_topology_completeness_report,
     };
 
     fn disk_with_state(endpoint: &str, state: &str) -> Disk {
@@ -900,11 +912,19 @@ mod tests {
         let mut delete_markers = rustfs_madmin::DeleteMarkers::default();
         let mut usage = rustfs_madmin::Usage::default();
         let info = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
             buckets_count: 2,
             objects_total_count: 3,
             versions_total_count: 4,
             delete_markers_total_count: 5,
             objects_total_size: 6,
+            buckets_usage: [
+                ("bucket-a".to_string(), rustfs_data_usage::BucketUsageInfo::default()),
+                ("bucket-b".to_string(), rustfs_data_usage::BucketUsageInfo::default()),
+            ]
+            .into_iter()
+            .collect(),
+            usage_snapshot_complete: true,
             ..Default::default()
         };
 
@@ -915,6 +935,71 @@ mod tests {
         assert_eq!(versions.count, 4);
         assert_eq!(delete_markers.count, 5);
         assert_eq!(usage.size, 6);
+    }
+
+    #[test]
+    fn incomplete_data_usage_is_unavailable_in_server_info() {
+        let mut buckets = rustfs_madmin::Buckets::default();
+        let mut objects = rustfs_madmin::Objects::default();
+        let mut versions = rustfs_madmin::Versions::default();
+        let mut delete_markers = rustfs_madmin::DeleteMarkers::default();
+        let mut usage = rustfs_madmin::Usage::default();
+        let info = rustfs_data_usage::DataUsageInfo {
+            buckets_count: 1,
+            objects_total_count: 100,
+            objects_total_size: 1024,
+            ..Default::default()
+        };
+
+        apply_data_usage_result(Ok(info), &mut buckets, &mut objects, &mut versions, &mut delete_markers, &mut usage);
+
+        assert_eq!(buckets.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(objects.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(versions.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(delete_markers.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(usage.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+    }
+
+    #[test]
+    fn incomplete_erasure_set_cache_is_not_reported_as_zero() {
+        let mut cache = rustfs_data_usage::DataUsageCache::default();
+        cache.info.name = DATA_USAGE_ROOT.to_string();
+        cache.replace(DATA_USAGE_ROOT, "", rustfs_data_usage::DataUsageEntry::default());
+        let mut set = rustfs_madmin::ErasureSetInfo::default();
+
+        apply_erasure_set_usage(&cache, &mut set);
+
+        assert_eq!(set.usage_error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(set.objects_count, 0);
+        assert_eq!(set.usage, 0);
+    }
+
+    #[test]
+    fn complete_erasure_set_cache_is_reported() {
+        let mut cache = rustfs_data_usage::DataUsageCache::default();
+        cache.info.name = DATA_USAGE_ROOT.to_string();
+        cache.info.last_update = Some(std::time::SystemTime::UNIX_EPOCH);
+        cache.info.snapshot_complete = true;
+        cache.replace(
+            DATA_USAGE_ROOT,
+            "",
+            rustfs_data_usage::DataUsageEntry {
+                size: 512,
+                objects: 3,
+                versions: 4,
+                delete_markers: 1,
+                ..Default::default()
+            },
+        );
+        let mut set = rustfs_madmin::ErasureSetInfo::default();
+
+        apply_erasure_set_usage(&cache, &mut set);
+
+        assert_eq!(set.objects_count, 3);
+        assert_eq!(set.versions_count, 4);
+        assert_eq!(set.delete_markers_count, 1);
+        assert_eq!(set.usage, 512);
+        assert!(set.usage_error.is_none());
     }
 
     #[serial]

@@ -219,6 +219,16 @@ impl ErasureInfo {
 }
 
 // #[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransitionVersionState {
+    #[default]
+    Unknown,
+    KnownDisabled,
+    SuspendedNull,
+    Exact,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub volume: String,
@@ -230,6 +240,10 @@ pub struct FileInfo {
     pub transitioned_objname: String,
     pub transition_tier: String,
     pub transition_version_id: Option<Uuid>,
+    #[serde(default)]
+    pub transition_version: Option<String>,
+    #[serde(default)]
+    pub transition_version_state: TransitionVersionState,
     pub expire_restored: bool,
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
@@ -415,6 +429,10 @@ impl FileInfo {
     }
 
     fn validate_collection_contents(&self, layout: Option<&ValidatedErasureLayout>) -> Result<()> {
+        if layout.is_some() && self.size > 0 && self.parts.is_empty() {
+            return Err(Error::FileCorrupt);
+        }
+
         let mut part_numbers = [0u64; FILEINFO_PART_BITMAP_WORDS];
         for part in &self.parts {
             if let Some(layout) = layout {
@@ -455,6 +473,10 @@ impl FileInfo {
         if self.mod_time.is_none_or(|mod_time| mod_time <= OffsetDateTime::UNIX_EPOCH)
             || (!allow_nil_version_id && self.version_id.is_some_and(|version_id| version_id.is_nil()))
             || self.transition_version_id.is_some_and(|version_id| version_id.is_nil())
+            || self
+                .transition_version
+                .as_ref()
+                .is_some_and(|version_id| version_id.is_empty())
             || self.size != 0
             || self.data_dir.is_some()
             || self.mode.is_some()
@@ -488,6 +510,7 @@ impl FileInfo {
             || !self.transitioned_objname.is_empty()
             || !self.transition_tier.is_empty()
             || self.transition_version_id.is_some()
+            || self.transition_version.is_some()
             || self.expire_restored
             || self.size != 0
             || self.data_dir.is_some()
@@ -532,6 +555,25 @@ impl FileInfo {
     /// return `None`.
     pub fn validate(&self, mode: ValidationMode) -> Result<Option<ValidatedErasureLayout>> {
         self.validate_collection_bounds()?;
+        if let (Some(version), Some(version_id)) = (&self.transition_version, self.transition_version_id)
+            && Uuid::parse_str(version).ok() != Some(version_id)
+        {
+            return Err(Error::FileCorrupt);
+        }
+        let transition_state_valid = match self.transition_version_state {
+            TransitionVersionState::Unknown => true,
+            TransitionVersionState::KnownDisabled => self.transition_version.is_none() && self.transition_version_id.is_none(),
+            TransitionVersionState::SuspendedNull => {
+                self.transition_version.as_deref() == Some("null") && self.transition_version_id.is_none()
+            }
+            TransitionVersionState::Exact => self
+                .transition_version
+                .as_deref()
+                .is_some_and(|version| version != "null" && !version.is_empty()),
+        };
+        if !transition_state_valid {
+            return Err(Error::FileCorrupt);
+        }
 
         let erasure_layout = match mode {
             ValidationMode::RequireErasure => Some(self.validate_erasure_geometry()?),
@@ -692,6 +734,10 @@ impl FileInfo {
 
     // to_part_offset gets the part index where offset is located, returns part index and offset
     pub fn to_part_offset(&self, offset: usize) -> Result<(usize, usize)> {
+        if self.size > 0 && self.parts.is_empty() {
+            return Err(Error::FileCorrupt);
+        }
+
         if offset == 0 {
             return Ok((0, 0));
         }
@@ -824,6 +870,8 @@ impl FileInfo {
             && self.transition_tier == other.transition_tier
             && self.transitioned_objname == other.transitioned_objname
             && self.transition_version_id == other.transition_version_id
+            && self.transition_version == other.transition_version
+            && self.transition_version_state == other.transition_version_state
     }
 
     /// Check if metadata maps are equal
@@ -1186,6 +1234,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_require_erasure_rejects_positive_size_without_parts() {
+        let mut fi = FileInfo::new("bucket/object", 4, 2);
+        fi.erasure.index = 1;
+        fi.size = 1;
+
+        assert_eq!(fi.validate_for_metadata_read(), Err(Error::FileCorrupt));
+        assert_eq!(fi.to_part_offset(0), Err(Error::FileCorrupt));
+
+        fi.size = 0;
+        fi.validate_for_metadata_read()
+            .expect("zero-byte object metadata may omit parts");
+        assert_eq!(fi.to_part_offset(0), Ok((0, 0)));
+    }
+
+    #[test]
     fn validate_for_erasure_write_only_relaxes_pending_shard_index() {
         let mut fi = validation_test_fileinfo();
         fi.erasure.index = 0;
@@ -1326,6 +1389,15 @@ mod tests {
         assert!(!fi.is_valid(), "wire-controlled state flags must not relax is_valid");
         assert!(matches!(fi.validate_for_metadata_read(), Err(Error::FileCorrupt)));
         assert_file_corrupt(&fi, ValidationMode::DeleteOnly);
+    }
+
+    #[test]
+    fn metadata_read_validation_rejects_conflicting_transition_versions() {
+        let mut fi = one_shard_validation_fileinfo(1);
+        fi.transition_version_id = Some(Uuid::new_v4());
+        fi.transition_version = Some(Uuid::new_v4().to_string());
+
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
     }
 
     #[test]
@@ -1699,6 +1771,12 @@ mod tests {
                     transitioned_objname,
                     transition_tier,
                     transition_version_id,
+                    transition_version: transition_version_id.map(|version_id| version_id.to_string()),
+                    transition_version_state: if transition_version_id.is_some() {
+                        TransitionVersionState::Exact
+                    } else {
+                        TransitionVersionState::Unknown
+                    },
                     expire_restored,
                     data_dir,
                     mod_time,

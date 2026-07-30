@@ -40,6 +40,7 @@ COOLDOWN_SECS=20
 BASELINE_CSV=""
 EXTRA_ARGS=()
 FAILED_FINAL_ROUNDS=0
+EXTRACT_METRICS_FROM_LOG=""
 SERVICE_METRICS_URL=""
 SERVICE_METRICS_DIR=""
 SERVICE_METRICS_CAPTURE_ATTEMPTS=3
@@ -126,6 +127,8 @@ Enhanced options:
   --server-revision            Source revision built into the benchmarked server
   --require-server-provenance  Fail unless the three server identity fields are set
   --label <key=value>          Repeatable run label written to run_manifest.env
+  --extract-metrics-from-log <log>
+                               Print parsed final Report metrics from one warp log and exit
   --node-metrics-url <node=url>
                                Repeatable node-specific Prometheus scrape URL captured
                                before/after each round attempt
@@ -195,6 +198,7 @@ parse_args() {
       --cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --round-cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --baseline-csv) BASELINE_CSV="$2"; shift 2 ;;
+      --extract-metrics-from-log) EXTRACT_METRICS_FROM_LOG="$2"; shift 2 ;;
       --service-metrics-url) SERVICE_METRICS_URL="$2"; shift 2 ;;
       --service-prometheus-query-url) SERVICE_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
       --service-prometheus-query) SERVICE_PROMETHEUS_QUERY="$2"; SERVICE_PROMETHEUS_QUERY_EXPLICIT=true; shift 2 ;;
@@ -664,6 +668,21 @@ extract_first() {
   rg -o "$regex" "$file" | head -n1 || true
 }
 
+extract_report_line() {
+  local regex="$1"
+  local file="$2"
+  awk -v regex="$regex" '
+    /^Report:/ {
+      in_report = 1
+      next
+    }
+    in_report && $0 ~ regex {
+      print
+      exit
+    }
+  ' "$file"
+}
+
 normalize_duration_metric() {
   local value="$1"
   value="$(trim "${value:-N/A}")"
@@ -684,12 +703,27 @@ normalize_duration_metric() {
 extract_metrics() {
   local log_file="$1"
 
-  local throughput reqps latency req_p90 req_p99
-  throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
-  reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
-  latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
-  req_p90="$(rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^90%:[[:space:]]+//')"
-  req_p99="$(rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^99%:[[:space:]]+//')"
+  local average_line reqs_line throughput reqps latency req_p90 req_p99 reqps_num
+  average_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Average:' "$log_file")"
+  reqs_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Reqs:' "$log_file")"
+
+  if [[ -n "$average_line" ]]; then
+    throughput="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*//; s/,[[:space:]]*.*$//')"
+    reqps="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*[^,]+,[[:space:]]*//; s/[[:space:]]*$//')"
+  else
+    throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
+    reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
+  fi
+
+  if [[ -n "$reqs_line" ]]; then
+    latency="$(echo "$reqs_line" | rg -o 'Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^Avg:[[:space:]]+//')"
+    req_p90="$(echo "$reqs_line" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^90%:[[:space:]]+//')"
+    req_p99="$(echo "$reqs_line" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^99%:[[:space:]]+//')"
+  else
+    latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
+    req_p90="$(rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^90%:[[:space:]]+//')"
+    req_p99="$(rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^99%:[[:space:]]+//')"
+  fi
 
   if [[ -z "$latency" ]]; then
     latency="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(ms|us|µs|s)' "$log_file")"
@@ -1286,6 +1320,27 @@ compare_baseline() {
 
 main() {
   parse_args "$@"
+  if [[ -n "$EXTRACT_METRICS_FROM_LOG" ]]; then
+    if [[ ! -f "$EXTRACT_METRICS_FROM_LOG" ]]; then
+      echo "ERROR: --extract-metrics-from-log file not found: $EXTRACT_METRICS_FROM_LOG" >&2
+      exit 2
+    fi
+    local metrics throughput_human reqps latency_human req_p90_human req_p99_human
+    local throughput_bps latency_ms req_p90_ms req_p99_ms
+    metrics="$(extract_metrics "$EXTRACT_METRICS_FROM_LOG")"
+    throughput_human="$(echo "$metrics" | cut -d',' -f1)"
+    reqps="$(echo "$metrics" | cut -d',' -f2)"
+    latency_human="$(echo "$metrics" | cut -d',' -f3)"
+    req_p90_human="$(echo "$metrics" | cut -d',' -f4)"
+    req_p99_human="$(echo "$metrics" | cut -d',' -f5)"
+    throughput_bps="$(to_bps "$throughput_human")"
+    latency_ms="$(to_ms "$latency_human")"
+    req_p90_ms="$(to_ms "$req_p90_human")"
+    req_p99_ms="$(to_ms "$req_p99_human")"
+    echo "throughput_human,throughput_bps,reqps,latency_human,latency_ms,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms"
+    echo "$throughput_human,$throughput_bps,$reqps,$latency_human,$latency_ms,$req_p90_human,$req_p90_ms,$req_p99_human,$req_p99_ms"
+    exit 0
+  fi
   validate_args
   require_cmd rg
   require_cmd awk

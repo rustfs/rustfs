@@ -18,7 +18,7 @@ use crate::error::is_err_no_such_temp_account;
 use crate::error::{Error, Result};
 use crate::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use crate::manager::extract_jwt_claims;
-use crate::manager::get_default_policyes;
+use crate::manager::get_default_policies;
 use crate::manager::{IamCache, IamSyncMetricsSnapshot};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
@@ -249,7 +249,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn delete_policy(&self, name: &str, notify: bool) -> Result<()> {
-        for k in get_default_policyes().keys() {
+        for k in get_default_policies().keys() {
             if k == name {
                 return Err(Error::other("system policy can not be deleted"));
             }
@@ -291,8 +291,17 @@ impl<T: Store> IamSys<T> {
         self.store.api.load_mapped_policies(user_type, is_group, m).await
     }
 
+    pub async fn list_policies(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+        self.store.list_policies(bucket_name).await
+    }
+
+    /// Backward-compatible misspelling retained until the next breaking release.
+    #[deprecated(
+        since = "1.0.0",
+        note = "use list_policies instead; this alias will be removed in the next breaking release"
+    )]
     pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
-        self.store.list_polices(bucket_name).await
+        self.list_policies(bucket_name).await
     }
 
     pub async fn list_policy_docs(&self, bucket_name: &str) -> Result<HashMap<String, PolicyDoc>> {
@@ -870,6 +879,10 @@ impl<T: Store> IamSys<T> {
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         self.store.policy_db_get(name, groups).await
+    }
+
+    pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        self.store.sts_policy_db_get(name, groups).await
     }
 
     /// Check whether a policy name from a JWT claim is safe to resolve against the IAM store.
@@ -1630,6 +1643,13 @@ pub struct UpdateServiceAccountOpts {
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
     pub status: Option<String>,
+    /// Rebind the account to a different parent.
+    ///
+    /// Only site replication sets this, and only to repair an account left pointing at a
+    /// parent that a root-credential change invalidated. Rebinding an arbitrary service
+    /// account would let it inherit another user's policies, so it is gated behind
+    /// `allow_site_replicator_account` in the same way the account itself is.
+    pub parent_user: Option<String>,
     pub allow_site_replicator_account: bool,
 }
 
@@ -1672,11 +1692,17 @@ mod tests {
     use super::*;
     use crate::cache::{Cache, CacheEntity};
     use crate::error::Error;
-    use crate::manager::get_default_policyes;
+    use crate::manager::get_default_policies;
     use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_list_polices_api_is_available() {
+        let _ = IamSys::<StsTestMockStore>::list_polices;
+    }
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
@@ -1914,7 +1940,7 @@ mod tests {
         }
 
         async fn load_all(&self, cache: &Cache) -> Result<()> {
-            let mut policy_docs = get_default_policyes();
+            let mut policy_docs = get_default_policies();
             let custom_claim_policy =
                 Policy::parse_config(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes()).expect("custom STS claim policy should parse");
             policy_docs.insert(CUSTOM_STS_CLAIM_POLICY.to_string(), PolicyDoc::new(custom_claim_policy));
@@ -2057,6 +2083,7 @@ mod tests {
                     description: None,
                     expiration: None,
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2086,6 +2113,7 @@ mod tests {
                     description: None,
                     expiration: None,
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2282,6 +2310,7 @@ mod tests {
                     description: None,
                     expiration: Some(updated_expiration),
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2328,6 +2357,7 @@ mod tests {
                     description: None,
                     expiration: Some(updated_expiration),
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2379,6 +2409,7 @@ mod tests {
                         description: None,
                         expiration: None,
                         status: Some(STATUS_ENABLED.to_string()),
+                        parent_user: None,
                         allow_site_replicator_account: false,
                     },
                 )
@@ -2397,6 +2428,7 @@ mod tests {
                     description: None,
                     expiration: None,
                     status: Some(STATUS_ENABLED.to_string()),
+                    parent_user: None,
                     allow_site_replicator_account: true,
                 },
             )
@@ -2410,6 +2442,116 @@ mod tests {
                 .expect("internal secret should be readable for canonical account"),
             cred.secret_key
         );
+    }
+
+    /// A root-credential change can leave `site-replicator-0` bound to a parent that no
+    /// longer exists, and the repair must rebind in place: deleting first would leave the
+    /// site with no replication account at all if the recreate failed. The parent also lives
+    /// in the session token, so both copies have to move together or authorization denies
+    /// the account.
+    #[tokio::test]
+    async fn test_site_replicator_parent_rebind_updates_credential_and_claim() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                "stale-parent-user",
+                None,
+                NewServiceAccountOpts {
+                    access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                    secret_key: "siteReplicatorSecretKeyForTest1234567890".to_string(),
+                    allow_site_replicator_account: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("site replicator account should be created");
+
+        iam_sys
+            .update_service_account(
+                &cred.access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: None,
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: None,
+                    parent_user: Some("current-parent-user".to_string()),
+                    allow_site_replicator_account: true,
+                },
+            )
+            .await
+            .expect("site replication repair may rebind the parent");
+
+        let (identity, claims) = iam_sys
+            .get_account_with_claims_allow_missing_exp(&cred.access_key)
+            .await
+            .expect("rebound account should still be readable");
+        assert_eq!(identity.credentials.parent_user, "current-parent-user");
+        assert_eq!(
+            claims.get("parent").and_then(Value::as_str),
+            Some("current-parent-user"),
+            "the token claim must follow the credential or authorization denies the account"
+        );
+        assert_eq!(
+            iam_sys
+                .get_site_replicator_service_account_secret(&cred.access_key)
+                .await
+                .expect("secret survives a rebind"),
+            cred.secret_key,
+            "peers keep using the same secret, so a rebind must not rotate it"
+        );
+    }
+
+    /// The rebind is a site-replication repair primitive, not a general capability: letting
+    /// any caller re-parent a service account would let it inherit another user's policies.
+    #[tokio::test]
+    async fn test_parent_rebind_is_rejected_for_ordinary_service_accounts() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                "ordinary-parent",
+                None,
+                NewServiceAccountOpts {
+                    access_key: "ordinary-service-account".to_string(),
+                    secret_key: "ordinaryServiceAccountSecret1234567890".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ordinary service account should be created");
+
+        for allow in [false, true] {
+            assert!(
+                iam_sys
+                    .update_service_account(
+                        &cred.access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: None,
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: None,
+                            parent_user: Some("victim-user".to_string()),
+                            allow_site_replicator_account: allow,
+                        },
+                    )
+                    .await
+                    .is_err(),
+                "re-parenting an ordinary service account must be rejected (allow={allow})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2776,7 +2918,7 @@ mod tests {
     async fn oidc_service_account_uses_verified_policy_and_persisted_boundary() {
         ensure_test_global_credentials();
         let iam_sys = IamSys::new(IamCache::new(StsTestMockStore::new(true)).await.unwrap());
-        let parent_user = "openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I";
+        let parent_user = "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA";
         let mut oidc_claims = HashMap::from([
             ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
             ("oidc_provider".to_string(), Value::String("default".to_string())),
@@ -3464,6 +3606,18 @@ mod tests {
             sts_policies.contains_key("notify-sts-parent"),
             "STS policy mapping notifications must update sts_policies instead of deleting them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sts_policy_lookup_loads_missing_mapping_without_regular_user() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let policies = iam_sys.sts_policy_db_get("notify-sts-parent", &None).await.unwrap();
+
+        assert_eq!(policies, vec!["readwrite"]);
+        assert!(iam_sys.store.cache.snapshot().sts_policies.contains_key("notify-sts-parent"));
     }
 
     #[tokio::test]

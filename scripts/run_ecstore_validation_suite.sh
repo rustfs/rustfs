@@ -317,7 +317,7 @@ write_blackbox_matrix() {
 	    printf 'quick\theal degraded erasure disk rebuild\tblack-box\tcargo test --package e2e_test heal_erasure_disk_rebuild_test -- --nocapture\tnone\t%s\n' "$e2e_status"
 	    printf 'quick\tnamespace lock quorum under EC ops\tblack-box\tcargo test --package e2e_test namespace_lock_quorum_test -- --nocapture\tnone\t%s\n' "$e2e_status"
 	    printf 'full\tlegacy bitrot read fixture restore\tfixture\tcargo test -p rustfs-ecstore --test legacy_bitrot_read_test -- --nocapture\tRUSTFS_LEGACY_TEST_ROOT,RUSTFS_LEGACY_TEST_DISK\t%s\n' "$legacy_status"
-	    printf 'full\tMinIO generated encrypted read and negative restore fixture\tfixture\tcargo test -p rustfs-ecstore --features rio-v2 --test minio_generated_read_test -- --ignored --nocapture\tRUSTFS_MINIO_FIXTURE_ROOT,RUSTFS_MINIO_STATIC_KMS_KEY_B64\t%s\n' "$minio_status"
+	    printf 'full\tMinIO generated encrypted read and negative restore fixture\tfixture\tcargo test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored --nocapture\tRUSTFS_MINIO_FIXTURE_ROOT,RUSTFS_MINIO_STATIC_KMS_KEY_B64\t%s\n' "$minio_status"
 	    printf 'full\tS3 multipart range versioning delete subset\tblack-box\tenv TESTEXPR=\"multipart or range or versioning or delete\" DEPLOY_MODE=build MAXFAIL=0 ./scripts/s3-tests/run.sh\tnone\t%s\n' "$s3_status"
 	    printf 'destructive\tdistributed cluster concurrency\tblack-box\tcargo test --package e2e_test cluster_concurrency_test -- --nocapture\tnone\t%s\n' "$destructive_status"
 	    printf 'destructive\tstale multipart cleanup cluster\tblack-box\tcargo test --package e2e_test stale_multipart_cleanup_cluster_test -- --nocapture\tnone\t%s\n' "$destructive_status"
@@ -377,7 +377,7 @@ run_fixture_steps() {
 
 	  if fixture_available; then
 	    run_step "ecstore-minio-generated-read-fixture" \
-	      cargo test -p rustfs-ecstore --features rio-v2 --test minio_generated_read_test -- --ignored --nocapture
+	      cargo test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored --nocapture
 	  elif [[ "$REQUIRE_FIXTURES" == "true" ]]; then
 	    echo "ERROR: $(minio_fixture_missing_reason)" >&2
 	    exit 1

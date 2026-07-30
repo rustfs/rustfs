@@ -30,7 +30,12 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
+        // Resolved from this set's own instance context (backlog#1052), not the
+        // ambient facade: the facade tracks whichever context is currently
+        // published process-wide, so a second instance (or, in tests, another
+        // test's transient DistErasure window) would push this set's namespace
+        // locking onto its own — possibly empty — dist locker list.
+        let set_lock = if self.ctx.is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
@@ -338,19 +343,22 @@ impl SetDisks {
             }
         };
 
-        // The drive's format may place it in a different erasure set than this
-        // one. Claiming a misplaced drive into `self.disks` would let two sets
-        // manage the same drive and degrade together, so reject it here
-        // (backlog#799 B19).
-        if set_idx != self.set_index {
+        // Claiming a misplaced drive into `self.disks` would let two slots or
+        // sets manage the same drive and degrade together (backlog#799 B19).
+        if set_idx != self.set_index || self.set_endpoints.get(disk_idx) != Some(ep) {
             warn!(
-                "renew_disk: drive {:?} belongs to set {} but is being renewed on set {}; skipping",
-                ep, set_idx, self.set_index
+                endpoint = %ep,
+                format_set_index = set_idx,
+                format_disk_index = disk_idx,
+                endpoint_pool_index = ep.pool_idx,
+                endpoint_set_index = ep.set_idx,
+                endpoint_disk_index = ep.disk_idx,
+                expected_pool_index = self.pool_index,
+                expected_set_index = self.set_index,
+                "renew_disk rejected a drive whose endpoint and format do not identify the same topology slot"
             );
             return;
         }
-
-        // Check that the endpoint matches
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
         new_disk.enable_health_check();
@@ -706,6 +714,108 @@ mod tests {
             renewed_disk.health_check_enabled_for_test(),
             "renewed disks must keep health monitoring enabled so later faulty marks can recover"
         );
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn renew_disk_rejects_a_format_from_another_slot_or_cluster() {
+        let disk_count = 3;
+        let format = FormatV3::new(1, disk_count);
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut fixture_disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            fixture_disks.push(disk);
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(fixture_disks[0].clone()), None, None])),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints.clone(),
+            format.clone(),
+            Vec::new(),
+        )
+        .await;
+
+        let mut other_cluster_format = format.clone();
+        other_cluster_format.id = Uuid::new_v4();
+        other_cluster_format.erasure.this = format.erasure.sets[0][2];
+        save_format_file(&Some(fixture_disks[2].clone()), &Some(other_cluster_format))
+            .await
+            .expect("other-cluster format should be written for the rejection test");
+
+        set_disks.renew_disk(&endpoints[2]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        assert_eq!(
+            disks[0]
+                .as_ref()
+                .expect("the canonical first slot must remain attached")
+                .endpoint(),
+            endpoints[0]
+        );
+        assert!(
+            disks[2].is_none(),
+            "a disk from another deployment must remain detached even when its slot UUID matches"
+        );
+
+        let mut correct_format = format.clone();
+        correct_format.erasure.this = format.erasure.sets[0][2];
+        let replacement_disk = new_disk(
+            &endpoints[2],
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("third endpoint should reopen after other-cluster rejection");
+        save_format_file(&Some(replacement_disk), &Some(correct_format))
+            .await
+            .expect("correct slot format should be restored");
+
+        set_disks.renew_disk(&endpoints[2]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        assert_eq!(
+            disks[0]
+                .as_ref()
+                .expect("the canonical first slot must remain attached")
+                .endpoint(),
+            endpoints[0]
+        );
+        assert_eq!(disks[2].as_ref().expect("the restored third slot should attach").endpoint(), endpoints[2]);
+
+        let third_disk = disks[2].clone();
+        let mut wrong_slot_format = format.clone();
+        wrong_slot_format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&third_disk, &Some(wrong_slot_format))
+            .await
+            .expect("wrong-slot format should be written for the rejection test");
+        set_disks.disks.write().await[2] = None;
+
+        let mut misplaced_endpoint = endpoints[2].clone();
+        misplaced_endpoint.set_disk_index(0);
+        set_disks.renew_disk(&misplaced_endpoint).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        assert_eq!(
+            disks[0]
+                .as_ref()
+                .expect("the canonical first slot must remain attached")
+                .endpoint(),
+            endpoints[0]
+        );
+        assert!(disks[2].is_none(), "a disk claiming another endpoint's slot must remain detached");
 
         drop(temp_dirs);
     }

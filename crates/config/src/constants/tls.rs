@@ -142,6 +142,10 @@ pub const DEFAULT_H2_KEEP_ALIVE_TIMEOUT: u64 = 10;
 /// proxy's upstream idle-keepalive, or lower the proxy's keepalive below this
 /// value. Environments that expose RustFS directly to untrusted slow clients and
 /// want tighter slowloris protection can lower it via the env var below.
+///
+/// The same budget bounds the TLS handshake on the listener, so an unauthenticated
+/// peer cannot park an accept task and its socket indefinitely by opening a
+/// connection and then stalling the handshake.
 pub const ENV_HTTP1_HEADER_READ_TIMEOUT: &str = "RUSTFS_HTTP1_HEADER_READ_TIMEOUT";
 pub const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: u64 = 75;
 

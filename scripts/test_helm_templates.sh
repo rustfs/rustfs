@@ -36,6 +36,16 @@ render_distributed_statefulset() {
     '
 }
 
+statefulset_env_names() {
+  yq eval '[(.spec.template.spec.containers[0].env // [])[] | .name] | join(" ")' -
+}
+
+statefulset_env_value() {
+  local rustfs_test_env_name=$1
+  RUSTFS_TEST_ENV_NAME="$rustfs_test_env_name" \
+    yq eval '.spec.template.spec.containers[0].env[] | select(.name == strenv(RUSTFS_TEST_ENV_NAME)) | .value' -
+}
+
 render_distributed_configmap() {
   helm template rustfs "$CHART_DIR" \
     --namespace rustfs \
@@ -195,6 +205,65 @@ if [[ $partial_empty_status -eq 0 ]]; then
   exit 1
 fi
 
+# The Vault KMS token is a credential: it must be rendered into a Secret and must never
+# reach the config ConfigMap, which is readable by anyone allowed to get ConfigMaps.
+kms_token="CS_TEST_SECRET_DO_NOT_LOG"
+kms_values=(
+  --set config.rustfs.kms.enabled=true
+  --set config.rustfs.kms.type=vault
+  --set config.rustfs.kms.vault.vault_backend=vault-kv2
+  --set config.rustfs.kms.vault.vault_address=http://vault.rustfs.svc:8200
+  --set "config.rustfs.kms.vault.vault_token=$kms_token"
+  --set config.rustfs.kms.vault.default_key=test-key
+)
+
+kms_configmap=$(render_distributed_configmap "${kms_values[@]}")
+if grep -q 'RUSTFS_KMS_VAULT_TOKEN' <<<"$kms_configmap"; then
+  echo "The Vault KMS token must not be rendered into the ConfigMap" >&2
+  exit 1
+fi
+if ! grep -q 'RUSTFS_KMS_VAULT_ADDRESS' <<<"$kms_configmap"; then
+  echo "Non-secret KMS settings must stay in the ConfigMap" >&2
+  exit 1
+fi
+
+kms_full=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  "${kms_values[@]}")
+if grep -q "$kms_token" <<<"$kms_full"; then
+  echo "The Vault KMS token must never appear in plaintext in any rendered manifest" >&2
+  exit 1
+fi
+expected_kms_token_b64=$(printf '%s' "$kms_token" | base64)
+if ! grep -q "RUSTFS_KMS_VAULT_TOKEN: \"$expected_kms_token_b64\"" <<<"$kms_full"; then
+  echo "The Vault KMS token must be rendered into a Secret" >&2
+  exit 1
+fi
+
+kms_statefulset=$(render_distributed_statefulset "${kms_values[@]}")
+if ! grep -q 'name: rustfs-kms-secret' <<<"$kms_statefulset"; then
+  echo "The distributed StatefulSet must consume the KMS Secret via envFrom" >&2
+  exit 1
+fi
+
+kms_deployment=$(render_standalone_deployment "${kms_values[@]}")
+if ! grep -q 'name: rustfs-kms-secret' <<<"$kms_deployment"; then
+  echo "The standalone Deployment must consume the KMS Secret via envFrom" >&2
+  exit 1
+fi
+
+# Without a configured token no KMS Secret is rendered and nothing references it.
+no_kms_output=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key)
+if grep -q 'kms-secret' <<<"$no_kms_output"; then
+  echo "No KMS Secret must be rendered when no Vault token is configured" >&2
+  exit 1
+fi
+
 command -v yq >/dev/null 2>&1 || { echo "yq is required for extra-volumes structural tests" >&2; exit 1; }
 
 # Structural helpers: verify wiring at the right YAML paths, not just string presence.
@@ -344,38 +413,308 @@ if grep -q "name: data$" <<<"$generic_eight_by_two"; then
   exit 1
 fi
 
-# Distributed startup coordination must use the configured endpoint port and
-# stay transport-neutral so the same wait works with and without mTLS.
-custom_port_startup=$(render_distributed_statefulset \
+# Issue #5416's exact three-node, one-drive topology must render all three
+# ordinal hosts while each StatefulSet pod receives its own explicit anchor.
+three_by_one_configmap=$(render_distributed_configmap --set replicaCount=3 --set drivesPerNode=1)
+if ! grep -Fq 'RUSTFS_VOLUMES: "http://rustfs-{0...2}.rustfs-headless.rustfs.svc.cluster.local:9000/data"' <<<"$three_by_one_configmap"; then
+  echo "Three-node topology must render ordinals 0 through 2 in RUSTFS_VOLUMES" >&2
+  exit 1
+fi
+# The distributed init container only prepares directories. Peer DNS or TCP
+# availability must not gate the RustFS process from applying its own quorum
+# checks. The deprecated timeout remains accepted but is not rendered.
+distributed_startup=$(render_distributed_statefulset \
+  --set replicaCount=3 \
+  --set drivesPerNode=1 \
+  --set startupWaitTimeoutSeconds=0)
+for removed_gate in nslookup 'nc -z' wait_for_peer STARTUP_WAIT_TIMEOUT_SECONDS ENDPOINT_PORT; do
+  if grep -Fq "$removed_gate" <<<"$distributed_startup"; then
+    echo "Distributed init must not contain the removed peer gate: $removed_gate" >&2
+    exit 1
+  fi
+done
+if ! grep -Fq 'mkdir -p /data/rustfs$i' <<<"$distributed_startup"; then
+  echo "Distributed init must keep per-drive directory initialization" >&2
+  exit 1
+fi
+if ! grep -Eq '^[[:space:]]+mkdir -p /data$' <<<"$distributed_startup"; then
+  echo "Distributed init must keep single-drive directory initialization" >&2
+  exit 1
+fi
+
+# Chart-generated volumes use the Downward API pod name to construct the exact
+# endpoint hostname. Order is load-bearing because Kubernetes only expands
+# environment references that were defined earlier in the env list.
+generated_env_names=$(statefulset_env_names <<<"$distributed_startup")
+if [[ "$generated_env_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST" ]]; then
+  echo "Unexpected generated topology env order: $generated_env_names" >&2
+  exit 1
+fi
+
+pod_name_field=$(yq eval '.spec.template.spec.containers[0].env[] | select(.name == "RUSTFS_CHART_POD_NAME") | .valueFrom.fieldRef.fieldPath' - <<<"$distributed_startup")
+local_endpoint_host=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$distributed_startup")
+if [[ "$pod_name_field" != "metadata.name" ]]; then
+  echo "Generated topology must source RUSTFS_CHART_POD_NAME from the Downward API" >&2
+  exit 1
+fi
+if [[ "$local_endpoint_host" != '$(RUSTFS_CHART_POD_NAME).rustfs-headless.rustfs.svc.cluster.local' ]]; then
+  echo "Unexpected generated RUSTFS_LOCAL_ENDPOINT_HOST: $local_endpoint_host" >&2
+  exit 1
+fi
+
+# Non-default release identity, namespace, cluster domain, mTLS, and endpoint
+# port must compose into one generated topology without restoring peer gates.
+nondefault_generated=$(helm template tenant "$CHART_DIR" \
+  --namespace object-storage \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  --set clusterDomain=cluster.corp \
+  --set mtls.enabled=true \
   --set service.endpoint.port=9443 \
   --set config.rustfs.address=:9443)
-grep -q 'name: ENDPOINT_PORT' <<<"$custom_port_startup"
-grep -A1 'name: ENDPOINT_PORT' <<<"$custom_port_startup" | grep -q 'value: "9443"'
-grep -q 'nc -z -w 2' <<<"$custom_port_startup"
-if grep -q 'http.*9000/health' <<<"$custom_port_startup"; then
-  echo "Distributed startup wait must not hardcode the HTTP scheme or port 9000" >&2
+nondefault_statefulset=$(awk '
+  /^# Source: rustfs\/templates\/statefulset.yaml$/ { in_statefulset = 1 }
+  in_statefulset && /^---$/ { exit }
+  in_statefulset { print }
+' <<<"$nondefault_generated")
+nondefault_local_host=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$nondefault_statefulset")
+nondefault_namespace=$(yq eval '.metadata.namespace' - <<<"$nondefault_statefulset")
+nondefault_endpoint_port=$(yq eval '.spec.template.spec.containers[0].ports[] | select(.name == "endpoint") | .containerPort' - <<<"$nondefault_statefulset")
+mtls_liveness_command=$(yq eval '.spec.template.spec.containers[0].livenessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
+mtls_readiness_command=$(yq eval '.spec.template.spec.containers[0].readinessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
+if [[ "$nondefault_local_host" != '$(RUSTFS_CHART_POD_NAME).tenant-rustfs-headless.object-storage.svc.cluster.corp' ]]; then
+  echo "Combined generated topology produced an unexpected local endpoint host: $nondefault_local_host" >&2
+  exit 1
+fi
+if [[ "$nondefault_namespace" != "object-storage" || "$nondefault_endpoint_port" != "9443" ]]; then
+  echo "Combined generated topology must retain its namespace and custom endpoint port" >&2
+  exit 1
+fi
+if ! grep -Fq 'https://127.0.0.1:9443/health' <<<"$mtls_liveness_command" ||
+   grep -Fq '/health/ready' <<<"$mtls_liveness_command"; then
+  echo "mTLS liveness must use the process health endpoint, not readiness" >&2
+  exit 1
+fi
+if ! grep -Fq 'https://127.0.0.1:9443/health/ready' <<<"$mtls_readiness_command"; then
+  echo "mTLS readiness must use the ready endpoint" >&2
+  exit 1
+fi
+if ! grep -Fq 'RUSTFS_VOLUMES: "https://tenant-rustfs-{0...3}.tenant-rustfs-headless.object-storage.svc.cluster.corp:9443/data/rustfs{0...3}"' <<<"$nondefault_generated"; then
+  echo "Combined generated topology must use its release fullname, namespace, domain, mTLS scheme, and endpoint port" >&2
+  exit 1
+fi
+if grep -Eq 'nslookup|nc -z|wait_for_peer' <<<"$nondefault_generated"; then
+  echo "Combined generated topology must not render peer DNS or TCP gates" >&2
   exit 1
 fi
 
-mtls_startup=$(render_distributed_statefulset --set mtls.enabled=true)
-grep -q 'nc -z -w 2' <<<"$mtls_startup"
-if grep -q 'wget .*http.*health' <<<"$mtls_startup"; then
-  echo "mTLS startup wait must not use a plaintext HTTP health probe" >&2
+default_scheme_port_generated=$(render_distributed_configmap \
+  --set service.endpoint.port=80 \
+  --set config.rustfs.address=:80)
+if ! grep -Fq 'rustfs-headless.rustfs.svc.cluster.local:80/' <<<"$default_scheme_port_generated"; then
+  echo "Chart-generated topology must retain an explicit HTTP default port" >&2
   exit 1
 fi
 
-# The timeout is one global deadline and invalid non-positive values fail
-# during rendering instead of creating an unbounded init wait.
-grep -q 'deadline=$(($(date +%s) + STARTUP_WAIT_TIMEOUT_SECONDS))' <<<"$custom_port_startup"
-invalid_startup_timeout_status=0
-render_distributed_statefulset --set startupWaitTimeoutSeconds=0 >/dev/null 2>&1 || invalid_startup_timeout_status=$?
-if [[ $invalid_startup_timeout_status -eq 0 ]]; then
-  echo "Distributed mode with startupWaitTimeoutSeconds=0 must fail rendering" >&2
+# Unrelated extraEnv entries follow the generated entries so dependent
+# environment expansion keeps working.
+generated_with_extra_env=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=CUSTOM_ENV' \
+  --set 'extraEnv[0].value=custom-value')
+generated_with_extra_names=$(statefulset_env_names <<<"$generated_with_extra_env")
+if [[ "$generated_with_extra_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST CUSTOM_ENV" ]]; then
+  echo "extraEnv must be appended after generated topology env entries" >&2
   exit 1
 fi
 
-# Every pool waits for DNS across the complete normalized pool list, while
-# port availability follows the stable pool-index/ordinal startup order.
+# Explicit bounded/fail-fast modes retain their legacy DNS locality semantics,
+# so the generated anchor must not make the runtime reject the configuration.
+for legacy_wait_mode in bounded '  Strict  '; do
+  bounded_wait_mode=$(render_distributed_statefulset \
+    --set 'extraEnv[0].name=RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE' \
+    --set-string "extraEnv[0].value=$legacy_wait_mode")
+  bounded_wait_env_names=$(statefulset_env_names <<<"$bounded_wait_mode")
+  bounded_wait_value=$(yq eval '.spec.template.spec.containers[0].env[0].value' - <<<"$bounded_wait_mode")
+  if [[ "$bounded_wait_env_names" != "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE" || "$bounded_wait_value" != "$legacy_wait_mode" ]]; then
+    echo "Startup mode $legacy_wait_mode must opt out of the generated local endpoint anchor" >&2
+    exit 1
+  fi
+done
+
+unknown_wait_mode=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE' \
+  --set 'extraEnv[0].value=invalid-mode')
+unknown_wait_env_names=$(statefulset_env_names <<<"$unknown_wait_mode")
+if [[ "$unknown_wait_env_names" != "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE" ]]; then
+  echo "An unknown explicit startup mode must not receive a generated local endpoint anchor" >&2
+  exit 1
+fi
+
+dynamic_wait_mode=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE' \
+  --set 'extraEnv[0].valueFrom.configMapKeyRef.name=startup-policy' \
+  --set 'extraEnv[0].valueFrom.configMapKeyRef.key=mode')
+dynamic_wait_env_names=$(statefulset_env_names <<<"$dynamic_wait_mode")
+if [[ "$dynamic_wait_env_names" != "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE" ]]; then
+  echo "Dynamically sourced startup mode must opt out of the generated local endpoint anchor" >&2
+  exit 1
+fi
+
+orchestrated_wait_mode=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE' \
+  --set 'extraEnv[0].value=orchestrated')
+orchestrated_wait_env_names=$(statefulset_env_names <<<"$orchestrated_wait_mode")
+if [[ "$orchestrated_wait_env_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE" ]]; then
+  echo "Explicit orchestrated startup mode must retain one generated local endpoint anchor" >&2
+  exit 1
+fi
+
+# Existing POD_NAME remains independent from the chart-private Downward API
+# variable, while an explicit anchor disables automatic anchor injection.
+existing_pod_name=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=POD_NAME' \
+  --set 'extraEnv[0].valueFrom.fieldRef.fieldPath=metadata.name')
+existing_pod_name_names=$(statefulset_env_names <<<"$existing_pod_name")
+existing_pod_name_count=$(yq eval '[.spec.template.spec.containers[0].env[] | select(.name == "POD_NAME")] | length' - <<<"$existing_pod_name")
+existing_pod_name_field=$(yq eval '.spec.template.spec.containers[0].env[] | select(.name == "POD_NAME") | .valueFrom.fieldRef.fieldPath' - <<<"$existing_pod_name")
+existing_chart_pod_name_field=$(yq eval '.spec.template.spec.containers[0].env[] | select(.name == "RUSTFS_CHART_POD_NAME") | .valueFrom.fieldRef.fieldPath' - <<<"$existing_pod_name")
+existing_pod_name_anchor=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$existing_pod_name")
+if [[ "$existing_pod_name_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST POD_NAME" ||
+      "$existing_pod_name_count" != "1" ||
+      "$existing_pod_name_field" != "metadata.name" ||
+      "$existing_chart_pod_name_field" != "metadata.name" ||
+      "$existing_pod_name_anchor" != '$(RUSTFS_CHART_POD_NAME).rustfs-headless.rustfs.svc.cluster.local' ]]; then
+  echo "An existing extraEnv POD_NAME must be preserved without interfering with the automatic anchor" >&2
+  exit 1
+fi
+
+existing_local_anchor=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=RUSTFS_LOCAL_ENDPOINT_HOST' \
+  --set-string 'extraEnv[0].value=rustfs-0.rustfs-headless.rustfs.svc.cluster.local')
+existing_local_anchor_names=$(statefulset_env_names <<<"$existing_local_anchor")
+existing_local_anchor_value=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$existing_local_anchor")
+if [[ "$existing_local_anchor_names" != "RUSTFS_LOCAL_ENDPOINT_HOST" || "$existing_local_anchor_value" != "rustfs-0.rustfs-headless.rustfs.svc.cluster.local" ]]; then
+  echo "An existing explicit local endpoint anchor must be preserved without a generated duplicate" >&2
+  exit 1
+fi
+
+# `helm upgrade --reuse-values` can omit keys introduced by the new chart.
+# A missing localEndpointHost map keeps the new safe default instead of
+# failing template evaluation.
+missing_local_endpoint_host_values=$(render_distributed_statefulset \
+  --set-json 'localEndpointHost=null')
+missing_local_endpoint_host_names=$(statefulset_env_names <<<"$missing_local_endpoint_host_values")
+if [[ "$missing_local_endpoint_host_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST" ]]; then
+  echo "Missing localEndpointHost values from a reused release must default to automatic anchor injection" >&2
+  exit 1
+fi
+
+# An opaque existing Secret keeps the historical DNS path by default because
+# it may hide runtime topology or startup-mode overrides. A credentials-only
+# Secret can explicitly opt in without changing envFrom precedence.
+existing_secret_statefulset=$(render_distributed_statefulset \
+  --set secret.existingSecret=legacy-rustfs-config)
+existing_secret_env_names=$(statefulset_env_names <<<"$existing_secret_statefulset")
+existing_secret_env_from=$(yq eval '[.spec.template.spec.containers[0].envFrom[] | (.configMapRef.name // .secretRef.name)] | join(" ")' - <<<"$existing_secret_statefulset")
+if [[ -n "$existing_secret_env_names" || "$existing_secret_env_from" != "rustfs-config legacy-rustfs-config" ]]; then
+  echo "An opaque existingSecret must default to the legacy environment path" >&2
+  exit 1
+fi
+
+existing_secret_opt_in=$(render_distributed_statefulset \
+  --set secret.existingSecret=legacy-rustfs-config \
+  --set localEndpointHost.autoInject=true)
+existing_secret_opt_in_names=$(statefulset_env_names <<<"$existing_secret_opt_in")
+existing_secret_opt_in_env_from=$(yq eval '[.spec.template.spec.containers[0].envFrom[] | (.configMapRef.name // .secretRef.name)] | join(" ")' - <<<"$existing_secret_opt_in")
+if [[ "$existing_secret_opt_in_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST" ||
+      "$existing_secret_opt_in_env_from" != "rustfs-config legacy-rustfs-config" ]]; then
+  echo "A credentials-only existingSecret must support explicit automatic anchor injection" >&2
+  exit 1
+fi
+
+# A Secret that hides a custom topology can explicitly preserve the historical
+# DNS path. No explicit env entries are added, and envFrom ordering is unchanged.
+existing_secret_opt_out=$(render_distributed_statefulset \
+  --set secret.existingSecret=legacy-rustfs-config \
+  --set localEndpointHost.autoInject=false)
+existing_secret_opt_out_env_names=$(statefulset_env_names <<<"$existing_secret_opt_out")
+existing_secret_opt_out_env_from=$(yq eval '[.spec.template.spec.containers[0].envFrom[] | (.configMapRef.name // .secretRef.name)] | join(" ")' - <<<"$existing_secret_opt_out")
+if [[ -n "$existing_secret_opt_out_env_names" || "$existing_secret_opt_out_env_from" != "rustfs-config legacy-rustfs-config" ]]; then
+  echo "localEndpointHost.autoInject=false must preserve the legacy existingSecret environment path" >&2
+  exit 1
+fi
+
+quoted_local_endpoint_host_status=0
+quoted_local_endpoint_host_error=$(render_distributed_statefulset \
+  --set secret.existingSecret=legacy-rustfs-config \
+  --set-string localEndpointHost.autoInject=false 2>&1) || quoted_local_endpoint_host_status=$?
+if [[ $quoted_local_endpoint_host_status -eq 0 ||
+      "$quoted_local_endpoint_host_error" != *"localEndpointHost.autoInject must be a boolean or null"* ]]; then
+  echo "A quoted localEndpointHost.autoInject value must fail closed instead of becoming truthy" >&2
+  exit 1
+fi
+
+missing_local_endpoint_host_with_secret=$(render_distributed_statefulset \
+  --set secret.existingSecret=legacy-rustfs-config \
+  --set-json 'localEndpointHost=null')
+if [[ -n "$(statefulset_env_names <<<"$missing_local_endpoint_host_with_secret")" ]]; then
+  echo "A reused release without localEndpointHost values must not override an opaque existingSecret" >&2
+  exit 1
+fi
+
+# An explicit topology disables inference, but an address override alone keeps
+# the generated anchor so RustFS can validate the effective port before format
+# initialization.
+volumes_override_statefulset=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=RUSTFS_VOLUMES' \
+  --set-string 'extraEnv[0].value=http://legacy.example/data')
+volumes_override_names=$(statefulset_env_names <<<"$volumes_override_statefulset")
+volumes_override_value=$(yq eval '.spec.template.spec.containers[0].env[0].value' - <<<"$volumes_override_statefulset")
+if [[ "$volumes_override_names" != "RUSTFS_VOLUMES" || "$volumes_override_value" != "http://legacy.example/data" ]]; then
+  echo "extraEnv RUSTFS_VOLUMES must retain precedence without a generated anchor" >&2
+  exit 1
+fi
+
+address_override_statefulset=$(render_distributed_statefulset \
+  --set 'extraEnv[0].name=RUSTFS_ADDRESS' \
+  --set-string 'extraEnv[0].value=:9443')
+address_override_names=$(statefulset_env_names <<<"$address_override_statefulset")
+address_override_value=$(statefulset_env_value RUSTFS_ADDRESS <<<"$address_override_statefulset")
+address_override_anchor_count=$(yq eval '[.spec.template.spec.containers[0].env[] | select(.name == "RUSTFS_LOCAL_ENDPOINT_HOST")] | length' - <<<"$address_override_statefulset")
+if [[ "$address_override_names" != "RUSTFS_CHART_POD_NAME RUSTFS_LOCAL_ENDPOINT_HOST RUSTFS_ADDRESS" ||
+      "$address_override_value" != ":9443" ||
+      "$address_override_anchor_count" != "1" ]]; then
+  echo "extraEnv RUSTFS_ADDRESS must retain one generated local endpoint anchor" >&2
+  exit 1
+fi
+
+# Explicit volumes remain authoritative: the chart must not infer any identity,
+# while a user-supplied local endpoint anchor remains allowed.
+custom_volumes_statefulset=$(render_distributed_statefulset \
+  --set config.rustfs.volumes=http://example.test/data)
+custom_volumes_env_names=$(statefulset_env_names <<<"$custom_volumes_statefulset")
+if [[ -n "$custom_volumes_env_names" ]]; then
+  echo "Custom volumes must not receive generated topology env entries" >&2
+  exit 1
+fi
+
+custom_volumes_with_anchor=$(render_distributed_statefulset \
+  --set config.rustfs.volumes=http://example.test/data \
+  --set 'extraEnv[0].name=RUSTFS_LOCAL_ENDPOINT_HOST' \
+  --set 'extraEnv[0].value=example.test')
+custom_anchor=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$custom_volumes_with_anchor")
+if [[ "$custom_anchor" != "example.test" ]]; then
+  echo "Custom volumes must allow a user-supplied local endpoint anchor" >&2
+  exit 1
+fi
+
+if grep -q 'RUSTFS_LOCAL_ENDPOINT_HOST' <<<"$standalone_default_output"; then
+  echo "Standalone mode must not receive a distributed local endpoint anchor" >&2
+  exit 1
+fi
+
+# Every generated server pool uses its runtime pod name with the shared root
+# headless service. No pool waits for another pool's DNS or TCP listener.
 multi_pool_startup=$(helm template rustfs "$CHART_DIR" \
   --namespace rustfs \
   --set secret.rustfs.access_key=test-access-key \
@@ -383,14 +722,19 @@ multi_pool_startup=$(helm template rustfs "$CHART_DIR" \
   --set pools.enabled=true \
   --set 'pools.list[0].replicaCount=2' \
   --set 'pools.list[1].replicaCount=2')
-grep -q 'nslookup "rustfs-0.rustfs-headless.rustfs.svc.cluster.local"' <<<"$multi_pool_startup"
-grep -q 'nslookup "rustfs-pool1-1.rustfs-headless.rustfs.svc.cluster.local"' <<<"$multi_pool_startup"
-if grep -q 'rustfs-pool1-headless' <<<"$multi_pool_startup"; then
-  echo "Multi-pool startup wait must use the shared root headless service" >&2
+multi_pool_anchor_count=$(grep -c 'name: RUSTFS_LOCAL_ENDPOINT_HOST' <<<"$multi_pool_startup" || true)
+if [[ $multi_pool_anchor_count -ne 2 ]]; then
+  echo "Every generated server pool must receive RUSTFS_LOCAL_ENDPOINT_HOST" >&2
   exit 1
 fi
-grep -q 'wait_for_peer "rustfs-1:${ENDPOINT_PORT}"' <<<"$multi_pool_startup"
-grep -q 'wait_for_peer "rustfs-pool1-${i}:${ENDPOINT_PORT}"' <<<"$multi_pool_startup"
+if grep -Eq 'nslookup|nc -z|wait_for_peer' <<<"$multi_pool_startup"; then
+  echo "Multi-pool init must not wait for peer DNS or TCP" >&2
+  exit 1
+fi
+if grep -q 'rustfs-pool1-headless' <<<"$multi_pool_startup"; then
+  echo "Multi-pool local endpoint identity must use the shared root headless service" >&2
+  exit 1
+fi
 
 # volumeClaimTemplates must not contain empty annotations when pvcAnnotations are unset,
 # because Kubernetes treats annotations: {} as a mutation of the immutable field.

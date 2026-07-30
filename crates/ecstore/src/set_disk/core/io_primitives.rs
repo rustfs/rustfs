@@ -46,7 +46,11 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::OldCurrentSize;
+use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
+use crate::disk::{
+    DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
+    PartTransactionAction, part_transaction_path,
+};
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
@@ -544,6 +548,8 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
         && left.transitioned_objname == right.transitioned_objname
         && left.transition_tier == right.transition_tier
         && left.transition_version_id == right.transition_version_id
+        && left.transition_version == right.transition_version
+        && left.transition_version_state == right.transition_version_state
         && left.expire_restored == right.expire_restored
         && left.size == right.size
         && left.mod_time == right.mod_time
@@ -2982,29 +2988,48 @@ impl SetDisks {
                 Self::rename_fanout_barrier(&object_for_fault, idx, rename_fanout_barrier_phase::CLEANUP).await;
 
                 if let Some(err) = Self::cleanup_injected_error(&object_for_fault, idx) {
-                    return Some(err);
+                    return (false, Some(err));
                 }
                 if let Some(disk) = disk {
-                    disk.delete(
-                        &bucket,
-                        &file_path,
-                        DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .err()
+                    match disk
+                        .delete_data_dir(
+                            &bucket,
+                            &file_path,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        Ok(DataDirDeleteStatus::Deleted) => (false, None),
+                        Ok(DataDirDeleteStatus::Deferred) => (true, None),
+                        Err(err) => (false, Some(err)),
+                    }
                 } else {
                     // `None` slot: ignored placeholder. It is not `attempted`, so
                     // classification excludes it from residue regardless.
-                    Some(DiskError::DiskNotFound)
+                    (false, Some(DiskError::DiskNotFound))
                 }
             })
         });
-        let errs: Vec<Option<DiskError>> = join_all(futures).await.into_iter().map(map_cleanup_join_result).collect();
+        let mut deferred = 0usize;
+        let errs: Vec<Option<DiskError>> = join_all(futures)
+            .await
+            .into_iter()
+            .map(|result| match result {
+                Ok((was_deferred, err)) => {
+                    deferred += usize::from(was_deferred);
+                    err
+                }
+                Err(join_err) => Some(DiskError::other(format!("old data dir cleanup task failed: {join_err}"))),
+            })
+            .collect();
 
-        classify_old_data_dir_cleanup(&errs, &attempted, write_quorum)
+        let mut cleanup = classify_old_data_dir_cleanup(&errs, &attempted, write_quorum);
+        cleanup.deferred = deferred;
+        cleanup.reclaimed = cleanup.reclaimed.saturating_sub(deferred);
+        cleanup
     }
 
     /// Test-only fault-injection seam for the old-data-dir cleanup path
@@ -3095,6 +3120,20 @@ impl SetDisks {
 
         rustfs_io_metrics::record_old_data_dir_cleanup(c.attempted, c.reclaimed, c.unreclaimed_disks.len(), c.below_quorum);
 
+        if c.deferred > 0 {
+            debug!(
+                event = EVENT_SET_DISK_WRITE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket = %bucket,
+                object = %object,
+                old_data_dir = %old_dir,
+                deferred = c.deferred,
+                state = "old_data_cleanup_deferred",
+                "Old data directory cleanup deferred for active snapshot leases"
+            );
+        }
+
         if actions.warn {
             warn!(
                 component = LOG_COMPONENT_ECSTORE,
@@ -3174,6 +3213,155 @@ impl SetDisks {
         }
     }
 
+    async fn recover_part_transaction(&self, dst_object: &str, write_quorum: usize) -> disk::error::Result<bool> {
+        let disks = self.get_disks_internal().await;
+        let transaction_path = part_transaction_path(dst_object);
+        let transaction_meta_path = format!("{transaction_path}/{PART_TRANSACTION_NEW_META}");
+        let rollback_path = format!("{transaction_path}/{PART_TRANSACTION_ROLLBACK}");
+        let current_meta_path = format!("{dst_object}.meta");
+
+        let reads = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let transaction_meta_path = transaction_meta_path.clone();
+            let rollback_path = rollback_path.clone();
+            let current_meta_path = current_meta_path.clone();
+            async move {
+                let Some(disk) = disk else {
+                    return Ok((None, None, false));
+                };
+                let transaction_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
+                    Ok(meta) => Some(meta),
+                    Err(DiskError::FileNotFound) => None,
+                    Err(err) => return Err(err),
+                };
+                let rollback = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
+                    Ok(_) => true,
+                    Err(DiskError::FileNotFound) => false,
+                    Err(err) => return Err(err),
+                };
+                let current_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
+                    Ok(meta) => Some(meta),
+                    Err(DiskError::FileNotFound | DiskError::DiskNotFound) => None,
+                    Err(_) => None,
+                };
+                Ok((transaction_meta, current_meta, rollback))
+            }
+        });
+        let observations = join_all(reads).await.into_iter().collect::<disk::error::Result<Vec<_>>>()?;
+        if observations.iter().all(|(transaction, _, _)| transaction.is_none()) {
+            return Ok(false);
+        }
+
+        let mut current_counts: HashMap<Bytes, usize> = HashMap::new();
+        for (_, current, _) in &observations {
+            if let Some(current) = current {
+                *current_counts.entry(current.clone()).or_default() += 1;
+            }
+        }
+        let current_quorum = current_counts
+            .into_iter()
+            .find_map(|(meta, count)| (count >= write_quorum).then_some(meta));
+
+        let old_meta_path = format!("{transaction_path}/{PART_TRANSACTION_OLD_META}");
+        let old_meta_absent_path = format!("{transaction_path}/old.meta.absent");
+        let decisions = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (transaction_meta, _, rollback))| {
+                transaction_meta.as_ref().map(|meta| (index, meta.clone(), *rollback))
+            })
+            .map(|(index, transaction_meta, rollback)| {
+                let disk = disks[index].clone();
+                let old_meta_path = old_meta_path.clone();
+                let old_meta_absent_path = old_meta_absent_path.clone();
+                let current_quorum = current_quorum.clone();
+                async move {
+                    let Some(disk) = disk else {
+                        return Err(DiskError::DiskNotFound);
+                    };
+                    let action = if rollback {
+                        PartTransactionAction::Rollback
+                    } else if current_quorum.as_ref() == Some(&transaction_meta) {
+                        PartTransactionAction::Commit
+                    } else if let Some(current_quorum) = current_quorum {
+                        match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_path).await {
+                            Ok(old_meta) if old_meta == current_quorum => PartTransactionAction::Rollback,
+                            Ok(_) => PartTransactionAction::Commit,
+                            Err(DiskError::FileNotFound) => {
+                                match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_absent_path).await {
+                                    Ok(_) => PartTransactionAction::Commit,
+                                    Err(_) => return Err(DiskError::FileCorrupt),
+                                }
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        PartTransactionAction::Rollback
+                    };
+                    disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, dst_object, action)
+                        .await?;
+                    Ok(action == PartTransactionAction::Commit)
+                }
+            });
+
+        let results = join_all(decisions).await;
+        if let Some(err) = results.iter().find_map(|result| result.as_ref().err()) {
+            return Err(err.clone());
+        }
+        Ok(results.iter().any(|result| matches!(result, Ok(true))))
+    }
+
+    pub(in crate::set_disk) async fn recover_part_transactions(
+        &self,
+        part_path: &str,
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<()> {
+        let disks = self.get_disks_internal().await;
+        let listings = join_all(disks.iter().map(|disk| {
+            let disk = disk.clone();
+            async move {
+                let Some(disk) = disk else {
+                    return Err(DiskError::DiskNotFound);
+                };
+                disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path, -1)
+                    .await
+            }
+        }))
+        .await;
+
+        let mut transaction_parts = HashSet::new();
+        let mut errs = Vec::with_capacity(listings.len());
+        for listing in listings {
+            match listing {
+                Ok(entries) => {
+                    errs.push(None);
+                    for entry in entries {
+                        let name = entry.trim_end_matches('/');
+                        let Some(part_number) = name
+                            .strip_prefix(".part.")
+                            .and_then(|name| name.strip_suffix(".rustfs-txn"))
+                            .and_then(|number| number.parse::<usize>().ok())
+                        else {
+                            continue;
+                        };
+                        transaction_parts.insert(part_number);
+                    }
+                }
+                Err(err) => errs.push(Some(err)),
+            }
+        }
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            return Err(err);
+        }
+
+        for part_number in transaction_parts {
+            self.recover_part_transaction(&format!("{part_path}part.{part_number}"), write_quorum)
+                .await?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(skip(disks, meta))]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::set_disk) async fn rename_part(
@@ -3187,23 +3375,46 @@ impl SetDisks {
         write_quorum: usize,
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
+        self.recover_part_transaction(dst_object, write_quorum).await?;
+
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
 
-        // Do NOT pre-delete the destination part before renaming: the per-disk
-        // `rename_part` replaces `part.N` atomically (std::fs::rename) and rewrites
-        // `part.N.meta`, so the pre-delete is redundant — and destructive. It
-        // opened a window where an already-committed (ACKed) part was removed on
-        // every disk before the new rename landed, so a re-upload that then failed
-        // quorum destroyed the committed part outright (backlog#853 / #799 B4).
-        // The atomic rename overwrites in place; on quorum failure below we roll
-        // the destination back.
+        let prepare_tasks = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let src_bucket = src_bucket.clone();
+            let src_object = src_object.clone();
+            let dst_bucket = dst_bucket.clone();
+            let dst_object = dst_object.clone();
+            let meta = meta.clone();
+            async move {
+                let disk = disk?;
+                Some(
+                    disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                        .await,
+                )
+            }
+        });
+        let prepare_results = join_all(prepare_tasks).await;
+        let prepare_errs = prepare_results
+            .into_iter()
+            .map(|result| match result {
+                Some(Ok(())) => None,
+                Some(Err(err)) => Some(err),
+                None => Some(DiskError::DiskNotFound),
+            })
+            .collect::<Vec<_>>();
+        let prepared_disks = Self::eval_disks(disks, &prepare_errs);
+        if reduce_write_quorum_errs(&prepare_errs, OBJECT_OP_IGNORED_ERRS, write_quorum).is_some() {
+            self.recover_part_transaction(&dst_object, write_quorum).await?;
+            return Err(DiskError::ErasureWriteQuorum);
+        }
 
         let mut errs = Vec::with_capacity(disks.len());
 
-        let futures = disks.iter().map(|disk| {
+        let futures = prepared_disks.iter().map(|disk| {
             let disk = disk.clone();
             let meta = meta.clone();
             let src_bucket = src_bucket.clone();
@@ -3253,19 +3464,42 @@ impl SetDisks {
             );
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+        let reduced_err = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+        if let Some(err) = reduced_err {
+            let rollbacks = prepared_disks.iter().filter_map(|disk| {
+                disk.clone().map(|disk| {
+                    let dst_object = dst_object.clone();
+                    async move {
+                        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &dst_object, PartTransactionAction::Rollback)
+                            .await
+                    }
+                })
+            });
+            let rollback_results = join_all(rollbacks).await;
+            self.recover_part_transaction(&dst_object, write_quorum).await?;
+            if let Some(rollback_err) = rollback_results.iter().find_map(|result| result.as_ref().err()) {
+                warn!(error = %rollback_err, "rename_part rollback did not settle on every prepared disk");
+            }
             if let Some(context) = quorum_context {
                 log_multipart_write_quorum_failure(context, &errs, write_quorum, &err);
             } else {
                 warn!("rename_part errs {:?}", &errs);
             }
-            self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
-                .await;
             return Err(err);
         }
 
-        let disks = Self::eval_disks(disks, &errs);
-        Ok(disks)
+        let committed = self.recover_part_transaction(&dst_object, write_quorum).await?;
+        if !committed {
+            let err = DiskError::ErasureWriteQuorum;
+            if let Some(context) = quorum_context {
+                log_multipart_write_quorum_failure(context, &errs, write_quorum, &err);
+            } else {
+                warn!("rename_part errs {:?}", &errs);
+            }
+            return Err(err);
+        }
+
+        Ok(Self::eval_disks(&prepared_disks, &errs))
     }
 
     pub(in crate::set_disk) fn eval_disks(disks: &[Option<DiskStore>], errs: &[Option<DiskError>]) -> Vec<Option<DiskStore>> {
@@ -3719,9 +3953,9 @@ impl SetDisks {
     /// * The set of referenced data dirs is the UNION of `get_data_dirs()` across
     ///   every online disk's `xl.meta`, so a dir named by *any* replica is kept.
     /// * If a disk holds the object directory but its `xl.meta` is missing or
-    ///   unparsable, the object is treated as degraded and NOTHING is removed —
-    ///   the unreadable copy could be the only one naming a live data dir, and a
-    ///   heal must run first.
+    ///   unparsable, the object is treated as degraded and unmarked data dirs are
+    ///   never removed. A data dir carrying a committed delete-transaction marker
+    ///   remains reclaimable after a downgrade/re-upgrade cleanup interruption.
     /// * Only subdirectories whose names parse as a UUID are ever considered;
     ///   removal is non-recursive-safe via a recursive delete of the full stray
     ///   data-dir path only.
@@ -3736,7 +3970,7 @@ impl SetDisks {
         // physical UUID subdirectories present on each disk. Abort on any degraded
         // copy so a healable object is never stripped of a referenced data dir.
         let mut referenced: HashSet<Uuid> = HashSet::new();
-        let mut per_disk_dirs: Vec<(usize, Vec<Uuid>)> = Vec::new();
+        let mut per_disk_dirs: Vec<(usize, Vec<(Uuid, bool)>)> = Vec::new();
         let mut healthy_metas = 0usize;
 
         for (i, disk) in disks.iter().enumerate() {
@@ -3770,6 +4004,22 @@ impl SetDisks {
                     if physical.is_empty() {
                         // Bare directory with no data dirs and no metadata: leave it
                         // to the orphan-dir / dangling-object heal paths.
+                        continue;
+                    }
+                    let mut committed = Vec::with_capacity(physical.len());
+                    for dir in physical {
+                        let data_dir = format!("{object}/{dir}");
+                        let committed_delete = disk.list_dir("", bucket, &data_dir, 0).await.is_ok_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry
+                                    .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
+                                    .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok())
+                            })
+                        });
+                        committed.push((dir, committed_delete));
+                    }
+                    if committed.iter().all(|(_, committed_delete)| *committed_delete) {
+                        per_disk_dirs.push((i, committed));
                         continue;
                     }
                     warn!(
@@ -3808,22 +4058,16 @@ impl SetDisks {
 
             healthy_metas += 1;
             if !physical.is_empty() {
-                per_disk_dirs.push((i, physical));
+                per_disk_dirs.push((i, physical.into_iter().map(|dir| (dir, false)).collect()));
             }
-        }
-
-        // No healthy metadata anywhere: this is not a live object, so surplus dirs
-        // (if any) belong to the dangling-object heal path, not here.
-        if healthy_metas == 0 {
-            return Ok(0);
         }
 
         // Phase 2: delete every physical data dir not referenced by the union.
         let mut removed = 0usize;
         for (i, physical) in per_disk_dirs {
             let Some(disk) = disks[i].as_ref() else { continue };
-            for dir in physical {
-                if referenced.contains(&dir) {
+            for (dir, committed_delete) in physical {
+                if referenced.contains(&dir) || (healthy_metas == 0 && !committed_delete) {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");
@@ -3931,6 +4175,9 @@ pub(in crate::set_disk) struct OldDataDirCleanup {
     /// Number of attempted disks that returned `Ok` or a not-found variant
     /// (a missing dir == already reclaimed).
     pub reclaimed: usize,
+    /// Number of attempted disks that retained the directory for an active
+    /// snapshot lease and registered it for deletion after the final release.
+    pub deferred: usize,
     /// Indices of attempted disks that failed with a non-ignored, non-not-found
     /// error (including task panic/cancel). This is the residue that actually
     /// leaks and drives the leak metric + heal enqueue.
@@ -3993,6 +4240,7 @@ fn classify_old_data_dir_cleanup(errs: &[Option<DiskError>], attempted: &[bool],
     OldDataDirCleanup {
         attempted: attempted_count,
         reclaimed,
+        deferred: 0,
         unreclaimed_disks,
         below_quorum,
     }
@@ -4931,6 +5179,40 @@ mod tests {
         assert_eq!(cleanup.reclaimed, 2, "the real old-data-dir must still be reclaimed after release");
 
         drop((disk1, disk2));
+    }
+
+    #[tokio::test]
+    async fn commit_cleanup_reports_and_releases_deferred_snapshot_data_dirs() {
+        let bucket = "cleanup-lease-bucket";
+        let object = "cleanup-lease-object";
+        let old_data_dir = "11111111-1111-1111-1111-111111111111";
+        let committed_data_dir = "22222222-2222-2222-2222-222222222222";
+        let data_dir_path = format!("{object}/{old_data_dir}");
+        let shard_path = format!("{data_dir_path}/part.1");
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[(&shard_path, b"one".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone())], 0).await;
+        let lease = disk1
+            .acquire_snapshot_lease(bucket, &data_dir_path)
+            .await
+            .expect("snapshot lease should be acquired before cleanup");
+
+        let cleanup = set
+            .commit_rename_data_dir(&[Some(disk1.clone())], bucket, object, old_data_dir, committed_data_dir, 1)
+            .await;
+        assert_eq!(cleanup.attempted, 1);
+        assert_eq!(cleanup.reclaimed, 0);
+        assert_eq!(cleanup.deferred, 1);
+        assert!(cleanup.unreclaimed_disks.is_empty());
+        disk1
+            .read_all(bucket, &shard_path)
+            .await
+            .expect("deferred cleanup must leave later shard opens available");
+
+        disk1
+            .release_snapshot_lease(bucket, &data_dir_path, lease)
+            .await
+            .expect("final lease release should reclaim the old data directory");
+        assert!(matches!(disk1.read_all(bucket, &shard_path).await, Err(DiskError::FileNotFound)));
     }
 
     /// Isolation guard: an armed barrier / observed object only affects its own

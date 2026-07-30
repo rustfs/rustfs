@@ -538,10 +538,12 @@ mod tests {
         use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
         use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
         use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::runtime::instance::InstanceContext;
         use crate::storage_api_contracts::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
         use crate::storage_api_contracts::object::{ObjectIO, ObjectOperations};
-        use crate::store::{ECStore, init_local_disks};
+        use crate::store::{ECStore, init_local_disks_with_instance_ctx};
         use rustfs_utils::path::SLASH_SEPARATOR;
+        use std::sync::Arc;
         use tokio::fs;
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
@@ -570,10 +572,20 @@ mod tests {
             cmd_line: "minio-migrate-test".to_string(),
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
         }]);
-        init_local_disks(endpoint_pools.clone()).await.unwrap();
-        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new())
+        // Isolated instance context: this test deletes its disks at the end,
+        // and dead entries in the shared registry break other cached envs.
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
             .unwrap();
+        let ecstore = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().unwrap(),
+            endpoint_pools,
+            CancellationToken::new(),
+            instance_ctx,
+        )
+        .await
+        .unwrap();
         let existing: Vec<String> = ecstore
             .list_bucket(&BucketOptions {
                 no_metadata: true,

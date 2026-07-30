@@ -17,11 +17,10 @@
 //! # Architecture
 //!
 //! ```text
-//! HTTP Ingress (SetRequestIdLayer)
-//!   → generates x-request-id UUID
-//!   → RequestContextLayer creates RequestContext
+//! External S3 HTTP ingress
+//!   → generates a server-owned request ID without mutating signed headers
+//!   → ExternalRequestContextLayer creates RequestContext
 //!     → stores in request.extensions()
-//!     → stores the S3-compatible request-id alias without changing signed headers
 //! Auth (FS::check)
 //!   → copies RequestContext into ReqInfo.request_context
 //! Storage (FS methods)
@@ -40,10 +39,11 @@
 //! # Frozen Rules (T00 Guardrails)
 //!
 //! ## request-id contract
-//! - Canonical wire header: `x-request-id` (set by `SetRequestIdLayer`)
+//! - External S3 response headers: `x-request-id` and `x-amz-request-id`
+//! - Non-S3 response header: propagated `x-request-id`
 //! - Compatibility wire header: `x-amz-request-id`
 //! - Canonical internal field: `RequestContext.request_id`
-//! - S3 compatibility internal alias field: `RequestContext.x_amz_request_id`
+//! - Client-provided request ID headers are never canonical on external S3 requests
 //! - Internal modules MUST NOT generate a second request id under the field name `request_id`
 //!   except for orphan/non-ingress fallback paths where no canonical request-id exists.
 //! - Internal identifiers for sub-operations should use `operation_id` or `subtask_id`
@@ -72,10 +72,14 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// Created exactly once at HTTP ingress. Cloned by value; never mutated after creation.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
-    /// Canonical request ID (from `x-request-id` header, set by `SetRequestIdLayer`).
+    /// Canonical request ID: server-owned for external S3 requests and
+    /// propagated for non-S3 and trusted internal requests.
     pub request_id: String,
-    /// S3-compatible request ID alias (preserves upstream `x-amz-request-id` if present,
-    /// otherwise equals `request_id`).
+    /// Compatibility-only alias that preserves an incoming
+    /// `x-amz-request-id`, or mirrors [`Self::request_id`] when absent.
+    ///
+    /// Internal correlation must use [`Self::request_id`]. This field remains
+    /// for compatibility with existing in-crate consumers.
     pub x_amz_request_id: String,
     /// OpenTelemetry trace ID (if present from upstream propagation).
     pub trace_id: Option<String>,
@@ -86,6 +90,57 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// Create a context for a trusted internal request that may propagate its
+    /// canonical ID through headers.
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        Self::new(
+            extract_request_id_from_headers(headers),
+            headers,
+            extract_trace_context_ids_from_headers(headers),
+        )
+    }
+
+    /// Create a context for a non-S3 request while mirroring the propagated
+    /// canonical request ID into the compatibility alias.
+    pub(crate) fn from_propagated_headers(headers: &HeaderMap) -> Self {
+        let request_id = extract_request_id_from_headers(headers);
+        let (trace_id, span_id) = extract_trace_context_ids_from_headers(headers)
+            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
+            .unwrap_or((None, None));
+        Self {
+            x_amz_request_id: request_id.clone(),
+            request_id,
+            trace_id,
+            span_id,
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Create an external request context with a server-owned ID while keeping
+    /// client headers unchanged for signature verification.
+    pub(crate) fn from_external_headers(headers: &HeaderMap) -> Self {
+        Self::new(uuid::Uuid::new_v4().to_string(), headers, extract_trace_context_ids_from_headers(headers))
+    }
+
+    fn new(request_id: String, headers: &HeaderMap, trace_context: Option<(String, String)>) -> Self {
+        let x_amz_request_id = headers
+            .get(AMZ_REQUEST_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| request_id.clone());
+        let (trace_id, span_id) = trace_context
+            .map(|(trace_id, span_id)| (Some(trace_id), Some(span_id)))
+            .unwrap_or((None, None));
+
+        Self {
+            request_id,
+            x_amz_request_id,
+            trace_id,
+            span_id,
+            start_time: Instant::now(),
+        }
+    }
+
     /// Create a fallback `RequestContext` for paths that bypass HTTP ingress.
     /// Generates a canonical internal `request_id` in `trace-{trace_id}` or `req-{uuid}` format.
     pub fn fallback() -> Self {
@@ -164,15 +219,26 @@ pub fn extract_request_id_from_headers(headers: &HeaderMap) -> String {
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
         .map(String::from)
-        .or_else(|| headers.get(AMZ_REQUEST_ID).and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(generate_fallback_request_id);
+        .or_else(|| {
+            headers
+                .get(AMZ_REQUEST_ID)
+                .and_then(|v| v.to_str().ok())
+                .filter(|value| !value.trim().is_empty())
+                .map(String::from)
+        });
 
-    if !headers.contains_key(REQUEST_ID_HEADER) && !headers.contains_key(AMZ_REQUEST_ID) {
-        counter!("rustfs_log_chain_fallback_request_id_total", "source" => "headers_missing").increment(1);
+    if request_id.is_none() {
+        let source = if headers.contains_key(REQUEST_ID_HEADER) || headers.contains_key(AMZ_REQUEST_ID) {
+            "headers_empty_or_invalid"
+        } else {
+            "headers_missing"
+        };
+        counter!("rustfs_log_chain_fallback_request_id_total", "source" => source).increment(1);
     }
 
-    request_id
+    request_id.unwrap_or_else(generate_fallback_request_id)
 }
 
 /// Spawn a request-internal task that inherits the current tracing span.
@@ -195,7 +261,7 @@ where
 #[allow(unused_imports)]
 mod tests {
     use super::{RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers};
-    use http::HeaderMap;
+    use http::{HeaderMap, HeaderValue};
     use opentelemetry::global;
     use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -242,6 +308,69 @@ mod tests {
     }
 
     #[test]
+    fn test_request_context_from_headers_prioritizes_canonical_request_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("canonical-request-id"));
+        headers.insert("x-amz-request-id", HeaderValue::from_static("client-request-id"));
+
+        let ctx = RequestContext::from_headers(&headers);
+
+        assert_eq!(ctx.request_id, "canonical-request-id");
+        assert_eq!(ctx.x_amz_request_id, "client-request-id");
+    }
+
+    #[test]
+    fn test_request_context_from_headers_preserves_empty_amz_alias() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("canonical-request-id"));
+        headers.insert("x-amz-request-id", HeaderValue::from_static(""));
+
+        let ctx = RequestContext::from_headers(&headers);
+
+        assert_eq!(ctx.request_id, "canonical-request-id");
+        assert_eq!(ctx.x_amz_request_id, "");
+    }
+
+    #[test]
+    fn test_propagated_request_context_mirrors_canonical_id_and_preserves_trace_context() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("canonical-request-id"));
+        headers.insert("x-amz-request-id", HeaderValue::from_static("untrusted-amz-request-id"));
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+
+        let ctx = RequestContext::from_propagated_headers(&headers);
+
+        assert_eq!(ctx.request_id, "canonical-request-id");
+        assert_eq!(ctx.x_amz_request_id, "canonical-request-id");
+        assert_eq!(ctx.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(ctx.span_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
+    #[test]
+    fn test_external_request_context_owns_id_and_preserves_trace_context() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("client-request-id"));
+        headers.insert("x-amz-request-id", HeaderValue::from_static("client-amz-request-id"));
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+
+        let ctx = RequestContext::from_external_headers(&headers);
+
+        assert_ne!(ctx.request_id, "client-request-id");
+        assert!(uuid::Uuid::parse_str(&ctx.request_id).is_ok());
+        assert_eq!(ctx.x_amz_request_id, "client-amz-request-id");
+        assert_eq!(ctx.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(ctx.span_id.as_deref(), Some("00f067aa0ba902b7"));
+    }
+
+    #[test]
     fn test_request_context_fallback_uses_trace_prefix_when_span_context_valid() {
         let trace_id = "70f5f77e2f0a4f24be343b59f8b66f8f";
         with_trace_parent(trace_id, || {
@@ -281,6 +410,21 @@ mod tests {
         headers.insert("x-amz-request-id", "amz-req-000".parse().unwrap());
         let id = extract_request_id_from_headers(&headers);
         assert_eq!(id, "x-req-789");
+    }
+
+    #[test]
+    fn test_extract_request_id_ignores_empty_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", http::HeaderValue::from_static(""));
+        headers.insert("x-amz-request-id", http::HeaderValue::from_static("amz-req-000"));
+        assert_eq!(extract_request_id_from_headers(&headers), "amz-req-000");
+
+        headers.insert(
+            "x-amz-request-id",
+            http::HeaderValue::from_bytes(b" \t").expect("optional whitespace is a valid header value"),
+        );
+        let id = extract_request_id_from_headers(&headers);
+        assert!(id.starts_with("req-"), "empty request ID headers must generate a fallback ID");
     }
 
     #[test]

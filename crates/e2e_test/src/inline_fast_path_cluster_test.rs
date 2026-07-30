@@ -67,6 +67,7 @@ type MetricValues = Arc<Mutex<BTreeMap<String, MetricPointVersions>>>;
 
 const KIB: usize = 1024;
 const READER_PATH_COUNTER: &str = "rustfs_io_get_object_reader_path_by_size_total";
+const MSGPACK_JSON_DECODE_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_total";
 const MSGPACK_JSON_FALLBACK_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const MSGPACK_JSON_DECODE_ERROR_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const DIRECTION_LABEL: &str = "direction";
@@ -142,6 +143,7 @@ impl VersionState {
 struct OtlpMetricCollector {
     endpoint: String,
     values: MetricValues,
+    decode_values: MetricValues,
     fallback_values: MetricValues,
     decode_error_values: MetricValues,
     task: JoinHandle<()>,
@@ -152,9 +154,11 @@ impl OtlpMetricCollector {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
         let values = Arc::new(Mutex::new(BTreeMap::new()));
+        let decode_values = Arc::new(Mutex::new(BTreeMap::new()));
         let fallback_values = Arc::new(Mutex::new(BTreeMap::new()));
         let decode_error_values = Arc::new(Mutex::new(BTreeMap::new()));
         let task_values = values.clone();
+        let task_decode_values = decode_values.clone();
         let task_fallback_values = fallback_values.clone();
         let task_decode_error_values = decode_error_values.clone();
         let task = tokio::spawn(async move {
@@ -163,6 +167,7 @@ impl OtlpMetricCollector {
                     break;
                 };
                 let values = task_values.clone();
+                let decode_values = task_decode_values.clone();
                 let fallback_values = task_fallback_values.clone();
                 let decode_error_values = task_decode_error_values.clone();
                 tokio::spawn(async move {
@@ -173,6 +178,7 @@ impl OtlpMetricCollector {
                                 handle_metric_export(
                                     request,
                                     values.clone(),
+                                    decode_values.clone(),
                                     fallback_values.clone(),
                                     decode_error_values.clone(),
                                 )
@@ -185,6 +191,7 @@ impl OtlpMetricCollector {
         Ok(Self {
             endpoint,
             values,
+            decode_values,
             fallback_values,
             decode_error_values,
             task,
@@ -218,6 +225,15 @@ impl OtlpMetricCollector {
 
     async fn msgpack_json_fallback_totals(&self) -> BTreeMap<String, u64> {
         self.fallback_values
+            .lock()
+            .await
+            .iter()
+            .map(|(key, points)| (key.clone(), points.values().map(|(_, value)| value).sum()))
+            .collect()
+    }
+
+    async fn msgpack_json_decode_totals(&self) -> BTreeMap<String, u64> {
+        self.decode_values
             .lock()
             .await
             .iter()
@@ -302,6 +318,7 @@ impl Drop for OtlpMetricCollector {
 async fn handle_metric_export(
     request: Request<Incoming>,
     values: MetricValues,
+    decode_values: MetricValues,
     fallback_values: MetricValues,
     decode_error_values: MetricValues,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -334,9 +351,11 @@ async fn handle_metric_export(
     match ExportMetricsServiceRequest::decode(payload.as_slice()) {
         Ok(export) => {
             let mut values = values.lock().await;
+            let mut decode_values = decode_values.lock().await;
             let mut fallback_values = fallback_values.lock().await;
             let mut decode_error_values = decode_error_values.lock().await;
             record_reader_path_metrics(&export, &mut values);
+            record_msgpack_decode_metrics(&export, &mut decode_values);
             record_msgpack_fallback_metrics(&export, &mut fallback_values);
             record_msgpack_decode_error_metrics(&export, &mut decode_error_values);
             Ok(response(StatusCode::OK))
@@ -415,6 +434,19 @@ fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
     format!("{direction}\u{1f}{message}")
 }
 
+fn record_msgpack_decode_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    record_msgpack_counter_metrics(export, MSGPACK_JSON_DECODE_COUNTER, values, |attributes| {
+        let direction = attribute_string(attributes, DIRECTION_LABEL)?;
+        let message = attribute_string(attributes, MESSAGE_LABEL)?;
+        let codec = attribute_string(attributes, CODEC_LABEL)?;
+        Some(msgpack_decode_metric_key(direction, message, codec))
+    });
+}
+
+fn msgpack_decode_metric_key(direction: &str, message: &str, codec: &str) -> String {
+    format!("{direction}\u{1f}{message}\u{1f}{codec}")
+}
+
 fn record_msgpack_decode_error_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
     record_msgpack_counter_metrics(export, MSGPACK_JSON_DECODE_ERROR_COUNTER, values, |attributes| {
         let direction = attribute_string(attributes, DIRECTION_LABEL)?;
@@ -488,6 +520,38 @@ async fn assert_msgpack_fallback_unchanged(
     Ok(())
 }
 
+async fn assert_msgpack_decode_observed(collector: &OtlpMetricCollector, before: &BTreeMap<String, u64>) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let after = collector.msgpack_json_decode_totals().await;
+        let missing = [FALLBACK_REQUEST_DIRECTION, FALLBACK_RESPONSE_DIRECTION]
+            .iter()
+            .filter_map(|direction| {
+                let prefix = format!("{direction}\u{1f}");
+                let suffix = format!("\u{1f}{MSGPACK_CODEC_MSGPACK}");
+                let before_total = before
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix) && key.ends_with(&suffix))
+                    .map(|(_, value)| *value)
+                    .sum::<u64>();
+                let after_total = after
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix) && key.ends_with(&suffix))
+                    .map(|(_, value)| *value)
+                    .sum::<u64>();
+                (after_total <= before_total).then_some(format!("{direction}/{}", MSGPACK_CODEC_MSGPACK))
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for msgpack decode traffic for {missing:?}; totals={after:?}").into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn assert_msgpack_decode_errors_unchanged(
     collector: &OtlpMetricCollector,
     before: &BTreeMap<String, u64>,
@@ -519,6 +583,77 @@ fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<
             _ => None,
         }
     })
+}
+
+#[test]
+fn records_msgpack_decode_metric_with_codec_label() {
+    let export = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: MSGPACK_JSON_DECODE_COUNTER.to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                metric_attribute(DIRECTION_LABEL, FALLBACK_RESPONSE_DIRECTION),
+                                metric_attribute(MESSAGE_LABEL, "ReadMultipleResp"),
+                                metric_attribute(CODEC_LABEL, MSGPACK_CODEC_MSGPACK),
+                            ],
+                            start_time_unix_nano: 7,
+                            time_unix_nano: 11,
+                            value: Some(number_data_point::Value::AsInt(5)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut values = BTreeMap::new();
+
+    record_msgpack_decode_metrics(&export, &mut values);
+
+    let key = msgpack_decode_metric_key(FALLBACK_RESPONSE_DIRECTION, "ReadMultipleResp", MSGPACK_CODEC_MSGPACK);
+    assert_eq!(values.get(&key).and_then(|points| points.get(&7)).copied(), Some((11, 5)));
+}
+
+#[test]
+fn records_msgpack_fallback_metric_with_direction_and_message_labels() {
+    let export = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: MSGPACK_JSON_FALLBACK_COUNTER.to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                metric_attribute(DIRECTION_LABEL, FALLBACK_RESPONSE_DIRECTION),
+                                metric_attribute(MESSAGE_LABEL, "RenameDataResp"),
+                            ],
+                            start_time_unix_nano: 7,
+                            time_unix_nano: 11,
+                            value: Some(number_data_point::Value::AsInt(14)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut values = BTreeMap::new();
+
+    record_msgpack_fallback_metrics(&export, &mut values);
+
+    let key = msgpack_fallback_metric_key(FALLBACK_RESPONSE_DIRECTION, "RenameDataResp");
+    assert_eq!(values.get(&key).and_then(|points| points.get(&7)).copied(), Some((11, 14)));
 }
 
 #[test]
@@ -1309,6 +1444,47 @@ async fn start_manual_transition_job(hot: &RustFSTestClusterEnvironment, bucket:
         .ok_or_else(|| format!("manual transition run response omitted job_id: {response}").into())
 }
 
+async fn start_manual_transition_job_on_node(
+    hot: &RustFSTestClusterEnvironment,
+    node_index: usize,
+    bucket: &str,
+    prefix: &str,
+    tier_name: &str,
+    dry_run: bool,
+    max_objects: u64,
+) -> TestResult<(StatusCode, String)> {
+    let bucket = urlencoding::encode(bucket);
+    let prefix = urlencoding::encode(prefix);
+    let tier = urlencoding::encode(tier_name);
+    let path = format!(
+        "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}&mode=async"
+    );
+    signed_admin_request(&hot.nodes[node_index].url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await
+}
+
+async fn read_manual_transition_job_status_endpoint(
+    hot: &RustFSTestClusterEnvironment,
+    node_index: usize,
+    status_endpoint: &str,
+) -> TestResult<serde_json::Value> {
+    let (status, response) = signed_admin_request(
+        &hot.nodes[node_index].url,
+        Method::GET,
+        status_endpoint,
+        None,
+        &hot.access_key,
+        &hot.secret_key,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "manual transition job status endpoint was not readable on node {node_index}: {}",
+        compact_body(&response)
+    );
+    Ok(serde_json::from_str(&response)?)
+}
+
 async fn wait_for_manual_transition_job_terminal(
     hot: &RustFSTestClusterEnvironment,
     node_index: usize,
@@ -1660,6 +1836,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     configure_mixed_msgpack_cluster(&mut cluster, &collector)?;
     cluster.start().await?;
 
+    let decode_before = collector.msgpack_json_decode_totals().await;
     let fallback_before = collector.msgpack_json_fallback_totals().await;
     let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
@@ -1685,6 +1862,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
         PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
+    assert_msgpack_decode_observed(&collector, &decode_before).await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
     assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
@@ -1775,8 +1953,8 @@ async fn four_node_add_tier_converges_after_offline_node_restart_without_second_
     hot.start().await?;
 
     let tier_name = unique_tier_name();
-    hot.stop_node(3)?;
     let add_tier_response = submit_rustfs_tier(&hot, &cold, &tier_name).await?;
+    hot.stop_node(3)?;
     hot.start_node(3).await?;
 
     wait_for_tier_converged(&hot, &tier_name, &add_tier_response).await
@@ -1813,6 +1991,25 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
     assert_eq!(after_restart["bucket"].as_str(), Some(bucket.as_str()));
     assert_eq!(after_restart["dry_run"].as_bool(), Some(true));
 
+    let job_endpoint = format!("/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
+    let (cancel_status, cancel_body) =
+        signed_admin_request(&hot.nodes[3].url, Method::DELETE, &job_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(
+        cancel_status,
+        StatusCode::OK,
+        "terminal manual transition job cancel after restart failed: {}",
+        compact_body(&cancel_body)
+    );
+    let cancel_value: serde_json::Value = serde_json::from_str(&cancel_body)?;
+    assert_eq!(
+        cancel_value["status"], after_restart["status"],
+        "terminal status changed after restart cancel"
+    );
+    assert_eq!(cancel_value["job_id"].as_str(), Some(job_id.as_str()));
+    assert_eq!(cancel_value["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(cancel_value["dry_run"].as_bool(), Some(true));
+    assert_eq!(cancel_value["cancel_requested"].as_bool(), Some(false));
+
     let missing_job_id = Uuid::new_v4();
     let (missing_status, missing_body) = signed_admin_request(
         &hot.nodes[3].url,
@@ -1833,6 +2030,257 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
         missing_body.contains("<Code>NoSuchKey</Code>") || missing_body.contains("NoSuchKey"),
         "unknown manual transition job should return NoSuchKey, body: {}",
         compact_body(&missing_body)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_manual_transition_distributed_admission_conflict_reports_status_and_backpressure() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inlinedistadmissioncoldadmin".to_string();
+    cold.secret_key = "inlinedistadmissioncoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env("RUSTFS_SCANNER_ENABLED", "false");
+    hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
+    hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "1");
+    hot.set_env("RUSTFS_TRANSITION_QUEUE_CAPACITY", "1");
+    hot.start().await?;
+
+    let hot_client = hot.create_s3_client(0)?;
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
+
+    let bucket = format!("distributed-admission-{}", Uuid::new_v4().simple());
+    let prefix = "transition/distributed-admission/";
+    hot_client.create_bucket().bucket(&bucket).send().await?;
+    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
+    for index in 0u8..64 {
+        let key = format!("{prefix}object-{index:02}.bin");
+        hot_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(payload(64 * KIB, index)))
+            .send()
+            .await?;
+    }
+
+    let (node0, node1) = tokio::join!(
+        start_manual_transition_job_on_node(&hot, 0, &bucket, prefix, &tier_name, false, 64),
+        start_manual_transition_job_on_node(&hot, 1, &bucket, prefix, &tier_name, false, 64)
+    );
+    let responses = [(0usize, node0?), (1usize, node1?)];
+    let accepted = responses
+        .iter()
+        .find(|(_, (status, _))| *status == StatusCode::ACCEPTED)
+        .ok_or_else(|| format!("one distributed async run must be accepted: {responses:#?}"))?;
+    let conflict = responses
+        .iter()
+        .find(|(_, (status, _))| *status == StatusCode::CONFLICT)
+        .ok_or_else(|| format!("one distributed async run must report conflict: {responses:#?}"))?;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, (status, _))| *status == StatusCode::ACCEPTED)
+            .count(),
+        1,
+        "distributed admission must allow exactly one winner: {responses:#?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, (status, _))| *status == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "distributed admission must reject exactly one overlapping contender: {responses:#?}"
+    );
+
+    let accepted_body: serde_json::Value = serde_json::from_str(&accepted.1.1)?;
+    let conflict_body: serde_json::Value = serde_json::from_str(&conflict.1.1)?;
+    let job_id = accepted_body["job_id"]
+        .as_str()
+        .ok_or_else(|| format!("accepted response omitted job_id: {}", accepted.1.1))?;
+    let status_endpoint = accepted_body["status_endpoint"]
+        .as_str()
+        .ok_or_else(|| format!("accepted response omitted status_endpoint: {}", accepted.1.1))?;
+    assert_eq!(accepted_body["state"].as_str(), Some("accepted"));
+    assert_eq!(accepted_body["mode"].as_str(), Some("durable_job"));
+    assert_eq!(accepted_body["cancel_endpoint"].as_str(), Some(status_endpoint));
+    assert_eq!(conflict_body["state"].as_str(), Some("conflict"));
+    assert_eq!(conflict_body["mode"].as_str(), Some("durable_job"));
+    assert_eq!(conflict_body["active_job_id"].as_str(), Some(job_id));
+    assert_eq!(conflict_body["status_endpoint"].as_str(), Some(status_endpoint));
+    assert_eq!(conflict_body["cancel_endpoint"].as_str(), Some(status_endpoint));
+    assert!(
+        conflict_body["scope_key"]
+            .as_str()
+            .is_some_and(|scope_key| !scope_key.is_empty()),
+        "conflict response must expose a readable active scope key: {}",
+        conflict.1.1
+    );
+
+    let status = read_manual_transition_job_status_endpoint(&hot, conflict.0, status_endpoint).await?;
+    assert_eq!(status["job_id"].as_str(), Some(job_id));
+    assert_eq!(status["status_endpoint"].as_str(), Some(status_endpoint));
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, conflict.0, job_id, false).await?;
+    assert_eq!(terminal["job_id"].as_str(), Some(job_id));
+    assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(terminal["prefix"].as_str(), Some(prefix));
+    assert_eq!(terminal["dry_run"].as_bool(), Some(false));
+    let terminal_status = terminal["status"].as_str();
+    assert!(
+        matches!(terminal_status, Some("partial" | "unknown")),
+        "small transition queue should surface terminal backpressure: {terminal}"
+    );
+    if terminal_status == Some("unknown") {
+        let failure_reason = terminal["failure_reason"]
+            .as_str()
+            .ok_or_else(|| format!("unknown terminal status omitted failure_reason: {terminal}"))?;
+        assert!(
+            failure_reason.contains("worker result was not persisted before the transition queue drained"),
+            "unknown terminal status should identify lost worker-result persistence: {terminal}"
+        );
+    }
+    let skipped_queue_full = terminal["report"]["skipped_queue_full"]
+        .as_u64()
+        .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?;
+    assert!(
+        skipped_queue_full > 0,
+        "terminal status should include queue-full backpressure counters: {terminal}"
+    );
+    let queue_snapshot = terminal["queue_snapshot"]
+        .as_object()
+        .ok_or_else(|| format!("terminal status omitted queue_snapshot: {terminal}"))?;
+    for field in [
+        "queue_capacity",
+        "queued",
+        "active",
+        "workers",
+        "queue_full",
+        "queue_send_timeout",
+    ] {
+        assert!(
+            queue_snapshot.get(field).and_then(serde_json::Value::as_u64).is_some(),
+            "queue_snapshot.{field} must be readable in terminal status: {terminal}"
+        );
+    }
+    assert!(
+        cold_tier_object_count(&cold_client).await? < 64,
+        "queue pressure should leave at least one object untransitioned"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "manual #1508 evidence harness: starts a 4-node cluster, a remote tier, and an in-flight transition job"]
+async fn four_node_manual_transition_rollout_non_empty_restart_readback() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inline1508coldadmin".to_string();
+    cold.secret_key = "inline1508coldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env("RUSTFS_SCANNER_ENABLED", "false");
+    hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
+    hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "2");
+    hot.set_env("RUSTFS_TRANSITION_QUEUE_CAPACITY", "64");
+    hot.start().await?;
+    let hot_client = hot.create_s3_client(0)?;
+
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
+    let bucket = format!("manual-transition-1508-{}", Uuid::new_v4().simple());
+    let prefix = "transition/manual-rollout/";
+    hot_client.create_bucket().bucket(&bucket).send().await?;
+    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
+    for index in 0u8..24 {
+        let key = format!("{prefix}object-{index:02}.bin");
+        hot_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(payload(64 * KIB, index)))
+            .send()
+            .await?;
+    }
+
+    let (accepted_status, accepted_body) =
+        start_manual_transition_job_on_node(&hot, 1, &bucket, prefix, &tier_name, false, 24).await?;
+    assert_eq!(
+        accepted_status,
+        StatusCode::ACCEPTED,
+        "non-empty #1508 transition job should be accepted by a rollout node: {}",
+        compact_body(&accepted_body)
+    );
+    let accepted: serde_json::Value = serde_json::from_str(&accepted_body)?;
+    let job_id = accepted["job_id"]
+        .as_str()
+        .ok_or_else(|| format!("accepted #1508 response omitted job_id: {accepted_body}"))?;
+    let status_endpoint = accepted["status_endpoint"]
+        .as_str()
+        .ok_or_else(|| format!("accepted #1508 response omitted status_endpoint: {accepted_body}"))?;
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, 0, job_id, false).await?;
+    assert_eq!(terminal["job_id"].as_str(), Some(job_id));
+    assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(terminal["prefix"].as_str(), Some(prefix));
+    assert_eq!(terminal["dry_run"].as_bool(), Some(false));
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("completed"),
+        "non-empty #1508 rollout transition should complete before restart readback: {terminal}"
+    );
+    let transition_failed: u64 = terminal["report"]
+        .get("transition_failed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    assert_eq!(
+        transition_failed, 0,
+        "terminal #1508 report should not hide transition failures: {terminal}"
+    );
+    assert_eq!(
+        terminal["report"]["tier_failure"].as_u64(),
+        Some(0),
+        "terminal #1508 report should not hide tier failures: {terminal}"
+    );
+    let transition_completed = terminal["report"]["transition_completed"]
+        .as_u64()
+        .ok_or_else(|| format!("terminal #1508 report omitted transition_completed: {terminal}"))?;
+    assert!(
+        transition_completed > 0,
+        "terminal #1508 report should include real completed transitions: {terminal}"
+    );
+    assert!(
+        cold_tier_object_count(&cold_client).await? > 0,
+        "cold tier should contain transitioned #1508 objects"
+    );
+
+    hot.stop_node(2)?;
+    hot.start_node(2).await?;
+    let after_restart = read_manual_transition_job_status_endpoint(&hot, 2, status_endpoint).await?;
+    assert_eq!(after_restart["job_id"].as_str(), Some(job_id));
+    assert_eq!(
+        after_restart["status"], terminal["status"],
+        "terminal #1508 status changed after rollout node restart"
+    );
+    assert_eq!(
+        after_restart["report"]["transition_completed"], terminal["report"]["transition_completed"],
+        "terminal #1508 transition count changed after rollout node restart"
     );
 
     Ok(())
@@ -1862,6 +2310,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     hot.start().await?;
     let hot_client = hot.create_s3_client(0)?;
 
+    let decode_before = collector.msgpack_json_decode_totals().await;
     let fallback_before = collector.msgpack_json_fallback_totals().await;
     let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
@@ -1890,6 +2339,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
         PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), REMOTE, REMOTE_TRANSITION),
     )
     .await?;
+    assert_msgpack_decode_observed(&collector, &decode_before).await?;
 
     let encrypted_key = "transition/encrypted-sse.bin";
     let encrypted_body = payload(16 * KIB, 0xAB);

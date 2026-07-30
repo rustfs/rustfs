@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::site_replication_reconcile::spawn_site_replication_reconcile_task;
 use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot};
 use crate::{
     config::Config,
@@ -79,6 +80,11 @@ pub(crate) async fn init_startup_runtime_services(
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
     let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
+    // Unconditional: deferred IAM recovers in the background and has no callback into this
+    // scheduler, so gating on the inline disposition would leave a recovered node with
+    // self-pointing replication rules until the next restart. The task waits for IAM and
+    // bucket metadata itself, and its first pass runs off this path.
+    spawn_site_replication_reconcile_task(ctx.clone());
     init_auth_integrations().await?;
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
