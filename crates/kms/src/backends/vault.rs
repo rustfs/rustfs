@@ -14,7 +14,10 @@
 
 //! Vault-based KMS backend implementation using vaultrs
 
-use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
+use crate::backends::vault_credentials::{
+    CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
+    token_source_for,
+};
 use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -32,7 +35,7 @@ use vaultrs::{api::kv2::requests::SetSecretRequestOptions, error::ClientError, k
 
 /// Vault KMS client implementation
 pub struct VaultKmsClient {
-    credentials: VaultCredentialProvider,
+    credentials: Arc<VaultCredentialProvider>,
     config: VaultConfig,
     /// Mount path for the KV engine (typically "kv" or "secret")
     kv_mount: String,
@@ -161,15 +164,18 @@ fn decode_stored_key_material(key_id: &str, encrypted_material: &str) -> Result<
 impl VaultKmsClient {
     /// Create a new Vault KMS client
     ///
-    /// `attempt_timeout` caps every HTTP request issued through this client.
-    pub async fn new(config: VaultConfig, attempt_timeout: Duration) -> Result<Self> {
-        let source = token_source_for(&config.auth_method)?;
+    /// `kms_config` supplies the per-attempt timeout that caps every HTTP
+    /// request issued through this client, plus the retry and fail-closed
+    /// budgets for credential refresh.
+    pub async fn new(config: VaultConfig, kms_config: &KmsConfig) -> Result<Self> {
         let settings = VaultConnectionSettings {
             address: config.address.clone(),
             namespace: config.namespace.clone(),
-            attempt_timeout,
+            attempt_timeout: kms_config.effective_timeout(),
         };
-        let credentials = VaultCredentialProvider::new(settings, source).await?;
+        let source = token_source_for(&config.auth_method, &settings)?;
+        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &config.auth_method);
+        let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
 
         info!(address = %config.address, "Vault KMS backend connected");
 
@@ -185,8 +191,9 @@ impl VaultKmsClient {
     /// Snapshot the authenticated Vault client for a single request.
     ///
     /// Every Vault call takes its own snapshot so a credential rotation
-    /// applies to subsequent calls without interrupting in-flight ones.
-    fn vault(&self) -> Arc<VaultClientHandle> {
+    /// applies to subsequent calls without interrupting in-flight ones. Fails
+    /// closed when the credentials could not be refreshed in time.
+    fn vault(&self) -> Result<Arc<VaultClientHandle>> {
         self.credentials.current()
     }
 
@@ -231,7 +238,7 @@ impl VaultKmsClient {
         let path = self.key_version_path(key_id, version);
 
         let record: VaultKeyVersionRecord =
-            kv2::read(&self.vault().client, &self.kv_mount, &path)
+            kv2::read(&self.vault()?.client, &self.kv_mount, &path)
                 .await
                 .map_err(|e| match e {
                     ClientError::ResponseWrapError => KmsError::key_version_not_found(key_id, version),
@@ -271,7 +278,7 @@ impl VaultKmsClient {
     async fn get_key_data_versioned(&self, key_id: &str) -> Result<(u32, VaultKeyData)> {
         let path = self.key_path(key_id);
 
-        let metadata = kv2::read_metadata(&self.vault().client, &self.kv_mount, &path)
+        let metadata = kv2::read_metadata(&self.vault()?.client, &self.kv_mount, &path)
             .await
             .map_err(|e| match e {
                 ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
@@ -283,7 +290,7 @@ impl VaultKmsClient {
 
         // Read the exact secret version from the metadata to keep the (cas, data)
         // pair consistent even if another writer lands in between.
-        let key_data: VaultKeyData = kv2::read_version(&self.vault().client, &self.kv_mount, &path, metadata.current_version)
+        let key_data: VaultKeyData = kv2::read_version(&self.vault()?.client, &self.kv_mount, &path, metadata.current_version)
             .await
             .map_err(|e| match e {
                 ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
@@ -303,7 +310,7 @@ impl VaultKmsClient {
         let path = self.key_path(key_id);
 
         let written =
-            kv2::set_with_options(&self.vault().client, &self.kv_mount, &path, key_data, SetSecretRequestOptions { cas })
+            kv2::set_with_options(&self.vault()?.client, &self.kv_mount, &path, key_data, SetSecretRequestOptions { cas })
                 .await
                 .map_err(|e| {
                     if is_cas_conflict(&e) {
@@ -327,7 +334,8 @@ impl VaultKmsClient {
     async fn try_create_key_version_record(&self, key_id: &str, record: &VaultKeyVersionRecord) -> Result<bool> {
         let path = self.key_version_path(key_id, record.version);
 
-        match kv2::set_with_options(&self.vault().client, &self.kv_mount, &path, record, SetSecretRequestOptions { cas: 0 }).await
+        match kv2::set_with_options(&self.vault()?.client, &self.kv_mount, &path, record, SetSecretRequestOptions { cas: 0 })
+            .await
         {
             Ok(_) => Ok(true),
             Err(e) if is_cas_conflict(&e) => Ok(false),
@@ -339,7 +347,7 @@ impl VaultKmsClient {
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let path = self.key_path(key_id);
 
-        kv2::set(&self.vault().client, &self.kv_mount, &path, key_data)
+        kv2::set(&self.vault()?.client, &self.kv_mount, &path, key_data)
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to store key in Vault: {e}")))?;
 
@@ -389,7 +397,7 @@ impl VaultKmsClient {
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
         let path = self.key_path(key_id);
 
-        let secret: VaultKeyData = kv2::read(&self.vault().client, &self.kv_mount, &path)
+        let secret: VaultKeyData = kv2::read(&self.vault()?.client, &self.kv_mount, &path)
             .await
             .map_err(|e| match e {
                 vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
@@ -404,7 +412,7 @@ impl VaultKmsClient {
     /// List all keys stored in Vault
     async fn list_vault_keys(&self) -> Result<Vec<String>> {
         // List keys under the prefix
-        match kv2::list(&self.vault().client, &self.kv_mount, &self.key_path_prefix).await {
+        match kv2::list(&self.vault()?.client, &self.kv_mount, &self.key_path_prefix).await {
             Ok(keys) => {
                 let keys = filter_key_directory_entries(keys);
                 debug!("Found {} keys in Vault", keys.len());
@@ -431,11 +439,11 @@ impl VaultKmsClient {
         // record still exists and the deletion can be retried. The reverse order
         // would leave orphaned master key material in Vault after the key vanished.
         let versions_dir = self.key_versions_dir(key_id);
-        match kv2::list(&self.vault().client, &self.kv_mount, &versions_dir).await {
+        match kv2::list(&self.vault()?.client, &self.kv_mount, &versions_dir).await {
             Ok(versions) => {
                 for version in versions {
                     let version_path = format!("{versions_dir}/{version}");
-                    kv2::delete_metadata(&self.vault().client, &self.kv_mount, &version_path)
+                    kv2::delete_metadata(&self.vault()?.client, &self.kv_mount, &version_path)
                         .await
                         .map_err(|e| KmsError::backend_error(format!("Failed to delete key version record from Vault: {e}")))?;
                 }
@@ -447,7 +455,7 @@ impl VaultKmsClient {
 
         // For this specific key path, we can safely delete the metadata
         // since each key has its own unique path under the prefix
-        kv2::delete_metadata(&self.vault().client, &self.kv_mount, &path)
+        kv2::delete_metadata(&self.vault()?.client, &self.kv_mount, &path)
             .await
             .map_err(|e| match e {
                 vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
@@ -865,8 +873,15 @@ impl VaultKmsBackend {
             }
         };
 
-        let client = VaultKmsClient::new(vault_config, config.effective_timeout()).await?;
+        let client = VaultKmsClient::new(vault_config, &config).await?;
         Ok(Self { client })
+    }
+
+    /// Spawn the background credential renewal task for this backend, if its
+    /// auth method issues lease-bound tokens. The caller owns the returned
+    /// handle; dropping it cancels the task.
+    pub(crate) fn spawn_credential_renewal(&self) -> Option<CredentialTaskHandle> {
+        self.client.credentials.spawn_renewal_task()
     }
 
     /// Update key metadata in Vault storage
@@ -1167,7 +1182,7 @@ mod tests {
             tls: None,
         };
 
-        let client = VaultKmsClient::new(config, Duration::from_secs(30))
+        let client = VaultKmsClient::new(config, &KmsConfig::default())
             .await
             .expect("Failed to create Vault client");
 
@@ -1220,7 +1235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_version_paths_stay_under_the_key() {
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
@@ -1305,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_kv2_backend_info_reports_at_rest_protection() {
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
@@ -1337,7 +1352,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires a running Vault instance (dev mode)
     async fn test_vault_kv2_decrypt_after_rotate() {
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
@@ -1374,7 +1389,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires a running Vault instance (dev mode)
     async fn test_vault_kv2_rotate_does_not_orphan_legacy_envelopes() {
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
@@ -1413,7 +1428,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires a running Vault instance (dev mode)
     async fn test_vault_kv2_envelope_version_tampering_fails_closed() {
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
@@ -1456,7 +1471,7 @@ mod tests {
         use std::sync::Arc;
 
         let client = Arc::new(
-            VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
                 .await
                 .expect("client"),
         );
@@ -1515,7 +1530,7 @@ mod tests {
         // Regression: get_key_material previously "self-healed" a decrypt/length failure by
         // minting a fresh random master key and overwriting the stored value — destroying the
         // original key and making every DEK wrapped by it permanently undecryptable.
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
@@ -1553,7 +1568,7 @@ mod tests {
         // bootstrap case and silently generated + persisted a fresh master key on the
         // read path. Empty material must instead fail closed as MaterialMissing and
         // leave the stored record untouched.
-        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+        let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
             .await
             .expect("client");
 
