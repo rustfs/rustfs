@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// Scope-based hotpath measurement for `#[async_trait]` methods, where
-/// `#[cfg_attr(feature = "hotpath", hotpath::measure)]` would only time the boxed-future construction.
+/// `#[hotpath::measure]` would only time the boxed-future construction.
 /// The guard records wall time from this statement until the enclosing
 /// (desugared) async block completes, including early returns via `?`.
 #[cfg(feature = "hotpath")]

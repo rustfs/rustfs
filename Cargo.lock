@@ -4916,19 +4916,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66750a77f4f6b408a148be5102ef1f3ba7172def7ee92b1cfc75d9f7a3870453"
 dependencies = [
  "arc-swap",
+ "async-channel",
+ "async-trait",
  "cfg-if",
  "crossbeam-channel",
+ "futures-channel",
  "futures-util",
  "hdrhistogram",
  "hotpath-macros",
+ "hotpath-meta",
+ "http 1.5.0",
  "libc",
+ "parking_lot",
  "pin-project-lite",
  "prettytable-rs",
  "quanta",
  "regex",
+ "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "tiny_http",
+ "tokio",
 ]
 
 [[package]]
@@ -4940,6 +4949,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "hotpath-macros-meta"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21f2f70b29b6f42311acd2fb0b2f91a34d9a573c76fb8a7f51970670a1673a49"
+
+[[package]]
+name = "hotpath-meta"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b771f77b2f409086bb40ff029f850ce99d17118d4e207df0f28cb32bd7568c7"
+dependencies = [
+ "hotpath-macros-meta",
 ]
 
 [[package]]
@@ -8512,6 +8536,21 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http 1.5.0",
+ "reqwest",
+ "serde",
+ "thiserror 2.0.19",
+ "tower-service",
 ]
 
 [[package]]

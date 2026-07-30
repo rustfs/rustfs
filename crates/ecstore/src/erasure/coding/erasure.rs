@@ -640,7 +640,7 @@ impl Erasure {
     /// # Returns
     /// A vector of encoded shards as `Bytes`.
     #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[hotpath::measure]
     pub fn encode_data(&self, data: &[u8]) -> io::Result<Vec<Bytes>> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy
@@ -688,7 +688,7 @@ impl Erasure {
 
     /// Encode owned data, avoiding a copy when the caller already has a heap buffer.
     /// Falls back to copying into a new buffer if zero-copy conversion fails.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[hotpath::measure]
     pub fn encode_data_owned(&self, data: Vec<u8>) -> io::Result<Vec<Bytes>> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy
@@ -752,7 +752,7 @@ impl Erasure {
     /// block), the `resize(need_total_size)` below stays within capacity for every
     /// `data_len <= block_size` — both shard-size formulas are monotone in
     /// `data_len` — so this function never reallocates the buffer.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[hotpath::measure]
     pub fn encode_data_bytes_mut(&self, mut data_buffer: BytesMut, data_len: usize) -> io::Result<Vec<Bytes>> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy
@@ -805,7 +805,7 @@ impl Erasure {
     ///
     /// # Returns
     /// Ok if reconstruction succeeds, error otherwise.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[hotpath::measure]
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         if self.parity_shards > 0 {
             if self.uses_legacy {
@@ -825,7 +825,7 @@ impl Erasure {
     }
 
     /// Decode and reconstruct missing data shards, then regenerate parity shards.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[hotpath::measure]
     pub fn decode_data_and_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         if self.parity_shards > 0 {
             if self.uses_legacy {
