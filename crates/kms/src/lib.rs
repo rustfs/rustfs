@@ -69,6 +69,7 @@ pub mod backends;
 pub mod backup;
 mod cache;
 pub mod config;
+pub mod deletion_worker;
 mod encryption;
 mod error;
 pub mod manager;
@@ -89,6 +90,7 @@ pub use api_types::{
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
+pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;

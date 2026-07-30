@@ -18,7 +18,9 @@ use crate::backends::vault_credentials::{
     CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
     token_source_for,
 };
-use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits};
+use crate::backends::{
+    BackendCapabilities, BackendInfo, ExpiredKeyRemoval, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits,
+};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -486,6 +488,7 @@ impl KmsClient for VaultTransitKmsClient {
             created_at: metadata.created_at,
             rotated_at: None,
             created_by: metadata.created_by,
+            deletion_date: None,
         })
     }
 
@@ -592,6 +595,7 @@ impl KmsClient for VaultTransitKmsClient {
             created_at: metadata.created_at,
             rotated_at: Some(Zoned::now()),
             created_by: metadata.created_by,
+            deletion_date: None,
         })
     }
 
@@ -810,6 +814,60 @@ impl KmsBackend for VaultTransitKmsBackend {
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(true)
+    }
+
+    async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
+        // The transit key's existence anchors "already removed": once it is
+        // gone only stale scheduling metadata can remain, so clean that up.
+        match self.client.read_transit_key(key_id).await {
+            Ok(_) => {}
+            Err(KmsError::KeyNotFound { .. }) => {
+                self.client.delete_key_metadata(key_id).await?;
+                return Ok(ExpiredKeyRemoval::Removed);
+            }
+            Err(error) => return Err(error),
+        }
+
+        // A metadata read failure synthesizes an Enabled record (see
+        // TransitKeyMetadata::synthesized), which lands in StateChanged below:
+        // the worker never destroys material based on synthesized state.
+        let mut metadata = self.client.get_key_metadata(key_id).await?;
+        match metadata.key_state {
+            // Tombstone left by a crashed removal: complete it.
+            KeyState::Unavailable => {}
+            KeyState::PendingDeletion => {
+                match &metadata.deletion_date {
+                    Some(deadline) if deadline <= now => {}
+                    // Not yet due, or no persisted deadline — never auto-remove.
+                    _ => return Ok(ExpiredKeyRemoval::NotExpired),
+                }
+                // Tombstone first: an Unavailable record is rejected by every
+                // state gate, and a crashed removal can simply be re-run.
+                metadata.key_state = KeyState::Unavailable;
+                self.client.store_key_metadata(key_id, &metadata).await?;
+            }
+            KeyState::Enabled | KeyState::Disabled | KeyState::PendingImport => {
+                return Ok(ExpiredKeyRemoval::StateChanged);
+            }
+        }
+
+        if !self.client.read_transit_key(key_id).await?.deletion_allowed {
+            let mut update_builder = UpdateKeyConfigurationRequestBuilder::default();
+            update_builder.deletion_allowed(true);
+            key::update(
+                &self.client.vault()?.client,
+                &self.client.config.mount_path,
+                key_id,
+                Some(&mut update_builder),
+            )
+            .await
+            .map_err(|e| KmsError::backend_error(format!("Failed to allow deletion of Vault Transit key {key_id}: {e}")))?;
+        }
+        key::delete(&self.client.vault()?.client, &self.client.config.mount_path, key_id)
+            .await
+            .map_err(|e| KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}")))?;
+        self.client.delete_key_metadata(key_id).await?;
+        Ok(ExpiredKeyRemoval::Removed)
     }
 }
 

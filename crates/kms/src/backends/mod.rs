@@ -17,6 +17,7 @@
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
+use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -265,6 +266,35 @@ pub trait KmsBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::minimal()
     }
+
+    /// Remove a key whose scheduled deletion deadline has passed.
+    ///
+    /// Used by the background deletion worker. Implementations must re-check
+    /// state and deadline under their own write synchronization so that a
+    /// concurrent cancellation observed after the caller's inspection wins
+    /// ([`ExpiredKeyRemoval::StateChanged`]), must write a tombstone (a
+    /// `Deleted`/`Unavailable` record) before destroying material so a crashed
+    /// removal can simply be re-run, and must treat an already-removed key as
+    /// success so the operation stays idempotent across restarts and nodes.
+    ///
+    /// The default rejects the operation for backends without deletion
+    /// support.
+    async fn remove_expired_key(&self, _key_id: &str, _now: &Zoned) -> Result<ExpiredKeyRemoval> {
+        Err(KmsError::unsupported_capability("backend without deletion support", "remove_expired_key"))
+    }
+}
+
+/// Outcome of [`KmsBackend::remove_expired_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredKeyRemoval {
+    /// The key's record and material were removed, or were already gone.
+    Removed,
+    /// The key is no longer pending deletion (for example the deletion was
+    /// cancelled after the caller inspected it); nothing was removed.
+    StateChanged,
+    /// The key is pending deletion but its deadline has not passed, or it has
+    /// no persisted deadline (legacy record) and is never auto-removed.
+    NotExpired,
 }
 
 /// Information about a KMS backend
@@ -489,6 +519,18 @@ mod tests {
         assert!(!capabilities.schedule_deletion);
         assert!(!capabilities.versioning);
         assert!(!capabilities.physical_delete);
+    }
+
+    #[tokio::test]
+    async fn default_remove_expired_key_is_unsupported() {
+        let error = MinimalBackend
+            .remove_expired_key("any-key", &jiff::Zoned::now())
+            .await
+            .expect_err("backends without deletion support must reject expired-key removal");
+        assert!(
+            matches!(error, KmsError::UnsupportedCapability { .. }),
+            "expected UnsupportedCapability, got {error:?}"
+        );
     }
 
     #[tokio::test]

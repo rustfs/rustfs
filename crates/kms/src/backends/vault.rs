@@ -19,7 +19,7 @@ use crate::backends::vault_credentials::{
     token_source_for,
 };
 use crate::backends::{
-    BackendCapabilities, BackendInfo, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits,
+    BackendCapabilities, BackendInfo, ExpiredKeyRemoval, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits,
     ensure_key_status_permits,
 };
 use crate::config::{KmsConfig, VaultConfig};
@@ -67,6 +67,10 @@ struct VaultKeyData {
     metadata: HashMap<String, String>,
     /// Key tags
     tags: HashMap<String, String>,
+    /// Scheduled deletion deadline; absent on records written before deadline
+    /// persistence landed, so it must stay optional for backward compatibility.
+    #[serde(default)]
+    deletion_date: Option<Zoned>,
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
     /// Version that pre-versioning envelopes (no `master_key_version`) resolve to.
@@ -384,6 +388,7 @@ impl VaultKmsClient {
             description: request.description.clone(),
             metadata: existing_key_data.metadata.clone(),
             tags: request.tags.clone(),
+            deletion_date: existing_key_data.deletion_date.clone(),
             encrypted_key_material: existing_key_data.encrypted_key_material.clone(), // Preserve the key material
             baseline_version: existing_key_data.baseline_version,
         };
@@ -600,6 +605,7 @@ impl KmsClient for VaultKmsClient {
             description: None,
             metadata: HashMap::new(),
             tags: HashMap::new(),
+            deletion_date: None,
             encrypted_key_material: encrypted_material,
             baseline_version: None,
         };
@@ -618,6 +624,7 @@ impl KmsClient for VaultKmsClient {
             created_at: key_data.created_at,
             rotated_at: None,
             created_by: None,
+            deletion_date: None,
         };
 
         debug!(key_id, "Vault KMS master key created");
@@ -708,7 +715,7 @@ impl KmsClient for VaultKmsClient {
     async fn schedule_key_deletion(
         &self,
         key_id: &str,
-        _pending_window_days: u32,
+        pending_window_days: u32,
         _context: Option<&OperationContext>,
     ) -> Result<()> {
         debug!("Scheduling key deletion: {}", key_id);
@@ -716,6 +723,7 @@ impl KmsClient for VaultKmsClient {
         let mut key_data = self.get_key_data(key_id).await?;
         ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::ScheduleDeletion)?;
         key_data.status = KeyStatus::PendingDeletion;
+        key_data.deletion_date = Some(Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400));
         self.store_key_data(key_id, &key_data).await?;
 
         debug!(key_id, "Vault KMS key deletion scheduled");
@@ -730,6 +738,7 @@ impl KmsClient for VaultKmsClient {
             return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
         key_data.status = KeyStatus::Active;
+        key_data.deletion_date = None;
         self.store_key_data(key_id, &key_data).await?;
 
         debug!(key_id, "Vault KMS key deletion canceled");
@@ -831,6 +840,7 @@ impl KmsClient for VaultKmsClient {
             created_at: key_data.created_at.clone(),
             rotated_at: Some(Zoned::now()),
             created_by: None,
+            deletion_date: key_data.deletion_date.clone(),
         })
     }
 
@@ -924,6 +934,7 @@ impl VaultKmsBackend {
             KeyState::Unavailable => KeyStatus::Deleted,
             KeyState::PendingImport => KeyStatus::Disabled, // Treat as disabled until import completes
         };
+        key_data.deletion_date = metadata.deletion_date.clone();
 
         // Update the key data in Vault storage
         self.client.store_key_data(key_id, &key_data).await?;
@@ -1023,7 +1034,7 @@ impl KmsBackend for VaultKmsBackend {
             key_usage: key_info.usage,
             description: key_info.description,
             creation_date: key_info.created_at,
-            deletion_date: None,
+            deletion_date: key_data.deletion_date.clone(),
             origin: "VAULT".to_string(),
             key_manager: "VAULT".to_string(),
             tags: key_data.tags,
@@ -1052,8 +1063,17 @@ impl KmsBackend for VaultKmsBackend {
         };
 
         let deletion_date = if request.force_immediate.unwrap_or(false) {
-            // Check if key is already in PendingDeletion state
-            if key_metadata.key_state == KeyState::PendingDeletion {
+            // Check if key is already in PendingDeletion state (or a tombstone
+            // left by a crashed removal, which may simply be completed)
+            if key_metadata.key_state == KeyState::PendingDeletion || key_metadata.key_state == KeyState::Unavailable {
+                // Tombstone first: mark the record Deleted before removing it,
+                // so a crash between the two steps leaves a key that is already
+                // unusable and whose removal can simply be re-run.
+                if key_metadata.key_state == KeyState::PendingDeletion {
+                    let mut key_data = self.client.get_key_data(key_id).await?;
+                    key_data.status = KeyStatus::Deleted;
+                    self.client.store_key_data(key_id, &key_data).await?;
+                }
                 // Force immediate deletion: physically delete the key from Vault storage
                 self.client.delete_key(key_id).await?;
 
@@ -1140,6 +1160,43 @@ impl KmsBackend for VaultKmsBackend {
             .with_enable_disable(true)
             .with_schedule_deletion(true)
             .with_physical_delete(true)
+    }
+
+    async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
+        // Vault KV2 offers no compare-and-swap here, so a cancellation racing
+        // the read below can still lose; the window is a single read-write
+        // gap and the sweep re-reads on every pass.
+        let mut key_data = match self.client.get_key_data(key_id).await {
+            Ok(key_data) => key_data,
+            Err(KmsError::KeyNotFound { .. }) => return Ok(ExpiredKeyRemoval::Removed),
+            Err(error) => return Err(error),
+        };
+        match key_data.status {
+            // Tombstone left by a crashed removal: complete it.
+            KeyStatus::Deleted => {}
+            KeyStatus::PendingDeletion => {
+                match &key_data.deletion_date {
+                    Some(deadline) if deadline <= now => {}
+                    // Not yet due, or a legacy record without a persisted
+                    // deadline — never auto-remove those.
+                    _ => return Ok(ExpiredKeyRemoval::NotExpired),
+                }
+                // Tombstone first: mark the record Deleted before removing it,
+                // so a crash between the two steps leaves a key that is
+                // already unusable and whose removal can simply be re-run.
+                key_data.status = KeyStatus::Deleted;
+                self.client.store_key_data(key_id, &key_data).await?;
+            }
+            KeyStatus::Active | KeyStatus::Disabled => return Ok(ExpiredKeyRemoval::StateChanged),
+        }
+
+        match self.client.delete_key(key_id).await {
+            Ok(()) | Err(KmsError::KeyNotFound { .. }) => {
+                debug!(key_id, "Vault KV2 expired key removed");
+                Ok(ExpiredKeyRemoval::Removed)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1305,6 +1362,7 @@ mod tests {
             tags: HashMap::new(),
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: Some(1),
+            deletion_date: None,
         };
 
         let mut value = serde_json::to_value(&key_data).expect("serialize key data");
@@ -1662,5 +1720,42 @@ mod tests {
             KeyStatus::Active,
             "cancel_key_deletion must persist Active status to Vault, not only mutate the response"
         );
+    }
+
+    /// The persisted KV2 record round-trips its deletion deadline, and records
+    /// written before the field existed keep deserializing (as None). A revert
+    /// of deadline persistence turns this test red.
+    #[test]
+    fn vault_key_data_deletion_date_round_trips_and_stays_backward_compatible() {
+        let deadline = Zoned::now() + Duration::from_secs(7 * 86400);
+        let key_data = VaultKeyData {
+            algorithm: "AES_256".to_string(),
+            usage: KeyUsage::EncryptDecrypt,
+            created_at: Zoned::now(),
+            status: KeyStatus::PendingDeletion,
+            version: 1,
+            description: None,
+            metadata: HashMap::new(),
+            tags: HashMap::new(),
+            deletion_date: Some(deadline.clone()),
+            encrypted_key_material: "material".to_string(),
+            baseline_version: None,
+        };
+
+        let mut value = serde_json::to_value(&key_data).expect("serialize");
+        let restored: VaultKeyData = serde_json::from_value(value.clone()).expect("round trip");
+        assert_eq!(
+            restored.deletion_date.as_ref().map(Zoned::timestamp),
+            Some(deadline.timestamp()),
+            "deletion deadline must survive the KV2 round trip"
+        );
+
+        value
+            .as_object_mut()
+            .expect("record must be a JSON object")
+            .remove("deletion_date")
+            .expect("current records must carry the field");
+        let legacy: VaultKeyData = serde_json::from_value(value).expect("legacy record must deserialize");
+        assert!(legacy.deletion_date.is_none());
     }
 }
