@@ -14,17 +14,88 @@
 
 //! KMS backend implementations
 
-use crate::error::Result;
+use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
+use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[cfg(test)]
+mod contract_tests;
 pub mod local;
 pub mod static_kms;
 pub mod vault;
 pub(crate) mod vault_credentials;
 pub mod vault_transit;
+
+/// Operations whose availability depends on the key's lifecycle state.
+///
+/// Decryption is deliberately absent: RustFS allows decryption with
+/// `Disabled` and `PendingDeletion` keys — an explicit deviation from AWS
+/// KMS — because rejecting it would break reads of every object encrypted
+/// under a key the moment it is disabled. Deletion cancellation is also
+/// absent: it is valid exactly when the key is `PendingDeletion`, which call
+/// sites enforce directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateGatedOperation {
+    Encrypt,
+    GenerateDataKey,
+    Rotate,
+    Enable,
+    Disable,
+    ScheduleDeletion,
+}
+
+impl StateGatedOperation {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Encrypt => "encryption",
+            Self::GenerateDataKey => "data key generation",
+            Self::Rotate => "rotation",
+            Self::Enable => "enabling",
+            Self::Disable => "disabling",
+            Self::ScheduleDeletion => "deletion scheduling",
+        }
+    }
+}
+
+/// Enforce the shared key state × operation matrix.
+///
+/// - `Enabled`: every operation is allowed.
+/// - `Disabled`: enabling, disabling (idempotent) and deletion scheduling are
+///   allowed; encryption, data key generation and rotation are rejected.
+/// - `PendingDeletion`: every state-gated operation is rejected, including a
+///   repeated deletion schedule; only cancellation and decryption proceed.
+/// - `PendingImport`/`Unavailable`: the key is not usable and is reported as
+///   not found.
+pub(crate) fn ensure_key_state_permits(key_id: &str, state: &KeyState, operation: StateGatedOperation) -> Result<()> {
+    match state {
+        KeyState::Enabled => Ok(()),
+        KeyState::Disabled => match operation {
+            StateGatedOperation::Enable | StateGatedOperation::Disable | StateGatedOperation::ScheduleDeletion => Ok(()),
+            StateGatedOperation::Encrypt | StateGatedOperation::GenerateDataKey | StateGatedOperation::Rotate => Err(
+                KmsError::invalid_key_state(format!("Key {key_id} is disabled: {} is not allowed", operation.describe())),
+            ),
+        },
+        KeyState::PendingDeletion => Err(KmsError::invalid_key_state(format!(
+            "Key {key_id} is pending deletion: {} is not allowed",
+            operation.describe()
+        ))),
+        KeyState::PendingImport | KeyState::Unavailable => Err(KmsError::key_not_found(key_id)),
+    }
+}
+
+/// [`ensure_key_state_permits`] for backends that persist [`KeyStatus`].
+pub(crate) fn ensure_key_status_permits(key_id: &str, status: &KeyStatus, operation: StateGatedOperation) -> Result<()> {
+    let state = match status {
+        KeyStatus::Active => KeyState::Enabled,
+        KeyStatus::Disabled => KeyState::Disabled,
+        KeyStatus::PendingDeletion => KeyState::PendingDeletion,
+        KeyStatus::Deleted => KeyState::Unavailable,
+    };
+    ensure_key_state_permits(key_id, &state, operation)
+}
 
 /// Abstract KMS client interface that all backends must implement
 #[async_trait]
@@ -195,6 +266,35 @@ pub trait KmsBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::minimal()
     }
+
+    /// Remove a key whose scheduled deletion deadline has passed.
+    ///
+    /// Used by the background deletion worker. Implementations must re-check
+    /// state and deadline under their own write synchronization so that a
+    /// concurrent cancellation observed after the caller's inspection wins
+    /// ([`ExpiredKeyRemoval::StateChanged`]), must write a tombstone (a
+    /// `Deleted`/`Unavailable` record) before destroying material so a crashed
+    /// removal can simply be re-run, and must treat an already-removed key as
+    /// success so the operation stays idempotent across restarts and nodes.
+    ///
+    /// The default rejects the operation for backends without deletion
+    /// support.
+    async fn remove_expired_key(&self, _key_id: &str, _now: &Zoned) -> Result<ExpiredKeyRemoval> {
+        Err(KmsError::unsupported_capability("backend without deletion support", "remove_expired_key"))
+    }
+}
+
+/// Outcome of [`KmsBackend::remove_expired_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredKeyRemoval {
+    /// The key's record and material were removed, or were already gone.
+    Removed,
+    /// The key is no longer pending deletion (for example the deletion was
+    /// cancelled after the caller inspected it); nothing was removed.
+    StateChanged,
+    /// The key is pending deletion but its deadline has not passed, or it has
+    /// no persisted deadline (legacy record) and is never auto-removed.
+    NotExpired,
 }
 
 /// Information about a KMS backend
@@ -419,6 +519,18 @@ mod tests {
         assert!(!capabilities.schedule_deletion);
         assert!(!capabilities.versioning);
         assert!(!capabilities.physical_delete);
+    }
+
+    #[tokio::test]
+    async fn default_remove_expired_key_is_unsupported() {
+        let error = MinimalBackend
+            .remove_expired_key("any-key", &jiff::Zoned::now())
+            .await
+            .expect_err("backends without deletion support must reject expired-key removal");
+        assert!(
+            matches!(error, KmsError::UnsupportedCapability { .. }),
+            "expected UnsupportedCapability, got {error:?}"
+        );
     }
 
     #[tokio::test]
