@@ -993,7 +993,9 @@ mod tests {
         // bootstrap case and silently generated + persisted a fresh master key on the
         // read path. Empty material must instead fail closed as MaterialMissing and
         // leave the stored record untouched.
-        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
 
         let key_id = format!("empty-{}", uuid::Uuid::new_v4());
         client.create_key(&key_id, "AES_256", None).await.expect("create");

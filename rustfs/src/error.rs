@@ -539,6 +539,29 @@ mod tests {
     }
 
     #[test]
+    fn test_kms_material_faults_map_to_internal_error_not_retryable_or_not_found() {
+        // Missing/corrupt key material is a persistent integrity fault of an existing key.
+        // It must not be disguised as a retryable backend outage (503 invites pointless
+        // retries) nor as NoSuchKey/404 (which suggests the key can be recreated —
+        // recreating it would orphan every DEK wrapped by the original material).
+        let material_faults = [
+            rustfs_kms::KmsError::material_missing("key-a"),
+            rustfs_kms::KmsError::material_corrupt("key-a", "truncated record"),
+            rustfs_kms::KmsError::material_authentication_failed("key-a"),
+            rustfs_kms::KmsError::unsupported_format_version("key-a", "v99"),
+        ];
+
+        for fault in material_faults {
+            let description = fault.to_string();
+            let api_error = ApiError::from(StorageError::other(fault));
+
+            assert_eq!(api_error.code, S3ErrorCode::InternalError, "wrong code for: {description}");
+            assert_ne!(api_error.code, S3ErrorCode::ServiceUnavailable, "must not be retryable: {description}");
+            assert_ne!(api_error.code, S3ErrorCode::NoSuchKey, "must not report key-not-found: {description}");
+        }
+    }
+
+    #[test]
     fn test_api_error_from_storage_error_mappings() {
         let test_cases = vec![
             (StorageError::NotImplemented, S3ErrorCode::NotImplemented),
