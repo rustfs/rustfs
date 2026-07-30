@@ -18,7 +18,7 @@ use crate::error::is_err_no_such_temp_account;
 use crate::error::{Error, Result};
 use crate::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use crate::manager::extract_jwt_claims;
-use crate::manager::get_default_policyes;
+use crate::manager::get_default_policies;
 use crate::manager::{IamCache, IamSyncMetricsSnapshot};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
@@ -249,7 +249,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn delete_policy(&self, name: &str, notify: bool) -> Result<()> {
-        for k in get_default_policyes().keys() {
+        for k in get_default_policies().keys() {
             if k == name {
                 return Err(Error::other("system policy can not be deleted"));
             }
@@ -291,8 +291,17 @@ impl<T: Store> IamSys<T> {
         self.store.api.load_mapped_policies(user_type, is_group, m).await
     }
 
+    pub async fn list_policies(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+        self.store.list_policies(bucket_name).await
+    }
+
+    /// Backward-compatible misspelling retained until the next breaking release.
+    #[deprecated(
+        since = "1.0.0",
+        note = "use list_policies instead; this alias will be removed in the next breaking release"
+    )]
     pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
-        self.store.list_polices(bucket_name).await
+        self.list_policies(bucket_name).await
     }
 
     pub async fn list_policy_docs(&self, bucket_name: &str) -> Result<HashMap<String, PolicyDoc>> {
@@ -1683,11 +1692,17 @@ mod tests {
     use super::*;
     use crate::cache::{Cache, CacheEntity};
     use crate::error::Error;
-    use crate::manager::get_default_policyes;
+    use crate::manager::get_default_policies;
     use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_list_polices_api_is_available() {
+        let _ = IamSys::<StsTestMockStore>::list_polices;
+    }
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
@@ -1925,7 +1940,7 @@ mod tests {
         }
 
         async fn load_all(&self, cache: &Cache) -> Result<()> {
-            let mut policy_docs = get_default_policyes();
+            let mut policy_docs = get_default_policies();
             let custom_claim_policy =
                 Policy::parse_config(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes()).expect("custom STS claim policy should parse");
             policy_docs.insert(CUSTOM_STS_CLAIM_POLICY.to_string(), PolicyDoc::new(custom_claim_policy));
