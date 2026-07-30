@@ -159,6 +159,11 @@ impl KmsManager {
     pub async fn health_check(&self) -> Result<bool> {
         self.backend.health_check().await
     }
+
+    /// Report the capabilities of the configured backend
+    pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
+        self.backend.capabilities()
+    }
 }
 
 #[cfg(test)]

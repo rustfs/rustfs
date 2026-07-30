@@ -438,7 +438,9 @@ mod tests {
         )
         .with_insecure_development_defaults();
         // Constructing the client performs no network I/O with token auth.
-        let backend = vault::VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+        let backend = vault::VaultKmsBackend::new(config)
+            .await
+            .expect("vault kv2 backend should build");
 
         insta::assert_json_snapshot!("vault_kv2_backend_capabilities", capabilities_snapshot(backend.capabilities()));
     }
