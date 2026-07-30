@@ -69,11 +69,14 @@ fn validate_key_id(key_id: &str) -> Result<()> {
 }
 
 const LOCAL_KMS_MASTER_KEY_SALT_FILE: &str = ".master-key.salt";
-const LOCAL_KMS_MASTER_KEY_SALT_LEN: usize = 16;
-const LOCAL_KMS_MASTER_KEY_LEN: usize = 32;
-const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
-const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
-const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
+// The KDF parameters are pub(crate) so the backup manifest contract
+// (`crate::backup`) records the exact compiled-in derivation instead of a
+// copy that could drift.
+pub(crate) const LOCAL_KMS_MASTER_KEY_SALT_LEN: usize = 16;
+pub(crate) const LOCAL_KMS_MASTER_KEY_LEN: usize = 32;
+pub(crate) const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
+pub(crate) const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
+pub(crate) const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
 
 /// Strict matcher for leftover commit temp files (`<prefix>.tmp-<uuid>`).
 ///
@@ -396,9 +399,11 @@ pub struct LocalKmsClient {
     key_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+// pub(crate) so the backup contract tests can anchor the manifest's
+// protection-state wire names against the marker values written to disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum StoredKeyProtection {
+pub(crate) enum StoredKeyProtection {
     #[default]
     LegacyUnspecified,
     EncryptedMasterKey,
