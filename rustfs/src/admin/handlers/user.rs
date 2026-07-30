@@ -724,7 +724,7 @@ impl Operation for ExportIam {
             match file {
                 ALL_POLICIES_FILE => {
                     let policies: HashMap<String, rustfs_policy::policy::Policy> = iam_store
-                        .list_polices("")
+                        .list_policies("")
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                     let json_str = serde_json::to_vec(&policies)

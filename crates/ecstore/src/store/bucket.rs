@@ -310,12 +310,13 @@ impl ECStore {
         meta.set_created(opts.created_at);
 
         if opts.lock_enabled {
-            meta.object_lock_config_xml = crate::bucket::utils::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
-            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.object_lock_config_xml =
+                crate::bucket::utils::serialize::<ObjectLockConfiguration>(&ENABLED_OBJECT_LOCK_CONFIG)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
         if opts.versioning_enabled {
-            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
         await_bucket_namespace_operation(
