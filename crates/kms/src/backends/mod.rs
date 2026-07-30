@@ -22,6 +22,7 @@ use std::collections::HashMap;
 pub mod local;
 pub mod static_kms;
 pub mod vault;
+pub(crate) mod vault_credentials;
 pub mod vault_transit;
 
 /// Abstract KMS client interface that all backends must implement
