@@ -15,7 +15,7 @@
 //! Vault Transit-based KMS backend.
 
 use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
-use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -81,6 +81,12 @@ impl TransitKeyMetadata {
         }
     }
 
+    // KNOWN RISK (rustfs/backlog#1571, residual of rustfs/backlog#808): this
+    // fallback defaults to Enabled, so a key whose KV metadata read fails is
+    // treated as usable — a disabled or pending-deletion key can transiently
+    // "revive" on that path. State gates therefore only hold as strongly as
+    // metadata reads do. Changing the fallback is out of scope here; the
+    // synthesized_metadata_defaults_to_enabled test pins the current behavior.
     fn synthesized() -> Self {
         Self {
             key_usage: KeyUsage::EncryptDecrypt,
@@ -363,14 +369,9 @@ impl VaultTransitKmsClient {
         })
     }
 
-    async fn ensure_key_active(&self, key_id: &str) -> Result<TransitKeyMetadata> {
+    async fn ensure_key_state_allows(&self, key_id: &str, operation: StateGatedOperation) -> Result<TransitKeyMetadata> {
         let metadata = self.get_key_metadata(key_id).await?;
-        if metadata.key_state != KeyState::Enabled {
-            return Err(KmsError::invalid_operation(format!(
-                "Key {key_id} is not active (state: {:?})",
-                metadata.key_state
-            )));
-        }
+        ensure_key_state_permits(key_id, &metadata.key_state, operation)?;
         Ok(metadata)
     }
 }
@@ -378,7 +379,8 @@ impl VaultTransitKmsClient {
 #[async_trait]
 impl KmsClient for VaultTransitKmsClient {
     async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
-        self.ensure_key_active(&request.master_key_id).await?;
+        self.ensure_key_state_allows(&request.master_key_id, StateGatedOperation::GenerateDataKey)
+            .await?;
 
         let plaintext_key = generate_key_material(&request.key_spec)?;
         let encrypted_key = self
@@ -409,7 +411,9 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
-        let metadata = self.ensure_key_active(&request.key_id).await?;
+        let metadata = self
+            .ensure_key_state_allows(&request.key_id, StateGatedOperation::Encrypt)
+            .await?;
         let ciphertext = self
             .transit_encrypt(&request.key_id, &request.plaintext, &request.encryption_context)
             .await?;
@@ -521,14 +525,16 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        let mut metadata = self.get_key_metadata(key_id).await?;
+        // A pending deletion must be reverted through cancel_key_deletion, not
+        // silently by enabling, so the gate rejects PendingDeletion here.
+        let mut metadata = self.ensure_key_state_allows(key_id, StateGatedOperation::Enable).await?;
         metadata.key_state = KeyState::Enabled;
         metadata.deletion_date = None;
         self.store_key_metadata(key_id, &metadata).await
     }
 
     async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        let mut metadata = self.get_key_metadata(key_id).await?;
+        let mut metadata = self.ensure_key_state_allows(key_id, StateGatedOperation::Disable).await?;
         metadata.key_state = KeyState::Disabled;
         self.store_key_metadata(key_id, &metadata).await
     }
@@ -539,7 +545,9 @@ impl KmsClient for VaultTransitKmsClient {
         pending_window_days: u32,
         _context: Option<&OperationContext>,
     ) -> Result<()> {
-        let mut metadata = self.get_key_metadata(key_id).await?;
+        let mut metadata = self
+            .ensure_key_state_allows(key_id, StateGatedOperation::ScheduleDeletion)
+            .await?;
         metadata.key_state = KeyState::PendingDeletion;
         metadata.deletion_date = Some(Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400));
         self.store_key_metadata(key_id, &metadata).await
@@ -547,12 +555,17 @@ impl KmsClient for VaultTransitKmsClient {
 
     async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         let mut metadata = self.get_key_metadata(key_id).await?;
+        if metadata.key_state != KeyState::PendingDeletion {
+            return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
+        }
         metadata.key_state = KeyState::Enabled;
         metadata.deletion_date = None;
         self.store_key_metadata(key_id, &metadata).await
     }
 
     async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+        self.ensure_key_state_allows(key_id, StateGatedOperation::Rotate).await?;
+
         key::rotate(&self.vault().client, &self.config.mount_path, key_id)
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to rotate Vault Transit key {key_id}: {e}")))?;
@@ -593,6 +606,14 @@ pub struct VaultTransitKmsBackend {
 }
 
 impl VaultTransitKmsBackend {
+    /// Lifecycle driver for the shared state-machine contract tests. Using the
+    /// backend's own client keeps its in-process metadata cache coherent with
+    /// the transitions the tests perform.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_client(&self) -> &VaultTransitKmsClient {
+        &self.client
+    }
+
     pub async fn new(config: KmsConfig) -> Result<Self> {
         config.validate()?;
 
@@ -722,6 +743,8 @@ impl KmsBackend for VaultTransitKmsBackend {
                 None
             }
         } else {
+            ensure_key_state_permits(&key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
+
             let days = request.pending_window_in_days.unwrap_or(30);
             if !(7..=30).contains(&days) {
                 return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30"));
@@ -984,5 +1007,16 @@ mod tests {
 
         // Cleanup so repeated runs against the same Vault do not accumulate keys.
         let _ = client.schedule_key_deletion(&key_id, 7, None).await;
+    }
+
+    /// Pins the known-risk fallback documented on `TransitKeyMetadata::synthesized`:
+    /// when KV metadata cannot be read, the synthesized record defaults to Enabled,
+    /// which weakens every state gate on that path. If this test turns red the
+    /// fallback semantics changed on purpose — update the comment there as well.
+    #[test]
+    fn synthesized_metadata_defaults_to_enabled() {
+        let metadata = TransitKeyMetadata::synthesized();
+        assert_eq!(metadata.key_state, KeyState::Enabled);
+        assert!(metadata.deletion_date.is_none());
     }
 }

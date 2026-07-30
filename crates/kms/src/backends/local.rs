@@ -14,7 +14,7 @@
 
 //! Local file-based KMS backend implementation
 
-use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient, StateGatedOperation, ensure_key_status_permits};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -931,8 +931,11 @@ impl LocalKmsClient {
 
 #[async_trait]
 impl KmsClient for LocalKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
+
+        let key_info = self.describe_key(&request.master_key_id, context).await?;
+        ensure_key_status_permits(&request.master_key_id, &key_info.status, StateGatedOperation::GenerateDataKey)?;
 
         // Generate random data key material
         let key_length = match request.key_spec.as_str() {
@@ -972,14 +975,9 @@ impl KmsClient for LocalKmsClient {
     async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse> {
         debug!("Encrypting data with key: {}", request.key_id);
 
-        // Verify key exists and is active
+        // Verify key exists and its state allows encryption
         let key_info = self.describe_key(&request.key_id, context).await?;
-        if key_info.status != KeyStatus::Active {
-            return Err(KmsError::invalid_operation(format!(
-                "Key {} is not active (status: {:?})",
-                request.key_id, key_info.status
-            )));
-        }
+        ensure_key_status_permits(&request.key_id, &key_info.status, StateGatedOperation::Encrypt)?;
 
         let (ciphertext, _nonce) = self.encrypt_with_master_key(&request.key_id, &request.plaintext).await?;
 
@@ -1110,6 +1108,7 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::Enable)?;
         master_key.status = KeyStatus::Active;
 
         // Preserve the existing key material. Regenerating it on a pure status change would
@@ -1127,6 +1126,7 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::Disable)?;
         master_key.status = KeyStatus::Disabled;
 
         // Preserve the existing key material (see enable_key): a status change must never
@@ -1148,6 +1148,7 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
         master_key.status = KeyStatus::PendingDeletion;
 
         // Preserve the existing key material (see enable_key): scheduling deletion must not
@@ -1165,6 +1166,9 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        if master_key.status != KeyStatus::PendingDeletion {
+            return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
+        }
         master_key.status = KeyStatus::Active;
 
         // Preserve the existing key material (see enable_key): cancelling deletion must recover
@@ -1215,6 +1219,12 @@ pub struct LocalKmsBackend {
 }
 
 impl LocalKmsBackend {
+    /// Lifecycle driver for the shared state-machine contract tests.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_client(&self) -> &LocalKmsClient {
+        &self.client
+    }
+
     /// Create a new LocalKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
         config.validate()?;
@@ -1399,6 +1409,8 @@ impl KmsBackend for LocalKmsBackend {
             });
         } else {
             // Schedule for deletion (default 30 days)
+            ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
+
             let days = request.pending_window_in_days.unwrap_or(30);
             if !(7..=30).contains(&days) {
                 return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
@@ -2617,9 +2629,16 @@ mod tests {
             client.schedule_key_deletion(key_id, 7, None),
             client.enable_key(key_id, None),
         );
-        disable.expect("disable");
-        schedule.expect("schedule deletion");
-        enable.expect("enable");
+        // The per-key lock serializes the three transitions in an arbitrary
+        // order, and the state gate may legitimately reject a transition that
+        // lost the race (e.g. enable after deletion was scheduled). Any other
+        // error kind would still mean corrupted storage.
+        for result in [disable, schedule, enable] {
+            match result {
+                Ok(()) | Err(KmsError::InvalidOperation { .. }) => {}
+                Err(other) => panic!("concurrent transition must only fail with a state rejection, got {other:?}"),
+            }
+        }
 
         // Whatever the serialization order, the file must be one writer's
         // complete output with the original material intact.

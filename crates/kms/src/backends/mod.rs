@@ -14,17 +14,87 @@
 
 //! KMS backend implementations
 
-use crate::error::Result;
+use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[cfg(test)]
+mod contract_tests;
 pub mod local;
 pub mod static_kms;
 pub mod vault;
 pub(crate) mod vault_credentials;
 pub mod vault_transit;
+
+/// Operations whose availability depends on the key's lifecycle state.
+///
+/// Decryption is deliberately absent: RustFS allows decryption with
+/// `Disabled` and `PendingDeletion` keys — an explicit deviation from AWS
+/// KMS — because rejecting it would break reads of every object encrypted
+/// under a key the moment it is disabled. Deletion cancellation is also
+/// absent: it is valid exactly when the key is `PendingDeletion`, which call
+/// sites enforce directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateGatedOperation {
+    Encrypt,
+    GenerateDataKey,
+    Rotate,
+    Enable,
+    Disable,
+    ScheduleDeletion,
+}
+
+impl StateGatedOperation {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Encrypt => "encryption",
+            Self::GenerateDataKey => "data key generation",
+            Self::Rotate => "rotation",
+            Self::Enable => "enabling",
+            Self::Disable => "disabling",
+            Self::ScheduleDeletion => "deletion scheduling",
+        }
+    }
+}
+
+/// Enforce the shared key state × operation matrix.
+///
+/// - `Enabled`: every operation is allowed.
+/// - `Disabled`: enabling, disabling (idempotent) and deletion scheduling are
+///   allowed; encryption, data key generation and rotation are rejected.
+/// - `PendingDeletion`: every state-gated operation is rejected, including a
+///   repeated deletion schedule; only cancellation and decryption proceed.
+/// - `PendingImport`/`Unavailable`: the key is not usable and is reported as
+///   not found.
+pub(crate) fn ensure_key_state_permits(key_id: &str, state: &KeyState, operation: StateGatedOperation) -> Result<()> {
+    match state {
+        KeyState::Enabled => Ok(()),
+        KeyState::Disabled => match operation {
+            StateGatedOperation::Enable | StateGatedOperation::Disable | StateGatedOperation::ScheduleDeletion => Ok(()),
+            StateGatedOperation::Encrypt | StateGatedOperation::GenerateDataKey | StateGatedOperation::Rotate => Err(
+                KmsError::invalid_key_state(format!("Key {key_id} is disabled: {} is not allowed", operation.describe())),
+            ),
+        },
+        KeyState::PendingDeletion => Err(KmsError::invalid_key_state(format!(
+            "Key {key_id} is pending deletion: {} is not allowed",
+            operation.describe()
+        ))),
+        KeyState::PendingImport | KeyState::Unavailable => Err(KmsError::key_not_found(key_id)),
+    }
+}
+
+/// [`ensure_key_state_permits`] for backends that persist [`KeyStatus`].
+pub(crate) fn ensure_key_status_permits(key_id: &str, status: &KeyStatus, operation: StateGatedOperation) -> Result<()> {
+    let state = match status {
+        KeyStatus::Active => KeyState::Enabled,
+        KeyStatus::Disabled => KeyState::Disabled,
+        KeyStatus::PendingDeletion => KeyState::PendingDeletion,
+        KeyStatus::Deleted => KeyState::Unavailable,
+    };
+    ensure_key_state_permits(key_id, &state, operation)
+}
 
 /// Abstract KMS client interface that all backends must implement
 #[async_trait]

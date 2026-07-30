@@ -15,7 +15,10 @@
 //! Vault-based KMS backend implementation using vaultrs
 
 use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
-use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{
+    BackendCapabilities, BackendInfo, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits,
+    ensure_key_status_permits,
+};
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -464,6 +467,9 @@ impl KmsClient for VaultKmsClient {
     async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
+        let key_data = self.get_key_data(&request.master_key_id).await?;
+        ensure_key_status_permits(&request.master_key_id, &key_data.status, StateGatedOperation::GenerateDataKey)?;
+
         // Generate random data key material using the existing method
         let plaintext_key = generate_key_material(&request.key_spec)?;
 
@@ -502,8 +508,9 @@ impl KmsClient for VaultKmsClient {
     async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
         debug!("Encrypting data with key: {}", request.key_id);
 
-        // Get the master key
+        // Get the master key and verify its state allows encryption
         let key_data = self.get_key_data(&request.key_id).await?;
+        ensure_key_status_permits(&request.key_id, &key_data.status, StateGatedOperation::Encrypt)?;
         let key_material = self.decrypt_key_material(&key_data.encrypted_key_material).await?;
 
         // For simplicity, we'll use a basic encryption approach
@@ -670,6 +677,7 @@ impl KmsClient for VaultKmsClient {
         debug!("Enabling key: {}", key_id);
 
         let mut key_data = self.get_key_data(key_id).await?;
+        ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::Enable)?;
         key_data.status = KeyStatus::Active;
         self.store_key_data(key_id, &key_data).await?;
 
@@ -681,6 +689,7 @@ impl KmsClient for VaultKmsClient {
         debug!("Disabling key: {}", key_id);
 
         let mut key_data = self.get_key_data(key_id).await?;
+        ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::Disable)?;
         key_data.status = KeyStatus::Disabled;
         self.store_key_data(key_id, &key_data).await?;
 
@@ -697,6 +706,7 @@ impl KmsClient for VaultKmsClient {
         debug!("Scheduling key deletion: {}", key_id);
 
         let mut key_data = self.get_key_data(key_id).await?;
+        ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::ScheduleDeletion)?;
         key_data.status = KeyStatus::PendingDeletion;
         self.store_key_data(key_id, &key_data).await?;
 
@@ -708,6 +718,9 @@ impl KmsClient for VaultKmsClient {
         debug!("Canceling key deletion: {}", key_id);
 
         let mut key_data = self.get_key_data(key_id).await?;
+        if key_data.status != KeyStatus::PendingDeletion {
+            return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
+        }
         key_data.status = KeyStatus::Active;
         self.store_key_data(key_id, &key_data).await?;
 
@@ -852,6 +865,12 @@ pub struct VaultKmsBackend {
 }
 
 impl VaultKmsBackend {
+    /// Lifecycle driver for the shared state-machine contract tests.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_client(&self) -> &VaultKmsClient {
+        &self.client
+    }
+
     /// Create a new VaultKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
         config.validate()?;
@@ -1037,6 +1056,8 @@ impl KmsBackend for VaultKmsBackend {
             }
         } else {
             // Schedule for deletion (default 30 days)
+            ensure_key_state_permits(key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
+
             let days = request.pending_window_in_days.unwrap_or(30);
             if !(7..=30).contains(&days) {
                 return Err(crate::error::KmsError::invalid_parameter(
