@@ -307,10 +307,17 @@ impl VaultTransitKmsClient {
             return Ok(persisted);
         }
 
+        // Deliberate exemption from the "read paths never write" rule (rustfs#4256 /
+        // rustfs#4262): transit keys created before metadata persistence existed have no
+        // KV record at all, so failing closed here would brick every pre-existing transit
+        // key. The synthesised record only describes metadata — key material lives solely
+        // inside Vault's transit engine and is never generated or written by this path.
+        //
         // Verify the transit key actually exists in Vault before synthesising.
         self.read_transit_key(key_id).await?;
         let metadata = TransitKeyMetadata::synthesized();
-        // Persist the synthesised metadata so future cache misses pick it up.
+        // Persist the synthesised metadata so future cache misses pick it up (best
+        // effort: the KV write failing must not fail the read).
         let _ = self.write_metadata_to_kv(key_id, &metadata).await;
         self.metadata_cache.write().await.insert(key_id.to_string(), metadata.clone());
         Ok(metadata)
