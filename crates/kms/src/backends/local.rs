@@ -1910,6 +1910,64 @@ mod tests {
         );
     }
 
+    /// Mixed-format regression for rustfs/backlog#1565: a batch interleaving
+    /// pre-versioning envelopes (no master_key_version field) with versioned ones
+    /// must route and decrypt in full, and a rejected rotation in the middle must
+    /// not disturb either format.
+    #[tokio::test]
+    async fn mixed_format_envelopes_decrypt_across_rejected_rotation() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "mixed-format-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+
+        let request = GenerateKeyRequest::new(key_id.to_string(), "AES_256".to_string());
+        let mut batch = Vec::new();
+        for index in 0..4 {
+            let data_key = client.generate_data_key(&request, None).await.expect("generate data key");
+            let ciphertext = if index % 2 == 0 {
+                // Legacy shape: the local backend already omits master_key_version.
+                let envelope: serde_json::Value = serde_json::from_slice(&data_key.ciphertext).expect("parse envelope");
+                assert!(
+                    !envelope
+                        .as_object()
+                        .expect("envelope is an object")
+                        .contains_key("master_key_version"),
+                    "local envelopes must keep the pre-versioning shape"
+                );
+                data_key.ciphertext.clone()
+            } else {
+                // Versioned shape, as a rotation-aware writer would emit it.
+                let mut envelope: serde_json::Value = serde_json::from_slice(&data_key.ciphertext).expect("parse envelope");
+                envelope
+                    .as_object_mut()
+                    .expect("envelope is an object")
+                    .insert("master_key_version".to_string(), serde_json::json!(1));
+                serde_json::to_vec(&envelope).expect("serialize versioned envelope")
+            };
+            assert!(
+                crate::encryption::is_data_key_envelope(&ciphertext),
+                "batch member {index} must still route as a KMS envelope"
+            );
+            batch.push((ciphertext, data_key.plaintext.clone().expect("plaintext")));
+        }
+
+        // A rejected rotation in the middle of the batch's lifetime must leave
+        // every already-issued envelope decryptable.
+        let error = client
+            .rotate_key(key_id, None)
+            .await
+            .expect_err("local rotation must stay rejected");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }));
+
+        for (index, (ciphertext, plaintext)) in batch.iter().enumerate() {
+            let decrypted = client
+                .decrypt(&DecryptRequest::new(ciphertext.clone()), None)
+                .await
+                .unwrap_or_else(|error| panic!("batch member {index} must decrypt: {error}"));
+            assert_eq!(&decrypted, plaintext, "batch member {index} plaintext must round-trip");
+        }
+    }
+
     #[tokio::test]
     async fn startup_rejects_key_file_with_mismatched_embedded_id() {
         let (client, temp_dir) = create_dev_mode_client().await;
