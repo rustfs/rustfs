@@ -128,6 +128,11 @@ pub enum KmsError {
     /// Backup/restore bundle contract violation; see [`crate::backup::BackupError`]
     #[error(transparent)]
     Backup(#[from] crate::backup::BackupError),
+
+    /// Backend credentials expired or could not be refreshed in time; requests
+    /// fail closed instead of being sent with credentials that may lapse mid-flight
+    #[error("KMS credentials unavailable: {message}")]
+    CredentialsUnavailable { message: String },
 }
 
 impl KmsError {
@@ -268,6 +273,11 @@ impl KmsError {
             key_id: key_id.into(),
             version,
         }
+    }
+
+    /// Create a credentials unavailable error
+    pub fn credentials_unavailable<S: Into<String>>(message: S) -> Self {
+        Self::CredentialsUnavailable { message: message.into() }
     }
 }
 
