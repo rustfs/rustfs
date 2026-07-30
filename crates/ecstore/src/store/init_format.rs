@@ -73,13 +73,33 @@ pub async fn connect_load_init_formats(
 
     check_disk_fatal_errs(&errs)?;
 
-    if first_disk && should_init_erasure_disks(&errs) {
-        // UnformattedDisk, try migrate from MinIO format first, else create new format
-        info!("first_disk && should_init_erasure_disks");
-        match try_migrate_format(disks, set_count, set_drive_count).await {
-            Ok(LegacyFormatOutcome::Migrated(fm)) => {
+    let all_unformatted = should_init_erasure_disks(&errs);
+    let formats_present = formats.iter().flatten().count();
+    let mut format_quorum = (formats_present > 0).then(|| select_format_erasure_in_quorum(&formats, 0));
+    if format_quorum.as_ref().is_none_or(Result::is_err)
+        && errs.iter().any(|error| {
+            matches!(
+                error,
+                Some(DiskError::InconsistentDisk | DiskError::CorruptedFormat | DiskError::CorruptedBackend)
+            )
+        })
+    {
+        return Err(Error::CorruptedFormat);
+    }
+    let resumable_partial_migration = formats_present > 0
+        && errs.iter().any(|error| matches!(error, Some(DiskError::UnformattedDisk)))
+        && format_quorum.as_ref().is_some_and(Result::is_err)
+        && formats.iter().zip(&errs).all(|(format, error)| {
+            format.is_some() || matches!(error, Some(DiskError::UnformattedDisk | DiskError::DiskNotFound))
+        });
+
+    if first_disk && (all_unformatted || resumable_partial_migration) {
+        info!(all_unformatted, resumable_partial_migration, "checking for a legacy storage format");
+        match try_migrate_format(disks, &formats, set_count, set_drive_count).await {
+            Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
-                return Ok(*fm);
+                retain_format_quorum_members(disks, &format, &quorum_members, set_drive_count).await?;
+                return Ok(*format);
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
                 error!(
@@ -94,8 +114,10 @@ pub async fn connect_load_init_formats(
             Ok(LegacyFormatOutcome::None) => {}
             Err(e) => return Err(e),
         }
-        let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
-        return Ok(fm);
+        if all_unformatted {
+            let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
+            return Ok(fm);
+        }
     }
 
     info!(
@@ -113,15 +135,51 @@ pub async fn connect_load_init_formats(
         return Err(Error::FirstDiskWait);
     }
 
-    let (fm, quorum_members) = select_format_erasure_in_quorum(&formats, 0)?;
+    let (fm, quorum_members) = match format_quorum.take() {
+        Some(result) => result?,
+        None => select_format_erasure_in_quorum(&formats, 0)?,
+    };
     check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
+    retain_format_quorum_members(disks, &fm, &quorum_members, set_drive_count).await?;
+
+    Ok(fm)
+}
+
+async fn retain_format_quorum_members(
+    disks: &mut [Option<DiskStore>],
+    format: &FormatV3,
+    quorum_members: &[bool],
+    set_drive_count: usize,
+) -> Result<()> {
+    if set_drive_count == 0 || quorum_members.len() != disks.len() {
+        return Err(Error::CorruptedFormat);
+    }
+    for (disk, belongs_to_quorum) in disks.iter().zip(quorum_members) {
+        if !belongs_to_quorum && let Some(disk) = disk {
+            disk.set_disk_id(None).await?;
+        }
+    }
+    for (index, (disk, belongs_to_quorum)) in disks.iter().zip(quorum_members).enumerate() {
+        if !belongs_to_quorum {
+            continue;
+        }
+        let disk_id = format
+            .erasure
+            .sets
+            .get(index / set_drive_count)
+            .and_then(|set| set.get(index % set_drive_count))
+            .ok_or(Error::CorruptedFormat)?;
+        disk.as_ref()
+            .ok_or(Error::CorruptedFormat)?
+            .set_disk_id(Some(*disk_id))
+            .await?;
+    }
     for (disk, belongs_to_quorum) in disks.iter_mut().zip(quorum_members) {
         if !belongs_to_quorum {
             *disk = None;
         }
     }
-
-    Ok(fm)
+    Ok(())
 }
 
 pub fn quorum_unformatted_disks(errs: &[Option<DiskError>]) -> bool {
@@ -178,7 +236,10 @@ async fn init_format_erasure(
 enum LegacyFormatOutcome {
     /// A compatible MinIO format was found and migrated into RustFS format files.
     /// Boxed to keep the enum small (`FormatV3` is large; the others are unit variants).
-    Migrated(Box<FormatV3>),
+    Migrated {
+        format: Box<FormatV3>,
+        quorum_members: Vec<bool>,
+    },
     /// A MinIO `format.json` was present but could not be migrated (topology /
     /// version mismatch, or a parse failure). The caller must decide how to
     /// proceed; creating a fresh format would leave the legacy objects unreadable.
@@ -194,6 +255,7 @@ enum LegacyFormatOutcome {
 /// failures that prevent a conclusive migration decision.
 async fn try_migrate_format(
     disks: &[Option<DiskStore>],
+    rustfs_formats: &[Option<FormatV3>],
     set_count: usize,
     set_drive_count: usize,
 ) -> Result<LegacyFormatOutcome> {
@@ -268,6 +330,7 @@ async fn try_migrate_format(
     if format.erasure.sets.len() != set_count
         || check_format_erasure_value_for_topology(&format, disks.len(), set_drive_count).is_err()
         || !formats_match_reference_slots(&legacy_formats, &format, 0)
+        || !formats_match_reference_slots(rustfs_formats, &format, 0)
     {
         return Ok(LegacyFormatOutcome::Incompatible);
     }
@@ -281,8 +344,48 @@ async fn try_migrate_format(
         }
     }
 
-    save_format_file_all(disks, &formats_to_write).await?;
-    Ok(LegacyFormatOutcome::Migrated(Box::new(format)))
+    let writes = disks
+        .iter()
+        .zip(&formats_to_write)
+        .zip(rustfs_formats)
+        .filter(|&((disk, _), existing)| disk.is_some() && existing.is_none())
+        .map(|((disk, format), _)| save_format_file(disk, format));
+    let mut write_error = None;
+    for result in join_all(writes).await {
+        if let Err(error) = result {
+            write_error.get_or_insert(error);
+        }
+    }
+    for disk in disks.iter().flatten() {
+        disk.set_disk_id(None).await?;
+    }
+
+    let (persisted_formats, persisted_errors) = load_format_erasure_all(disks, false).await;
+    if let Some(error) = persisted_errors
+        .into_iter()
+        .flatten()
+        .find(|error| !matches!(error, DiskError::UnformattedDisk | DiskError::DiskNotFound))
+    {
+        return match error {
+            DiskError::CorruptedFormat | DiskError::CorruptedBackend | DiskError::InconsistentDisk => {
+                Ok(LegacyFormatOutcome::Incompatible)
+            }
+            error => Err(error.into()),
+        };
+    }
+    if !formats_match_reference_slots(&persisted_formats, &format, 0) {
+        return Ok(LegacyFormatOutcome::Incompatible);
+    }
+    let (persisted_format, quorum_members) = match select_format_erasure_in_quorum(&persisted_formats, 0) {
+        Ok(selected) => selected,
+        Err(error) => return Err(write_error.map_or(error, Into::into)),
+    };
+    check_format_erasure_value_for_topology(&persisted_format, disks.len(), set_drive_count)?;
+
+    Ok(LegacyFormatOutcome::Migrated {
+        format: Box::new(persisted_format),
+        quorum_members,
+    })
 }
 
 fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
@@ -511,13 +614,9 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
     }
 
     let results = join_all(futures).await;
-    for (i, result) in results.into_iter().enumerate() {
+    for result in results {
         match result {
             Ok(s) => {
-                if !heal {
-                    let _ = disks[i].as_ref().unwrap().set_disk_id(Some(s.erasure.this)).await;
-                }
-
                 datas.push(Some(s));
                 errors.push(None);
             }
@@ -639,6 +738,8 @@ pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::layout::endpoint::Endpoint;
+    use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
+    use serial_test::serial;
 
     async fn local_disks(count: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
         let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
@@ -681,10 +782,10 @@ mod tests {
     }
 
     async fn write_legacy_majority(disks: &[Option<DiskStore>], format: &FormatV3) {
-        for index in 0..(disks.len() / 2 + 1) {
+        for (index, disk) in disks.iter().enumerate().take(disks.len() / 2 + 1) {
             let mut disk_format = format.clone();
             disk_format.erasure.this = format.erasure.sets[0][index];
-            write_legacy_format(&disks[index], &disk_format).await;
+            write_legacy_format(disk, &disk_format).await;
         }
     }
 
@@ -696,6 +797,16 @@ mod tests {
         disk.write_all(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE, data)
             .await
             .expect("legacy format should be written");
+    }
+
+    async fn write_rustfs_bytes(disk: &Option<DiskStore>, data: bytes::Bytes) {
+        let disk = disk.as_ref().expect("RustFS disk should exist");
+        if let Err(err) = disk.make_volume(RUSTFS_META_BUCKET).await {
+            assert_eq!(err, DiskError::VolumeExists, "RustFS metadata volume should be created");
+        }
+        disk.write_all(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE, data)
+            .await
+            .expect("RustFS format should be written");
     }
 
     #[tokio::test]
@@ -717,18 +828,18 @@ mod tests {
         let (_temp_dir, mut disks) = local_disks(3).await;
         let legacy = FormatV3::new(1, 3);
         let oversized_len = legacy_format_max_bytes(disks.len()).expect("size limit should resolve") + 1;
-        for index in 0..2 {
+        for (index, disk) in disks.iter().enumerate().take(2) {
             let mut disk_format = legacy.clone();
             disk_format.erasure.this = legacy.erasure.sets[0][index];
             let mut data = disk_format.to_json().expect("legacy format should serialize").into_bytes();
             data.resize(oversized_len, b' ');
-            write_legacy_bytes(&disks[index], data.into()).await;
+            write_legacy_bytes(disk, data.into()).await;
         }
 
-        assert!(matches!(
-            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
-            Err(Error::CorruptedFormat)
-        ));
+        let error = connect_load_init_formats(true, &mut disks, 1, 3, None)
+            .await
+            .expect_err("oversized legacy metadata must be rejected");
+        assert!(matches!(error, Error::CorruptedFormat), "unexpected error: {error:?}");
         let (formats, errors) = load_format_erasure_all(&disks, false).await;
         assert!(formats.iter().all(Option::is_none), "oversized legacy metadata must not be migrated");
         assert!(
@@ -932,6 +1043,44 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn existing_format_load_publishes_only_validated_quorum_disk_ids() {
+        clear_local_disk_id_map_for_test().await;
+        let (_temp_dir, mut disks) = local_disks(5).await;
+        let canonical = FormatV3::new(1, 5);
+        for (index, disk) in disks.iter().enumerate().take(3) {
+            let mut disk_format = canonical.clone();
+            disk_format.erasure.this = canonical.erasure.sets[0][index];
+            save_format_file(disk, &Some(disk_format))
+                .await
+                .expect("canonical format should be written");
+        }
+        let mut wrong_slot = canonical.clone();
+        wrong_slot.erasure.this = wrong_slot.erasure.sets[0][0];
+        save_format_file(&disks[3], &Some(wrong_slot))
+            .await
+            .expect("wrong-slot format should be written");
+        let mut foreign = FormatV3::new(1, 5);
+        foreign.erasure.this = foreign.erasure.sets[0][4];
+        let foreign_id = foreign.erasure.this;
+        save_format_file(&disks[4], &Some(foreign))
+            .await
+            .expect("foreign format should be written");
+        let canonical_id = canonical.erasure.sets[0][0];
+        let canonical_endpoint = disks[0].as_ref().expect("canonical disk should exist").endpoint().to_string();
+
+        connect_load_init_formats(true, &mut disks, 1, 5, None)
+            .await
+            .expect("the canonical strict majority should load");
+
+        assert!(disks[..3].iter().all(Option::is_some));
+        assert!(disks[3..].iter().all(Option::is_none));
+        assert_eq!(local_disk_path_by_id(&canonical_id).await, Some(canonical_endpoint));
+        assert_eq!(local_disk_path_by_id(&foreign_id).await, None);
+        clear_local_disk_id_map_for_test().await;
+    }
+
+    #[tokio::test]
     async fn existing_format_load_excludes_a_malformed_outlier() {
         let (_temp_dir, mut disks) = local_disks(3).await;
         let mut majority = FormatV3::new(1, 3);
@@ -1039,6 +1188,118 @@ mod tests {
             Some(legacy.erasure.sets[0][2]),
             "the missing legacy format file must be replaced with the third slot"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_resumes_partial_rustfs_writes() {
+        for drive_count in [3, 4] {
+            let (_temp_dir, mut disks) = local_disks(drive_count).await;
+            let legacy = FormatV3::new(1, drive_count);
+            write_legacy_majority(&disks, &legacy).await;
+            for (index, disk) in disks.iter().enumerate().take(drive_count / 2) {
+                let mut disk_format = legacy.clone();
+                disk_format.erasure.this = legacy.erasure.sets[0][index];
+                save_format_file(disk, &Some(disk_format))
+                    .await
+                    .expect("partial RustFS format should be written");
+            }
+
+            let mut expected = legacy;
+            expected.erasure.this = Uuid::nil();
+            assert_eq!(
+                connect_load_init_formats(true, &mut disks, 1, drive_count, None)
+                    .await
+                    .expect("a partial migration should resume from the legacy quorum"),
+                expected
+            );
+            let (formats, errors) = load_format_erasure_all(&disks, false).await;
+            assert!(errors.iter().all(Option::is_none), "the resumed migration should format every disk");
+            for (index, format) in formats.iter().enumerate() {
+                assert_eq!(
+                    format.as_ref().map(|format| format.erasure.this),
+                    Some(expected.erasure.sets[0][index]),
+                    "the resumed migration must preserve each physical slot"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_resumes_to_quorum_with_an_unavailable_disk() {
+        let (_temp_dir, mut disks) = two_local_disks_with_missing_third().await;
+        let legacy = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &legacy).await;
+        let mut partial = legacy.clone();
+        partial.erasure.this = partial.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(partial))
+            .await
+            .expect("partial RustFS format should be written");
+
+        let mut expected = legacy;
+        expected.erasure.this = Uuid::nil();
+        assert_eq!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None)
+                .await
+                .expect("the available blank disk should complete the migration quorum"),
+            expected
+        );
+        let (formats, errors) = load_format_erasure_all(&disks, false).await;
+        assert!(formats[0].is_some() && formats[1].is_some());
+        assert!(formats[2].is_none());
+        assert!(matches!(errors[2], Some(DiskError::DiskNotFound)));
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_rejects_a_foreign_partial_rustfs_format() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let legacy = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &legacy).await;
+        let mut foreign = FormatV3::new(1, 3);
+        foreign.erasure.this = foreign.erasure.sets[0][0];
+        let foreign_id = foreign.id;
+        save_format_file(&disks[0], &Some(foreign))
+            .await
+            .expect("foreign partial RustFS format should be written");
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::CorruptedFormat)
+        ));
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert_eq!(formats[0].as_ref().map(|format| format.id), Some(foreign_id));
+        assert!(formats[1..].iter().all(Option::is_none), "foreign partial state must not be extended");
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_rejects_a_wrong_slot_partial_rustfs_format() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let legacy = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &legacy).await;
+        let mut wrong_slot = legacy;
+        wrong_slot.erasure.this = wrong_slot.erasure.sets[0][1];
+        save_format_file(&disks[0], &Some(wrong_slot))
+            .await
+            .expect("wrong-slot partial RustFS format should be written");
+
+        let error = connect_load_init_formats(true, &mut disks, 1, 3, None)
+            .await
+            .expect_err("a wrong-slot partial RustFS format must be rejected");
+        assert!(matches!(error, Error::CorruptedFormat), "unexpected error: {error:?}");
+        let (formats, errors) = load_format_erasure_all(&disks, false).await;
+        assert!(matches!(errors[0], Some(DiskError::InconsistentDisk)));
+        assert!(formats[1..].iter().all(Option::is_none), "wrong-slot partial state must not be extended");
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_does_not_extend_a_malformed_rustfs_format() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let legacy = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &legacy).await;
+        write_rustfs_bytes(&disks[0], bytes::Bytes::from_static(b"{not-json")).await;
+
+        assert!(connect_load_init_formats(true, &mut disks, 1, 3, None).await.is_err());
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert!(formats.iter().all(Option::is_none), "malformed partial state must not be extended");
     }
 
     #[tokio::test]
@@ -1153,10 +1414,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_format_migration_rejects_conflicting_candidates_without_a_quorum() {
         let (_temp_dir, mut disks) = local_disks(3).await;
-        for index in 0..2 {
+        for (index, disk) in disks.iter().enumerate().take(2) {
             let mut disk_format = FormatV3::new(1, 3);
             disk_format.erasure.this = disk_format.erasure.sets[0][index];
-            write_legacy_format(&disks[index], &disk_format).await;
+            write_legacy_format(disk, &disk_format).await;
         }
 
         assert!(matches!(

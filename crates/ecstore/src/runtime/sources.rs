@@ -424,7 +424,11 @@ pub(crate) async fn record_local_disk_id(instance_ctx: &Arc<InstanceContext>, di
 pub(crate) async fn replace_local_disk_id(previous: Option<Uuid>, current: Option<Uuid>, endpoint: String) {
     let id_map = local_disk_id_map_handle();
     let mut disk_id_map = id_map.write().await;
-    if let Some(previous_id) = previous {
+    if let Some(previous_id) = previous
+        && disk_id_map
+            .get(&previous_id)
+            .is_some_and(|registered_endpoint| registered_endpoint == &endpoint)
+    {
         disk_id_map.remove(&previous_id);
     }
     if let Some(current_id) = current {
@@ -558,10 +562,14 @@ pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LockRegistry, local_node_name, set_local_node_name};
+    use super::{
+        LockRegistry, clear_local_disk_id_map_for_test, local_disk_path_by_id, local_node_name, replace_local_disk_id,
+        set_local_node_name,
+    };
     use crate::disk::endpoint::Endpoint;
     use rustfs_lock::{LocalClient, LockClient};
     use std::{collections::HashMap, sync::Arc};
+    use uuid::Uuid;
 
     fn url_endpoint(raw: &str) -> Endpoint {
         Endpoint {
@@ -606,5 +614,18 @@ mod tests {
         set_local_node_name(previous).await;
 
         assert_eq!(observed, next);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn clearing_a_stale_disk_id_does_not_remove_another_endpoint() {
+        clear_local_disk_id_map_for_test().await;
+        let disk_id = Uuid::new_v4();
+        replace_local_disk_id(None, Some(disk_id), "endpoint-a".to_string()).await;
+
+        replace_local_disk_id(Some(disk_id), None, "endpoint-b".to_string()).await;
+
+        assert_eq!(local_disk_path_by_id(&disk_id).await, Some("endpoint-a".to_string()));
+        clear_local_disk_id_map_for_test().await;
     }
 }
