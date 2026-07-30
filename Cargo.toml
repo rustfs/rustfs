@@ -137,7 +137,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.12" }
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.18" }
 mysql_async = { default-features = false, version = "0.37" }
-async-compression = { version = "0.4.42" }
+async-compression = { version = "0.4.43" }
 async-recursion = "1.1.1"
 async-trait = "0.1.91"
 async-nats = { version = "0.50.0", default-features = false }
@@ -152,7 +152,7 @@ lapin = { default-features = false, version = "4.10.0" }
 hyper = { version = "1.11.0" }
 hyper-rustls = { default-features = false, version = "0.27.9" }
 hyper-util = { version = "0.1.20" }
-http = "1.4.2"
+http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.4"
 minlz = "1.2.3"
@@ -200,7 +200,7 @@ jsonwebtoken = { version = "11.0.0" }
 openidconnect = { default-features = false, version = "4.0" }
 pbkdf2 = "0.13.0"
 rsa = { version = "=0.10.0-rc.18" }
-rustls = { default-features = false, version = "0.23.42" }
+rustls = { default-features = false, version = "0.23.43" }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.15.1"
 sha1 = "0.11.0"
@@ -283,7 +283,7 @@ reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "8.0.2" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.33.3" }
-redis = { version = "1.4.1" }
+redis = { version = "1.5.0" }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
