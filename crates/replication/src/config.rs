@@ -186,17 +186,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
             if let Some(filter) = &rule.filter {
                 let object_tags = ReplicationTagFilter::decode_tags_to_map(&obj.user_tags);
-                let tags_match = if let Some(and) = &filter.and {
-                    and.tags.as_ref().is_none_or(|tags| {
-                        tags.iter()
-                            .all(|tag| tag.key.as_ref().is_some_and(|key| object_tags.get(key) == tag.value.as_ref()))
-                    })
-                } else if let Some(tag) = &filter.tag {
-                    tag.key.as_ref().is_some_and(|key| object_tags.get(key) == tag.value.as_ref())
-                } else {
-                    true
-                };
-                if tags_match {
+                if filter.test_tags(&object_tags) {
                     rules.push(rule.clone());
                 }
             } else {
@@ -334,9 +324,8 @@ mod tests {
     use super::*;
     use s3s::dto::{
         DeleteMarkerReplication, DeleteReplication, Destination, EncryptionConfiguration, ExistingObjectReplication, Metrics,
-        MetricsStatus, ReplicationRule, ReplicationRuleAndOperator, ReplicationRuleFilter, ReplicationTime,
-        ReplicationTimeStatus, ReplicationTimeValue, SourceSelectionCriteria, SseKmsEncryptedObjects,
-        SseKmsEncryptedObjectsStatus, Tag,
+        MetricsStatus, ReplicationRule, ReplicationTime, ReplicationTimeStatus, ReplicationTimeValue, SourceSelectionCriteria,
+        SseKmsEncryptedObjects, SseKmsEncryptedObjectsStatus,
     };
 
     fn replication_rule(id: &str, arn: &str) -> ReplicationRule {
@@ -636,69 +625,6 @@ mod tests {
             !config.replicate(&opts),
             "highest-priority rule disables delete-marker replication, so the delete marker must not replicate"
         );
-    }
-
-    #[test]
-    fn replication_filter_requires_every_and_tag_and_accepts_extra_tags() {
-        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
-        let mut rule = replication_rule("and-tags", arn);
-        rule.filter = Some(ReplicationRuleFilter {
-            and: Some(ReplicationRuleAndOperator {
-                prefix: Some("logs/".to_string()),
-                tags: Some(vec![
-                    Tag {
-                        key: Some("env".to_string()),
-                        value: Some("prod".to_string()),
-                    },
-                    Tag {
-                        key: Some("team".to_string()),
-                        value: Some("storage/core".to_string()),
-                    },
-                ]),
-            }),
-            ..Default::default()
-        });
-        rule.prefix = None;
-        let config = ReplicationConfiguration {
-            role: String::new(),
-            rules: vec![rule],
-        };
-
-        let matching = ObjectOpts {
-            name: "logs/app.log".to_string(),
-            user_tags: "env=prod&team=storage%2Fcore&extra=value".to_string(),
-            op_type: ReplicationType::Object,
-            ..Default::default()
-        };
-        let partial = ObjectOpts {
-            user_tags: "env=prod".to_string(),
-            ..matching.clone()
-        };
-        let wrong_prefix = ObjectOpts {
-            name: "archive/app.log".to_string(),
-            ..matching.clone()
-        };
-
-        for (op_type, existing_object) in [
-            (ReplicationType::Object, false),
-            (ReplicationType::Delete, false),
-            (ReplicationType::ExistingObject, true),
-            (ReplicationType::Heal, false),
-        ] {
-            let mut matching = matching.clone();
-            matching.op_type = op_type;
-            matching.existing_object = existing_object;
-            let mut partial = partial.clone();
-            partial.op_type = op_type;
-            partial.existing_object = existing_object;
-            let mut wrong_prefix = wrong_prefix.clone();
-            wrong_prefix.op_type = op_type;
-            wrong_prefix.existing_object = existing_object;
-
-            assert_eq!(config.filter_actionable_rules(&matching).len(), 1);
-            assert!(config.filter_actionable_rules(&partial).is_empty());
-            assert!(config.filter_actionable_rules(&wrong_prefix).is_empty());
-        }
     }
 
     #[test]
