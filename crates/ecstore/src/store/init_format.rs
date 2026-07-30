@@ -199,6 +199,7 @@ async fn try_migrate_format(
 ) -> Result<LegacyFormatOutcome> {
     let legacy_format_max_bytes = legacy_format_max_bytes(disks.len())?;
     let mut legacy_seen = false;
+    let mut invalid_legacy_format = false;
     let mut read_error: Option<Error> = None;
     let mut legacy_formats = vec![None; disks.len()];
 
@@ -242,7 +243,8 @@ async fn try_migrate_format(
         };
         legacy_seen = true;
         match read {
-            Ok(format) => legacy_formats[index] = format,
+            Ok(Some(format)) => legacy_formats[index] = Some(format),
+            Ok(None) => invalid_legacy_format = true,
             Err(err) => {
                 read_error.get_or_insert_with(|| err.into());
             }
@@ -255,6 +257,9 @@ async fn try_migrate_format(
     if !legacy_seen {
         return Ok(LegacyFormatOutcome::None);
     }
+    if invalid_legacy_format {
+        return Ok(LegacyFormatOutcome::Incompatible);
+    }
 
     let format = match get_format_erasure_in_quorum(&legacy_formats, 0) {
         Ok(format) => format,
@@ -262,6 +267,7 @@ async fn try_migrate_format(
     };
     if format.erasure.sets.len() != set_count
         || check_format_erasure_value_for_topology(&format, disks.len(), set_drive_count).is_err()
+        || !formats_match_reference_slots(&legacy_formats, &format, 0)
     {
         return Ok(LegacyFormatOutcome::Incompatible);
     }
@@ -674,6 +680,14 @@ mod tests {
         write_legacy_bytes(disk, bytes::Bytes::from(format.to_json().expect("legacy format should serialize"))).await;
     }
 
+    async fn write_legacy_majority(disks: &[Option<DiskStore>], format: &FormatV3) {
+        for index in 0..(disks.len() / 2 + 1) {
+            let mut disk_format = format.clone();
+            disk_format.erasure.this = format.erasure.sets[0][index];
+            write_legacy_format(&disks[index], &disk_format).await;
+        }
+    }
+
     async fn write_legacy_bytes(disk: &Option<DiskStore>, data: bytes::Bytes) {
         let disk = disk.as_ref().expect("legacy disk should exist");
         if let Err(err) = disk.make_volume(MIGRATING_META_BUCKET).await {
@@ -976,11 +990,7 @@ mod tests {
     async fn compatible_legacy_format_migrates() {
         let (_temp_dir, mut disks) = local_disks(3).await;
         let legacy = FormatV3::new(1, 3);
-        for index in 0..2 {
-            let mut disk_format = legacy.clone();
-            disk_format.erasure.this = legacy.erasure.sets[0][index];
-            write_legacy_format(&disks[index], &disk_format).await;
-        }
+        write_legacy_majority(&disks, &legacy).await;
 
         let mut expected = legacy;
         expected.erasure.this = Uuid::nil();
@@ -990,6 +1000,45 @@ mod tests {
                 .expect("compatible legacy format should migrate"),
             expected
         );
+        let (formats, errors) = load_format_erasure_all(&disks, false).await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "every available disk should receive the migrated format"
+        );
+        for (index, format) in formats.iter().enumerate() {
+            assert_eq!(
+                format.as_ref().map(|format| format.erasure.this),
+                Some(expected.erasure.sets[0][index]),
+                "the migrated format must preserve each disk's physical slot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_legacy_format_migrates_when_the_file_is_missing() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let legacy = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &legacy).await;
+        disks[2]
+            .as_ref()
+            .expect("third legacy disk should exist")
+            .make_volume(MIGRATING_META_BUCKET)
+            .await
+            .expect("legacy metadata volume should be created without a format file");
+
+        connect_load_init_formats(true, &mut disks, 1, 3, None)
+            .await
+            .expect("a missing legacy format file should be initialized from the majority");
+        let (formats, errors) = load_format_erasure_all(&disks, false).await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "every available disk should receive the migrated format"
+        );
+        assert_eq!(
+            formats[2].as_ref().map(|format| format.erasure.this),
+            Some(legacy.erasure.sets[0][2]),
+            "the missing legacy format file must be replaced with the third slot"
+        );
     }
 
     #[tokio::test]
@@ -997,11 +1046,7 @@ mod tests {
         let (_temp_dir, mut disks) = local_disks(3).await;
         let mut legacy = FormatV3::new(1, 3);
         legacy.id = Uuid::nil();
-        for index in 0..2 {
-            let mut disk_format = legacy.clone();
-            disk_format.erasure.this = legacy.erasure.sets[0][index];
-            write_legacy_format(&disks[index], &disk_format).await;
-        }
+        write_legacy_majority(&disks, &legacy).await;
 
         assert!(matches!(
             connect_load_init_formats(true, &mut disks, 1, 3, None).await,
@@ -1017,26 +1062,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_format_migration_selects_the_slot_correct_majority() {
+    async fn legacy_format_migration_rejects_a_foreign_minority() {
         let (_temp_dir, mut disks) = local_disks(3).await;
         let majority = FormatV3::new(1, 3);
-        for index in 0..2 {
-            let mut disk_format = majority.clone();
-            disk_format.erasure.this = majority.erasure.sets[0][index];
-            write_legacy_format(&disks[index], &disk_format).await;
-        }
+        write_legacy_majority(&disks, &majority).await;
         let minority = FormatV3::new(1, 3);
         let mut minority_disk = minority;
         minority_disk.erasure.this = minority_disk.erasure.sets[0][2];
         write_legacy_format(&disks[2], &minority_disk).await;
 
-        let mut expected = majority;
-        expected.erasure.this = Uuid::nil();
-        assert_eq!(
-            connect_load_init_formats(true, &mut disks, 1, 3, None)
-                .await
-                .expect("a strict legacy majority should migrate"),
-            expected
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::CorruptedFormat)
+        ));
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert!(formats.iter().all(Option::is_none), "a foreign legacy minority must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_rejects_a_wrong_slot_minority() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let majority = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &majority).await;
+        let mut wrong_slot = majority;
+        wrong_slot.erasure.this = wrong_slot.erasure.sets[0][1];
+        write_legacy_format(&disks[2], &wrong_slot).await;
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::CorruptedFormat)
+        ));
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert!(
+            formats.iter().all(Option::is_none),
+            "a wrong-slot legacy minority must not be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_rejects_a_malformed_minority() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let majority = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &majority).await;
+        write_legacy_bytes(&disks[2], bytes::Bytes::from_static(b"{not-json")).await;
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::CorruptedFormat)
+        ));
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert!(formats.iter().all(Option::is_none), "a malformed legacy minority must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_rejects_an_empty_minority() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let majority = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &majority).await;
+        write_legacy_bytes(&disks[2], bytes::Bytes::new()).await;
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::CorruptedFormat)
+        ));
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert!(formats.iter().all(Option::is_none), "an empty legacy minority must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn legacy_format_migration_rejects_a_parseable_invalid_minority() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let majority = FormatV3::new(1, 3);
+        write_legacy_majority(&disks, &majority).await;
+        let mut invalid = majority;
+        invalid.id = Uuid::nil();
+        invalid.erasure.this = invalid.erasure.sets[0][2];
+        write_legacy_format(&disks[2], &invalid).await;
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::CorruptedFormat)
+        ));
+        let (formats, _) = load_format_erasure_all(&disks, false).await;
+        assert!(
+            formats.iter().all(Option::is_none),
+            "a parseable invalid legacy minority must not be overwritten"
         );
     }
 
