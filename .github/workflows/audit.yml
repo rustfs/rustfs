@@ -23,6 +23,7 @@ on:
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
+      - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
@@ -33,6 +34,7 @@ on:
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
+      - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
     - cron: '0 3 * * 0' # Weekly on Sunday 03:00 UTC (staggered after the midnight ci/build crons)
@@ -95,6 +97,9 @@ jobs:
 
       - name: Report unpinned GitHub Actions
         run: ./scripts/security/check_workflow_pins.sh --enforce
+
+      - name: Check preview release workflow policy
+        run: ./scripts/security/check_preview_release_workflow.sh
 
   dependency-review:
     name: Dependency Review
