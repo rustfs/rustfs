@@ -1044,6 +1044,7 @@ mod tests {
                     op: MrfOpKind::Object,
                     delete_marker_version_id: None,
                     delete_marker: false,
+                    replica: false,
                     delete_marker_mtime: None,
                 },
                 MrfReplicateEntry {
@@ -1055,6 +1056,7 @@ mod tests {
                     op: MrfOpKind::Object,
                     delete_marker_version_id: None,
                     delete_marker: false,
+                    replica: false,
                     delete_marker_mtime: None,
                 },
             ],

@@ -67,6 +67,7 @@ const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
+const EVENT_REPLICATION_MRF_ENTRY_SKIPPED: &str = "replication_mrf_entry_skipped";
 
 #[derive(Debug, Default)]
 pub struct DurableMrfBacklog {
@@ -660,6 +661,21 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             for entry in entries.iter() {
                 match entry.op {
                     MrfOpKind::Delete => {
+                        let Some(delete_parts) = entry.delete_parts_for_replay() else {
+                            debug!(
+                                event = EVENT_REPLICATION_MRF_ENTRY_SKIPPED,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                bucket = %entry.bucket,
+                                object = %entry.object,
+                                reason = "invalid_delete_version_ids",
+                                "Skipped invalid persisted replication delete"
+                            );
+                            continue;
+                        };
+                        let version_purge_id = delete_parts
+                            .version_id
+                            .or_else(|| delete_parts.delete_marker_version_id.filter(|_| !delete_parts.delete_marker));
                         // Reconstruct a heal delete and re-queue it.  We do NOT call
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
@@ -674,15 +690,20 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         let oi = ObjectInfo {
                             bucket: entry.bucket.clone(),
                             name: entry.object.clone(),
-                            version_id: entry.version_id,
-                            delete_marker: entry.delete_marker,
+                            version_id: version_purge_id,
+                            delete_marker: delete_parts.delete_marker,
+                            replication_status: if entry.replica {
+                                ReplicationStatusType::Replica
+                            } else {
+                                ReplicationStatusType::Empty
+                            },
                             ..Default::default()
                         };
                         let dsc = check_replicate_delete(
                             &entry.bucket,
                             &ObjectToDelete {
                                 object_name: entry.object.clone(),
-                                version_id: entry.version_id,
+                                version_id: version_purge_id,
                                 ..Default::default()
                             },
                             &oi,
@@ -708,9 +729,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         let dv = DeletedObjectReplicationInfo {
                             delete_object: ReplicationDeletedObject {
                                 object_name: entry.object.clone(),
-                                version_id: entry.version_id,
-                                delete_marker_version_id: entry.delete_marker_version_id,
-                                delete_marker: entry.delete_marker,
+                                version_id: delete_parts.version_id,
+                                delete_marker_version_id: delete_parts.delete_marker_version_id,
+                                delete_marker: delete_parts.delete_marker,
                                 delete_marker_mtime,
                                 replication_state: Some(rstate),
                                 ..Default::default()
@@ -2333,6 +2354,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         };
         let second = MrfReplicateEntry {
@@ -2446,6 +2468,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         };
 
@@ -2479,6 +2502,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: Some(dm_vid),
             delete_marker: true,
+            replica: false,
             delete_marker_mtime: Some(mtime_nanos),
         };
 
@@ -2512,6 +2536,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         };
 
@@ -2540,6 +2565,7 @@ mod tests {
                 op: MrfOpKind::Object,
                 delete_marker_version_id: None,
                 delete_marker: false,
+                replica: false,
                 delete_marker_mtime: None,
             },
             MrfReplicateEntry {
@@ -2551,6 +2577,7 @@ mod tests {
                 op: MrfOpKind::Delete,
                 delete_marker_version_id: Some(del_dm_vid),
                 delete_marker: true,
+                replica: false,
                 delete_marker_mtime: None,
             },
         ];
@@ -2580,6 +2607,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
@@ -2594,6 +2622,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
+            replica: false,
             delete_marker_mtime: None,
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
@@ -2609,6 +2638,7 @@ mod tests {
             op: MrfOpKind::default(),
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
@@ -2672,6 +2702,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         }];
         let encoded = encode_mrf_file(&entries).expect("durable MRF backlog should encode");
@@ -2702,6 +2733,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            replica: false,
             delete_marker_mtime: None,
         }])
         .expect("invalid persisted entry should still encode for boundary testing");

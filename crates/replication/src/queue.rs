@@ -17,8 +17,8 @@ use std::any::Any;
 use crate::storage_api::DeletedObject;
 use crate::{
     DeletedObjectReplicationInfo, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE,
-    ReplicateObjectInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision,
-    VersionPurgeStatusType,
+    ReplicateObjectInfo, ReplicationDeleteParts, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+    ResyncDecision, VersionPurgeStatusType, delete_replication_parts,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,7 +109,11 @@ pub fn replication_heal_queue_action(roi: &mut ReplicateObjectInfo) -> Replicati
     }
 
     if roi.delete_marker || !roi.version_purge_status.is_empty() {
-        let delete_info = heal_deleted_object_replication_info(roi);
+        let Some(parts) = delete_replication_parts(roi.delete_marker, roi.version_id, !roi.version_purge_status.is_empty())
+        else {
+            return ReplicationHealQueueAction::Skip;
+        };
+        let delete_info = heal_deleted_object_replication_info(roi, parts);
 
         if is_pending_or_failed_object_heal(roi) || is_pending_or_failed_version_purge(roi) {
             return ReplicationHealQueueAction::QueueDelete(delete_info);
@@ -144,21 +148,18 @@ pub fn replication_heal_queue_action(roi: &mut ReplicateObjectInfo) -> Replicati
     ReplicationHealQueueAction::Skip
 }
 
-fn heal_deleted_object_replication_info(roi: &ReplicateObjectInfo) -> DeletedObjectReplicationInfo {
-    let (version_id, delete_marker_version_id) = if roi.version_purge_status.is_empty() {
-        (None, roi.version_id)
-    } else {
-        (roi.version_id, None)
-    };
-
+fn heal_deleted_object_replication_info(
+    roi: &ReplicateObjectInfo,
+    parts: ReplicationDeleteParts,
+) -> DeletedObjectReplicationInfo {
     DeletedObjectReplicationInfo {
         delete_object: DeletedObject {
             object_name: roi.name.clone(),
-            delete_marker_version_id,
-            version_id,
+            delete_marker_version_id: parts.delete_marker_version_id,
+            version_id: parts.version_id,
             replication_state: roi.replication_state.clone(),
             delete_marker_mtime: roi.mod_time,
-            delete_marker: roi.delete_marker,
+            delete_marker: parts.delete_marker,
             ..Default::default()
         },
         bucket: roi.bucket.clone(),
@@ -399,6 +400,7 @@ mod tests {
         let version_id = Uuid::new_v4();
         let mut roi = replicate_object_info(ReplicationStatusType::Completed);
         roi.version_id = Some(version_id);
+        roi.delete_marker = true;
         roi.version_purge_status = VersionPurgeStatusType::Pending;
 
         let action = replication_heal_queue_action(&mut roi);
@@ -408,6 +410,16 @@ mod tests {
         };
         assert_eq!(delete_info.delete_object.version_id, Some(version_id));
         assert_eq!(delete_info.delete_object.delete_marker_version_id, None);
+        assert!(!delete_info.delete_object.delete_marker);
+    }
+
+    #[test]
+    fn heal_queue_action_skips_version_purge_without_version_id() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+        roi.delete_marker = true;
+        roi.version_purge_status = VersionPurgeStatusType::Pending;
+
+        assert!(matches!(replication_heal_queue_action(&mut roi), ReplicationHealQueueAction::Skip));
     }
 
     #[test]

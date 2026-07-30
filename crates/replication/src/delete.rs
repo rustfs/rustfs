@@ -15,7 +15,7 @@
 use std::any::Any;
 
 use crate::storage_api::DeletedObject;
-use crate::{MrfOpKind, MrfReplicateEntry, ReplicationType, ReplicationWorkerOperation};
+use crate::{MrfOpKind, MrfReplicateEntry, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation};
 
 #[derive(Debug, Clone, Default)]
 pub struct DeletedObjectReplicationInfo {
@@ -42,6 +42,11 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
             op: MrfOpKind::Delete,
             delete_marker_version_id: self.delete_object.delete_marker_version_id,
             delete_marker: self.delete_object.delete_marker,
+            replica: self
+                .delete_object
+                .replication_state
+                .as_ref()
+                .is_some_and(|state| state.replica_status == ReplicationStatusType::Replica),
             // Persist the original delete-marker mtime as Unix nanoseconds so replay after a
             // restart stamps the replica with the source timestamp rather than the replay time
             // (backlog#867). None when unknown; replay then falls back to the current time.
@@ -85,14 +90,22 @@ pub fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Opti
     !(is_not_found || matches!(code, Some("MethodNotAllowed" | "405")))
 }
 
+pub fn version_purge_target_missing(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
+    if matches!(code, Some("MethodNotAllowed" | "405")) || raw_status == Some(405) {
+        return false;
+    }
+
+    is_not_found || matches!(code, Some("NoSuchVersion" | "NoSuchKey" | "NotFound" | "404")) || raw_status == Some(404)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
-        should_retry_delete_marker_purge,
+        should_retry_delete_marker_purge, version_purge_target_missing,
     };
     use crate::storage_api::DeletedObject;
-    use crate::{MrfOpKind, ReplicationType, ReplicationWorkerOperation};
+    use crate::{MrfOpKind, ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation};
     use uuid::Uuid;
 
     #[test]
@@ -109,6 +122,10 @@ mod tests {
                 delete_marker_version_id: Some(delete_marker_version_id),
                 delete_marker: true,
                 delete_marker_mtime: Some(mtime),
+                replication_state: Some(ReplicationState {
+                    replica_status: ReplicationStatusType::Replica,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -122,6 +139,7 @@ mod tests {
         assert_eq!(entry.delete_marker_version_id, Some(delete_marker_version_id));
         assert_eq!(entry.op, MrfOpKind::Delete);
         assert!(entry.delete_marker);
+        assert!(entry.replica);
         // The original mtime must be persisted (as Unix nanos) so replay keeps the source
         // timestamp instead of stamping the replica with the replay time (backlog#867).
         assert_eq!(
@@ -211,5 +229,15 @@ mod tests {
         assert!(!is_retryable_delete_replication_head_error(false, Some("MethodNotAllowed")));
         assert!(!is_retryable_delete_replication_head_error(true, Some("NoSuchKey")));
         assert!(is_retryable_delete_replication_head_error(false, Some("AccessDenied")));
+    }
+
+    #[test]
+    fn version_purge_target_missing_requires_not_found() {
+        assert!(version_purge_target_missing(true, Some("NoSuchVersion"), Some(404)));
+        assert!(version_purge_target_missing(false, Some("NoSuchVersion"), None));
+        assert!(version_purge_target_missing(false, None, Some(404)));
+        assert!(!version_purge_target_missing(false, None, None));
+        assert!(!version_purge_target_missing(true, Some("MethodNotAllowed"), Some(405)));
+        assert!(!version_purge_target_missing(true, Some("405"), None));
     }
 }

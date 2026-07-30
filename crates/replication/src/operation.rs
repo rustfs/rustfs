@@ -151,6 +151,11 @@ pub fn delete_replication_state_from_config(
 
     let pending_status = decision.pending_status();
     let mut state = ReplicationState {
+        replica_status: if source.replica {
+            ReplicationStatusType::Replica
+        } else {
+            ReplicationStatusType::Empty
+        },
         replicate_decision_str: decision.to_string(),
         ..Default::default()
     };
@@ -174,11 +179,31 @@ pub struct ReplicationDeleteScheduleInput<'a> {
     pub deleted_delete_marker_version: bool,
 }
 
-fn delete_version_purge_source_status(status: &ReplicationStatusType) -> bool {
-    status == &ReplicationStatusType::Replica
-        || status == &ReplicationStatusType::Pending
-        || status == &ReplicationStatusType::Completed
-        || status == &ReplicationStatusType::Failed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationDeleteParts {
+    pub delete_marker: bool,
+    pub version_id: Option<Uuid>,
+    pub delete_marker_version_id: Option<Uuid>,
+}
+
+pub fn delete_replication_parts(
+    source_delete_marker: bool,
+    source_version_id: Option<Uuid>,
+    version_purge: bool,
+) -> Option<ReplicationDeleteParts> {
+    if version_purge {
+        return source_version_id.map(|version_id| ReplicationDeleteParts {
+            delete_marker: false,
+            version_id: Some(version_id),
+            delete_marker_version_id: None,
+        });
+    }
+
+    Some(ReplicationDeleteParts {
+        delete_marker: source_delete_marker,
+        version_id: None,
+        delete_marker_version_id: source_version_id,
+    })
 }
 
 pub fn should_schedule_delete_replication(input: ReplicationDeleteScheduleInput<'_>) -> bool {
@@ -186,14 +211,11 @@ pub fn should_schedule_delete_replication(input: ReplicationDeleteScheduleInput<
         return false;
     }
 
-    if input.version_id_requested && !input.deleted_delete_marker_version && !input.source_delete_marker {
-        return delete_version_purge_source_status(input.source_replication_status);
+    if input.version_id_requested {
+        return input.source_version_purge_status == &VersionPurgeStatusType::Pending;
     }
 
-    input.source_replication_status == &ReplicationStatusType::Replica
-        || input.source_replication_status == &ReplicationStatusType::Pending
-        || input.source_version_purge_status == &VersionPurgeStatusType::Pending
-        || (input.deleted_delete_marker_version && input.source_replication_status == &ReplicationStatusType::Completed)
+    input.source_replication_status == &ReplicationStatusType::Pending
 }
 
 pub fn delete_replication_version_id(
@@ -312,19 +334,20 @@ pub fn resync_target_for_object(
 #[cfg(test)]
 mod tests {
     use super::{
-        MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteSource, ReplicationDeleteStateSource,
-        ReplicationResyncTargetObject, delete_replication_missing_source_decision, delete_replication_object_opts,
-        delete_replication_state_from_config, delete_replication_version_id, heal_uses_delete_replication_path,
-        is_ssec_encrypted, resync_target_for_object, should_schedule_delete_replication,
-        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+        MustReplicateOptions, ReplicationDeleteParts, ReplicationDeleteScheduleInput, ReplicationDeleteSource,
+        ReplicationDeleteStateSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
+        delete_replication_object_opts, delete_replication_parts, delete_replication_state_from_config,
+        delete_replication_version_id, heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
+        should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        should_use_existing_delete_replication_source,
     };
     use crate::http::{AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER};
     use crate::storage_api::ObjectToDelete;
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
     use s3s::dto::{
-        DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
-        ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
+        DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
+        ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
     };
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
@@ -474,6 +497,7 @@ mod tests {
             .expect("replica delete marker should be forwarded to downstream targets");
         let pending = format!("{arn}=PENDING;");
 
+        assert_eq!(state.replica_status, ReplicationStatusType::Replica);
         assert_eq!(state.replication_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.targets.contains_key(arn));
@@ -500,9 +524,13 @@ mod tests {
     #[test]
     fn delete_replication_state_tracks_delete_marker_version_purges() {
         let arn = "arn:aws:s3:::target-bucket";
+        let mut rule = delete_replication_rule(arn, false);
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
         let config = ReplicationConfiguration {
             role: arn.to_string(),
-            rules: vec![delete_replication_rule(arn, false)],
+            rules: vec![rule],
         };
         let source = ReplicationDeleteStateSource {
             name: "test/object.txt".to_string(),
@@ -513,9 +541,10 @@ mod tests {
         };
 
         let state = delete_replication_state_from_config(&config, &source)
-            .expect("delete-marker version purge should honor delete-marker replication rules");
+            .expect("delete-marker version purge should honor delete replication rules");
         let pending = format!("{arn}=PENDING;");
 
+        assert_eq!(state.replica_status, ReplicationStatusType::Empty);
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.purge_targets.contains_key(arn));
@@ -534,13 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_replication_schedule_keeps_marker_and_version_purges() {
+    fn delete_replication_schedule_uses_pending_state_from_current_delete_rules() {
         assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
             replication_request: false,
             version_id_requested: true,
             source_delete_marker: true,
-            source_replication_status: &ReplicationStatusType::Completed,
-            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            source_replication_status: &ReplicationStatusType::Empty,
+            source_version_purge_status: &VersionPurgeStatusType::Pending,
             deleted_delete_marker_version: true,
         }));
         assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
@@ -548,17 +577,52 @@ mod tests {
             version_id_requested: true,
             source_delete_marker: false,
             source_replication_status: &ReplicationStatusType::Completed,
-            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            source_version_purge_status: &VersionPurgeStatusType::Pending,
             deleted_delete_marker_version: false,
         }));
         assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
             replication_request: false,
             version_id_requested: false,
             source_delete_marker: false,
-            source_replication_status: &ReplicationStatusType::Empty,
-            source_version_purge_status: &VersionPurgeStatusType::Pending,
+            source_replication_status: &ReplicationStatusType::Pending,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
             deleted_delete_marker_version: false,
         }));
+    }
+
+    #[test]
+    fn delete_replication_schedule_skips_non_pending_states() {
+        for replication_status in [
+            ReplicationStatusType::Empty,
+            ReplicationStatusType::Replica,
+            ReplicationStatusType::Completed,
+            ReplicationStatusType::CompletedLegacy,
+            ReplicationStatusType::Failed,
+        ] {
+            assert!(!should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+                replication_request: false,
+                version_id_requested: false,
+                source_delete_marker: false,
+                source_replication_status: &replication_status,
+                source_version_purge_status: &VersionPurgeStatusType::Empty,
+                deleted_delete_marker_version: false,
+            }));
+        }
+
+        for version_purge_status in [
+            VersionPurgeStatusType::Empty,
+            VersionPurgeStatusType::Complete,
+            VersionPurgeStatusType::Failed,
+        ] {
+            assert!(!should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+                replication_request: false,
+                version_id_requested: true,
+                source_delete_marker: true,
+                source_replication_status: &ReplicationStatusType::Completed,
+                source_version_purge_status: &version_purge_status,
+                deleted_delete_marker_version: true,
+            }));
+        }
     }
 
     #[test]
@@ -567,6 +631,32 @@ mod tests {
 
         assert_eq!(delete_replication_version_id(true, Some(version_id), false), None);
         assert_eq!(delete_replication_version_id(true, Some(version_id), true), Some(version_id));
+    }
+
+    #[test]
+    fn delete_replication_parts_fail_closed_without_purge_version() {
+        assert_eq!(delete_replication_parts(true, None, true), None);
+
+        for version_id in [Uuid::nil(), Uuid::new_v4()] {
+            assert_eq!(
+                delete_replication_parts(true, Some(version_id), true),
+                Some(ReplicationDeleteParts {
+                    delete_marker: false,
+                    version_id: Some(version_id),
+                    delete_marker_version_id: None,
+                })
+            );
+        }
+
+        let marker_version_id = Uuid::new_v4();
+        assert_eq!(
+            delete_replication_parts(true, Some(marker_version_id), false),
+            Some(ReplicationDeleteParts {
+                delete_marker: true,
+                version_id: None,
+                delete_marker_version_id: Some(marker_version_id),
+            })
+        );
     }
 
     #[test]

@@ -3237,6 +3237,116 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
         .await?;
     assert_eq!(retained.body.collect().await?.into_bytes().as_ref(), b"versioned replication payload v2");
 
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .version_id(delete_marker_version_id)
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    assert!(
+        target_state.iter().all(|entry| entry.version_id != delete_marker_version_id),
+        "target retained the explicitly purged delete-marker version"
+    );
+    assert!(
+        target_state
+            .iter()
+            .any(|entry| !entry.delete_marker && entry.version_id == retained_version_id),
+        "target removed the retained object version while purging the delete marker: {target_state:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_disabled_version_delete_preserves_target_versions_issue_5442() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-no-version-delete-src";
+    let target_bucket = "replication-no-version-delete-dst";
+    let object_key = "retained-versions.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Enabled", None).await?;
+
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"permanent delete replication disabled"))
+        .send()
+        .await?;
+    let object_version_id = put.version_id().ok_or("source PUT omitted version ID")?.to_string();
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    let delete_marker_version_id = delete
+        .version_id()
+        .ok_or("source DELETE omitted marker version ID")?
+        .to_string();
+    assert_eq!(delete.delete_marker(), Some(true));
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    let expected_target_state = list_replication_state(&target_client, target_bucket).await?;
+    assert_eq!(expected_target_state.len(), 2);
+    assert!(
+        expected_target_state
+            .iter()
+            .any(|entry| !entry.delete_marker && entry.version_id == object_version_id)
+    );
+    assert!(
+        expected_target_state
+            .iter()
+            .any(|entry| entry.delete_marker && entry.version_id == delete_marker_version_id)
+    );
+
+    for version_id in [&object_version_id, &delete_marker_version_id] {
+        source_client
+            .delete_object()
+            .bucket(source_bucket)
+            .key(object_key)
+            .version_id(version_id)
+            .send()
+            .await?;
+    }
+    assert!(list_replication_state(&source_client, source_bucket).await?.is_empty());
+
+    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let target_state = list_replication_state(&target_client, target_bucket).await?;
+        assert_eq!(
+            target_state, expected_target_state,
+            "disabled permanent-delete replication changed target versions"
+        );
+        if tokio::time::Instant::now() >= observation_deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
     Ok(())
 }
 

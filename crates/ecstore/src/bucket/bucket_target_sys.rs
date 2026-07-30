@@ -1278,6 +1278,12 @@ fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOpti
 fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
     if opts.replication_request && opts.replication_delete_marker {
         None
+    } else if opts.replication_request
+        && version_id
+            .as_deref()
+            .is_some_and(|version_id| Uuid::parse_str(version_id).is_ok_and(|version_id| version_id.is_nil()))
+    {
+        Some("null".to_string())
     } else {
         version_id
     }
@@ -2257,6 +2263,12 @@ mod tests {
         let vid = Uuid::new_v4().to_string();
         let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(true, false));
         assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[test]
+    fn null_version_purge_sends_s3_null_version_id() {
+        let got = resolve_delete_api_version_id(Some(Uuid::nil().to_string()), &remove_opts(true, false));
+        assert_eq!(got.as_deref(), Some("null"));
     }
 
     #[test]

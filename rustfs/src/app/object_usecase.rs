@@ -2637,18 +2637,24 @@ where
 fn delete_replication_state_source<'a>(
     opts: &ObjectOptions,
     existing_object_info: Option<&'a ObjectInfo>,
-    deleted_object_info: &'a ObjectInfo,
+    deleted_object_source: &'a ObjectInfo,
+    delete_result: &'a ObjectInfo,
 ) -> &'a ObjectInfo {
+    let replication_source = if opts.replication_request {
+        deleted_object_source
+    } else {
+        delete_result
+    };
     if should_use_existing_delete_replication_source(
         opts.replication_request,
-        deleted_object_info.delete_marker,
+        replication_source.delete_marker,
         existing_object_info.is_some(),
     ) && let Some(existing) = existing_object_info
     {
         return existing;
     }
 
-    deleted_object_info
+    replication_source
 }
 
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
@@ -7190,14 +7196,14 @@ impl DefaultObjectUsecase {
         let _delete_tail_guard = DeleteTailActivityGuard::new(DeleteTailStage::Tail);
         let deleted_object_source = deleted_replication_info.unwrap_or(&obj_info);
         let replication_state_source =
-            delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source);
+            delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source, &obj_info);
         let deleted_delete_marker_version = deleted_replication_info.is_some_and(|info| info.delete_marker);
 
         let delete_replication_version_id = delete_replication_version_id(deleted_object_source, deleted_delete_marker_version);
         let schedule_delete_replication = if opts.replication_request && replica {
             should_schedule_replica_delete_replication(&bucket, replication_state_source, delete_replication_version_id).await
         } else {
-            should_schedule_delete_replication(&opts, deleted_object_source, deleted_delete_marker_version)
+            should_schedule_delete_replication(&opts, replication_state_source, deleted_delete_marker_version)
         };
 
         if schedule_delete_replication {
@@ -13388,7 +13394,7 @@ mod tests {
     }
 
     #[test]
-    fn should_schedule_delete_replication_keeps_delete_marker_version_purge_from_source() {
+    fn should_schedule_delete_replication_uses_pending_marker_version_purge_state() {
         let opts = ObjectOptions {
             replication_request: false,
             version_id: Some(Uuid::new_v4().to_string()),
@@ -13396,18 +13402,18 @@ mod tests {
         };
         let replication_source = ObjectInfo {
             delete_marker: true,
-            replication_status: ReplicationStatusType::Completed,
+            version_purge_status: VersionPurgeStatusType::Pending,
             ..Default::default()
         };
 
         assert!(
             should_schedule_delete_replication(&opts, &replication_source, true),
-            "source-side delete-marker version purge still needs replication scheduling"
+            "source-side delete-marker version purge needs scheduling when the current delete rule marked it pending"
         );
     }
 
     #[test]
-    fn should_schedule_delete_replication_keeps_object_version_purge_from_completed_source() {
+    fn should_schedule_delete_replication_uses_pending_object_version_purge_state() {
         let opts = ObjectOptions {
             replication_request: false,
             version_id: Some(Uuid::new_v4().to_string()),
@@ -13416,12 +13422,13 @@ mod tests {
         let replication_source = ObjectInfo {
             delete_marker: false,
             replication_status: ReplicationStatusType::Completed,
+            version_purge_status: VersionPurgeStatusType::Pending,
             ..Default::default()
         };
 
         assert!(
             should_schedule_delete_replication(&opts, &replication_source, false),
-            "source-side object version purge must still enqueue delete replication after the original PUT completed"
+            "source-side object version purge needs scheduling when the current delete rule marked it pending"
         );
     }
 
@@ -13681,7 +13688,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_replication_state_from_config_tracks_delete_marker_version_purges() {
+    fn delete_replication_state_from_config_skips_delete_marker_version_purges_when_delete_is_disabled() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
         let config = ReplicationConfiguration {
             role: arn.clone(),
@@ -13691,7 +13698,7 @@ mod tests {
                 }),
                 delete_replication: None,
                 destination: Destination {
-                    bucket: arn.clone(),
+                    bucket: arn,
                     ..Default::default()
                 },
                 existing_object_replication: Some(ExistingObjectReplication {
@@ -13714,13 +13721,10 @@ mod tests {
         };
 
         let version_id = Some(Uuid::new_v4());
-        let state = delete_replication_state_from_config(&config, &obj_info, version_id, false)
-            .expect("delete-marker version purge should honor delete-marker replication rules");
-        let pending = format!("{arn}=PENDING;");
-
-        assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
-        assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
-        assert!(state.purge_targets.contains_key(&arn));
+        assert!(
+            delete_replication_state_from_config(&config, &obj_info, version_id, false).is_none(),
+            "delete-marker version purge must remain local when delete replication is disabled"
+        );
     }
 
     #[test]
@@ -13741,7 +13745,7 @@ mod tests {
             ..Default::default()
         };
 
-        let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
+        let source = delete_replication_state_source(&opts, Some(&existing), &deleted, &deleted);
 
         assert_eq!(source.replication_status, ReplicationStatusType::Completed);
         assert!(
@@ -13764,12 +13768,52 @@ mod tests {
             ..Default::default()
         };
 
-        let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
+        let source = delete_replication_state_source(&opts, Some(&existing), &deleted, &deleted);
 
         assert!(
             source.delete_marker,
             "source-originated deletes should keep using the new delete marker state"
         );
+    }
+
+    #[test]
+    fn delete_replication_state_source_uses_current_state_for_source_version_purge() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let existing = ObjectInfo {
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        let delete_result = ObjectInfo {
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+
+        let source = delete_replication_state_source(&opts, Some(&existing), &existing, &delete_result);
+
+        assert_eq!(source.version_purge_status, VersionPurgeStatusType::Pending);
+    }
+
+    #[test]
+    fn delete_replication_state_source_preserves_tags_for_replica_version_purge() {
+        let opts = ObjectOptions {
+            replication_request: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let existing = ObjectInfo {
+            user_tags: Arc::new("environment=production".to_string()),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+        let delete_result = ObjectInfo::default();
+
+        let source = delete_replication_state_source(&opts, Some(&existing), &existing, &delete_result);
+
+        assert_eq!(source.user_tags.as_str(), "environment=production");
+        assert_eq!(source.replication_status, ReplicationStatusType::Replica);
     }
 
     #[test]

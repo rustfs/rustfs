@@ -13,6 +13,6 @@
 // limitations under the License.
 
 pub use rustfs_replication::{
-    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, replication_target_arns,
-    should_remove_replication_target, validate_replication_config_target_arns,
+    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, delete_replication_target_arns,
+    replication_target_arns, should_remove_replication_target, validate_replication_config_target_arns,
 };

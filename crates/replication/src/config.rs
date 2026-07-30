@@ -18,7 +18,9 @@ use crate::rule::ReplicationRuleExt as _;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;
-use s3s::dto::{ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRuleStatus, ReplicationRules};
+use s3s::dto::{
+    ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, ReplicationRules,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -43,6 +45,86 @@ pub trait ReplicationConfigurationExt {
     fn get_destination(&self) -> Destination;
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
+}
+
+pub fn delete_replication_target_arns(config: &ReplicationConfiguration, object_name: &str, replica: bool) -> HashSet<String> {
+    let role = config.role.trim();
+    if !role.is_empty() && active_replication_rule_destination_arns(config).len() > 1 {
+        return HashSet::new();
+    }
+
+    let mut targets = HashSet::new();
+    let mut targets_with_unknown_tags = HashSet::new();
+    for rule in &config.rules {
+        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED)
+            || !object_name.starts_with(rule.prefix())
+        {
+            continue;
+        }
+        let arn = if role.is_empty() {
+            rule.destination.bucket.trim()
+        } else {
+            role
+        };
+        if arn.is_empty() {
+            continue;
+        }
+        targets.insert(arn.to_string());
+        if rule.filter.as_ref().is_some_and(|filter| {
+            filter.tag.is_some()
+                || filter
+                    .and
+                    .as_ref()
+                    .and_then(|and| and.tags.as_ref())
+                    .is_some_and(|tags| !tags.is_empty())
+        }) {
+            targets_with_unknown_tags.insert(arn.to_string());
+        }
+    }
+
+    targets
+        .into_iter()
+        .filter(|arn| !targets_with_unknown_tags.contains(arn))
+        .filter(|arn| {
+            config.replicate(&ObjectOpts {
+                name: object_name.to_string(),
+                target_arn: arn.clone(),
+                version_id: Some(Uuid::nil()),
+                delete_marker: true,
+                op_type: ReplicationType::Delete,
+                replica,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+fn rule_replicates(rule: &ReplicationRule, obj: &ObjectOpts) -> bool {
+    if let Some(status) = &rule.existing_object_replication
+        && obj.existing_object
+        && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+    {
+        return false;
+    }
+
+    if obj.op_type == ReplicationType::Delete {
+        if !rule.metadata_replicate(obj) {
+            return false;
+        }
+
+        if obj.version_id.is_some() {
+            return rule
+                .delete_replication
+                .clone()
+                .is_some_and(|d| d.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED));
+        }
+
+        return rule.delete_marker_replication.clone().is_some_and(|d| {
+            d.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
+        });
+    }
+
+    rule.metadata_replicate(obj)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,37 +286,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(status) = &rule.existing_object_replication
-                && obj.existing_object
-                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
-            {
-                return false;
-            }
-
-            if obj.op_type == ReplicationType::Delete {
-                if !rule.metadata_replicate(obj) {
-                    return false;
-                }
-
-                if obj.version_id.is_some() {
-                    if obj.delete_marker {
-                        return rule.delete_marker_replication.clone().is_some_and(|d| {
-                            d.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
-                        });
-                    }
-                    return rule
-                        .delete_replication
-                        .clone()
-                        .is_some_and(|d| d.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED));
-                } else {
-                    return rule.delete_marker_replication.clone().is_some_and(|d| {
-                        d.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
-                    });
-                }
-            }
-
-            // Regular object/metadata replication
-            return rule.metadata_replicate(obj);
+            return rule_replicates(rule, obj);
         }
         false
     }
@@ -305,7 +357,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::dto::{DeleteMarkerReplication, Destination, ExistingObjectReplication, ReplicationRule};
+    use s3s::dto::{
+        DeleteMarkerReplication, DeleteReplication, Destination, ExistingObjectReplication, ReplicationRule,
+        ReplicationRuleFilter, Tag,
+    };
 
     fn replication_rule(id: &str, arn: &str) -> ReplicationRule {
         ReplicationRule {
@@ -328,6 +383,37 @@ mod tests {
     }
 
     #[test]
+    fn delete_replication_target_arns_uses_highest_priority_matching_rule() {
+        let arn = "arn:target:a";
+        let mut lower_priority = replication_rule("lower", arn);
+        lower_priority.priority = Some(1);
+        lower_priority.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let mut higher_priority = replication_rule("higher", arn);
+        higher_priority.priority = Some(2);
+        higher_priority.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        let mut config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![lower_priority, higher_priority],
+        };
+
+        let targets = delete_replication_target_arns(&config, "object", false);
+
+        assert!(targets.is_empty(), "the higher-priority disabled rule must suppress the target");
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        config.rules[1].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        assert_eq!(delete_replication_target_arns(&config, "object", false), HashSet::from([arn.to_string()]));
+    }
+
+    #[test]
     fn filter_target_arns_uses_role_when_role_is_present() {
         let config = ReplicationConfiguration {
             role: " arn:legacy:target ".to_string(),
@@ -337,13 +423,149 @@ mod tests {
             ],
         };
 
-        let arns = config.filter_target_arns(&ObjectOpts {
+        let opts = ObjectOpts {
             name: "object".to_string(),
             op_type: ReplicationType::Object,
             ..Default::default()
-        });
+        };
+        let arns = config.filter_target_arns(&opts);
 
         assert_eq!(arns, vec!["arn:legacy:target".to_string()]);
+    }
+
+    #[test]
+    fn delete_replication_target_arns_uses_role_when_role_is_present() {
+        let mut rule = replication_rule("rule", "arn:target:a");
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let config = ReplicationConfiguration {
+            role: " arn:legacy:target ".to_string(),
+            rules: vec![rule],
+        };
+
+        assert_eq!(
+            delete_replication_target_arns(&config, "object", false),
+            HashSet::from(["arn:legacy:target".to_string()])
+        );
+    }
+
+    #[test]
+    fn delete_replication_target_arns_ignores_disjoint_prefix_rules() {
+        let arn = "arn:target:a";
+        let mut matching = replication_rule("matching", arn);
+        matching.prefix = None;
+        matching.filter = Some(ReplicationRuleFilter {
+            prefix: Some("logs/".to_string()),
+            ..Default::default()
+        });
+        matching.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        let mut unrelated = replication_rule("unrelated", arn);
+        unrelated.prefix = None;
+        unrelated.filter = Some(ReplicationRuleFilter {
+            prefix: Some("archive/".to_string()),
+            ..Default::default()
+        });
+        unrelated.priority = Some(2);
+        unrelated.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let mut config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![matching, unrelated],
+        };
+
+        assert!(delete_replication_target_arns(&config, "logs/object", false).is_empty());
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        config.rules[1].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        assert_eq!(
+            delete_replication_target_arns(&config, "logs/object", false),
+            HashSet::from([arn.to_string()])
+        );
+    }
+
+    #[test]
+    fn delete_replication_target_arns_fails_closed_for_unknown_tag_rules() {
+        let arn = "arn:target:a";
+        let mut known = replication_rule("known", arn);
+        known.priority = Some(2);
+        known.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let mut unknown = replication_rule("unknown", arn);
+        unknown.priority = Some(1);
+        unknown.prefix = None;
+        unknown.filter = Some(ReplicationRuleFilter {
+            tag: Some(Tag {
+                key: Some("env".to_string()),
+                value: Some("prod".to_string()),
+            }),
+            ..Default::default()
+        });
+        unknown.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![known, unknown],
+        };
+
+        assert!(delete_replication_target_arns(&config, "object", false).is_empty());
+    }
+
+    #[test]
+    fn delete_replication_target_arns_reuses_full_destination_rule_order() {
+        let arn = "arn:target:a";
+        let mut first = replication_rule("first", arn);
+        first.priority = Some(1);
+        first.destination.account = Some("account-a".to_string());
+        first.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        let mut second = replication_rule("second", arn);
+        second.priority = Some(2);
+        second.destination.account = Some("account-b".to_string());
+        second.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![first, second],
+        };
+        let opts = ObjectOpts {
+            name: "object".to_string(),
+            target_arn: arn.to_string(),
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            op_type: ReplicationType::Delete,
+            ..Default::default()
+        };
+
+        assert!(!config.replicate(&opts));
+        assert!(delete_replication_target_arns(&config, "object", false).is_empty());
+    }
+
+    #[test]
+    fn delete_replication_target_arns_rejects_role_with_multiple_destinations() {
+        let mut first = replication_rule("first", "arn:target:a");
+        first.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let mut second = replication_rule("second", "arn:target:b");
+        second.delete_replication = first.delete_replication.clone();
+        let config = ReplicationConfiguration {
+            role: "arn:legacy:target".to_string(),
+            rules: vec![first, second],
+        };
+
+        assert!(delete_replication_target_arns(&config, "object", false).is_empty());
     }
 
     #[test]
@@ -603,6 +825,44 @@ mod tests {
         assert!(
             !config.replicate(&opts),
             "highest-priority rule disables delete-marker replication, so the delete marker must not replicate"
+        );
+    }
+
+    #[test]
+    fn delete_marker_version_purge_requires_delete_replication() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![delete_marker_rule("delete-markers-only", arn, "", 1, true)],
+        };
+        let opts = ObjectOpts {
+            name: "object.txt".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            !config.replicate(&opts),
+            "permanently deleting a delete-marker version must not use the delete-marker replication setting"
+        );
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        assert!(
+            !config.replicate(&opts),
+            "an explicitly disabled permanent-delete setting must not replicate"
+        );
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+
+        assert!(
+            config.replicate(&opts),
+            "permanently deleting a delete-marker version should replicate when delete replication is enabled"
         );
     }
 }

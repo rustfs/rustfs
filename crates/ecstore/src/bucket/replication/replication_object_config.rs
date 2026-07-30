@@ -28,7 +28,7 @@ use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONE
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
-    delete_replication_object_opts, resync_target_for_object,
+    delete_replication_object_opts, delete_replication_version_id, resync_target_for_object,
 };
 use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete, object_to_delete_for_replication};
 use super::replication_target_boundary::{BucketTargets, ReplicationTargetStore};
@@ -73,7 +73,7 @@ impl ReplicationConfig {
         if oi.delete_marker {
             let opts = ObjectOpts {
                 name: oi.name.clone(),
-                version_id: oi.version_id,
+                version_id: delete_replication_version_id(oi.delete_marker, oi.version_id, !oi.version_purge_status.is_empty()),
                 delete_marker: true,
                 op_type: ReplicationType::Delete,
                 existing_object: true,
@@ -299,8 +299,14 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
 
 #[cfg(test)]
 mod tests {
-    use s3s::dto::{Destination, ReplicationRule, ReplicationRuleStatus};
+    use s3s::dto::{
+        DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
+        ReplicationRule, ReplicationRuleStatus,
+    };
+    use uuid::Uuid;
 
+    use super::super::replication_filemeta_boundary::VersionPurgeStatusType;
+    use super::super::replication_target_boundary::BucketTarget;
     use super::*;
 
     fn replication_rule() -> ReplicationRule {
@@ -359,5 +365,57 @@ mod tests {
         assert!(options.is_metadata_replication());
         assert!(options.is_replication_request());
         assert_eq!(options.user_tags(), "env=prod");
+    }
+
+    #[tokio::test]
+    async fn resync_distinguishes_delete_marker_creation_from_version_purge() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut rule = replication_rule();
+        rule.destination.bucket = arn.to_string();
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        });
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        let config = ReplicationConfig::new(
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![rule],
+            }),
+            Some(BucketTargets {
+                targets: vec![BucketTarget {
+                    arn: arn.to_string(),
+                    endpoint: "target.example".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
+        let marker_version_id = Uuid::new_v4();
+        let marker = ObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            delete_marker: true,
+            version_id: Some(marker_version_id),
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+
+        let creation = config
+            .resync(marker.clone(), ReplicateDecision::default(), &HashMap::new())
+            .await;
+        assert!(creation.targets.contains_key(arn));
+
+        let purge = config
+            .resync(
+                ObjectInfo {
+                    version_purge_status: VersionPurgeStatusType::Pending,
+                    ..marker
+                },
+                ReplicateDecision::default(),
+                &HashMap::new(),
+            )
+            .await;
+        assert!(purge.targets.is_empty());
     }
 }

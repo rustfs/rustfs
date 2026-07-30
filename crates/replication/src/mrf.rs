@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use byteorder::{ByteOrder, LittleEndian};
+use uuid::Uuid;
 
 use crate::{Error, Result};
 
@@ -20,6 +21,31 @@ pub use crate::filemeta::{MrfOpKind, MrfReplicateEntry};
 
 pub const MRF_META_FORMAT: u16 = 1;
 pub const MRF_META_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MrfDeleteParts {
+    pub version_id: Option<Uuid>,
+    pub delete_marker_version_id: Option<Uuid>,
+    pub delete_marker: bool,
+}
+
+impl MrfReplicateEntry {
+    pub fn delete_parts_for_replay(&self) -> Option<MrfDeleteParts> {
+        match (self.version_id, self.delete_marker_version_id) {
+            (Some(version_id), None) => Some(MrfDeleteParts {
+                version_id: Some(version_id),
+                delete_marker_version_id: None,
+                delete_marker: false,
+            }),
+            (None, Some(delete_marker_version_id)) => Some(MrfDeleteParts {
+                version_id: None,
+                delete_marker_version_id: Some(delete_marker_version_id),
+                delete_marker: self.delete_marker,
+            }),
+            _ => None,
+        }
+    }
+}
 
 pub fn encode_mrf_file(entries: &[MrfReplicateEntry]) -> Result<Vec<u8>> {
     let payload = rmp_serde::to_vec_named(entries).map_err(|e| Error::Other(e.to_string()))?;
@@ -54,7 +80,6 @@ pub fn decode_mrf_file(data: &[u8]) -> Result<Vec<MrfReplicateEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
 
     #[test]
     fn mrf_file_round_trips_object_and_delete_entries() {
@@ -70,6 +95,7 @@ mod tests {
                 op: MrfOpKind::Object,
                 delete_marker_version_id: None,
                 delete_marker: false,
+                replica: false,
                 delete_marker_mtime: None,
             },
             MrfReplicateEntry {
@@ -81,6 +107,7 @@ mod tests {
                 op: MrfOpKind::Delete,
                 delete_marker_version_id: Some(del_vid),
                 delete_marker: true,
+                replica: true,
                 delete_marker_mtime: Some(1_705_312_200_123_456_789),
             },
         ];
@@ -95,11 +122,52 @@ mod tests {
         assert_eq!(decoded[1].delete_marker_version_id, Some(del_vid));
         assert_eq!(decoded[1].op, MrfOpKind::Delete);
         assert!(decoded[1].delete_marker);
+        assert!(decoded[1].replica);
         assert_eq!(
             decoded[1].delete_marker_mtime,
             Some(1_705_312_200_123_456_789),
             "delete-marker mtime must survive the MRF disk round-trip"
         );
+    }
+
+    #[test]
+    fn legacy_version_purge_replay_clears_delete_marker_creation() {
+        let entry = MrfReplicateEntry {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            retry_count: 0,
+            size: 0,
+            delete_marker: true,
+            op: MrfOpKind::Delete,
+            delete_marker_version_id: None,
+            replica: false,
+            delete_marker_mtime: None,
+        };
+        let encoded = encode_mrf_file(&[entry]).expect("legacy MRF entry should encode");
+        let decoded = decode_mrf_file(&encoded).expect("legacy MRF entry should decode");
+
+        assert_eq!(decoded[0].delete_parts_for_replay().map(|parts| parts.delete_marker), Some(false));
+    }
+
+    #[test]
+    fn invalid_delete_id_shapes_fail_closed_on_replay() {
+        for (version_id, delete_marker_version_id) in [(None, None), (Some(Uuid::new_v4()), Some(Uuid::new_v4()))] {
+            let entry = MrfReplicateEntry {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                version_id,
+                retry_count: 0,
+                size: 0,
+                op: MrfOpKind::Delete,
+                delete_marker_version_id,
+                delete_marker: false,
+                replica: false,
+                delete_marker_mtime: None,
+            };
+
+            assert_eq!(entry.delete_parts_for_replay(), None);
+        }
     }
 
     #[test]
@@ -129,6 +197,7 @@ mod tests {
         assert_eq!(decoded[0].retry_count, 2);
         assert_eq!(decoded[0].size, 100);
         assert_eq!(decoded[0].op, MrfOpKind::Object);
+        assert!(!decoded[0].replica);
         // Old files lack the deleteMarkerMtime key; it must default to None so replay keeps the
         // pre-#867 fallback to the current time.
         assert_eq!(decoded[0].delete_marker_mtime, None);

@@ -31,10 +31,13 @@ use rustfs_utils::http::{
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
 pub(crate) use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
+#[cfg(test)]
+pub(crate) use crate::bucket::target::BucketTarget;
 pub(crate) use crate::bucket::target::BucketTargets;
 
 use super::replication_config_store::ReplicationConfigStore;
@@ -305,6 +308,14 @@ pub(crate) fn replication_target_head_is_newer_null_version(object_info: &Object
     target_is_newer_than_source_null_version(&replication_source_object(object_info), &replication_target_object(target))
 }
 
+pub(crate) fn replication_target_version_id(version_id: Option<Uuid>, version_purge: bool) -> Option<String> {
+    match version_id {
+        Some(version_id) if version_id.is_nil() && version_purge => Some("null".to_string()),
+        Some(version_id) if !version_id.is_nil() => Some(version_id.to_string()),
+        _ => None,
+    }
+}
+
 pub(crate) fn replication_delete_remove_options(
     delete_marker: bool,
     replication_mtime: Option<OffsetDateTime>,
@@ -517,6 +528,18 @@ mod tests {
         assert!(!force.replication_delete_marker);
         assert_eq!(force.replication_status, ReplicationStatusType::Replica);
         assert!(force.replication_request);
+    }
+
+    #[test]
+    fn replication_target_version_id_preserves_null_purges() {
+        assert_eq!(replication_target_version_id(Some(Uuid::nil()), true).as_deref(), Some("null"));
+        assert_eq!(replication_target_version_id(Some(Uuid::nil()), false), None);
+
+        let version_id = Uuid::new_v4();
+        assert_eq!(
+            replication_target_version_id(Some(version_id), true).as_deref(),
+            Some(version_id.to_string().as_str())
+        );
     }
 
     #[test]
