@@ -942,7 +942,8 @@ impl KmsClient for LocalKmsClient {
         // Encrypt the data key with the master key
         let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
 
-        // Create data key envelope with master key version for rotation support
+        // Local rotation is rejected, so every envelope is wrapped by the key's sole
+        // material and needs no master key version.
         let envelope = DataKeyEnvelope {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
@@ -951,6 +952,7 @@ impl KmsClient for LocalKmsClient {
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            master_key_version: None,
         };
 
         // Serialize the envelope as the ciphertext

@@ -32,7 +32,10 @@ use std::collections::HashMap;
 ///
 /// This structure stores the encrypted DEK along with metadata needed for decryption.
 /// The `master_key_version` field records which version of the KEK (Key Encryption Key)
-/// was used to encrypt this DEK, enabling proper key rotation support.
+/// wrapped this DEK so rotation-aware backends can load the matching historical
+/// material. Envelopes written before versioning carry `None`; backends must resolve
+/// `None` to a deterministic baseline version recorded in key metadata, never
+/// implicitly to whatever version is current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataKeyEnvelope {
     pub key_id: String,
@@ -43,6 +46,12 @@ pub struct DataKeyEnvelope {
     pub encryption_context: HashMap<String, String>,
     #[serde(with = "crate::time_serde::zoned")]
     pub created_at: Zoned,
+    /// KEK version that wrapped `encrypted_key`; `None` on pre-versioning envelopes.
+    ///
+    /// Optional and omitted when `None` so envelopes from non-rotating backends stay
+    /// byte-identical to the historical seven-field JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_key_version: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -307,6 +316,7 @@ mod tests {
                 map
             },
             created_at: Zoned::now(),
+            master_key_version: None,
         };
 
         // Test serialization
@@ -336,6 +346,8 @@ mod tests {
         let deserialized: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("Should deserialize current format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
+        // Envelopes persisted before versioning must parse with no master key version.
+        assert_eq!(deserialized.master_key_version, None);
     }
 
     #[tokio::test]
@@ -353,6 +365,50 @@ mod tests {
         let deserialized: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("Should deserialize legacy format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
+        assert_eq!(deserialized.master_key_version, None);
+    }
+
+    #[test]
+    fn test_data_key_envelope_none_version_serializes_without_field() {
+        // A `None` version must keep the serialized envelope on the historical
+        // seven-field JSON shape so non-rotating backends emit byte-compatible
+        // envelopes that older readers accept unchanged.
+        let envelope = DataKeyEnvelope {
+            key_id: "test-key-id".to_string(),
+            master_key_id: "master-key-id".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: vec![1, 2, 3, 4],
+            nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+
+        let value = serde_json::to_value(&envelope).expect("serialize envelope");
+        let object = value.as_object().expect("envelope serializes to an object");
+        assert!(!object.contains_key("master_key_version"));
+        assert_eq!(object.len(), 7, "None version must not change the seven-field JSON shape");
+    }
+
+    #[test]
+    fn test_data_key_envelope_version_round_trip() {
+        let envelope = DataKeyEnvelope {
+            key_id: "test-key-id".to_string(),
+            master_key_id: "master-key-id".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: vec![1, 2, 3, 4],
+            nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: Some(7),
+        };
+
+        let serialized = serde_json::to_vec(&envelope).expect("serialize envelope");
+        let value: serde_json::Value = serde_json::from_slice(&serialized).expect("parse serialized envelope");
+        assert_eq!(value.get("master_key_version"), Some(&serde_json::json!(7)));
+
+        let deserialized: DataKeyEnvelope = serde_json::from_slice(&serialized).expect("deserialize envelope");
+        assert_eq!(deserialized.master_key_version, Some(7));
     }
 
     #[test]
@@ -368,8 +424,19 @@ mod tests {
         }"#;
         let minio_legacy = br#"{"aead":"AES-256-GCM-HMAC-SHA-256","iv":[1],"nonce":[2],"bytes":[3]}"#;
         let duplicate_key_id = [b"{\"key_id\":\"duplicate\",".as_slice(), &kms_envelope[1..]].concat();
+        // Rotation-aware envelope: the optional master_key_version field must not
+        // change how mixed batches of old and new envelopes are routed.
+        let versioned_envelope = {
+            let mut value: serde_json::Value = serde_json::from_slice(kms_envelope).expect("parse KMS envelope fixture");
+            value
+                .as_object_mut()
+                .expect("KMS envelope fixture is an object")
+                .insert("master_key_version".to_string(), serde_json::json!(2));
+            serde_json::to_vec(&value).expect("serialize versioned envelope")
+        };
 
         assert!(is_data_key_envelope(kms_envelope));
+        assert!(is_data_key_envelope(&versioned_envelope));
         assert!(is_data_key_envelope(&[b" \n".as_slice(), kms_envelope].concat()));
         assert!(!is_data_key_envelope(&duplicate_key_id));
         assert!(!is_data_key_envelope(b"bm9uY2U=:Y2lwaGVydGV4dA=="));

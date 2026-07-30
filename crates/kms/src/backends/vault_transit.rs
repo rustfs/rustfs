@@ -406,6 +406,9 @@ impl KmsClient for VaultTransitKmsClient {
             nonce: Vec::new(),
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            // Transit ciphertext already self-describes its key version
+            // ("vault:vN:..."), so the envelope never carries one.
+            master_key_version: None,
         };
 
         let ciphertext = serde_json::to_vec(&envelope)?;

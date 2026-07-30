@@ -311,6 +311,7 @@ impl KmsClient for VaultKmsClient {
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            master_key_version: None,
         };
 
         // Serialize the envelope as the ciphertext
