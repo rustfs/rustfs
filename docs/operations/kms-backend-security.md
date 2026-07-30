@@ -2,6 +2,8 @@
 
 RustFS ships several KMS backends. They differ not only in deployment effort but in **where master key material lives and who can read it**. Pick a backend based on the confidentiality boundary you need, not on the name alone.
 
+For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md).
+
 ## Backend comparison
 
 | Backend | Config tag | Master key material location | At-rest protection of key material | Durability | Rotation | Intended use |
