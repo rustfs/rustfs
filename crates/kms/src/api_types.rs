@@ -249,6 +249,13 @@ enum StrictVaultAuthMethod {
         #[serde(default)]
         refresh_safety_window_secs: Option<u64>,
     },
+    TokenFile {
+        path: std::path::PathBuf,
+        #[serde(default)]
+        poll_interval_secs: Option<u64>,
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
 }
 
 impl From<StrictVaultAuthMethod> for VaultAuthMethod {
@@ -266,6 +273,15 @@ impl From<StrictVaultAuthMethod> for VaultAuthMethod {
                 secret_id,
                 secret_id_file,
                 mount: mount.unwrap_or_else(|| crate::config::DEFAULT_VAULT_APPROLE_MOUNT.to_string()),
+                refresh_safety_window_secs,
+            },
+            StrictVaultAuthMethod::TokenFile {
+                path,
+                poll_interval_secs,
+                refresh_safety_window_secs,
+            } => Self::TokenFile {
+                path,
+                poll_interval_secs,
                 refresh_safety_window_secs,
             },
         }
@@ -427,6 +443,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                    VaultAuthMethod::TokenFile { .. } => "token_file".to_string(),
                 },
                 has_stored_credentials: true,
                 namespace: vault_config.namespace.clone(),
@@ -440,6 +457,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                    VaultAuthMethod::TokenFile { .. } => "token_file".to_string(),
                 },
                 has_stored_credentials: true,
                 namespace: vault_config.namespace.clone(),

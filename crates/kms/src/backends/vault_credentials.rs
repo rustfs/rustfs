@@ -35,9 +35,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use sha2::Digest;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -52,6 +53,9 @@ type AttemptResult<T> = std::result::Result<T, AttemptError>;
 /// Cadence for refresh retries after a failed cycle (on top of the bounded
 /// retries inside one [`policy::execute`] call).
 const DEFAULT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default seconds between token file re-reads for [`TokenFileSource`].
+const DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS: u64 = 30;
 
 /// A crate-owned secret value, zeroized on drop and redacted in Debug output.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -147,8 +151,8 @@ fn attempt_error(operation: &str, error: vaultrs::error::ClientError) -> Attempt
 ///
 /// Implementations perform one attempt per call; bounded retries and backoff
 /// are owned by the caller through [`policy::execute`] with [`OpClass::Auth`].
-/// Current sources are [`StaticToken`] and [`AppRoleLogin`]; an agent-managed
-/// `TokenFile` source is planned as a follow-up.
+/// Current sources are [`StaticToken`], [`AppRoleLogin`], and the agent-managed
+/// [`TokenFileSource`].
 #[async_trait]
 pub(crate) trait TokenSource: fmt::Debug + Send + Sync {
     /// One login attempt yielding a token for a new client generation.
@@ -286,6 +290,124 @@ impl fmt::Debug for AppRoleLogin {
     }
 }
 
+/// Token source for [`VaultAuthMethod::TokenFile`]: reads an agent-managed
+/// token file (for example a Vault Agent auto-auth sink).
+///
+/// The agent owns the token's lifecycle; this source only tracks the file.
+/// Every read grants the token an observed validity of `validity`, so the
+/// renewal loop re-reads the file at half that interval and installs a new
+/// client generation from whatever the file holds. A file that disappears or
+/// turns empty keeps failing the refresh until the fail-closed window trips,
+/// and heals the provider as soon as it is restored.
+pub(crate) struct TokenFileSource {
+    path: PathBuf,
+    /// Observed validity granted per successful read; the renewal loop
+    /// re-reads at half this value.
+    validity: Duration,
+    /// Digest of the last token read, to tell agent-driven rotations apart
+    /// from plain refreshes in the logs. Never holds the token itself.
+    last_digest: std::sync::Mutex<Option<[u8; 32]>>,
+}
+
+impl TokenFileSource {
+    pub(crate) fn new(path: PathBuf, validity: Duration) -> Self {
+        Self {
+            path,
+            validity,
+            last_digest: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn fatal(error: KmsError) -> AttemptError {
+        AttemptError {
+            class: ErrorClass::Fatal,
+            error,
+        }
+    }
+
+    /// Reject a token file readable by group or other, mirroring the SFTP
+    /// host-key rule: a Vault token grants use of the KMS keys, so a mode
+    /// wider than owner-only is a deployment error, not a warning.
+    #[cfg(unix)]
+    fn check_permissions(&self, metadata: &std::fs::Metadata) -> AttemptResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(Self::fatal(KmsError::configuration_error(format!(
+                "Vault token file {} has insecure permissions {mode:#o} (group and other permission bits must be unset)",
+                self.path.display()
+            ))));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TokenSource for TokenFileSource {
+    async fn acquire(&self) -> AttemptResult<TokenLease> {
+        // Synchronous reads on purpose: the token file is tiny, this runs at
+        // the renewal cadence, and staying off the blocking pool keeps the
+        // paused-clock tests of the renewal timing deterministic.
+        let metadata = std::fs::metadata(&self.path).map_err(|error| {
+            Self::fatal(KmsError::configuration_error(format!(
+                "Failed to read Vault token file {}: {error}",
+                self.path.display()
+            )))
+        })?;
+        #[cfg(unix)]
+        self.check_permissions(&metadata)?;
+
+        let mut raw = std::fs::read_to_string(&self.path).map_err(|error| {
+            Self::fatal(KmsError::configuration_error(format!(
+                "Failed to read Vault token file {}: {error}",
+                self.path.display()
+            )))
+        })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            raw.zeroize();
+            return Err(Self::fatal(KmsError::configuration_error(format!(
+                "Vault token file {} is empty",
+                self.path.display()
+            ))));
+        }
+
+        let digest: [u8; 32] = sha2::Sha256::digest(trimmed.as_bytes()).into();
+        let previous = self
+            .last_digest
+            .lock()
+            .expect("token file digest mutex poisoned")
+            .replace(digest);
+        if previous.is_some_and(|previous| previous != digest) {
+            info!(
+                path = %self.path.display(),
+                modified = ?metadata.modified().ok(),
+                "Vault token file rotated; installing a new client generation"
+            );
+        }
+
+        let token = trimmed.to_string();
+        raw.zeroize();
+        Ok(TokenLease::new(
+            token,
+            Some(LeaseInfo {
+                ttl: self.validity,
+                renewable: false,
+            }),
+        ))
+    }
+}
+
+impl fmt::Debug for TokenFileSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The token itself is never stored on the source; only its digest is.
+        f.debug_struct("TokenFileSource")
+            .field("path", &self.path)
+            .field("validity", &self.validity)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Map the configured auth method onto a token source.
 pub(crate) fn token_source_for(
     auth_method: &VaultAuthMethod,
@@ -306,6 +428,18 @@ pub(crate) fn token_source_for(
             secret_id.clone(),
             secret_id_file.clone(),
         )?)),
+        VaultAuthMethod::TokenFile {
+            path,
+            poll_interval_secs,
+            ..
+        } => {
+            let poll_interval = Duration::from_secs(poll_interval_secs.unwrap_or(DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS).max(1));
+            // Validity is twice the poll interval because the renewal loop
+            // fires at half the lease TTL: the file is then re-read once per
+            // poll interval, and a file that stops being readable expires the
+            // token after roughly two missed polls minus the safety window.
+            Ok(Box::new(TokenFileSource::new(path.clone(), poll_interval * 2)))
+        }
     }
 }
 
@@ -370,6 +504,10 @@ impl VaultCredentialPolicy {
         let retry = RetryPolicy::from_config(config);
         let safety_window = match auth_method {
             VaultAuthMethod::AppRole {
+                refresh_safety_window_secs: Some(secs),
+                ..
+            }
+            | VaultAuthMethod::TokenFile {
                 refresh_safety_window_secs: Some(secs),
                 ..
             } => Duration::from_secs(*secs),
@@ -1052,5 +1190,168 @@ mod tests {
         let approle_rendered = format!("{approle_source:?}");
         assert!(approle_rendered.contains("leak-test-role-id"), "role_id is not a secret");
         assert!(approle_rendered.contains(REDACTED_SECRET));
+    }
+
+    /// Write a token file with owner-only permissions, as a Vault Agent sink
+    /// would.
+    fn write_owner_only(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).expect("write token file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod token file");
+        }
+    }
+
+    async fn token_file_provider(path: std::path::PathBuf, policy: VaultCredentialPolicy) -> Arc<VaultCredentialProvider> {
+        Arc::new(
+            VaultCredentialProvider::new(test_settings(), Box::new(TokenFileSource::new(path, Duration::from_secs(60))), policy)
+                .await
+                .expect("token file provider must build without a live Vault"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_token_file_source_reads_and_trims_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, &format!("  {TEST_TOKEN}\n"));
+        let source = TokenFileSource::new(path, Duration::from_secs(60));
+
+        let lease = source.acquire().await.expect("readable token file must resolve");
+        assert_eq!(lease.expose(), TEST_TOKEN);
+        let lease_info = lease.lease_info().expect("token file leases carry an observed validity");
+        assert_eq!(lease_info.ttl, Duration::from_secs(60));
+        assert!(!lease_info.renewable, "agent-managed tokens are refreshed by re-reading, not renew-self");
+    }
+
+    #[tokio::test]
+    async fn test_token_file_missing_fails_fatally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = TokenFileSource::new(dir.path().join("absent-token"), Duration::from_secs(60));
+
+        let failure = source.acquire().await.expect_err("missing token file must fail the attempt");
+        assert_eq!(failure.class, ErrorClass::Fatal);
+        assert!(matches!(failure.error, KmsError::ConfigurationError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_token_file_empty_fails_fatally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, "  \n\t\n");
+        let source = TokenFileSource::new(path, Duration::from_secs(60));
+
+        let failure = source
+            .acquire()
+            .await
+            .expect_err("effectively empty token file must fail the attempt");
+        assert_eq!(failure.class, ErrorClass::Fatal);
+        assert!(failure.error.to_string().contains("is empty"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_token_file_rejects_group_or_other_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, TEST_TOKEN);
+        let source = TokenFileSource::new(path.clone(), Duration::from_secs(60));
+
+        for mode in [0o640u32, 0o604, 0o622, 0o660] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let failure = source
+                .acquire()
+                .await
+                .expect_err("token file readable or writable beyond the owner must be rejected");
+            assert_eq!(failure.class, ErrorClass::Fatal, "mode {mode:#o}");
+            let rendered = failure.error.to_string();
+            assert!(rendered.contains("insecure permissions"), "mode {mode:#o}: {rendered}");
+            assert!(!rendered.contains(TEST_TOKEN), "permission errors must not echo the token");
+        }
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        source.acquire().await.expect("owner-only token file must resolve");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_token_file_replacement_installs_new_generation_next_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, "agent-token-v1");
+        let provider = token_file_provider(path.clone(), test_policy(Duration::from_secs(10), Duration::from_secs(5))).await;
+        let task = provider.spawn_renewal_task().expect("token file credentials are lease-bound");
+
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert_eq!(provider.snapshot().generation, 0, "no re-read before half the observed validity");
+
+        // Atomic replacement, as a Vault Agent sink writes: temp file + rename.
+        let staged = dir.path().join("vault-token.tmp");
+        write_owner_only(&staged, "agent-token-v2");
+        std::fs::rename(&staged, &path).expect("atomic replace");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            provider.snapshot().generation,
+            1,
+            "the poll after a rotation must install a new generation"
+        );
+
+        // A poll without a rotation still installs a fresh generation: each
+        // successful read re-extends the token's observed validity.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(provider.snapshot().generation, 2);
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_token_file_deletion_fails_closed_and_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, "agent-token-v1");
+        let provider = token_file_provider(path.clone(), test_policy(Duration::from_secs(10), Duration::from_secs(5))).await;
+        let task = provider.spawn_renewal_task().expect("renewal task");
+
+        std::fs::remove_file(&path).expect("remove token file");
+
+        // Polls at 30s, 35s, ... keep failing; the last read keeps the token
+        // usable until 50s (60s observed validity minus the 10s safety window).
+        tokio::time::sleep(Duration::from_secs(49)).await;
+        provider
+            .current()
+            .expect("token outside the safety window must still be served");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let error = provider
+            .current()
+            .expect_err("token inside the safety window must be refused");
+        assert!(
+            matches!(error, KmsError::CredentialsUnavailable { .. }),
+            "expected CredentialsUnavailable, got {error:?}"
+        );
+
+        // Restoring the file heals the provider on the next retry cycle.
+        write_owner_only(&path, "agent-token-v2");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let handle = provider.current().expect("provider must recover once the token file is back");
+        assert!(handle.generation >= 1);
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_token_file_debug_redacts_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, TEST_TOKEN);
+        let source = TokenFileSource::new(path.clone(), Duration::from_secs(60));
+        source.acquire().await.expect("token file must resolve");
+
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains(TEST_TOKEN), "debug output must not leak the vault token: {rendered}");
+        assert!(rendered.contains("vault-token"), "the file path is not a secret");
     }
 }
