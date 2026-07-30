@@ -20,7 +20,7 @@
 //!
 //! ## Features
 //!
-//! - **Multiple Backends**: Local file storage, Vault KV2+Transit, and Vault Transit (optional)
+//! - **Multiple Backends**: Local file storage, Vault KV2 (plain KV storage), and Vault Transit (optional)
 //! - **Object Encryption**: Transparent S3-compatible object encryption
 //! - **Streaming Encryption**: Memory-efficient encryption for large files
 //! - **Key Management**: Full lifecycle management of encryption keys

@@ -71,7 +71,10 @@ impl fmt::Debug for ConfigureLocalKmsRequest {
     }
 }
 
-/// Request to configure KMS with Vault KV v2 + Transit backend
+/// Request to configure KMS with the Vault KV v2 storage backend.
+///
+/// This backend stores master key material directly in KV v2; confidentiality relies on
+/// Vault ACLs and KV v2 at-rest encryption, with no Transit wrapping involved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigureVaultKmsRequest {
@@ -82,7 +85,8 @@ pub struct ConfigureVaultKmsRequest {
     pub auth_method: VaultAuthMethod,
     /// Vault namespace (Vault Enterprise, optional)
     pub namespace: Option<String>,
-    /// Transit engine mount path
+    /// Deprecated: legacy Transit engine mount path. Still accepted so older clients keep
+    /// working, but the Vault KV2 backend never uses it.
     pub mount_path: Option<String>,
     /// KV engine mount path for storing keys  
     pub kv_mount: Option<String>,
@@ -192,7 +196,7 @@ pub enum ConfigureKmsRequest {
     /// Configure with Local backend
     #[serde(alias = "local", alias = "Local")]
     Local(ConfigureLocalKmsRequest),
-    /// Configure with Vault KV v2 + Transit backend
+    /// Configure with the Vault KV v2 storage backend
     #[serde(
         rename = "VaultKV2",
         alias = "Vault",
@@ -333,7 +337,7 @@ pub enum BackendSummary {
         /// File permissions (octal)
         file_permissions: Option<u32>,
     },
-    /// Vault KV v2 + Transit backend summary
+    /// Vault KV v2 storage backend summary
     #[serde(alias = "vault")]
     VaultKv2 {
         /// Vault server address
@@ -344,7 +348,8 @@ pub enum BackendSummary {
         has_stored_credentials: bool,
         /// Namespace (if configured)
         namespace: Option<String>,
-        /// Transit engine mount path
+        /// Deprecated: legacy Transit mount path. Unused by the backend; kept only so the
+        /// serialized response shape stays stable for existing consumers.
         mount_path: String,
         /// KV engine mount path
         kv_mount: String,
@@ -619,6 +624,52 @@ mod tests {
             let vault = config.vault_config().expect("vault-kv2 config");
             assert_eq!(vault.mount_path, "transit");
         }
+    }
+
+    #[test]
+    fn test_deserialize_vault_kv2_configure_request_mount_path_optional_but_accepted() {
+        // deny_unknown_fields regression guard: mount_path is deprecated but must remain
+        // accepted so older clients that still send it do not get a 400.
+        let with_mount_path = serde_json::json!({
+            "backend_type": "VaultKV2",
+            "address": "http://127.0.0.1:8200",
+            "auth_method": { "Token": { "token": "dev-root-token" } },
+            "mount_path": "transit"
+        });
+        let request: ConfigureKmsRequest =
+            serde_json::from_value(with_mount_path).expect("request with deprecated mount_path should deserialize");
+        let config = request.to_kms_config();
+        assert_eq!(config.vault_config().expect("vault-kv2 config").mount_path, "transit");
+
+        let without_mount_path = serde_json::json!({
+            "backend_type": "VaultKV2",
+            "address": "http://127.0.0.1:8200",
+            "auth_method": { "Token": { "token": "dev-root-token" } }
+        });
+        let request: ConfigureKmsRequest =
+            serde_json::from_value(without_mount_path).expect("request without mount_path should deserialize");
+        let config = request.to_kms_config();
+        assert_eq!(config.vault_config().expect("vault-kv2 config").mount_path, "transit");
+    }
+
+    #[test]
+    fn test_vault_kv2_status_summary_does_not_mention_transit() {
+        let config = KmsConfig::vault(
+            url::Url::parse("https://vault.example.com:8200").expect("vault URL"),
+            "summary-token".to_string(),
+        );
+        let response = KmsStatusResponse {
+            status: KmsServiceStatus::Running,
+            backend_type: Some(config.backend.clone()),
+            healthy: Some(true),
+            config_summary: Some(KmsConfigSummary::from(&config)),
+        };
+
+        let json = serde_json::to_string(&response).expect("kms status response should serialize");
+        assert!(
+            !json.contains("Transit"),
+            "vault-kv2 status output must not describe the backend as Transit: {json}"
+        );
     }
 
     #[test]
