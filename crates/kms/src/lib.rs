@@ -66,6 +66,7 @@
 // Core modules
 pub mod api_types;
 pub mod backends;
+pub mod backup;
 mod cache;
 pub mod config;
 mod encryption;

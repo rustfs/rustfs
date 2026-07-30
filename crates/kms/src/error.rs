@@ -124,6 +124,10 @@ pub enum KmsError {
     /// Requested master key version has no persisted material for the key
     #[error("Key version {version} not found for key {key_id}")]
     KeyVersionNotFound { key_id: String, version: u32 },
+
+    /// Backup/restore bundle contract violation; see [`crate::backup::BackupError`]
+    #[error(transparent)]
+    Backup(#[from] crate::backup::BackupError),
 }
 
 impl KmsError {
