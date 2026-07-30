@@ -148,7 +148,7 @@ impl Operation for ListCannedPolicies {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        let policies = iam_store.list_polices(&query.bucket).await.map_err(|e| {
+        let policies = iam_store.list_policies(&query.bucket).await.map_err(|e| {
             warn!(
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_POLICY,

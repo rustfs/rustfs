@@ -642,9 +642,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.42"
+version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -870,7 +870,7 @@ dependencies = [
  "bytes",
  "fastrand",
  "hex",
- "http 1.4.2",
+ "http 1.5.0",
  "sha1 0.10.7",
  "time",
  "tokio",
@@ -934,7 +934,7 @@ dependencies = [
  "bytes-utils",
  "fastrand",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 0.4.6",
  "http-body 1.1.0",
  "percent-encoding",
@@ -970,7 +970,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "lru 0.16.4",
  "percent-encoding",
@@ -1001,7 +1001,7 @@ dependencies = [
  "bytes",
  "fastrand",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -1027,7 +1027,7 @@ dependencies = [
  "bytes",
  "fastrand",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -1054,7 +1054,7 @@ dependencies = [
  "aws-types",
  "fastrand",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "regex-lite",
  "tracing",
 ]
@@ -1076,7 +1076,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "p256 0.13.2",
  "percent-encoding",
  "sha2 0.11.0",
@@ -1108,7 +1108,7 @@ dependencies = [
  "bytes",
  "crc-fast",
  "hex",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "md-5 0.11.0",
@@ -1142,7 +1142,7 @@ dependencies = [
  "bytes-utils",
  "futures-core",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "percent-encoding",
@@ -1161,7 +1161,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "h2",
- "http 1.4.2",
+ "http 1.5.0",
  "hyper",
  "hyper-rustls",
  "hyper-util",
@@ -1224,7 +1224,7 @@ dependencies = [
  "bytes",
  "fastrand",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 0.4.6",
  "http-body 1.1.0",
  "http-body-util",
@@ -1245,7 +1245,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "pin-project-lite",
  "tokio",
  "tracing",
@@ -1271,7 +1271,7 @@ checksum = "7d56e0a4e53127a632224e43633b0fe045fa9e1e3cfc68b9830f1115e103f910"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "http 1.4.2",
+ "http 1.5.0",
 ]
 
 [[package]]
@@ -1285,7 +1285,7 @@ dependencies = [
  "bytes-utils",
  "futures-core",
  "http 0.2.12",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 0.4.6",
  "http-body 1.1.0",
  "http-body-util",
@@ -1337,7 +1337,7 @@ dependencies = [
  "bytes",
  "form_urlencoded",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -1368,7 +1368,7 @@ checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
 dependencies = [
  "bytes",
  "futures-core",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "mime",
@@ -3229,7 +3229,7 @@ dependencies = [
  "futures-util",
  "headers",
  "htmlescape",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "libc",
@@ -3654,7 +3654,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_test"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -3672,7 +3672,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -4384,7 +4384,7 @@ dependencies = [
  "google-cloud-gax",
  "hex",
  "hmac 0.13.0",
- "http 1.4.2",
+ "http 1.5.0",
  "jsonwebtoken 10.4.0",
  "reqwest",
  "rustc_version",
@@ -4409,7 +4409,7 @@ dependencies = [
  "futures",
  "google-cloud-rpc",
  "google-cloud-wkt",
- "http 1.4.2",
+ "http 1.5.0",
  "pin-project",
  "rand 0.10.2",
  "serde",
@@ -4431,7 +4431,7 @@ dependencies = [
  "google-cloud-rpc",
  "google-cloud-wkt",
  "h2",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -4544,7 +4544,7 @@ dependencies = [
  "google-cloud-type",
  "google-cloud-wkt",
  "hex",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "md5",
  "percent-encoding",
@@ -4624,7 +4624,7 @@ dependencies = [
  "fnv",
  "futures-core",
  "futures-sink",
- "http 1.4.2",
+ "http 1.5.0",
  "indexmap 2.14.0",
  "slab",
  "tokio",
@@ -4727,7 +4727,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "headers-core",
- "http 1.4.2",
+ "http 1.5.0",
  "httpdate",
  "mime",
  "sha1 0.10.7",
@@ -4739,7 +4739,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b4a22553d4242c49fddb9ba998a99962b5cc6f22cb5a3482bec22522403ce4"
 dependencies = [
- "http 1.4.2",
+ "http 1.5.0",
 ]
 
 [[package]]
@@ -4961,9 +4961,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
 dependencies = [
  "bytes",
  "itoa",
@@ -4987,7 +4987,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
 dependencies = [
  "bytes",
- "http 1.4.2",
+ "http 1.5.0",
 ]
 
 [[package]]
@@ -4998,7 +4998,7 @@ checksum = "e9f41fd6a08e4d4ec69df65976da761afd5ad5e58a9d4acb46bd1c953a9e3ff2"
 dependencies = [
  "bytes",
  "futures-core",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "pin-project-lite",
 ]
@@ -5044,7 +5044,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "h2",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "httparse",
  "httpdate",
@@ -5061,7 +5061,7 @@ version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
- "http 1.4.2",
+ "http 1.5.0",
  "hyper",
  "hyper-util",
  "log",
@@ -5095,7 +5095,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "hyper",
  "ipnet",
@@ -6704,10 +6704,10 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
- "http 1.4.2",
+ "http 1.5.0",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -6815,7 +6815,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "humantime",
  "itertools 0.14.0",
  "parking_lot",
@@ -6871,7 +6871,7 @@ dependencies = [
  "dyn-clone",
  "ed25519-dalek 2.2.0",
  "hmac 0.12.1",
- "http 1.4.2",
+ "http 1.5.0",
  "itertools 0.10.5",
  "log",
  "oauth2",
@@ -6932,7 +6932,7 @@ checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
 dependencies = [
  "async-trait",
  "bytes",
- "http 1.4.2",
+ "http 1.5.0",
  "opentelemetry",
  "reqwest",
 ]
@@ -6944,7 +6944,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
  "flate2",
- "http 1.4.2",
+ "http 1.5.0",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-proto",
@@ -7820,7 +7820,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -7840,7 +7840,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7861,7 +7861,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7874,7 +7874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8329,9 +8329,9 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "1.4.1"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a"
+checksum = "3257df217f7eab0044627a268c9cc6cdb60c0c421c88f83ac41c4e31520b6b84"
 dependencies = [
  "arc-swap",
  "arcstr",
@@ -8481,7 +8481,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -8627,7 +8627,7 @@ dependencies = [
  "async-tungstenite",
  "futures-io",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "rustls-native-certs",
  "rustls-pki-types",
  "rustls-webpki",
@@ -8657,7 +8657,7 @@ dependencies = [
  "flume",
  "futures-io",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "log",
  "mqttbytes-core-next",
  "rumqttc-core-next",
@@ -8845,7 +8845,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -8874,7 +8874,7 @@ dependencies = [
  "hex-simd",
  "hmac 0.13.0",
  "hotpath",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -8981,7 +8981,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-audit"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "chrono",
@@ -9003,12 +9003,12 @@ dependencies = [
 
 [[package]]
 name = "rustfs-checksums"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "base64-simd",
  "bytes",
  "crc-fast",
- "http 1.4.2",
+ "http 1.5.0",
  "md-5 0.11.0",
  "pretty_assertions",
  "sha1 0.11.0",
@@ -9018,7 +9018,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-common"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
  "metrics",
@@ -9033,7 +9033,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-concurrency"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "insta",
  "rustfs-io-core",
@@ -9045,7 +9045,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-config"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "const-str",
  "serde",
@@ -9054,7 +9054,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-credentials"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -9067,7 +9067,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-crypto"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -9087,7 +9087,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-data-usage"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "rmp-serde",
@@ -9097,7 +9097,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-ecstore"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -9130,7 +9130,7 @@ dependencies = [
  "hmac 0.13.0",
  "hostname",
  "hotpath",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -9236,7 +9236,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-extension-schema"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -9245,7 +9245,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-filemeta"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "arc-swap",
  "byteorder",
@@ -9271,12 +9271,12 @@ dependencies = [
 
 [[package]]
 name = "rustfs-heal"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
  "futures",
- "http 1.4.2",
+ "http 1.5.0",
  "metrics",
  "rustfs-common",
  "rustfs-concurrency",
@@ -9301,13 +9301,13 @@ dependencies = [
 
 [[package]]
 name = "rustfs-iam"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "arc-swap",
  "async-trait",
  "base64-simd",
  "futures",
- "http 1.4.2",
+ "http 1.5.0",
  "jsonwebtoken 11.0.0",
  "moka",
  "openidconnect",
@@ -9338,7 +9338,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-core"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "bytes",
  "memmap2",
@@ -9350,7 +9350,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-metrics"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "criterion",
  "metrics",
@@ -9413,11 +9413,11 @@ dependencies = [
 
 [[package]]
 name = "rustfs-keystone"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "bytes",
  "futures",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -9439,7 +9439,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kms"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -9473,7 +9473,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lifecycle"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "metrics",
@@ -9495,7 +9495,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lock"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -9517,7 +9517,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-log-analyzer"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
  "flate2",
@@ -9535,7 +9535,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-madmin"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
  "humantime",
@@ -9549,7 +9549,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-notify"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -9583,7 +9583,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-capacity"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "criterion",
  "futures",
@@ -9601,7 +9601,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-data-cache"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "bytes",
  "criterion",
@@ -9617,7 +9617,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-obs"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -9669,7 +9669,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-policy"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -9698,7 +9698,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protocols"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
@@ -9711,7 +9711,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.13.0",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -9760,7 +9760,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protos"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "flatbuffers",
  "prost 0.14.4",
@@ -9783,7 +9783,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-replication"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "byteorder",
  "bytes",
@@ -9800,7 +9800,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -9812,7 +9812,7 @@ dependencies = [
  "futures",
  "hex-simd",
  "hotpath",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body-util",
  "md-5 0.11.0",
  "pin-project-lite",
@@ -9838,7 +9838,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio-v2"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -9860,14 +9860,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-ops"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "rustfs-s3-types",
 ]
 
 [[package]]
 name = "rustfs-s3-types"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -9875,7 +9875,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-api"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "bytes",
@@ -9883,7 +9883,7 @@ dependencies = [
  "datafusion",
  "futures",
  "futures-core",
- "http 1.4.2",
+ "http 1.5.0",
  "metrics",
  "parking_lot",
  "rustfs-common",
@@ -9904,7 +9904,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-query"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -9920,7 +9920,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "bytes",
@@ -9928,7 +9928,7 @@ dependencies = [
  "futures",
  "hex-simd",
  "hmac 0.13.0",
- "http 1.4.2",
+ "http 1.5.0",
  "metrics",
  "rand 0.10.2",
  "rmp-serde",
@@ -9958,18 +9958,18 @@ dependencies = [
 
 [[package]]
 name = "rustfs-security-governance"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "thiserror 2.0.19",
 ]
 
 [[package]]
 name = "rustfs-signer"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "base64-simd",
  "bytes",
- "http 1.4.2",
+ "http 1.5.0",
  "hyper",
  "rustfs-utils",
  "s3s",
@@ -9982,7 +9982,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-storage-api"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "insta",
@@ -9996,7 +9996,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-targets"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -10049,7 +10049,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-test-utils"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "rustfs-data-usage",
  "rustfs-ecstore",
@@ -10064,7 +10064,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-tls-runtime"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "arc-swap",
  "metrics",
@@ -10084,11 +10084,11 @@ dependencies = [
 
 [[package]]
 name = "rustfs-trusted-proxies"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "axum",
- "http 1.4.2",
+ "http 1.5.0",
  "ipnetwork",
  "metrics",
  "moka",
@@ -10120,7 +10120,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-utils"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "base64-simd",
  "blake2",
@@ -10134,7 +10134,7 @@ dependencies = [
  "hex-simd",
  "highway",
  "hmac 0.13.0",
- "http 1.4.2",
+ "http 1.5.0",
  "hyper",
  "local-ip-address",
  "lz4",
@@ -10161,7 +10161,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-zip"
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.12"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
@@ -10191,7 +10191,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "http 1.4.2",
+ "http 1.5.0",
  "reqwest",
  "rustify_derive",
  "serde",
@@ -10231,9 +10231,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -10371,7 +10371,7 @@ dependencies = [
  "futures",
  "hex-simd",
  "hmac 0.13.0",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "httparse",
@@ -11499,7 +11499,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -11735,13 +11735,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.1"
+version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -11845,7 +11845,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "http 1.4.2",
+ "http 1.5.0",
  "httparse",
  "rand 0.8.7",
  "rustls-pki-types",
@@ -11897,7 +11897,7 @@ dependencies = [
  "bytes",
  "flate2",
  "h2",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
@@ -11984,7 +11984,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "pin-project-lite",
  "tower",
@@ -12004,7 +12004,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "percent-encoding",
@@ -12177,7 +12177,7 @@ checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
 dependencies = [
  "bytes",
  "data-encoding",
- "http 1.4.2",
+ "http 1.5.0",
  "httparse",
  "log",
  "rand 0.9.5",
@@ -12364,7 +12364,7 @@ checksum = "30ffcc0e81025065dda612ec1e26a3d81bb16ef3062354873d17a35965d68522"
 dependencies = [
  "async-trait",
  "derive_builder",
- "http 1.4.2",
+ "http 1.5.0",
  "reqwest",
  "rustify",
  "rustify_derive",
