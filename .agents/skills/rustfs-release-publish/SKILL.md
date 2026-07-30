@@ -1,19 +1,21 @@
 ---
 name: rustfs-release-publish
-description: "End-to-end RustFS release pipeline: bump version files on main directly to the final target version, cut a preview tag on that commit, verify the CI build and release artifacts, run the downloaded binary locally and exercise the console, validate the server with the latest rc client, then publish the final tag on the SAME validated commit — never a new bump commit, never latest main. Use whenever the user wants to release/publish a RustFS version (发版/发布)."
+description: "End-to-end RustFS release pipeline: first publish any merged-but-unreleased rustfs/console changes and wait for its latest Release asset, then bump RustFS version files on main directly to the final target, publish a visible GitHub prerelease from a preview tag without updating latest channels, validate it, and publish the final tag on the SAME commit. Use whenever the user wants to release/publish a RustFS version (发版/发布)."
 ---
 # RustFS Release Publish (preview-validated pipeline)
 
 This skill orchestrates a full release. It wraps `rustfs-release-version-bump` (which only edits version files and opens the PR) with a mandatory preview-tag validation loop before the final tag is published.
 
-Core design: **version files never carry a `-preview.N` suffix**. The preview suffix exists only in tag names. This works because the binary self-reports the git tag it was built from (`build::TAG` via shadow_rs, see `rustfs/src/config/cli.rs` `SHORT_VERSION`), and `build.yml` derives artifact names and prerelease classification from the tag name — Cargo.toml's version is only a no-tag fallback. Therefore the preview tag and the final tag can (and MUST) point at the exact same commit: what you validated is byte-for-byte the source that ships.
+Core design: **version files never carry a `-preview.N` suffix**. The preview suffix exists only in tag names. A preview tag creates a visible GitHub Release marked Prerelease and uploads versioned assets, but it never becomes GitHub Latest and never updates `*-latest`, `latest.json`, R2, Docker, or Helm channels. This works because the binary self-reports the git tag it was built from (`build::TAG` via shadow_rs, see `rustfs/src/config/cli.rs` `SHORT_VERSION`), and `build.yml` derives artifact names and preview classification from the tag name — Cargo.toml's version is only a no-tag fallback. Therefore the preview tag and the final tag can (and MUST) point at the exact same commit: what you validated is byte-for-byte the source that ships.
 
 Pipeline shape:
 
 ```
-bump version files to <target> (final version, ONE commit) -> merge
+check console main against its latest Release
+  -> if ahead: publish console -> wait for Release asset + latest API
+  -> bump RustFS version files to <target> (final version, ONE commit) -> merge
   -> tag <preview-tag> at that commit -> CI green
-  -> verify release artifacts -> run binary locally + console checks
+  -> verify preview Release assets -> run binary locally + console checks
   -> validate with latest rc client
   -> tag <target> at the SAME commit (zero delta) -> re-verify CI/release
 ```
@@ -23,7 +25,7 @@ On validation failure: fix lands on main via normal PR (version files are alread
 ## Required inputs
 
 - Final target version, for example `1.0.0-beta.10`.
-- Preview iteration `N` (default: next unused preview tag for that target; check with `git tag -l '<target>-preview.*'` — and for stable targets `git tag -l '<target>-rc.*'` — after `git fetch --tags`).
+- Preview iteration `N` (default: next unused preview tag for that target; check with `git tag -l '<target>-preview.*'` after `git fetch --tags`).
 
 If the target version is missing or ambiguous, stop and ask before doing anything (see the semver gate below).
 
@@ -45,12 +47,14 @@ Rules:
 
 ## Preview tag naming
 
-- Prerelease target (contains `alpha`/`beta`/`rc`): preview tag is `<target>-preview.N`, e.g. `1.0.0-beta.10-preview.3`. It contains `beta`, so `build.yml`'s substring-based classification marks it prerelease — safe.
-- **Stable** target (e.g. `1.1.0`): NEVER tag `1.1.0-preview.N` — `build.yml` marks a tag prerelease only if its name contains `alpha`, `beta`, or `rc`, so `1.1.0-preview.N` would be treated as a stable release and overwrite `latest.json` as stable. Use `1.1.0-rc.N` as the preview tag instead.
+- Use `<target>-preview.N` for every target, e.g. `1.0.0-beta.10-preview.3` or `1.1.0-preview.1`.
+- The canonical suffix is exactly `-preview.<digits>`. `build.yml` recognizes it before alpha/beta/rc classification and routes it to the preview-only path; any other tag containing `-preview` fails closed instead of being treated as a release.
+- A preview Release MUST be published with `isPrerelease=true` and `isLatest=false`. Any `*-latest` preview asset or preview-triggered `latest.json`, R2, Docker, or Helm publication is a pipeline failure.
 
 ## Hard rules
 
 - Version files (Cargo.toml, Cargo.lock, README, flake.nix, Chart.yaml, rustfs.spec) are bumped ONCE, directly to `<target>`. Never write a `-preview.N` suffix into any version file. If `rustfs-release-version-bump` is ever asked for a `-preview` version, that is a pipeline bug — stop.
+- Preview Release assets are versioned and intentionally visible on the Releases page. Do not label them Latest or use them to update any latest distribution channel.
 - Tags have no `v` prefix. Always annotated: `git tag -a <tag> -m "Release <tag>"`.
 - The final tag MUST point at exactly `PREVIEW_HASH` — the commit the validated preview tag points at. Never tag current `main` HEAD (commits merged after validation are unvalidated), and never create an extra version-bump commit between preview and final.
 - Phases run in order; a failure in any phase blocks everything after it. After the fix lands on main, restart from Phase 2 with the next preview iteration against the new `origin/main` hash — do not resume mid-pipeline against a stale hash.
@@ -62,6 +66,61 @@ Rules:
 - `git status --short` clean; `git fetch origin main --tags`.
 - `gh auth status` works; confirm you can view `gh release list -L 3`.
 - Confirm the exact final target version with the user if not explicit.
+
+### Console release gate
+
+Complete this gate before changing any RustFS version file or creating any RustFS tag. RustFS `build.yml` downloads the asset returned by `repos/rustfs/console/releases/latest`, so a successful Console build alone is insufficient.
+
+1. Read the latest published Console tag and compare it with Console `main`:
+
+```bash
+CONSOLE_REPO="rustfs/console"
+CONSOLE_LATEST=$(gh api "repos/${CONSOLE_REPO}/releases/latest" --jq .tag_name)
+gh api "repos/${CONSOLE_REPO}/compare/${CONSOLE_LATEST}...main" \
+  --jq '{status, ahead_by, behind_by, commits: [.commits[] | {sha, message: .commit.message}]}'
+```
+
+- `ahead_by == 0`: no merged Console change is waiting for release. Still verify the current latest asset using step 4, then continue to Phase 1.
+- `ahead_by > 0` and `behind_by == 0`: publish Console before continuing. Report the merged commits and select the next unused `vX.Y.Z` tag. Default to the next patch version when the changes are fixes or backward-compatible UI work; stop for confirmation if a minor/major bump is plausible.
+- Any diverged history or `behind_by > 0`: stop and resolve the Console release baseline explicitly. Do not guess a range or publish RustFS.
+
+2. Clone/fetch `rustfs/console` into a scratch directory and record its exact `main` commit. Before creating a tag, check for a `v*` tag or Release workflow already associated with that hash. If one is in progress, wait for it instead of creating another version:
+
+```bash
+CONSOLE_SCRATCH=$(mktemp -d)
+gh repo clone "$CONSOLE_REPO" "$CONSOLE_SCRATCH/console"
+git -C "$CONSOLE_SCRATCH/console" fetch origin main --tags
+CONSOLE_HASH=$(git -C "$CONSOLE_SCRATCH/console" rev-parse origin/main)
+git -C "$CONSOLE_SCRATCH/console" tag --points-at "$CONSOLE_HASH" 'v*'
+gh run list -R "$CONSOLE_REPO" --workflow release.yml --commit "$CONSOLE_HASH" --limit 5
+```
+
+If no release exists or is running for `CONSOLE_HASH`, create the selected annotated tag at that exact hash and push it:
+
+```bash
+git -C "$CONSOLE_SCRATCH/console" tag -a "<console-tag>" -m "Release <console-tag>" "$CONSOLE_HASH"
+git -C "$CONSOLE_SCRATCH/console" push origin "<console-tag>"
+```
+
+Console tags include the `v` prefix. Pushing the tag triggers `.github/workflows/release.yml` (`🚀 Release`). Remove `CONSOLE_SCRATCH` after the gate completes.
+
+3. Find the exact tag run and wait for completion:
+
+```bash
+gh run list -R "$CONSOLE_REPO" --workflow release.yml --branch "<console-tag>" --limit 1
+gh run watch -R "$CONSOLE_REPO" "<console-run-id>" --exit-status
+```
+
+4. Block until the published Release is non-draft, the latest endpoint returns the expected tag, and `rustfs-console-<console-tag>.zip` is uploaded, non-empty, and carries a `sha256:` digest:
+
+```bash
+gh release view -R "$CONSOLE_REPO" "<console-tag>" --json isDraft,isPrerelease,assets,url
+test "$(gh api "repos/${CONSOLE_REPO}/releases/latest" --jq .tag_name)" = "<console-tag>"
+test "$(gh api "repos/${CONSOLE_REPO}/releases/tags/<console-tag>" \
+  --jq '[.assets[] | select(.name == "rustfs-console-<console-tag>.zip" and .state == "uploaded" and .size > 0 and (.digest | startswith("sha256:")))] | length')" -eq 1
+```
+
+Treat a missing/mismatched asset, digest, latest tag, or failed/cancelled workflow as BLOCKED. Do not start Phase 1 until the Console gate passes. Record `CONSOLE_TAG`, `CONSOLE_HASH`, Console run URL, and Release URL for the final report.
 
 ## Phase 1 — Version bump to the final target (once)
 
@@ -85,16 +144,16 @@ git push origin "<preview-tag>"
 
 Pushing the tag triggers `.github/workflows/build.yml` ("Build and Release"); `docker.yml` chains off it via `workflow_run`.
 
+The preview run builds versioned artifacts and publishes them in a GitHub prerelease. Its latest-channel, R2, Docker, and Helm jobs must be skipped. Those publication paths run only after the final tag is pushed.
+
 On a restart (N+1), refresh `PREVIEW_HASH=$(git rev-parse origin/main)` first — it must contain the fix — and re-report it.
 
-## Phase 3 — CI and artifact verification
+## Phase 3 — CI and preview Release verification
 
-- Watch the tag build: `gh run list --workflow build.yml --limit 5` then `gh run watch <run-id>`. Every matrix target must succeed (linux x86_64/aarch64 × musl/gnu, macos-aarch64, windows-x86_64) plus the release and latest.json jobs.
-- Verify the GitHub release: `gh release view "<preview-tag>" --json isPrerelease,assets`
-  - `isPrerelease` must be `true`.
-  - Assets must include all 6 platform zips in both versioned (`rustfs-<platform>-v<tag>.zip`) and `-latest` forms, plus `SHA256SUMS`, `SHA512SUMS`, `rustfs-<tag>.sbom.cdx.json`, `rustfs-<tag>.provenance.json`.
-- Verify the chained Docker run succeeded: `gh run list --workflow docker.yml --limit 3`.
-- Checksum spot-check for the platform you will run locally: download the zip and `SHA256SUMS`, verify with `shasum -a 256 -c` (grep to one line).
+- Find and watch the tag build: `gh run list --workflow build.yml --branch "<preview-tag>" --limit 1` then `gh run watch <run-id>`. Every build matrix target must succeed (linux x86_64/aarch64 × musl/gnu, macos-aarch64, windows-x86_64).
+- Confirm the Release publication jobs (`create-release`, `upload-release-assets`, and `publish-release`) succeed while `update-latest-version` is skipped.
+- Verify `gh release view "<preview-tag>" --json isPrerelease,assets,url`: `isPrerelease` must be `true`, and the Release must contain all 6 versioned platform zips, checksums, SBOM, and provenance with no `-latest` assets. Confirm `gh api repos/{owner}/{repo}/releases/latest --jq .tag_name` does not return `<preview-tag>`.
+- Confirm preview-triggered Docker and Helm jobs are skipped. Preview validation covers the built RustFS binaries, embedded console, and rc compatibility; Docker image construction and Helm publication are deferred to the final tag because the Dockerfiles consume GitHub Release assets.
 
 ## Phase 4 — Run the artifact locally, verify the console
 
@@ -157,13 +216,14 @@ git push origin "<target>"
 ```
 
 - CI rebuilds from the same source; the only changed input is the tag name, so the binary now self-reports `<target>`.
-- Re-run the Phase 3 verification against the final tag: all matrix jobs green; `gh release view "<target>"` shows the full asset set; for a prerelease target `isPrerelease` is `true`, for a stable target it must be `false` and `latest.json` must be updated.
+- Verify the final tag's complete publication path: all matrix and release jobs green; `gh release view "<target>"` shows the full versioned and `-latest` asset set plus checksums, SBOM, and provenance; Docker and Helm workflows succeed; `latest.json` points to `<target>`. A stable target must have `isPrerelease=false` and `isLatest=true`. An alpha/beta/rc target must have `isPrerelease=true`; GitHub does not permit prereleases to be Latest, but the project `latest.json` still advances to the final non-preview target.
 - Optionally spot-check `./rustfs --version` from a final-tag artifact — it must report `<target>`.
 
 ## Output contract
 
 Always report:
 
+- Console gate result: previous/latest Console tags, whether merged changes required a release, `CONSOLE_HASH`, and Console run/Release URLs when a release was published.
 - Target version, preview tag(s) used, `PREVIEW_HASH` (which both tags point at).
-- Per-phase result (PASS/FAIL/BLOCKED) with key evidence: CI run URLs, release URLs, console check results, the rc command matrix.
+- Per-phase result (PASS/FAIL/BLOCKED) with key evidence: preview and final Release URLs, preview `isPrerelease`/`isLatest` state, final latest-channel state, console check results, and the rc command matrix.
 - Any deviation from this pipeline and why the user approved it.
