@@ -17,6 +17,7 @@
 use crate::error::Result;
 use crate::types::*;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub mod local;
@@ -184,6 +185,16 @@ pub trait KmsBackend: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> Result<bool>;
+
+    /// Report which operations this backend actually supports.
+    ///
+    /// The default is conservative: only the operations every backend is
+    /// required to implement by this trait are advertised. Optional lifecycle
+    /// operations (rotation, enable/disable, deletion scheduling, ...) must be
+    /// opted in by overriding this method.
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::minimal()
+    }
 }
 
 /// Information about a KMS backend
@@ -235,5 +246,225 @@ impl BackendInfo {
     pub fn with_metadata(mut self, key: String, value: String) -> Self {
         self.metadata.insert(key, value);
         self
+    }
+}
+
+/// Set of operations a KMS backend supports.
+///
+/// Reported by [`KmsBackend::capabilities`] so callers (manager, admin API)
+/// can discover what the active backend can do without probing individual
+/// operations. Marked `#[non_exhaustive]` so new capability flags can be
+/// added without breaking downstream code; construct values through
+/// [`BackendCapabilities::minimal`] and the `with_*` builders.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapabilities {
+    /// Direct encryption of caller-provided plaintext with a master key
+    pub encrypt: bool,
+    /// Decryption of previously produced ciphertext
+    pub decrypt: bool,
+    /// Data encryption key (DEK) generation
+    pub generate_data_key: bool,
+    /// Key rotation that retains prior versions for decryption
+    pub rotate: bool,
+    /// Enabling and disabling keys
+    pub enable_disable: bool,
+    /// Scheduling key deletion with a pending window
+    pub schedule_deletion: bool,
+    /// Multiple key versions addressable after rotation
+    pub versioning: bool,
+    /// Irreversible physical deletion of key material
+    pub physical_delete: bool,
+}
+
+impl BackendCapabilities {
+    /// Conservative baseline: only the operations that every [`KmsBackend`]
+    /// implementation is required to provide by the trait. All optional
+    /// lifecycle capabilities default to unsupported.
+    pub const fn minimal() -> Self {
+        Self {
+            encrypt: true,
+            decrypt: true,
+            generate_data_key: true,
+            rotate: false,
+            enable_disable: false,
+            schedule_deletion: false,
+            versioning: false,
+            physical_delete: false,
+        }
+    }
+
+    /// Set whether direct encryption is supported
+    pub const fn with_encrypt(mut self, encrypt: bool) -> Self {
+        self.encrypt = encrypt;
+        self
+    }
+
+    /// Set whether decryption is supported
+    pub const fn with_decrypt(mut self, decrypt: bool) -> Self {
+        self.decrypt = decrypt;
+        self
+    }
+
+    /// Set whether data key generation is supported
+    pub const fn with_generate_data_key(mut self, generate_data_key: bool) -> Self {
+        self.generate_data_key = generate_data_key;
+        self
+    }
+
+    /// Set whether version-retaining key rotation is supported
+    pub const fn with_rotate(mut self, rotate: bool) -> Self {
+        self.rotate = rotate;
+        self
+    }
+
+    /// Set whether enabling/disabling keys is supported
+    pub const fn with_enable_disable(mut self, enable_disable: bool) -> Self {
+        self.enable_disable = enable_disable;
+        self
+    }
+
+    /// Set whether scheduled deletion with a pending window is supported
+    pub const fn with_schedule_deletion(mut self, schedule_deletion: bool) -> Self {
+        self.schedule_deletion = schedule_deletion;
+        self
+    }
+
+    /// Set whether multiple key versions are supported
+    pub const fn with_versioning(mut self, versioning: bool) -> Self {
+        self.versioning = versioning;
+        self
+    }
+
+    /// Set whether physical deletion of key material is supported
+    pub const fn with_physical_delete(mut self, physical_delete: bool) -> Self {
+        self.physical_delete = physical_delete;
+        self
+    }
+}
+
+impl Default for BackendCapabilities {
+    fn default() -> Self {
+        Self::minimal()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::KmsConfig;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    /// Backend that implements only the trait-mandated operations and relies
+    /// on the default `capabilities` implementation.
+    struct MinimalBackend;
+
+    #[async_trait]
+    impl KmsBackend for MinimalBackend {
+        async fn create_key(&self, _request: CreateKeyRequest) -> Result<CreateKeyResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn encrypt(&self, _request: EncryptRequest) -> Result<EncryptResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn decrypt(&self, _request: DecryptRequest) -> Result<DecryptResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn generate_data_key(&self, _request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn describe_key(&self, _request: DescribeKeyRequest) -> Result<DescribeKeyResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn list_keys(&self, _request: ListKeysRequest) -> Result<ListKeysResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn delete_key(&self, _request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn cancel_key_deletion(&self, _request: CancelKeyDeletionRequest) -> Result<CancelKeyDeletionResponse> {
+            unimplemented!("not exercised by capability tests")
+        }
+
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn capabilities_snapshot(capabilities: BackendCapabilities) -> std::collections::BTreeMap<String, bool> {
+        serde_json::from_value(serde_json::to_value(capabilities).expect("capabilities should serialize"))
+            .expect("capabilities should deserialize into a flat bool map")
+    }
+
+    #[test]
+    fn default_capabilities_are_conservative() {
+        let capabilities = MinimalBackend.capabilities();
+        assert_eq!(capabilities, BackendCapabilities::minimal());
+        assert_eq!(capabilities, BackendCapabilities::default());
+
+        // The conservative baseline advertises only trait-mandated operations.
+        assert!(capabilities.encrypt);
+        assert!(capabilities.decrypt);
+        assert!(capabilities.generate_data_key);
+        assert!(!capabilities.rotate);
+        assert!(!capabilities.enable_disable);
+        assert!(!capabilities.schedule_deletion);
+        assert!(!capabilities.versioning);
+        assert!(!capabilities.physical_delete);
+    }
+
+    #[tokio::test]
+    async fn local_backend_capabilities_golden() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        let backend = local::LocalKmsBackend::new(config).await.expect("local backend should build");
+
+        insta::assert_json_snapshot!("local_backend_capabilities", capabilities_snapshot(backend.capabilities()));
+    }
+
+    #[tokio::test]
+    async fn vault_kv2_backend_capabilities_golden() {
+        let config = KmsConfig::vault(
+            url::Url::parse("http://127.0.0.1:8200").expect("vault URL should parse"),
+            "dev-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        // Constructing the client performs no network I/O with token auth.
+        let backend = vault::VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        insta::assert_json_snapshot!("vault_kv2_backend_capabilities", capabilities_snapshot(backend.capabilities()));
+    }
+
+    #[tokio::test]
+    async fn vault_transit_backend_capabilities_golden() {
+        let config = KmsConfig::vault_transit(
+            url::Url::parse("http://127.0.0.1:8200").expect("vault URL should parse"),
+            "dev-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        // Constructing the client performs no network I/O with token auth.
+        let backend = vault_transit::VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        insta::assert_json_snapshot!("vault_transit_backend_capabilities", capabilities_snapshot(backend.capabilities()));
+    }
+
+    #[tokio::test]
+    async fn static_backend_capabilities_golden() {
+        let config = KmsConfig::static_kms("static-key".to_string(), BASE64.encode([0u8; 32]));
+        let backend = static_kms::StaticKmsBackend::new(config)
+            .await
+            .expect("static backend should build");
+
+        insta::assert_json_snapshot!("static_backend_capabilities", capabilities_snapshot(backend.capabilities()));
     }
 }

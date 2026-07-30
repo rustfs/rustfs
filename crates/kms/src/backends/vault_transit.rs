@@ -15,7 +15,7 @@
 //! Vault Transit-based KMS backend.
 
 use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
-use crate::backends::{BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -761,6 +761,18 @@ impl KmsBackend for VaultTransitKmsBackend {
 
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        // Vault Transit natively supports version-retaining rotation, keeps
+        // prior versions addressable for decryption, and allows physical
+        // deletion once a key is pending deletion.
+        BackendCapabilities::minimal()
+            .with_rotate(true)
+            .with_enable_disable(true)
+            .with_schedule_deletion(true)
+            .with_versioning(true)
+            .with_physical_delete(true)
     }
 }
 

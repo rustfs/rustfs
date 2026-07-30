@@ -14,7 +14,7 @@
 
 //! Local file-based KMS backend implementation
 
-use crate::backends::{BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -1491,6 +1491,17 @@ impl KmsBackend for LocalKmsBackend {
 
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        // Rotation stays unadvertised until historical key versions can be
+        // retained (see LocalKmsClient::rotate_key); without version history
+        // there is also no versioning capability. Deletion deadlines are not
+        // yet persisted across restarts, but scheduling itself is supported.
+        BackendCapabilities::minimal()
+            .with_enable_disable(true)
+            .with_schedule_deletion(true)
+            .with_physical_delete(true)
     }
 }
 
