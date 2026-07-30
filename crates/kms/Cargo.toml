@@ -65,11 +65,17 @@ rustfs-security-governance = { workspace = true }
 # HTTP client for Vault
 reqwest = { workspace = true }
 vaultrs = { workspace = true }
+# vaultrs surfaces transport-level failures as wrapped rustify errors; the
+# operation policy needs the concrete type to classify them for retry decisions.
+rustify = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []

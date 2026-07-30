@@ -9441,6 +9441,7 @@ name = "rustfs-kms"
 version = "1.0.0-beta.12"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "arc-swap",
  "argon2",
  "async-trait",
@@ -9455,6 +9456,7 @@ dependencies = [
  "reqwest",
  "rustfs-security-governance",
  "rustfs-utils",
+ "rustify",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -9463,6 +9465,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "uuid",

@@ -138,9 +138,17 @@ pub struct VaultTransitKmsClient {
 }
 
 impl VaultTransitKmsClient {
-    pub async fn new(config: VaultTransitConfig) -> Result<Self> {
+    /// Create a new Vault Transit KMS client
+    ///
+    /// `attempt_timeout` caps every HTTP request issued through this client.
+    pub async fn new(config: VaultTransitConfig, attempt_timeout: Duration) -> Result<Self> {
         let mut settings_builder = VaultClientSettingsBuilder::default();
         settings_builder.address(&config.address);
+        // Defense in depth against stalled connections: vaultrs leaves the
+        // underlying reqwest client without any timeout by default, so a hung
+        // request would otherwise wait forever regardless of the
+        // operation-level retry policy.
+        settings_builder.timeout(Some(attempt_timeout));
 
         let token = match &config.auth_method {
             crate::config::VaultAuthMethod::Token { token } => token.clone(),
@@ -607,7 +615,7 @@ impl VaultTransitKmsBackend {
             }
         };
 
-        let client = VaultTransitKmsClient::new(vault_config).await?;
+        let client = VaultTransitKmsClient::new(vault_config, config.effective_timeout()).await?;
         Ok(Self { client })
     }
 }
@@ -788,7 +796,7 @@ mod tests {
         let config = test_vault_transit_config();
 
         // --- First "process": create a key and disable it ---
-        let client1 = VaultTransitKmsClient::new(config.clone())
+        let client1 = VaultTransitKmsClient::new(config.clone(), Duration::from_secs(30))
             .await
             .expect("Failed to create VaultTransit client");
 
@@ -811,7 +819,7 @@ mod tests {
         assert_eq!(info_after_disable.status, KeyStatus::Disabled, "key must be Disabled after disable_key");
 
         // --- Simulate restart: create a brand new client with empty cache ---
-        let client2 = VaultTransitKmsClient::new(config)
+        let client2 = VaultTransitKmsClient::new(config, Duration::from_secs(30))
             .await
             .expect("Failed to create second VaultTransit client (restart simulation)");
 
@@ -841,7 +849,7 @@ mod tests {
     async fn test_transit_pending_deletion_survives_restart_simulation() {
         let config = test_vault_transit_config();
 
-        let client1 = VaultTransitKmsClient::new(config.clone())
+        let client1 = VaultTransitKmsClient::new(config.clone(), Duration::from_secs(30))
             .await
             .expect("Failed to create VaultTransit client");
 
@@ -865,7 +873,7 @@ mod tests {
             "key must be PendingDeletion after schedule_key_deletion"
         );
 
-        let client2 = VaultTransitKmsClient::new(config)
+        let client2 = VaultTransitKmsClient::new(config, Duration::from_secs(30))
             .await
             .expect("Failed to create second VaultTransit client (restart simulation)");
 
