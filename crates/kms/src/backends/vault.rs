@@ -114,17 +114,18 @@ impl VaultKmsClient {
         format!("{}/{}", self.key_path_prefix, key_id)
     }
 
-    /// Encrypt key material using Vault's transit engine
+    /// Encode key material for KV2 storage.
+    ///
+    /// This is plain Base64 encoding, not encryption: the KV2 backend stores master key
+    /// material as-is and relies on Vault ACLs plus KV2 at-rest encryption for
+    /// confidentiality. Any identity with KV read access to the key path can recover the
+    /// plaintext master key.
     async fn encrypt_key_material(&self, key_material: &[u8]) -> Result<String> {
-        // For simplicity, we'll base64 encode the key material
-        // In a production setup, you would use Vault's transit engine for additional encryption
         Ok(general_purpose::STANDARD.encode(key_material))
     }
 
-    /// Decrypt key material
+    /// Decode key material from KV2 storage (plain Base64, see `encrypt_key_material`).
     async fn decrypt_key_material(&self, encrypted_material: &str) -> Result<Vec<u8>> {
-        // For simplicity, we'll base64 decode the key material
-        // In a production setup, you would use Vault's transit engine for decryption
         general_purpose::STANDARD
             .decode(encrypted_material)
             .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))
@@ -529,33 +530,13 @@ impl KmsClient for VaultKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
-        debug!("Rotating key: {}", key_id);
-
-        let mut key_data = self.get_key_data(key_id).await?;
-        key_data.version += 1;
-
-        // Generate new key material
-        let key_material = generate_key_material(&key_data.algorithm)?;
-        key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
-
-        self.store_key_data(key_id, &key_data).await?;
-
-        let master_key = MasterKeyInfo {
-            key_id: key_id.to_string(),
-            version: key_data.version,
-            algorithm: key_data.algorithm,
-            usage: key_data.usage,
-            status: key_data.status,
-            description: None, // Rotate preserves existing description (would need key lookup)
-            metadata: key_data.metadata,
-            created_at: key_data.created_at,
-            rotated_at: Some(Zoned::now()),
-            created_by: None,
-        };
-
-        debug!(key_id, "Vault KMS key rotated");
-        Ok(master_key)
+    async fn rotate_key(&self, _key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+        // Rotation previously overwrote the stored master key with fresh material, which
+        // permanently orphaned every DEK wrapped by the prior version. Reject before any
+        // storage access so existing material can never be touched.
+        Err(KmsError::invalid_operation(
+            "Vault KV2 rotation is unavailable until versioned key material retention lands",
+        ))
     }
 
     async fn health_check(&self) -> Result<()> {
@@ -585,6 +566,9 @@ impl KmsClient for VaultKmsClient {
         BackendInfo::new("vault-kv2".to_string(), "0.1.0".to_string(), self.config.address.clone(), true)
             .with_metadata("kv_mount".to_string(), self.kv_mount.clone())
             .with_metadata("key_prefix".to_string(), self.key_path_prefix.clone())
+            // Master key material is protected only by Vault ACLs and KV2 at-rest
+            // encryption; there is no additional cryptographic wrapping.
+            .with_metadata("at_rest_protection".to_string(), "vault-kv2-acl".to_string())
     }
 }
 
@@ -898,6 +882,54 @@ mod tests {
             namespace: None,
             tls: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_vault_kv2_rotate_key_rejected_without_touching_storage() {
+        // No Vault instance needed: rotation must be rejected before any storage access,
+        // so the call cannot read or overwrite key material.
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let err = client
+            .rotate_key("any-key", None)
+            .await
+            .expect_err("Vault KV2 rotation must be rejected");
+        assert!(matches!(err, KmsError::InvalidOperation { .. }), "expected InvalidOperation, got {err:?}");
+        assert!(err.to_string().contains("rotation is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_vault_kv2_backend_info_reports_at_rest_protection() {
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let info = client.backend_info();
+        assert_eq!(info.backend_type, "vault-kv2");
+        assert_eq!(info.metadata.get("at_rest_protection").map(String::as_str), Some("vault-kv2-acl"));
+        // The KV2 backend must not present itself as Transit-backed.
+        assert!(!format!("{info:?}").contains("Transit"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn test_vault_kv2_rotate_rejected_and_material_untouched() {
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let key_id = format!("rotate-{}", uuid::Uuid::new_v4());
+        client.create_key(&key_id, "AES_256", None).await.expect("create");
+        let before = client.get_key_data(&key_id).await.expect("read");
+
+        let err = client
+            .rotate_key(&key_id, None)
+            .await
+            .expect_err("Vault KV2 rotation must be rejected");
+        assert!(matches!(err, KmsError::InvalidOperation { .. }));
+
+        let after = client.get_key_data(&key_id).await.expect("reread");
+        assert_eq!(
+            after.encrypted_key_material, before.encrypted_key_material,
+            "rejected rotation must leave stored key material untouched"
+        );
+        assert_eq!(after.version, before.version, "rejected rotation must not bump the key version");
     }
 
     #[tokio::test]
