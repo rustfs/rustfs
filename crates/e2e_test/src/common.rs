@@ -24,7 +24,12 @@
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
+use http::header::{CONTENT_TYPE, HOST};
 use reqwest::Client as HttpClient;
+use reqwest::StatusCode;
+use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use rustfs_signer::sign_v4;
+use s3s::Body;
 use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::path::{Path, PathBuf};
@@ -73,6 +78,58 @@ pub fn local_http_client() -> HttpClient {
         .no_proxy()
         .build()
         .expect("failed to build local reqwest client")
+}
+
+/// Signs and sends an admin HTTP request with the given credentials.
+pub(crate) async fn admin_request(
+    base_url: &str,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{base_url}{path_and_query}");
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
+    let mut request = http::Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .header(HOST, authority)
+        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if body.is_some() {
+        request = request.header(CONTENT_TYPE, "application/json");
+    }
+
+    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "admin request body is too large")?;
+    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
+
+    let mut request = local_http_client().request(method, &url);
+    for (name, value) in signed.headers() {
+        request = request.header(name, value);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    Ok((status, body))
+}
+
+/// Sends a root-credential admin request and returns its successful response body.
+pub(crate) async fn admin_ok(
+    env: &RustFSTestEnvironment,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (status, response_body) =
+        admin_request(&env.url, method.clone(), path_and_query, body, &env.access_key, &env.secret_key).await?;
+    if !status.is_success() {
+        return Err(format!("{method} {path_and_query} failed: {status} {response_body}").into());
+    }
+    Ok(response_body)
 }
 
 /// Resolve the RustFS binary relative to the workspace.

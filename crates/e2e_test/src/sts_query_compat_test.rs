@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestEnvironment, admin_ok, init_logging};
 use aws_sdk_sts::config::retry::RetryConfig;
 use aws_sdk_sts::config::{Credentials, Region};
 use aws_sdk_sts::error::ProvideErrorMetadata;
@@ -20,16 +20,13 @@ use aws_sdk_sts::operation::RequestId;
 use aws_sdk_sts::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use bytes::Bytes;
-use http::header::{CONTENT_TYPE, HOST};
+use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use serde_json::Value;
 use serial_test::serial;
 use std::collections::BTreeSet;
@@ -60,42 +57,6 @@ fn sts_client(url: &str, access_key: &str, secret_key: &str, session_token: Opti
         config = config.http_client(SmithyHttpClientBuilder::new().build_http());
     }
     Client::from_conf(config.build())
-}
-
-async fn admin_ok(
-    env: &RustFSTestEnvironment,
-    method: http::Method,
-    path: &str,
-    body: Option<String>,
-) -> Result<String, BoxError> {
-    let url = format!("{}{path}", env.url);
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
-    let mut request = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if body.is_some() {
-        request = request.header(CONTENT_TYPE, "application/json");
-    }
-    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "admin request body is too large")?;
-    let request = request.body(Body::empty())?;
-    let signed = sign_v4(request, content_length, &env.access_key, &env.secret_key, "", "us-east-1");
-    let mut request = local_http_client().request(method.clone(), &url);
-    for (name, value) in signed.headers() {
-        request = request.header(name, value);
-    }
-    if let Some(body) = body {
-        request = request.body(body);
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(format!("{method} {path} failed: {status} {body}").into());
-    }
-    Ok(body)
 }
 
 async fn create_root_service_account(env: &RustFSTestEnvironment) -> Result<(String, String), BoxError> {

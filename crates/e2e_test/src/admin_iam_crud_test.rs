@@ -26,75 +26,16 @@
 //! Later batches tracked on backlog#1154: config get/set, info, pools status,
 //! group lifecycle, import/export IAM.
 
-use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestEnvironment, admin_ok, admin_request, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
-use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use serial_test::serial;
 use std::error::Error;
 use tokio::time::{Duration, sleep};
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
-type BoxError = Box<dyn Error + Send + Sync>;
-
-/// Signs and sends an admin HTTP request with the given credential, returning
-/// status and body. Native `/rustfs/admin/v3` requests and responses are plain
-/// JSON (the MinIO-compat encryption applies only to `/minio/admin/v3` paths).
-async fn admin_request(
-    base_url: &str,
-    method: http::Method,
-    path_and_query: &str,
-    body: Option<String>,
-    access_key: &str,
-    secret_key: &str,
-) -> Result<(StatusCode, String), BoxError> {
-    let url = format!("{base_url}{path_and_query}");
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
-    let mut builder = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if body.is_some() {
-        builder = builder.header(CONTENT_TYPE, "application/json");
-    }
-
-    let content_len = body.as_ref().map(|b| b.len() as i64).unwrap_or_default();
-    let signed = sign_v4(builder.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request = local_http_client().request(reqwest_method, &url);
-    for (name, value) in signed.headers() {
-        request = request.header(name, value);
-    }
-    if let Some(body) = body {
-        request = request.body(body);
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    Ok((status, text))
-}
-
-/// Root-credential admin request that must succeed; returns the response body.
-async fn admin_ok(
-    env: &RustFSTestEnvironment,
-    method: http::Method,
-    path_and_query: &str,
-    body: Option<String>,
-) -> Result<String, BoxError> {
-    let (status, text) = admin_request(&env.url, method.clone(), path_and_query, body, &env.access_key, &env.secret_key).await?;
-    if !status.is_success() {
-        return Err(format!("{method} {path_and_query} failed: {status} {text}").into());
-    }
-    Ok(text)
-}
 
 fn build_s3_client(url: &str, access_key: &str, secret_key: &str) -> Client {
     let config = Config::builder()

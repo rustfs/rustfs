@@ -1163,7 +1163,19 @@ impl<T: Store> IamSys<T> {
             };
         }
 
-        let combined_policy = self.get_combined_policy(&policies).await;
+        let (resolved_policies, combined_policy) = self.store.merge_policies(&policies.join(",")).await;
+        if args.deny_only {
+            let resolved_policy_names = MappedPolicy::new(&resolved_policies).policy_set();
+            if policies
+                .iter()
+                .any(|policy_name| !resolved_policy_names.contains(policy_name))
+            {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
+            }
+        }
         PreparedIamAuth {
             needs_existing_object_tag: policy_needs_existing_object_tag_for_args(&combined_policy, args).await,
             mode: PreparedIamMode::Regular { combined_policy },
@@ -1703,7 +1715,7 @@ mod tests {
     fn deprecated_list_polices_api_is_available() {
         let _ = IamSys::<StsTestMockStore>::list_polices;
     }
-    use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use rustfs_policy::policy::action::{Action, AdminAction, S3Action, StsAction};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
     use std::{
@@ -3307,6 +3319,45 @@ mod tests {
 
         assert!(matches!(prepared.mode, PreparedIamMode::Deny));
         assert!(!iam_sys.eval_prepared(&prepared, &args).await);
+    }
+
+    #[tokio::test]
+    async fn regular_deny_only_rejects_unresolved_mapped_policy() {
+        let iam_sys = test_iam_sys().await;
+        let user = "regular-unresolved-policy";
+        let identity = UserIdentity::from(Credentials {
+            access_key: user.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        iam_sys.store.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_user(user, &identity, now);
+            cache.add_or_update_user_policy(user, &MappedPolicy::new("readwrite,missing-policy"), now);
+        });
+
+        let groups = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let args = Args {
+            account: user,
+            groups: &groups,
+            action: Action::StsAction(StsAction::AssumeRoleAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let prepared = iam_sys.prepare_regular_auth(&args).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Deny));
+        assert!(
+            !iam_sys.eval_prepared(&prepared, &args).await,
+            "deny-only evaluation must fail closed when a mapped policy document is unresolved"
+        );
     }
 
     #[tokio::test]
