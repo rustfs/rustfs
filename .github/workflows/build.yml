@@ -781,6 +781,7 @@ jobs:
           VERSION="${{ needs.build-check.outputs.version }}"
           IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          TARGET_COMMITISH=$(git rev-parse --verify "refs/tags/${TAG}^{commit}")
 
           # Determine release type for title
           if [[ "$BUILD_TYPE" == "preview" ]]; then
@@ -799,49 +800,18 @@ jobs:
             RELEASE_TYPE="release"
           fi
 
-          # Check if release already exists
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
-            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
-            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          # Create release title
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            TITLE="RustFS $VERSION (${RELEASE_TYPE})"
           else
-            # Get release notes from tag message
-            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
-            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
-              if [[ "$IS_PRERELEASE" == "true" ]]; then
-                RELEASE_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
-              else
-                RELEASE_NOTES="Release ${VERSION}"
-              fi
-            fi
-
-            # Create release title
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              TITLE="RustFS $VERSION (${RELEASE_TYPE})"
-            else
-              TITLE="RustFS $VERSION"
-            fi
-
-            # Create the release
-            PRERELEASE_FLAG=""
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              PRERELEASE_FLAG="--prerelease"
-            fi
-
-            gh release create "$TAG" \
-              --title "$TITLE" \
-              --notes "$RELEASE_NOTES" \
-              $PRERELEASE_FLAG \
-              --latest=false \
-              --draft
-
-            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
-            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+            TITLE="RustFS $VERSION"
           fi
 
-          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
-          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
-          echo "Created release: $RELEASE_URL"
+          ./scripts/release/create_or_update_release.sh \
+            "$TAG" \
+            "$TARGET_COMMITISH" \
+            "$TITLE" \
+            "$IS_PRERELEASE"
 
   # Prepare and upload release assets
   upload-release-assets:
@@ -1002,10 +972,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - name: Update release notes and publish
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

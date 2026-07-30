@@ -4,6 +4,10 @@ set -euo pipefail
 build_workflow=".github/workflows/build.yml"
 docker_workflow=".github/workflows/docker.yml"
 helm_workflow=".github/workflows/helm-package.yml"
+release_script="scripts/release/create_or_update_release.sh"
+
+# shellcheck source=scripts/release/create_or_update_release.sh
+source "$release_script"
 
 require_line() {
   local file="$1"
@@ -12,6 +16,17 @@ require_line() {
 
   if ! grep -Fxq "$line" "$file"; then
     echo "missing preview release workflow contract: $description" >&2
+    exit 1
+  fi
+}
+
+require_absent() {
+  local file="$1"
+  local text="$2"
+  local description="$3"
+
+  if grep -Fq -- "$text" "$file"; then
+    echo "invalid preview release workflow contract: $description" >&2
     exit 1
   fi
 }
@@ -125,24 +140,12 @@ done
 latest_guard="startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')"
 require_job_if "$build_workflow" "update-latest-version" "    if: $latest_guard"
 require_line "$build_workflow" "    needs: [ build-check, publish-release ]" "latest update must follow release publication"
-require_line "$build_workflow" "              --latest=false \\" "new releases must start outside the latest channel"
-prerelease_flag_block=$(awk '
-  $0 == "            PRERELEASE_FLAG=\"\"" { in_block = 1 }
-  in_block { print }
-  in_block && $0 == "            fi" { exit }
-' "$build_workflow")
-IFS= read -r -d '' expected_prerelease_flag_block <<'EOF' || true
-            PRERELEASE_FLAG=""
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              PRERELEASE_FLAG="--prerelease"
-            fi
-EOF
-expected_prerelease_flag_block=${expected_prerelease_flag_block%$'\n'}
-if [[ "$prerelease_flag_block" != "$expected_prerelease_flag_block" ]]; then
-  echo "missing preview release workflow contract: prerelease flag propagation" >&2
-  exit 1
-fi
-require_line "$build_workflow" "              \$PRERELEASE_FLAG \\" "GitHub prerelease creation flag"
+require_line "$build_workflow" "          TARGET_COMMITISH=\$(git rev-parse --verify \"refs/tags/\${TAG}^{commit}\")" "release target commit resolution"
+require_line "$build_workflow" "          ./scripts/release/create_or_update_release.sh \\" "managed release creation"
+require_absent "$build_workflow" "git tag -l --format='%(contents)'" "annotated tag messages must not become release notes"
+require_absent "$build_workflow" "--generate-notes" "GitHub must not choose the release notes baseline implicitly"
+require_line "$release_script" "  gh api --method POST \"repos/\${GITHUB_REPOSITORY}/releases/generate-notes\" \\" "Generate Release Notes API"
+require_line "$release_script" "    local create_args=(release create \"\$tag\" --title \"\$title\" --notes-file \"\$notes_file\" --latest=false --draft)" "draft release creation with a notes file"
 
 release_channel_block=$(awk '
   $0 == "          if [[ \"\$BUILD_TYPE\" == \"release\" ]]; then" { in_block = 1 }
@@ -165,6 +168,20 @@ EOF
 expected_release_channel_block=${expected_release_channel_block%$'\n'}
 if [[ "$release_channel_block" != "$expected_release_channel_block" ]]; then
   echo "missing preview release workflow contract: only stable releases may become GitHub Latest" >&2
+  exit 1
+fi
+
+publish_release_block=$(awk '
+  $0 == "  publish-release:" { in_job = 1 }
+  in_job { print }
+  in_job && /^  [A-Za-z0-9_-]+:$/ && $0 != "  publish-release:" { exit }
+' "$build_workflow")
+if [[ "$publish_release_block" != *"      - name: Publish release"* ]]; then
+  echo "missing preview release workflow contract: publish job must only publish the prepared release" >&2
+  exit 1
+fi
+if grep -Eq -- '--notes|generate-notes|create_or_update_release' <<<"$publish_release_block"; then
+  echo "invalid preview release workflow contract: publish job must not replace release notes" >&2
   exit 1
 fi
 
@@ -201,5 +218,187 @@ IFS= read -r -d '' expected_helm_guard <<'EOF' || true
 EOF
 expected_helm_guard=${expected_helm_guard%$'\n'}
 require_job_if "$helm_workflow" "build-helm-package" "$expected_helm_guard"
+
+assert_equal() {
+  local expected="$1"
+  local actual="$2"
+  local description="$3"
+
+  if [[ "$actual" != "$expected" ]]; then
+    echo "invalid preview release workflow contract: $description (expected '$expected', got '$actual')" >&2
+    exit 1
+  fi
+}
+
+IFS= read -r -d '' release_fixture <<'EOF' || true
+[
+  [
+    {"tag_name":"1.0.0-beta.12-preview.1","created_at":"2026-07-30T02:30:00Z","published_at":"2026-07-30T02:36:43Z","draft":false},
+    {"tag_name":"1.0.0-beta.12","created_at":"2026-07-30T04:00:00Z","published_at":"2026-07-30T04:13:04Z","draft":false},
+    {"tag_name":"1.0.0-beta.12-preview.0","created_at":"2026-07-29T10:00:00Z","published_at":"2026-07-29T10:05:00Z","draft":false}
+  ],
+  [
+    {"tag_name":"1.0.0-beta.10","created_at":"2026-07-17T05:50:00Z","published_at":"2026-07-17T05:58:19Z","draft":false},
+    {"tag_name":"1.0.0-beta.11","created_at":"2026-07-23T04:00:00Z","published_at":"2026-07-23T04:07:31Z","draft":false},
+    {"tag_name":"9.0.0","created_at":"2025-01-01T00:00:00Z","published_at":"2025-01-01T00:00:00Z","draft":false},
+    {"tag_name":"1.0.0-beta.13","created_at":"2026-08-01T00:00:00Z","published_at":null,"draft":true}
+  ]
+]
+EOF
+
+preview_previous=$(select_previous_release_tag "1.0.0-beta.12-preview.1" "2026-07-30T02:36:43Z" <<<"$release_fixture")
+assert_equal "1.0.0-beta.11" "$preview_previous" "preview notes baseline must exclude preview releases and its final deliverable"
+
+final_previous=$(select_previous_release_tag "1.0.0-beta.12" "2026-07-30T04:13:04Z" <<<"$release_fixture")
+assert_equal "1.0.0-beta.11" "$final_previous" "final notes baseline must exclude the same-commit preview release"
+
+no_previous=$(select_previous_release_tag "1.0.0-beta.1-preview.1" "2026-01-01T00:00:00Z" <<'EOF'
+[[{"tag_name":"1.0.0-beta.1-preview.1","created_at":"2026-01-01T00:00:00Z","published_at":"2026-01-01T00:00:00Z","draft":false}]]
+EOF
+)
+assert_equal "" "$no_previous" "repositories without a previous deliverable must use GitHub's fallback baseline"
+
+delayed_draft_previous=$(select_previous_release_tag "1.0.0-beta.12" "2026-07-30T04:00:00Z" <<'EOF'
+[[
+  {"tag_name":"1.0.0-beta.12","created_at":"2026-07-30T04:00:00Z","published_at":null,"draft":true},
+  {"tag_name":"1.0.0-beta.13","created_at":"2026-08-01T00:00:00Z","published_at":"2026-08-01T00:05:00Z","draft":false},
+  {"tag_name":"1.0.0-beta.11","created_at":"2026-07-23T04:00:00Z","published_at":"2026-07-23T04:07:31Z","draft":false}
+]]
+EOF
+)
+assert_equal "1.0.0-beta.11" "$delayed_draft_previous" "draft rerun must exclude deliverables published after the draft was created"
+
+release_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rustfs-release-workflow-test.XXXXXX")
+trap 'rm -rf -- "$release_test_dir"' EXIT
+request_json="${release_test_dir}/request.json"
+write_generate_notes_request "1.0.0-beta.12" "0123456789abcdef" "1.0.0-beta.11" "$request_json"
+assert_equal "1.0.0-beta.11" "$(jq -r .previous_tag_name "$request_json")" "explicit previous_tag_name request field"
+write_generate_notes_request "1.0.0-beta.1" "0123456789abcdef" "" "$request_json"
+assert_equal "false" "$(jq 'has("previous_tag_name")' "$request_json")" "fallback request must omit previous_tag_name"
+
+existing_release_json="${release_test_dir}/existing-release.json"
+jq -n --arg body "Pre-release 1.0.0-beta.12 (beta)" '{body: $body}' > "$existing_release_json"
+assert_equal "update" "$(release_notes_action "$existing_release_json" "1.0.0-beta.12")" "rerun must repair legacy prerelease placeholder notes"
+jq -n --arg body "${MANAGED_NOTES_MARKER}
+## What's Changed" '{body: $body}' > "$existing_release_json"
+assert_equal "update" "$(release_notes_action "$existing_release_json" "1.0.0-beta.12")" "rerun must refresh managed notes"
+
+generated_body="## What's Changed
+
+* Fix release notes by @alice in #123
+* First contribution by @bob in #124
+
+## New Contributors
+* @bob made their first contribution in #124
+
+**Full Changelog**: https://github.com/rustfs/rustfs/compare/1.0.0-beta.11...1.0.0-beta.12"
+response_json="${release_test_dir}/response.json"
+notes_file="${release_test_dir}/notes.md"
+jq -n --arg body "$generated_body" '{body: $body}' > "$response_json"
+write_generated_release_notes "$response_json" "$notes_file" "rustfs/rustfs" "1.0.0-beta.12" "1.0.0-beta.11"
+expected_notes="${MANAGED_NOTES_MARKER}
+${generated_body}"
+assert_equal "$expected_notes" "$(<"$notes_file")" "generated multiline Markdown must remain intact"
+
+mock_log="${release_test_dir}/gh.log"
+mock_notes="${release_test_dir}/captured-notes.md"
+mock_generate_calls="${release_test_dir}/generate-calls"
+MOCK_RELEASES_JSON="$release_fixture"
+MOCK_GENERATED_BODY="$generated_body"
+MOCK_RELEASE_EXISTS=true
+MOCK_RELEASE_BODY="Release 1.0.0-beta.12"
+MOCK_RELEASE_VIEW_ERROR=""
+
+gh() {
+  local input_file=""
+  local notes_path=""
+
+  if [[ "$1" == "api" && "$*" == *"--paginate --slurp"* ]]; then
+    printf '%s\n' "$MOCK_RELEASES_JSON"
+    return
+  fi
+
+  if [[ "$1" == "api" && "$*" == *"releases/generate-notes"* ]]; then
+    while [[ "$#" -gt 0 ]]; do
+      if [[ "$1" == "--input" ]]; then
+        input_file="$2"
+        break
+      fi
+      shift
+    done
+    jq -e '.tag_name == "1.0.0-beta.12" and .target_commitish == "0123456789abcdef" and .previous_tag_name == "1.0.0-beta.11"' "$input_file" >/dev/null
+    printf '%s\n' called >> "$mock_generate_calls"
+    jq -n --arg body "$MOCK_GENERATED_BODY" '{body: $body}'
+    return
+  fi
+
+  if [[ "$1" == "release" && "$2" == "view" ]]; then
+    if [[ -n "$MOCK_RELEASE_VIEW_ERROR" ]]; then
+      printf '%s\n' "$MOCK_RELEASE_VIEW_ERROR" >&2
+      return 1
+    fi
+    if [[ "$MOCK_RELEASE_EXISTS" != "true" ]]; then
+      echo "release not found" >&2
+      return 1
+    fi
+    jq -n --arg body "$MOCK_RELEASE_BODY" '{databaseId: 123, url: "https://github.com/rustfs/rustfs/releases/tag/test", body: $body, createdAt: "2026-07-30T04:00:00Z", publishedAt: "2026-07-30T04:13:04Z"}'
+    return
+  fi
+
+  if [[ "$1" == "release" && ("$2" == "edit" || "$2" == "create") ]]; then
+    local action="$2"
+    shift 2
+    while [[ "$#" -gt 0 ]]; do
+      if [[ "$1" == "--notes-file" ]]; then
+        notes_path="$2"
+        break
+      fi
+      shift
+    done
+    cp "$notes_path" "$mock_notes"
+    MOCK_RELEASE_BODY=$(<"$mock_notes")
+    MOCK_RELEASE_EXISTS=true
+    printf '%s\n' "$action" >> "$mock_log"
+    return
+  fi
+
+  echo "unexpected mock gh invocation: $*" >&2
+  return 1
+}
+
+GITHUB_REPOSITORY="rustfs/rustfs"
+GITHUB_OUTPUT="${release_test_dir}/github-output"
+RUNNER_TEMP="$release_test_dir"
+create_or_update_release "1.0.0-beta.12" "0123456789abcdef" "RustFS 1.0.0-beta.12 (beta)" true
+assert_equal "edit" "$(<"$mock_log")" "existing placeholder release must be updated on rerun"
+assert_equal "$expected_notes" "$(<"$mock_notes")" "rerun must update notes through --notes-file"
+
+: > "$mock_log"
+MOCK_RELEASE_EXISTS=false
+MOCK_RELEASE_BODY=""
+create_or_update_release "1.0.0-beta.12" "0123456789abcdef" "RustFS 1.0.0-beta.12 (beta)" true
+assert_equal "create" "$(<"$mock_log")" "first run must create the draft release"
+
+: > "$mock_log"
+: > "$mock_generate_calls"
+MOCK_RELEASE_EXISTS=true
+MOCK_RELEASE_BODY="$generated_body"
+create_or_update_release "1.0.0-beta.12" "0123456789abcdef" "RustFS 1.0.0-beta.12 (beta)" true
+assert_equal "" "$(<"$mock_log")" "manual notes must not trigger a release edit"
+assert_equal "" "$(<"$mock_generate_calls")" "manual notes must be preserved without regeneration"
+
+MOCK_RELEASE_BODY="Manually curated release guidance"
+if create_or_update_release "1.0.0-beta.12" "0123456789abcdef" "RustFS 1.0.0-beta.12 (beta)" true; then
+  echo "invalid preview release workflow contract: incomplete manual notes must block publication" >&2
+  exit 1
+fi
+assert_equal "" "$(<"$mock_log")" "incomplete manual notes must not be overwritten"
+
+MOCK_RELEASE_VIEW_ERROR="gh: service unavailable (HTTP 503)"
+if create_or_update_release "1.0.0-beta.12" "0123456789abcdef" "RustFS 1.0.0-beta.12 (beta)" true; then
+  echo "invalid preview release workflow contract: transient release lookup failures must fail closed" >&2
+  exit 1
+fi
+assert_equal "" "$(<"$mock_log")" "release lookup failures must not attempt create or edit"
 
 echo "Preview release workflow contract ok."
