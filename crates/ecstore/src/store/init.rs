@@ -313,7 +313,8 @@ impl ECStore {
                 let mut times = 0;
                 let mut interval = 1;
                 loop {
-                    match init_format::connect_load_init_formats(
+                    match init_format::connect_load_init_formats_with_instance_ctx(
+                        &instance_ctx,
                         pool_first_is_local,
                         &mut disks,
                         pool_eps.set_count,
@@ -1259,6 +1260,16 @@ mod tests {
 
         let registered: Vec<String> = instance_ctx.local_disk_map().read().await.keys().cloned().collect();
         assert_eq!(registered.len(), 4, "the passed context must register all four local disks");
+        let registered_disk_ids = instance_ctx.local_disk_id_map();
+        let registered_disk_ids = registered_disk_ids.read().await;
+        assert_eq!(registered_disk_ids.len(), 4, "the passed context must publish all four disk IDs");
+        for endpoint in registered_disk_ids.values() {
+            assert!(
+                registered.contains(endpoint),
+                "every disk ID in the passed context must resolve to one of its registered endpoints"
+            );
+        }
+        drop(registered_disk_ids);
         let bootstrap = crate::runtime::instance::bootstrap_ctx();
         assert_ne!(
             bootstrap.deployment_id(),
@@ -1271,6 +1282,15 @@ mod tests {
             assert!(
                 !bootstrap_map.contains_key(key),
                 "the bootstrap context must not absorb the fresh store's disks"
+            );
+        }
+        drop(bootstrap_map);
+        let bootstrap_disk_ids = bootstrap.local_disk_id_map();
+        let bootstrap_disk_ids = bootstrap_disk_ids.read().await;
+        for endpoint in bootstrap_disk_ids.values() {
+            assert!(
+                !registered.contains(endpoint),
+                "the bootstrap context must not absorb the fresh store's disk IDs"
             );
         }
     }

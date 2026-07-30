@@ -1049,6 +1049,10 @@ impl LocalDiskWrapper {
         Ok(())
     }
 
+    pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) {
+        *self.disk_id.write().await = id;
+    }
+
     /// Get the current disk ID
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
