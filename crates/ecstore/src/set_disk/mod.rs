@@ -147,15 +147,17 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, current_dirty_generation, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
+#[cfg(test)]
+use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
 use rustfs_utils::http::{
-    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, contains_key_str,
-    get_header_map, get_str, insert_str, is_encryption_metadata_key, remove_header_map,
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_RESTORE_OPERATION_ID, contains_key_str, get_header_map, get_str, insert_str, is_object_encryption_marker,
+    remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -670,10 +672,7 @@ pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, S
 }
 
 fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
-    metadata.keys().any(|key| is_encryption_metadata_key(key))
-        || metadata.contains_key(SSEC_ALGORITHM_HEADER)
-        || metadata.contains_key(SSEC_KEY_HEADER)
-        || metadata.contains_key(SSEC_KEY_MD5_HEADER)
+    metadata.keys().any(|key| is_object_encryption_marker(key))
 }
 
 /// Per-set memoized capacity dirty scope.

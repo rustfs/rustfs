@@ -358,7 +358,7 @@ Fixture-backed tests should run when the fixture path is present:
 
 ```bash
 cargo test -p rustfs-ecstore --test legacy_bitrot_read_test -- --nocapture
-cargo test -p rustfs-ecstore --features rio-v2 --test minio_generated_read_test -- --ignored --nocapture
+cargo test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored --nocapture
 ```
 
 ## Multi-Expert Adversarial Review Summary

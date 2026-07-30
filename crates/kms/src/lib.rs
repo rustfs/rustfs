@@ -89,7 +89,7 @@ pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{
-    KmsServiceManager, KmsServiceStatus, get_global_encryption_service, get_global_kms_service_manager,
+    KmsServiceManager, KmsServiceStatus, KmsStartOutcome, get_global_encryption_service, get_global_kms_service_manager,
     init_global_kms_service_manager,
 };
 pub use types::*;

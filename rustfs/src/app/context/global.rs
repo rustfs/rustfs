@@ -18,13 +18,12 @@ use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_boot_time_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
     default_endpoints_interface, default_expiry_state_interface, default_federated_identity_interface,
-    default_internode_metrics_interface, default_kms_runtime_interface, default_local_node_name_interface,
-    default_lock_client_interface, default_lock_clients_interface, default_notification_system_interface,
-    default_notify_interface, default_outbound_tls_runtime_interface, default_performance_metrics_interface,
-    default_region_interface, default_replication_pool_interface, default_replication_stats_interface,
-    default_runtime_port_interface, default_s3select_db_interface, default_scanner_metrics_interface,
-    default_server_config_interface, default_storage_class_interface, default_tier_config_interface,
-    default_transition_state_interface,
+    default_internode_metrics_interface, default_local_node_name_interface, default_lock_client_interface,
+    default_lock_clients_interface, default_notification_system_interface, default_notify_interface,
+    default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
+    default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
+    default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
+    default_storage_class_interface, default_tier_config_interface, default_transition_state_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
@@ -80,6 +79,7 @@ pub struct AppContext {
 impl AppContext {
     pub fn new(object_store: Arc<ECStore>, iam: Arc<dyn IamInterface>, kms: Arc<dyn KmsInterface>) -> Self {
         let object_data_cache = ObjectDataCacheAdapter::from_env_or_disabled();
+        let kms_runtime = Arc::new(crate::app::context::handles::KmsRuntimeHandle::new(kms.handle()));
         // Let ecstore probe this cache inside get_object_reader, after
         // metadata resolution but before the erasure data read (backlog#802).
         crate::app::object_data_cache::register_object_data_cache_body_hook(Arc::clone(&object_data_cache));
@@ -94,7 +94,7 @@ impl AppContext {
             iam,
             federated_identity: default_federated_identity_interface(),
             kms,
-            kms_runtime: default_kms_runtime_interface(),
+            kms_runtime,
             outbound_tls_runtime: default_outbound_tls_runtime_interface(),
             notify: default_notify_interface(),
             notification_system: default_notification_system_interface(),

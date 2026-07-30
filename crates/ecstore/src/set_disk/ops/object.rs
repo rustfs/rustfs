@@ -42,11 +42,23 @@ use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppress
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
 use futures::FutureExt as _;
+use http::HeaderValue;
 use std::future::Future;
 
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
     coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
         .map_err(Error::from)
+}
+
+async fn get_object_reader_with_context(
+    ctx: &InstanceContext,
+    reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    range: Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    opts: &ObjectOptions,
+    headers: &HeaderMap<HeaderValue>,
+) -> Result<(GetObjectReader, usize, i64)> {
+    GetObjectReader::new_with_resolver(reader, range, object_info, opts, headers, ctx.object_encryption_resolver()).await
 }
 
 /// Length of the full plaintext body when — and only when — this read's output
@@ -713,7 +725,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                             size_bucket,
                         );
                         record_get_object_reader_path_observation(GET_OBJECT_PATH_CODEC_STREAMING, object_class, size_bucket);
-                        let (mut reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                        let (mut reader, _offset, _length) =
+                            get_object_reader_with_context(&self.ctx, stream, range, &object_info, opts, &h).await?;
                         // Carry the hook probe result so the app layer skips its
                         // now-redundant lookup on the streaming miss path (ODC-16).
                         reader.body_source = body_source;
@@ -745,7 +758,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
-        let (mut reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h).await?;
+        let (mut reader, offset, length) =
+            get_object_reader_with_context(&self.ctx, Box::new(rd), range, &object_info, opts, &h).await?;
         // Carry the hook probe result so the app layer skips its now-redundant
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
@@ -4533,6 +4547,61 @@ mod erasure_construction_tests {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
+    }
+}
+
+#[cfg(test)]
+mod object_encryption_resolver_wiring_tests {
+    use super::*;
+    use crate::object_api::{EncryptionResolutionError, ObjectEncryptionResolver, ReadEncryptionMaterial, ReadEncryptionRequest};
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for CountingResolver {
+        async fn resolve_read_material(
+            &self,
+            _request: ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_forwards_instance_resolver() {
+        let resolver = Arc::new(CountingResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let ctx = InstanceContext::new();
+        assert!(
+            ctx.set_object_encryption_resolver(resolver.clone()).is_ok(),
+            "fresh context should accept resolver"
+        );
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            user_defined: Arc::new(HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])),
+            ..Default::default()
+        };
+
+        let result = get_object_reader_with_context(
+            &ctx,
+            Box::new(Cursor::new(Vec::<u8>::new())),
+            None,
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .await;
+
+        assert!(result.is_err(), "resolver returning no material must fail closed");
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
     }
 }
 

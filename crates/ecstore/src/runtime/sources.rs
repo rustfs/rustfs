@@ -46,7 +46,6 @@ use crate::{
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
 use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
@@ -103,10 +102,6 @@ pub(crate) fn workload_admission_snapshot_provider() -> Option<WorkloadSnapshotP
 
 pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_error: &'static str) {
     global_internode_metrics().record_erasure_write_quorum_failure(stage, dominant_error);
-}
-
-pub(crate) async fn object_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    get_global_encryption_service().await
 }
 
 pub fn object_store_handle() -> Option<Arc<ECStore>> {
