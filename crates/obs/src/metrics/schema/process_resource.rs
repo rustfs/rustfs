@@ -14,6 +14,7 @@
 
 #![allow(dead_code)]
 
+use crate::node_identity::SERVER_LABEL;
 use crate::{MetricDescriptor, MetricName, MetricSubsystem, new_gauge_md};
 use std::sync::LazyLock;
 
@@ -22,7 +23,7 @@ pub static PROCESS_CPU_PERCENT_MD: LazyLock<MetricDescriptor> = LazyLock::new(||
     new_gauge_md(
         MetricName::Custom("cpu_percent".to_string()),
         "CPU usage of the RustFS process as a percentage",
-        &[],
+        &[SERVER_LABEL],
         MetricSubsystem::new("/process"),
     )
 });
@@ -32,7 +33,7 @@ pub static PROCESS_MEMORY_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|
     new_gauge_md(
         MetricName::Custom("memory_bytes".to_string()),
         "Resident memory usage of the RustFS process in bytes",
-        &[],
+        &[SERVER_LABEL],
         MetricSubsystem::new("/process"),
     )
 });
@@ -42,7 +43,7 @@ pub static PROCESS_UPTIME_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_gauge_md(
         MetricName::Custom("uptime_seconds".to_string()),
         "Uptime of the RustFS process in seconds",
-        &[],
+        &[SERVER_LABEL],
         MetricSubsystem::new("/process"),
     )
 });
