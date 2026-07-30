@@ -137,6 +137,8 @@ impl KmsClient for StaticKmsBackend {
             nonce: nonce_bytes.to_vec(),
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            // The static backend has a single fixed key with no rotation.
+            master_key_version: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
@@ -181,6 +183,8 @@ impl KmsClient for StaticKmsBackend {
             nonce: nonce_bytes.to_vec(),
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            // The static backend has a single fixed key with no rotation.
+            master_key_version: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 

@@ -311,6 +311,7 @@ impl KmsClient for VaultKmsClient {
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
+            master_key_version: None,
         };
 
         // Serialize the envelope as the ciphertext
@@ -938,7 +939,9 @@ mod tests {
     async fn test_vault_kv2_rotate_key_rejected_without_touching_storage() {
         // No Vault instance needed: rotation must be rejected before any storage access,
         // so the call cannot read or overwrite key material.
-        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
 
         let err = client
             .rotate_key("any-key", None)
@@ -950,7 +953,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_kv2_backend_info_reports_at_rest_protection() {
-        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
 
         let info = client.backend_info();
         assert_eq!(info.backend_type, "vault-kv2");
@@ -962,7 +967,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires a running Vault instance (dev mode)
     async fn test_vault_kv2_rotate_rejected_and_material_untouched() {
-        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
 
         let key_id = format!("rotate-{}", uuid::Uuid::new_v4());
         client.create_key(&key_id, "AES_256", None).await.expect("create");
