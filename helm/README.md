@@ -62,25 +62,31 @@ validated while rendering. Otherwise, Kubernetes auto-detection selects
 orchestrated startup when RustFS consumes the generated anchor.
 
 An existing Secret is opaque to the chart and may historically contain more
-than credentials, so automatic selection preserves the legacy DNS-based
-locality path whenever `secret.existingSecret` is set. For a credentials-only
-Secret, set `localEndpointHost.autoInject=true` to add the anchor without
-changing the historical ConfigMap-then-Secret `envFrom` precedence. Set it to
-`false` to preserve the legacy path explicitly. If injection is explicitly
-enabled with an incompatible hidden `RUSTFS_VOLUMES`, `RUSTFS_ADDRESS`, or
-`RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE`, RustFS fails during endpoint construction
-before format initialization; it does not silently fall back to a different
+than credentials, so the chart does not inject an anchor whenever
+`secret.existingSecret` is set. In Kubernetes auto/orchestrated mode, RustFS
+then derives a DNS-free identity from the kernel hostname when exactly one
+domain endpoint at the server port has the same full hostname or first label.
+All-IP topologies retain direct IP locality detection. A domain topology with
+zero or multiple hostname matches fails before format initialization and must
+set `RUSTFS_LOCAL_ENDPOINT_HOST` explicitly. For a credentials-only Secret, set
+`localEndpointHost.autoInject=true` to add the chart anchor without changing
+the historical ConfigMap-then-Secret `envFrom` precedence. If injection is
+explicitly enabled with an incompatible hidden `RUSTFS_VOLUMES`,
+`RUSTFS_ADDRESS`, or `RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE`, RustFS also fails
+during endpoint construction; it does not silently fall back to a different
 topology.
 
 When `config.rustfs.volumes` is set explicitly, the chart does not infer a
-local endpoint identity. Custom topologies that need one must provide
-`RUSTFS_LOCAL_ENDPOINT_HOST` through `extraEnv`. An explicit
-`RUSTFS_VOLUMES`, explicit `RUSTFS_LOCAL_ENDPOINT_HOST`, bounded/dynamic
-or unrecognized startup mode, or `localEndpointHost.autoInject=false`, also
-disables automatic injection. A `RUSTFS_ADDRESS` override alone does not disable
-it; the effective address and generated topology must agree on the endpoint
-port. Custom anchor-based configurations must resolve to `orchestrated` startup
-mode and must not receive a conflicting mode from an `envFrom` source.
+local endpoint identity. RustFS applies the same kernel-hostname inference to
+custom domain topologies in Kubernetes auto/orchestrated mode; aliases that do
+not match the Pod hostname must provide `RUSTFS_LOCAL_ENDPOINT_HOST` through
+`extraEnv`. An explicit `RUSTFS_VOLUMES`, explicit
+`RUSTFS_LOCAL_ENDPOINT_HOST`, bounded/dynamic or unrecognized startup mode, or
+`localEndpointHost.autoInject=false`, also disables chart injection. A
+`RUSTFS_ADDRESS` override alone does not disable it; the effective address and
+generated topology must agree on the endpoint port. Custom anchor-based
+configurations must resolve to `orchestrated` startup mode and must not receive
+a conflicting mode from an `envFrom` source.
 `startupWaitTimeoutSeconds` is retained for values-file compatibility but is
 deprecated and ignored.
 

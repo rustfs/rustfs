@@ -543,7 +543,7 @@ done
 
 unknown_wait_mode=$(render_distributed_statefulset \
   --set 'extraEnv[0].name=RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE' \
-  --set 'extraEnv[0].value=boudned')
+  --set 'extraEnv[0].value=invalid-mode')
 unknown_wait_env_names=$(statefulset_env_names <<<"$unknown_wait_mode")
 if [[ "$unknown_wait_env_names" != "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE" ]]; then
   echo "An unknown explicit startup mode must not receive a generated local endpoint anchor" >&2

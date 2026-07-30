@@ -129,7 +129,10 @@ impl<T: AsRef<str>> TryFrom<&[T]> for Endpoints {
 
         // Loop through args and adds to endpoint list.
         for (i, arg) in args.iter().enumerate() {
-            let endpoint = Endpoint::try_from(arg.as_ref())?;
+            let endpoint = Endpoint::try_from(arg.as_ref()).map_err(|err| {
+                let err = std::io::Error::from(err);
+                Error::new(err.kind(), format!("{err} (endpoint argument #{})", i + 1))
+            })?;
 
             // All endpoints have to be same type and scheme if applicable.
             if i == 0 {
@@ -842,6 +845,58 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
     port.parse().map(Some).map_err(|_| invalid())
 }
 
+fn infer_kubernetes_local_endpoint_host(
+    disks_layout: &DisksLayout,
+    local_port: u16,
+    raw_kernel_hostname: &str,
+) -> Result<Option<String>> {
+    let raw_kernel_hostname = raw_kernel_hostname.trim();
+    let Host::Domain(kernel_hostname) = Host::parse(raw_kernel_hostname)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not a valid DNS name"))?
+    else {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "kernel hostname must be a DNS name for Kubernetes endpoint inference",
+        ));
+    };
+    let kernel_hostname = domain_without_optional_trailing_dot(&kernel_hostname)
+        .filter(|hostname| !hostname.contains('*'))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "kernel hostname is not a canonical DNS name"))?;
+    let kernel_hostname_is_fqdn = kernel_hostname.contains('.');
+    let mut candidates = HashSet::new();
+
+    for raw_endpoint in disks_layout.pools.iter().flat_map(|pool| pool.iter().flatten()) {
+        let endpoint = Endpoint::try_from(raw_endpoint.as_str())?;
+        let Some(Host::Domain(endpoint_host)) = endpoint.url.host() else {
+            continue;
+        };
+        let endpoint_host = domain_without_optional_trailing_dot(endpoint_host)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "distributed endpoint host is not canonical"))?;
+        let hostname_matches = if kernel_hostname_is_fqdn {
+            endpoint_host == kernel_hostname
+        } else {
+            endpoint_host.split('.').next() == Some(kernel_hostname)
+        };
+        if !hostname_matches {
+            continue;
+        }
+
+        let endpoint_port = explicit_url_port(raw_endpoint)?.unwrap_or(local_port);
+        if endpoint_port == local_port {
+            candidates.insert(endpoint_host.to_string());
+        }
+    }
+
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next()),
+        _ => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "kernel hostname matches multiple distributed endpoint hosts; set RUSTFS_LOCAL_ENDPOINT_HOST explicitly",
+        )),
+    }
+}
+
 fn parse_explicit_local_endpoint_host(raw: &str) -> Result<Host<String>> {
     let invalid = || {
         Error::other(format!(
@@ -989,6 +1044,12 @@ impl StartupTopologyPolicy {
         let retry_max_delay = max_delay_env
             .and_then(parse_wait_duration)
             .unwrap_or(Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS));
+        if retry_max_delay.is_zero() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("{ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY} must be greater than zero"),
+            ));
+        }
 
         let wait_timeout = match mode {
             // Effectively unbounded unless the operator sets an explicit cap.
@@ -1125,7 +1186,53 @@ impl EndpointServerPools {
         server_addr: &str,
         disks_layout: &DisksLayout,
     ) -> Result<(EndpointServerPools, SetupType)> {
-        let local_endpoint_host = get_env_opt_str(ENV_LOCAL_ENDPOINT_HOST);
+        let mut local_endpoint_host = get_env_opt_str(ENV_LOCAL_ENDPOINT_HOST);
+        let first_endpoint = disks_layout
+            .pools
+            .iter()
+            .flat_map(|pool| pool.iter().flatten())
+            .next()
+            .map(|endpoint| Endpoint::try_from(endpoint.as_str()))
+            .transpose()?;
+        let distributed = first_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.get_type() == EndpointType::Url);
+        let mut all_distributed_hosts_are_ip_literals = distributed;
+        if distributed {
+            for raw_endpoint in disks_layout.pools.iter().flat_map(|pool| pool.iter().flatten()) {
+                let endpoint = Endpoint::try_from(raw_endpoint.as_str())?;
+                if !matches!(endpoint.url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_))) {
+                    all_distributed_hosts_are_ip_literals = false;
+                    break;
+                }
+            }
+        }
+        let wait_mode = get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_MODE).map(|value| value.trim().to_ascii_lowercase());
+        let infer_kubernetes_host = local_endpoint_host.is_none()
+            && distributed
+            && !all_distributed_hosts_are_ip_literals
+            && std::env::var_os(ENV_KUBERNETES_SERVICE_HOST).is_some()
+            && matches!(wait_mode.as_deref(), None | Some("") | Some("auto") | Some("orchestrated"));
+        if infer_kubernetes_host {
+            let kernel_hostname = hostname::get()
+                .map_err(|err| {
+                    Error::other(format!("failed to read the kernel hostname for Kubernetes endpoint identity: {err}"))
+                })?
+                .into_string()
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not valid UTF-8"))?;
+            let local_port = check_local_server_addr(server_addr)?.port();
+            local_endpoint_host = Some(
+                infer_kubernetes_local_endpoint_host(disks_layout, local_port, &kernel_hostname)?.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "kernel hostname does not identify a distributed endpoint on port {local_port}; \
+set {ENV_LOCAL_ENDPOINT_HOST} explicitly"
+                        ),
+                    )
+                })?,
+            );
+        }
         Self::create_server_endpoints_with(server_addr, disks_layout, None, local_endpoint_host.as_deref()).await
     }
 
@@ -1700,11 +1807,11 @@ mod test {
             assert_eq!(auto.mode, StartupTopologyWaitMode::Orchestrated);
         }
 
-        let legacy_unknown = StartupTopologyPolicy::resolve_from(Some("boudned"), true, true, None, None, false)
+        let legacy_unknown = StartupTopologyPolicy::resolve_from(Some("invalid-mode"), true, true, None, None, false)
             .expect("unknown mode without an explicit host should retain auto compatibility");
         assert_eq!(legacy_unknown.mode, StartupTopologyWaitMode::Orchestrated);
 
-        let invalid = StartupTopologyPolicy::resolve_from(Some("boudned"), true, true, None, None, true).unwrap_err();
+        let invalid = StartupTopologyPolicy::resolve_from(Some("invalid-mode"), true, true, None, None, true).unwrap_err();
         assert_eq!(invalid.kind(), ErrorKind::InvalidInput);
         assert!(invalid.to_string().contains(ENV_STARTUP_TOPOLOGY_WAIT_MODE));
 
@@ -1718,6 +1825,22 @@ mod test {
                 "alias {alias:?} should resolve to fail-fast"
             );
         }
+    }
+
+    #[test]
+    fn startup_policy_rejects_zero_retry_delay_and_preserves_malformed_fallback() {
+        let err = StartupTopologyPolicy::resolve_from(Some("orchestrated"), true, true, None, Some("0"), false)
+            .expect_err("zero retry delay would create a DNS retry busy-loop");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY));
+
+        let malformed =
+            StartupTopologyPolicy::resolve_from(Some("orchestrated"), true, true, None, Some("invalid-duration"), false)
+                .expect("malformed historical values should retain default fallback");
+        assert_eq!(
+            malformed.retry_max_delay,
+            Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS)
+        );
     }
 
     #[test]
@@ -1845,6 +1968,54 @@ mod test {
     }
 
     #[test]
+    fn kubernetes_kernel_hostname_inference_requires_one_canonical_host() {
+        let layout =
+            DisksLayout::from_volumes(["http://rustfs-{0...2}.rustfs-headless.ns.svc.cluster.local:9000/data"].as_slice())
+                .expect("StatefulSet topology should parse");
+        for ordinal in 0..3 {
+            let pod_name = format!("rustfs-{ordinal}");
+            let expected_host = format!("{pod_name}.rustfs-headless.ns.svc.cluster.local");
+            assert_eq!(
+                infer_kubernetes_local_endpoint_host(&layout, 9000, &pod_name)
+                    .expect("short kernel hostname should infer safely")
+                    .as_deref(),
+                Some(expected_host.as_str())
+            );
+        }
+        assert_eq!(
+            infer_kubernetes_local_endpoint_host(&layout, 9000, "rustfs-1.rustfs-headless.ns.svc.cluster.local",)
+                .expect("FQDN kernel hostname should require an exact match")
+                .as_deref(),
+            Some("rustfs-1.rustfs-headless.ns.svc.cluster.local")
+        );
+        assert!(
+            infer_kubernetes_local_endpoint_host(&layout, 9000, "other-pod")
+                .expect("no matching endpoint is not ambiguous")
+                .is_none()
+        );
+
+        let wrong_port = DisksLayout::from_volumes(["http://rustfs-1.rustfs-headless.ns.svc.cluster.local:9001/data"].as_slice())
+            .expect("wrong-port topology should parse");
+        assert!(
+            infer_kubernetes_local_endpoint_host(&wrong_port, 9000, "rustfs-1")
+                .expect("a host at another port is not local")
+                .is_none()
+        );
+
+        let ambiguous = DisksLayout::from_volumes(
+            [
+                "http://rustfs-0.first-headless.ns.svc.cluster.local:9000/data0",
+                "http://rustfs-0.second-headless.ns.svc.cluster.local:9000/data1",
+            ]
+            .as_slice(),
+        )
+        .expect("ambiguous topology should parse");
+        let err = infer_kubernetes_local_endpoint_host(&ambiguous, 9000, "rustfs-0").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(ENV_LOCAL_ENDPOINT_HOST));
+    }
+
+    #[test]
     fn explicit_url_port_distinguishes_omitted_and_scheme_default_ports() {
         assert_eq!(explicit_url_port("http://rustfs-0.example/data").unwrap(), None);
         assert_eq!(explicit_url_port("http://rustfs-0.example:80/data").unwrap(), Some(80));
@@ -1866,7 +2037,7 @@ mod test {
     fn endpoint_parse_errors_do_not_echo_url_credentials() {
         let err = Endpoints::try_from(["http://:topsecret@server/path"].as_slice()).unwrap_err();
 
-        assert_eq!(err.to_string(), "invalid URL endpoint format");
+        assert_eq!(err.to_string(), "invalid URL endpoint format (endpoint argument #1)");
         assert!(!err.to_string().contains("topsecret"));
     }
 
@@ -1973,11 +2144,108 @@ mod test {
 
     #[serial]
     #[tokio::test]
+    async fn create_server_endpoints_infers_kubernetes_pod_host_without_peer_dns() {
+        let raw_hostname = hostname::get()
+            .expect("kernel hostname should be available")
+            .into_string()
+            .expect("kernel hostname should be UTF-8");
+        let Host::Domain(kernel_hostname) = Host::parse(raw_hostname.trim()).expect("kernel hostname should be a DNS name")
+        else {
+            panic!("kernel hostname should be a DNS name");
+        };
+        let kernel_hostname =
+            domain_without_optional_trailing_dot(&kernel_hostname).expect("kernel hostname should be canonical");
+        let local_host = if kernel_hostname.contains('.') {
+            kernel_hostname.to_string()
+        } else {
+            format!("{kernel_hostname}.rustfs-headless.ns.svc.cluster.local")
+        };
+
+        async_with_vars(
+            [
+                (ENV_LOCAL_ENDPOINT_HOST, None),
+                (ENV_KUBERNETES_SERVICE_HOST, Some("10.0.0.1")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("auto")),
+            ],
+            async {
+                let (pools, setup_type) = EndpointServerPools::from_volumes(
+                    "0.0.0.0:9000",
+                    vec![
+                        format!("http://{local_host}:9000/data0"),
+                        "http://permanently-missing.invalid:9000/data1".to_string(),
+                    ],
+                )
+                .await
+                .expect("kernel hostname inference should avoid resolving the missing peer");
+
+                assert_eq!(local_flags(&pools.0[0].endpoints), vec![true, false]);
+                assert_eq!(setup_type, SetupType::DistErasure);
+            },
+        )
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn create_server_endpoints_keeps_ip_literal_kubernetes_topologies() {
+        async_with_vars(
+            [
+                (ENV_LOCAL_ENDPOINT_HOST, None),
+                (ENV_KUBERNETES_SERVICE_HOST, Some("10.0.0.1")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("auto")),
+            ],
+            async {
+                let (pools, setup_type) = EndpointServerPools::from_volumes(
+                    "127.0.0.1:9000",
+                    vec![
+                        "http://127.0.0.1:9000/data0".to_string(),
+                        "http://192.0.2.10:9000/data1".to_string(),
+                    ],
+                )
+                .await
+                .expect("literal IP endpoints should retain DNS-free locality detection");
+
+                assert_eq!(local_flags(&pools.0[0].endpoints), vec![true, false]);
+                assert_eq!(setup_type, SetupType::DistErasure);
+            },
+        )
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn create_server_endpoints_requires_an_unambiguous_kubernetes_identity() {
+        async_with_vars(
+            [
+                (ENV_LOCAL_ENDPOINT_HOST, None),
+                (ENV_KUBERNETES_SERVICE_HOST, Some("10.0.0.1")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("auto")),
+            ],
+            async {
+                let err = EndpointServerPools::from_volumes(
+                    "0.0.0.0:9000",
+                    vec![
+                        "http://unrelated-0.example.invalid:9000/data0".to_string(),
+                        "http://unrelated-1.example.invalid:9000/data1".to_string(),
+                    ],
+                )
+                .await
+                .unwrap_err();
+
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.to_string().contains(ENV_LOCAL_ENDPOINT_HOST));
+            },
+        )
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
     async fn create_server_endpoints_rejects_an_unknown_wait_mode() {
         async_with_vars(
             [
                 ("RUSTFS_LOCAL_ENDPOINT_HOST", Some("rustfs-0.example")),
-                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("boudned")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("invalid-mode")),
             ],
             async {
                 let err = EndpointServerPools::from_volumes(
