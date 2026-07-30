@@ -9128,6 +9128,7 @@ dependencies = [
  "google-cloud-storage",
  "hex-simd",
  "hmac 0.13.0",
+ "hostname",
  "hotpath",
  "http 1.5.0",
  "http-body 1.1.0",

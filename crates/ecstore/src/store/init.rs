@@ -101,6 +101,10 @@ fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
     matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
 }
 
+fn should_retry_format_load(err: &Error) -> bool {
+    !matches!(err, Error::CorruptedFormat)
+}
+
 fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_meta_loaded: bool) -> bool {
     rebalance_meta_loaded && !decommission_running
 }
@@ -294,7 +298,7 @@ impl ECStore {
             // periodic monitoring until format loading succeeds. Startup RPC
             // failures can still spawn recovery probes for peers that come up
             // after this node.
-            let (disks, errs) = init_format::init_disks(
+            let (mut disks, errs) = init_format::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -311,7 +315,7 @@ impl ECStore {
                 loop {
                     match init_format::connect_load_init_formats(
                         pool_first_is_local,
-                        &disks,
+                        &mut disks,
                         pool_eps.set_count,
                         pool_eps.drives_per_set,
                         deployment_id,
@@ -319,6 +323,7 @@ impl ECStore {
                     .await
                     {
                         Ok(fm) => break Ok(fm),
+                        Err(e) if !should_retry_format_load(&e) => break Err(e),
                         // Wrap the final error if we are giving up
                         Err(e) if times >= 10 => {
                             break Err(Error::other(format!("store init failed to load formats after {times} retries: {e}")));
@@ -551,7 +556,7 @@ mod tests {
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, pool_first_endpoint_is_local,
         pool_meta_has_active_decommission, preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with,
         resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
-        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        should_retry_format_load, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::{
@@ -771,6 +776,13 @@ mod tests {
     #[test]
     fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
         assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    }
+
+    #[test]
+    fn test_should_retry_format_load_rejects_permanent_corruption() {
+        assert!(!should_retry_format_load(&StorageError::CorruptedFormat));
+        assert!(should_retry_format_load(&StorageError::ErasureReadQuorum));
+        assert!(should_retry_format_load(&StorageError::FirstDiskWait));
     }
 
     #[test]

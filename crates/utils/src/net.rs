@@ -92,7 +92,6 @@ fn resolve_domain(domain: &str) -> std::io::Result<HashSet<IpAddr>> {
     (domain, 0)
         .to_socket_addrs()
         .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
-        .map_err(Error::other)
 }
 
 #[cfg(test)]
@@ -284,7 +283,7 @@ pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
                 }
                 Err(err) => {
                     error!("Failed to resolve domain {domain} using system resolver, err: {err}");
-                    Err(Error::other(err))
+                    Err(err)
                 }
             }
         }
@@ -606,6 +605,27 @@ mod test {
         // Test invalid domain
         let invalid_host = Host::Domain("invalid.nonexistent.domain.example");
         assert!(get_host_ip(invalid_host).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_host_ip_preserves_resolver_error_provenance() {
+        let _resolver_guard = set_mock_dns_resolver(|_| Err(IoError::from_raw_os_error(-3)));
+
+        let err = get_host_ip(Host::Domain("temporarily-unavailable.example"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(-3));
+    }
+
+    #[test]
+    fn test_resolve_domain_preserves_system_resolver_error_provenance() {
+        let _resolver_lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
+        reset_dns_resolver_inner();
+
+        let err = resolve_domain("rustfs-resolver-provenance.invalid").unwrap_err();
+
+        assert_ne!(err.kind(), std::io::ErrorKind::Other, "system resolver error was wrapped: {err}");
     }
 
     #[test]

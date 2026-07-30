@@ -4814,9 +4814,11 @@ mod tests {
     async fn test_remote_disk_endpoints_with_different_schemes() {
         let test_cases = vec![
             ("http://server:9000", "server:9000"),
-            ("https://secure-server:443", "secure-server"), // Default HTTPS port is omitted
+            ("http://plain-server:80", "plain-server"),
+            ("http://plain-server", "plain-server"),
+            ("https://secure-server:443", "secure-server"),
             ("http://192.168.1.100:8080", "192.168.1.100:8080"),
-            ("https://secure-server", "secure-server"), // No port specified
+            ("https://secure-server", "secure-server"),
         ];
 
         for (url_str, expected_hostname) in test_cases {

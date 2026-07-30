@@ -2044,15 +2044,10 @@ fn synthesized_disks(host: &str, endpoints: &EndpointServerPools, state: ItemSta
 /// Whether `peer_host` refers to the same node as an endpoint whose
 /// `host_port()` is `ep_host_port`.
 ///
-/// `PeerRestClient::host` is an `XHost`, which resolves names to an address on
-/// construction (`hosts_sorted` -> `XHost::try_from` -> `to_socket_addrs`), so
-/// `peer_host` is the resolved `IP:port`. An endpoint's `host_port()`, however,
-/// is `url.host():port` — still the raw `hostname:port` on hostname-based
-/// deployments. A plain string compare therefore misses on hostname clusters,
-/// leaving the synthesized/degraded drive list empty and `unknownDisks` at 0
-/// (rustfs/rustfs#4607 follow-up). Compare directly first (fast path / IP
-/// deployments), then canonicalize the endpoint side through the same `XHost`
-/// resolution and compare again.
+/// Current topology clients preserve the endpoint `hostname:port`, so the
+/// direct comparison is the normal path. The resolution fallback keeps
+/// compatibility with older or manually constructed clients whose `XHost`
+/// contains a resolved `IP:port` (rustfs/rustfs#4607 follow-up).
 fn endpoint_host_matches(peer_host: &str, ep_host_port: &str) -> bool {
     if peer_host == ep_host_port {
         return true;
