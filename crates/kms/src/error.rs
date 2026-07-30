@@ -90,6 +90,14 @@ pub enum KmsError {
     /// Encryption context mismatch
     #[error("Encryption context mismatch: {message}")]
     ContextMismatch { message: String },
+
+    /// Backend operation exceeded its per-attempt timeout or total deadline
+    #[error("Operation timed out: {message}")]
+    OperationTimedOut { message: String },
+
+    /// Backend operation aborted by cancellation or shutdown
+    #[error("Operation cancelled: {message}")]
+    OperationCancelled { message: String },
 }
 
 impl KmsError {
@@ -186,6 +194,16 @@ impl KmsError {
     /// Create an encryption context mismatch error
     pub fn context_mismatch<S: Into<String>>(message: S) -> Self {
         Self::ContextMismatch { message: message.into() }
+    }
+
+    /// Create an operation timed out error
+    pub fn operation_timed_out<S: Into<String>>(message: S) -> Self {
+        Self::OperationTimedOut { message: message.into() }
+    }
+
+    /// Create an operation cancelled error
+    pub fn operation_cancelled<S: Into<String>>(message: S) -> Self {
+        Self::OperationCancelled { message: message.into() }
     }
 }
 
