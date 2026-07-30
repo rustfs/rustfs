@@ -18,6 +18,7 @@ use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::system_network_host::{
     DIRECTION_LABEL, HOST_NETWORK_IO_MD, HOST_NETWORK_IO_PER_INTERFACE_MD, INTERFACE_LABEL,
 };
+use crate::node_identity::SERVER_LABEL;
 use std::borrow::Cow;
 
 /// Network I/O statistics.
@@ -25,6 +26,8 @@ use std::borrow::Cow;
 /// Contains host-wide network I/O totals and per-interface counters.
 #[derive(Debug, Clone, Default)]
 pub struct HostNetworkStats {
+    /// Stable local node identity for labeling host-wide network metrics.
+    pub server: String,
     /// Total bytes received across observed host interfaces.
     pub total_received: u64,
     /// Total bytes transmitted across observed host interfaces.
@@ -47,7 +50,11 @@ pub fn collect_host_network_metrics(
     let mut received_metric = PrometheusMetric::from_descriptor(&HOST_NETWORK_IO_MD, stats.total_received as f64);
     let mut transmitted_metric = PrometheusMetric::from_descriptor(&HOST_NETWORK_IO_MD, stats.total_transmitted as f64);
 
+    received_metric.labels.push((SERVER_LABEL, Cow::Owned(stats.server.clone())));
     received_metric.labels.push((DIRECTION_LABEL, Cow::Borrowed("received")));
+    transmitted_metric
+        .labels
+        .push((SERVER_LABEL, Cow::Owned(stats.server.clone())));
     transmitted_metric
         .labels
         .push((DIRECTION_LABEL, Cow::Borrowed("transmitted")));
@@ -64,9 +71,13 @@ pub fn collect_host_network_metrics(
         let mut iface_received = PrometheusMetric::from_descriptor(&HOST_NETWORK_IO_PER_INTERFACE_MD, *received as f64);
         let mut iface_transmitted = PrometheusMetric::from_descriptor(&HOST_NETWORK_IO_PER_INTERFACE_MD, *transmitted as f64);
 
+        iface_received.labels.push((SERVER_LABEL, Cow::Owned(stats.server.clone())));
         iface_received.labels.push((INTERFACE_LABEL, Cow::Owned(interface.clone())));
         iface_received.labels.push((DIRECTION_LABEL, Cow::Borrowed("received")));
 
+        iface_transmitted
+            .labels
+            .push((SERVER_LABEL, Cow::Owned(stats.server.clone())));
         iface_transmitted
             .labels
             .push((INTERFACE_LABEL, Cow::Owned(interface.clone())));
@@ -92,6 +103,7 @@ mod tests {
     #[test]
     fn host_network_metrics_use_dedicated_network_host_prefix() {
         let stats = HostNetworkStats {
+            server: "node1:9000".to_string(),
             total_received: 1024,
             total_transmitted: 2048,
             per_interface: vec![("eth0".to_string(), 512, 256)],
@@ -107,9 +119,9 @@ mod tests {
         );
 
         let total_keys: BTreeSet<&str> = metrics[0].labels.iter().map(|(key, _)| *key).collect();
-        assert_eq!(total_keys, BTreeSet::from([DIRECTION_LABEL]));
+        assert_eq!(total_keys, BTreeSet::from([SERVER_LABEL, DIRECTION_LABEL]));
 
         let per_interface_keys: BTreeSet<&str> = metrics[2].labels.iter().map(|(key, _)| *key).collect();
-        assert_eq!(per_interface_keys, BTreeSet::from([DIRECTION_LABEL, INTERFACE_LABEL]));
+        assert_eq!(per_interface_keys, BTreeSet::from([SERVER_LABEL, DIRECTION_LABEL, INTERFACE_LABEL]));
     }
 }

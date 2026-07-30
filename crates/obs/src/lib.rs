@@ -64,6 +64,7 @@ mod error;
 mod global;
 mod logging;
 pub mod metrics;
+mod node_identity;
 mod telemetry;
 
 pub use cleaner::*;

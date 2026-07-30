@@ -24,6 +24,7 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::system_process::*;
+use crate::node_identity::SERVER_LABEL;
 use std::borrow::Cow;
 use sysinfo::{Pid, ProcessStatus, System};
 
@@ -146,6 +147,8 @@ impl From<ProcessStatus> for ProcessStatusType {
 /// Process statistics for the RustFS server process.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessStats {
+    /// Stable local node identity for labeling node-local process metrics
+    pub server: String,
     /// Total read locks held
     pub locks_read_total: u64,
     /// Total write locks held
@@ -190,6 +193,7 @@ pub struct ProcessStats {
 ///
 /// Returns a vector of Prometheus metrics for process statistics.
 pub fn collect_process_metrics(stats: &ProcessStats) -> Vec<PrometheusMetric> {
+    let server_label = stats.server.as_str();
     let mut metrics = vec![
         PrometheusMetric::from_descriptor(&PROCESS_LOCKS_READ_TOTAL_MD, stats.locks_read_total as f64),
         PrometheusMetric::from_descriptor(&PROCESS_LOCKS_WRITE_TOTAL_MD, stats.locks_write_total as f64),
@@ -209,12 +213,18 @@ pub fn collect_process_metrics(stats: &ProcessStats) -> Vec<PrometheusMetric> {
         PrometheusMetric::from_descriptor(&PROCESS_VIRTUAL_MEMORY_BYTES_MD, stats.virtual_memory_bytes as f64),
         PrometheusMetric::from_descriptor(&PROCESS_VIRTUAL_MEMORY_MAX_BYTES_MD, stats.virtual_memory_max_bytes as f64),
     ];
+    for metric in &mut metrics {
+        metric.labels.push((SERVER_LABEL, Cow::Owned(server_label.to_string())));
+    }
 
     // Add process status metric
     let mut status_metric = PrometheusMetric::from_descriptor(&PROCESS_STATUS_MD, stats.status_value as f64);
     status_metric
         .labels
-        .push(("status", Cow::Owned(format!("{:?}", stats.status))));
+        .push((SERVER_LABEL, Cow::Owned(server_label.to_string())));
+    status_metric
+        .labels
+        .push((STATUS_LABEL, Cow::Owned(format!("{:?}", stats.status))));
     metrics.push(status_metric);
 
     metrics
@@ -235,6 +245,7 @@ mod tests {
     #[test]
     fn test_collect_process_metrics() {
         let stats = ProcessStats {
+            server: "node1:9000".to_string(),
             locks_read_total: 100,
             locks_write_total: 50,
             cpu_total_seconds: 1234.56,
@@ -261,6 +272,11 @@ mod tests {
 
         // 17 original metrics + 1 status metric = 18
         assert_eq!(metrics.len(), 18);
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"))
+        );
 
         // Verify uptime
         let uptime_name = PROCESS_UPTIME_SECONDS_MD.get_full_metric_name();
@@ -288,6 +304,7 @@ mod tests {
 
         // 17 original metrics + 1 status metric = 18
         assert_eq!(metrics.len(), 18);
+        assert!(metrics.iter().all(|m| m.labels.iter().any(|(k, _)| *k == SERVER_LABEL)));
     }
 
     #[test]
@@ -296,7 +313,7 @@ mod tests {
         let result = collect_process_attributes();
         assert!(result.is_ok());
 
-        let attrs = result.unwrap();
+        let attrs = result.expect("current process attributes should be collectable");
         assert!(attrs.pid > 0);
         assert!(!attrs.executable_name.is_empty());
     }
@@ -319,7 +336,7 @@ mod tests {
 
         let labels = attrs.to_labels();
         assert_eq!(labels.len(), 4);
-        assert_eq!(labels[0].0, "process_pid");
+        assert_eq!(labels[0].0, PROCESS_PID_LABEL);
         assert_eq!(labels[0].1, "12345");
     }
 }

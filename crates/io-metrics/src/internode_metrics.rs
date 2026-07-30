@@ -15,7 +15,7 @@
 use metrics::{counter, gauge};
 use std::collections::HashMap;
 use std::sync::{
-    Arc, LazyLock, RwLock,
+    Arc, LazyLock, OnceLock, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,6 +40,7 @@ pub const INTERNODE_MSGPACK_CODEC_JSON: &str = "json";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
+const SERVER_LABEL: &str = "server";
 const CLASSIFICATION_LABEL: &str = "classification";
 const STAGE_LABEL: &str = "stage";
 const DOMINANT_ERROR_LABEL: &str = "dominant_error";
@@ -77,73 +78,92 @@ pub struct InternodeOperationMetricDescriptor {
     pub labels: &'static [&'static str],
 }
 
-const OPERATION_BACKEND_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL];
-const OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
-const OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
-const QUORUM_FAILURE_LABELS: &[&str] = &[STAGE_LABEL, DOMINANT_ERROR_LABEL];
+const SERVER_OPERATION_BACKEND_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL];
+const SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] =
+    &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
+const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
+const SERVER_QUORUM_FAILURE_LABELS: &[&str] = &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL];
 
 pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &[
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_SENT_BYTES_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_RECV_BYTES_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_ERRORS_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_DURATION_MS,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
-        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_RETRIES_TOTAL,
-        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL,
-        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL,
-        labels: OPERATION_BACKEND_HTTP_VERSION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
-        labels: QUORUM_FAILURE_LABELS,
+        labels: SERVER_QUORUM_FAILURE_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_PAYLOAD_BYTES,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
 ];
+
+fn current_server_label() -> &'static str {
+    static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
+    static FALLBACK_SERVER_LABEL: LazyLock<String> = LazyLock::new(rustfs_utils::get_local_ip_with_default);
+
+    if let Some(server) = STABLE_SERVER_LABEL.get() {
+        return server.as_str();
+    }
+
+    if let Some(server) = rustfs_common::try_get_global_local_node_name() {
+        let _ = STABLE_SERVER_LABEL.set(server);
+        if let Some(server) = STABLE_SERVER_LABEL.get() {
+            return server.as_str();
+        }
+    }
+
+    FALLBACK_SERVER_LABEL.as_str()
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InternodeMetricsSnapshot {
@@ -193,7 +213,7 @@ impl InternodeMetrics {
             return;
         }
         self.sent_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_sent_bytes_total").increment(bytes);
+        counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
     pub fn record_sent_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
@@ -207,7 +227,13 @@ impl InternodeMetrics {
         if bytes == 0 {
             return;
         }
-        counter!(INTERNODE_OPERATION_SENT_BYTES_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(bytes);
+        counter!(
+            INTERNODE_OPERATION_SENT_BYTES_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(bytes);
     }
 
     pub fn record_recv_bytes(&self, bytes: usize) {
@@ -216,7 +242,7 @@ impl InternodeMetrics {
             return;
         }
         self.recv_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_recv_bytes_total").increment(bytes);
+        counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
     pub fn record_recv_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
@@ -230,12 +256,18 @@ impl InternodeMetrics {
         if bytes == 0 {
             return;
         }
-        counter!(INTERNODE_OPERATION_RECV_BYTES_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(bytes);
+        counter!(
+            INTERNODE_OPERATION_RECV_BYTES_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(bytes);
     }
 
     pub fn record_outgoing_request(&self) {
         self.outgoing_requests_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_requests_outgoing_total").increment(1);
+        counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_outgoing_request_for_operation(&self, operation: &'static str) {
@@ -244,13 +276,18 @@ impl InternodeMetrics {
 
     pub fn record_outgoing_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_outgoing_request();
-        counter!(INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .increment(1);
+        counter!(
+            INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     pub fn record_incoming_request(&self) {
         self.incoming_requests_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_requests_incoming_total").increment(1);
+        counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_incoming_request_for_operation(&self, operation: &'static str) {
@@ -259,13 +296,18 @@ impl InternodeMetrics {
 
     pub fn record_incoming_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_incoming_request();
-        counter!(INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .increment(1);
+        counter!(
+            INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_errors_total").increment(1);
+        counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_error_for_operation(&self, operation: &'static str) {
@@ -274,13 +316,24 @@ impl InternodeMetrics {
 
     pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
-        counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+        counter!(
+            INTERNODE_OPERATION_ERRORS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
-        metrics::histogram!(INTERNODE_OPERATION_DURATION_MS, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .record(duration_ms);
+        metrics::histogram!(
+            INTERNODE_OPERATION_DURATION_MS,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .record(duration_ms);
     }
 
     pub fn record_classified_error_for_operation_and_backend(
@@ -291,6 +344,7 @@ impl InternodeMetrics {
     ) {
         counter!(
             INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             CLASSIFICATION_LABEL => classification
@@ -306,6 +360,7 @@ impl InternodeMetrics {
     ) {
         counter!(
             INTERNODE_OPERATION_RETRIES_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             CLASSIFICATION_LABEL => classification
@@ -321,6 +376,7 @@ impl InternodeMetrics {
     ) {
         counter!(
             INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             CLASSIFICATION_LABEL => classification
@@ -337,6 +393,7 @@ impl InternodeMetrics {
         self.operation_http_versions_total.fetch_add(1, Ordering::Relaxed);
         counter!(
             INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             HTTP_VERSION_LABEL => http_version
@@ -346,13 +403,24 @@ impl InternodeMetrics {
 
     pub fn record_stall_timeout_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.operation_stall_timeouts_total.fetch_add(1, Ordering::Relaxed);
-        counter!(INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+        counter!(
+            INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     pub fn record_write_shutdown_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.operation_write_shutdown_errors_total.fetch_add(1, Ordering::Relaxed);
-        counter!(INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .increment(1);
+        counter!(
+            INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     /// Record the payload size (bytes) of a completed internode operation into a histogram
@@ -360,15 +428,26 @@ impl InternodeMetrics {
     /// (`ReadAll`/`ReadMultiple`/`WriteAll`) would benefit from being moved off the shared
     /// control-plane channel (see docs/grpc-optimization P1).
     pub fn record_operation_payload_bytes(&self, operation: &'static str, backend: &'static str, bytes: usize) {
-        metrics::histogram!(INTERNODE_OPERATION_PAYLOAD_BYTES, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .record(bytes as f64);
+        metrics::histogram!(
+            INTERNODE_OPERATION_PAYLOAD_BYTES,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .record(bytes as f64);
     }
 
     /// Increment the large-payload counter for an operation+backend whose payload exceeded the
     /// caller-configured warning threshold. Feeds alerting on large unary RPCs that contend with
     /// latency-sensitive control-plane traffic on the shared connection.
     pub fn record_large_operation_payload(&self, operation: &'static str, backend: &'static str) {
-        counter!(INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+        counter!(
+            INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     /// Count a decode that fell back to the JSON compatibility field because the msgpack `_bin`
@@ -377,13 +456,20 @@ impl InternodeMetrics {
     /// dropped (grpc-optimization P2). `direction` is [`INTERNODE_MSGPACK_DIRECTION_REQUEST`] or
     /// [`INTERNODE_MSGPACK_DIRECTION_RESPONSE`]; `message` is the low-cardinality value name.
     pub fn record_msgpack_json_fallback(&self, direction: &'static str, message: &'static str) {
-        counter!(INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL, DIRECTION_LABEL => direction, MESSAGE_LABEL => message).increment(1);
+        counter!(
+            INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message
+        )
+        .increment(1);
     }
 
     pub fn record_msgpack_json_decode(&self, direction: &'static str, message: &'static str, codec: &'static str) {
         self.msgpack_json_decode_total.fetch_add(1, Ordering::Relaxed);
         counter!(
             INTERNODE_MSGPACK_JSON_DECODE_TOTAL,
+            SERVER_LABEL => current_server_label(),
             DIRECTION_LABEL => direction,
             MESSAGE_LABEL => message,
             CODEC_LABEL => codec
@@ -395,6 +481,7 @@ impl InternodeMetrics {
         self.msgpack_json_decode_error_total.fetch_add(1, Ordering::Relaxed);
         counter!(
             INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            SERVER_LABEL => current_server_label(),
             DIRECTION_LABEL => direction,
             MESSAGE_LABEL => message,
             CODEC_LABEL => codec
@@ -420,7 +507,7 @@ impl InternodeMetrics {
     /// enabled; after the strict flip the legacy fallback path is closed and the counter stays flat.
     pub fn record_signature_v1_fallback(&self) {
         self.signature_v1_fallback_total.fetch_add(1, Ordering::Relaxed);
-        counter!(INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL).increment(1);
+        counter!(INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
     }
 
     /// Count a mutating internode disk RPC that was accepted without a signature-bound canonical
@@ -431,14 +518,14 @@ impl InternodeMetrics {
     /// mutations are rejected and the counter stays flat.
     pub fn record_body_digest_fallback(&self) {
         self.body_digest_fallback_total.fetch_add(1, Ordering::Relaxed);
-        counter!(INTERNODE_BODY_DIGEST_FALLBACK_TOTAL).increment(1);
+        counter!(INTERNODE_BODY_DIGEST_FALLBACK_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
     }
 
     /// Count an accepted v1/v2 request that does not carry the replay-scoped signature. This is
     /// the convergence signal for `RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT`.
     pub fn record_replay_scope_fallback(&self) {
         self.replay_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
-        counter!(INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL).increment(1);
+        counter!(INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
     }
 
     /// Count a body-bound internode RPC rejected because the replay-protection nonce cache was
@@ -447,12 +534,13 @@ impl InternodeMetrics {
     /// mutation rate and writes are being refused — alert on this counter.
     pub fn record_replay_cache_overflow(&self) {
         self.replay_cache_overflow_total.fetch_add(1, Ordering::Relaxed);
-        counter!(INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL).increment(1);
+        counter!(INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
+            SERVER_LABEL => current_server_label(),
             STAGE_LABEL => stage,
             DOMINANT_ERROR_LABEL => dominant_error
         )
@@ -464,11 +552,12 @@ impl InternodeMetrics {
         self.dial_total_time_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
         let samples = self.dial_samples_total.fetch_add(1, Ordering::Relaxed) + 1;
         let total = self.dial_total_time_nanos.load(Ordering::Relaxed);
-        gauge!("rustfs_system_network_internode_dial_avg_time_nanos").set(total as f64 / samples as f64);
+        gauge!("rustfs_system_network_internode_dial_avg_time_nanos", SERVER_LABEL => current_server_label())
+            .set(total as f64 / samples as f64);
 
         if !success {
             self.dial_errors_total.fetch_add(1, Ordering::Relaxed);
-            counter!("rustfs_system_network_internode_dial_errors_total").increment(1);
+            counter!("rustfs_system_network_internode_dial_errors_total", SERVER_LABEL => current_server_label()).increment(1);
         }
 
         let now_ms = SystemTime::now()
@@ -687,6 +776,9 @@ fn cluster_peer_health_keys() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::DebuggingRecorder;
+    use std::collections::HashSet;
 
     #[test]
     fn snapshot_reports_recorded_values() {
@@ -750,22 +842,22 @@ mod tests {
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
         assert_eq!(INTERNODE_OPERATION_METRICS.len(), 15);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
-            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+            assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
         for metric in &INTERNODE_OPERATION_METRICS[6..9] {
-            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
+            assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
         }
         assert_eq!(
             INTERNODE_OPERATION_METRICS[9].labels,
-            &[OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL]
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL]
         );
         for metric in &INTERNODE_OPERATION_METRICS[10..12] {
-            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+            assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[12].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[12].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
         // Payload histogram + large-payload counter carry operation+backend labels.
-        assert_eq!(INTERNODE_OPERATION_METRICS[13].labels, &[OPERATION_LABEL, BACKEND_LABEL]);
-        assert_eq!(INTERNODE_OPERATION_METRICS[14].labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[13].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[14].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
@@ -841,6 +933,59 @@ mod tests {
             INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
             "rustfs_system_network_internode_signature_v1_fallback_total"
         );
+    }
+
+    #[test]
+    fn direct_internode_metrics_emit_stable_server_label() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_sent_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_READ_FILE_STREAM,
+                INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                128,
+            );
+            metrics.record_recv_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_PUT_FILE_STREAM,
+                INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                256,
+            );
+            metrics.record_dial_result(Duration::from_millis(3), false);
+        });
+
+        let observed: Vec<(String, HashSet<String>, Option<String>)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                matches!(
+                    composite.key().name(),
+                    "rustfs_system_network_internode_sent_bytes_total"
+                        | "rustfs_system_network_internode_recv_bytes_total"
+                        | INTERNODE_OPERATION_SENT_BYTES_TOTAL
+                        | INTERNODE_OPERATION_RECV_BYTES_TOTAL
+                        | "rustfs_system_network_internode_dial_avg_time_nanos"
+                        | "rustfs_system_network_internode_dial_errors_total"
+                )
+            })
+            .map(|(composite, _, _, _)| {
+                let labels = composite.key().labels();
+                let keys = labels.clone().map(|label| label.key().to_string()).collect();
+                let server = labels
+                    .filter(|label| label.key() == SERVER_LABEL)
+                    .map(|label| label.value().to_string())
+                    .next();
+                (composite.key().name().to_string(), keys, server)
+            })
+            .collect();
+
+        assert_eq!(observed.len(), 6);
+        for (name, keys, server) in observed {
+            assert!(keys.contains(SERVER_LABEL), "{name} must carry the server label");
+            assert!(server.is_some_and(|value| !value.is_empty()), "{name} server label must not be empty");
+        }
     }
 
     #[test]
