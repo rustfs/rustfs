@@ -117,6 +117,9 @@ pub struct MasterKeyInfo {
     pub rotated_at: Option<Zoned>,
     /// Key creator/owner
     pub created_by: Option<String>,
+    /// Scheduled deletion deadline while the key is pending deletion
+    #[serde(default)]
+    pub deletion_date: Option<Zoned>,
 }
 
 impl MasterKeyInfo {
@@ -142,6 +145,7 @@ impl MasterKeyInfo {
             created_at: Zoned::now(),
             rotated_at: None,
             created_by,
+            deletion_date: None,
         }
     }
 
@@ -173,6 +177,7 @@ impl MasterKeyInfo {
             created_at: Zoned::now(),
             rotated_at: None,
             created_by,
+            deletion_date: None,
         }
     }
 }

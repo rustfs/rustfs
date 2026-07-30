@@ -16,6 +16,7 @@
 
 use crate::backends::{KmsBackend, local::LocalKmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
+use crate::deletion_worker::{DeletionReferenceChecker, DeletionWorker};
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::service::ObjectEncryptionService;
@@ -28,6 +29,7 @@ use std::sync::{
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_KMS: &str = "kms";
@@ -110,6 +112,40 @@ struct ServiceVersion {
     service: Arc<ObjectEncryptionService>,
     /// The KMS manager instance
     manager: Arc<KmsManager>,
+    /// Background deletion worker owned by this service version, if the
+    /// backend supports deletion scheduling
+    deletion_worker: Option<Arc<DeletionWorkerHandle>>,
+}
+
+impl ServiceVersion {
+    fn shutdown_deletion_worker(&self) {
+        if let Some(worker) = &self.deletion_worker {
+            worker.shutdown();
+        }
+    }
+}
+
+/// Cancellation handle for one service version's deletion worker.
+struct DeletionWorkerHandle {
+    cancel: CancellationToken,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl DeletionWorkerHandle {
+    fn shutdown(&self) {
+        self.cancel.cancel();
+        if let Ok(mut task) = self.task.lock() {
+            // Detach: the task observes the cancelled token on its next poll.
+            drop(task.take());
+        }
+    }
+}
+
+impl Drop for DeletionWorkerHandle {
+    fn drop(&mut self) {
+        // Safety net for versions that are replaced without an explicit stop.
+        self.cancel.cancel();
+    }
 }
 
 #[derive(Clone)]
@@ -128,6 +164,8 @@ pub struct KmsServiceManager {
     /// Mutex to protect lifecycle operations (start, stop, reconfigure)
     /// This ensures only one lifecycle operation happens at a time
     lifecycle_mutex: Arc<Mutex<()>>,
+    /// External reference checker consulted before expired keys are removed
+    deletion_reference_checker: std::sync::RwLock<Option<Arc<dyn DeletionReferenceChecker>>>,
 }
 
 impl KmsServiceManager {
@@ -141,7 +179,21 @@ impl KmsServiceManager {
             }),
             version_counter: Arc::new(AtomicU64::new(0)),
             lifecycle_mutex: Arc::new(Mutex::new(())),
+            deletion_reference_checker: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Install the reference checker consulted before the deletion worker
+    /// removes an expired key. Takes effect for workers spawned by the next
+    /// start or reconfigure.
+    pub fn set_deletion_reference_checker(&self, checker: Arc<dyn DeletionReferenceChecker>) {
+        if let Ok(mut slot) = self.deletion_reference_checker.write() {
+            *slot = Some(checker);
+        }
+    }
+
+    fn deletion_reference_checker(&self) -> Option<Arc<dyn DeletionReferenceChecker>> {
+        self.deletion_reference_checker.read().ok().and_then(|slot| slot.clone())
     }
 
     /// Get current service status
@@ -321,6 +373,9 @@ impl KmsServiceManager {
         // Atomically clear current service version (lock-free, instant)
         // Note: Existing Arc references will keep the service alive until operations complete
         let state = self.state.load_full();
+        if let Some(current) = state.current_service.as_ref() {
+            current.shutdown_deletion_worker();
+        }
         self.state.store(Arc::new(RuntimeState {
             config: state.config.clone(),
             status: if state.config.is_some() {
@@ -522,6 +577,7 @@ impl KmsServiceManager {
             version,
             service: encryption_service,
             manager: kms_manager,
+            deletion_worker: None,
         })
     }
 
@@ -533,12 +589,34 @@ impl KmsServiceManager {
         Ok(service_version)
     }
 
-    fn publish_running(&self, config: KmsConfig, service_version: ServiceVersion) {
+    fn publish_running(&self, config: KmsConfig, mut service_version: ServiceVersion) {
+        if let Some(previous) = self.state.load().current_service.as_ref() {
+            previous.shutdown_deletion_worker();
+        }
+        service_version.deletion_worker = self.spawn_deletion_worker(&config, &service_version);
         self.state.store(Arc::new(RuntimeState {
             config: Some(config),
             status: KmsServiceStatus::Running,
             current_service: Some(service_version),
         }));
+    }
+
+    /// Spawn the background deletion worker for a service version about to be
+    /// published, if its backend supports deletion scheduling. The worker is
+    /// only started at publish time so failed start/reconfigure candidates
+    /// never leak a running task.
+    fn spawn_deletion_worker(&self, config: &KmsConfig, service_version: &ServiceVersion) -> Option<Arc<DeletionWorkerHandle>> {
+        let backend = service_version.manager.backend();
+        if !backend.capabilities().schedule_deletion {
+            return None;
+        }
+        let cancel = CancellationToken::new();
+        let worker = DeletionWorker::new(backend, config.default_key_id.clone(), self.deletion_reference_checker());
+        let task = worker.spawn(cancel.clone());
+        Some(Arc::new(DeletionWorkerHandle {
+            cancel,
+            task: std::sync::Mutex::new(Some(task)),
+        }))
     }
 
     fn mark_health_error_if_current(&self, checked_version: u64, error: &KmsError) {
@@ -822,6 +900,66 @@ mod tests {
         assert!(error.to_string().contains("backend cannot be changed"));
         let current = manager.get_config().await.expect("local config must remain");
         assert!(matches!(current.backend_config, BackendConfig::Local(_)));
+    }
+
+    #[tokio::test]
+    async fn deletion_worker_follows_the_service_lifecycle() {
+        use tempfile::TempDir;
+
+        let key_dir = TempDir::new().expect("create local KMS directory");
+        let mut config = KmsConfig::local(key_dir.path().to_path_buf());
+        config.allow_insecure_dev_defaults = true;
+        let manager = KmsServiceManager::new();
+        manager.configure(config).await.expect("configure local KMS");
+        manager.start().await.expect("start local KMS");
+
+        let first_worker = manager
+            .state
+            .load()
+            .current_service
+            .as_ref()
+            .expect("running service")
+            .deletion_worker
+            .clone()
+            .expect("local backend must run a deletion worker");
+        assert!(!first_worker.cancel.is_cancelled());
+
+        // Replacing the service version replaces (and cancels) its worker.
+        manager.restart().await.expect("restart");
+        assert!(first_worker.cancel.is_cancelled(), "replaced version's worker must be cancelled");
+        let second_worker = manager
+            .state
+            .load()
+            .current_service
+            .as_ref()
+            .expect("running service")
+            .deletion_worker
+            .clone()
+            .expect("restarted service must run a fresh worker");
+        assert!(!second_worker.cancel.is_cancelled());
+
+        // Stopping the service stops its worker.
+        manager.stop().await.expect("stop");
+        assert!(second_worker.cancel.is_cancelled(), "stop must cancel the deletion worker");
+    }
+
+    #[tokio::test]
+    async fn static_backend_runs_no_deletion_worker() {
+        let manager = KmsServiceManager::new();
+        manager.configure(static_config("key-a", 0x11)).await.expect("configure");
+        manager.start().await.expect("start");
+
+        assert!(
+            manager
+                .state
+                .load()
+                .current_service
+                .as_ref()
+                .expect("running service")
+                .deletion_worker
+                .is_none(),
+            "a backend without deletion scheduling must not run a worker"
+        );
     }
 
     #[tokio::test]
