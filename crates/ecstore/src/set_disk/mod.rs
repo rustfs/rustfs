@@ -110,7 +110,9 @@ use crate::{
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     // event::name::EventName,
     services::event_notification::{EventArgs, send_event},
-    store::init_format::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
+    store::init_format::{
+        format_disk_id_matches_slot, get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file,
+    },
 };
 use bytes::Bytes;
 use bytesize::ByteSize;

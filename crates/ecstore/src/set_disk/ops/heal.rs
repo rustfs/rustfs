@@ -1373,11 +1373,23 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         let disks = self.disks.read().await.clone();
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
-        let ref_format = match get_format_erasure_in_quorum(&formats) {
-            Ok(format) => format,
+        let slot_offset = self
+            .set_index
+            .checked_mul(self.set_drive_count)
+            .ok_or_else(|| Error::other("erasure set slot offset overflow"))?;
+        let ref_format = match get_format_erasure_in_quorum(&formats, slot_offset) {
+            Ok(format) if format.shared_identity() == self.format.shared_identity() => format,
+            Ok(_) => return Ok((HealResultItem::default(), Some(StorageError::CorruptedFormat))),
             Err(err) => {
                 let can_use_cached_layout = count_errs(&errs, &DiskError::UnformattedDisk) > 0
-                    && formats.iter().flatten().all(|format| self.format.check_other(format).is_ok())
+                    && formats.iter().enumerate().all(|(index, format)| {
+                        format.as_ref().is_none_or(|format| {
+                            self.format.shared_identity() == format.shared_identity()
+                                && slot_offset
+                                    .checked_add(index)
+                                    .is_some_and(|slot| format_disk_id_matches_slot(format, slot))
+                        })
+                    })
                     && errs
                         .iter()
                         .all(|err| err.is_none() || matches!(err, Some(DiskError::UnformattedDisk)));
@@ -1543,11 +1555,16 @@ mod heal_result_report_tests {
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
     use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, new_disk};
+    use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
-    use crate::{config::storageclass, store::init_format::save_format_file};
+    use crate::{
+        config::storageclass,
+        store::init_format::{load_format_erasure, save_format_file},
+    };
     use rustfs_common::heal_channel::{DriveState, HealOpts, HealScanMode};
     use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo, ObjectPartInfo, TRANSITION_COMPLETE};
     use std::sync::Arc;
@@ -1861,6 +1878,44 @@ mod heal_result_report_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn format_heal_cached_layout_rejects_a_disk_from_another_slot() {
+        let mut _temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_index in 0..3 {
+            let (temp_dir, mut endpoint, disk) = real_disk().await;
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            _temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        let set = set_disks_with(disks.clone(), endpoints, 1).await;
+        let mut wrong_slot = set.format.clone();
+        wrong_slot.erasure.this = set.format.erasure.sets[0][1];
+        save_format_file(&disks[0], &Some(wrong_slot))
+            .await
+            .expect("wrong-slot format fixture should be saved");
+        let mut correct_slot = set.format.clone();
+        correct_slot.erasure.this = set.format.erasure.sets[0][2];
+        save_format_file(&disks[2], &Some(correct_slot))
+            .await
+            .expect("correct format fixture should be saved");
+
+        let (_, heal_err) = set
+            .heal_format(false)
+            .await
+            .expect("format heal should report the quorum failure in its result");
+
+        assert!(matches!(heal_err, Some(Error::ErasureReadQuorum)));
+        let unformatted = load_format_erasure(disks[1].as_ref().expect("second disk should be online"), true)
+            .await
+            .expect_err("a rejected fallback must not format the missing slot");
+        assert_eq!(unformatted, DiskError::UnformattedDisk);
     }
 
     // Regression for #955: an offline disk must contribute exactly one drive

@@ -203,7 +203,7 @@ fn get_all_sets<T: AsRef<str>>(set_drive_count: usize, is_ellipses: bool, args: 
     for args in set_args.iter() {
         for arg in args {
             if unique_args.contains(arg) {
-                return Err(Error::other(format!("Input args {arg} has duplicate ellipses")));
+                return Err(Error::other("input arguments contain a duplicate endpoint after ellipsis expansion"));
             }
             unique_args.insert(arg);
         }
@@ -922,6 +922,17 @@ mod test {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn layout_errors_do_not_echo_url_credentials() {
+        for volumes in [
+            vec!["http://:duplicate-secret@server/path", "http://:duplicate-secret@server/path"],
+            vec!["http://:ellipsis...secret@server/path"],
+        ] {
+            let err = DisksLayout::from_volumes(&volumes).unwrap_err();
+            assert!(!err.to_string().contains("secret"), "layout error leaked endpoint credentials: {err}");
         }
     }
 }

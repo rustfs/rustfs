@@ -20,13 +20,13 @@ use crate::{
     disk::{
         DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
         error::DiskError,
-        format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
+        format::{FormatBackend, FormatErasureVersion, FormatMetaVersion, FormatV3},
         new_disk,
     },
     layout::endpoints::Endpoints,
 };
 use futures::future::join_all;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -59,7 +59,7 @@ pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskSt
 
 pub async fn connect_load_init_formats(
     first_disk: bool,
-    disks: &[Option<DiskStore>],
+    disks: &mut [Option<DiskStore>],
     set_count: usize,
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
@@ -67,8 +67,6 @@ pub async fn connect_load_init_formats(
     let (formats, errs) = load_format_erasure_all(disks, false).await;
 
     check_disk_fatal_errs(&errs)?;
-
-    check_format_erasure_values(&formats, set_drive_count)?;
 
     if first_disk && should_init_erasure_disks(&errs) {
         // UnformattedDisk, try migrate from MinIO format first, else create new format
@@ -114,7 +112,17 @@ pub async fn connect_load_init_formats(
         return Err(Error::FirstDiskWait);
     }
 
-    let fm = get_format_erasure_in_quorum(&formats)?;
+    let fm = get_format_erasure_in_quorum(&formats, 0)?;
+    check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
+    let quorum_key = fm.shared_identity();
+    for (index, (disk, format)) in disks.iter_mut().zip(&formats).enumerate() {
+        let belongs_to_quorum = format
+            .as_ref()
+            .is_some_and(|format| format_disk_id_matches_slot(format, index) && format.shared_identity() == quorum_key);
+        if !belongs_to_quorum {
+            *disk = None;
+        }
+    }
 
     Ok(fm)
 }
@@ -166,7 +174,7 @@ async fn init_format_erasure(
 
     save_format_file_all(disks, &fms).await?;
 
-    get_format_erasure_in_quorum(&fms)
+    get_format_erasure_in_quorum(&fms, 0)
 }
 
 /// Outcome of attempting to migrate an on-disk MinIO `format.json`.
@@ -249,7 +257,7 @@ async fn try_migrate_format(
         }
 
         save_format_file_all(disks, &fms).await?;
-        return Ok(LegacyFormatOutcome::Migrated(Box::new(get_format_erasure_in_quorum(&fms)?)));
+        return Ok(LegacyFormatOutcome::Migrated(Box::new(get_format_erasure_in_quorum(&fms, 0)?)));
     }
 
     Ok(if legacy_seen {
@@ -259,36 +267,63 @@ async fn try_migrate_format(
     })
 }
 
-pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
-    let mut countmap = HashMap::new();
+pub(crate) fn format_disk_id_matches_slot(format: &FormatV3, index: usize) -> bool {
+    let Ok(set_drive_count) = validate_format_erasure_layout(format) else {
+        return false;
+    };
+    format
+        .erasure
+        .sets
+        .get(index / set_drive_count)
+        .and_then(|set| set.get(index % set_drive_count))
+        .is_some_and(|expected| *expected == format.erasure.this)
+}
 
-    for f in formats.iter() {
-        if f.is_some() {
-            let ds = f.as_ref().unwrap().drives();
-            let v = countmap.entry(ds);
-            match v {
-                Entry::Occupied(mut entry) => *entry.get_mut() += 1,
-                Entry::Vacant(vacant) => {
-                    vacant.insert(1);
-                }
-            };
-        }
+pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>], slot_offset: usize) -> Result<FormatV3> {
+    let mut candidates = HashMap::new();
+    let formats_present = formats.iter().flatten().count();
+    let required_votes = formats.len() / 2 + 1;
+
+    for format in formats.iter().enumerate().filter_map(|(index, format)| {
+        let format = format.as_ref()?;
+        let slot = slot_offset.checked_add(index)?;
+        format_disk_id_matches_slot(format, slot).then_some(format)
+    }) {
+        let key = format.shared_identity();
+        candidates
+            .entry(key)
+            .and_modify(|(_, count)| *count += 1)
+            .or_insert((format, 1));
     }
 
-    let (max_drives, max_count) = countmap.iter().max_by_key(|&(_, c)| c).unwrap_or((&0, &0));
+    let candidate_groups = candidates.len();
+    let log_quorum_failure = |max_votes| {
+        warn!(
+            event = "format_quorum_failed",
+            component = "ecstore",
+            subsystem = "store_init",
+            state = "rejected",
+            formats_total = formats.len(),
+            formats_present,
+            candidate_groups,
+            max_votes,
+            required_votes,
+            "storage format quorum not reached"
+        );
+    };
+    let Some((format, max_count)) = candidates.into_values().max_by_key(|(_, count)| *count) else {
+        log_quorum_failure(0);
+        return Err(Error::ErasureReadQuorum);
+    };
 
-    if *max_drives == 0 || *max_count <= formats.len() / 2 {
-        warn!("get_format_erasure_in_quorum fi: {:?}", &formats);
+    if max_count < required_votes {
+        log_quorum_failure(max_count);
         return Err(Error::ErasureReadQuorum);
     }
 
-    let format = formats
-        .iter()
-        .find(|f| f.as_ref().is_some_and(|v| v.drives().eq(max_drives)))
-        .ok_or(Error::ErasureReadQuorum)?;
-
-    let mut format = format.as_ref().unwrap().clone();
+    let mut format = (*format).clone();
     format.erasure.this = Uuid::nil();
+    format.disk_info = None;
 
     Ok(format)
 }
@@ -298,32 +333,29 @@ pub fn check_format_erasure_values(
     // disks: &Vec<Option<DiskStore>>,
     set_drive_count: usize,
 ) -> Result<()> {
-    for f in formats.iter() {
-        if f.is_none() {
-            continue;
-        }
+    for format in formats.iter().flatten() {
+        check_format_erasure_value_for_topology(format, formats.len(), set_drive_count)?;
+    }
+    Ok(())
+}
 
-        let f = f.as_ref().unwrap();
-
-        check_format_erasure_value(f)?;
-
-        let first_set = f.erasure.sets.first().ok_or_else(|| Error::other("erasure.sets is empty"))?;
-
-        if formats.len() != f.erasure.sets.len() * first_set.len() {
-            return Err(Error::other(format!(
-                "formats length for erasure.sets does not match: got {}, expected {}",
-                formats.len(),
-                f.erasure.sets.len() * first_set.len()
-            )));
-        }
-
-        if first_set.len() != set_drive_count {
-            return Err(Error::other(format!(
-                "erasure set length for set_drive_count does not match: got {}, expected {}",
-                first_set.len(),
-                set_drive_count
-            )));
-        }
+fn check_format_erasure_value_for_topology(format: &FormatV3, format_count: usize, set_drive_count: usize) -> Result<()> {
+    let set_drive_count_in_format = validate_format_erasure_layout(format)?;
+    let format_drive_count = format
+        .erasure
+        .sets
+        .len()
+        .checked_mul(set_drive_count_in_format)
+        .ok_or_else(|| Error::other("erasure set drive count overflow"))?;
+    if format_count != format_drive_count {
+        return Err(Error::other(format!(
+            "formats length for erasure.sets does not match: got {format_count}, expected {format_drive_count}"
+        )));
+    }
+    if set_drive_count_in_format != set_drive_count {
+        return Err(Error::other(format!(
+            "erasure set length for set_drive_count does not match: got {set_drive_count_in_format}, expected {set_drive_count}"
+        )));
     }
     Ok(())
 }
@@ -333,10 +365,47 @@ fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
         return Err(Error::other("invalid FormatMetaVersion"));
     }
 
+    if !matches!(format.format, FormatBackend::Erasure | FormatBackend::ErasureSingle) {
+        return Err(Error::other("invalid FormatBackend"));
+    }
+
+    if format.id.is_nil() || format.id == Uuid::max() {
+        return Err(Error::other("invalid deployment ID"));
+    }
+
     if format.erasure.version != FormatErasureVersion::V3 {
         return Err(Error::other("invalid FormatErasureVersion"));
     }
     Ok(())
+}
+
+fn validate_format_erasure_layout(format: &FormatV3) -> Result<usize> {
+    check_format_erasure_value(format)?;
+
+    let set_drive_count = format
+        .erasure
+        .sets
+        .first()
+        .map(Vec::len)
+        .filter(|count| *count > 0)
+        .ok_or_else(|| Error::other("erasure.sets must contain at least one drive"))?;
+    let mut disk_ids = HashSet::new();
+
+    for set in &format.erasure.sets {
+        if set.len() != set_drive_count {
+            return Err(Error::other("erasure.sets must be rectangular"));
+        }
+        for disk_id in set {
+            if disk_id.is_nil() || *disk_id == Uuid::max() {
+                return Err(Error::other("erasure.sets contains an invalid disk UUID"));
+            }
+            if !disk_ids.insert(*disk_id) {
+                return Err(Error::other("erasure.sets contains a duplicate disk UUID"));
+            }
+        }
+    }
+
+    Ok(set_drive_count)
 }
 
 // load_format_erasure_all reads all format.json files
@@ -483,12 +552,267 @@ pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::endpoint::Endpoint;
+
+    async fn local_disks(count: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
+        let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
+        let mut endpoints = Vec::with_capacity(count);
+        for disk_index in 0..count {
+            let path = temp_dir.path().join(format!("disk-{disk_index}"));
+            tokio::fs::create_dir_all(&path)
+                .await
+                .expect("temporary disk path should be created");
+            let mut endpoint =
+                Endpoint::try_from(path.to_str().expect("temporary disk path should be UTF-8")).expect("endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+
+        let (disks, errors) = init_disks(
+            &Endpoints::from(endpoints),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await;
+        assert!(errors.iter().all(Option::is_none), "local disk initialization failed: {errors:?}");
+
+        (temp_dir, disks)
+    }
+
+    async fn two_local_disks_with_missing_third() -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
+        let (temp_dir, mut disks) = local_disks(2).await;
+        disks.push(None);
+
+        (temp_dir, disks)
+    }
 
     #[test]
     fn ec_drives_no_config_uses_topology_defaults() {
         assert_eq!(ec_drives_no_config(1).expect("single-drive topology should resolve"), 0);
         assert_eq!(ec_drives_no_config(2).expect("two-drive topology should resolve"), 1);
         assert_eq!(ec_drives_no_config(6).expect("six-drive topology should resolve"), 3);
+    }
+
+    #[test]
+    fn format_quorum_rejects_duplicate_sentinel_and_ragged_layouts() {
+        let mut duplicate = FormatV3::new(1, 3);
+        duplicate.erasure.sets[0][1] = duplicate.erasure.sets[0][0];
+
+        let mut nil = FormatV3::new(1, 3);
+        nil.erasure.sets[0][2] = Uuid::nil();
+
+        let mut max = FormatV3::new(1, 3);
+        max.erasure.sets[0][2] = Uuid::max();
+
+        let mut ragged = FormatV3::new(2, 2);
+        ragged.erasure.sets[1].pop();
+
+        for (name, format, total_slots, voting_slots) in [
+            ("duplicate", duplicate, 3, vec![0, 1]),
+            ("nil", nil, 3, vec![0, 1]),
+            ("max", max, 3, vec![0, 1]),
+            ("ragged", ragged, 4, vec![0, 1, 2]),
+        ] {
+            let set_drive_count = format.erasure.sets[0].len();
+            let mut formats = vec![None; total_slots];
+            for index in voting_slots {
+                let mut vote = format.clone();
+                vote.erasure.this = format.erasure.sets[index / set_drive_count][index % set_drive_count];
+                formats[index] = Some(vote);
+            }
+
+            assert!(
+                matches!(get_format_erasure_in_quorum(&formats, 0), Err(Error::ErasureReadQuorum)),
+                "{name} layout must not form a format quorum"
+            );
+            assert!(
+                check_format_erasure_values(&formats, set_drive_count).is_err(),
+                "{name} layout must fail startup format validation"
+            );
+        }
+    }
+
+    #[test]
+    fn format_quorum_rejects_unknown_backend_and_invalid_deployment_ids() {
+        let mut unknown_backend = FormatV3::new(1, 3);
+        unknown_backend.format = FormatBackend::Unknown;
+
+        let mut nil_deployment = FormatV3::new(1, 3);
+        nil_deployment.id = Uuid::nil();
+
+        let mut max_deployment = FormatV3::new(1, 3);
+        max_deployment.id = Uuid::max();
+
+        for (name, format) in [
+            ("unknown backend", unknown_backend),
+            ("nil deployment ID", nil_deployment),
+            ("max deployment ID", max_deployment),
+        ] {
+            let mut formats = vec![None; 3];
+            for (index, slot) in formats.iter_mut().take(2).enumerate() {
+                let mut vote = format.clone();
+                vote.erasure.this = format.erasure.sets[0][index];
+                *slot = Some(vote);
+            }
+
+            assert!(
+                matches!(get_format_erasure_in_quorum(&formats, 0), Err(Error::ErasureReadQuorum)),
+                "{name} must not form a format quorum"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_format_load_succeeds_with_a_strict_majority() {
+        let (_temp_dir, mut disks) = two_local_disks_with_missing_third().await;
+        let mut format = FormatV3::new(1, 3);
+        let mut expected = format.clone();
+        expected.erasure.this = Uuid::nil();
+
+        format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(format.clone()))
+            .await
+            .expect("existing format should be written to the first disk");
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::ErasureReadQuorum)
+        ));
+        assert!(matches!(
+            load_format_erasure(disks[1].as_ref().expect("second disk should exist"), false).await,
+            Err(DiskError::UnformattedDisk)
+        ));
+
+        format.erasure.this = format.erasure.sets[0][1];
+        save_format_file(&disks[1], &Some(format))
+            .await
+            .expect("existing format should be written to the second disk");
+
+        assert_eq!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None)
+                .await
+                .expect("two existing formats should satisfy the production load path"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_format_load_rejects_conflicting_formats_without_a_majority() {
+        let (_temp_dir, mut disks) = two_local_disks_with_missing_third().await;
+        let mut first = FormatV3::new(1, 3);
+        first.erasure.this = first.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(first))
+            .await
+            .expect("first existing format should be written");
+
+        let mut second = FormatV3::new(1, 3);
+        second.erasure.this = second.erasure.sets[0][1];
+        save_format_file(&disks[1], &Some(second))
+            .await
+            .expect("conflicting existing format should be written");
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::ErasureReadQuorum)
+        ));
+    }
+
+    #[tokio::test]
+    async fn existing_format_load_excludes_disks_outside_the_selected_quorum() {
+        for wrong_slot_id in [false, true] {
+            let (_temp_dir, mut disks) = local_disks(3).await;
+            let mut majority = FormatV3::new(1, 3);
+            let mut expected = majority.clone();
+            expected.erasure.this = Uuid::nil();
+
+            for (index, disk) in disks.iter().take(2).enumerate() {
+                majority.erasure.this = majority.erasure.sets[0][index];
+                save_format_file(disk, &Some(majority.clone()))
+                    .await
+                    .expect("majority format should be written");
+            }
+
+            let mut outlier = if wrong_slot_id {
+                majority.clone()
+            } else {
+                FormatV3::new(1, 3)
+            };
+            outlier.erasure.this = if wrong_slot_id {
+                outlier.erasure.sets[0][0]
+            } else {
+                outlier.erasure.sets[0][2]
+            };
+            save_format_file(&disks[2], &Some(outlier))
+                .await
+                .expect("outlier format should be written");
+
+            assert_eq!(
+                connect_load_init_formats(true, &mut disks, 1, 3, None)
+                    .await
+                    .expect("two valid members should select the majority format"),
+                expected
+            );
+            assert!(disks[0].is_some() && disks[1].is_some());
+            assert!(disks[2].is_none(), "the outlier disk must not enter the selected erasure set");
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_format_load_excludes_a_malformed_outlier() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+        let mut majority = FormatV3::new(1, 3);
+        let mut expected = majority.clone();
+        expected.erasure.this = Uuid::nil();
+
+        for (index, disk) in disks.iter().take(2).enumerate() {
+            majority.erasure.this = majority.erasure.sets[0][index];
+            save_format_file(disk, &Some(majority.clone()))
+                .await
+                .expect("majority format should be written");
+        }
+        let mut malformed = majority;
+        malformed.erasure.sets[0][1] = malformed.erasure.sets[0][0];
+        malformed.erasure.this = malformed.erasure.sets[0][2];
+        save_format_file(&disks[2], &Some(malformed))
+            .await
+            .expect("malformed outlier should be written");
+
+        assert_eq!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None)
+                .await
+                .expect("one malformed outlier must not block a valid strict majority"),
+            expected
+        );
+        assert!(disks[0].is_some() && disks[1].is_some());
+        assert!(disks[2].is_none(), "the malformed outlier must be isolated");
+    }
+
+    #[tokio::test]
+    async fn fresh_format_load_does_not_initialize_with_a_missing_disk() {
+        let (_temp_dir, mut disks) = two_local_disks_with_missing_third().await;
+
+        assert!(matches!(
+            connect_load_init_formats(true, &mut disks, 1, 3, None).await,
+            Err(Error::FirstDiskWait)
+        ));
+        assert!(matches!(
+            connect_load_init_formats(false, &mut disks, 1, 3, None).await,
+            Err(Error::NotFirstDisk)
+        ));
+
+        let (formats, errors) = load_format_erasure_all(&disks, false).await;
+        assert!(formats.iter().all(Option::is_none));
+        assert!(matches!(
+            errors.as_slice(),
+            [
+                Some(DiskError::UnformattedDisk),
+                Some(DiskError::UnformattedDisk),
+                Some(DiskError::DiskNotFound)
+            ]
+        ));
     }
 }
 

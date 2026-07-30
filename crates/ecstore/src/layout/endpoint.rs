@@ -88,6 +88,7 @@ impl TryFrom<&str> for Endpoint {
                 // - All field should be empty except Host and Path.
                 if !((url.scheme() == "http" || url.scheme() == "https")
                     && url.username().is_empty()
+                    && url.password().is_none()
                     && url.fragment().is_none()
                     && url.query().is_none())
                 {
@@ -367,6 +368,12 @@ mod test {
                 expected_err: Some(Error::other("invalid URL endpoint format")),
             },
             TestCase {
+                arg: "http://:topsecret@server/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::other("invalid URL endpoint format")),
+            },
+            TestCase {
                 arg: "http://:/path",
                 expected_endpoint: None,
                 expected_type: None,
@@ -505,8 +512,18 @@ mod test {
         let endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
         assert_eq!(endpoint.host_port(), "example.com:9000");
 
-        let endpoint_no_port = Endpoint::try_from("https://example.com/path").unwrap();
-        assert_eq!(endpoint_no_port.host_port(), "example.com");
+        for endpoint in [
+            Endpoint::try_from("http://example.com/path").unwrap(),
+            Endpoint::try_from("http://example.com:80/path").unwrap(),
+        ] {
+            assert_eq!(endpoint.host_port(), "example.com");
+        }
+        for endpoint in [
+            Endpoint::try_from("https://example.com/path").unwrap(),
+            Endpoint::try_from("https://example.com:443/path").unwrap(),
+        ] {
+            assert_eq!(endpoint.host_port(), "example.com");
+        }
 
         let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
         assert_eq!(file_endpoint.host_port(), "");

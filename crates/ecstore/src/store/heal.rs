@@ -37,9 +37,7 @@ impl ECStore {
                     StorageError::NoHealRequired => {
                         count_no_heal += 1;
                     }
-                    _ => {
-                        continue;
-                    }
+                    err => return Ok((result, Some(err))),
                 }
             }
             r.disk_count += result.disk_count;
@@ -163,5 +161,83 @@ impl ECStore {
         // pool/set storage layers, so keep the placeholder explicit at the ECStore
         // boundary instead of dispatching into lower layers.
         Err(StorageError::NotImplemented)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::{DiskOption, format::FormatV3, new_disk};
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+    use crate::store::init_format::save_format_file;
+
+    #[tokio::test]
+    async fn handle_heal_format_propagates_a_foreign_format_majority() {
+        let canonical_format = FormatV3::new(1, 3);
+        let mut foreign_format = canonical_format.clone();
+        foreign_format.id = Uuid::new_v4();
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+
+        for disk_index in 0..3 {
+            let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
+            let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("temporary path should be UTF-8"))
+                .expect("temporary endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            let disk = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("temporary disk should open");
+            let mut disk_format = foreign_format.clone();
+            disk_format.erasure.this = foreign_format.erasure.sets[0][disk_index];
+            save_format_file(&Some(disk.clone()), &Some(disk_format))
+                .await
+                .expect("foreign format should be written");
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 3,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "foreign-format-majority-test".to_string(),
+            platform: "test".to_string(),
+        };
+        let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
+        let pool = Sets::new(disks, &pool_endpoints, &canonical_format, 0, 1)
+            .await
+            .expect("test pool should build around the cached canonical format");
+        let store = ECStore {
+            id: canonical_format.id,
+            disk_map: HashMap::new(),
+            pools: vec![pool],
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
+        };
+
+        let (_, err) = store
+            .handle_heal_format(false)
+            .await
+            .expect("format heal should return the typed pool error");
+        assert!(
+            matches!(err, Some(StorageError::CorruptedFormat)),
+            "foreign format majority must not be downgraded to a successful heal: {err:?}"
+        );
     }
 }

@@ -294,7 +294,7 @@ impl ECStore {
             // periodic monitoring until format loading succeeds. Startup RPC
             // failures can still spawn recovery probes for peers that come up
             // after this node.
-            let (disks, errs) = init_format::init_disks(
+            let (mut disks, errs) = init_format::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -311,7 +311,7 @@ impl ECStore {
                 loop {
                     match init_format::connect_load_init_formats(
                         pool_first_is_local,
-                        &disks,
+                        &mut disks,
                         pool_eps.set_count,
                         pool_eps.drives_per_set,
                         deployment_id,

@@ -989,7 +989,7 @@ mod tests {
 
         init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
 
-        let (disks, errs) = init_disks(
+        let (mut disks, errs) = init_disks(
             &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
             &DiskOption {
                 cleanup: true,
@@ -999,7 +999,7 @@ mod tests {
         .await;
 
         assert!(errs.iter().all(|err| err.is_none()), "disk init should succeed: {errs:?}");
-        connect_load_init_formats(true, &disks, 1, 4, None)
+        connect_load_init_formats(true, &mut disks, 1, 4, None)
             .await
             .expect("initialize format metadata");
 

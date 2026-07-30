@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    layout::{
-        disks_layout::DisksLayout,
-        endpoint::{Endpoint, EndpointType},
-    },
-    runtime::sources as runtime_sources,
+use crate::layout::{
+    disks_layout::DisksLayout,
+    endpoint::{Endpoint, EndpointType},
 };
 use rustfs_config::{
     DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS, DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS, DEFAULT_UNSAFE_BYPASS_DISK_CHECK,
-    ENV_KUBERNETES_SERVICE_HOST, ENV_MINIO_CI, ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY, ENV_STARTUP_TOPOLOGY_WAIT_MODE,
-    ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, ENV_UNSAFE_BYPASS_DISK_CHECK,
+    ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_MINIO_CI, ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY,
+    ENV_STARTUP_TOPOLOGY_WAIT_MODE, ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, ENV_UNSAFE_BYPASS_DISK_CHECK,
 };
 use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, get_host_ip, is_local_host};
 use std::{
@@ -132,10 +129,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for Endpoints {
 
         // Loop through args and adds to endpoint list.
         for (i, arg) in args.iter().enumerate() {
-            let endpoint = match Endpoint::try_from(arg.as_ref()) {
-                Ok(ep) => ep,
-                Err(e) => return Err(Error::other(format!("'{}': {}", arg.as_ref(), e))),
-            };
+            let endpoint = Endpoint::try_from(arg.as_ref())?;
 
             // All endpoints have to be same type and scheme if applicable.
             if i == 0 {
@@ -213,17 +207,23 @@ impl PoolEndpointList {
     /// creates a list of endpoints per pool, resolves their relevant
     /// hostnames and discovers those are local or remote.
     async fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
-        Self::create_pool_endpoints_with(server_addr, disks_layout, None).await
+        Self::create_pool_endpoints_with(server_addr, disks_layout, None, None).await
     }
 
     /// Same as [`create_pool_endpoints`] but lets tests inject an explicit
-    /// startup topology convergence policy instead of resolving it from the
-    /// environment.
+    /// startup topology convergence policy and local endpoint host instead of
+    /// resolving them from the environment.
     async fn create_pool_endpoints_with(
         server_addr: &str,
         disks_layout: &DisksLayout,
         policy_override: Option<StartupTopologyPolicy>,
+        local_endpoint_host: Option<&str>,
     ) -> Result<Self> {
+        let unsupported_explicit_host = || {
+            Error::other(format!(
+                "{ENV_LOCAL_ENDPOINT_HOST} is only supported for distributed URL endpoints in orchestrated mode"
+            ))
+        };
         if disks_layout.is_empty_layout() {
             return Err(Error::other("invalid number of endpoints"));
         }
@@ -232,6 +232,10 @@ impl PoolEndpointList {
 
         // For single arg, return single drive EC setup.
         if disks_layout.is_single_drive_layout() {
+            if local_endpoint_host.is_some() {
+                return Err(unsupported_explicit_host());
+            }
+
             let mut endpoint = Endpoint::try_from(disks_layout.get_single_drive_layout())?;
             endpoint.update_is_local(server_addr.port())?;
 
@@ -293,7 +297,18 @@ impl PoolEndpointList {
             .first()
             .and_then(|eps| eps.as_ref().first())
             .is_some_and(|ep| ep.get_type() == EndpointType::Url);
-        let policy = policy_override.unwrap_or_else(|| StartupTopologyPolicy::resolve(distributed));
+        let all_distributed = pool_endpoint_list
+            .inner
+            .iter()
+            .flat_map(|endpoints| endpoints.as_ref())
+            .all(|endpoint| endpoint.get_type() == EndpointType::Url);
+        let policy = match policy_override {
+            Some(policy) => policy,
+            None => StartupTopologyPolicy::resolve(distributed, local_endpoint_host.is_some())?,
+        };
+        if local_endpoint_host.is_some() && (!all_distributed || !policy.is_orchestrated()) {
+            return Err(unsupported_explicit_host());
+        }
         info!(
             target: "rustfs::ecstore::endpoints",
             mode = ?policy.mode,
@@ -305,14 +320,18 @@ impl PoolEndpointList {
 
         let convergence_started = Instant::now();
         let dns_retry_deadline = DnsRetryDeadline::new(policy.wait_timeout, policy.retry_max_delay);
-        pool_endpoint_list
-            .update_is_local(server_addr.port(), &dns_retry_deadline)
-            .await?;
+        if let Some(local_endpoint_host) = local_endpoint_host {
+            pool_endpoint_list.update_is_local_from_explicit_host(disks_layout, server_addr.port(), local_endpoint_host)?;
+        } else {
+            pool_endpoint_list
+                .update_is_local(server_addr.port(), &dns_retry_deadline)
+                .await?;
 
-        // Collapse divergent local/remote verdicts for the same host:port that
-        // orchestrated DNS churn can produce during startup, before any check
-        // relies on the local flag.
-        normalize_same_host_local_state(pool_endpoint_list.as_mut());
+            // Collapse divergent local/remote verdicts for the same host:port that
+            // orchestrated DNS churn can produce during startup, before any check
+            // relies on the local flag.
+            normalize_same_host_local_state(pool_endpoint_list.as_mut());
+        }
 
         for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
@@ -424,7 +443,9 @@ impl PoolEndpointList {
                 }
                 match ep.url.port() {
                     None => {
-                        let _ = ep.url.set_port(Some(server_addr.port()));
+                        if local_endpoint_host.is_none() {
+                            let _ = ep.url.set_port(Some(server_addr.port()));
+                        }
                     }
                     Some(port) => {
                         // If endpoint is local, but port is different than serverAddrPort, then make it as remote.
@@ -494,6 +515,79 @@ impl PoolEndpointList {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    fn update_is_local_from_explicit_host(
+        &mut self,
+        disks_layout: &DisksLayout,
+        local_port: u16,
+        raw_local_host: &str,
+    ) -> Result<()> {
+        let local_host = parse_explicit_local_endpoint_host(raw_local_host)?;
+        let mut local_endpoint_found = false;
+        let mut host_path_ports = HashMap::new();
+        debug_assert_eq!(self.inner.len(), disks_layout.pools.len());
+
+        for (endpoints, pool_layout) in self.inner.iter_mut().zip(&disks_layout.pools) {
+            debug_assert_eq!(endpoints.as_ref().len(), pool_layout.iter().map(Vec::len).sum::<usize>());
+            for (endpoint, raw_endpoint) in endpoints.as_mut().iter_mut().zip(pool_layout.iter().flatten()) {
+                let endpoint_host = match endpoint.url.host().map(|host| host.to_owned()) {
+                    Some(Host::Domain(domain)) => {
+                        let canonical_domain = domain_without_optional_trailing_dot(&domain)
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidInput,
+                                    "explicit local endpoint identity requires canonical endpoint hostnames",
+                                )
+                            })?
+                            .to_string();
+                        if canonical_domain != domain {
+                            endpoint
+                                .url
+                                .set_host(Some(&canonical_domain))
+                                .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to canonicalize endpoint host"))?;
+                        }
+                        Host::Domain(canonical_domain)
+                    }
+                    Some(host) => host,
+                    None => {
+                        return Err(Error::other(
+                            "explicit local endpoint identity requires every distributed endpoint to have a host",
+                        ));
+                    }
+                };
+                let explicit_port = explicit_url_port(raw_endpoint)?;
+                let endpoint_port = explicit_port.unwrap_or(local_port);
+                if explicit_port.is_none() {
+                    let _ = endpoint.url.set_port(Some(local_port));
+                }
+                let path = endpoint.get_file_path();
+                endpoint.is_local = endpoint_host == local_host && endpoint_port == local_port;
+                match host_path_ports.entry((endpoint_host, path)) {
+                    Entry::Occupied(entry) if *entry.get() != endpoint_port => {
+                        return Err(Error::other(
+                            "same path can not be served by different port on the same explicit endpoint host",
+                        ));
+                    }
+                    Entry::Occupied(_) => {
+                        return Err(Error::other("duplicate distributed endpoint after explicit host normalization"));
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(endpoint_port);
+                    }
+                }
+
+                local_endpoint_found |= endpoint.is_local;
+            }
+        }
+
+        if !local_endpoint_found {
+            return Err(Error::other(format!(
+                "{ENV_LOCAL_ENDPOINT_HOST} does not match any distributed endpoint on the local server port {local_port}"
+            )));
         }
 
         Ok(())
@@ -672,18 +766,118 @@ fn is_retryable_dns_error(err: &Error) -> bool {
         return true;
     }
 
-    if matches!(err.raw_os_error(), Some(-3) | Some(-2)) {
+    if err.raw_os_error().is_some_and(is_retryable_dns_raw_os_error) {
         return true;
     }
 
-    let message = err.to_string().to_ascii_lowercase();
+    let message = err.to_string().trim().to_ascii_lowercase();
     // Kubernetes and Docker DNS records can be observed as negative lookups
     // while headless service records are still propagating during startup.
-    message.contains("temporary failure in name resolution")
-        || message.contains("try again")
-        || message.contains("name or service not known")
-        || message.contains("no such host")
-        || message.contains("nodename nor servname provided")
+    matches!(
+        message.as_str(),
+        "temporary failure in name resolution"
+            | "failed to lookup address information: temporary failure in name resolution"
+            | "name or service not known"
+            | "failed to lookup address information: name or service not known"
+            | "name does not resolve"
+            | "failed to lookup address information: name does not resolve"
+            | "no such host"
+            | "no such host is known."
+            | "nodename nor servname provided, or not known"
+            | "failed to lookup address information: nodename nor servname provided, or not known"
+    )
+}
+
+fn is_retryable_dns_raw_os_error(code: i32) -> bool {
+    if matches!(code, -3 | -2 | 11001 | 11002 | 11004) {
+        return true;
+    }
+
+    cfg!(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )) && matches!(code, 2 | 8)
+}
+
+fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
+    let invalid = || {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "explicit local endpoint identity requires canonical HTTP(S) endpoint URLs",
+        )
+    };
+    if raw.trim() != raw || raw.contains('\\') || raw.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(invalid());
+    }
+
+    let (scheme, remainder) = raw.split_once("://").ok_or_else(&invalid)?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(invalid());
+    }
+    let authority = remainder
+        .split('/')
+        .next()
+        .filter(|authority| !authority.is_empty())
+        .ok_or_else(&invalid)?;
+    if authority.contains('@') {
+        return Err(invalid());
+    }
+
+    let port = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (_, suffix) = bracketed.split_once(']').ok_or_else(&invalid)?;
+        if suffix.is_empty() {
+            return Ok(None);
+        }
+        suffix.strip_prefix(':').ok_or_else(&invalid)?
+    } else if let Some((_, port)) = authority.rsplit_once(':') {
+        port
+    } else {
+        return Ok(None);
+    };
+
+    port.parse().map(Some).map_err(|_| invalid())
+}
+
+fn parse_explicit_local_endpoint_host(raw: &str) -> Result<Host<String>> {
+    let invalid = || {
+        Error::other(format!(
+            "{ENV_LOCAL_ENDPOINT_HOST} must contain exactly one host without a scheme, port, or path"
+        ))
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(invalid());
+    }
+
+    let host = Host::parse(raw).map_err(|_| invalid())?;
+    let host = match host {
+        Host::Domain(domain) => Host::Domain(
+            domain_without_optional_trailing_dot(&domain)
+                .ok_or_else(&invalid)?
+                .to_string(),
+        ),
+        host => host,
+    };
+    if matches!(&host, Host::Domain(domain) if domain.contains('*'))
+        || matches!(&host, Host::Ipv4(ip) if ip.is_unspecified())
+        || matches!(&host, Host::Ipv6(ip) if ip.is_unspecified()
+            || ip.to_ipv4_mapped().is_some_and(|mapped| mapped.is_unspecified()))
+    {
+        return Err(Error::other(format!(
+            "{ENV_LOCAL_ENDPOINT_HOST} must not be a wildcard or unspecified address"
+        )));
+    }
+
+    Ok(host)
+}
+
+fn domain_without_optional_trailing_dot(domain: &str) -> Option<&str> {
+    let canonical = domain.strip_suffix('.').unwrap_or(domain);
+    (!canonical.is_empty() && !canonical.ends_with('.')).then_some(canonical)
 }
 
 fn dns_retry_delay(attempt: u32, max_delay: Duration) -> Duration {
@@ -743,7 +937,7 @@ pub(crate) struct StartupTopologyPolicy {
 impl StartupTopologyPolicy {
     /// Resolves the policy from the environment. `distributed` is true when the
     /// endpoints are URL style (the only ones that resolve hostnames).
-    fn resolve(distributed: bool) -> Self {
+    fn resolve(distributed: bool, explicit_local_host: bool) -> Result<Self> {
         // `KUBERNETES_SERVICE_HOST` is platform-injected, so probe it directly
         // rather than through the RUSTFS/MINIO config alias helpers.
         Self::resolve_from(
@@ -752,6 +946,7 @@ impl StartupTopologyPolicy {
             distributed,
             get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT).as_deref(),
             get_env_opt_str(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY).as_deref(),
+            explicit_local_host,
         )
     }
 
@@ -762,23 +957,32 @@ impl StartupTopologyPolicy {
         distributed: bool,
         timeout_env: Option<&str>,
         max_delay_env: Option<&str>,
-    ) -> Self {
-        let mode = match mode_env.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+        explicit_local_host: bool,
+    ) -> Result<Self> {
+        let mode_env = mode_env.map(|value| value.trim().to_ascii_lowercase());
+        let auto_mode = || {
+            if !distributed {
+                StartupTopologyWaitMode::FailFast
+            } else if kubernetes {
+                StartupTopologyWaitMode::Orchestrated
+            } else {
+                StartupTopologyWaitMode::Bounded
+            }
+        };
+        let mode = match mode_env.as_deref() {
             Some("orchestrated") => StartupTopologyWaitMode::Orchestrated,
             Some("bounded") => StartupTopologyWaitMode::Bounded,
             Some("fail-fast") | Some("failfast") | Some("strict") => StartupTopologyWaitMode::FailFast,
-            // "auto", unset, or unrecognized: derive from the environment.
-            // Only URL-style (distributed) endpoints resolve hostnames and need
-            // to wait for DNS/topology convergence; local path endpoints never
-            // do, so they fail fast regardless of the platform.
-            _ => {
-                if !distributed {
-                    StartupTopologyWaitMode::FailFast
-                } else if kubernetes {
-                    StartupTopologyWaitMode::Orchestrated
-                } else {
-                    StartupTopologyWaitMode::Bounded
-                }
+            None | Some("") | Some("auto") => auto_mode(),
+            // RUSTFS_COMPAT_TODO(rustfs-5416-wait-mode): Preserve unknown-mode auto fallback without an anchor. Remove after every supported direct-upgrade chart validates this setting.
+            Some(_) if !explicit_local_host => auto_mode(),
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "invalid {ENV_STARTUP_TOPOLOGY_WAIT_MODE}; expected auto, orchestrated, bounded, fail-fast, failfast, or strict"
+                    ),
+                ));
             }
         };
 
@@ -796,11 +1000,11 @@ impl StartupTopologyPolicy {
             StartupTopologyWaitMode::FailFast => Duration::ZERO,
         };
 
-        Self {
+        Ok(Self {
             mode,
             wait_timeout,
             retry_max_delay,
-        }
+        })
     }
 
     fn is_orchestrated(&self) -> bool {
@@ -921,23 +1125,25 @@ impl EndpointServerPools {
         server_addr: &str,
         disks_layout: &DisksLayout,
     ) -> Result<(EndpointServerPools, SetupType)> {
-        Self::create_server_endpoints_with(server_addr, disks_layout, None).await
+        let local_endpoint_host = get_env_opt_str(ENV_LOCAL_ENDPOINT_HOST);
+        Self::create_server_endpoints_with(server_addr, disks_layout, None, local_endpoint_host.as_deref()).await
     }
 
     /// Same as [`create_server_endpoints`] but lets tests inject an explicit
-    /// startup topology convergence policy instead of resolving it from the
-    /// environment (which would otherwise vary with the CI runner's ambient
-    /// `KUBERNETES_SERVICE_HOST`).
+    /// startup topology convergence policy and local endpoint host instead of
+    /// resolving them from the environment.
     async fn create_server_endpoints_with(
         server_addr: &str,
         disks_layout: &DisksLayout,
         policy_override: Option<StartupTopologyPolicy>,
+        local_endpoint_host: Option<&str>,
     ) -> Result<(EndpointServerPools, SetupType)> {
         if disks_layout.pools.is_empty() {
             return Err(Error::other("Invalid arguments specified"));
         }
 
-        let pool_eps = PoolEndpointList::create_pool_endpoints_with(server_addr, disks_layout, policy_override).await?;
+        let pool_eps =
+            PoolEndpointList::create_pool_endpoints_with(server_addr, disks_layout, policy_override, local_endpoint_host).await?;
 
         let mut ret: EndpointServerPools = Vec::with_capacity(pool_eps.as_ref().len()).into();
         for (i, eps) in pool_eps.inner.into_iter().enumerate() {
@@ -1104,7 +1310,7 @@ impl EndpointServerPools {
                     continue;
                 }
                 let host = endpoint.host_port();
-                if endpoint.is_local && endpoint.url.port() == Some(runtime_sources::rustfs_port()) && local.is_none() {
+                if endpoint.is_local && local.is_none() {
                     local = Some(host.clone());
                 }
 
@@ -1333,28 +1539,65 @@ mod test {
 
     use super::*;
 
-    #[cfg(target_os = "linux")]
     use serial_test::serial;
     use std::path::Path;
-    #[cfg(target_os = "linux")]
     use temp_env::async_with_vars;
     #[cfg(target_os = "linux")]
     use tempfile::tempdir;
 
+    fn local_flags(endpoints: &Endpoints) -> Vec<bool> {
+        endpoints.as_ref().iter().map(|endpoint| endpoint.is_local).collect()
+    }
+
     #[test]
     fn retryable_dns_error_accepts_startup_dns_transients() {
         assert!(is_retryable_dns_error(&Error::new(ErrorKind::TimedOut, "resolver timeout")));
-        assert!(is_retryable_dns_error(&Error::other(
-            "failed to lookup address information: Name or service not known"
-        )));
-        assert!(is_retryable_dns_error(&Error::other("no such host")));
-        assert!(is_retryable_dns_error(&Error::other("nodename nor servname provided, or not known")));
+        for message in [
+            "temporary failure in name resolution",
+            "failed to lookup address information: temporary failure in name resolution",
+            "name or service not known",
+            "failed to lookup address information: name or service not known",
+            "name does not resolve",
+            "  Failed to lookup address information: Name does not resolve  ",
+            "no such host",
+            "no such host is known.",
+            "nodename nor servname provided, or not known",
+            "failed to lookup address information: nodename nor servname provided, or not known",
+        ] {
+            assert!(is_retryable_dns_error(&Error::other(message)), "{message:?} must be retryable");
+        }
+        assert!(is_retryable_dns_error(&Error::new(ErrorKind::NotFound, "no such host")));
+    }
+
+    #[tokio::test]
+    async fn system_resolver_negative_result_reaches_the_dns_allowlist() {
+        let err = get_host_ip(Host::Domain("rustfs-startup-negative.invalid"))
+            .await
+            .expect_err("the reserved .invalid domain must not resolve");
+        assert!(
+            is_retryable_dns_error(&err),
+            "system resolver error kind {:?} and message {err:?} must retain retry provenance",
+            err.kind()
+        );
     }
 
     #[test]
     fn retryable_dns_error_accepts_resolver_raw_os_codes() {
-        assert!(is_retryable_dns_error(&Error::from_raw_os_error(-3)));
-        assert!(is_retryable_dns_error(&Error::from_raw_os_error(-2)));
+        for code in [-3, -2, 11001, 11002, 11004] {
+            assert!(is_retryable_dns_error(&Error::from_raw_os_error(code)));
+        }
+
+        let positive_eai = cfg!(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ));
+        for code in [2, 8] {
+            assert_eq!(is_retryable_dns_error(&Error::from_raw_os_error(code)), positive_eai);
+        }
     }
 
     #[test]
@@ -1364,6 +1607,8 @@ mod test {
             "invalid URL endpoint format"
         )));
         assert!(!is_retryable_dns_error(&Error::other("mixed scheme is not supported")));
+        assert!(!is_retryable_dns_error(&Error::other("request failed: no such host")));
+        assert!(!is_retryable_dns_error(&Error::other("try again")));
     }
 
     #[test]
@@ -1409,25 +1654,27 @@ mod test {
     #[test]
     fn startup_policy_auto_maps_environment_to_mode() {
         // Kubernetes -> orchestrated (unbounded by default).
-        let k8s = StartupTopologyPolicy::resolve_from(None, true, true, None, None);
+        let k8s = StartupTopologyPolicy::resolve_from(None, true, true, None, None, false).expect("auto mode should resolve");
         assert_eq!(k8s.mode, StartupTopologyWaitMode::Orchestrated);
         assert_eq!(k8s.wait_timeout, Duration::MAX);
         assert!(k8s.is_orchestrated());
 
         // Distributed URL endpoints, non-Kubernetes -> bounded (default window).
-        let bounded = StartupTopologyPolicy::resolve_from(None, false, true, None, None);
+        let bounded =
+            StartupTopologyPolicy::resolve_from(None, false, true, None, None, false).expect("auto mode should resolve");
         assert_eq!(bounded.mode, StartupTopologyWaitMode::Bounded);
         assert_eq!(bounded.wait_timeout, Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS));
         assert!(!bounded.is_orchestrated());
 
         // Local path endpoints -> fail-fast (zero wait window).
-        let local = StartupTopologyPolicy::resolve_from(None, false, false, None, None);
+        let local = StartupTopologyPolicy::resolve_from(None, false, false, None, None, false).expect("auto mode should resolve");
         assert_eq!(local.mode, StartupTopologyWaitMode::FailFast);
         assert_eq!(local.wait_timeout, Duration::ZERO);
 
         // Local path endpoints stay fail-fast even under Kubernetes: they have
         // no hostnames to resolve, so there is nothing to wait for.
-        let k8s_local = StartupTopologyPolicy::resolve_from(None, true, false, None, None);
+        let k8s_local =
+            StartupTopologyPolicy::resolve_from(None, true, false, None, None, false).expect("auto mode should resolve");
         assert_eq!(k8s_local.mode, StartupTopologyWaitMode::FailFast);
         assert_eq!(k8s_local.wait_timeout, Duration::ZERO);
     }
@@ -1435,24 +1682,38 @@ mod test {
     #[test]
     fn startup_policy_explicit_mode_overrides_auto_and_parses_durations() {
         // Explicit mode wins even under Kubernetes auto-detection.
-        let forced = StartupTopologyPolicy::resolve_from(Some("bounded"), true, true, Some("2m"), Some("4s"));
+        let forced = StartupTopologyPolicy::resolve_from(Some("bounded"), true, true, Some("2m"), Some("4s"), false)
+            .expect("bounded mode should resolve");
         assert_eq!(forced.mode, StartupTopologyWaitMode::Bounded);
         assert_eq!(forced.wait_timeout, Duration::from_secs(120));
         assert_eq!(forced.retry_max_delay, Duration::from_secs(4));
 
         // Explicit orchestrated can still be capped by an explicit timeout.
-        let capped = StartupTopologyPolicy::resolve_from(Some("orchestrated"), false, false, Some("10m"), None);
+        let capped = StartupTopologyPolicy::resolve_from(Some("orchestrated"), false, false, Some("10m"), None, false)
+            .expect("orchestrated mode should resolve");
         assert_eq!(capped.mode, StartupTopologyWaitMode::Orchestrated);
         assert_eq!(capped.wait_timeout, Duration::from_secs(600));
 
-        // Unrecognized mode falls back to auto (here: Kubernetes -> orchestrated).
-        let auto = StartupTopologyPolicy::resolve_from(Some("bogus"), true, true, None, None);
-        assert_eq!(auto.mode, StartupTopologyWaitMode::Orchestrated);
+        for auto_value in ["", "auto", "  AUTO  "] {
+            let auto = StartupTopologyPolicy::resolve_from(Some(auto_value), true, true, None, None, false)
+                .expect("explicit auto mode should resolve");
+            assert_eq!(auto.mode, StartupTopologyWaitMode::Orchestrated);
+        }
+
+        let legacy_unknown = StartupTopologyPolicy::resolve_from(Some("boudned"), true, true, None, None, false)
+            .expect("unknown mode without an explicit host should retain auto compatibility");
+        assert_eq!(legacy_unknown.mode, StartupTopologyWaitMode::Orchestrated);
+
+        let invalid = StartupTopologyPolicy::resolve_from(Some("boudned"), true, true, None, None, true).unwrap_err();
+        assert_eq!(invalid.kind(), ErrorKind::InvalidInput);
+        assert!(invalid.to_string().contains(ENV_STARTUP_TOPOLOGY_WAIT_MODE));
 
         // fail-fast accepts a few spellings, trimmed and case-insensitive.
         for alias in ["fail-fast", "failfast", "strict", "  Strict  "] {
             assert_eq!(
-                StartupTopologyPolicy::resolve_from(Some(alias), false, true, None, None).mode,
+                StartupTopologyPolicy::resolve_from(Some(alias), false, true, None, None, false)
+                    .expect("fail-fast alias should resolve")
+                    .mode,
                 StartupTopologyWaitMode::FailFast,
                 "alias {alias:?} should resolve to fail-fast"
             );
@@ -1528,12 +1789,8 @@ mod test {
         ];
         let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
 
-        let bounded = StartupTopologyPolicy {
-            mode: StartupTopologyWaitMode::Bounded,
-            wait_timeout: Duration::from_secs(1),
-            retry_max_delay: DNS_RETRY_MAX_DELAY,
-        };
-        let bounded_err = PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(bounded))
+        let bounded = bounded_test_policy();
+        let bounded_err = PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(bounded), None)
             .await
             .unwrap_err();
         assert!(
@@ -1543,15 +1800,467 @@ mod test {
             "bounded mode should run the DNS-IP cross-port check: {bounded_err}"
         );
 
-        let orchestrated = StartupTopologyPolicy {
-            mode: StartupTopologyWaitMode::Orchestrated,
-            wait_timeout: Duration::MAX,
-            retry_max_delay: DNS_RETRY_MAX_DELAY,
-        };
-        let resolved = PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(orchestrated))
+        let orchestrated = orchestrated_test_policy();
+        let resolved = PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(orchestrated), None)
             .await
             .expect("orchestrated mode should defer the DNS-IP cross-port check");
         assert_eq!(resolved.setup_type, SetupType::DistErasure);
+    }
+
+    #[test]
+    fn explicit_local_endpoint_host_accepts_only_a_canonical_host() {
+        assert_eq!(
+            parse_explicit_local_endpoint_host("  BÜCHER.example.  ").expect("trimmed IDNA host should parse"),
+            Host::Domain("xn--bcher-kva.example".to_string())
+        );
+        assert_eq!(
+            parse_explicit_local_endpoint_host("[2001:db8::1]").expect("bracketed IPv6 host should parse"),
+            Host::<String>::Ipv6("2001:db8::1".parse().expect("test IPv6 literal should parse"))
+        );
+        assert_eq!(
+            parse_explicit_local_endpoint_host("192.0.2.10").expect("IPv4 host should parse"),
+            Host::<String>::Ipv4("192.0.2.10".parse().expect("test IPv4 literal should parse"))
+        );
+
+        for invalid in [
+            "",
+            ".",
+            "example.com..",
+            "example.com%2e%2e",
+            "http://example.com",
+            "example.com:9000",
+            "example.com/path",
+            "*",
+            "*.example.com",
+            "%2A.example.com",
+            "0.0.0.0",
+            "[::]",
+            "[::ffff:0.0.0.0]",
+        ] {
+            assert!(
+                parse_explicit_local_endpoint_host(invalid).is_err(),
+                "{invalid:?} must not be accepted as a host-only anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_url_port_distinguishes_omitted_and_scheme_default_ports() {
+        assert_eq!(explicit_url_port("http://rustfs-0.example/data").unwrap(), None);
+        assert_eq!(explicit_url_port("http://rustfs-0.example:80/data").unwrap(), Some(80));
+        assert_eq!(explicit_url_port("https://[2001:db8::1]:443/data").unwrap(), Some(443));
+
+        for invalid in [
+            r"http://rustfs-0.example:80\data",
+            r"http:\\rustfs-0.example:80\data",
+            r"http:/\rustfs-0.example:80\data",
+            "http://rustfs-0.example:\t80/data",
+            "https://[2001:db8::1]:\n443/data",
+            "http://rustfs-0.example:80 ",
+        ] {
+            assert!(explicit_url_port(invalid).is_err(), "{invalid:?} must not bypass raw-port validation");
+        }
+    }
+
+    #[test]
+    fn endpoint_parse_errors_do_not_echo_url_credentials() {
+        let err = Endpoints::try_from(["http://:topsecret@server/path"].as_slice()).unwrap_err();
+
+        assert_eq!(err.to_string(), "invalid URL endpoint format");
+        assert!(!err.to_string().contains("topsecret"));
+    }
+
+    #[tokio::test]
+    async fn explicit_local_endpoint_host_selects_only_exact_host_and_server_port() {
+        let args = vec![
+            "http://rustfs-0.rustfs-headless.ns.svc.cluster.local/data0",
+            "http://rustfs-0.rustfs-headless.ns.svc.cluster.local.:9443/data1",
+            "http://rustfs-0.rustfs-headless.ns.svc.cluster.local:9001/data2",
+            "http://localhost:9443/data3",
+        ];
+        let layout = DisksLayout::from_volumes(args.as_slice()).expect("distributed test topology should parse");
+        let orchestrated = orchestrated_test_policy();
+
+        let (server_pools, setup_type) = EndpointServerPools::create_server_endpoints_with(
+            "0.0.0.0:9443",
+            &layout,
+            Some(orchestrated),
+            Some("RUSTFS-0.RUSTFS-HEADLESS.NS.SVC.CLUSTER.LOCAL."),
+        )
+        .await
+        .expect("equivalent FQDN spellings should form one local peer identity");
+        let local_flags = local_flags(&server_pools.0[0].endpoints);
+
+        assert_eq!(local_flags, vec![true, true, false, false]);
+        assert_eq!(setup_type, SetupType::DistErasure);
+        assert_eq!(
+            server_pools.0[0].endpoints.as_ref()[1].url.host_str(),
+            Some("rustfs-0.rustfs-headless.ns.svc.cluster.local")
+        );
+
+        let slots = server_pools.peer_grid_host_slots_sorted();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots.iter().filter(|(_, _, is_local)| *is_local).count(), 1);
+        assert!(
+            slots.iter().all(|(_, grid_host, is_local)| *is_local || grid_host.is_some()),
+            "canonical host aliases must not create a remote slot without a grid URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ip_endpoint_host_selects_only_the_matching_address() {
+        let orchestrated = orchestrated_test_policy();
+
+        for (endpoints, anchor) in [
+            (
+                [
+                    "http://192.0.2.10:9443/data0",
+                    "http://192.0.2.11:9443/data1",
+                    "http://192.0.2.12:9443/data2",
+                    "http://192.0.2.13:9443/data3",
+                ],
+                "192.0.2.10",
+            ),
+            (
+                [
+                    "http://[2001:db8::1]:9443/data0",
+                    "http://[2001:db8::2]:9443/data1",
+                    "http://[2001:db8::3]:9443/data2",
+                    "http://[2001:db8::4]:9443/data3",
+                ],
+                "[2001:db8::1]",
+            ),
+        ] {
+            let layout = DisksLayout::from_volumes(endpoints.as_slice()).expect("distributed IP topology should parse");
+            let resolved =
+                PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9443", &layout, Some(orchestrated), Some(anchor))
+                    .await
+                    .expect("explicit IP anchor should select its exact endpoint");
+            let local_flags = local_flags(&resolved.inner[0]);
+
+            assert_eq!(local_flags, vec![true, false, false, false]);
+        }
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn create_server_endpoints_reads_explicit_local_host_from_environment() {
+        assert_eq!(ENV_LOCAL_ENDPOINT_HOST, "RUSTFS_LOCAL_ENDPOINT_HOST");
+        async_with_vars(
+            [
+                ("RUSTFS_LOCAL_ENDPOINT_HOST", Some("rustfs-0.rustfs-headless.ns.svc.cluster.local")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("orchestrated")),
+            ],
+            async {
+                let endpoints = vec![
+                    "http://rustfs-0.rustfs-headless.ns.svc.cluster.local:9000/data0".to_string(),
+                    "http://localhost:9000/data1".to_string(),
+                    "http://missing-1.invalid:9000/data2".to_string(),
+                    "http://missing-2.invalid:9000/data3".to_string(),
+                ];
+
+                let (pools, setup_type) = EndpointServerPools::from_volumes("0.0.0.0:9000", endpoints)
+                    .await
+                    .expect("production endpoint entry should consume the explicit host environment");
+                let local_flags = local_flags(&pools.0[0].endpoints);
+
+                assert_eq!(local_flags, vec![true, false, false, false]);
+                assert_eq!(setup_type, SetupType::DistErasure);
+            },
+        )
+        .await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn create_server_endpoints_rejects_an_unknown_wait_mode() {
+        async_with_vars(
+            [
+                ("RUSTFS_LOCAL_ENDPOINT_HOST", Some("rustfs-0.example")),
+                (ENV_STARTUP_TOPOLOGY_WAIT_MODE, Some("boudned")),
+            ],
+            async {
+                let err = EndpointServerPools::from_volumes(
+                    "0.0.0.0:9000",
+                    vec![
+                        "http://rustfs-0.example:9000/data0".to_string(),
+                        "http://rustfs-1.example:9000/data1".to_string(),
+                    ],
+                )
+                .await
+                .unwrap_err();
+
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.to_string().contains(ENV_STARTUP_TOPOLOGY_WAIT_MODE));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_local_endpoint_host_matches_the_local_pool_in_multi_pool_topology() {
+        let layout = DisksLayout::from_volumes(
+            [
+                "http://rustfs-{0...1}.rustfs-headless.ns.svc.cluster.local:9000/data",
+                "http://rustfs-pool1-{0...1}.rustfs-headless.ns.svc.cluster.local:9000/data",
+            ]
+            .as_slice(),
+        )
+        .expect("multi-pool distributed topology should parse");
+        let orchestrated = orchestrated_test_policy();
+
+        let resolved = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &layout,
+            Some(orchestrated),
+            Some("rustfs-pool1-0.rustfs-headless.ns.svc.cluster.local"),
+        )
+        .await
+        .expect("multi-pool explicit host should select its local pool");
+        let local_endpoints = resolved
+            .inner
+            .iter()
+            .flat_map(|endpoints| endpoints.as_ref())
+            .filter(|endpoint| endpoint.is_local)
+            .collect::<Vec<_>>();
+
+        assert_eq!(local_endpoints.len(), 1);
+        assert_eq!(
+            local_endpoints[0].url.host_str(),
+            Some("rustfs-pool1-0.rustfs-headless.ns.svc.cluster.local")
+        );
+        assert_eq!(local_endpoints[0].pool_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_local_endpoint_host_fails_closed_for_invalid_context_or_zero_match() {
+        let args = vec![
+            "http://192.0.2.10:9000/data0",
+            "http://192.0.2.11:9000/data1",
+            "http://192.0.2.12:9000/data2",
+            "http://192.0.2.13:9000/data3",
+        ];
+        let layout = DisksLayout::from_volumes(args.as_slice()).expect("distributed test topology should parse");
+        let orchestrated = orchestrated_test_policy();
+        let bounded = bounded_test_policy();
+
+        let single_drive_layout =
+            DisksLayout::from_volumes(["/data"].as_slice()).expect("single-drive test topology should parse");
+        let single_drive = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &single_drive_layout,
+            Some(orchestrated),
+            Some("rustfs-0.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            single_drive
+                .to_string()
+                .contains("only supported for distributed URL endpoints in orchestrated mode")
+        );
+
+        let zero_match = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &layout,
+            Some(orchestrated),
+            Some("rustfs-0.rustfs-headless.ns.svc.cluster.local"),
+        )
+        .await
+        .unwrap_err();
+        assert!(zero_match.to_string().contains("does not match any distributed endpoint"));
+
+        for invalid_host in ["rustfs-0.example..", "rustfs-0.example%2e%2e"] {
+            let invalid_layout = DisksLayout::from_volumes(
+                [
+                    format!("http://{invalid_host}:9000/data0"),
+                    "http://rustfs-1.example:9000/data1".to_string(),
+                ]
+                .as_slice(),
+            )
+            .expect("noncanonical hostname reaches explicit identity validation");
+            let err = PoolEndpointList::create_pool_endpoints_with(
+                "0.0.0.0:9000",
+                &invalid_layout,
+                Some(orchestrated),
+                Some("rustfs-0.example"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        for aliases in [
+            ["http://remote.example:9000/data", "http://remote.example.:9000/data"],
+            ["http://remote.example/data", "http://remote.example:9000/data"],
+        ] {
+            let alias_layout =
+                DisksLayout::from_volumes([aliases[0], aliases[1], "http://rustfs-0.example:9000/local-data"].as_slice())
+                    .expect("raw endpoint aliases are distinct before explicit identity normalization");
+            let err = PoolEndpointList::create_pool_endpoints_with(
+                "0.0.0.0:9000",
+                &alias_layout,
+                Some(orchestrated),
+                Some("rustfs-0.example"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("duplicate distributed endpoint"),
+                "canonical endpoint aliases must not occupy multiple erasure slots: {err}"
+            );
+        }
+
+        for (scheme, scheme_port, mismatched_local_port) in [("http", 80, 9000), ("https", 443, 9443)] {
+            let default_port_endpoints = (0..4)
+                .map(|index| format!("{scheme}://127.0.0.{}:{scheme_port}/data{index}", index + 1))
+                .collect::<Vec<_>>();
+            let default_port_layout = DisksLayout::from_volumes(default_port_endpoints.as_slice())
+                .expect("default-port distributed topology should parse");
+
+            let mismatch = PoolEndpointList::create_pool_endpoints_with(
+                &format!("0.0.0.0:{mismatched_local_port}"),
+                &default_port_layout,
+                Some(orchestrated),
+                Some("127.0.0.1"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                mismatch.to_string().contains("does not match any distributed endpoint"),
+                "{scheme} default port must not be replaced by the local server port: {mismatch}"
+            );
+
+            let (server_pools, _) = EndpointServerPools::create_server_endpoints_with(
+                &format!("0.0.0.0:{scheme_port}"),
+                &default_port_layout,
+                Some(orchestrated),
+                Some("127.0.0.1"),
+            )
+            .await
+            .expect("matching scheme-default topology should build server pools");
+            assert!(server_pools.0[0].endpoints.as_ref()[0].is_local);
+            let slots = server_pools.peer_grid_host_slots_sorted();
+            let mut local_slots = 0;
+            for (peer, grid_host, is_local) in slots {
+                assert!(
+                    !peer.contains(':'),
+                    "{scheme} peer identity must preserve the legacy default-port spelling: {peer}"
+                );
+                if is_local {
+                    local_slots += 1;
+                    assert!(grid_host.is_none());
+                } else {
+                    assert!(grid_host.is_some());
+                }
+            }
+            assert_eq!(local_slots, 1, "{scheme} default port must retain exactly one local peer slot");
+        }
+
+        let noncanonical_layout =
+            DisksLayout::from_volumes([r"http://rustfs-0.example:80\data0", "http://rustfs-1.example:9000/data1"].as_slice())
+                .expect("noncanonical URL reaches endpoint validation");
+        let err = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &noncanonical_layout,
+            Some(orchestrated),
+            Some("rustfs-0.example"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let distinct_host_ports_layout = DisksLayout::from_volumes(
+            [
+                "http://rustfs-0.example:9000/data",
+                "http://rustfs-1.example:9001/data",
+                "http://rustfs-2.example:9000/data2",
+                "http://rustfs-3.example:9000/data3",
+            ]
+            .as_slice(),
+        )
+        .expect("distinct-host port topology should parse");
+        let distinct_host_ports = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &distinct_host_ports_layout,
+            Some(orchestrated),
+            Some("rustfs-0.example"),
+        )
+        .await
+        .expect("the same path on different hosts and ports must remain valid");
+        assert_eq!(distinct_host_ports.setup_type, SetupType::DistErasure);
+
+        let duplicate_path_layout = DisksLayout::from_volumes(
+            [
+                "http://rustfs-0.example:9000/data0",
+                "http://rustfs-1.example:9000/data1",
+                "http://rustfs-1.example:9001/data1",
+                "http://rustfs-2.example:9000/data2",
+            ]
+            .as_slice(),
+        )
+        .expect("distributed duplicate-path test topology should parse");
+        let duplicate_path = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &duplicate_path_layout,
+            Some(orchestrated),
+            Some("rustfs-0.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            duplicate_path
+                .to_string()
+                .contains("same path can not be served by different port on the same explicit endpoint host")
+        );
+
+        let cross_pool_duplicate_layout = DisksLayout::from_volumes(
+            [
+                "http://rustfs-{0...1}.example:9000/data",
+                "http://rustfs-{0...1}.example:9001/data",
+            ]
+            .as_slice(),
+        )
+        .expect("cross-pool duplicate-path topology should parse");
+        let cross_pool_duplicate = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &cross_pool_duplicate_layout,
+            Some(orchestrated),
+            Some("rustfs-0.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            cross_pool_duplicate
+                .to_string()
+                .contains("same path can not be served by different port on the same explicit endpoint host")
+        );
+
+        let non_orchestrated =
+            PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(bounded), Some("192.0.2.10"))
+                .await
+                .unwrap_err();
+        assert!(
+            non_orchestrated
+                .to_string()
+                .contains("only supported for distributed URL endpoints in orchestrated mode")
+        );
+
+        let mixed_layout = DisksLayout::from_volumes(["http://rustfs-{0...1}.example/data", "/data{0...1}"].as_slice())
+            .expect("mixed multi-pool test topology should parse");
+        let mixed = PoolEndpointList::create_pool_endpoints_with(
+            "0.0.0.0:9000",
+            &mixed_layout,
+            Some(orchestrated),
+            Some("rustfs-0.example"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            mixed
+                .to_string()
+                .contains("only supported for distributed URL endpoints in orchestrated mode")
+        );
     }
 
     #[tokio::test]
@@ -1720,7 +2429,7 @@ mod test {
             ),
             (
                 vec!["ftp://server/d1", "http://server/d2", "http://server/d3", "http://server/d4"],
-                Some(Error::other("'ftp://server/d1': io error invalid URL endpoint format")),
+                Some(Error::other("invalid URL endpoint format")),
                 10,
             ),
             (
@@ -1745,7 +2454,7 @@ mod test {
                     "192.168.1.210:9000/tmp/dir2",
                     "192.168.110:9000/tmp/dir3",
                 ],
-                Some(Error::other("'192.168.1.210:9000/tmp/dir0': io error")),
+                Some(Error::other("invalid URL endpoint format: missing scheme http or https")),
                 13,
             ),
         ];
@@ -2297,8 +3006,13 @@ mod test {
 
             match (
                 test_case.expected_err,
-                PoolEndpointList::create_pool_endpoints_with(test_case.server_addr, &disks_layout, Some(bounded_test_policy()))
-                    .await,
+                PoolEndpointList::create_pool_endpoints_with(
+                    test_case.server_addr,
+                    &disks_layout,
+                    Some(bounded_test_policy()),
+                    None,
+                )
+                .await,
             ) {
                 (None, Err(err)) => panic!("Test {}: error: expected = <nil>, got = {}", test_case.num, err),
                 (Some(err), Ok(_)) => panic!("Test {}: error: expected = {}, got = <nil>", test_case.num, err),
@@ -2367,6 +3081,14 @@ mod test {
         }
     }
 
+    fn orchestrated_test_policy() -> StartupTopologyPolicy {
+        StartupTopologyPolicy {
+            mode: StartupTopologyWaitMode::Orchestrated,
+            wait_timeout: Duration::MAX,
+            retry_max_delay: DNS_RETRY_MAX_DELAY,
+        }
+    }
+
     fn get_expected_endpoints(args: Vec<String>, prefix: String) -> (Vec<url::Url>, Vec<bool>) {
         let mut urls = vec![];
         let mut local_flags = vec![];
@@ -2415,7 +3137,8 @@ mod test {
             };
 
             let ret =
-                EndpointServerPools::create_server_endpoints_with(test_case.0, &disks_layout, Some(bounded_test_policy())).await;
+                EndpointServerPools::create_server_endpoints_with(test_case.0, &disks_layout, Some(bounded_test_policy()), None)
+                    .await;
 
             if let Err(err) = ret {
                 if test_case.2 {
