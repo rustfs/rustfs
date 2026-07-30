@@ -15,7 +15,7 @@
 //! Vault-based KMS backend implementation using vaultrs
 
 use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
-use crate::backends::{BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -1094,6 +1094,16 @@ impl KmsBackend for VaultKmsBackend {
 
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        // Rotation is unadvertised: the KV2 backend cannot rotate without
+        // replacing key material in place, and no historical versions are
+        // retained, so versioning is unsupported as well.
+        BackendCapabilities::minimal()
+            .with_enable_disable(true)
+            .with_schedule_deletion(true)
+            .with_physical_delete(true)
     }
 }
 

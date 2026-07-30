@@ -128,6 +128,10 @@ pub enum KmsError {
     /// Backup/restore bundle contract violation; see [`crate::backup::BackupError`]
     #[error(transparent)]
     Backup(#[from] crate::backup::BackupError),
+
+    /// Operation is not supported by the active KMS backend
+    #[error("Operation '{operation}' is not supported by KMS backend '{backend}'")]
+    UnsupportedCapability { backend: String, operation: String },
 }
 
 impl KmsError {
@@ -267,6 +271,14 @@ impl KmsError {
         Self::KeyVersionNotFound {
             key_id: key_id.into(),
             version,
+        }
+    }
+
+    /// Create an unsupported capability error
+    pub fn unsupported_capability<S1: Into<String>, S2: Into<String>>(backend: S1, operation: S2) -> Self {
+        Self::UnsupportedCapability {
+            backend: backend.into(),
+            operation: operation.into(),
         }
     }
 }

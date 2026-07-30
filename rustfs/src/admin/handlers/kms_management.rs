@@ -72,6 +72,10 @@ pub struct KmsStatusResponse {
     pub cache_enabled: bool,
     pub cache_stats: Option<CacheStatsResponse>,
     pub default_key_id: Option<String>,
+    /// Capability matrix of the active backend. Additive field: omitted by
+    /// older servers, so it must stay optional for consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<rustfs_kms::backends::BackendCapabilities>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -204,6 +208,7 @@ impl Operation for KmsStatusHandler {
             cache_enabled: config.as_ref().is_some_and(|cfg| cfg.enable_cache),
             cache_stats,
             default_key_id: service.get_default_key_id().cloned(),
+            capabilities: Some(service.backend_capabilities()),
         };
 
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -338,5 +343,35 @@ mod tests {
     #[test]
     fn kms_clear_cache_rejects_server_info_fallback() {
         assert_lacks_action(&kms_clear_cache_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
+    }
+
+    /// The `capabilities` field is additive: payloads produced by older
+    /// servers (without the field) must keep deserializing, and the field
+    /// must be omitted from JSON when unset so existing consumers see an
+    /// unchanged response shape.
+    #[test]
+    fn kms_status_response_capabilities_field_is_additive() {
+        let legacy_json = serde_json::json!({
+            "backend_type": "local",
+            "backend_status": "healthy",
+            "cache_enabled": true,
+            "cache_stats": null,
+            "default_key_id": null,
+        });
+        let legacy: super::KmsStatusResponse =
+            serde_json::from_value(legacy_json).expect("legacy status payload should deserialize");
+        assert!(legacy.capabilities.is_none());
+
+        let serialized = serde_json::to_value(&legacy).expect("status response should serialize");
+        assert!(serialized.get("capabilities").is_none(), "unset capabilities must be omitted");
+
+        let with_capabilities = super::KmsStatusResponse {
+            capabilities: Some(rustfs_kms::backends::BackendCapabilities::minimal()),
+            ..legacy
+        };
+        let serialized = serde_json::to_value(&with_capabilities).expect("status response should serialize");
+        let capabilities = serialized.get("capabilities").expect("capabilities must be present when set");
+        assert_eq!(capabilities.get("encrypt"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(capabilities.get("rotate"), Some(&serde_json::Value::Bool(false)));
     }
 }
