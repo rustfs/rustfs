@@ -6,12 +6,12 @@ based on the confidentiality boundary you need, not on the name alone.
 
 ## Backend comparison
 
-| Backend | Config tag | Master key material location | At-rest protection of key material | Rotation | Intended use |
-| --- | --- | --- | --- | --- | --- |
-| Local | `Local` | Files under `key_dir`, encrypted with the configured local master key | Local master key (AES-GCM) + file permissions | Rejected (no versioned retention yet) | Development; single-node setups that accept host-level trust |
-| Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | Rejected (read-only backend) | Simple deployments with an external secret manager |
-| Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Rejected (no versioned retention yet) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
-| Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
+| Backend | Config tag | Master key material location | At-rest protection of key material | Durability | Rotation | Intended use |
+| --- | --- | --- | --- | --- | --- | --- |
+| Local | `Local` | Files under `key_dir`, encrypted with the configured local master key | Local master key (AES-GCM) + file permissions | Crash-durable commits on local filesystems only; see [Local backend durability and deployment support matrix](#local-backend-durability-and-deployment-support-matrix) | Rejected (no versioned retention yet) | Development; single-node setups that accept host-level trust |
+| Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | No state persisted by RustFS | Rejected (read-only backend) | Simple deployments with an external secret manager |
+| Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Rejected (no versioned retention yet) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
+| Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
 
 ## Vault KV2: what the backend does and does not do
 
@@ -76,3 +76,82 @@ ciphertext, and supports server-side key versioning/rotation.
 Use **Vault KV2** only when you accept that the Vault ACL on the key path *is*
 the confidentiality boundary and you want the operational simplicity of a
 single KV mount.
+
+## Local backend durability and deployment support matrix
+
+The Local backend stores one JSON record per key (`<key_id>.key`) plus an
+Argon2id salt file (`.master-key.salt`) inside the configured `key_dir`. This
+section documents which deployments that layout supports and how the backend
+recovers from a crash or power loss. For where the key material lives and who
+can read it, see the [backend comparison](#backend-comparison) above.
+
+### Positioning
+
+The facts today:
+
+- `Local` is the current default backend (`kms_backend` defaults to `local`).
+- The RustFS Kubernetes operator places the key directory on a
+  PersistentVolumeClaim, so the keys survive pod rescheduling.
+- The in-code documentation labels the backend "for development and testing
+  only", and configuration validation enforces stricter rules outside explicit
+  development mode: a master key is required and `key_dir` must not live under
+  the process temp directory.
+- Production multi-node deployments should use the Vault Transit backend.
+
+The backend's final support level is positioning under review (internal
+tracking); this section describes what the implementation guarantees, not a
+commitment to a support tier.
+
+### Deployment support matrix
+
+| Deployment | Supported | Notes |
+| --- | --- | --- |
+| Local filesystem (ext4, XFS, APFS, ...) | Yes | The commit protocol relies on POSIX `rename`/`hard_link` atomicity and `fsync` durability, which local filesystems provide |
+| Kubernetes PVC | Yes | Only when the PersistentVolume is backed by a local or block filesystem; this is how the RustFS operator provisions the key directory |
+| NFS or other shared/network filesystems | No | Network filesystems do not reliably provide the atomicity and fsync semantics the commit protocol depends on; an NFS-backed PersistentVolume is this case, not the PVC case above |
+| Multiple RustFS processes sharing one `key_dir` | No | Concurrent key **creation** is linearized (`hard_link` refuses to clobber an existing key), but every other write — status updates, deletion, cancellation — is a read-modify-write with no cross-process lock, so concurrent writers can silently lose updates |
+
+Within a single process, per-key write locks serialize read-modify-write
+updates, so concurrent API calls against one RustFS instance are safe.
+
+### Crash recovery behavior
+
+Every mutation of the key directory uses a durable commit protocol:
+
+1. A temp file (`<name>.tmp-<uuid>`) is created exclusively in `key_dir`.
+2. The content is written and fsynced (`sync_all`).
+3. The file is published atomically: `rename` to replace an existing file,
+   `hard_link` to create a new one without clobbering.
+4. The parent directory is fsynced so the new directory entry is durable.
+
+Deletion mirrors the tail of the protocol (`remove_file` followed by a parent
+directory fsync), so a deleted key cannot resurface after power loss. A crash
+at any step leaves either the complete old state or the complete new state,
+plus at most an unpublished temp file.
+
+On startup the backend then:
+
+- **Removes orphaned commit temp files.** The matcher is strict
+  (`<prefix>.tmp-<uuid>`, never anything ending in `.key`), so published key
+  files — including a key the user named to look like a temp file — are never
+  touched. Publishing is atomic, so a matching leftover can only be an
+  unpublished remnant of an interrupted commit.
+- **Validates every published `.key` file.** A record that fails to decode
+  fails startup rather than being silently skipped.
+- **Guards the salt file.** If `.master-key.salt` is missing but the directory
+  contains keys marked `encrypted-master-key`, initialization fails closed
+  with a configuration error naming the salt path. A regenerated salt derives
+  a different master key and can never decrypt those keys, so the correct
+  recovery is to **restore the salt file (or the whole directory) from
+  backup**, never to let a fresh salt be generated. An empty directory, or a
+  legacy directory predating the salt file, still initializes normally.
+
+### Backing up the key directory
+
+Back up `key_dir` as a whole, including the hidden `.master-key.salt` file. A
+key file on its own is not restorable: decrypting it requires the master key
+derived from the configured `master_key` **and** the persisted salt. Restoring
+a partial directory — key files without the salt, or the salt without the key
+files — leaves the backend unable to decrypt, and the salt guard above will
+(correctly) refuse to start with encrypted keys and no salt. Losing the salt
+file with no backup means every key encrypted under it is unrecoverable.
