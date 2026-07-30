@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-filemeta/latest/rustfs_filemeta/"
 default = []
 hotpath = ["hotpath/hotpath", "hotpath/tokio"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath/hotpath-cpu"]
 
 [dependencies]
 hotpath.workspace = true

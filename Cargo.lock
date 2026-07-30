@@ -4920,6 +4920,7 @@ dependencies = [
  "async-trait",
  "cfg-if",
  "crossbeam-channel",
+ "flate2",
  "futures-channel",
  "futures-util",
  "hdrhistogram",
@@ -4927,6 +4928,7 @@ dependencies = [
  "hotpath-meta",
  "http 1.5.0",
  "libc",
+ "object 0.36.7",
  "parking_lot",
  "pin-project-lite",
  "prettytable-rs",
@@ -4934,6 +4936,7 @@ dependencies = [
  "regex",
  "reqwest",
  "reqwest-middleware",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "tiny_http",
@@ -6805,6 +6808,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
 dependencies = [
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -9716,6 +9728,7 @@ dependencies = [
  "base64-simd",
  "chrono",
  "futures",
+ "hotpath",
  "ipnetwork",
  "jsonwebtoken 11.0.0",
  "moka",

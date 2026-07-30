@@ -62,13 +62,22 @@ hotpath = [
     "hotpath/reqwest-0-13",
     "rustfs-ecstore/hotpath",
     "rustfs-filemeta/hotpath",
+    "rustfs-policy/hotpath",
     "rustfs-rio/hotpath",
 ]
 hotpath-alloc = [
     "hotpath/hotpath-alloc",
     "rustfs-ecstore/hotpath-alloc",
     "rustfs-filemeta/hotpath-alloc",
+    "rustfs-policy/hotpath-alloc",
     "rustfs-rio/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-filemeta/hotpath-cpu",
+    "rustfs-policy/hotpath-cpu",
+    "rustfs-rio/hotpath-cpu",
 ]
 
 [lints]
