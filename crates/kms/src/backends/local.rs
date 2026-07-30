@@ -658,7 +658,20 @@ impl LocalKmsClient {
         }
 
         let content = fs::read(&key_path).await?;
-        let stored_key: StoredMasterKey = serde_json::from_slice(&content)?;
+
+        // Two-stage parse so an unrecognised protection marker is reported as an
+        // unsupported format (a newer build may still read the key) instead of being
+        // folded into generic corruption with every other malformed record.
+        let raw: serde_json::Value = serde_json::from_slice(&content)
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not valid JSON: {e}")))?;
+        if let Some(marker) = raw.get("at_rest_protection")
+            && serde_json::from_value::<StoredKeyProtection>(marker.clone()).is_err()
+        {
+            let version = marker.as_str().map(str::to_owned).unwrap_or_else(|| marker.to_string());
+            return Err(KmsError::unsupported_format_version(key_id, version));
+        }
+        let stored_key: StoredMasterKey = serde_json::from_value(raw)
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record does not deserialize: {e}")))?;
         if stored_key.key_id != key_id {
             return Err(KmsError::invalid_key(format!(
                 "Local KMS key file identity mismatch: expected {key_id:?}, found {:?}",
@@ -666,9 +679,15 @@ impl LocalKmsClient {
             )));
         }
 
+        // An empty material field is a damaged record, whatever the protection marker
+        // says. Fail closed: reads must never backfill or regenerate master key material.
+        if stored_key.encrypted_key_material.is_empty() {
+            return Err(KmsError::material_missing(key_id));
+        }
+
         let encrypted_bytes = BASE64
             .decode(&stored_key.encrypted_key_material)
-            .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?;
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key material is not valid base64: {e}")))?;
 
         let effective_protection = if stored_key.at_rest_protection == StoredKeyProtection::LegacyUnspecified {
             if stored_key.nonce.is_empty() {
@@ -692,7 +711,10 @@ impl LocalKmsClient {
                     ))
                 })?;
                 if stored_key.nonce.len() != 12 {
-                    return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+                    return Err(KmsError::material_corrupt(
+                        key_id,
+                        format!("stored nonce has invalid length ({} bytes, expected 12)", stored_key.nonce.len()),
+                    ));
                 }
 
                 let mut nonce_array = [0u8; 12];
@@ -701,7 +723,7 @@ impl LocalKmsClient {
 
                 match cipher.decrypt(&nonce, encrypted_bytes.as_ref()) {
                     Ok(key_material) => key_material,
-                    Err(current_error) if stored_key.at_rest_protection == StoredKeyProtection::LegacyUnspecified => {
+                    Err(_) if stored_key.at_rest_protection == StoredKeyProtection::LegacyUnspecified => {
                         let legacy_cipher = self.legacy_master_cipher.as_ref().ok_or_else(|| {
                             KmsError::configuration_error(format!(
                                 "Local KMS key {key_id} is encrypted at rest and requires a configured master key"
@@ -709,9 +731,9 @@ impl LocalKmsClient {
                         })?;
                         legacy_cipher
                             .decrypt(&nonce, encrypted_bytes.as_ref())
-                            .map_err(|_| KmsError::cryptographic_error("decrypt", current_error.to_string()))?
+                            .map_err(|_| KmsError::material_authentication_failed(key_id))?
                     }
-                    Err(error) => return Err(KmsError::cryptographic_error("decrypt", error.to_string())),
+                    Err(_) => return Err(KmsError::material_authentication_failed(key_id)),
                 }
             }
             StoredKeyProtection::PlaintextDevOnly | StoredKeyProtection::LegacyUnspecified => {
@@ -1597,6 +1619,124 @@ mod tests {
         assert_eq!(decrypted, plaintext, "master key material must survive status transitions");
     }
 
+    /// Snapshot every file in the key directory as (name, content SHA-256, mtime).
+    /// Comparing snapshots proves the read paths performed no persistent write at all —
+    /// no rewrite, no "repair", no temp-file leftovers.
+    async fn snapshot_key_dir(dir: &std::path::Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+        let mut entries = fs::read_dir(dir).await.expect("read key dir");
+        let mut snapshot = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("next key dir entry") {
+            let content = fs::read(entry.path()).await.expect("read key dir file");
+            let modified = entry
+                .metadata()
+                .await
+                .expect("key dir file metadata")
+                .modified()
+                .expect("key dir file mtime");
+            snapshot.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                Sha256::digest(&content).to_vec(),
+                modified,
+            ));
+        }
+        snapshot.sort();
+        snapshot
+    }
+
+    /// Poison matrix guard: every corruption class must surface its precise typed error
+    /// from every read path (get_key_material / describe_key / decrypt), and the key
+    /// directory must stay byte-for-byte identical. Restoring any historical "self-heal"
+    /// behaviour (regenerating or rewriting material on a failed read) flips either the
+    /// error assertion (read succeeds) or the snapshot assertion (directory changed).
+    #[tokio::test]
+    async fn read_paths_fail_closed_never_write_on_poisoned_key_files() {
+        let (client, temp_dir) = create_test_client().await;
+        let key_id = "poisoned-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+
+        // Wrap a DEK while the key is healthy so the decrypt path can be exercised
+        // against each poisoned state of its master key.
+        let request = GenerateKeyRequest::new(key_id.to_string(), "AES_256".to_string());
+        let data_key = client.generate_data_key(&request, None).await.expect("generate data key");
+        let envelope_ciphertext = data_key.ciphertext.clone();
+
+        let key_path = client.master_key_path(key_id).expect("valid key id");
+        let pristine: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read pristine key file")).expect("decode pristine record");
+        let pristine_bytes = serde_json::to_vec_pretty(&pristine).expect("encode pristine record");
+
+        let with_field = |field: &str, value: serde_json::Value| {
+            let mut record = pristine.clone();
+            record[field] = value;
+            serde_json::to_vec_pretty(&record).expect("encode poisoned record")
+        };
+
+        let tampered_material = {
+            let mut material = BASE64
+                .decode(pristine["encrypted_key_material"].as_str().expect("material is a string"))
+                .expect("decode pristine material");
+            *material.last_mut().expect("material is not empty") ^= 0x01;
+            BASE64.encode(&material)
+        };
+
+        type PoisonCase = (&'static str, Vec<u8>, fn(&KmsError) -> bool);
+        let poisons: Vec<PoisonCase> = vec![
+            ("empty material", with_field("encrypted_key_material", serde_json::json!("")), |e| {
+                matches!(e, KmsError::MaterialMissing { .. })
+            }),
+            ("truncated JSON", pristine_bytes[..pristine_bytes.len() / 2].to_vec(), |e| {
+                matches!(e, KmsError::MaterialCorrupt { .. })
+            }),
+            (
+                "invalid base64",
+                with_field("encrypted_key_material", serde_json::json!("!!!not-base64!!!")),
+                |e| matches!(e, KmsError::MaterialCorrupt { .. }),
+            ),
+            ("wrong nonce length", with_field("nonce", serde_json::json!([0, 1, 2])), |e| {
+                matches!(e, KmsError::MaterialCorrupt { .. })
+            }),
+            (
+                "tampered AEAD",
+                with_field("encrypted_key_material", serde_json::json!(tampered_material)),
+                |e| matches!(e, KmsError::MaterialAuthenticationFailed { .. }),
+            ),
+            (
+                "unknown protection marker",
+                with_field("at_rest_protection", serde_json::json!("post-quantum-v2")),
+                |e| matches!(e, KmsError::UnsupportedFormatVersion { version, .. } if version == "post-quantum-v2"),
+            ),
+        ];
+
+        for (name, poisoned_content, expected) in poisons {
+            fs::write(&key_path, &poisoned_content).await.expect("write poisoned record");
+            let before = snapshot_key_dir(temp_dir.path()).await;
+
+            let error = client
+                .get_key_material(key_id)
+                .await
+                .expect_err("get_key_material must fail on poisoned material");
+            assert!(expected(&error), "{name}: get_key_material returned wrong variant: {error:?}");
+
+            let error = client
+                .describe_key(key_id, None)
+                .await
+                .expect_err("describe_key must fail on poisoned material");
+            assert!(expected(&error), "{name}: describe_key returned wrong variant: {error:?}");
+
+            let error = client
+                .decrypt(&DecryptRequest::new(envelope_ciphertext.clone()), None)
+                .await
+                .expect_err("decrypt must fail on poisoned material");
+            assert!(expected(&error), "{name}: decrypt returned wrong variant: {error:?}");
+
+            assert_eq!(
+                snapshot_key_dir(temp_dir.path()).await,
+                before,
+                "{name}: read paths must not write to the key directory"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_encryption_operations() {
         let (client, _temp_dir) = create_test_client().await;
@@ -1651,7 +1791,7 @@ mod tests {
             Ok(_) => panic!("wrong master key must fail initialization"),
             Err(error) => error,
         };
-        assert!(matches!(wrong_master_error, KmsError::CryptographicError { .. }));
+        assert!(matches!(wrong_master_error, KmsError::MaterialAuthenticationFailed { .. }));
     }
 
     #[tokio::test]
@@ -1906,7 +2046,7 @@ mod tests {
             .get_key_material("beta5-explicit-key")
             .await
             .expect_err("explicit current protection must not fall back to the beta.5 KDF");
-        assert!(matches!(explicit_error, KmsError::CryptographicError { .. }));
+        assert!(matches!(explicit_error, KmsError::MaterialAuthenticationFailed { .. }));
 
         let wrong_key_error = match LocalKmsClient::new(LocalConfig {
             key_dir: temp_dir.path().to_path_buf(),
@@ -1918,7 +2058,7 @@ mod tests {
             Ok(_) => panic!("wrong beta.5 master key must fail initialization"),
             Err(error) => error,
         };
-        assert!(matches!(wrong_key_error, KmsError::CryptographicError { .. }));
+        assert!(matches!(wrong_key_error, KmsError::MaterialAuthenticationFailed { .. }));
     }
 
     /// R03-CAN-072 / R03-CAN-073: key identifiers arrive from request input, so every path
