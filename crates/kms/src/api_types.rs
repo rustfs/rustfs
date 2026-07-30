@@ -235,15 +235,55 @@ pub struct StartKmsRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 enum StrictVaultAuthMethod {
-    Token { token: String },
-    AppRole { role_id: String, secret_id: String },
+    Token {
+        token: String,
+    },
+    AppRole {
+        role_id: String,
+        #[serde(default)]
+        secret_id: String,
+        #[serde(default)]
+        secret_id_file: Option<std::path::PathBuf>,
+        #[serde(default)]
+        mount: Option<String>,
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
+    TokenFile {
+        path: std::path::PathBuf,
+        #[serde(default)]
+        poll_interval_secs: Option<u64>,
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
 }
 
 impl From<StrictVaultAuthMethod> for VaultAuthMethod {
     fn from(value: StrictVaultAuthMethod) -> Self {
         match value {
             StrictVaultAuthMethod::Token { token } => Self::Token { token },
-            StrictVaultAuthMethod::AppRole { role_id, secret_id } => Self::AppRole { role_id, secret_id },
+            StrictVaultAuthMethod::AppRole {
+                role_id,
+                secret_id,
+                secret_id_file,
+                mount,
+                refresh_safety_window_secs,
+            } => Self::AppRole {
+                role_id,
+                secret_id,
+                secret_id_file,
+                mount: mount.unwrap_or_else(|| crate::config::DEFAULT_VAULT_APPROLE_MOUNT.to_string()),
+                refresh_safety_window_secs,
+            },
+            StrictVaultAuthMethod::TokenFile {
+                path,
+                poll_interval_secs,
+                refresh_safety_window_secs,
+            } => Self::TokenFile {
+                path,
+                poll_interval_secs,
+                refresh_safety_window_secs,
+            },
         }
     }
 }
@@ -403,6 +443,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                    VaultAuthMethod::TokenFile { .. } => "token_file".to_string(),
                 },
                 has_stored_credentials: true,
                 namespace: vault_config.namespace.clone(),
@@ -416,6 +457,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                    VaultAuthMethod::TokenFile { .. } => "token_file".to_string(),
                 },
                 has_stored_credentials: true,
                 namespace: vault_config.namespace.clone(),
@@ -872,10 +914,7 @@ mod tests {
         });
         let approle = ConfigureKmsRequest::VaultKv2(ConfigureVaultKmsRequest {
             address: "https://vault.example.com:8200".to_string(),
-            auth_method: VaultAuthMethod::AppRole {
-                role_id: "configure-role-id".to_string(),
-                secret_id: "configure-approle-secret-id".to_string(),
-            },
+            auth_method: VaultAuthMethod::approle("configure-role-id".to_string(), "configure-approle-secret-id".to_string()),
             namespace: None,
             mount_path: Some("transit".to_string()),
             kv_mount: Some("secret".to_string()),

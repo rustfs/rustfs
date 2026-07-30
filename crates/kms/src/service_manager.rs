@@ -14,6 +14,7 @@
 
 //! KMS service manager for dynamic configuration and runtime management
 
+use crate::backends::vault_credentials::CredentialTaskHandle;
 use crate::backends::{KmsBackend, local::LocalKmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
 use crate::error::{KmsError, Result};
@@ -110,6 +111,10 @@ struct ServiceVersion {
     service: Arc<ObjectEncryptionService>,
     /// The KMS manager instance
     manager: Arc<KmsManager>,
+    /// Owner of the backend's credential renewal task, if the backend needs
+    /// one. Stop shuts it down explicitly; reconfigure recycles it through
+    /// the handle's cancel-on-drop behavior when the old version is discarded.
+    credential_task: Option<Arc<CredentialTaskHandle>>,
 }
 
 #[derive(Clone)]
@@ -331,6 +336,13 @@ impl KmsServiceManager {
             current_service: None,
         }));
 
+        // Shut down the stopped version's credential renewal task before
+        // reporting stopped, so stop deterministically recycles the background
+        // task even while in-flight operations still hold the old service Arc.
+        if let Some(task) = state.current_service.as_ref().and_then(|sv| sv.credential_task.clone()) {
+            task.shutdown().await;
+        }
+
         debug!(
             event = EVENT_KMS_SERVICE_STATE,
             component = LOG_COMPONENT_KMS,
@@ -488,7 +500,10 @@ impl KmsServiceManager {
 
         info!("Creating KMS service version {} with backend: {:?}", version, config.backend);
 
-        // Create backend
+        // Create backend. Vault backends may also spawn a background
+        // credential renewal task whose owner handle lives on the service
+        // version, so replacing the version recycles the task.
+        let mut credential_task = None;
         let backend = match &config.backend_config {
             BackendConfig::Local(_) => {
                 info!("Creating Local KMS backend for version {}", version);
@@ -498,11 +513,13 @@ impl KmsServiceManager {
             BackendConfig::VaultKv2(_) => {
                 info!("Creating Vault KV2 KMS backend for version {}", version);
                 let backend = crate::backends::vault::VaultKmsBackend::new(config.clone()).await?;
+                credential_task = backend.spawn_credential_renewal().map(Arc::new);
                 Arc::new(backend) as Arc<dyn KmsBackend>
             }
             BackendConfig::VaultTransit(_) => {
                 info!("Creating Vault Transit KMS backend for version {}", version);
                 let backend = crate::backends::vault_transit::VaultTransitKmsBackend::new(config.clone()).await?;
+                credential_task = backend.spawn_credential_renewal().map(Arc::new);
                 Arc::new(backend) as Arc<dyn KmsBackend>
             }
             BackendConfig::Static(_) => {
@@ -522,6 +539,7 @@ impl KmsServiceManager {
             version,
             service: encryption_service,
             manager: kms_manager,
+            credential_task,
         })
     }
 

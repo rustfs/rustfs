@@ -14,7 +14,10 @@
 
 //! Vault Transit-based KMS backend.
 
-use crate::backends::vault_credentials::{VaultClientHandle, VaultConnectionSettings, VaultCredentialProvider, token_source_for};
+use crate::backends::vault_credentials::{
+    CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
+    token_source_for,
+};
 use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
@@ -129,7 +132,7 @@ impl From<TransitKeyMetadataPersisted> for TransitKeyMetadata {
 }
 
 pub struct VaultTransitKmsClient {
-    credentials: VaultCredentialProvider,
+    credentials: Arc<VaultCredentialProvider>,
     config: VaultTransitConfig,
     /// KV v2 mount path for persisting transit key metadata
     metadata_kv_mount: String,
@@ -141,15 +144,18 @@ pub struct VaultTransitKmsClient {
 impl VaultTransitKmsClient {
     /// Create a new Vault Transit KMS client
     ///
-    /// `attempt_timeout` caps every HTTP request issued through this client.
-    pub async fn new(config: VaultTransitConfig, attempt_timeout: Duration) -> Result<Self> {
-        let source = token_source_for(&config.auth_method)?;
+    /// `kms_config` supplies the per-attempt timeout that caps every HTTP
+    /// request issued through this client, plus the retry and fail-closed
+    /// budgets for credential refresh.
+    pub async fn new(config: VaultTransitConfig, kms_config: &KmsConfig) -> Result<Self> {
         let settings = VaultConnectionSettings {
             address: config.address.clone(),
             namespace: config.namespace.clone(),
-            attempt_timeout,
+            attempt_timeout: kms_config.effective_timeout(),
         };
-        let credentials = VaultCredentialProvider::new(settings, source).await?;
+        let source = token_source_for(&config.auth_method, &settings)?;
+        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &config.auth_method);
+        let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
 
         Ok(Self {
             credentials,
@@ -163,8 +169,9 @@ impl VaultTransitKmsClient {
     /// Snapshot the authenticated Vault client for a single request.
     ///
     /// Every Vault call takes its own snapshot so a credential rotation
-    /// applies to subsequent calls without interrupting in-flight ones.
-    fn vault(&self) -> Arc<VaultClientHandle> {
+    /// applies to subsequent calls without interrupting in-flight ones. Fails
+    /// closed when the credentials could not be refreshed in time.
+    fn vault(&self) -> Result<Arc<VaultClientHandle>> {
         self.credentials.current()
     }
 
@@ -192,7 +199,7 @@ impl VaultTransitKmsClient {
     }
 
     async fn read_transit_key(&self, key_id: &str) -> Result<vaultrs::api::transit::responses::ReadKeyResponse> {
-        key::read(&self.vault().client, &self.config.mount_path, key_id)
+        key::read(&self.vault()?.client, &self.config.mount_path, key_id)
             .await
             .or_else(|e| Self::map_vault_error(key_id, e, "read"))
     }
@@ -200,7 +207,7 @@ impl VaultTransitKmsClient {
     async fn create_transit_key(&self, key_id: &str) -> Result<()> {
         let mut builder = CreateKeyRequestBuilder::default();
         builder.key_type(KeyType::Aes256Gcm96);
-        key::create(&self.vault().client, &self.config.mount_path, key_id, Some(&mut builder))
+        key::create(&self.vault()?.client, &self.config.mount_path, key_id, Some(&mut builder))
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to create Vault Transit key {key_id}: {e}")))
     }
@@ -217,7 +224,7 @@ impl VaultTransitKmsClient {
             builder.associated_data(aad);
         }
 
-        let response = data::encrypt(&self.vault().client, &self.config.mount_path, key_id, &plaintext_b64, Some(&mut builder))
+        let response = data::encrypt(&self.vault()?.client, &self.config.mount_path, key_id, &plaintext_b64, Some(&mut builder))
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to encrypt data with Vault Transit key {key_id}: {e}")))?;
 
@@ -235,7 +242,7 @@ impl VaultTransitKmsClient {
             builder.associated_data(aad);
         }
 
-        let response = data::decrypt(&self.vault().client, &self.config.mount_path, key_id, ciphertext, Some(&mut builder))
+        let response = data::decrypt(&self.vault()?.client, &self.config.mount_path, key_id, ciphertext, Some(&mut builder))
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data with Vault Transit key {key_id}: {e}")))?;
 
@@ -250,7 +257,7 @@ impl VaultTransitKmsClient {
 
     async fn read_metadata_from_kv(&self, key_id: &str) -> Result<Option<TransitKeyMetadata>> {
         let path = self.metadata_key_path(key_id);
-        match kv2::read::<TransitKeyMetadataPersisted>(&self.vault().client, &self.metadata_kv_mount, &path).await {
+        match kv2::read::<TransitKeyMetadataPersisted>(&self.vault()?.client, &self.metadata_kv_mount, &path).await {
             Ok(persisted) => Ok(Some(persisted.into())),
             Err(vaultrs::error::ClientError::ResponseWrapError)
             | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(None),
@@ -261,7 +268,7 @@ impl VaultTransitKmsClient {
     async fn write_metadata_to_kv(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<()> {
         let path = self.metadata_key_path(key_id);
         let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
-        kv2::set(&self.vault().client, &self.metadata_kv_mount, &path, &persisted)
+        kv2::set(&self.vault()?.client, &self.metadata_kv_mount, &path, &persisted)
             .await
             .map(|_| ())
             .map_err(|e| KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}")))
@@ -269,7 +276,7 @@ impl VaultTransitKmsClient {
 
     async fn delete_metadata_from_kv(&self, key_id: &str) -> Result<()> {
         let path = self.metadata_key_path(key_id);
-        match kv2::delete_metadata(&self.vault().client, &self.metadata_kv_mount, &path).await {
+        match kv2::delete_metadata(&self.vault()?.client, &self.metadata_kv_mount, &path).await {
             Ok(_) => Ok(()),
             Err(vaultrs::error::ClientError::ResponseWrapError)
             | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(()),
@@ -483,7 +490,7 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn list_keys(&self, request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
-        let all_keys = key::list(&self.vault().client, &self.config.mount_path)
+        let all_keys = key::list(&self.vault()?.client, &self.config.mount_path)
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}")))?
             .keys;
@@ -553,7 +560,7 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
-        key::rotate(&self.vault().client, &self.config.mount_path, key_id)
+        key::rotate(&self.vault()?.client, &self.config.mount_path, key_id)
             .await
             .map_err(|e| KmsError::backend_error(format!("Failed to rotate Vault Transit key {key_id}: {e}")))?;
 
@@ -576,7 +583,7 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn health_check(&self) -> Result<()> {
-        key::list(&self.vault().client, &self.config.mount_path)
+        key::list(&self.vault()?.client, &self.config.mount_path)
             .await
             .map(|_| ())
             .map_err(|e| KmsError::backend_error(format!("Vault Transit health check failed: {e}")))
@@ -612,8 +619,15 @@ impl VaultTransitKmsBackend {
             }
         };
 
-        let client = VaultTransitKmsClient::new(vault_config, config.effective_timeout()).await?;
+        let client = VaultTransitKmsClient::new(vault_config, &config).await?;
         Ok(Self { client })
+    }
+
+    /// Spawn the background credential renewal task for this backend, if its
+    /// auth method issues lease-bound tokens. The caller owns the returned
+    /// handle; dropping it cancels the task.
+    pub(crate) fn spawn_credential_renewal(&self) -> Option<CredentialTaskHandle> {
+        self.client.credentials.spawn_renewal_task()
     }
 }
 
@@ -698,7 +712,7 @@ impl KmsBackend for VaultTransitKmsBackend {
                     let mut update_builder = UpdateKeyConfigurationRequestBuilder::default();
                     update_builder.deletion_allowed(true);
                     key::update(
-                        &self.client.vault().client,
+                        &self.client.vault()?.client,
                         &self.client.config.mount_path,
                         &key_id,
                         Some(&mut update_builder),
@@ -708,7 +722,7 @@ impl KmsBackend for VaultTransitKmsBackend {
                         KmsError::backend_error(format!("Failed to allow deletion of Vault Transit key {key_id}: {e}"))
                     })?;
                 }
-                key::delete(&self.client.vault().client, &self.client.config.mount_path, &key_id)
+                key::delete(&self.client.vault()?.client, &self.client.config.mount_path, &key_id)
                     .await
                     .map_err(|e| KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}")))?;
                 self.client.delete_key_metadata(&key_id).await?;
@@ -810,7 +824,7 @@ mod tests {
         let config = test_vault_transit_config();
 
         // --- First "process": create a key and disable it ---
-        let client1 = VaultTransitKmsClient::new(config.clone(), Duration::from_secs(30))
+        let client1 = VaultTransitKmsClient::new(config.clone(), &KmsConfig::default())
             .await
             .expect("Failed to create VaultTransit client");
 
@@ -833,7 +847,7 @@ mod tests {
         assert_eq!(info_after_disable.status, KeyStatus::Disabled, "key must be Disabled after disable_key");
 
         // --- Simulate restart: create a brand new client with empty cache ---
-        let client2 = VaultTransitKmsClient::new(config, Duration::from_secs(30))
+        let client2 = VaultTransitKmsClient::new(config, &KmsConfig::default())
             .await
             .expect("Failed to create second VaultTransit client (restart simulation)");
 
@@ -863,7 +877,7 @@ mod tests {
     async fn test_transit_pending_deletion_survives_restart_simulation() {
         let config = test_vault_transit_config();
 
-        let client1 = VaultTransitKmsClient::new(config.clone(), Duration::from_secs(30))
+        let client1 = VaultTransitKmsClient::new(config.clone(), &KmsConfig::default())
             .await
             .expect("Failed to create VaultTransit client");
 
@@ -887,7 +901,7 @@ mod tests {
             "key must be PendingDeletion after schedule_key_deletion"
         );
 
-        let client2 = VaultTransitKmsClient::new(config, Duration::from_secs(30))
+        let client2 = VaultTransitKmsClient::new(config, &KmsConfig::default())
             .await
             .expect("Failed to create second VaultTransit client (restart simulation)");
 
@@ -929,7 +943,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires a running Vault instance with transit engine enabled
     async fn test_transit_old_ciphertext_decrypts_after_rotate() {
-        let client = VaultTransitKmsClient::new(test_vault_transit_config(), Duration::from_secs(30))
+        let client = VaultTransitKmsClient::new(test_vault_transit_config(), &KmsConfig::default())
             .await
             .expect("Failed to create VaultTransit client");
 

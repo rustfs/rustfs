@@ -132,6 +132,11 @@ pub enum KmsError {
     /// Operation is not supported by the active KMS backend
     #[error("Operation '{operation}' is not supported by KMS backend '{backend}'")]
     UnsupportedCapability { backend: String, operation: String },
+
+    /// Backend credentials expired or could not be refreshed in time; requests
+    /// fail closed instead of being sent with credentials that may lapse mid-flight
+    #[error("KMS credentials unavailable: {message}")]
+    CredentialsUnavailable { message: String },
 }
 
 impl KmsError {
@@ -280,6 +285,11 @@ impl KmsError {
             backend: backend.into(),
             operation: operation.into(),
         }
+    }
+
+    /// Create a credentials unavailable error
+    pub fn credentials_unavailable<S: Into<String>>(message: S) -> Self {
+        Self::CredentialsUnavailable { message: message.into() }
     }
 }
 
