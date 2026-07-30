@@ -68,10 +68,17 @@ struct VaultKeyData {
 
 impl VaultKmsClient {
     /// Create a new Vault KMS client
-    pub async fn new(config: VaultConfig) -> Result<Self> {
+    ///
+    /// `attempt_timeout` caps every HTTP request issued through this client.
+    pub async fn new(config: VaultConfig, attempt_timeout: Duration) -> Result<Self> {
         // Create client settings
         let mut settings_builder = VaultClientSettingsBuilder::default();
         settings_builder.address(&config.address);
+        // Defense in depth against stalled connections: vaultrs leaves the
+        // underlying reqwest client without any timeout by default, so a hung
+        // request would otherwise wait forever regardless of the
+        // operation-level retry policy.
+        settings_builder.timeout(Some(attempt_timeout));
 
         // Set authentication token based on method
         let token = match &config.auth_method {
@@ -607,7 +614,7 @@ impl VaultKmsBackend {
             }
         };
 
-        let client = VaultKmsClient::new(vault_config).await?;
+        let client = VaultKmsClient::new(vault_config, config.effective_timeout()).await?;
         Ok(Self { client })
     }
 
@@ -851,7 +858,9 @@ mod tests {
             tls: None,
         };
 
-        let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
+        let client = VaultKmsClient::new(config, Duration::from_secs(30))
+            .await
+            .expect("Failed to create Vault client");
 
         // Test key operations
         let key_id = "test-key-vault";
@@ -906,7 +915,9 @@ mod tests {
         // Regression: get_key_material previously "self-healed" a decrypt/length failure by
         // minting a fresh random master key and overwriting the stored value — destroying the
         // original key and making every DEK wrapped by it permanently undecryptable.
-        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+        let client = VaultKmsClient::new(integration_vault_config(), Duration::from_secs(30))
+            .await
+            .expect("client");
 
         let key_id = format!("corrupt-{}", uuid::Uuid::new_v4());
         client.create_key(&key_id, "AES_256", None).await.expect("create");
