@@ -907,4 +907,70 @@ mod tests {
             "after restart, a pending-deletion key must not be usable for new data keys"
         );
     }
+
+    /// Contract regression for rustfs/backlog#1565.
+    ///
+    /// Transit rotation is delegated entirely to Vault's own key versioning: the
+    /// ciphertext self-describes the wrapping version ("vault:vN:..."), so historical
+    /// ciphertext must keep decrypting after rotation without any RustFS-side
+    /// version bookkeeping in the envelope.
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance with transit engine enabled
+    async fn test_transit_old_ciphertext_decrypts_after_rotate() {
+        let client = VaultTransitKmsClient::new(test_vault_transit_config(), Duration::from_secs(30))
+            .await
+            .expect("Failed to create VaultTransit client");
+
+        let key_id = format!("regression-1565-rotate-{}", uuid::Uuid::new_v4());
+        client.create_key(&key_id, "AES_256", None).await.expect("create_key");
+
+        let request = GenerateKeyRequest {
+            master_key_id: key_id.clone(),
+            key_spec: "AES_256".to_string(),
+            key_length: Some(32),
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+
+        let dk_v1 = client.generate_data_key(&request, None).await.expect("generate under v1");
+        let env_v1: DataKeyEnvelope = serde_json::from_slice(&dk_v1.ciphertext).expect("parse v1 envelope");
+        assert!(
+            env_v1.encrypted_key.starts_with(b"vault:v1:"),
+            "first-version Transit ciphertext must carry the vault:v1: prefix"
+        );
+        assert_eq!(
+            env_v1.master_key_version, None,
+            "Transit envelopes must not carry a RustFS-side master key version"
+        );
+
+        let rotated = client.rotate_key(&key_id, None).await.expect("rotate_key");
+        assert_eq!(rotated.version, 2, "rotation must advance the Transit key version");
+
+        let dk_v2 = client.generate_data_key(&request, None).await.expect("generate under v2");
+        let env_v2: DataKeyEnvelope = serde_json::from_slice(&dk_v2.ciphertext).expect("parse v2 envelope");
+        assert!(
+            env_v2.encrypted_key.starts_with(b"vault:v2:"),
+            "post-rotation Transit ciphertext must carry the vault:v2: prefix"
+        );
+
+        // Historical ciphertext keeps decrypting per Vault's version semantics,
+        // interleaved with post-rotation ciphertext.
+        for (data_key, label) in [(&dk_v1, "v1"), (&dk_v2, "v2"), (&dk_v1, "v1 again")] {
+            let plaintext = client
+                .decrypt(
+                    &DecryptRequest {
+                        ciphertext: data_key.ciphertext.clone(),
+                        encryption_context: HashMap::new(),
+                        grant_tokens: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label} ciphertext must stay decryptable after rotation: {error}"));
+            assert_eq!(Some(plaintext), data_key.plaintext, "{label} plaintext must round-trip");
+        }
+
+        // Cleanup so repeated runs against the same Vault do not accumulate keys.
+        let _ = client.schedule_key_deletion(&key_id, 7, None).await;
+    }
 }
