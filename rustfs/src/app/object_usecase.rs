@@ -7116,12 +7116,9 @@ impl DefaultObjectUsecase {
                 &fallback_source
             };
             match metadata_sys::get_replication_config(&bucket).await {
-                Ok((config, _)) => delete_replication_state_from_config(
-                    &config,
-                    source,
-                    version_id_clone.as_ref().and_then(|_| source.version_id),
-                    false,
-                ),
+                Ok((config, _)) => {
+                    delete_replication_state_from_config(&config, source, version_id_clone.as_ref().and(source.version_id), false)
+                }
                 Err(StorageError::ConfigNotFound) => None,
                 Err(err) => return Err(ApiError::from(err).into()),
             }
