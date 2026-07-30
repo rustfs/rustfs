@@ -25,14 +25,17 @@ use crate::backends::{
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
+use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vaultrs::{api::kv2::requests::SetSecretRequestOptions, error::ClientError, kv2};
 
@@ -46,6 +49,13 @@ pub struct VaultKmsClient {
     key_path_prefix: String,
     /// DEK encryption implementation
     dek_crypto: AesDekCrypto,
+    /// Budgets wrapping every outbound Vault call (see `crate::policy`).
+    retry: RetryPolicy,
+    /// Cancellation point for the operation executor: aborts in-flight
+    /// attempts and backoff sleeps. Owned by the client and currently never
+    /// triggered — shutdown drops the whole client — but kept as the single
+    /// hook a future lifecycle owner can cancel through.
+    cancel: CancellationToken,
 }
 
 /// Key data stored in Vault
@@ -192,6 +202,8 @@ impl VaultKmsClient {
             key_path_prefix: config.key_path_prefix.clone(),
             config,
             dek_crypto: AesDekCrypto::new(),
+            retry: RetryPolicy::from_config(kms_config),
+            cancel: CancellationToken::new(),
         })
     }
 
@@ -202,6 +214,19 @@ impl VaultKmsClient {
     /// closed when the credentials could not be refreshed in time.
     fn vault(&self) -> Result<Arc<VaultClientHandle>> {
         self.credentials.current()
+    }
+
+    /// Run one Vault call under the operation policy.
+    ///
+    /// The closure performs a single classified attempt and takes a fresh
+    /// credential snapshot per attempt, so a retry after a credential rotation
+    /// uses the new token.
+    async fn run<T, F, Fut>(&self, operation: &'static str, class: OpClass, attempt: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, AttemptError>>,
+    {
+        policy::execute(operation, class, &self.retry, &self.cancel, attempt).await
     }
 
     /// Get the full path for a key in Vault
@@ -244,14 +269,20 @@ impl VaultKmsClient {
     async fn get_key_version_record(&self, key_id: &str, version: u32) -> Result<VaultKeyVersionRecord> {
         let path = self.key_version_path(key_id, version);
 
-        let record: VaultKeyVersionRecord =
-            kv2::read(&self.vault()?.client, &self.kv_mount, &path)
-                .await
-                .map_err(|e| match e {
-                    ClientError::ResponseWrapError => KmsError::key_version_not_found(key_id, version),
-                    ClientError::APIError { code: 404, .. } => KmsError::key_version_not_found(key_id, version),
-                    _ => KmsError::backend_error(format!("Failed to read key version record from Vault: {e}")),
-                })?;
+        let path = path.as_str();
+        let record: VaultKeyVersionRecord = self
+            .run("vault_kv2_read_key_version", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                kv2::read(&vault.client, &self.kv_mount, path).await.map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| match e {
+                        ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => {
+                            KmsError::key_version_not_found(key_id, version)
+                        }
+                        e => KmsError::backend_error(format!("Failed to read key version record from Vault: {e}")),
+                    })
+                })
+            })
+            .await?;
 
         if record.version != version {
             return Err(KmsError::material_corrupt(
@@ -284,26 +315,42 @@ impl VaultKmsClient {
     /// later write can be check-and-set against exactly this snapshot.
     async fn get_key_data_versioned(&self, key_id: &str) -> Result<(u32, VaultKeyData)> {
         let path = self.key_path(key_id);
+        let path = path.as_str();
 
-        let metadata = kv2::read_metadata(&self.vault()?.client, &self.kv_mount, &path)
-            .await
-            .map_err(|e| match e {
-                ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
-                ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-                _ => KmsError::backend_error(format!("Failed to read key metadata from Vault: {e}")),
-            })?;
+        let metadata = self
+            .run("vault_kv2_read_key_metadata", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                kv2::read_metadata(&vault.client, &self.kv_mount, path).await.map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| match e {
+                        ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => {
+                            KmsError::key_not_found(key_id)
+                        }
+                        e => KmsError::backend_error(format!("Failed to read key metadata from Vault: {e}")),
+                    })
+                })
+            })
+            .await?;
         let cas = u32::try_from(metadata.current_version)
             .map_err(|_| KmsError::backend_error(format!("KV2 secret version for key {key_id} exceeds u32")))?;
 
         // Read the exact secret version from the metadata to keep the (cas, data)
         // pair consistent even if another writer lands in between.
-        let key_data: VaultKeyData = kv2::read_version(&self.vault()?.client, &self.kv_mount, &path, metadata.current_version)
-            .await
-            .map_err(|e| match e {
-                ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
-                ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-                _ => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
-            })?;
+        let secret_version = metadata.current_version;
+        let key_data: VaultKeyData = self
+            .run("vault_kv2_read_key_at_version", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                kv2::read_version(&vault.client, &self.kv_mount, path, secret_version)
+                    .await
+                    .map_err(|e| {
+                        AttemptError::from_vaultrs(e, |e| match e {
+                            ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => {
+                                KmsError::key_not_found(key_id)
+                            }
+                            e => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
+                        })
+                    })
+            })
+            .await?;
 
         Ok((cas, key_data))
     }
@@ -315,19 +362,29 @@ impl VaultKmsClient {
     /// further check-and-set writes.
     async fn cas_store_key_data(&self, key_id: &str, key_data: &VaultKeyData, cas: u32) -> Result<u32> {
         let path = self.key_path(key_id);
+        let path = path.as_str();
 
-        let written =
-            kv2::set_with_options(&self.vault()?.client, &self.kv_mount, &path, key_data, SetSecretRequestOptions { cas })
-                .await
-                .map_err(|e| {
-                    if is_cas_conflict(&e) {
-                        KmsError::invalid_operation(format!(
-                            "Concurrent modification of key {key_id} detected, retry the rotation"
-                        ))
-                    } else {
-                        KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
-                    }
-                })?;
+        // Single attempt: replaying a lost-response write would double-apply
+        // the mutation, and a CAS conflict is a normal concurrency signal that
+        // must reach the caller untouched.
+        let written = self
+            .run("vault_kv2_cas_write_key", OpClass::MutatingNonIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                kv2::set_with_options(&vault.client, &self.kv_mount, path, key_data, SetSecretRequestOptions { cas })
+                    .await
+                    .map_err(|e| {
+                        AttemptError::from_vaultrs(e, |e| {
+                            if is_cas_conflict(&e) {
+                                KmsError::invalid_operation(format!(
+                                    "Concurrent modification of key {key_id} detected, retry the rotation"
+                                ))
+                            } else {
+                                KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
+                            }
+                        })
+                    })
+            })
+            .await?;
 
         u32::try_from(written.version)
             .map_err(|_| KmsError::backend_error(format!("KV2 secret version for key {key_id} exceeds u32")))
@@ -340,23 +397,42 @@ impl VaultKmsClient {
     /// existing record is acceptable. The record is never overwritten.
     async fn try_create_key_version_record(&self, key_id: &str, record: &VaultKeyVersionRecord) -> Result<bool> {
         let path = self.key_version_path(key_id, record.version);
+        let path = path.as_str();
 
-        match kv2::set_with_options(&self.vault()?.client, &self.kv_mount, &path, record, SetSecretRequestOptions { cas: 0 })
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if is_cas_conflict(&e) => Ok(false),
-            Err(e) => Err(KmsError::backend_error(format!("Failed to store key version record in Vault: {e}"))),
-        }
+        // Single attempt: the create-only CAS makes a duplicate replay fail
+        // with a conflict, which the caller resolves by reading the record
+        // back, so retrying here would only mask that recovery path.
+        self.run("vault_kv2_create_key_version", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            match kv2::set_with_options(&vault.client, &self.kv_mount, path, record, SetSecretRequestOptions { cas: 0 }).await {
+                Ok(_) => Ok(true),
+                Err(e) if is_cas_conflict(&e) => Ok(false),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Failed to store key version record in Vault: {e}"))
+                })),
+            }
+        })
+        .await
     }
 
     /// Store key data in Vault
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let path = self.key_path(key_id);
+        let path = path.as_str();
 
-        kv2::set(&self.vault()?.client, &self.kv_mount, &path, key_data)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to store key in Vault: {e}")))?;
+        // Single attempt: this is a whole-record overwrite without a CAS
+        // precondition, so a replay after a lost response could clobber a
+        // concurrent writer.
+        self.run("vault_kv2_write_key", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            kv2::set(&vault.client, &self.kv_mount, path, key_data)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Failed to store key in Vault: {e}")))
+                })
+        })
+        .await?;
 
         debug!("Stored key {} in Vault at path {}", key_id, path);
         Ok(())
@@ -404,14 +480,21 @@ impl VaultKmsClient {
     /// Retrieve key data from Vault
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
         let path = self.key_path(key_id);
+        let path = path.as_str();
 
-        let secret: VaultKeyData = kv2::read(&self.vault()?.client, &self.kv_mount, &path)
-            .await
-            .map_err(|e| match e {
-                vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
-                vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-                _ => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
-            })?;
+        let secret: VaultKeyData = self
+            .run("vault_kv2_read_key", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                kv2::read(&vault.client, &self.kv_mount, path).await.map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| match e {
+                        ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => {
+                            KmsError::key_not_found(key_id)
+                        }
+                        e => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
+                    })
+                })
+            })
+            .await?;
 
         debug!("Retrieved key {} from Vault, tags: {:?}", key_id, secret.tags);
         Ok(secret)
@@ -419,56 +502,87 @@ impl VaultKmsClient {
 
     /// List all keys stored in Vault
     async fn list_vault_keys(&self) -> Result<Vec<String>> {
-        // List keys under the prefix
-        match kv2::list(&self.vault()?.client, &self.kv_mount, &self.key_path_prefix).await {
-            Ok(keys) => {
+        // List keys under the prefix; `None` means the prefix does not exist
+        // yet (no keys were ever created).
+        let keys = self
+            .run("vault_kv2_list_keys", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::list(&vault.client, &self.kv_mount, &self.key_path_prefix).await {
+                    Ok(keys) => Ok(Some(keys)),
+                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to list keys in Vault: {e}"))
+                    })),
+                }
+            })
+            .await?;
+
+        match keys {
+            Some(keys) => {
                 let keys = filter_key_directory_entries(keys);
                 debug!("Found {} keys in Vault", keys.len());
                 Ok(keys)
             }
-            Err(vaultrs::error::ClientError::ResponseWrapError) => {
-                // No keys exist yet
-                Ok(Vec::new())
-            }
-            Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => {
-                // Path doesn't exist - no keys exist yet
+            None => {
                 debug!("Key path doesn't exist in Vault (404), returning empty list");
                 Ok(Vec::new())
             }
-            Err(e) => Err(KmsError::backend_error(format!("Failed to list keys in Vault: {e}"))),
         }
     }
 
     /// Physically delete a key from Vault storage
     async fn delete_key(&self, key_id: &str) -> Result<()> {
         let path = self.key_path(key_id);
+        let path = path.as_str();
 
         // Purge immutable version records first: if any purge fails, the top-level
         // record still exists and the deletion can be retried. The reverse order
         // would leave orphaned master key material in Vault after the key vanished.
         let versions_dir = self.key_versions_dir(key_id);
-        match kv2::list(&self.vault()?.client, &self.kv_mount, &versions_dir).await {
-            Ok(versions) => {
-                for version in versions {
-                    let version_path = format!("{versions_dir}/{version}");
-                    kv2::delete_metadata(&self.vault()?.client, &self.kv_mount, &version_path)
-                        .await
-                        .map_err(|e| KmsError::backend_error(format!("Failed to delete key version record from Vault: {e}")))?;
+        let versions_dir = versions_dir.as_str();
+        // `None` means no version records exist (the key was never rotated).
+        let versions = self
+            .run("vault_kv2_list_key_versions", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::list(&vault.client, &self.kv_mount, versions_dir).await {
+                    Ok(versions) => Ok(Some(versions)),
+                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to list key version records in Vault: {e}"))
+                    })),
                 }
-            }
-            // No version records exist (the key was never rotated).
-            Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => {}
-            Err(e) => return Err(KmsError::backend_error(format!("Failed to list key version records in Vault: {e}"))),
+            })
+            .await?;
+        for version in versions.unwrap_or_default() {
+            let version_path = format!("{versions_dir}/{version}");
+            let version_path = version_path.as_str();
+            self.run("vault_kv2_delete_key_version", OpClass::MutatingNonIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::delete_metadata(&vault.client, &self.kv_mount, version_path).await {
+                    // A version record that is already gone is a completed
+                    // delete (e.g. this deletion is being re-run after a lost
+                    // response), not a failure.
+                    Ok(_) | Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(()),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to delete key version record from Vault: {e}"))
+                    })),
+                }
+            })
+            .await?;
         }
 
         // For this specific key path, we can safely delete the metadata
         // since each key has its own unique path under the prefix
-        kv2::delete_metadata(&self.vault()?.client, &self.kv_mount, &path)
-            .await
-            .map_err(|e| match e {
-                vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-                _ => KmsError::backend_error(format!("Failed to delete key metadata from Vault: {e}")),
-            })?;
+        self.run("vault_kv2_delete_key", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            kv2::delete_metadata(&vault.client, &self.kv_mount, path).await.map_err(|e| {
+                AttemptError::from_vaultrs(e, |e| match e {
+                    ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+                    e => KmsError::backend_error(format!("Failed to delete key metadata from Vault: {e}")),
+                })
+            })
+        })
+        .await?;
 
         debug!("Permanently deleted key {} metadata from Vault at path {}", key_id, path);
         Ok(())
@@ -586,9 +700,43 @@ impl KmsClient for VaultKmsClient {
     async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {} with algorithm: {}", key_id, algorithm);
 
-        // Check if key already exists
-        if self.get_key_data(key_id).await.is_ok() {
-            return Err(KmsError::key_already_exists(key_id));
+        // Existence pre-check with read-confirm recovery: a create whose
+        // response was lost gets retried by callers, and used to be
+        // misreported as KeyAlreadyExists. If the stored key is exactly what
+        // this create would have produced (same algorithm, active, usable
+        // material), report the stored key as the create result. Anything
+        // else keeps failing: create never adopts a key it would not have
+        // produced. A failed pre-check read must fail the create rather than
+        // fall through to a blind overwrite of a possibly existing key.
+        match self.get_key_data(key_id).await {
+            Ok(existing) => {
+                return if existing.algorithm == algorithm
+                    && existing.status == KeyStatus::Active
+                    && decode_stored_key_material(key_id, &existing.encrypted_key_material).is_ok()
+                {
+                    info!(
+                        key_id,
+                        "Vault KMS create found an identical active key; treating it as a recovered create"
+                    );
+                    Ok(MasterKeyInfo {
+                        key_id: key_id.to_string(),
+                        version: existing.version,
+                        algorithm: existing.algorithm,
+                        usage: existing.usage,
+                        status: existing.status,
+                        description: existing.description,
+                        metadata: existing.metadata,
+                        created_at: existing.created_at,
+                        rotated_at: None,
+                        created_by: None,
+                        deletion_date: existing.deletion_date,
+                    })
+                } else {
+                    Err(KmsError::key_already_exists(key_id))
+                };
+            }
+            Err(KmsError::KeyNotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
 
         // Generate key material
@@ -1203,7 +1351,182 @@ impl KmsBackend for VaultKmsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::scripted_vault::{ScriptedResponse, ScriptedVault};
     use crate::config::{VaultAuthMethod, VaultConfig};
+
+    /// Vault + KMS config pair pointing at a scripted loopback Vault.
+    fn scripted_configs(address: &str) -> (VaultConfig, KmsConfig) {
+        let vault_config = VaultConfig {
+            address: address.to_string(),
+            auth_method: VaultAuthMethod::Token {
+                token: "scripted-token".to_string(),
+            },
+            kv_mount: "secret".to_string(),
+            key_path_prefix: "rustfs/kms/keys".to_string(),
+            mount_path: "transit".to_string(),
+            namespace: None,
+            tls: None,
+        };
+        let kms_config = KmsConfig {
+            timeout: Duration::from_secs(5),
+            retry_attempts: 3,
+            ..KmsConfig::default()
+        };
+        (vault_config, kms_config)
+    }
+
+    async fn scripted_client(responses: Vec<ScriptedResponse>) -> (ScriptedVault, VaultKmsClient) {
+        let vault = ScriptedVault::serve(responses).await;
+        let (vault_config, kms_config) = scripted_configs(&vault.address);
+        let client = VaultKmsClient::new(vault_config, &kms_config)
+            .await
+            .expect("scripted Vault client");
+        (vault, client)
+    }
+
+    fn healthy_key_data() -> VaultKeyData {
+        VaultKeyData {
+            algorithm: "AES_256".to_string(),
+            usage: KeyUsage::EncryptDecrypt,
+            created_at: Zoned::now(),
+            status: KeyStatus::Active,
+            version: 1,
+            description: None,
+            metadata: HashMap::new(),
+            tags: HashMap::new(),
+            deletion_date: None,
+            encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
+            baseline_version: None,
+        }
+    }
+
+    /// KV2 read payload (the `data` field of the Vault envelope) for a key record.
+    fn kv2_read_data(key_data: &VaultKeyData) -> serde_json::Value {
+        serde_json::json!({
+            "data": serde_json::to_value(key_data).expect("serialize key data"),
+            "metadata": {
+                "created_time": "2026-01-01T00:00:00Z",
+                "deletion_time": "",
+                "custom_metadata": null,
+                "destroyed": false,
+                "version": 1,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn wired_read_retries_transient_status_then_succeeds() {
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::error(503, "temporarily unavailable"),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+        ])
+        .await;
+
+        let key_data = client
+            .get_key_data("wired-key")
+            .await
+            .expect("read must retry past a transient 503");
+        assert_eq!(key_data.algorithm, "AES_256");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "one failed attempt plus one retry: {requests:?}");
+        assert!(
+            requests
+                .iter()
+                .all(|line| line == "GET /v1/secret/data/rustfs/kms/keys/wired-key"),
+            "both attempts must hit the same read endpoint: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_read_does_not_retry_permission_errors() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(403, "permission denied")]).await;
+
+        client
+            .get_key_data("wired-key")
+            .await
+            .expect_err("a 403 must fail the read outright");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 1, "fatal statuses must not be retried: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_write_is_never_retried_on_transient_status() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(503, "sealed")]).await;
+
+        let error = client
+            .store_key_data("wired-key", &healthy_key_data())
+            .await
+            .expect_err("the scripted 503 must fail the write");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec!["POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string()],
+            "a non-idempotent write must run exactly once even on a retryable status"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_cas_conflict_is_surfaced_without_retry() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(
+            400,
+            "check-and-set parameter did not match the current version",
+        )])
+        .await;
+
+        let error = client
+            .cas_store_key_data("wired-key", &healthy_key_data(), 7)
+            .await
+            .expect_err("the scripted CAS conflict must fail the write");
+        assert!(
+            matches!(error, KmsError::InvalidOperation { .. }),
+            "a CAS conflict is a concurrency signal, not a backend failure: {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 1, "a CAS conflict must never be retried: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_create_key_read_confirms_identical_existing_key() {
+        // The stored key is exactly what create_key("wired-key", "AES_256")
+        // would have produced, so a retried create whose first response was
+        // lost recovers by reading it back instead of failing.
+        let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&healthy_key_data()))]).await;
+
+        let recovered = client
+            .create_key("wired-key", "AES_256", None)
+            .await
+            .expect("an identical active key must read-confirm as a recovered create");
+        assert_eq!(recovered.version, 1);
+        assert_eq!(recovered.algorithm, "AES_256");
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec!["GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string()],
+            "a recovered create must not write anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_create_key_still_fails_on_mismatched_existing_key() {
+        let mut disabled = healthy_key_data();
+        disabled.status = KeyStatus::Disabled;
+        let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&disabled))]).await;
+
+        let error = client
+            .create_key("wired-key", "AES_256", None)
+            .await
+            .expect_err("a non-active existing key must keep failing the create");
+        assert!(matches!(error, KmsError::KeyAlreadyExists { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 1, "the mismatch must be decided from the single read: {requests:?}");
+    }
 
     /// Poison matrix for the read-side material gate. Every corruption class must fail
     /// closed with its typed error; reintroducing any "self-heal" (regenerate on empty or

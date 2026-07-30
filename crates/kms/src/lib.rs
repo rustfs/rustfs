@@ -73,9 +73,6 @@ pub mod deletion_worker;
 mod encryption;
 mod error;
 pub mod manager;
-// The executor is wired into the Vault backends in a follow-up change; until
-// then the module is only exercised by its own tests.
-#[allow(dead_code)]
 mod policy;
 pub mod service;
 pub mod service_manager;

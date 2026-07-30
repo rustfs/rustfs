@@ -16,8 +16,8 @@
 //!
 //! Vault-backed operations leave the process boundary, so every call needs a
 //! per-attempt timeout, a total operation deadline, and classification-driven
-//! bounded retries. This module provides the engine only; the Vault backends
-//! wire their call sites through [`execute`] in a follow-up change.
+//! bounded retries. The Vault backends and the credential provider wire every
+//! outbound `vaultrs` call through [`execute`].
 //!
 //! Retry safety is driven by two orthogonal classifications:
 //! - [`OpClass`] states whether replaying the operation is safe at all.
@@ -110,6 +110,32 @@ fn classify_status(code: u16) -> ErrorClass {
 pub(crate) struct AttemptError {
     pub(crate) class: ErrorClass,
     pub(crate) error: KmsError,
+}
+
+impl AttemptError {
+    /// A failure that must never be retried, regardless of operation class.
+    pub(crate) fn fatal(error: KmsError) -> Self {
+        Self {
+            class: ErrorClass::Fatal,
+            error,
+        }
+    }
+
+    /// Classify a `vaultrs` failure and map it onto a domain error.
+    ///
+    /// Classification reads the raw error before `map` consumes it, so call
+    /// sites keep their site-specific error mapping (404 to key-not-found and
+    /// so on) without losing the status code the retry decision needs.
+    pub(crate) fn from_vaultrs(
+        error: vaultrs::error::ClientError,
+        map: impl FnOnce(vaultrs::error::ClientError) -> KmsError,
+    ) -> Self {
+        let class = classify_vaultrs(&error);
+        Self {
+            class,
+            error: map(error),
+        }
+    }
 }
 
 /// Budgets applied by [`execute`].
