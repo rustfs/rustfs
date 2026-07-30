@@ -9,7 +9,7 @@
 > (`.config/nextest.toml`); admission criteria: `crates/e2e_test/README.md`.
 > 🌙 marks tests in the scheduled `e2e-repl-nightly` profile (backlog#1147
 > repl-1): `replication_extension_test` splits 20 fast tests into the PR smoke
-> lane and 27 slow / `_real_dual_node` / `_real_three_node` / `_real_single_node` tests into the
+> lane and 28 slow / `_real_dual_node` / `_real_three_node` / `_real_single_node` tests into the
 > nightly lane (`.github/workflows/e2e-replication-nightly.yml`).
 > Note: counts exclude `#[ignore]`d tests (nextest lists them separately).
 > The SSE-S3 replication contract is ignored under backlog#1291 until its
@@ -17,11 +17,11 @@
 
 | module | tests | PR smoke |
 |---|---|---|
-| admin_auth_test | 3 | ✅ |
+| admin_auth_test | 4 | ✅ |
 | admin_iam_crud_test | 2 | ✅ |
 | admin_pools_test | 1 | ✅ |
 | admin_timeout_regression_test | 1 |  |
-| anonymous_access_test | 3 | ✅ |
+| anonymous_access_test | 4 | ✅ |
 | api_rate_limit_test | 3 |  |
 | archive_download_integrity_test | 13 |  |
 | bucket_logging_test | 3 |  |
@@ -29,7 +29,7 @@
 | checksum_upload_test | 7 |  |
 | cluster_concurrency_test | 2 |  |
 | cluster_multidrive_pool_test | 2 |  |
-| common | 10 |  |
+| common | 12 |  |
 | compression_test | 1 |  |
 | connection_cap_test | 2 |  |
 | console_smoke_test | 1 | ✅ |
@@ -51,7 +51,9 @@
 | head_object_consistency_test | 1 | ✅ |
 | head_object_range_test | 1 | ✅ |
 | heal_erasure_disk_rebuild_test | 3 |  |
-| kms | 40 |  |
+| inline_fast_path_cluster_test | 14 |  |
+| internode_rpc_signature_e2e_test | 5 |  |
+| kms | 41 |  |
 | leading_slash_key_test | 2 | ✅ |
 | list_buckets_double_slash_test | 3 | ✅ |
 | list_object_versions_metadata_extension_test | 1 |  |
@@ -72,7 +74,7 @@
 | protocols | 16 |  |
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 3 |  |
-| reliant | 10 | 5 ✅ |
+| reliant | 24 | 18 ✅ |
 | replication_extension_test | 48 | 20 ✅ +28 🌙 |
 | security_boundary_test | 4 |  |
 | ssec_copy_test | 2 | ✅ |
@@ -81,10 +83,11 @@
 | special_chars_test | 14 | ✅ |
 | stale_multipart_cleanup_cluster_test | 1 |  |
 | storage_class_capability_test | 4 | ✅ |
+| sts_query_compat_test | 3 | ✅ |
 | tls_gen | 3 |  |
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
 `notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
 
-**Total listed: 486 tests across 67 modules · PR smoke subset: 129 tests / 32 modules** (30 full modules + 5 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 28 tests** · generated 2026-07-26.
+**Total listed: 527 tests across 70 modules · PR smoke subset: 147 tests / 33 modules** (31 full modules + 18 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 28 tests** · generated 2026-07-30.
