@@ -14,9 +14,7 @@
 
 //! Local file-based KMS backend implementation
 
-use crate::backends::{
-    BackendCapabilities, BackendInfo, ExpiredKeyRemoval, KmsBackend, KmsClient, StateGatedOperation, ensure_key_status_permits,
-};
+use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -937,9 +935,12 @@ impl LocalKmsClient {
     }
 }
 
-#[async_trait]
-impl KmsClient for LocalKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo> {
+impl LocalKmsClient {
+    pub(crate) async fn generate_data_key(
+        &self,
+        request: &GenerateKeyRequest,
+        context: Option<&OperationContext>,
+    ) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
         let key_info = self.describe_key(&request.master_key_id, context).await?;
@@ -980,7 +981,7 @@ impl KmsClient for LocalKmsClient {
         Ok(data_key)
     }
 
-    async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse> {
+    pub(crate) async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse> {
         debug!("Encrypting data with key: {}", request.key_id);
 
         // Verify key exists and its state allows encryption
@@ -997,7 +998,7 @@ impl KmsClient for LocalKmsClient {
         })
     }
 
-    async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    pub(crate) async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
         debug!("Decrypting data");
 
         // Parse the data key envelope from ciphertext
@@ -1031,7 +1032,14 @@ impl KmsClient for LocalKmsClient {
         Ok(plaintext)
     }
 
-    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn create_key(
+        &self,
+        key_id: &str,
+        algorithm: &str,
+        context: Option<&OperationContext>,
+    ) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {}", key_id);
 
         // Check if key already exists
@@ -1060,14 +1068,18 @@ impl KmsClient for LocalKmsClient {
         Ok(master_key)
     }
 
-    async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
+    pub(crate) async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
         debug!("Describing key: {}", key_id);
 
         let master_key = self.load_master_key(key_id).await?;
         Ok(master_key.into())
     }
 
-    async fn list_keys(&self, request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
+    pub(crate) async fn list_keys(
+        &self,
+        request: &ListKeysRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<ListKeysResponse> {
         debug!("Listing keys");
 
         let mut keys = Vec::new();
@@ -1111,7 +1123,7 @@ impl KmsClient for LocalKmsClient {
         })
     }
 
-    async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    pub(crate) async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Enabling key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
@@ -1129,7 +1141,7 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    pub(crate) async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Disabling key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
@@ -1146,7 +1158,9 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn schedule_key_deletion(
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn schedule_key_deletion(
         &self,
         key_id: &str,
         pending_window_days: u32,
@@ -1170,7 +1184,9 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Canceling deletion for key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
@@ -1190,7 +1206,9 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         if !fs::try_exists(self.master_key_path(key_id)?).await? {
             return Err(KmsError::key_not_found(key_id));
         }
@@ -1199,7 +1217,7 @@ impl KmsClient for LocalKmsClient {
         ))
     }
 
-    async fn health_check(&self) -> Result<()> {
+    pub(crate) async fn health_check(&self) -> Result<()> {
         // Check if key directory is accessible
         if !self.config.key_dir.exists() {
             return Err(KmsError::backend_error("Key directory does not exist"));
@@ -1209,17 +1227,6 @@ impl KmsClient for LocalKmsClient {
         let _ = fs::read_dir(&self.config.key_dir).await?;
 
         Ok(())
-    }
-
-    fn backend_info(&self) -> BackendInfo {
-        BackendInfo::new(
-            "local".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-            self.config.key_dir.to_string_lossy().to_string(),
-            true, // We'll assume healthy for now
-        )
-        .with_metadata("key_dir".to_string(), self.config.key_dir.to_string_lossy().to_string())
-        .with_metadata("encrypted_at_rest".to_string(), self.master_cipher.is_some().to_string())
     }
 }
 

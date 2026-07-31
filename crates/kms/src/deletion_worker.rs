@@ -182,7 +182,6 @@ impl DeletionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::KmsClient as _;
     use crate::backends::local::LocalKmsBackend;
     use crate::config::KmsConfig;
     use crate::error::KmsError;
