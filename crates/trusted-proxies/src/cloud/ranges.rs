@@ -227,6 +227,7 @@ pub struct GoogleCloudIpRanges;
 
 impl GoogleCloudIpRanges {
     /// Fetches the latest Google Cloud IP ranges from their official source.
+    #[hotpath::measure]
     pub async fn fetch() -> Result<Vec<IpNetwork>, AppError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))

@@ -28,6 +28,7 @@ categories = ["cryptography", "web-programming", "authentication"]
 workspace = true
 
 [dependencies]
+hotpath.workspace = true
 # Core dependencies
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
@@ -84,3 +85,17 @@ tokio = { workspace = true, features = ["net", "test-util"] }
 
 [features]
 default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/reqwest-0-13",
+    "rustfs-security-governance/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-security-governance/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-security-governance/hotpath-cpu", "rustfs-utils/hotpath-cpu"]

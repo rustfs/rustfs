@@ -85,6 +85,7 @@ fn classify_probe_error(err: &reqwest::Error) -> TargetHealthReason {
     TargetHealthReason::Unreachable
 }
 
+#[hotpath::measure]
 async fn probe_health_url(client: &Client, health_check_url: &Url) -> TargetHealth {
     match tokio::time::timeout(WEBHOOK_HEALTH_TIMEOUT, client.head(health_check_url.as_str()).send()).await {
         Ok(Ok(_)) => TargetHealth::online(TargetHealthReason::Reachable),
@@ -480,6 +481,7 @@ where
         build_queued_payload(event)
     }
 
+    #[hotpath::measure]
     async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
         debug!(
             event = EVENT_WEBHOOK_DELIVERY_STATE,

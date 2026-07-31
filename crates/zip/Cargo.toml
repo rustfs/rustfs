@@ -32,7 +32,14 @@ doctest = false
 name = "zip_benchmark"
 harness = false
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 async-compression = { workspace = true, features = [
     "tokio",
     "bzip2",

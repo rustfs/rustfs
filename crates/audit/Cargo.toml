@@ -25,7 +25,33 @@ documentation = "https://docs.rs/rustfs-audit/latest/rustfs_audit/"
 keywords = ["audit", "target", "management", "fan-out", "RustFS"]
 categories = ["web-programming", "development-tools", "asynchronous", "api-bindings"]
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "rustfs-config/hotpath",
+    "rustfs-s3-types/hotpath",
+    "rustfs-targets/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-s3-types/hotpath-alloc",
+    "rustfs-targets/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-s3-types/hotpath-cpu",
+    "rustfs-targets/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "server-config-model"] }
 rustfs-s3-types = { workspace = true }

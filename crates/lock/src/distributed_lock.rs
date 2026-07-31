@@ -540,6 +540,7 @@ impl DistributedLock {
     }
 
     /// Acquire a lock and return a RAII guard
+    #[hotpath::measure]
     pub(crate) async fn acquire_guard(&self, request: &LockRequest) -> Result<Option<DistributedLockGuard>> {
         if self.clients.is_empty() {
             return Err(LockError::internal("No lock clients available"));
@@ -626,6 +627,7 @@ impl DistributedLock {
     }
 
     /// Convenience: acquire exclusive lock as a guard
+    #[hotpath::measure]
     pub async fn lock_guard(
         &self,
         resource: ObjectKey,
@@ -640,6 +642,7 @@ impl DistributedLock {
     }
 
     /// Convenience: acquire exclusive lock with expected contention logs suppressed
+    #[hotpath::measure]
     pub async fn lock_guard_quiet(
         &self,
         resource: ObjectKey,
@@ -655,6 +658,7 @@ impl DistributedLock {
     }
 
     /// Convenience: acquire shared lock as a guard
+    #[hotpath::measure]
     pub async fn rlock_guard(
         &self,
         resource: ObjectKey,

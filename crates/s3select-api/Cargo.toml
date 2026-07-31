@@ -28,7 +28,37 @@ documentation = "https://docs.rs/rustfs-s3select-api/latest/rustfs_s3select_api/
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/parking_lot",
+    "rustfs-common/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-test-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-test-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-test-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 metrics = { workspace = true }
 async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
