@@ -4740,14 +4740,13 @@ mod tests {
         ) -> Result<ObjectInfo> {
             let current_etag = format!("config-{}", self.revision.load(Ordering::SeqCst));
             let object_exists = matches!(&*self.state.lock().expect("state lock poisoned"), RecoveryReadState::Blob(_));
-            if let Some(preconditions) = &opts.http_preconditions {
-                if preconditions
+            if let Some(preconditions) = &opts.http_preconditions
+                && (preconditions
                     .if_match_value()
                     .is_some_and(|etag| !object_exists || etag != current_etag)
-                    || (object_exists && preconditions.if_none_match_value() == Some("*"))
-                {
-                    return Err(Error::PreconditionFailed);
-                }
+                    || (object_exists && preconditions.if_none_match_value() == Some("*")))
+            {
+                return Err(Error::PreconditionFailed);
             }
             let mut body = Vec::new();
             data.stream.read_to_end(&mut body).await?;
