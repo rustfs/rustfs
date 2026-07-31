@@ -462,16 +462,19 @@ impl BackupManifest {
     /// Compute the digest over the canonical manifest form.
     ///
     /// Canonical form: the JSON *value* of the manifest with the digest hex
-    /// emptied, serialized compactly by `serde_json`'s value serializer. The
-    /// value layer is what makes sealing and decoding agree byte-for-byte:
-    /// a decoder recovers the identical value from the raw stored bytes
-    /// without round-tripping any typed field through parse-and-reprint.
+    /// emptied, object keys rebuilt in bytewise-sorted order at every level
+    /// (see [`canonicalize_value`]), then serialized compactly. The value
+    /// layer is what makes sealing and decoding agree byte-for-byte — a
+    /// decoder recovers the identical value from the raw stored bytes
+    /// without round-tripping any typed field through parse-and-reprint —
+    /// and the explicit key sort makes the bytes independent of
+    /// `serde_json`'s map implementation (`preserve_order` on or off).
     pub fn compute_digest(&self) -> Result<ContentDigest, BackupError> {
         let mut unsealed = self.clone();
         unsealed.manifest_digest = ContentDigest::placeholder(self.manifest_digest.algorithm);
         let value = serde_json::to_value(&unsealed)
             .map_err(|error| BackupError::corrupted(format!("manifest canonicalization failed: {error}")))?;
-        Self::digest_of_canonical_value(&value, self.manifest_digest.algorithm)
+        Self::digest_of_canonical_value(value, self.manifest_digest.algorithm)
     }
 
     /// Verify the sealed digest against the current in-memory content.
@@ -503,7 +506,7 @@ impl BackupManifest {
             return Err(BackupError::corrupted("manifest has no digest slot"));
         };
         *slot = serde_json::Value::String(String::new());
-        if Self::digest_of_canonical_value(&value, declared.algorithm)? != *declared {
+        if Self::digest_of_canonical_value(value, declared.algorithm)? != *declared {
             return Err(BackupError::corrupted(
                 "manifest digest mismatch: content does not match the sealed digest",
             ));
@@ -511,8 +514,8 @@ impl BackupManifest {
         Ok(())
     }
 
-    fn digest_of_canonical_value(value: &serde_json::Value, algorithm: DigestAlgorithm) -> Result<ContentDigest, BackupError> {
-        let canonical = serde_json::to_vec(value)
+    fn digest_of_canonical_value(value: serde_json::Value, algorithm: DigestAlgorithm) -> Result<ContentDigest, BackupError> {
+        let canonical = serde_json::to_vec(&canonicalize_value(value))
             .map_err(|error| BackupError::corrupted(format!("manifest canonicalization failed: {error}")))?;
         match algorithm {
             DigestAlgorithm::Sha256 => Ok(ContentDigest::sha256_of(&canonical)),
@@ -698,6 +701,29 @@ fn map_serde_error(error: serde_json::Error) -> BackupError {
         BackupError::truncated(error.to_string())
     } else {
         BackupError::corrupted(error.to_string())
+    }
+}
+
+/// Rebuild a JSON value with object keys in bytewise-sorted order at every
+/// nesting level (array element order is preserved).
+///
+/// `serde_json`'s map keeps keys sorted by default but preserves insertion
+/// order when the `preserve_order` feature is unified into the build by any
+/// other crate. Digest bytes must not depend on that, so the ordering is
+/// imposed explicitly here instead of being inherited from the map type.
+fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut sorted = serde_json::Map::with_capacity(entries.len());
+            for (key, entry) in entries {
+                sorted.insert(key, canonicalize_value(entry));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(items.into_iter().map(canonicalize_value).collect()),
+        other => other,
     }
 }
 
@@ -1085,8 +1111,8 @@ mod tests {
         let mut value = serde_json::to_value(&sealed).expect("manifest should convert to a value");
         value["created_at"] = serde_json::Value::String("2026-07-30T00:00:00+00:00".to_string());
         value["manifest_digest"]["hex"] = serde_json::Value::String(String::new());
-        let canonical = serde_json::to_vec(&value).expect("canonical bytes");
-        let digest = ContentDigest::sha256_of(&canonical);
+        let digest = BackupManifest::digest_of_canonical_value(value.clone(), DigestAlgorithm::Sha256)
+            .expect("canonical digest should compute");
         value["manifest_digest"]["hex"] = serde_json::Value::String(digest.hex);
         let bytes = serde_json::to_vec(&value).expect("manifest bytes");
 
