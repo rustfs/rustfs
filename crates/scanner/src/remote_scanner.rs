@@ -951,7 +951,7 @@ async fn scan_and_persist_local_bucket(
             ))
         })?;
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
-    let lock_resource = scanner_cache_lock_resource(&cache_name);
+    let lock_resource = scanner_cache_lock_resource(&cache_name, source);
     let ns_lock = set
         .new_ns_lock(RUSTFS_META_BUCKET, &lock_resource)
         .await

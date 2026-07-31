@@ -944,8 +944,9 @@ fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> 
     Some(usage)
 }
 
-pub(crate) fn scanner_cache_lock_resource(cache_name: &str) -> String {
-    path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name, SCANNER_CACHE_LOCK_SUFFIX])
+pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
+    let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
+    path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name, &lock_name])
 }
 
 pub(crate) fn scanner_cache_lock_timeout() -> Duration {
@@ -1698,6 +1699,19 @@ mod publish_gate_tests {
     }
 
     #[test]
+    fn scanner_cache_lock_resource_is_scoped_to_cache_source() {
+        let cache_name = "photos/.usage-cache.bin";
+        let first_source = DataUsageCacheSource::new(0, 1);
+        let same_source = DataUsageCacheSource::new(0, 1);
+        let other_source = DataUsageCacheSource::new(1, 0);
+
+        let first = scanner_cache_lock_resource(cache_name, first_source);
+        assert_eq!(first, scanner_cache_lock_resource(cache_name, same_source));
+        assert_ne!(first, scanner_cache_lock_resource(cache_name, other_source));
+        assert!(first.ends_with(".scanner-cycle.lock.pool-0.set-1"));
+    }
+
+    #[test]
     fn count_budget_serializes_set_and_disk_work() {
         assert_eq!(scanner_budgeted_concurrency_limit(8, true), 1);
         assert_eq!(scanner_budgeted_concurrency_limit(8, false), 8);
@@ -1797,7 +1811,7 @@ async fn persist_and_publish_cache_snapshot(
     cache_cycle_floor: &AtomicU64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
-    let lock_resource = scanner_cache_lock_resource(DATA_USAGE_CACHE_NAME);
+    let lock_resource = scanner_cache_lock_resource(DATA_USAGE_CACHE_NAME, source);
     let ns_lock = match store.new_ns_lock(RUSTFS_META_BUCKET, &lock_resource).await {
         Ok(lock) => lock,
         Err(err) => {
@@ -3080,11 +3094,11 @@ impl ScannerIOCache for SetDisks {
                         None
                     };
 
-                    // Lock order: scanner leader fence -> per-bucket cache lock ->
+                    // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write. The cache lock stays outermost for
                     // local and rolling-upgrade workers so leader failover cannot
                     // execute the same bucket concurrently.
-                    let lock_resource = scanner_cache_lock_resource(&cache_name);
+                    let lock_resource = scanner_cache_lock_resource(&cache_name, source);
                     let ns_lock = match store_clone_clone.new_ns_lock(RUSTFS_META_BUCKET, &lock_resource).await {
                         Ok(lock) => lock,
                         Err(e) => {
