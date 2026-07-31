@@ -26,6 +26,12 @@
 //!       policy is also allowed by the widened policy;
 //!   (c) an empty policy denies every non-owner request (default deny).
 //!
+//! Properties (d)-(g) extend the same invariants to KMS key resources
+//! (`arn:aws:kms:::key/<key_id>`, backlog#1582): Deny-first over key scopes,
+//! wildcard/resource-less supersets implying concrete key grants, exact key
+//! scoping without cross-key leaks, and the legacy resource-less
+//! match-every-key compatibility pin.
+//!
 //! Pure evaluation: no IO, no global state, parallel-safe. Statements are built
 //! from JSON exactly like production policies arriving via PutPolicy. Generated
 //! bucket/key/action pools avoid wildcard metacharacters so resource patterns
@@ -47,8 +53,21 @@ const OBJECT_ACTIONS: &[&str] = &[
     "s3:PutObjectTagging",
 ];
 
+/// Key-scoped KMS actions safe to pair with an `arn:aws:kms:::key/<id>` resource.
+const KMS_KEY_ACTIONS: &[&str] = &[
+    "kms:GenerateDataKey",
+    "kms:Decrypt",
+    "kms:DisableKey",
+    "kms:RotateKey",
+    "kms:DescribeKey",
+];
+
 fn statement_json(effect: &str, action: &str, resource: &str) -> String {
     format!(r#"{{"Effect":"{effect}","Action":["{action}"],"Resource":["{resource}"]}}"#)
+}
+
+fn resourceless_statement_json(effect: &str, action: &str) -> String {
+    format!(r#"{{"Effect":"{effect}","Action":["{action}"]}}"#)
 }
 
 fn policy_from_statements(statements: &[String]) -> Policy {
@@ -86,6 +105,22 @@ fn key_strategy() -> impl Strategy<Value = String> {
 /// Strategy: one action name from the object-action pool.
 fn action_strategy() -> impl Strategy<Value = &'static str> {
     proptest::sample::select(OBJECT_ACTIONS)
+}
+
+/// Strategy: a KMS key id without wildcard metacharacters or separators.
+fn key_id_strategy() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9-]{2,11}"
+}
+
+/// Strategy: one action name from the key-scoped KMS action pool.
+fn kms_action_strategy() -> impl Strategy<Value = &'static str> {
+    proptest::sample::select(KMS_KEY_ACTIONS)
+}
+
+/// KMS evaluation contract: the requested key id travels in `args.object` with an
+/// empty bucket (see `Statement::kms_key_scope_matches`).
+fn is_allowed_for_key(policy: &Policy, action: &str, key_id: &str) -> bool {
+    is_allowed(policy, action, "", key_id)
 }
 
 proptest! {
@@ -203,6 +238,124 @@ proptest! {
         prop_assert!(
             !is_allowed(&default_policy, action, &bucket, &key),
             "Policy::default() must deny {action} on {bucket}/{key}"
+        );
+    }
+
+    /// (d) KMS Deny anywhere wins: a Deny scoped to the exact key (or `key/*`)
+    /// denies the request no matter how many broad KMS Allow statements
+    /// (resource-less or `key/*`-scoped) surround it.
+    #[test]
+    fn kms_explicit_deny_anywhere_denies(
+        key_id in key_id_strategy(),
+        action in kms_action_strategy(),
+        allow_count in 0usize..4,
+        deny_pos_seed in 0usize..16,
+        broad in proptest::bool::ANY,
+        wildcard_deny in proptest::bool::ANY,
+    ) {
+        let mut statements: Vec<String> = (0..allow_count)
+            .map(|_| {
+                if broad {
+                    resourceless_statement_json("Allow", "kms:*")
+                } else {
+                    statement_json("Allow", "kms:*", "arn:aws:kms:::key/*")
+                }
+            })
+            .collect();
+
+        let deny_resource = if wildcard_deny {
+            "arn:aws:kms:::key/*".to_string()
+        } else {
+            format!("arn:aws:kms:::key/{key_id}")
+        };
+        let deny = statement_json("Deny", action, &deny_resource);
+        let deny_pos = deny_pos_seed % (statements.len() + 1);
+        statements.insert(deny_pos, deny);
+
+        let policy = policy_from_statements(&statements);
+
+        if allow_count > 0 {
+            let mut allows_only = statements.clone();
+            allows_only.remove(deny_pos);
+            let allow_policy = policy_from_statements(&allows_only);
+            prop_assert!(
+                is_allowed_for_key(&allow_policy, action, &key_id),
+                "sanity: the KMS Allow statements alone should permit {action} on key {key_id}"
+            );
+        }
+
+        prop_assert!(
+            !is_allowed_for_key(&policy, action, &key_id),
+            "explicit KMS Deny at index {deny_pos} of {} statements must deny {action} on key {key_id}",
+            statements.len()
+        );
+    }
+
+    /// (e) KMS wildcard superset implies the concrete key grant: whatever an
+    /// exact `key/<id>` Allow permits is also permitted by `key/*`, by a bare
+    /// `arn:aws:kms:::*`, and by the legacy resource-less statement form.
+    #[test]
+    fn kms_wildcard_superset_implies_concrete_match(
+        key_id in key_id_strategy(),
+        action in kms_action_strategy(),
+    ) {
+        let narrow = policy_from_statements(&[statement_json(
+            "Allow",
+            action,
+            &format!("arn:aws:kms:::key/{key_id}"),
+        )]);
+        let widened = policy_from_statements(&[statement_json("Allow", "kms:*", "arn:aws:kms:::key/*")]);
+        let star = policy_from_statements(&[statement_json("Allow", "kms:*", "arn:aws:kms:::*")]);
+        let resourceless = policy_from_statements(&[resourceless_statement_json("Allow", "kms:*")]);
+
+        prop_assert!(is_allowed_for_key(&narrow, action, &key_id), "narrow KMS policy must allow its own grant");
+        prop_assert!(is_allowed_for_key(&widened, action, &key_id), "kms:* on key/* must imply the concrete grant");
+        prop_assert!(is_allowed_for_key(&star, action, &key_id), "kms:* on arn:aws:kms:::* must imply the concrete grant");
+        prop_assert!(
+            is_allowed_for_key(&resourceless, action, &key_id),
+            "the legacy resource-less KMS statement must imply the concrete grant"
+        );
+    }
+
+    /// (f) Key scoping is exact: an Allow on `key/<a>` never leaks to a
+    /// different key id, while the compatibility contract keeps unscoped
+    /// requests (no key id passed) matching.
+    #[test]
+    fn kms_key_scope_does_not_leak_across_keys(
+        key_a in key_id_strategy(),
+        key_b in key_id_strategy(),
+        action in kms_action_strategy(),
+    ) {
+        prop_assume!(key_a != key_b);
+
+        let policy = policy_from_statements(&[statement_json(
+            "Allow",
+            action,
+            &format!("arn:aws:kms:::key/{key_a}"),
+        )]);
+
+        prop_assert!(is_allowed_for_key(&policy, action, &key_a), "the granted key must be allowed");
+        prop_assert!(
+            !is_allowed_for_key(&policy, action, &key_b),
+            "an Allow scoped to key {key_a} must not leak to key {key_b}"
+        );
+        prop_assert!(
+            is_allowed_for_key(&policy, action, ""),
+            "call sites that pass no key resource keep the legacy match-every-key behaviour"
+        );
+    }
+
+    /// (g) Legacy compatibility pin: resource-less KMS statements match every
+    /// generated key id, exactly as before KMS resources existed.
+    #[test]
+    fn kms_resourceless_statement_matches_every_key(
+        key_id in key_id_strategy(),
+        action in kms_action_strategy(),
+    ) {
+        let policy = policy_from_statements(&[resourceless_statement_json("Allow", action)]);
+        prop_assert!(
+            is_allowed_for_key(&policy, action, &key_id),
+            "resource-less KMS statement must keep matching {action} on key {key_id}"
         );
     }
 }
