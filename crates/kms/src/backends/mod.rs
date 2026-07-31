@@ -24,6 +24,8 @@ use std::collections::HashMap;
 #[cfg(test)]
 mod contract_tests;
 pub mod local;
+#[cfg(test)]
+pub(crate) mod scripted_vault;
 pub mod static_kms;
 pub mod vault;
 pub(crate) mod vault_credentials;

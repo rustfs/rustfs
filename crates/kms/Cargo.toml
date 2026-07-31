@@ -75,7 +75,8 @@ anyhow = { workspace = true }
 insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+# "net" backs the scripted loopback Vault used by the policy wiring tests.
+tokio = { workspace = true, features = ["net", "test-util"] }
 
 [features]
 default = []

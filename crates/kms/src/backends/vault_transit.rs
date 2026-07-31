@@ -24,15 +24,19 @@ use crate::backends::{
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
+use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 use vaultrs::{
     api::transit::{
         KeyType,
@@ -147,6 +151,13 @@ pub struct VaultTransitKmsClient {
     /// Path prefix under metadata_kv_mount for storing transit key metadata records
     metadata_key_prefix: String,
     metadata_cache: RwLock<HashMap<String, TransitKeyMetadata>>,
+    /// Budgets wrapping every outbound Vault call (see `crate::policy`).
+    retry: RetryPolicy,
+    /// Cancellation point for the operation executor: aborts in-flight
+    /// attempts and backoff sleeps. Owned by the client and currently never
+    /// triggered — shutdown drops the whole client — but kept as the single
+    /// hook a future lifecycle owner can cancel through.
+    cancel: CancellationToken,
 }
 
 impl VaultTransitKmsClient {
@@ -171,6 +182,8 @@ impl VaultTransitKmsClient {
             metadata_key_prefix: config.metadata_key_prefix.clone(),
             config,
             metadata_cache: RwLock::new(HashMap::new()),
+            retry: RetryPolicy::from_config(kms_config),
+            cancel: CancellationToken::new(),
         })
     }
 
@@ -181,6 +194,19 @@ impl VaultTransitKmsClient {
     /// closed when the credentials could not be refreshed in time.
     fn vault(&self) -> Result<Arc<VaultClientHandle>> {
         self.credentials.current()
+    }
+
+    /// Run one Vault call under the operation policy.
+    ///
+    /// The closure performs a single classified attempt and takes a fresh
+    /// credential snapshot per attempt, so a retry after a credential rotation
+    /// uses the new token.
+    async fn run<T, F, Fut>(&self, operation: &'static str, class: OpClass, attempt: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, AttemptError>>,
+    {
+        policy::execute(operation, class, &self.retry, &self.cancel, attempt).await
     }
 
     fn canonicalize_context(encryption_context: &HashMap<String, String>) -> Result<Option<String>> {
@@ -196,28 +222,40 @@ impl VaultTransitKmsClient {
         Ok(Some(BASE64.encode(serialized)))
     }
 
-    fn map_vault_error<T>(key_id: &str, error: vaultrs::error::ClientError, operation: &str) -> Result<T> {
+    fn map_vault_error(key_id: &str, error: vaultrs::error::ClientError, operation: &str) -> KmsError {
         match error {
-            vaultrs::error::ClientError::ResponseWrapError => Err(KmsError::key_not_found(key_id)),
-            vaultrs::error::ClientError::APIError { code: 404, .. } => Err(KmsError::key_not_found(key_id)),
-            other => Err(KmsError::backend_error(format!(
-                "Vault Transit {operation} failed for key {key_id}: {other}"
-            ))),
+            vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
+            vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+            other => KmsError::backend_error(format!("Vault Transit {operation} failed for key {key_id}: {other}")),
         }
     }
 
     async fn read_transit_key(&self, key_id: &str) -> Result<vaultrs::api::transit::responses::ReadKeyResponse> {
-        key::read(&self.vault()?.client, &self.config.mount_path, key_id)
-            .await
-            .or_else(|e| Self::map_vault_error(key_id, e, "read"))
+        self.run("vault_transit_read_key", OpClass::ReadIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            key::read(&vault.client, &self.config.mount_path, key_id)
+                .await
+                .map_err(|e| AttemptError::from_vaultrs(e, |e| Self::map_vault_error(key_id, e, "read")))
+        })
+        .await
     }
 
     async fn create_transit_key(&self, key_id: &str) -> Result<()> {
-        let mut builder = CreateKeyRequestBuilder::default();
-        builder.key_type(KeyType::Aes256Gcm96);
-        key::create(&self.vault()?.client, &self.config.mount_path, key_id, Some(&mut builder))
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to create Vault Transit key {key_id}: {e}")))
+        // Single attempt: create carries external side effects and the caller
+        // owns the read-confirm recovery for lost responses.
+        self.run("vault_transit_create_key", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            let mut builder = CreateKeyRequestBuilder::default();
+            builder.key_type(KeyType::Aes256Gcm96);
+            key::create(&vault.client, &self.config.mount_path, key_id, Some(&mut builder))
+                .await
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to create Vault Transit key {key_id}: {e}"))
+                    })
+                })
+        })
+        .await
     }
 
     async fn transit_encrypt(
@@ -227,14 +265,26 @@ impl VaultTransitKmsClient {
         encryption_context: &HashMap<String, String>,
     ) -> Result<String> {
         let plaintext_b64 = BASE64.encode(plaintext);
-        let mut builder = EncryptDataRequestBuilder::default();
-        if let Some(aad) = Self::canonicalize_context(encryption_context)? {
-            builder.associated_data(aad);
-        }
+        let plaintext_b64 = plaintext_b64.as_str();
+        let aad = Self::canonicalize_context(encryption_context)?;
+        let aad = aad.as_deref();
 
-        let response = data::encrypt(&self.vault()?.client, &self.config.mount_path, key_id, &plaintext_b64, Some(&mut builder))
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to encrypt data with Vault Transit key {key_id}: {e}")))?;
+        let response = self
+            .run("vault_transit_encrypt", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                let mut builder = EncryptDataRequestBuilder::default();
+                if let Some(aad) = aad {
+                    builder.associated_data(aad);
+                }
+                data::encrypt(&vault.client, &self.config.mount_path, key_id, plaintext_b64, Some(&mut builder))
+                    .await
+                    .map_err(|e| {
+                        AttemptError::from_vaultrs(e, |e| {
+                            KmsError::backend_error(format!("Failed to encrypt data with Vault Transit key {key_id}: {e}"))
+                        })
+                    })
+            })
+            .await?;
 
         Ok(response.ciphertext)
     }
@@ -245,14 +295,25 @@ impl VaultTransitKmsClient {
         ciphertext: &str,
         encryption_context: &HashMap<String, String>,
     ) -> Result<Vec<u8>> {
-        let mut builder = DecryptDataRequestBuilder::default();
-        if let Some(aad) = Self::canonicalize_context(encryption_context)? {
-            builder.associated_data(aad);
-        }
+        let aad = Self::canonicalize_context(encryption_context)?;
+        let aad = aad.as_deref();
 
-        let response = data::decrypt(&self.vault()?.client, &self.config.mount_path, key_id, ciphertext, Some(&mut builder))
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data with Vault Transit key {key_id}: {e}")))?;
+        let response = self
+            .run("vault_transit_decrypt", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                let mut builder = DecryptDataRequestBuilder::default();
+                if let Some(aad) = aad {
+                    builder.associated_data(aad);
+                }
+                data::decrypt(&vault.client, &self.config.mount_path, key_id, ciphertext, Some(&mut builder))
+                    .await
+                    .map_err(|e| {
+                        AttemptError::from_vaultrs(e, |e| {
+                            KmsError::backend_error(format!("Failed to decrypt data with Vault Transit key {key_id}: {e}"))
+                        })
+                    })
+            })
+            .await?;
 
         BASE64
             .decode(response.plaintext)
@@ -265,33 +326,93 @@ impl VaultTransitKmsClient {
 
     async fn read_metadata_from_kv(&self, key_id: &str) -> Result<Option<TransitKeyMetadata>> {
         let path = self.metadata_key_path(key_id);
-        match kv2::read::<TransitKeyMetadataPersisted>(&self.vault()?.client, &self.metadata_kv_mount, &path).await {
-            Ok(persisted) => Ok(Some(persisted.into())),
-            Err(vaultrs::error::ClientError::ResponseWrapError)
-            | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(None),
-            Err(e) => Err(KmsError::backend_error(format!("Failed to read transit key metadata from Vault KV: {e}"))),
-        }
+        let path = path.as_str();
+        self.run("vault_transit_read_metadata", OpClass::ReadIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            match kv2::read::<TransitKeyMetadataPersisted>(&vault.client, &self.metadata_kv_mount, path).await {
+                Ok(persisted) => Ok(Some(persisted.into())),
+                Err(vaultrs::error::ClientError::ResponseWrapError)
+                | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(None),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Failed to read transit key metadata from Vault KV: {e}"))
+                })),
+            }
+        })
+        .await
     }
 
     async fn write_metadata_to_kv(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<()> {
         let path = self.metadata_key_path(key_id);
+        let path = path.as_str();
         let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
-        kv2::set(&self.vault()?.client, &self.metadata_kv_mount, &path, &persisted)
-            .await
-            .map(|_| ())
-            .map_err(|e| KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}")))
+        let persisted = &persisted;
+        // Single attempt: this is a whole-record overwrite without a CAS
+        // precondition, so a replay after a lost response could clobber a
+        // concurrent writer.
+        self.run("vault_transit_write_metadata", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            kv2::set(&vault.client, &self.metadata_kv_mount, path, persisted)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}"))
+                    })
+                })
+        })
+        .await
     }
 
     async fn delete_metadata_from_kv(&self, key_id: &str) -> Result<()> {
         let path = self.metadata_key_path(key_id);
-        match kv2::delete_metadata(&self.vault()?.client, &self.metadata_kv_mount, &path).await {
-            Ok(_) => Ok(()),
-            Err(vaultrs::error::ClientError::ResponseWrapError)
-            | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(()),
-            Err(e) => Err(KmsError::backend_error(format!(
-                "Failed to delete transit key metadata from Vault KV: {e}"
-            ))),
-        }
+        let path = path.as_str();
+        self.run("vault_transit_delete_metadata", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            match kv2::delete_metadata(&vault.client, &self.metadata_kv_mount, path).await {
+                // Metadata that is already gone is a completed delete.
+                Ok(_)
+                | Err(vaultrs::error::ClientError::ResponseWrapError)
+                | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(()),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Failed to delete transit key metadata from Vault KV: {e}"))
+                })),
+            }
+        })
+        .await
+    }
+
+    /// Flip `deletion_allowed` on the transit key so it can be deleted.
+    async fn allow_transit_key_deletion(&self, key_id: &str) -> Result<()> {
+        self.run("vault_transit_allow_deletion", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            let mut builder = UpdateKeyConfigurationRequestBuilder::default();
+            builder.deletion_allowed(true);
+            key::update(&vault.client, &self.config.mount_path, key_id, Some(&mut builder))
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to allow deletion of Vault Transit key {key_id}: {e}"))
+                    })
+                })
+        })
+        .await
+    }
+
+    /// Physically delete the transit key material in Vault.
+    async fn delete_transit_key(&self, key_id: &str) -> Result<()> {
+        self.run("vault_transit_delete_key", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            key::delete(&vault.client, &self.config.mount_path, key_id)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}"))
+                    })
+                })
+        })
+        .await
     }
 
     async fn get_key_metadata(&self, key_id: &str) -> Result<TransitKeyMetadata> {
@@ -462,8 +583,40 @@ impl KmsClient for VaultTransitKmsClient {
             return Err(KmsError::unsupported_algorithm(algorithm));
         }
 
-        if self.read_transit_key(key_id).await.is_ok() {
-            return Err(KmsError::key_already_exists(key_id));
+        // Existence pre-check with read-confirm recovery: a create whose
+        // response was lost gets retried by callers, and used to be
+        // misreported as KeyAlreadyExists. Transit keys are always AES-256,
+        // so an existing enabled key of the default usage is exactly what
+        // this create would have produced; report it as the create result.
+        // Anything else keeps failing. A failed pre-check read must fail the
+        // create rather than fall through to re-creating over an unknown key.
+        match self.read_transit_key(key_id).await {
+            Ok(_) => {
+                let existing = self.get_key_metadata(key_id).await?;
+                return if existing.key_state == KeyState::Enabled && existing.key_usage == KeyUsage::EncryptDecrypt {
+                    info!(
+                        key_id,
+                        "Vault Transit create found an identical enabled key; treating it as a recovered create"
+                    );
+                    Ok(MasterKeyInfo {
+                        key_id: key_id.to_string(),
+                        version: existing.current_version,
+                        algorithm: algorithm.to_string(),
+                        usage: existing.key_usage,
+                        status: KeyStatus::Active,
+                        description: existing.description,
+                        metadata: existing.tags.clone(),
+                        created_at: existing.created_at,
+                        rotated_at: None,
+                        created_by: existing.created_by,
+                        deletion_date: None,
+                    })
+                } else {
+                    Err(KmsError::key_already_exists(key_id))
+                };
+            }
+            Err(KmsError::KeyNotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
 
         self.create_transit_key(key_id).await?;
@@ -497,9 +650,14 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn list_keys(&self, request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
-        let all_keys = key::list(&self.vault()?.client, &self.config.mount_path)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}")))?
+        let all_keys = self
+            .run("vault_transit_list_keys", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                key::list(&vault.client, &self.config.mount_path).await.map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}")))
+                })
+            })
+            .await?
             .keys;
 
         let mut filtered = Vec::new();
@@ -576,9 +734,20 @@ impl KmsClient for VaultTransitKmsClient {
     async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         self.ensure_key_state_allows(key_id, StateGatedOperation::Rotate).await?;
 
-        key::rotate(&self.vault()?.client, &self.config.mount_path, key_id)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to rotate Vault Transit key {key_id}: {e}")))?;
+        // Single attempt, never retried: replaying a rotate whose response was
+        // lost would advance the key version once more per replay.
+        self.run("vault_transit_rotate_key", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            key::rotate(&vault.client, &self.config.mount_path, key_id)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to rotate Vault Transit key {key_id}: {e}"))
+                    })
+                })
+        })
+        .await?;
 
         let mut metadata = self.get_key_metadata(key_id).await?;
         metadata.current_version += 1;
@@ -600,10 +769,16 @@ impl KmsClient for VaultTransitKmsClient {
     }
 
     async fn health_check(&self) -> Result<()> {
-        key::list(&self.vault()?.client, &self.config.mount_path)
-            .await
-            .map(|_| ())
-            .map_err(|e| KmsError::backend_error(format!("Vault Transit health check failed: {e}")))
+        self.run("vault_transit_health_check", OpClass::ReadIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            key::list(&vault.client, &self.config.mount_path)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Vault Transit health check failed: {e}")))
+                })
+        })
+        .await
     }
 
     fn backend_info(&self) -> BackendInfo {
@@ -660,8 +835,46 @@ impl VaultTransitKmsBackend {
 impl KmsBackend for VaultTransitKmsBackend {
     async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         let key_id = request.key_name.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if self.client.read_transit_key(&key_id).await.is_ok() {
-            return Err(KmsError::key_already_exists(&key_id));
+
+        // Existence pre-check with read-confirm recovery: a create whose
+        // response was lost gets retried by callers, and used to be
+        // misreported as KeyAlreadyExists. If the stored record is exactly
+        // what this request would have written, report it as the create
+        // result; any divergence keeps failing so a create can never adopt or
+        // reshape a key it would not have produced.
+        match self.client.read_transit_key(&key_id).await {
+            Ok(_) => {
+                let existing = self.client.get_key_metadata(&key_id).await?;
+                let requested = TransitKeyMetadata::from_create_request(&request);
+                return if existing.key_state == KeyState::Enabled
+                    && existing.key_usage == requested.key_usage
+                    && existing.description == requested.description
+                    && existing.tags == requested.tags
+                {
+                    info!(
+                        key_id,
+                        "Vault Transit create found an identical enabled key; treating it as a recovered create"
+                    );
+                    Ok(CreateKeyResponse {
+                        key_id: key_id.clone(),
+                        key_metadata: KeyMetadata {
+                            key_id,
+                            key_state: existing.key_state,
+                            key_usage: existing.key_usage,
+                            description: existing.description,
+                            creation_date: existing.created_at,
+                            deletion_date: existing.deletion_date,
+                            origin: existing.origin,
+                            key_manager: "VAULT_TRANSIT".to_string(),
+                            tags: existing.tags,
+                        },
+                    })
+                } else {
+                    Err(KmsError::key_already_exists(&key_id))
+                };
+            }
+            Err(KmsError::KeyNotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
 
         self.client.create_transit_key(&key_id).await?;
@@ -734,22 +947,9 @@ impl KmsBackend for VaultTransitKmsBackend {
         let deletion_date = if request.force_immediate.unwrap_or(false) {
             if key_metadata.key_state == KeyState::PendingDeletion {
                 if !self.client.read_transit_key(&key_id).await?.deletion_allowed {
-                    let mut update_builder = UpdateKeyConfigurationRequestBuilder::default();
-                    update_builder.deletion_allowed(true);
-                    key::update(
-                        &self.client.vault()?.client,
-                        &self.client.config.mount_path,
-                        &key_id,
-                        Some(&mut update_builder),
-                    )
-                    .await
-                    .map_err(|e| {
-                        KmsError::backend_error(format!("Failed to allow deletion of Vault Transit key {key_id}: {e}"))
-                    })?;
+                    self.client.allow_transit_key_deletion(&key_id).await?;
                 }
-                key::delete(&self.client.vault()?.client, &self.client.config.mount_path, &key_id)
-                    .await
-                    .map_err(|e| KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}")))?;
+                self.client.delete_transit_key(&key_id).await?;
                 self.client.delete_key_metadata(&key_id).await?;
                 None
             } else {
@@ -852,20 +1052,9 @@ impl KmsBackend for VaultTransitKmsBackend {
         }
 
         if !self.client.read_transit_key(key_id).await?.deletion_allowed {
-            let mut update_builder = UpdateKeyConfigurationRequestBuilder::default();
-            update_builder.deletion_allowed(true);
-            key::update(
-                &self.client.vault()?.client,
-                &self.client.config.mount_path,
-                key_id,
-                Some(&mut update_builder),
-            )
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to allow deletion of Vault Transit key {key_id}: {e}")))?;
+            self.client.allow_transit_key_deletion(key_id).await?;
         }
-        key::delete(&self.client.vault()?.client, &self.client.config.mount_path, key_id)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}")))?;
+        self.client.delete_transit_key(key_id).await?;
         self.client.delete_key_metadata(key_id).await?;
         Ok(ExpiredKeyRemoval::Removed)
     }
@@ -874,10 +1063,167 @@ impl KmsBackend for VaultTransitKmsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::scripted_vault::{ScriptedResponse, ScriptedVault};
     use crate::config::{
         DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, VaultAuthMethod, VaultTransitConfig,
     };
     use crate::types::KeyStatus;
+    use vaultrs::api::transit::responses::{ReadKeyData, ReadKeyResponse};
+
+    async fn scripted_client(responses: Vec<ScriptedResponse>) -> (ScriptedVault, VaultTransitKmsClient) {
+        let vault = ScriptedVault::serve(responses).await;
+        let config = VaultTransitConfig {
+            address: vault.address.clone(),
+            ..test_vault_transit_config()
+        };
+        let kms_config = KmsConfig {
+            timeout: Duration::from_secs(5),
+            retry_attempts: 3,
+            ..KmsConfig::default()
+        };
+        let client = VaultTransitKmsClient::new(config, &kms_config)
+            .await
+            .expect("scripted Vault Transit client");
+        (vault, client)
+    }
+
+    /// KV2 read payload for a persisted transit metadata record.
+    fn metadata_read_data(metadata: &TransitKeyMetadata) -> serde_json::Value {
+        let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
+        serde_json::json!({
+            "data": serde_json::to_value(&persisted).expect("serialize transit metadata"),
+            "metadata": {
+                "created_time": "2026-01-01T00:00:00Z",
+                "deletion_time": "",
+                "custom_metadata": null,
+                "destroyed": false,
+                "version": 1,
+            },
+        })
+    }
+
+    /// Transit read-key payload for an existing symmetric key.
+    fn transit_key_read_data(key_id: &str) -> serde_json::Value {
+        let response = ReadKeyResponse {
+            key_type: KeyType::Aes256Gcm96,
+            deletion_allowed: false,
+            derived: false,
+            exportable: false,
+            allow_plaintext_backup: false,
+            keys: ReadKeyData::Symmetric(HashMap::from([("1".to_string(), 1_700_000_000_u64)])),
+            min_decryption_version: 1,
+            min_encryption_version: 0,
+            name: key_id.to_string(),
+            supports_encryption: true,
+            supports_decryption: true,
+            supports_derivation: false,
+            supports_signing: false,
+            imported: Some(false),
+        };
+        serde_json::to_value(&response).expect("serialize transit key read response")
+    }
+
+    #[tokio::test]
+    async fn wired_transit_encrypt_retries_transient_status() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::error(429, "throttled"),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+        ])
+        .await;
+
+        let response = client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: b"plaintext".to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("encrypt must retry past a transient 429");
+        assert_eq!(response.ciphertext, b"vault:v1:scripted".to_vec());
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 3, "metadata read plus two encrypt attempts: {requests:?}");
+        assert_eq!(requests[1], "POST /v1/transit/encrypt/wired-key");
+        assert_eq!(requests[2], "POST /v1/transit/encrypt/wired-key");
+    }
+
+    #[tokio::test]
+    async fn wired_transit_rotate_is_never_retried() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::error(503, "standby"),
+        ])
+        .await;
+
+        let error = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect_err("the scripted 503 must fail the rotation");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "metadata read plus exactly one rotate attempt: {requests:?}");
+        assert_eq!(
+            requests[1], "POST /v1/transit/keys/wired-key/rotate",
+            "a rotation must never be replayed: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_transit_create_read_confirms_identical_existing_key() {
+        // The stored key and metadata are exactly what this create would have
+        // produced, so a retried create whose first response was lost recovers
+        // by reading them back instead of failing.
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+        ])
+        .await;
+
+        let recovered = client
+            .create_key("wired-key", "AES_256", None)
+            .await
+            .expect("an identical enabled key must read-confirm as a recovered create");
+        assert_eq!(recovered.status, KeyStatus::Active);
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "read-confirm must be decided from reads alone: {requests:?}");
+        assert!(
+            requests.iter().all(|line| line.starts_with("GET ")),
+            "a recovered create must not write anything: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_transit_create_still_fails_on_mismatched_existing_key() {
+        let mut metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        metadata.key_state = KeyState::Disabled;
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+        ])
+        .await;
+
+        let error = client
+            .create_key("wired-key", "AES_256", None)
+            .await
+            .expect_err("a non-enabled existing key must keep failing the create");
+        assert!(matches!(error, KmsError::KeyAlreadyExists { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert!(
+            requests.iter().all(|line| line.starts_with("GET ")),
+            "the rejected create must not write anything: {requests:?}"
+        );
+    }
 
     fn test_vault_transit_config() -> VaultTransitConfig {
         VaultTransitConfig {
