@@ -1533,6 +1533,14 @@ impl KmsBackend for LocalKmsBackend {
         })
     }
 
+    async fn enable_key(&self, key_id: &str) -> Result<()> {
+        self.client.enable_key(key_id, None).await
+    }
+
+    async fn disable_key(&self, key_id: &str) -> Result<()> {
+        self.client.disable_key(key_id, None).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
