@@ -94,7 +94,7 @@ pub struct GenerateDataKeyApiResponse {
     pub ciphertext_blob: String, // Base64 encoded
 }
 
-fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
+pub(super) fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
     if let Some(query) = uri.query() {
         query.split('&').for_each(|pair| {

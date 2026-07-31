@@ -14,12 +14,13 @@
 
 //! KMS admin handlers for HTTP API
 
-use super::{kms_dynamic, kms_keys, kms_management};
+use super::{kms_dynamic, kms_key_lifecycle, kms_keys, kms_management};
 use crate::admin::router::{AdminOperation, S3Router};
 
 pub fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     kms_management::register_kms_management_route(r)?;
     kms_dynamic::register_kms_dynamic_route(r)?;
     kms_keys::register_kms_key_route(r)?;
+    kms_key_lifecycle::register_kms_key_lifecycle_route(r)?;
     Ok(())
 }
