@@ -14,7 +14,8 @@
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
 #[global_allocator]
-static GLOBAL: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
+static GLOBAL: hotpath::CountingAllocator<mimalloc::MiMalloc> =
+    hotpath::CountingAllocator::new();
 
 #[cfg(not(all(feature = "hotpath", feature = "hotpath-alloc")))]
 #[global_allocator]
