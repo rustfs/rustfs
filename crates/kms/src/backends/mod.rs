@@ -256,6 +256,34 @@ pub trait KmsBackend: Send + Sync {
     /// Cancel key deletion
     async fn cancel_key_deletion(&self, request: CancelKeyDeletionRequest) -> Result<CancelKeyDeletionResponse>;
 
+    /// Enable a disabled key so it can be used for cryptographic operations
+    /// again.
+    ///
+    /// Backends that advertise [`BackendCapabilities::enable_disable`] must
+    /// override this method; the default rejects the operation.
+    async fn enable_key(&self, _key_id: &str) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without enable/disable support", "enable_key"))
+    }
+
+    /// Disable a key, rejecting new cryptographic use while existing data
+    /// remains decryptable.
+    ///
+    /// Backends that advertise [`BackendCapabilities::enable_disable`] must
+    /// override this method; the default rejects the operation.
+    async fn disable_key(&self, _key_id: &str) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without enable/disable support", "disable_key"))
+    }
+
+    /// Rotate a key to a new version while prior versions remain available
+    /// for decryption.
+    ///
+    /// Only backends that advertise [`BackendCapabilities::rotate`] (that is,
+    /// backends with retained version history) may override this method; the
+    /// default rejects the operation.
+    async fn rotate_key(&self, _key_id: &str) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without rotation support", "rotate_key"))
+    }
+
     /// Health check
     async fn health_check(&self) -> Result<bool>;
 
@@ -521,6 +549,21 @@ mod tests {
         assert!(!capabilities.schedule_deletion);
         assert!(!capabilities.versioning);
         assert!(!capabilities.physical_delete);
+    }
+
+    #[tokio::test]
+    async fn default_lifecycle_operations_are_unsupported() {
+        for (operation, result) in [
+            ("enable_key", MinimalBackend.enable_key("any-key").await),
+            ("disable_key", MinimalBackend.disable_key("any-key").await),
+            ("rotate_key", MinimalBackend.rotate_key("any-key").await),
+        ] {
+            let error = result.expect_err("backends must opt in to lifecycle operations by overriding them");
+            assert!(
+                matches!(error, KmsError::UnsupportedCapability { .. }),
+                "expected UnsupportedCapability for {operation}, got {error:?}"
+            );
+        }
     }
 
     #[tokio::test]
