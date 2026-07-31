@@ -19,7 +19,6 @@ use crate::types::*;
 use async_trait::async_trait;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[cfg(test)]
 mod contract_tests;
@@ -97,136 +96,6 @@ pub(crate) fn ensure_key_status_permits(key_id: &str, status: &KeyStatus, operat
         KeyStatus::Deleted => KeyState::Unavailable,
     };
     ensure_key_state_permits(key_id, &state, operation)
-}
-
-/// Abstract KMS client interface that all backends must implement
-#[async_trait]
-pub trait KmsClient: Send + Sync {
-    /// Generate a new data encryption key (DEK)
-    ///
-    /// Creates a new data key using the specified master key. The returned DataKey
-    /// contains both the plaintext and encrypted versions of the key.
-    ///
-    /// # Arguments
-    /// * `request` - The key generation request
-    /// * `context` - Optional operation context for auditing
-    ///
-    /// # Returns
-    /// Returns a DataKey containing both plaintext and encrypted key material
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo>;
-
-    /// Encrypt data directly using a master key
-    ///
-    /// Encrypts the provided plaintext using the specified master key.
-    /// This is different from generate_data_key as it encrypts user data directly.
-    ///
-    /// # Arguments
-    /// * `request` - The encryption request containing plaintext and key ID
-    /// * `context` - Optional operation context for auditing
-    async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse>;
-
-    /// Decrypt data using a master key
-    ///
-    /// Decrypts the provided ciphertext. The KMS automatically determines
-    /// which key was used for encryption based on the ciphertext metadata.
-    ///
-    /// # Arguments
-    /// * `request` - The decryption request containing ciphertext
-    /// * `context` - Optional operation context for auditing
-    async fn decrypt(&self, request: &DecryptRequest, context: Option<&OperationContext>) -> Result<Vec<u8>>;
-
-    /// Create a new master key
-    ///
-    /// Creates a new master key in the KMS with the specified ID.
-    /// Returns an error if a key with the same ID already exists.
-    ///
-    /// # Arguments
-    /// * `key_id` - Unique identifier for the new key
-    /// * `algorithm` - Key algorithm (e.g., "AES_256")
-    /// * `context` - Optional operation context for auditing
-    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo>;
-
-    /// Get information about a specific key
-    ///
-    /// Returns metadata and information about the specified key.
-    ///
-    /// # Arguments
-    /// * `key_id` - The key identifier
-    /// * `context` - Optional operation context for auditing
-    async fn describe_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<KeyInfo>;
-
-    /// List available keys
-    ///
-    /// Returns a paginated list of keys available in the KMS.
-    ///
-    /// # Arguments
-    /// * `request` - List request parameters (pagination, filters)
-    /// * `context` - Optional operation context for auditing
-    async fn list_keys(&self, request: &ListKeysRequest, context: Option<&OperationContext>) -> Result<ListKeysResponse>;
-
-    /// Enable a key
-    ///
-    /// Enables a previously disabled key, allowing it to be used for cryptographic operations.
-    ///
-    /// # Arguments
-    /// * `key_id` - The key identifier
-    /// * `context` - Optional operation context for auditing
-    async fn enable_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<()>;
-
-    /// Disable a key
-    ///
-    /// Disables a key, preventing it from being used for new cryptographic operations.
-    /// Existing encrypted data can still be decrypted.
-    ///
-    /// # Arguments
-    /// * `key_id` - The key identifier
-    /// * `context` - Optional operation context for auditing
-    async fn disable_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<()>;
-
-    /// Schedule key deletion
-    ///
-    /// Schedules a key for deletion after a specified number of days.
-    /// This allows for a grace period to recover the key if needed.
-    ///
-    /// # Arguments
-    /// * `key_id` - The key identifier
-    /// * `pending_window_days` - Number of days before actual deletion
-    /// * `context` - Optional operation context for auditing
-    async fn schedule_key_deletion(
-        &self,
-        key_id: &str,
-        pending_window_days: u32,
-        context: Option<&OperationContext>,
-    ) -> Result<()>;
-
-    /// Cancel key deletion
-    ///
-    /// Cancels a previously scheduled key deletion.
-    ///
-    /// # Arguments
-    /// * `key_id` - The key identifier
-    /// * `context` - Optional operation context for auditing
-    async fn cancel_key_deletion(&self, key_id: &str, context: Option<&OperationContext>) -> Result<()>;
-
-    /// Rotate a key
-    ///
-    /// Creates a new version of the specified key. Previous versions remain
-    /// available for decryption but new operations will use the new version.
-    ///
-    /// # Arguments
-    /// * `key_id` - The key identifier
-    /// * `context` - Optional operation context for auditing
-    async fn rotate_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo>;
-
-    /// Health check
-    ///
-    /// Performs a health check on the KMS backend to ensure it's operational.
-    async fn health_check(&self) -> Result<()>;
-
-    /// Get backend information
-    ///
-    /// Returns information about the KMS backend (type, version, etc.).
-    fn backend_info(&self) -> BackendInfo;
 }
 
 /// Simplified KMS backend interface for manager
@@ -325,58 +194,6 @@ pub enum ExpiredKeyRemoval {
     /// The key is pending deletion but its deadline has not passed, or it has
     /// no persisted deadline (legacy record) and is never auto-removed.
     NotExpired,
-}
-
-/// Information about a KMS backend
-#[derive(Debug, Clone)]
-pub struct BackendInfo {
-    /// Backend type name (e.g., "local", "vault")
-    pub backend_type: String,
-    /// Backend version
-    pub version: String,
-    /// Backend endpoint or location
-    pub endpoint: String,
-    /// Whether the backend is currently healthy
-    pub healthy: bool,
-    /// Additional metadata about the backend
-    pub metadata: HashMap<String, String>,
-}
-
-impl BackendInfo {
-    /// Create a new backend info
-    ///
-    /// # Arguments
-    /// * `backend_type` - The type of the backend
-    /// * `version` - The version of the backend
-    /// * `endpoint` - The endpoint or location of the backend
-    /// * `healthy` - Whether the backend is healthy
-    ///
-    /// # Returns
-    /// A new BackendInfo instance
-    ///
-    pub fn new(backend_type: String, version: String, endpoint: String, healthy: bool) -> Self {
-        Self {
-            backend_type,
-            version,
-            endpoint,
-            healthy,
-            metadata: HashMap::new(),
-        }
-    }
-
-    /// Add metadata to the backend info
-    ///
-    /// # Arguments
-    /// * `key` - Metadata key
-    /// * `value` - Metadata value
-    ///
-    /// # Returns
-    /// Updated BackendInfo instance
-    ///
-    pub fn with_metadata(mut self, key: String, value: String) -> Self {
-        self.metadata.insert(key, value);
-        self
-    }
 }
 
 /// Set of operations a KMS backend supports.

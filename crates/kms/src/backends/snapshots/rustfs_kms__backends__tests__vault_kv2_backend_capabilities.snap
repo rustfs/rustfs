@@ -8,7 +8,7 @@ expression: capabilities_snapshot(backend.capabilities())
   "encrypt": true,
   "generate_data_key": true,
   "physical_delete": true,
-  "rotate": false,
+  "rotate": true,
   "schedule_deletion": true,
-  "versioning": false
+  "versioning": true
 }

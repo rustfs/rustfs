@@ -18,9 +18,7 @@ use crate::backends::vault_credentials::{
     CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
     token_source_for,
 };
-use crate::backends::{
-    BackendCapabilities, BackendInfo, ExpiredKeyRemoval, KmsBackend, KmsClient, StateGatedOperation, ensure_key_state_permits,
-};
+use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -506,9 +504,12 @@ impl VaultTransitKmsClient {
     }
 }
 
-#[async_trait]
-impl KmsClient for VaultTransitKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
+impl VaultTransitKmsClient {
+    pub(crate) async fn generate_data_key(
+        &self,
+        request: &GenerateKeyRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<DataKeyInfo> {
         self.ensure_key_state_allows(&request.master_key_id, StateGatedOperation::GenerateDataKey)
             .await?;
 
@@ -540,7 +541,7 @@ impl KmsClient for VaultTransitKmsClient {
         ))
     }
 
-    async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
+    pub(crate) async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
         let metadata = self
             .ensure_key_state_allows(&request.key_id, StateGatedOperation::Encrypt)
             .await?;
@@ -556,7 +557,7 @@ impl KmsClient for VaultTransitKmsClient {
         })
     }
 
-    async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    pub(crate) async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
 
@@ -578,7 +579,14 @@ impl KmsClient for VaultTransitKmsClient {
             .await
     }
 
-    async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn create_key(
+        &self,
+        key_id: &str,
+        algorithm: &str,
+        _context: Option<&OperationContext>,
+    ) -> Result<MasterKeyInfo> {
         if algorithm != "AES_256" {
             return Err(KmsError::unsupported_algorithm(algorithm));
         }
@@ -645,11 +653,17 @@ impl KmsClient for VaultTransitKmsClient {
         })
     }
 
-    async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
         self.key_info(key_id).await
     }
 
-    async fn list_keys(&self, request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
+    pub(crate) async fn list_keys(
+        &self,
+        request: &ListKeysRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<ListKeysResponse> {
         let all_keys = self
             .run("vault_transit_list_keys", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
@@ -692,7 +706,7 @@ impl KmsClient for VaultTransitKmsClient {
         })
     }
 
-    async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    pub(crate) async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         // A pending deletion must be reverted through cancel_key_deletion, not
         // silently by enabling, so the gate rejects PendingDeletion here.
         let mut metadata = self.ensure_key_state_allows(key_id, StateGatedOperation::Enable).await?;
@@ -701,13 +715,15 @@ impl KmsClient for VaultTransitKmsClient {
         self.store_key_metadata(key_id, &metadata).await
     }
 
-    async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    pub(crate) async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         let mut metadata = self.ensure_key_state_allows(key_id, StateGatedOperation::Disable).await?;
         metadata.key_state = KeyState::Disabled;
         self.store_key_metadata(key_id, &metadata).await
     }
 
-    async fn schedule_key_deletion(
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn schedule_key_deletion(
         &self,
         key_id: &str,
         pending_window_days: u32,
@@ -721,17 +737,7 @@ impl KmsClient for VaultTransitKmsClient {
         self.store_key_metadata(key_id, &metadata).await
     }
 
-    async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        let mut metadata = self.get_key_metadata(key_id).await?;
-        if metadata.key_state != KeyState::PendingDeletion {
-            return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
-        }
-        metadata.key_state = KeyState::Enabled;
-        metadata.deletion_date = None;
-        self.store_key_metadata(key_id, &metadata).await
-    }
-
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+    pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         self.ensure_key_state_allows(key_id, StateGatedOperation::Rotate).await?;
 
         // Single attempt, never retried: replaying a rotate whose response was
@@ -768,7 +774,7 @@ impl KmsClient for VaultTransitKmsClient {
         })
     }
 
-    async fn health_check(&self) -> Result<()> {
+    pub(crate) async fn health_check(&self) -> Result<()> {
         self.run("vault_transit_health_check", OpClass::ReadIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
             key::list(&vault.client, &self.config.mount_path)
@@ -780,11 +786,6 @@ impl KmsClient for VaultTransitKmsClient {
         })
         .await
     }
-
-    fn backend_info(&self) -> BackendInfo {
-        BackendInfo::new("vault-transit".to_string(), "0.1.0".to_string(), self.config.address.clone(), true)
-            .with_metadata("mount_path".to_string(), self.config.mount_path.clone())
-    }
 }
 
 pub struct VaultTransitKmsBackend {
@@ -792,14 +793,6 @@ pub struct VaultTransitKmsBackend {
 }
 
 impl VaultTransitKmsBackend {
-    /// Lifecycle driver for the shared state-machine contract tests. Using the
-    /// backend's own client keeps its in-process metadata cache coherent with
-    /// the transitions the tests perform.
-    #[cfg(test)]
-    pub(crate) fn lifecycle_client(&self) -> &VaultTransitKmsClient {
-        &self.client
-    }
-
     pub async fn new(config: KmsConfig) -> Result<Self> {
         config.validate()?;
 
@@ -998,6 +991,18 @@ impl KmsBackend for VaultTransitKmsBackend {
             key_id: request.key_id.clone(),
             key_metadata: self.client.key_metadata_response(&request.key_id).await?,
         })
+    }
+
+    async fn enable_key(&self, key_id: &str) -> Result<()> {
+        self.client.enable_key(key_id, None).await
+    }
+
+    async fn disable_key(&self, key_id: &str) -> Result<()> {
+        self.client.disable_key(key_id, None).await
+    }
+
+    async fn rotate_key(&self, key_id: &str) -> Result<()> {
+        self.client.rotate_key(key_id, None).await.map(|_| ())
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -1436,5 +1441,59 @@ mod tests {
         let metadata = TransitKeyMetadata::synthesized();
         assert_eq!(metadata.key_state, KeyState::Enabled);
         assert!(metadata.deletion_date.is_none());
+    }
+
+    /// KV2 write acknowledgement (`SecretVersionMetadata`) for `kv2::set`.
+    fn kv2_write_ack() -> serde_json::Value {
+        serde_json::json!({
+            "created_time": "2026-01-01T00:00:00Z",
+            "custom_metadata": null,
+            "deletion_time": "",
+            "destroyed": false,
+            "version": 2,
+        })
+    }
+
+    #[tokio::test]
+    async fn wired_backend_lifecycle_overrides_reach_the_client() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let vault = ScriptedVault::serve(vec![
+            // disable: metadata cache miss reads KV, then persists Disabled.
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // enable: the state gate hits the metadata cache, so only the
+            // persisting write goes out.
+            ScriptedResponse::ok(kv2_write_ack()),
+            // rotate: the gate hits the cache again; the single rotate
+            // attempt fails and must not be retried.
+            ScriptedResponse::error(503, "standby"),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        backend
+            .disable_key("wired-key")
+            .await
+            .expect("KmsBackend::disable_key must persist through the client");
+        backend
+            .enable_key("wired-key")
+            .await
+            .expect("KmsBackend::enable_key must persist through the client");
+        let error = backend
+            .rotate_key("wired-key")
+            .await
+            .expect_err("the scripted 503 must fail the rotation");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 4, "gated reads, two writes and one rotate attempt: {requests:?}");
+        assert_eq!(requests[3], "POST /v1/transit/keys/wired-key/rotate", "{requests:?}");
     }
 }
