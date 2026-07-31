@@ -20,7 +20,7 @@ use aws_sdk_sts::operation::RequestId;
 use aws_sdk_sts::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use bytes::Bytes;
-use http::header::CONTENT_TYPE;
+use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -32,13 +32,15 @@ use serial_test::serial;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, timeout};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type TestResult = Result<(), BoxError>;
+const OPA_AUTH_TOKEN: &str = "sts-opa-token";
 
 fn sts_client(url: &str, access_key: &str, secret_key: &str, session_token: Option<&str>) -> Client {
     let mut config = Config::builder()
@@ -86,13 +88,7 @@ async fn create_user_with_policy(
     policy_name: &str,
     statements: Value,
 ) -> TestResult {
-    admin_ok(
-        env,
-        http::Method::PUT,
-        &format!("/rustfs/admin/v3/add-user?accessKey={user}"),
-        Some(serde_json::json!({ "secretKey": secret, "status": "enabled" }).to_string()),
-    )
-    .await?;
+    create_user(env, user, secret).await?;
     admin_ok(
         env,
         http::Method::PUT,
@@ -111,6 +107,17 @@ async fn create_user_with_policy(
         http::Method::POST,
         "/rustfs/admin/v3/idp/builtin/policy/attach",
         Some(serde_json::json!({ "policies": [policy_name], "user": user }).to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn create_user(env: &RustFSTestEnvironment, user: &str, secret: &str) -> TestResult {
+    admin_ok(
+        env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-user?accessKey={user}"),
+        Some(serde_json::json!({ "secretKey": secret, "status": "enabled" }).to_string()),
     )
     .await?;
     Ok(())
@@ -141,7 +148,19 @@ async fn assert_access_denied(client: &Client, context: &str) -> TestResult {
 async fn handle_opa_request(
     request: Request<Incoming>,
     requests: mpsc::UnboundedSender<Value>,
+    validation_started: mpsc::UnboundedSender<()>,
+    validation_mode: OpaValidationMode,
+    expected_authorization: Option<String>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    if let Some(expected_authorization) = expected_authorization
+        && request.headers().get(AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some(expected_authorization.as_str())
+    {
+        return Ok(Response::builder()
+            .status(401)
+            .body(Full::new(Bytes::new()))
+            .expect("static OPA unauthorized response must be valid"));
+    }
+
     let body = match request.into_body().collect().await {
         Ok(body) => body.to_bytes(),
         Err(error) => {
@@ -165,6 +184,16 @@ async fn handle_opa_request(
             }
         }
     };
+    if payload.is_none() {
+        let _ = validation_started.send(());
+        if let OpaValidationMode::DelayedUnavailable(release) = validation_mode {
+            release.notified().await;
+            return Ok(Response::builder()
+                .status(503)
+                .body(Full::new(Bytes::new()))
+                .expect("static OPA unavailable response must be valid"));
+        }
+    }
     let allow = match payload.as_ref().and_then(|value| value.pointer("/input/identity/account")) {
         Some(Value::String(account)) if account == "opaallow" => payload
             .as_ref()
@@ -186,17 +215,40 @@ async fn handle_opa_request(
         .expect("static OPA response must be valid"))
 }
 
+#[derive(Clone)]
+enum OpaValidationMode {
+    Ready,
+    DelayedUnavailable(Arc<Notify>),
+}
+
 struct OpaMock {
     url: String,
     requests: mpsc::UnboundedReceiver<Value>,
+    validation_started: mpsc::UnboundedReceiver<()>,
+    validation_release: Option<Arc<Notify>>,
     task: JoinHandle<()>,
 }
 
 impl OpaMock {
     async fn start() -> Result<Self, BoxError> {
+        Self::start_with_mode(OpaValidationMode::Ready, Some(OPA_AUTH_TOKEN)).await
+    }
+
+    async fn start_delayed_unavailable() -> Result<Self, BoxError> {
+        let release = Arc::new(Notify::new());
+        Self::start_with_mode(OpaValidationMode::DelayedUnavailable(release), None).await
+    }
+
+    async fn start_with_mode(validation_mode: OpaValidationMode, auth_token: Option<&str>) -> Result<Self, BoxError> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/v1/data/rustfs/authz/allow", listener.local_addr()?);
         let (requests_tx, requests) = mpsc::unbounded_channel();
+        let (validation_started_tx, validation_started) = mpsc::unbounded_channel();
+        let expected_authorization = auth_token.map(|token| format!("Bearer {token}"));
+        let validation_release = match &validation_mode {
+            OpaValidationMode::Ready => None,
+            OpaValidationMode::DelayedUnavailable(release) => Some(Arc::clone(release)),
+        };
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -204,8 +256,19 @@ impl OpaMock {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
                         let requests = requests_tx.clone();
+                        let validation_started = validation_started_tx.clone();
+                        let validation_mode = validation_mode.clone();
+                        let expected_authorization = expected_authorization.clone();
                         connections.spawn(async move {
-                            let handler = service_fn(move |request| handle_opa_request(request, requests.clone()));
+                            let handler = service_fn(move |request| {
+                                handle_opa_request(
+                                    request,
+                                    requests.clone(),
+                                    validation_started.clone(),
+                                    validation_mode.clone(),
+                                    expected_authorization.clone(),
+                                )
+                            });
                             let _ = http1::Builder::new()
                                 .serve_connection(TokioIo::new(stream), handler)
                                 .await;
@@ -215,13 +278,31 @@ impl OpaMock {
                 }
             }
         });
-        Ok(Self { url, requests, task })
+        Ok(Self {
+            url,
+            requests,
+            validation_started,
+            validation_release,
+            task,
+        })
     }
 
     async fn next_request(&mut self) -> Result<Value, BoxError> {
         timeout(Duration::from_secs(5), self.requests.recv())
             .await?
             .ok_or_else(|| "OPA request channel closed".into())
+    }
+
+    async fn wait_for_validation(&mut self) -> TestResult {
+        timeout(Duration::from_secs(5), self.validation_started.recv())
+            .await?
+            .ok_or_else(|| "OPA validation channel closed".into())
+    }
+
+    fn release_validation(&self) {
+        if let Some(release) = &self.validation_release {
+            release.notify_one();
+        }
     }
 }
 
@@ -299,7 +380,10 @@ async fn test_sts_query_responses_are_aws_sdk_compatible() -> TestResult {
     let implicit_user = "stsimplicit";
     let explicit_allow_user = "stsallow";
     let explicit_deny_user = "stsdeny";
+    let policyless_user = "stspolicyless";
     let secret = "stsAuthzSecret123";
+    create_user(&env, policyless_user, secret).await?;
+    assert_access_denied(&sts_client(&env.url, policyless_user, secret, None), "policyless user").await?;
     create_user_with_policy(
         &env,
         implicit_user,
@@ -372,8 +456,14 @@ async fn test_sts_assume_role_opa_contract() -> TestResult {
 
     let mut opa = OpaMock::start().await?;
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str())])
-        .await?;
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str()),
+            ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", OPA_AUTH_TOKEN),
+        ],
+    )
+    .await?;
 
     let secret = "stsOpaSecret123";
     create_user_with_policy(
@@ -426,6 +516,42 @@ async fn test_sts_assume_role_opa_contract() -> TestResult {
         accounts.insert(account.to_owned());
     }
     assert_eq!(accounts, BTreeSet::from(["opaallow".to_owned(), "opadeny".to_owned()]));
+
+    env.stop_server();
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sts_assume_role_fails_closed_while_opa_is_unavailable() -> TestResult {
+    init_logging();
+
+    let mut opa = OpaMock::start_delayed_unavailable().await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str())])
+        .await?;
+    opa.wait_for_validation().await?;
+
+    let user = "opaunavailable";
+    let secret = "stsOpaUnavailableSecret123";
+    create_user_with_policy(
+        &env,
+        user,
+        secret,
+        "sts-opa-unavailable-local-policy",
+        serde_json::json!([{
+            "Effect": "Allow",
+            "Action": ["s3:ListAllMyBuckets"],
+            "Resource": ["arn:aws:s3:::*"],
+        }]),
+    )
+    .await?;
+
+    assert_access_denied(&sts_client(&env.url, user, secret, None), "configured OPA initialization").await?;
+
+    opa.release_validation();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_access_denied(&sts_client(&env.url, user, secret, None), "configured OPA validation failure").await?;
 
     env.stop_server();
     Ok(())

@@ -41,7 +41,7 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
 use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_needs_existing_object_tag_for_args};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
@@ -61,10 +61,45 @@ const VERIFIED_FEDERATED_POLICY_CLAIM: &str = "x-rustfs-internal-federated-polic
 const FEDERATED_POLICY_BOUNDARY_CLAIM: &str = "x-rustfs-internal-federated-boundary";
 pub(crate) const SITE_REPLICATOR_CLAIM: &str = "site-replicator";
 
-static POLICY_PLUGIN_CLIENT: OnceLock<Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>>> = OnceLock::new();
+#[derive(Clone)]
+enum PolicyPluginState {
+    Disabled,
+    Initializing,
+    Ready(opa::AuthZPlugin),
+    Failed,
+}
 
-fn get_policy_plugin_client() -> Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>> {
-    POLICY_PLUGIN_CLIENT.get_or_init(|| Arc::new(RwLock::new(None))).clone()
+static POLICY_PLUGIN_STATE: OnceLock<Arc<RwLock<PolicyPluginState>>> = OnceLock::new();
+
+fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
+    POLICY_PLUGIN_STATE
+        .get_or_init(|| {
+            let configured = opa::is_configured();
+            let state = Arc::new(RwLock::new(if configured {
+                PolicyPluginState::Initializing
+            } else {
+                PolicyPluginState::Disabled
+            }));
+            if configured {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let next_state = match opa::lookup_config().await {
+                        Ok(conf) if conf.enable() => {
+                            info!("OPA plugin enabled");
+                            PolicyPluginState::Ready(opa::AuthZPlugin::new(conf))
+                        }
+                        Ok(_) => PolicyPluginState::Failed,
+                        Err(e) => {
+                            error!("Error loading OPA configuration err:{}", e);
+                            PolicyPluginState::Failed
+                        }
+                    };
+                    *state.write().await = next_state;
+                });
+            }
+            state
+        })
+        .clone()
 }
 
 pub struct IamSys<T> {
@@ -173,19 +208,7 @@ impl<T: Store> IamSys<T> {
     /// # Returns
     /// A new instance of IamSys
     pub fn new(store: Arc<IamCache<T>>) -> Self {
-        tokio::spawn(async move {
-            match opa::lookup_config().await {
-                Ok(conf) => {
-                    if conf.enable() {
-                        Self::set_policy_plugin_client(opa::AuthZPlugin::new(conf)).await;
-                        info!("OPA plugin enabled");
-                    }
-                }
-                Err(e) => {
-                    error!("Error loading OPA configuration err:{}", e);
-                }
-            };
-        });
+        get_policy_plugin_state();
 
         Self {
             store,
@@ -206,15 +229,22 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_policy_plugin_client(client: rustfs_policy::policy::opa::AuthZPlugin) {
-        let policy_plugin_client = get_policy_plugin_client();
-        let mut guard = policy_plugin_client.write().await;
-        *guard = Some(client);
+        let policy_plugin_state = get_policy_plugin_state();
+        let mut guard = policy_plugin_state.write().await;
+        *guard = PolicyPluginState::Ready(client);
     }
 
     pub async fn get_policy_plugin_client() -> Option<rustfs_policy::policy::opa::AuthZPlugin> {
-        let policy_plugin_client = get_policy_plugin_client();
-        let guard = policy_plugin_client.read().await;
-        guard.clone()
+        let policy_plugin_state = get_policy_plugin_state();
+        let guard = policy_plugin_state.read().await;
+        match &*guard {
+            PolicyPluginState::Ready(client) => Some(client.clone()),
+            PolicyPluginState::Disabled | PolicyPluginState::Initializing | PolicyPluginState::Failed => None,
+        }
+    }
+
+    async fn policy_plugin_state() -> PolicyPluginState {
+        get_policy_plugin_state().read().await.clone()
     }
 
     pub async fn load_group(&self, name: &str) -> Result<()> {
@@ -1060,11 +1090,20 @@ impl<T: Store> IamSys<T> {
             };
         }
 
-        if Self::get_policy_plugin_client().await.is_some() {
-            return PreparedIamAuth {
-                needs_existing_object_tag: false,
-                mode: PreparedIamMode::Opa,
-            };
+        match Self::policy_plugin_state().await {
+            PolicyPluginState::Ready(_) => {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Opa,
+                };
+            }
+            PolicyPluginState::Initializing | PolicyPluginState::Failed => {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
+            }
+            PolicyPluginState::Disabled => {}
         }
 
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
@@ -1165,10 +1204,13 @@ impl<T: Store> IamSys<T> {
 
         let (resolved_policies, combined_policy) = self.store.merge_policies(&policies.join(",")).await;
         if args.deny_only {
-            let resolved_policy_names = MappedPolicy::new(&resolved_policies).policy_set();
+            let resolved_policy_names: HashSet<&str> = resolved_policies
+                .split(',')
+                .filter(|policy_name| !policy_name.trim().is_empty())
+                .collect();
             if policies
                 .iter()
-                .any(|policy_name| !resolved_policy_names.contains(policy_name))
+                .any(|policy_name| !resolved_policy_names.contains(policy_name.as_str()))
             {
                 return PreparedIamAuth {
                     needs_existing_object_tag: false,
@@ -3357,6 +3399,116 @@ mod tests {
         assert!(
             !iam_sys.eval_prepared(&prepared, &args).await,
             "deny-only evaluation must fail closed when a mapped policy document is unresolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_full_evaluation_keeps_resolved_part_of_partial_mapping() {
+        let iam_sys = test_iam_sys().await;
+        let user = "regular-partial-policy";
+        let identity = UserIdentity::from(Credentials {
+            access_key: user.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        iam_sys.store.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_user(user, &identity, now);
+            cache.add_or_update_user_policy(user, &MappedPolicy::new("readwrite,missing-policy"), now);
+        });
+
+        let groups = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let args = Args {
+            account: user,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "object",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_regular_auth(&args).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Regular { .. }));
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "full evaluation must preserve the historical partial-resolution behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_deny_only_honors_group_derived_explicit_deny() {
+        let iam_sys = test_iam_sys().await;
+        let deny_policy =
+            Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["sts:AssumeRole"]}]}"#)
+                .expect("group deny policy should parse");
+        let now = OffsetDateTime::now_utc();
+        iam_sys
+            .store
+            .cache
+            .add_or_update_policy_doc("deny-assume-role", &PolicyDoc::new(deny_policy), now);
+        iam_sys
+            .store
+            .cache
+            .add_or_update_group_policy("testgroup", &MappedPolicy::new("deny-assume-role"), now);
+
+        let groups = Some(vec!["testgroup".to_string()]);
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let args = Args {
+            account: "sts-fallback-test-parent",
+            groups: &groups,
+            action: Action::StsAction(StsAction::AssumeRoleAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let prepared = iam_sys.prepare_regular_auth(&args).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Regular { .. }));
+        assert!(
+            !iam_sys.eval_prepared(&prepared, &args).await,
+            "group-derived explicit Deny must remain authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_deny_only_rejects_unresolved_group_mapping() {
+        let iam_sys = test_iam_sys().await;
+        iam_sys.store.cache.add_or_update_group_policy(
+            "testgroup",
+            &MappedPolicy::new("readwrite,missing-policy"),
+            OffsetDateTime::now_utc(),
+        );
+
+        let groups = Some(vec!["testgroup".to_string()]);
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let args = Args {
+            account: "sts-fallback-test-parent",
+            groups: &groups,
+            action: Action::StsAction(StsAction::AssumeRoleAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let prepared = iam_sys.prepare_regular_auth(&args).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Deny));
+        assert!(
+            !iam_sys.eval_prepared(&prepared, &args).await,
+            "deny-only evaluation must fail closed for an unresolved group-derived mapping"
         );
     }
 
