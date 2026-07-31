@@ -73,6 +73,7 @@ hotpath-alloc = [
     "rustfs-rio/hotpath-alloc",
 ]
 hotpath-cpu = [
+    "hotpath",
     "hotpath/hotpath-cpu",
     "rustfs-ecstore/hotpath-cpu",
     "rustfs-filemeta/hotpath-cpu",

@@ -32,7 +32,7 @@ workspace = true
 default = []
 hotpath = ["hotpath/hotpath", "hotpath/reqwest-0-13"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath/hotpath-cpu"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
 rustfs-credentials = { workspace = true }
