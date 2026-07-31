@@ -9490,6 +9490,8 @@ dependencies = [
  "insta",
  "jiff",
  "md-5 0.11.0",
+ "metrics",
+ "metrics-util",
  "moka",
  "rand 0.10.2",
  "reqwest",

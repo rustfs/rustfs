@@ -27,6 +27,12 @@
 //! retried automatically: a response lost after the server applied the write
 //! would otherwise be replayed into duplicate side effects (extra key versions,
 //! repeated deletes).
+//!
+//! Every execution also records operation metrics (attempt failures by retry
+//! class, terminal outcome, attempts used, wall-clock duration) through the
+//! process-global `metrics` recorder. Metric labels carry only static enum
+//! values — operation names, classes, outcomes — never key identifiers, key
+//! material, ciphertext, or tokens.
 
 use std::future::Future;
 use std::time::Duration;
@@ -200,6 +206,130 @@ fn equal_jitter(rng: &mut impl RngExt, cap: Duration) -> Duration {
     half + Duration::from_nanos(rng.random_range(0..=spread))
 }
 
+// ---------------------------------------------------------------------------
+// Metrics
+//
+// Every execution is recorded here, at the single choke point all backend
+// calls flow through, so instrumenting a new call site costs nothing beyond
+// naming its operation. Label values are exclusively static enum strings
+// (operation names, classes, outcomes) — key identifiers, key material,
+// ciphertext, and tokens must never reach a metric label.
+// ---------------------------------------------------------------------------
+
+/// Counter: operations executed, by `operation`, `op_class`, and `outcome`.
+const METRIC_OPERATIONS_TOTAL: &str = "rustfs_kms_backend_operations_total";
+/// Counter: failed attempts, by `operation` and `error_class` (including
+/// `attempt_timeout` for attempts cut off by the per-attempt timeout).
+const METRIC_ATTEMPT_FAILURES_TOTAL: &str = "rustfs_kms_backend_attempt_failures_total";
+/// Histogram: wall-clock duration of a whole operation (attempts plus
+/// backoff), in seconds, by `operation` and `outcome`.
+const METRIC_OPERATION_DURATION_SECONDS: &str = "rustfs_kms_backend_operation_duration_seconds";
+/// Histogram: attempts one operation used before completing, by `operation`
+/// and `outcome`.
+const METRIC_OPERATION_ATTEMPTS: &str = "rustfs_kms_backend_operation_attempts";
+
+impl OpClass {
+    fn as_label(self) -> &'static str {
+        match self {
+            OpClass::ReadIdempotent => "read_idempotent",
+            OpClass::MutatingNonIdempotent => "mutating_non_idempotent",
+            OpClass::Auth => "auth",
+        }
+    }
+}
+
+impl ErrorClass {
+    fn as_label(self) -> &'static str {
+        match self {
+            ErrorClass::RetryableConn => "retryable_conn",
+            ErrorClass::RetryableStatus => "retryable_status",
+            ErrorClass::Fatal => "fatal",
+        }
+    }
+}
+
+/// How one policy execution terminated, for the `outcome` metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Success,
+    /// A fatal-classified failure ended the operation on its first observation.
+    Fatal,
+    /// The attempt budget ran out; the last failure was retryable (including a
+    /// timed-out final attempt).
+    BudgetExhausted,
+    /// The operation deadline ran out before another attempt could complete.
+    DeadlineExceeded,
+    Cancelled,
+}
+
+impl Outcome {
+    fn as_label(self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+            Outcome::Fatal => "fatal",
+            Outcome::BudgetExhausted => "budget_exhausted",
+            Outcome::DeadlineExceeded => "deadline_exceeded",
+            Outcome::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Register metric descriptions once per process.
+fn describe_metrics() {
+    static DESCRIBE: std::sync::Once = std::sync::Once::new();
+    DESCRIBE.call_once(|| {
+        metrics::describe_counter!(
+            METRIC_OPERATIONS_TOTAL,
+            "Total KMS backend operations executed under the operation policy, by operation, operation class, and outcome"
+        );
+        metrics::describe_counter!(
+            METRIC_ATTEMPT_FAILURES_TOTAL,
+            "Total failed KMS backend attempts, by operation and retry classification"
+        );
+        metrics::describe_histogram!(
+            METRIC_OPERATION_DURATION_SECONDS,
+            "Wall-clock duration of KMS backend operations including retries and backoff, in seconds"
+        );
+        metrics::describe_histogram!(
+            METRIC_OPERATION_ATTEMPTS,
+            "Number of attempts a KMS backend operation used before completing"
+        );
+    });
+}
+
+/// Record one failed attempt with its retry classification.
+fn record_attempt_failure(operation: &'static str, error_class: &'static str) {
+    metrics::counter!(
+        METRIC_ATTEMPT_FAILURES_TOTAL,
+        "operation" => operation,
+        "error_class" => error_class
+    )
+    .increment(1);
+}
+
+/// Record the terminal outcome of one policy execution.
+fn record_operation(operation: &'static str, class: OpClass, outcome: Outcome, attempts: u32, elapsed: Duration) {
+    metrics::counter!(
+        METRIC_OPERATIONS_TOTAL,
+        "operation" => operation,
+        "op_class" => class.as_label(),
+        "outcome" => outcome.as_label()
+    )
+    .increment(1);
+    metrics::histogram!(
+        METRIC_OPERATION_DURATION_SECONDS,
+        "operation" => operation,
+        "outcome" => outcome.as_label()
+    )
+    .record(elapsed.as_secs_f64());
+    metrics::histogram!(
+        METRIC_OPERATION_ATTEMPTS,
+        "operation" => operation,
+        "outcome" => outcome.as_label()
+    )
+    .record(f64::from(attempts));
+}
+
 /// Run `attempt` under the policy.
 ///
 /// Each attempt is bounded by `attempt_timeout` (further capped by whatever is
@@ -234,9 +364,33 @@ pub(crate) async fn execute_with_jitter<T, F, Fut, J>(
     class: OpClass,
     policy: &RetryPolicy,
     cancel: &CancellationToken,
+    jitter: J,
+    attempt: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, AttemptError>>,
+    J: FnMut(Duration) -> Duration,
+{
+    describe_metrics();
+    let started = Instant::now();
+    let mut attempts_made = 0u32;
+    let (outcome, result) = drive_attempts(operation, class, policy, cancel, jitter, attempt, &mut attempts_made).await;
+    record_operation(operation, class, outcome, attempts_made, started.elapsed());
+    result
+}
+
+/// The attempt loop behind [`execute_with_jitter`], returning the terminal
+/// outcome alongside the result so the caller can record it exactly once.
+async fn drive_attempts<T, F, Fut, J>(
+    operation: &'static str,
+    class: OpClass,
+    policy: &RetryPolicy,
+    cancel: &CancellationToken,
     mut jitter: J,
     mut attempt: F,
-) -> Result<T>
+    attempts_made: &mut u32,
+) -> (Outcome, Result<T>)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<T, AttemptError>>,
@@ -247,48 +401,68 @@ where
 
     let mut attempt_no = 0u32;
     loop {
-        attempt_no += 1;
         if cancel.is_cancelled() {
-            return Err(KmsError::operation_cancelled(format!(
-                "{operation} cancelled before attempt {attempt_no}"
-            )));
+            return (
+                Outcome::Cancelled,
+                Err(KmsError::operation_cancelled(format!(
+                    "{operation} cancelled before attempt {}",
+                    attempt_no + 1
+                ))),
+            );
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(KmsError::operation_timed_out(format!(
-                "{operation} exceeded operation deadline of {:?}",
-                policy.op_deadline
-            )));
+            return (
+                Outcome::DeadlineExceeded,
+                Err(KmsError::operation_timed_out(format!(
+                    "{operation} exceeded operation deadline of {:?}",
+                    policy.op_deadline
+                ))),
+            );
         }
 
+        attempt_no += 1;
+        *attempts_made = attempt_no;
         let attempt_budget = policy.attempt_timeout.min(remaining);
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return Err(KmsError::operation_cancelled(format!("{operation} cancelled during attempt {attempt_no}")));
+                return (
+                    Outcome::Cancelled,
+                    Err(KmsError::operation_cancelled(format!("{operation} cancelled during attempt {attempt_no}"))),
+                );
             }
             outcome = tokio::time::timeout(attempt_budget, attempt()) => outcome,
         };
 
         let failure = match outcome {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(failure)) => failure,
-            Err(_) => AttemptError {
-                class: ErrorClass::RetryableConn,
-                error: KmsError::operation_timed_out(format!(
-                    "{operation} attempt {attempt_no} timed out after {attempt_budget:?}"
-                )),
-            },
+            Ok(Ok(value)) => return (Outcome::Success, Ok(value)),
+            Ok(Err(failure)) => {
+                record_attempt_failure(operation, failure.class.as_label());
+                failure
+            }
+            Err(_) => {
+                record_attempt_failure(operation, "attempt_timeout");
+                AttemptError {
+                    class: ErrorClass::RetryableConn,
+                    error: KmsError::operation_timed_out(format!(
+                        "{operation} attempt {attempt_no} timed out after {attempt_budget:?}"
+                    )),
+                }
+            }
         };
 
-        if failure.class == ErrorClass::Fatal || attempt_no >= max_attempts {
-            return Err(failure.error);
+        if failure.class == ErrorClass::Fatal {
+            return (Outcome::Fatal, Err(failure.error));
+        }
+        if attempt_no >= max_attempts {
+            return (Outcome::BudgetExhausted, Err(failure.error));
         }
 
         let backoff = jitter(backoff_cap(policy, attempt_no));
         if backoff >= deadline.saturating_duration_since(Instant::now()) {
             // Not enough deadline budget left for another attempt.
-            return Err(failure.error);
+            return (Outcome::DeadlineExceeded, Err(failure.error));
         }
         tracing::warn!(
             operation,
@@ -300,7 +474,10 @@ where
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return Err(KmsError::operation_cancelled(format!("{operation} cancelled during retry backoff")));
+                return (
+                    Outcome::Cancelled,
+                    Err(KmsError::operation_cancelled(format!("{operation} cancelled during retry backoff"))),
+                );
             }
             _ = tokio::time::sleep(backoff) => {}
         }
@@ -627,5 +804,314 @@ mod tests {
         assert_eq!(classify_vaultrs(&malformed), ErrorClass::Fatal);
         assert_eq!(classify_vaultrs(&ClientError::ResponseEmptyError), ErrorClass::Fatal);
         assert_eq!(classify_vaultrs(&ClientError::InvalidLoginMethodError), ErrorClass::Fatal);
+    }
+
+    // -- Metric emission ----------------------------------------------------
+    //
+    // Each test installs a thread-local debugging recorder and drives a
+    // paused-clock current-thread runtime inside it, so the emitted metrics
+    // (including virtual-clock durations) are fully deterministic.
+
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    type MetricEntry = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
+
+    /// Run `test` on a paused current-thread runtime under a debugging
+    /// recorder and return one snapshot of everything it emitted.
+    ///
+    /// A single snapshot per test on purpose: `Snapshotter::snapshot` drains
+    /// the recorded state, so taking it per assertion would only show the
+    /// first assertion any data.
+    fn record_metrics<Out>(test: impl FnOnce() -> std::pin::Pin<Box<dyn Future<Output = Out>>>) -> (Vec<MetricEntry>, Out) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let out = metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("current-thread runtime must build");
+            runtime.block_on(test())
+        });
+        (snapshotter.snapshot().into_vec(), out)
+    }
+
+    fn labels_match(key: &metrics::Key, labels: &[(&str, &str)]) -> bool {
+        labels
+            .iter()
+            .all(|(label, expected)| key.labels().any(|l| l.key() == *label && l.value() == *expected))
+    }
+
+    fn counter_value(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)]) -> u64 {
+        snapshot
+            .iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                let matches = composite.kind() == MetricKind::Counter
+                    && composite.key().name() == name
+                    && labels_match(composite.key(), labels);
+                match (matches, value) {
+                    (true, DebugValue::Counter(count)) => Some(*count),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    fn histogram_values(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)]) -> Vec<f64> {
+        snapshot
+            .iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                let matches = composite.kind() == MetricKind::Histogram
+                    && composite.key().name() == name
+                    && labels_match(composite.key(), labels);
+                match (matches, value) {
+                    (true, DebugValue::Histogram(values)) => Some(values),
+                    _ => None,
+                }
+            })
+            .flatten()
+            .map(|value| value.into_inner())
+            .collect()
+    }
+
+    #[test]
+    fn metrics_record_retried_success_with_attempts_and_duration() {
+        let calls_in_test = Arc::new(AtomicU32::new(0));
+        let (snapshot, ()) = record_metrics(move || {
+            Box::pin(async move {
+                let policy = policy_of(1_000, 60_000, 3, 100, 2_000);
+                let cancel = CancellationToken::new();
+                let calls_in_attempt = calls_in_test.clone();
+                execute_with_jitter("metrics_read", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, move || {
+                    let calls = calls_in_attempt.clone();
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                            Err(AttemptError {
+                                class: ErrorClass::RetryableStatus,
+                                error: KmsError::backend_error("throttled (429)"),
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .await
+                .expect("retries within budget must succeed");
+            })
+        });
+
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_OPERATIONS_TOTAL,
+                &[
+                    ("operation", "metrics_read"),
+                    ("op_class", "read_idempotent"),
+                    ("outcome", "success")
+                ]
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_ATTEMPT_FAILURES_TOTAL,
+                &[("operation", "metrics_read"), ("error_class", "retryable_status")]
+            ),
+            2
+        );
+        assert_eq!(
+            histogram_values(
+                &snapshot,
+                METRIC_OPERATION_ATTEMPTS,
+                &[("operation", "metrics_read"), ("outcome", "success")]
+            ),
+            vec![3.0]
+        );
+        // Full-cap backoffs of 100ms and 200ms on the paused clock.
+        let durations = histogram_values(
+            &snapshot,
+            METRIC_OPERATION_DURATION_SECONDS,
+            &[("operation", "metrics_read"), ("outcome", "success")],
+        );
+        assert_eq!(durations.len(), 1);
+        assert!((durations[0] - 0.3).abs() < 1e-9, "expected 0.3s of virtual backoff, got {durations:?}");
+    }
+
+    #[test]
+    fn metrics_record_fatal_outcome_with_single_attempt() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                let policy = policy_of(1_000, 60_000, 5, 100, 2_000);
+                let cancel = CancellationToken::new();
+                let result: Result<()> =
+                    execute_with_jitter("metrics_fatal", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, || async {
+                        Err(AttemptError {
+                            class: ErrorClass::Fatal,
+                            error: KmsError::access_denied("permission denied (403)"),
+                        })
+                    })
+                    .await;
+                result.expect_err("a fatal failure must end the operation");
+            })
+        });
+
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_OPERATIONS_TOTAL,
+                &[("operation", "metrics_fatal"), ("outcome", "fatal")]
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_ATTEMPT_FAILURES_TOTAL,
+                &[("operation", "metrics_fatal"), ("error_class", "fatal")]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_values(
+                &snapshot,
+                METRIC_OPERATION_ATTEMPTS,
+                &[("operation", "metrics_fatal"), ("outcome", "fatal")]
+            ),
+            vec![1.0]
+        );
+    }
+
+    #[test]
+    fn metrics_record_mutating_budget_exhausted_after_one_attempt() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                let policy = policy_of(1_000, 60_000, 5, 100, 2_000);
+                let cancel = CancellationToken::new();
+                let result: Result<()> = execute_with_jitter(
+                    "metrics_rotate",
+                    OpClass::MutatingNonIdempotent,
+                    &policy,
+                    &cancel,
+                    full_jitter,
+                    || async { Err(retryable_conn_error()) },
+                )
+                .await;
+                result.expect_err("a mutating operation must not retry a retryable failure");
+            })
+        });
+
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_OPERATIONS_TOTAL,
+                &[
+                    ("operation", "metrics_rotate"),
+                    ("op_class", "mutating_non_idempotent"),
+                    ("outcome", "budget_exhausted")
+                ]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_values(
+                &snapshot,
+                METRIC_OPERATION_ATTEMPTS,
+                &[("operation", "metrics_rotate"), ("outcome", "budget_exhausted")]
+            ),
+            vec![1.0]
+        );
+    }
+
+    #[test]
+    fn metrics_record_timeouts_and_deadline_outcome() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                // Hung attempts: 10s each against a 25s deadline (see
+                // total_duration_never_exceeds_deadline for the timeline).
+                let policy = policy_of(10_000, 25_000, 5, 100, 2_000);
+                let cancel = CancellationToken::new();
+                let result: Result<()> =
+                    execute_with_jitter("metrics_hung", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, || {
+                        std::future::pending::<AttemptResult<()>>()
+                    })
+                    .await;
+                result.expect_err("hung attempts must exhaust the deadline");
+            })
+        });
+
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_OPERATIONS_TOTAL,
+                &[("operation", "metrics_hung"), ("outcome", "deadline_exceeded")]
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_ATTEMPT_FAILURES_TOTAL,
+                &[("operation", "metrics_hung"), ("error_class", "attempt_timeout")]
+            ),
+            3
+        );
+        let durations = histogram_values(
+            &snapshot,
+            METRIC_OPERATION_DURATION_SECONDS,
+            &[("operation", "metrics_hung"), ("outcome", "deadline_exceeded")],
+        );
+        assert_eq!(durations.len(), 1);
+        assert!((durations[0] - 25.0).abs() < 1e-9, "expected the full 25s deadline, got {durations:?}");
+    }
+
+    #[test]
+    fn metrics_record_cancelled_outcome() {
+        let calls_in_test = Arc::new(AtomicU32::new(0));
+        let (snapshot, ()) = record_metrics(move || {
+            Box::pin(async move {
+                let policy = policy_of(1_000, 600_000, 5, 10_000, 10_000);
+                let cancel = CancellationToken::new();
+                let canceller = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    canceller.cancel();
+                });
+                let calls_in_attempt = calls_in_test.clone();
+                let result: Result<()> =
+                    execute_with_jitter("metrics_cancel", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, move || {
+                        let calls = calls_in_attempt.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Err(retryable_conn_error())
+                        }
+                    })
+                    .await;
+                result.expect_err("cancellation must abort the backoff");
+            })
+        });
+
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_OPERATIONS_TOTAL,
+                &[("operation", "metrics_cancel"), ("outcome", "cancelled")]
+            ),
+            1
+        );
+        assert_eq!(
+            histogram_values(
+                &snapshot,
+                METRIC_OPERATION_ATTEMPTS,
+                &[("operation", "metrics_cancel"), ("outcome", "cancelled")]
+            ),
+            vec![1.0]
+        );
     }
 }
