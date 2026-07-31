@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, cache_root_entry_info, current_cache_root_or_prepare,
-    scanner_cache_lock_resource, scanner_cache_lock_timeout, scanner_set_disk_inventory,
+    DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
+    current_cache_root_or_prepare, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
-use crate::storage_api::scan::NamespaceLocking as _;
 use crate::{
     DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource,
-    DataUsageEntryInfo, DataUsageScanPlanDigest, Disk, EcstoreError, RUSTFS_META_BUCKET, ScannerDiskExt as _, ScannerError,
-    ScannerObjectIO, StorageError, is_reserved_or_invalid_bucket, read_config, resolve_scanner_object_store_handle,
+    DataUsageEntryInfo, DataUsageScanPlanDigest, Disk, EcstoreError, ScannerDiskExt as _, ScannerError, ScannerObjectIO,
+    StorageError, is_reserved_or_invalid_bucket, read_config, resolve_scanner_object_store_handle,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_common::heal_channel::HealScanMode;
@@ -63,6 +64,7 @@ const NS_SCANNER_DISK_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const NS_SCANNER_VALIDATED_CYCLE_TTL: Duration = Duration::from_secs(1);
 const NS_SCANNER_MAX_REPLAY_SESSIONS: usize = 65_536;
 const NS_SCANNER_MAX_ERROR_CHARS: usize = 4096;
+const NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX: &str = "retry_bucket:";
 const NS_SCANNER_FRAME_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-frame-v3";
 
 pub const NS_SCANNER_MAX_REQUEST_BODY_SIZE: usize = 16 * 1024;
@@ -317,6 +319,13 @@ impl RemoteScannerServerError {
         }
     }
 
+    fn retry_bucket(message: impl Into<String>) -> Self {
+        Self {
+            scope: RemoteScannerErrorScope::Bucket,
+            error: ScannerError::Other(format!("{}{}", NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX, message.into())),
+        }
+    }
+
     fn into_frame(self) -> RemoteScannerErrorFrame {
         RemoteScannerErrorFrame {
             scope: self.scope,
@@ -336,6 +345,7 @@ struct RemoteScannerStreamError {
     error: StorageError,
     progress_fully_reported: bool,
     retire_worker: bool,
+    retry_bucket: bool,
 }
 
 impl RemoteScannerStreamError {
@@ -344,6 +354,7 @@ impl RemoteScannerStreamError {
             error,
             progress_fully_reported: false,
             retire_worker: true,
+            retry_bucket: false,
         }
     }
 
@@ -352,6 +363,7 @@ impl RemoteScannerStreamError {
             error,
             progress_fully_reported: true,
             retire_worker: true,
+            retry_bucket: false,
         }
     }
 
@@ -360,6 +372,16 @@ impl RemoteScannerStreamError {
             error,
             progress_fully_reported: true,
             retire_worker: false,
+            retry_bucket: false,
+        }
+    }
+
+    fn retry_bucket(error: StorageError) -> Self {
+        Self {
+            error,
+            progress_fully_reported: true,
+            retire_worker: false,
+            retry_bucket: true,
         }
     }
 
@@ -951,16 +973,14 @@ async fn scan_and_persist_local_bucket(
             ))
         })?;
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
-    let lock_resource = scanner_cache_lock_resource(&cache_name, source);
-    let ns_lock = set
-        .new_ns_lock(RUSTFS_META_BUCKET, &lock_resource)
-        .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache lock creation failed: {err}")))?;
-    let guard = ns_lock
-        .get_write_lock_quiet(scanner_cache_lock_timeout())
+    let guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
         .await
         .map_err(|err| {
-            RemoteScannerServerError::worker(format!("remote namespace scanner cache lock acquisition failed: {err}"))
+            if err.is_contention() {
+                RemoteScannerServerError::retry_bucket(format!("remote namespace scanner cache lock contention: {err}"))
+            } else {
+                RemoteScannerServerError::worker(format!("remote namespace scanner cache lock acquisition failed: {err}"))
+            }
         })?;
     let mut cache = DataUsageCache::default();
     let revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
@@ -1216,7 +1236,9 @@ fn finish_remote_scanner_stream(
             if !error.progress_fully_reported {
                 budget.cancel_after_unreported_remote_progress();
             }
-            let failure = if error.retire_worker {
+            let failure = if error.retry_bucket {
+                RemoteScannerFailure::retry_bucket(error.error)
+            } else if error.retire_worker {
                 RemoteScannerFailure::transport(error.error)
             } else {
                 RemoteScannerFailure::bucket(error.error)
@@ -1374,9 +1396,16 @@ where
                 return Ok(RemoteScannerOutcome::CycleAhead(required_cycle));
             }
             RemoteScannerFrameResult::Error(error_frame) => {
+                let retry_bucket = error_frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX);
+                let message = error_frame
+                    .message
+                    .strip_prefix(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX)
+                    .map(str::trim_start)
+                    .unwrap_or(error_frame.message.as_str());
                 let error =
-                    StorageError::other(format!("remote namespace scanner failed: {}", limit_error_message(error_frame.message)));
+                    StorageError::other(format!("remote namespace scanner failed: {}", limit_error_message(message.to_string())));
                 return Err(match error_frame.scope {
+                    RemoteScannerErrorScope::Bucket if retry_bucket => RemoteScannerStreamError::retry_bucket(error),
                     RemoteScannerErrorScope::Bucket => RemoteScannerStreamError::bucket(error),
                     RemoteScannerErrorScope::Worker => RemoteScannerStreamError::reconciled(error),
                 });
@@ -2489,6 +2518,42 @@ mod tests {
         assert!(error.to_string().contains("cache save failed"));
         assert!(!error.retire_worker());
         assert!(!budget.budget_elapsed());
+    }
+
+    #[tokio::test]
+    async fn retry_bucket_error_terminal_frame_requeues_bucket_work() {
+        let request_id = Uuid::new_v4();
+        let writer_auth = FrameAuthenticator::for_test(request_id);
+        let reader_auth = FrameAuthenticator::for_test(request_id);
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut sequence = 0;
+            write_frame(
+                &mut writer,
+                &writer_auth,
+                &mut sequence,
+                &RemoteScannerFrame::terminal(
+                    RemoteScannerProgress::default(),
+                    RemoteScannerFrameResult::Error(RemoteScannerErrorFrame {
+                        scope: RemoteScannerErrorScope::Bucket,
+                        message: format!("{NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX} cache lock contention"),
+                    }),
+                ),
+            )
+            .await
+            .expect("retry-bucket error terminal frame should write");
+        });
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+        let stream_result =
+            consume_remote_scanner_stream(reader, parent, budget.clone(), "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+                .await;
+        let error = finish_remote_scanner_stream(stream_result, budget.as_ref()).expect_err("retry-bucket frame must fail");
+
+        assert!(error.retry_bucket_work());
+        assert!(!error.retire_worker());
+        assert!(error.to_string().contains("cache lock contention"));
     }
 
     #[tokio::test]
