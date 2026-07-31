@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Backup/restore contract types for KMS state.
+//! Backup/restore contracts and backup production for KMS state.
 //!
-//! This module is contract-only: it defines the versioned backup manifest,
-//! the per-backend responsibility matrix, typed failure modes, and the
-//! restore dry-run report. Nothing here is wired into handlers or backends;
-//! backup export, restore orchestration, and the admin API build on these
-//! types in follow-up changes.
+//! The contract side defines the versioned backup manifest, the per-backend
+//! responsibility matrix, typed failure modes, and the restore dry-run
+//! report. [`local_export`] implements the producer side for the Local
+//! backend as a crate-internal API; restore orchestration and the admin API
+//! build on these pieces in follow-up changes.
 //!
 //! # Bundle model
 //!
@@ -50,6 +50,7 @@
 mod capability;
 mod dry_run;
 mod error;
+pub mod local_export;
 mod manifest;
 
 pub use capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
@@ -57,6 +58,10 @@ pub use dry_run::{
     ExternalDependencyMismatch, RestoreBlocker, RestoreBlockerCode, RestoreConflict, RestoreConflictKind, RestoreDryRunReport,
 };
 pub use error::BackupError;
+pub use local_export::{
+    BackupKek, LOCAL_BUNDLE_MANIFEST_FILE, LocalBackupExportRequest, decrypt_bundle_artifact, export_local_backup,
+    read_local_bundle_manifest,
+};
 pub use manifest::{
     AeadAlgorithm, ArtifactDescriptor, ArtifactKind, BackupKekDescriptor, BackupManifest, CompletenessState, ContentDigest,
     DigestAlgorithm, LocalKdfDescriptor, LocalKeyDerivation, ReservedSlot,
