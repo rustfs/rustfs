@@ -338,6 +338,7 @@ pub async fn select_capacity_refresh_disks(
     }
 }
 
+#[hotpath::measure]
 pub async fn refresh_capacity_with_scope(disks: Vec<CapacityDiskRef>, dirty_subset: bool) -> Result<CapacityUpdate, String> {
     let scan_started_at = Instant::now();
     let report = calculate_data_dir_used_capacity_report(&disks)

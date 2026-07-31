@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 /// Scope-based hotpath measurement for `#[async_trait]` methods, where
 /// `#[hotpath::measure]` would only time the boxed-future construction.
 /// The guard records wall time from this statement until the enclosing

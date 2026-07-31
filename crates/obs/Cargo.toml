@@ -27,6 +27,50 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 
 [features]
 default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/crossbeam",
+    "rustfs-audit/hotpath",
+    "rustfs-common/hotpath",
+    "rustfs-config/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-iam/hotpath",
+    "rustfs-io-metrics/hotpath",
+    "rustfs-notify/hotpath",
+    "rustfs-security-governance/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-audit/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-iam/hotpath-alloc",
+    "rustfs-io-metrics/hotpath-alloc",
+    "rustfs-notify/hotpath-alloc",
+    "rustfs-security-governance/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-audit/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-iam/hotpath-cpu",
+    "rustfs-io-metrics/hotpath-cpu",
+    "rustfs-notify/hotpath-cpu",
+    "rustfs-security-governance/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
 # Tokio runtime-level telemetry. Requires a `--cfg tokio_unstable` build; the
 # build script fails the compile when that flag is missing. Off by default so
 # ordinary builds neither pay for nor depend on Tokio's unstable API.
@@ -58,6 +102,7 @@ required-features = ["dial9"]
 workspace = true
 
 [dependencies]
+hotpath.workspace = true
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["observability"] }

@@ -27,7 +27,14 @@ categories = ["web-programming", "development-tools", "data-structures"]
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }

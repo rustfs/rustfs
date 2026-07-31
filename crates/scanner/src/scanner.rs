@@ -2531,6 +2531,7 @@ where
 }
 
 #[instrument(skip_all)]
+#[hotpath::measure]
 async fn run_data_scanner_cycle(
     ctx: &CancellationToken,
     storeapi: &Arc<ECStore>,

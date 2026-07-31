@@ -66,16 +66,19 @@ impl KmsManager {
     }
 
     /// Encrypt data with a master key
+    #[hotpath::measure]
     pub async fn encrypt(&self, request: EncryptRequest) -> Result<EncryptResponse> {
         self.backend.encrypt(request).await
     }
 
     /// Decrypt data with a master key
+    #[hotpath::measure]
     pub async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         self.backend.decrypt(request).await
     }
 
     /// Generate a data encryption key
+    #[hotpath::measure]
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
         self.backend.generate_data_key(request).await
     }
