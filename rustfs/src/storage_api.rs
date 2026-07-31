@@ -72,6 +72,24 @@ pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{QuotaError, StorageError};
 }
 
+pub(crate) mod kms {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
+        }
+    }
+
+    pub(crate) use crate::storage::storage_api::{ECStore, StorageError};
+
+    /// Bucket SSE configuration for the KMS deletion reference gate;
+    /// `Err(StorageError::ConfigNotFound)` when the bucket has none.
+    pub(crate) async fn get_bucket_sse_config(bucket: &str) -> Result<s3s::dto::ServerSideEncryptionConfiguration, StorageError> {
+        crate::storage::storage_api::ecstore_bucket::metadata_sys::get_sse_config(bucket)
+            .await
+            .map(|(config, _)| config)
+    }
+}
+
 pub(crate) mod protocols {
     pub(crate) mod client {
         pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;

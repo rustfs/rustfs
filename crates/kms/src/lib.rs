@@ -66,14 +66,13 @@
 // Core modules
 pub mod api_types;
 pub mod backends;
+pub mod backup;
 mod cache;
 pub mod config;
+pub mod deletion_worker;
 mod encryption;
 mod error;
 pub mod manager;
-// The executor is wired into the Vault backends in a follow-up change; until
-// then the module is only exercised by its own tests.
-#[allow(dead_code)]
 mod policy;
 pub mod service;
 pub mod service_manager;
@@ -88,6 +87,7 @@ pub use api_types::{
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
+pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;

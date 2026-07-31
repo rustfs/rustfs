@@ -62,6 +62,8 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
 }
 
 async fn async_main() -> Result<()> {
+    hotpath::tokio_runtime!();
+
     let env_compat_report = bootstrap_external_prefix_compat()?;
 
     // Parse command line arguments

@@ -21,7 +21,7 @@
 //!
 //! encrypted_data(plaintext_len+16) || nonce (12 bytes)
 
-use crate::backends::{BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
 use crate::config::{BackendConfig, KmsConfig};
 use crate::encryption::DataKeyEnvelope;
 use crate::error::{KmsError, Result};
@@ -434,6 +434,12 @@ impl KmsBackend for StaticKmsBackend {
 
     async fn health_check(&self) -> Result<bool> {
         Ok(true)
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        // Static KMS is a read-only single-key backend: it only performs
+        // cryptographic operations and rejects every lifecycle mutation.
+        BackendCapabilities::minimal()
     }
 }
 

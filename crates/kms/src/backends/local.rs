@@ -14,7 +14,9 @@
 
 //! Local file-based KMS backend implementation
 
-use crate::backends::{BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{
+    BackendCapabilities, BackendInfo, ExpiredKeyRemoval, KmsBackend, KmsClient, StateGatedOperation, ensure_key_status_permits,
+};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -69,11 +71,14 @@ fn validate_key_id(key_id: &str) -> Result<()> {
 }
 
 const LOCAL_KMS_MASTER_KEY_SALT_FILE: &str = ".master-key.salt";
-const LOCAL_KMS_MASTER_KEY_SALT_LEN: usize = 16;
-const LOCAL_KMS_MASTER_KEY_LEN: usize = 32;
-const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
-const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
-const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
+// The KDF parameters are pub(crate) so the backup manifest contract
+// (`crate::backup`) records the exact compiled-in derivation instead of a
+// copy that could drift.
+pub(crate) const LOCAL_KMS_MASTER_KEY_SALT_LEN: usize = 16;
+pub(crate) const LOCAL_KMS_MASTER_KEY_LEN: usize = 32;
+pub(crate) const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
+pub(crate) const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
+pub(crate) const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
 
 /// Strict matcher for leftover commit temp files (`<prefix>.tmp-<uuid>`).
 ///
@@ -396,9 +401,11 @@ pub struct LocalKmsClient {
     key_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+// pub(crate) so the backup contract tests can anchor the manifest's
+// protection-state wire names against the marker values written to disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum StoredKeyProtection {
+pub(crate) enum StoredKeyProtection {
     #[default]
     LegacyUnspecified,
     EncryptedMasterKey,
@@ -420,6 +427,10 @@ struct StoredMasterKey {
     #[serde(with = "crate::time_serde::option_zoned")]
     rotated_at: Option<Zoned>,
     created_by: Option<String>,
+    /// Scheduled deletion deadline; absent on records written before deadline
+    /// persistence landed, so it must stay optional for backward compatibility.
+    #[serde(default, with = "crate::time_serde::option_zoned")]
+    deletion_date: Option<Zoned>,
     /// Encrypted key material (32 bytes encoded in base64 for AES-256)
     encrypted_key_material: String,
     /// Nonce used for encryption
@@ -765,6 +776,7 @@ impl LocalKmsClient {
             created_at: stored_key.created_at,
             rotated_at: stored_key.rotated_at,
             created_by: stored_key.created_by,
+            deletion_date: stored_key.deletion_date,
         })
     }
 
@@ -838,6 +850,7 @@ impl LocalKmsClient {
             created_at: master_key.created_at.clone(),
             rotated_at: master_key.rotated_at.clone(),
             created_by: master_key.created_by.clone(),
+            deletion_date: master_key.deletion_date.clone(),
             encrypted_key_material,
             nonce,
             at_rest_protection,
@@ -926,8 +939,11 @@ impl LocalKmsClient {
 
 #[async_trait]
 impl KmsClient for LocalKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
+
+        let key_info = self.describe_key(&request.master_key_id, context).await?;
+        ensure_key_status_permits(&request.master_key_id, &key_info.status, StateGatedOperation::GenerateDataKey)?;
 
         // Generate random data key material
         let key_length = match request.key_spec.as_str() {
@@ -967,14 +983,9 @@ impl KmsClient for LocalKmsClient {
     async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse> {
         debug!("Encrypting data with key: {}", request.key_id);
 
-        // Verify key exists and is active
+        // Verify key exists and its state allows encryption
         let key_info = self.describe_key(&request.key_id, context).await?;
-        if key_info.status != KeyStatus::Active {
-            return Err(KmsError::invalid_operation(format!(
-                "Key {} is not active (status: {:?})",
-                request.key_id, key_info.status
-            )));
-        }
+        ensure_key_status_permits(&request.key_id, &key_info.status, StateGatedOperation::Encrypt)?;
 
         let (ciphertext, _nonce) = self.encrypt_with_master_key(&request.key_id, &request.plaintext).await?;
 
@@ -1105,6 +1116,7 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::Enable)?;
         master_key.status = KeyStatus::Active;
 
         // Preserve the existing key material. Regenerating it on a pure status change would
@@ -1122,6 +1134,7 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::Disable)?;
         master_key.status = KeyStatus::Disabled;
 
         // Preserve the existing key material (see enable_key): a status change must never
@@ -1136,14 +1149,16 @@ impl KmsClient for LocalKmsClient {
     async fn schedule_key_deletion(
         &self,
         key_id: &str,
-        _pending_window_days: u32,
+        pending_window_days: u32,
         _context: Option<&OperationContext>,
     ) -> Result<()> {
         debug!("Scheduling deletion for key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
         master_key.status = KeyStatus::PendingDeletion;
+        master_key.deletion_date = Some(Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400));
 
         // Preserve the existing key material (see enable_key): scheduling deletion must not
         // regenerate the master key, or cancelling the deletion later would recover a key that
@@ -1160,7 +1175,11 @@ impl KmsClient for LocalKmsClient {
 
         let _write_guard = self.lock_key_for_write(key_id).await;
         let mut master_key = self.load_master_key(key_id).await?;
+        if master_key.status != KeyStatus::PendingDeletion {
+            return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
+        }
         master_key.status = KeyStatus::Active;
+        master_key.deletion_date = None;
 
         // Preserve the existing key material (see enable_key): cancelling deletion must recover
         // the ORIGINAL key, not mint a new one that cannot decrypt existing data.
@@ -1210,6 +1229,12 @@ pub struct LocalKmsBackend {
 }
 
 impl LocalKmsBackend {
+    /// Lifecycle driver for the shared state-machine contract tests.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_client(&self) -> &LocalKmsClient {
+        &self.client
+    }
+
     /// Create a new LocalKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
         config.validate()?;
@@ -1323,6 +1348,11 @@ impl KmsBackend for LocalKmsBackend {
 
     async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse> {
         let key_info = self.client.describe_key(&request.key_id, None).await?;
+        let deletion_date = if key_info.status == KeyStatus::PendingDeletion {
+            self.client.load_master_key(&request.key_id).await?.deletion_date
+        } else {
+            None
+        };
 
         let metadata = KeyMetadata {
             key_id: key_info.key_id,
@@ -1335,7 +1365,7 @@ impl KmsBackend for LocalKmsBackend {
             key_usage: key_info.usage,
             description: key_info.description,
             creation_date: key_info.created_at,
-            deletion_date: None,
+            deletion_date,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
             tags: key_info.tags,
@@ -1366,7 +1396,22 @@ impl KmsBackend for LocalKmsBackend {
             .map_err(|_| KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
-            // For immediate deletion, actually delete the key from filesystem
+            // Tombstone first: mark the record Deleted before removing the
+            // file, so a crash between the two steps leaves a key that is
+            // already unusable and whose removal can simply be re-run.
+            match self.client.decode_stored_key(key_id).await {
+                Ok((_stored, key_material)) => {
+                    let mut tombstone = master_key.clone();
+                    tombstone.status = KeyStatus::Deleted;
+                    tombstone.deletion_date = Some(Zoned::now());
+                    self.client.save_master_key(&tombstone, &key_material).await?;
+                }
+                Err(error) => {
+                    // A record whose material can no longer be decoded cannot be
+                    // re-encrypted into a tombstone; proceed with the removal.
+                    warn!(key_id, %error, "skipping tombstone for undecodable key record");
+                }
+            }
             let key_path = self.client.master_key_path(key_id)?;
             durable_file::remove_durably(key_path)
                 .await
@@ -1394,6 +1439,8 @@ impl KmsBackend for LocalKmsBackend {
             });
         } else {
             // Schedule for deletion (default 30 days)
+            ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
+
             let days = request.pending_window_in_days.unwrap_or(30);
             if !(7..=30).contains(&days) {
                 return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
@@ -1401,6 +1448,7 @@ impl KmsBackend for LocalKmsBackend {
 
             let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
             master_key.status = KeyStatus::PendingDeletion;
+            master_key.deletion_date = Some(deletion_date.clone());
 
             (Some(deletion_date.to_string()), Some(deletion_date))
         };
@@ -1454,6 +1502,7 @@ impl KmsBackend for LocalKmsBackend {
 
         // Cancel the deletion by resetting the state
         master_key.status = KeyStatus::Active;
+        master_key.deletion_date = None;
 
         // Save the updated key to disk - this is the missing critical step!
         // Preserve existing key material instead of generating new one
@@ -1484,8 +1533,69 @@ impl KmsBackend for LocalKmsBackend {
         })
     }
 
+    async fn enable_key(&self, key_id: &str) -> Result<()> {
+        self.client.enable_key(key_id, None).await
+    }
+
+    async fn disable_key(&self, key_id: &str) -> Result<()> {
+        self.client.disable_key(key_id, None).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        // Rotation stays unadvertised until historical key versions can be
+        // retained (see LocalKmsClient::rotate_key); without version history
+        // there is also no versioning capability.
+        BackendCapabilities::minimal()
+            .with_enable_disable(true)
+            .with_schedule_deletion(true)
+            .with_physical_delete(true)
+    }
+
+    async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
+        // The per-key write lock serializes this against a concurrent
+        // cancellation, closing the check-then-remove race.
+        let _write_guard = self.client.lock_key_for_write(key_id).await;
+
+        if !fs::try_exists(self.client.master_key_path(key_id)?).await? {
+            return Ok(ExpiredKeyRemoval::Removed);
+        }
+        let master_key = self.client.load_master_key(key_id).await?;
+        match master_key.status {
+            // Tombstone left by a crashed removal: complete it.
+            KeyStatus::Deleted => {}
+            KeyStatus::PendingDeletion => {
+                match &master_key.deletion_date {
+                    Some(deadline) if deadline <= now => {}
+                    // Not yet due, or a legacy record without a persisted
+                    // deadline — never auto-remove those.
+                    _ => return Ok(ExpiredKeyRemoval::NotExpired),
+                }
+                // Tombstone first (see delete_key): a crash between the state
+                // write and the file removal must leave an unusable record.
+                match self.client.decode_stored_key(key_id).await {
+                    Ok((_stored, key_material)) => {
+                        let mut tombstone = master_key.clone();
+                        tombstone.status = KeyStatus::Deleted;
+                        tombstone.deletion_date = Some(now.clone());
+                        self.client.save_master_key(&tombstone, &key_material).await?;
+                    }
+                    Err(error) => {
+                        warn!(key_id, %error, "skipping tombstone for undecodable key record");
+                    }
+                }
+            }
+            KeyStatus::Active | KeyStatus::Disabled => return Ok(ExpiredKeyRemoval::StateChanged),
+        }
+
+        durable_file::remove_durably(self.client.master_key_path(key_id)?)
+            .await
+            .map_err(|e| KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
+        debug!(key_id, "Local KMS expired key removed");
+        Ok(ExpiredKeyRemoval::Removed)
     }
 }
 
@@ -1903,6 +2013,64 @@ mod tests {
             client.get_key_material(key_id).await.expect("reload original material"),
             original_material
         );
+    }
+
+    /// Mixed-format regression for rustfs/backlog#1565: a batch interleaving
+    /// pre-versioning envelopes (no master_key_version field) with versioned ones
+    /// must route and decrypt in full, and a rejected rotation in the middle must
+    /// not disturb either format.
+    #[tokio::test]
+    async fn mixed_format_envelopes_decrypt_across_rejected_rotation() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "mixed-format-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+
+        let request = GenerateKeyRequest::new(key_id.to_string(), "AES_256".to_string());
+        let mut batch = Vec::new();
+        for index in 0..4 {
+            let data_key = client.generate_data_key(&request, None).await.expect("generate data key");
+            let ciphertext = if index % 2 == 0 {
+                // Legacy shape: the local backend already omits master_key_version.
+                let envelope: serde_json::Value = serde_json::from_slice(&data_key.ciphertext).expect("parse envelope");
+                assert!(
+                    !envelope
+                        .as_object()
+                        .expect("envelope is an object")
+                        .contains_key("master_key_version"),
+                    "local envelopes must keep the pre-versioning shape"
+                );
+                data_key.ciphertext.clone()
+            } else {
+                // Versioned shape, as a rotation-aware writer would emit it.
+                let mut envelope: serde_json::Value = serde_json::from_slice(&data_key.ciphertext).expect("parse envelope");
+                envelope
+                    .as_object_mut()
+                    .expect("envelope is an object")
+                    .insert("master_key_version".to_string(), serde_json::json!(1));
+                serde_json::to_vec(&envelope).expect("serialize versioned envelope")
+            };
+            assert!(
+                crate::encryption::is_data_key_envelope(&ciphertext),
+                "batch member {index} must still route as a KMS envelope"
+            );
+            batch.push((ciphertext, data_key.plaintext.clone().expect("plaintext")));
+        }
+
+        // A rejected rotation in the middle of the batch's lifetime must leave
+        // every already-issued envelope decryptable.
+        let error = client
+            .rotate_key(key_id, None)
+            .await
+            .expect_err("local rotation must stay rejected");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }));
+
+        for (index, (ciphertext, plaintext)) in batch.iter().enumerate() {
+            let decrypted = client
+                .decrypt(&DecryptRequest::new(ciphertext.clone()), None)
+                .await
+                .unwrap_or_else(|error| panic!("batch member {index} must decrypt: {error}"));
+            assert_eq!(&decrypted, plaintext, "batch member {index} plaintext must round-trip");
+        }
     }
 
     #[tokio::test]
@@ -2543,9 +2711,16 @@ mod tests {
             client.schedule_key_deletion(key_id, 7, None),
             client.enable_key(key_id, None),
         );
-        disable.expect("disable");
-        schedule.expect("schedule deletion");
-        enable.expect("enable");
+        // The per-key lock serializes the three transitions in an arbitrary
+        // order, and the state gate may legitimately reject a transition that
+        // lost the race (e.g. enable after deletion was scheduled). Any other
+        // error kind would still mean corrupted storage.
+        for result in [disable, schedule, enable] {
+            match result {
+                Ok(()) | Err(KmsError::InvalidOperation { .. }) => {}
+                Err(other) => panic!("concurrent transition must only fail with a state rejection, got {other:?}"),
+            }
+        }
 
         // Whatever the serialization order, the file must be one writer's
         // complete output with the original material intact.
@@ -2559,5 +2734,68 @@ mod tests {
             original_material,
             "concurrent status updates must never lose or regenerate key material"
         );
+    }
+
+    /// Records written before deadline persistence landed have no
+    /// deletion_date field and must keep deserializing (as None).
+    #[tokio::test]
+    async fn stored_master_key_without_deletion_date_still_deserializes() {
+        let (client, _temp_dir) = create_test_client().await;
+        client.create_key("legacy-key", "AES_256", None).await.expect("create key");
+
+        let path = client.master_key_path("legacy-key").expect("key path");
+        let bytes = fs::read(&path).await.expect("read stored key");
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("stored key must be JSON");
+        value
+            .as_object_mut()
+            .expect("stored key must be a JSON object")
+            .remove("deletion_date")
+            .expect("current records must carry the field");
+
+        let stored: StoredMasterKey = serde_json::from_value(value).expect("legacy record must deserialize");
+        assert!(stored.deletion_date.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_expired_key_completes_a_tombstone_and_stays_idempotent() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        let backend = LocalKmsBackend::new(config).await.expect("backend");
+        let created = backend
+            .create_key(CreateKeyRequest {
+                key_name: Some("tombstoned-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                ..Default::default()
+            })
+            .await
+            .expect("create key");
+        let key_id = created.key_id;
+
+        // Craft the state a removal crashed in: tombstone written, file not
+        // yet removed.
+        let client = backend.lifecycle_client();
+        let (_stored, key_material) = client.decode_stored_key(&key_id).await.expect("decode stored key");
+        let mut tombstone = client.load_master_key(&key_id).await.expect("load key");
+        tombstone.status = KeyStatus::Deleted;
+        tombstone.deletion_date = Some(Zoned::now());
+        client
+            .save_master_key(&tombstone, &key_material)
+            .await
+            .expect("write tombstone");
+
+        // The sweep primitive completes the crashed removal...
+        let outcome = backend
+            .remove_expired_key(&key_id, &Zoned::now())
+            .await
+            .expect("tombstone completion");
+        assert_eq!(outcome, crate::backends::ExpiredKeyRemoval::Removed);
+        assert!(!client.master_key_path(&key_id).expect("key path").exists());
+
+        // ...and stays idempotent once the key is gone.
+        let outcome = backend
+            .remove_expired_key(&key_id, &Zoned::now())
+            .await
+            .expect("repeat removal");
+        assert_eq!(outcome, crate::backends::ExpiredKeyRemoval::Removed);
     }
 }

@@ -1139,8 +1139,11 @@ impl OidcSys {
         let mut policies = Vec::new();
         let mut groups = Vec::new();
 
-        // Add default role policy if configured
-        if !config.role_policy.is_empty() {
+        // Role-policy and claim-based authorization are separate OIDC modes. When a
+        // role policy is configured, group claims still provide group context but
+        // must not also become policy names.
+        let has_role_policy = !config.role_policy.trim().is_empty();
+        if has_role_policy {
             for policy in config.role_policy.split(',') {
                 let policy = policy.trim();
                 if !policy.is_empty() {
@@ -1149,21 +1152,20 @@ impl OidcSys {
             }
         }
 
-        // Map groups claim to policies
         for group in &claims.groups {
             groups.push(group.clone());
-            let policy_name = if config.claim_prefix.is_empty() {
-                group.clone()
-            } else {
-                format!("{}{}", config.claim_prefix, group)
-            };
-            policies.push(policy_name);
+            if !has_role_policy {
+                let policy_name = if config.claim_prefix.is_empty() {
+                    group.clone()
+                } else {
+                    format!("{}{}", config.claim_prefix, group)
+                };
+                policies.push(policy_name);
+            }
         }
 
-        // Map primary claim (if different from groups)
-        if config.claim_name != config.groups_claim {
-            let claim_values = extract_groups_claim(&claims.raw, &config.claim_name);
-            for val in claim_values {
+        if !has_role_policy && config.claim_name != config.groups_claim {
+            for val in extract_groups_claim(&claims.raw, &config.claim_name) {
                 let policy_name = if config.claim_prefix.is_empty() {
                     val
                 } else {
@@ -3201,26 +3203,22 @@ mod tests {
     }
 
     #[test]
-    fn test_map_claims_to_policies_with_provider() {
-        let mut config = test_config("okta");
-        config.role_policy = "readwrite".to_string();
-        config.display_name = "Okta".to_string();
+    fn role_policy_does_not_map_groups_as_policies() {
+        let mut config = test_config("authentik");
+        config.role_policy = "consoleAdmin".to_string();
+        config.claim_name = "policy".to_string();
 
         let sys = make_test_sys(vec![config]);
 
         let claims = OidcClaims {
-            sub: "user123".to_string(),
-            email: "user@example.com".to_string(),
-            username: "user".to_string(),
-            groups: vec!["admin".to_string(), "devs".to_string()],
-            raw: HashMap::new(),
+            groups: vec!["authentik Admins".to_string(), "users".to_string()],
+            raw: HashMap::from([("policy".to_string(), serde_json::json!(["readonly"]))]),
+            ..Default::default()
         };
 
-        let (policies, groups) = sys.map_claims_to_policies("okta", &claims);
-        assert_eq!(groups, vec!["admin", "devs"]);
-        assert!(policies.contains(&"readwrite".to_string()));
-        assert!(policies.contains(&"admin".to_string()));
-        assert!(policies.contains(&"devs".to_string()));
+        let (policies, groups) = sys.map_claims_to_policies("authentik", &claims);
+        assert_eq!(groups, vec!["authentik Admins", "users"]);
+        assert_eq!(policies, vec!["consoleAdmin"]);
     }
 
     #[test]
@@ -3243,6 +3241,39 @@ mod tests {
         assert_eq!(groups, vec!["engineers"]);
         assert!(policies.contains(&"oidc-engineers".to_string()));
         assert_eq!(policies.len(), 1);
+    }
+
+    #[test]
+    fn blank_role_policy_uses_claim_mapping() {
+        let mut config = test_config("keycloak");
+        config.role_policy = "   ".to_string();
+
+        let sys = make_test_sys(vec![config]);
+        let claims = OidcClaims {
+            groups: vec!["readonly".to_string()],
+            ..Default::default()
+        };
+
+        let (policies, groups) = sys.map_claims_to_policies("keycloak", &claims);
+        assert_eq!(groups, vec!["readonly"]);
+        assert_eq!(policies, vec!["readonly"]);
+    }
+
+    #[test]
+    fn claim_mapping_keeps_groups_with_distinct_primary_claim() {
+        let mut config = test_config("keycloak");
+        config.claim_name = "policy".to_string();
+
+        let sys = make_test_sys(vec![config]);
+        let claims = OidcClaims {
+            groups: vec!["developers".to_string()],
+            raw: HashMap::from([("policy".to_string(), serde_json::json!(["readonly"]))]),
+            ..Default::default()
+        };
+
+        let (policies, groups) = sys.map_claims_to_policies("keycloak", &claims);
+        assert_eq!(groups, vec!["developers"]);
+        assert_eq!(policies, vec!["developers", "readonly"]);
     }
 
     #[test]

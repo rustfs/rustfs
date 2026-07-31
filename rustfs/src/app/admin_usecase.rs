@@ -276,10 +276,8 @@ impl DefaultAdminUsecase {
             .await
             .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
         if !Self::data_usage_snapshot_covers_namespace(&info, buckets.into_iter().map(|bucket| bucket.name)) {
-            return Err(Self::app_error(
-                S3ErrorCode::ServiceUnavailable,
-                "authoritative data usage snapshot is not available yet",
-            ));
+            // The default wire shape distinguishes unknown usage from a confirmed zero snapshot.
+            info = DataUsageInfo::default();
         }
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;

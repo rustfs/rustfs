@@ -58,8 +58,11 @@ const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
 const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
 const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
 const KMS_DESCRIBE_KEY: AdminActionRef = AdminActionRef::new("kms:DescribeKey");
+const KMS_DISABLE_KEY: AdminActionRef = AdminActionRef::new("kms:DisableKey");
+const KMS_ENABLE_KEY: AdminActionRef = AdminActionRef::new("kms:EnableKey");
 const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
 const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
@@ -777,6 +780,14 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/enable", KMS_ENABLE_KEY, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/disable",
+        KMS_DISABLE_KEY,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rotate", KMS_ROTATE_KEY, RouteRiskLevel::High),
     public(
         HttpMethod::Get,
         "/rustfs/admin/v3/oidc/providers",

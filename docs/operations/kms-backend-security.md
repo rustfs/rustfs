@@ -2,13 +2,15 @@
 
 RustFS ships several KMS backends. They differ not only in deployment effort but in **where master key material lives and who can read it**. Pick a backend based on the confidentiality boundary you need, not on the name alone.
 
+For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md).
+
 ## Backend comparison
 
 | Backend | Config tag | Master key material location | At-rest protection of key material | Durability | Rotation | Intended use |
 | --- | --- | --- | --- | --- | --- | --- |
-| Local | `Local` | Files under `key_dir`, encrypted with the configured local master key | Local master key (AES-GCM) + file permissions | Crash-durable commits on local filesystems only; see [Local backend durability and deployment support matrix](#local-backend-durability-and-deployment-support-matrix) | Rejected (no versioned retention yet) | Development; single-node setups that accept host-level trust |
+| Local | `Local` | Files under `key_dir`, encrypted with the configured local master key | Local master key (AES-GCM) + file permissions | Crash-durable commits on local filesystems only; see [Local backend durability and deployment support matrix](#local-backend-durability-and-deployment-support-matrix) | Rejected by design (single material, development backend) | Development; single-node setups that accept host-level trust |
 | Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | No state persisted by RustFS | Rejected (read-only backend) | Simple deployments with an external secret manager |
-| Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Rejected (no versioned retention yet) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
+| Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Versioned retention (immutable per-version records + current pointer) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
 
 ## Vault KV2: what the backend does and does not do
@@ -19,7 +21,7 @@ The Vault KV2 backend uses Vault purely as a **secure storage** service:
 - The backend never calls the Vault Transit engine. The `mount_path` configuration field and the `RUSTFS_KMS_VAULT_MOUNT_PATH` environment variable are deprecated leftovers: they are accepted for compatibility and ignored.
 - Data-encryption keys (DEKs) handed to the object-encryption path are still wrapped with AES-256-GCM under the master key; the statement above concerns the master key's storage in Vault, not the DEK envelope.
 - The backend reports this boundary in its `backend_info` metadata as `at_rest_protection: vault-kv2-acl`.
-- Key rotation is rejected (`InvalidOperation`) until versioned key material retention lands; rotating by overwriting the stored key would orphan every DEK wrapped by the previous version.
+- Key rotation retains every historical master key version as an immutable record under `{prefix}/{key_id}/versions/{N}` and only then moves the current-version pointer; see [Master key rotation](#master-key-rotation-retention-destruction-and-upgrade-ordering) for the retention preconditions and the cluster-upgrade ordering constraint.
 
 > **Warning: KV read access is equivalent to holding the master keys.**
 > Any Vault identity (token, AppRole, or policy) that can `read` the RustFS key path in KV v2 can recover the plaintext master key material and decrypt every object protected by those keys. Treat KV read grants on that path with the same care as handing out the keys themselves. If this is not acceptable, use the Vault Transit backend instead.
@@ -41,9 +43,31 @@ path "secret/metadata/rustfs/kms/keys/*" {
 
 Notes:
 
+- The trailing wildcards also cover the per-version material records that rotation creates under `.../keys/{key_id}/versions/{N}`; no extra policy paths are needed.
 - `delete` on the metadata path is required for permanent key deletion (`force_immediate`); drop it if you never hard-delete keys.
 - Do not attach `sudo`, wildcard mounts, or Transit paths to this policy; the KV2 backend does not use them.
 - Auditing KV reads on the key prefix is strongly recommended: every read event is a potential master-key disclosure.
+
+## Master key rotation: retention, destruction, and upgrade ordering
+
+Rotation support differs per backend. Local and Static reject rotation outright (`InvalidOperation`); their single key material is never overwritten. Vault Transit delegates rotation to the Transit engine's own key versioning (ciphertext is version-prefixed, e.g. `vault:v1:...`). Vault KV2 rotates by retaining every historical version, as described below. Rotation is currently only reachable through the backend-level `KmsClient::rotate_key` API; it is not exposed through the admin or S3 surface.
+
+### Vault KV2 versioned retention model
+
+Each rotation writes the new version's material to `{prefix}/{key_id}/versions/{N}` as an immutable, create-only record, and only after that material is durably persisted does a check-and-set write move the top-level record (the current-version pointer, which also mirrors the current material as a fast path). The first rotation additionally freezes the pre-rotation material as a version record and pins it as the key's `baseline_version`; DEK envelopes written before versioning existed (no `master_key_version` field) always resolve to that baseline, never to whatever version is current.
+
+Decryption loads exactly the version recorded in the envelope and fails closed with a typed `KeyVersionNotFound` error when that version's record is missing. There is deliberately no fallback to the current material: falling back would silently feed the wrong key to AEAD and mask tampered envelopes.
+
+### Retention and destruction preconditions
+
+- Every version record that any stored DEK envelope references must remain readable. Until an object rewrap/migration capability exists, assume **every** version of a rotated key is referenced: destroying a version record permanently orphans all objects whose DEKs it wrapped.
+- Version records are ordinary KV v2 secrets under the key subtree. Never run `kv metadata delete` or `kv destroy` against `{prefix}/{key_id}/versions/*`, and do not apply `delete-version-after` or retention tooling to that subtree. RustFS-managed retention does not rely on KV2's own secret versioning (each version record has a single KV revision), so KV `max-versions` settings do not protect or endanger history — but metadata deletion always removes a record entirely.
+- Permanent key deletion through RustFS (`force_immediate` after `PendingDeletion`) purges the key's version records together with the key record; that is the only supported way to remove them.
+- For Vault Transit, retention is governed by the Transit key's `min_decryption_version`: never raise it above the oldest version that may still protect live ciphertext.
+
+### Upgrade before first rotation (hard constraint)
+
+Do not rotate any key until **every** RustFS node in the cluster runs a build that understands the `master_key_version` envelope field. Older binaries ignore the field and always decrypt with the current material: harmless while nothing has been rotated, but after a rotation they will fail to decrypt every object wrapped by an earlier key version. Complete the rolling upgrade of the entire cluster first, then rotate.
 
 ## Choosing between Vault KV2 and Vault Transit
 

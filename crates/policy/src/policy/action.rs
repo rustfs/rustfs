@@ -718,6 +718,10 @@ pub enum KmsAction {
     GenerateDataKeyAction,
     #[strum(serialize = "kms:DeleteKey")]
     DeleteKeyAction,
+    #[strum(serialize = "kms:EnableKey")]
+    EnableKeyAction,
+    #[strum(serialize = "kms:DisableKey")]
+    DisableKeyAction,
     #[strum(serialize = "kms:RotateKey")]
     RotateKeyAction,
     #[strum(serialize = "kms:ListKeys")]
@@ -755,6 +759,8 @@ mod tests {
             ("kms:ClearCache", KmsAction::ClearCacheAction),
             ("kms:GenerateDataKey", KmsAction::GenerateDataKeyAction),
             ("kms:DeleteKey", KmsAction::DeleteKeyAction),
+            ("kms:EnableKey", KmsAction::EnableKeyAction),
+            ("kms:DisableKey", KmsAction::DisableKeyAction),
             ("kms:RotateKey", KmsAction::RotateKeyAction),
             ("kms:ListKeys", KmsAction::ListKeysAction),
             ("kms:DescribeKey", KmsAction::DescribeKeyAction),

@@ -30,10 +30,12 @@ workspace = true
 
 [features]
 default = []
-hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "hotpath/futures", "hotpath/reqwest-0-13"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 arc-swap.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 rand = { workspace = true, features = ["serde"] }

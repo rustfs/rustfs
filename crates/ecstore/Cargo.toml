@@ -33,14 +33,34 @@ workspace = true
 [features]
 default = []
 rio-v2 = ["dep:rustfs-rio-v2"]
-hotpath = ["dep:hotpath", "hotpath/hotpath", "rustfs-filemeta/hotpath", "rustfs-rio/hotpath"]
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/async-channel",
+    "hotpath/parking_lot",
+    "hotpath/reqwest-0-13",
+    "rustfs-filemeta/hotpath",
+    "rustfs-rio/hotpath",
+]
+hotpath-alloc = [
+    "hotpath/hotpath-alloc",
+    "rustfs-filemeta/hotpath-alloc",
+    "rustfs-rio/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-filemeta/hotpath-cpu",
+    "rustfs-rio/hotpath-cpu",
+]
 # Exposes shared lifecycle/tier test utilities (MockWarmBackend, fault
 # injection, xl.meta transition assertions) via `api::tier::test_util`.
 # Enable only from `[dev-dependencies]` (rustfs/backlog#1148 ilm-6).
 test-util = []
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
