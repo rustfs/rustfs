@@ -399,6 +399,20 @@ pub struct LocalKmsClient {
     /// Per-key write locks serializing read-modify-write updates within this
     /// process (see [`Self::lock_key_for_write`]).
     key_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Directory-wide writer fence for backup export (see
+    /// [`Self::acquire_export_fence`]). Writers hold the read side; an export
+    /// snapshot holds the write side so it observes a single-generation view.
+    export_fence: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// Guard pairing the export-fence read lock with a per-key write mutex.
+///
+/// Dropping it releases both, so every existing `lock_key_for_write` call
+/// site participates in the export fence without changes.
+#[must_use]
+struct KeyWriteGuard {
+    _fence: tokio::sync::OwnedRwLockReadGuard<()>,
+    _key: tokio::sync::OwnedMutexGuard<()>,
 }
 
 // pub(crate) so the backup contract tests can anchor the manifest's
@@ -465,6 +479,7 @@ impl LocalKmsClient {
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
             key_write_locks: Mutex::new(HashMap::new()),
+            export_fence: Arc::new(tokio::sync::RwLock::new(())),
         };
         client.validate_existing_keys().await?;
         Ok(client)
@@ -507,6 +522,7 @@ impl LocalKmsClient {
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
             key_write_locks: Mutex::new(HashMap::new()),
+            export_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -517,12 +533,40 @@ impl LocalKmsClient {
     /// delete with a rewrite. Cross-process writers sharing a key directory
     /// remain unsupported. Entries live for the client's lifetime; the table
     /// is bounded by the number of distinct key ids this process touches.
-    async fn lock_key_for_write(&self, key_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn lock_key_for_write(&self, key_id: &str) -> KeyWriteGuard {
+        // Fence first, per-key mutex second: the ordering is uniform across
+        // all writers, so an export waiting on the write side can never
+        // deadlock with a writer holding a key mutex.
+        let fence = Arc::clone(&self.export_fence).read_owned().await;
         let lock = {
             let mut locks = self.key_write_locks.lock().expect("Local KMS key write lock table poisoned");
             Arc::clone(locks.entry(key_id.to_string()).or_default())
         };
-        lock.lock_owned().await
+        KeyWriteGuard {
+            _fence: fence,
+            _key: lock.lock_owned().await,
+        }
+    }
+
+    /// Block every key-directory writer while a backup export collects its
+    /// snapshot, so all records belong to one generation.
+    ///
+    /// Mutating operations hold the read side (via [`Self::lock_key_for_write`]
+    /// or [`Self::save_new_master_key`]); the export holds the write side only
+    /// for the collection phase, never while encrypting or writing the bundle.
+    pub(crate) async fn acquire_export_fence(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.export_fence).write_owned().await
+    }
+
+    /// Key directory root, exposed for the backup export module.
+    pub(crate) fn key_directory(&self) -> &Path {
+        &self.config.key_dir
+    }
+
+    /// Absolute path of the master-key KDF salt file, exposed for the backup
+    /// export module.
+    pub(crate) fn master_key_salt_file(&self) -> PathBuf {
+        Self::master_key_salt_path(&self.config)
     }
 
     /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
@@ -799,6 +843,11 @@ impl LocalKmsClient {
     }
 
     async fn save_new_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
+        // Creates never take the per-key write lock (`NoClobber` publishing
+        // already linearizes them), so they join the export fence here. This
+        // must stay the only fence acquisition on the create path: the fence
+        // read lock is not reentrant while an export waits for the write side.
+        let _fence = Arc::clone(&self.export_fence).read_owned().await;
         let key_path = self.master_key_path(&master_key.key_id)?;
         let content = self.encode_master_key(master_key, key_material)?;
         let temp_path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
