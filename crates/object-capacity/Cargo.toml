@@ -34,7 +34,33 @@ harness = false
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "rustfs-config/hotpath",
+    "rustfs-io-metrics/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-io-metrics/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-io-metrics/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics = { workspace = true }
 rustfs-utils = { workspace = true, features = ["os"] }

@@ -1035,6 +1035,7 @@ impl HybridCapacityManager {
     ///
     /// Joiners subscribe to the watch channel *before* releasing the mutex, which guarantees
     /// they cannot miss the completion notification even if the leader finishes very quickly.
+    #[hotpath::measure]
     pub async fn refresh_or_join<F, Fut>(&self, source: DataSource, refresh_fn: F) -> Result<CapacityUpdate, String>
     where
         F: FnOnce() -> Fut,
@@ -1142,6 +1143,7 @@ impl HybridCapacityManager {
     }
 
     /// Start a background refresh if one is not already in flight.
+    #[hotpath::measure]
     pub async fn spawn_refresh_if_needed<F, Fut>(self: Arc<Self>, source: DataSource, refresh_fn: F) -> bool
     where
         F: FnOnce() -> Fut + Send + 'static,

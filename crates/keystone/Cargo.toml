@@ -28,7 +28,34 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/reqwest-0-13",
+    "rustfs-credentials/hotpath",
+    "rustfs-policy/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-policy/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-policy/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }

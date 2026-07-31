@@ -29,7 +29,48 @@ documentation = "https://docs.rs/rustfs-scanner/latest/rustfs_scanner/"
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "rustfs-common/hotpath",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-data-usage/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-filemeta/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-data-usage/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-filemeta/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-data-usage/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-filemeta/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-credentials = { workspace = true }

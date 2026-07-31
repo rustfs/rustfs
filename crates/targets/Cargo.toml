@@ -11,7 +11,41 @@ keywords = ["file-system", "notification", "target", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-targets/latest/rustfs_targets/"
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/parking_lot",
+    "hotpath/reqwest-0-13",
+    "rustfs-config/hotpath",
+    "rustfs-extension-schema/hotpath",
+    "rustfs-s3-types/hotpath",
+    "rustfs-tls-runtime/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-extension-schema/hotpath-alloc",
+    "rustfs-s3-types/hotpath-alloc",
+    "rustfs-tls-runtime/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-extension-schema/hotpath-cpu",
+    "rustfs-s3-types/hotpath-cpu",
+    "rustfs-tls-runtime/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["notify", "audit", "server-config-model"] }
 rustfs-extension-schema = { workspace = true }
 rustfs-tls-runtime = { workspace = true }

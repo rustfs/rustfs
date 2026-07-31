@@ -24,7 +24,20 @@ description = " RustFS Trusted Proxies module provides secure and efficient mana
 keywords = ["trusted-proxies", "network-security", "rustfs", "proxy-management"]
 categories = ["network-programming", "security", "web-programming"]
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/reqwest-0-13",
+    "rustfs-config/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-config/hotpath-alloc", "rustfs-utils/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-config/hotpath-cpu", "rustfs-utils/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 async-trait = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
