@@ -56,6 +56,21 @@ mod tests {
         );
     }
 
+    async fn assert_current_list_hides_delete_marker(client: &Client, bucket: &str, key: &str) {
+        let listed = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .expect("list current objects after delete marker");
+
+        assert!(
+            listed.contents().iter().all(|object| object.key() != Some(key)),
+            "ListObjectsV2 must hide an object whose latest version is a delete marker"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_versioning_only_delete_marker_has_minio_compatible_visibility_for_migration_proof() {
@@ -94,6 +109,7 @@ mod tests {
         assert_eq!(markers[0].version_id(), Some(delete_marker_version_id));
         assert_eq!(markers[0].is_latest(), Some(true));
         assert_current_get_is_delete_marker_not_found(&client, bucket, key).await;
+        assert_current_list_hides_delete_marker(&client, bucket, key).await;
     }
 
     #[tokio::test]
@@ -118,6 +134,17 @@ mod tests {
             .await
             .expect("put historical version");
         let data_version_id = put.version_id().expect("put should return data version id");
+        let listed_before_delete = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .expect("list current object before creating delete marker");
+        assert!(
+            listed_before_delete.contents().iter().any(|object| object.key() == Some(key)),
+            "ListObjectsV2 must include the current object before it is deleted"
+        );
 
         let delete_marker = client
             .delete_object()
@@ -145,6 +172,7 @@ mod tests {
         assert_eq!(markers[0].version_id(), Some(delete_marker_version_id));
         assert_eq!(markers[0].is_latest(), Some(true));
         assert_current_get_is_delete_marker_not_found(&client, bucket, key).await;
+        assert_current_list_hides_delete_marker(&client, bucket, key).await;
 
         let historical = client
             .get_object()
