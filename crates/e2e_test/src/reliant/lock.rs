@@ -15,9 +15,7 @@
 
 use super::{grpc_lock_client::GrpcLockClient, grpc_lock_server::spawn_lock_server};
 use rustfs_lock::client::{LockClient, local::LocalClient};
-use rustfs_lock::{
-    GlobalLockManager, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockType, NamespaceLock, ObjectKey,
-};
+use rustfs_lock::{GlobalLockManager, LockInfo, LockRequest, LockResponse, LockStats, LockType, NamespaceLock, ObjectKey};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +33,11 @@ struct FailingClient;
 #[async_trait::async_trait]
 impl rustfs_lock::LockClient for FailingClient {
     async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
-        Err(LockError::internal("simulated gRPC node failure"))
+        // Match RemoteClient's transport-failure response so the coordinator can count this node toward quorum loss.
+        Ok(LockResponse::failure(
+            "Remote lock RPC failed: simulated gRPC node failure",
+            Duration::ZERO,
+        ))
     }
 
     async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
