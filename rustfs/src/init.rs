@@ -468,6 +468,13 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
 
+    // A key referenced by any bucket's encryption configuration must never be
+    // deleted. Register the gate before the service can start so every
+    // deletion-worker spawn observes it; the gate fails closed while the
+    // object store is not ready.
+    service_manager
+        .set_deletion_reference_checker(std::sync::Arc::new(crate::kms_deletion_gate::BucketEncryptionReferenceChecker));
+
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
         info!(
