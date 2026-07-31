@@ -128,6 +128,15 @@ pub enum KmsError {
     /// Backup/restore bundle contract violation; see [`crate::backup::BackupError`]
     #[error(transparent)]
     Backup(#[from] crate::backup::BackupError),
+
+    /// Operation is not supported by the active KMS backend
+    #[error("Operation '{operation}' is not supported by KMS backend '{backend}'")]
+    UnsupportedCapability { backend: String, operation: String },
+
+    /// Backend credentials expired or could not be refreshed in time; requests
+    /// fail closed instead of being sent with credentials that may lapse mid-flight
+    #[error("KMS credentials unavailable: {message}")]
+    CredentialsUnavailable { message: String },
 }
 
 impl KmsError {
@@ -268,6 +277,19 @@ impl KmsError {
             key_id: key_id.into(),
             version,
         }
+    }
+
+    /// Create an unsupported capability error
+    pub fn unsupported_capability<S1: Into<String>, S2: Into<String>>(backend: S1, operation: S2) -> Self {
+        Self::UnsupportedCapability {
+            backend: backend.into(),
+            operation: operation.into(),
+        }
+    }
+
+    /// Create a credentials unavailable error
+    pub fn credentials_unavailable<S: Into<String>>(message: S) -> Self {
+        Self::CredentialsUnavailable { message: message.into() }
     }
 }
 

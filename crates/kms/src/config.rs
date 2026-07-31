@@ -29,8 +29,14 @@ pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRAN
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
 pub const ENV_KMS_STATIC_SECRET_KEY: &str = "RUSTFS_KMS_STATIC_SECRET_KEY";
 pub const ENV_KMS_STATIC_SECRET_KEY_FILE: &str = "RUSTFS_KMS_STATIC_SECRET_KEY_FILE";
+pub const ENV_KMS_VAULT_APPROLE_ROLE_ID: &str = "RUSTFS_KMS_VAULT_APPROLE_ROLE_ID";
+pub const ENV_KMS_VAULT_APPROLE_SECRET_ID: &str = "RUSTFS_KMS_VAULT_APPROLE_SECRET_ID";
+pub const ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE: &str = "RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE";
+pub const ENV_KMS_VAULT_APPROLE_MOUNT: &str = "RUSTFS_KMS_VAULT_APPROLE_MOUNT";
+pub const ENV_KMS_VAULT_TOKEN_FILE: &str = "RUSTFS_KMS_VAULT_TOKEN_FILE";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
+pub const DEFAULT_VAULT_APPROLE_MOUNT: &str = "approle";
 
 /// Upper bound applied to `KmsConfig::timeout` when deriving backend behavior.
 ///
@@ -51,6 +57,10 @@ fn default_vault_transit_metadata_key_prefix() -> String {
 
 fn default_vault_kv2_mount_path() -> String {
     "transit".to_string()
+}
+
+fn default_vault_approle_mount() -> String {
+    DEFAULT_VAULT_APPROLE_MOUNT.to_string()
 }
 
 pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
@@ -388,18 +398,94 @@ impl Default for VaultTransitConfig {
 pub enum VaultAuthMethod {
     /// Token authentication
     Token { token: String },
-    /// AppRole authentication
-    AppRole { role_id: String, secret_id: String },
+    /// AppRole authentication: login with `role_id` + `secret_id` for a
+    /// lease-bound token that is renewed in the background.
+    AppRole {
+        role_id: String,
+        /// Inline secret_id; used only when `secret_id_file` is unset.
+        secret_id: String,
+        /// Path to a file holding the secret_id. Re-read on every login so an
+        /// externally rotated secret_id is picked up; takes precedence over the
+        /// inline value.
+        #[serde(default)]
+        secret_id_file: Option<PathBuf>,
+        /// AppRole auth engine mount path.
+        #[serde(default = "default_vault_approle_mount")]
+        mount: String,
+        /// Fail-closed margin in seconds: once the current token is within this
+        /// window of expiry without a successful refresh, requests are refused
+        /// instead of sent with a token that may lapse mid-flight. Defaults to
+        /// the per-attempt timeout.
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
+    /// Agent-managed token file (for example a Vault Agent auto-auth sink):
+    /// the token is read from `path` and re-read periodically so a token
+    /// rotated by the agent is picked up without a restart.
+    TokenFile {
+        path: PathBuf,
+        /// Seconds between token file re-reads. Each successful read also
+        /// extends the token's observed validity to twice this value, so a
+        /// file that stops being readable eventually trips the fail-closed
+        /// window. Defaults to 30 seconds.
+        #[serde(default)]
+        poll_interval_secs: Option<u64>,
+        /// Fail-closed margin in seconds, as on `AppRole`. Defaults to the
+        /// per-attempt timeout.
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
+}
+
+impl VaultAuthMethod {
+    /// AppRole authentication with the default mount and no secret-id file.
+    pub fn approle(role_id: String, secret_id: String) -> Self {
+        Self::AppRole {
+            role_id,
+            secret_id,
+            secret_id_file: None,
+            mount: default_vault_approle_mount(),
+            refresh_safety_window_secs: None,
+        }
+    }
+
+    /// Agent-managed token file with the default poll interval.
+    pub fn token_file(path: PathBuf) -> Self {
+        Self::TokenFile {
+            path,
+            poll_interval_secs: None,
+            refresh_safety_window_secs: None,
+        }
+    }
 }
 
 impl fmt::Debug for VaultAuthMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Token { token } => f.debug_struct("Token").field("token", &redacted_secret(token)).finish(),
-            Self::AppRole { role_id, secret_id } => f
+            Self::AppRole {
+                role_id,
+                secret_id,
+                secret_id_file,
+                mount,
+                refresh_safety_window_secs,
+            } => f
                 .debug_struct("AppRole")
                 .field("role_id", role_id)
                 .field("secret_id", &redacted_secret(secret_id))
+                .field("secret_id_file", secret_id_file)
+                .field("mount", mount)
+                .field("refresh_safety_window_secs", refresh_safety_window_secs)
+                .finish(),
+            Self::TokenFile {
+                path,
+                poll_interval_secs,
+                refresh_safety_window_secs,
+            } => f
+                .debug_struct("TokenFile")
+                .field("path", path)
+                .field("poll_interval_secs", poll_interval_secs)
+                .field("refresh_safety_window_secs", refresh_safety_window_secs)
                 .finish(),
         }
     }
@@ -479,7 +565,7 @@ impl KmsConfig {
             backend: KmsBackend::VaultKv2,
             backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
                 address: address.to_string(),
-                auth_method: VaultAuthMethod::AppRole { role_id, secret_id },
+                auth_method: VaultAuthMethod::approle(role_id, secret_id),
                 ..Default::default()
             })),
             ..Default::default()
@@ -637,6 +723,8 @@ impl KmsConfig {
                     return Err(KmsError::configuration_error("Vault KV2 address must use http or https scheme"));
                 }
 
+                validate_vault_auth_method("Vault KV2", &config.auth_method)?;
+
                 if !self.allow_insecure_dev_defaults {
                     validate_vault_development_defaults("Vault KV2", &config.address, &config.auth_method, config.tls.as_ref())?;
                 }
@@ -659,6 +747,8 @@ impl KmsConfig {
                 if !config.address.starts_with("http://") && !config.address.starts_with("https://") {
                     return Err(KmsError::configuration_error("Vault Transit address must use http or https scheme"));
                 }
+
+                validate_vault_auth_method("Vault Transit", &config.auth_method)?;
 
                 if !self.allow_insecure_dev_defaults {
                     validate_vault_development_defaults(
@@ -764,7 +854,7 @@ impl KmsConfig {
             }
             KmsBackend::VaultKv2 => {
                 let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
-                let token = get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token");
+                let auth_method = vault_auth_method_from_env()?;
                 let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
 
                 let mount_path = match get_env_opt_str("RUSTFS_KMS_VAULT_MOUNT_PATH") {
@@ -779,7 +869,7 @@ impl KmsConfig {
 
                 config.backend_config = BackendConfig::VaultKv2(Box::new(VaultConfig {
                     address,
-                    auth_method: VaultAuthMethod::Token { token },
+                    auth_method,
                     namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
                     mount_path,
                     kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
@@ -789,12 +879,12 @@ impl KmsConfig {
             }
             KmsBackend::VaultTransit => {
                 let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
-                let token = get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token");
+                let auth_method = vault_auth_method_from_env()?;
                 let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
 
                 config.backend_config = BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
                     address,
-                    auth_method: VaultAuthMethod::Token { token },
+                    auth_method,
                     namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
                     mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
                     metadata_kv_mount: get_env_str(
@@ -871,6 +961,95 @@ fn development_default_error(reason: &str) -> KmsError {
 
 fn is_under_temp_dir(path: &Path) -> bool {
     path.starts_with(std::env::temp_dir())
+}
+
+/// Resolve the Vault auth method from environment variables.
+///
+/// Setting `RUSTFS_KMS_VAULT_APPROLE_ROLE_ID` selects AppRole authentication;
+/// the secret_id then comes from `RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE`
+/// (re-read on every login, mirroring the `RUSTFS_KMS_STATIC_SECRET_KEY_FILE`
+/// precedent) or inline from `RUSTFS_KMS_VAULT_APPROLE_SECRET_ID`, with the
+/// file taking precedence. Without a role id the legacy token flow applies.
+fn vault_auth_method_from_env() -> Result<VaultAuthMethod> {
+    if let Some(token_file) = get_env_opt_str(ENV_KMS_VAULT_TOKEN_FILE) {
+        // A token file names one authoritative credential source; combining it
+        // with another one would leave the effective identity ambiguous, so
+        // that is a configuration error rather than a precedence rule.
+        if get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID).is_some() {
+            return Err(KmsError::configuration_error(format!(
+                "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with {ENV_KMS_VAULT_APPROLE_ROLE_ID}; configure exactly one Vault auth method"
+            )));
+        }
+        if get_env_opt_str("RUSTFS_KMS_VAULT_TOKEN").is_some() {
+            return Err(KmsError::configuration_error(format!(
+                "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with RUSTFS_KMS_VAULT_TOKEN; configure exactly one Vault auth method"
+            )));
+        }
+        return Ok(VaultAuthMethod::token_file(PathBuf::from(token_file)));
+    }
+
+    let Some(role_id) = get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID) else {
+        return Ok(VaultAuthMethod::Token {
+            token: get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token"),
+        });
+    };
+
+    let secret_id_file = get_env_opt_str(ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE).map(PathBuf::from);
+    let secret_id = get_env_opt_str(ENV_KMS_VAULT_APPROLE_SECRET_ID).unwrap_or_default();
+    if secret_id.is_empty() && secret_id_file.is_none() {
+        return Err(KmsError::configuration_error(format!(
+            "Vault AppRole requires {ENV_KMS_VAULT_APPROLE_SECRET_ID} or {ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE} to be set"
+        )));
+    }
+
+    Ok(VaultAuthMethod::AppRole {
+        role_id,
+        secret_id,
+        secret_id_file,
+        mount: get_env_str(ENV_KMS_VAULT_APPROLE_MOUNT, DEFAULT_VAULT_APPROLE_MOUNT),
+        refresh_safety_window_secs: None,
+    })
+}
+
+fn validate_vault_auth_method(backend_name: &str, auth_method: &VaultAuthMethod) -> Result<()> {
+    match auth_method {
+        VaultAuthMethod::Token { .. } => Ok(()),
+        VaultAuthMethod::AppRole {
+            role_id,
+            secret_id,
+            secret_id_file,
+            mount,
+            ..
+        } => {
+            if role_id.is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} AppRole role_id cannot be empty")));
+            }
+            if secret_id.is_empty() && secret_id_file.is_none() {
+                return Err(KmsError::configuration_error(format!(
+                    "{backend_name} AppRole requires a secret_id or a secret_id_file"
+                )));
+            }
+            if mount.is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} AppRole mount cannot be empty")));
+            }
+            Ok(())
+        }
+        VaultAuthMethod::TokenFile {
+            path,
+            poll_interval_secs,
+            ..
+        } => {
+            if path.as_os_str().is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} token file path cannot be empty")));
+            }
+            if poll_interval_secs == &Some(0) {
+                return Err(KmsError::configuration_error(format!(
+                    "{backend_name} token file poll interval must be greater than 0"
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_vault_development_defaults(
@@ -1295,6 +1474,220 @@ mod tests {
                 assert_eq!(vault.key_path_prefix, "tenant/keys");
             },
         );
+    }
+
+    #[test]
+    fn test_from_env_selects_approle_when_role_id_is_set() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, Some("env-role-id")),
+                (ENV_KMS_VAULT_APPROLE_SECRET_ID, Some("env-approle-secret-id")),
+                (ENV_KMS_VAULT_APPROLE_MOUNT, Some("approle-alt")),
+                // A stale token env var must not override the AppRole selection.
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("vault-token")),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                let vault = config.vault_config().expect("vault backend config");
+                let VaultAuthMethod::AppRole {
+                    role_id,
+                    secret_id,
+                    secret_id_file,
+                    mount,
+                    refresh_safety_window_secs,
+                } = &vault.auth_method
+                else {
+                    panic!("role id in the environment must select AppRole auth, got {:?}", vault.auth_method);
+                };
+                assert_eq!(role_id, "env-role-id");
+                assert_eq!(secret_id, "env-approle-secret-id");
+                assert_eq!(secret_id_file, &None);
+                assert_eq!(mount, "approle-alt");
+                assert_eq!(refresh_safety_window_secs, &None);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_approle_secret_id_file_is_stored_as_path() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, Some("env-role-id")),
+                (ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE, Some("/etc/rustfs/approle-secret-id")),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                let vault = config.vault_transit_config().expect("vault transit backend config");
+                let VaultAuthMethod::AppRole {
+                    secret_id,
+                    secret_id_file,
+                    mount,
+                    ..
+                } = &vault.auth_method
+                else {
+                    panic!("role id in the environment must select AppRole auth");
+                };
+                // The path is stored, not read: the secret_id file is re-read on
+                // every login so external rotation is picked up.
+                assert_eq!(secret_id_file.as_deref(), Some(std::path::Path::new("/etc/rustfs/approle-secret-id")));
+                assert!(secret_id.is_empty());
+                assert_eq!(mount, DEFAULT_VAULT_APPROLE_MOUNT);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_approle_requires_secret_id_or_file() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, Some("env-role-id")),
+                (ENV_KMS_VAULT_APPROLE_SECRET_ID, None::<&str>),
+                (ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE, None::<&str>),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("approle without a secret_id source must be rejected");
+                assert!(error.to_string().contains(ENV_KMS_VAULT_APPROLE_SECRET_ID));
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_selects_token_file() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
+                (ENV_KMS_VAULT_TOKEN_FILE, Some("/run/vault-agent/token")),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                let vault = config.vault_config().expect("vault backend config");
+                let VaultAuthMethod::TokenFile {
+                    path,
+                    poll_interval_secs,
+                    refresh_safety_window_secs,
+                } = &vault.auth_method
+                else {
+                    panic!("token file in the environment must select TokenFile auth, got {:?}", vault.auth_method);
+                };
+                assert_eq!(path, std::path::Path::new("/run/vault-agent/token"));
+                assert_eq!(poll_interval_secs, &None);
+                assert_eq!(refresh_safety_window_secs, &None);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_token_file_is_mutually_exclusive_with_other_auth() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                (ENV_KMS_VAULT_TOKEN_FILE, Some("/run/vault-agent/token")),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, Some("env-role-id")),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("token file combined with approle must be rejected");
+                assert!(error.to_string().contains(ENV_KMS_VAULT_TOKEN_FILE));
+                assert!(error.to_string().contains(ENV_KMS_VAULT_APPROLE_ROLE_ID));
+            },
+        );
+
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                (ENV_KMS_VAULT_TOKEN_FILE, Some("/run/vault-agent/token")),
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("vault-token")),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("token file combined with a static token must be rejected");
+                assert!(error.to_string().contains(ENV_KMS_VAULT_TOKEN_FILE));
+                assert!(error.to_string().contains("RUSTFS_KMS_VAULT_TOKEN"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_token_file_settings() {
+        let vault_config = |auth_method: VaultAuthMethod| KmsConfig {
+            backend: KmsBackend::VaultKv2,
+            backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let error = vault_config(VaultAuthMethod::token_file(PathBuf::new()))
+            .validate()
+            .expect_err("empty token file path must be rejected");
+        assert!(error.to_string().contains("path"));
+
+        let error = vault_config(VaultAuthMethod::TokenFile {
+            path: PathBuf::from("/run/vault-agent/token"),
+            poll_interval_secs: Some(0),
+            refresh_safety_window_secs: None,
+        })
+        .validate()
+        .expect_err("zero poll interval must be rejected");
+        assert!(error.to_string().contains("poll interval"));
+
+        vault_config(VaultAuthMethod::token_file(PathBuf::from("/run/vault-agent/token")))
+            .validate()
+            .expect("well-formed token file auth must validate");
+    }
+
+    #[test]
+    fn test_approle_config_deserializes_legacy_shape_with_defaults() {
+        // Persisted configurations from before the AppRole implementation only
+        // carry role_id and secret_id; the new fields must fill with defaults.
+        let legacy = serde_json::json!({
+            "AppRole": {
+                "role_id": "legacy-role",
+                "secret_id": "legacy-secret-id",
+            }
+        });
+        let auth: VaultAuthMethod = serde_json::from_value(legacy).expect("legacy AppRole config must keep deserializing");
+        let VaultAuthMethod::AppRole {
+            role_id,
+            secret_id_file,
+            mount,
+            refresh_safety_window_secs,
+            ..
+        } = auth
+        else {
+            panic!("expected AppRole");
+        };
+        assert_eq!(role_id, "legacy-role");
+        assert_eq!(secret_id_file, None);
+        assert_eq!(mount, DEFAULT_VAULT_APPROLE_MOUNT);
+        assert_eq!(refresh_safety_window_secs, None);
+    }
+
+    #[test]
+    fn test_validate_rejects_incomplete_approle() {
+        let mut config = KmsConfig::vault_approle(
+            Url::parse("https://vault.example.com:8200").expect("vault URL"),
+            String::new(),
+            "secret-id".to_string(),
+        );
+        let error = config.validate().expect_err("empty role_id must be rejected");
+        assert!(error.to_string().contains("role_id"));
+
+        config = KmsConfig::vault_approle(
+            Url::parse("https://vault.example.com:8200").expect("vault URL"),
+            "role-id".to_string(),
+            String::new(),
+        );
+        let error = config
+            .validate()
+            .expect_err("approle without secret_id or secret_id_file must be rejected");
+        assert!(error.to_string().contains("secret_id"));
     }
 
     #[test]

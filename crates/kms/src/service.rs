@@ -184,6 +184,15 @@ impl ObjectEncryptionService {
         self.kms_manager.health_check().await
     }
 
+    /// Report the capabilities of the configured backend
+    ///
+    /// # Returns
+    /// The capability matrix advertised by the active KMS backend
+    ///
+    pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
+        self.kms_manager.backend_capabilities()
+    }
+
     /// Create a data encryption key for object encryption
     ///
     /// # Arguments

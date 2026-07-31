@@ -17,21 +17,74 @@
 //! [`VaultCredentialProvider`] owns the authenticated [`VaultClient`] and hands
 //! out per-request snapshots. Backends take a fresh snapshot via
 //! [`VaultCredentialProvider::current`] for every Vault call instead of holding
-//! a client for their own lifetime: a future credential rotation then applies
-//! to the next call, while calls already in flight finish on the generation
-//! they captured (their `Arc` keeps it alive).
+//! a client for their own lifetime: a credential rotation applies to the next
+//! call, while calls already in flight finish on the generation they captured
+//! (their `Arc` keeps it alive).
+//!
+//! Lease-bound tokens (AppRole) are kept fresh by a background renewal task
+//! (see [`VaultCredentialProvider::spawn_renewal_task`]): it renews at half the
+//! lease TTL, falls back to a fresh login when renewal is not possible, and
+//! keeps retrying after failures. If the token still reaches the configured
+//! safety window before expiry, [`VaultCredentialProvider::current`] fails
+//! closed rather than handing out a token that may lapse mid-request.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use sha2::Digest;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::config::{VaultAuthMethod, redacted_secret};
+use crate::config::{KmsConfig, VaultAuthMethod, redacted_secret};
 use crate::error::{KmsError, Result};
+use crate::policy::{self, AttemptError, ErrorClass, OpClass, RetryPolicy};
+
+/// Result of a single authentication attempt, classified for the Auth retry
+/// policy.
+type AttemptResult<T> = std::result::Result<T, AttemptError>;
+
+/// Cadence for refresh retries after a failed cycle (on top of the bounded
+/// retries inside one [`policy::execute`] call).
+const DEFAULT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default seconds between token file re-reads for [`TokenFileSource`].
+const DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS: u64 = 30;
+
+/// A crate-owned secret value, zeroized on drop and redacted in Debug output.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub(crate) struct SecretString(String);
+
+impl SecretString {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(redacted_secret(&self.0))
+    }
+}
+
+/// Expiry attributes of a lease-bound token.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LeaseInfo {
+    /// Time-to-live granted at issue or renewal.
+    pub(crate) ttl: Duration,
+    /// Whether `renew-self` can extend this token.
+    pub(crate) renewable: bool,
+}
 
 /// A Vault token handed out by a [`TokenSource`].
 ///
@@ -39,22 +92,41 @@ use crate::error::{KmsError, Result};
 /// copy `vaultrs` keeps inside its client settings (or the HTTP headers built
 /// from it); it bounds how long the token lingers in memory owned by this
 /// module.
-///
-/// AppRole login (PR-2) will extend this with the lease metadata returned by
-/// the login endpoint (`lease_duration`, `renewable`, accessor).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct TokenLease {
     token: String,
+    /// `None` for tokens without an expiry (static configuration tokens and
+    /// non-expiring root-like tokens).
+    #[zeroize(skip)]
+    lease: Option<LeaseInfo>,
 }
 
 impl TokenLease {
-    pub(crate) fn new(token: String) -> Self {
-        Self { token }
+    pub(crate) fn new(token: String, lease: Option<LeaseInfo>) -> Self {
+        Self { token, lease }
+    }
+
+    /// Map a Vault auth response onto a lease. A `lease_duration` of zero
+    /// means the token never expires, so no lease is tracked and no renewal is
+    /// scheduled.
+    fn from_auth(auth: vaultrs::api::AuthInfo) -> Self {
+        let lease = (auth.lease_duration > 0).then_some(LeaseInfo {
+            ttl: Duration::from_secs(auth.lease_duration),
+            renewable: auth.renewable,
+        });
+        Self {
+            token: auth.client_token,
+            lease,
+        }
     }
 
     /// Expose the raw token for handing to the Vault client builder.
     pub(crate) fn expose(&self) -> &str {
         &self.token
+    }
+
+    pub(crate) fn lease_info(&self) -> Option<LeaseInfo> {
+        self.lease
     }
 }
 
@@ -62,29 +134,45 @@ impl fmt::Debug for TokenLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenLease")
             .field("token", &redacted_secret(&self.token))
+            .field("lease", &self.lease)
             .finish()
+    }
+}
+
+/// Wrap a `vaultrs` failure as a classified attempt failure.
+fn attempt_error(operation: &str, error: vaultrs::error::ClientError) -> AttemptError {
+    AttemptError {
+        class: policy::classify_vaultrs(&error),
+        error: KmsError::backend_error(format!("Vault {operation} failed: {error}")),
     }
 }
 
 /// Source of Vault authentication tokens.
 ///
-/// Only [`StaticToken`] exists today. The trait is async and fallible so
-/// future sources can perform I/O when acquiring a token without changing the
-/// provider:
-/// - `AppRoleLogin` (PR-2): performs an `auth/approle/login` round trip and
-///   returns the issued token with its lease metadata;
-/// - `TokenFile` (PR-3): re-reads an agent-managed token file.
+/// Implementations perform one attempt per call; bounded retries and backoff
+/// are owned by the caller through [`policy::execute`] with [`OpClass::Auth`].
+/// Current sources are [`StaticToken`], [`AppRoleLogin`], and the agent-managed
+/// [`TokenFileSource`].
 #[async_trait]
 pub(crate) trait TokenSource: fmt::Debug + Send + Sync {
-    /// Acquire a token for a new client generation.
+    /// One login attempt yielding a token for a new client generation.
+    async fn acquire(&self) -> AttemptResult<TokenLease>;
+
+    /// One `renew-self` attempt for the token held by `client`.
     ///
-    /// Called once at provider construction today; rotation (PR-2) will call
-    /// it again for every re-authentication.
-    async fn acquire(&self) -> Result<TokenLease>;
+    /// Sources whose tokens cannot be renewed fail fatally; callers fall back
+    /// to [`TokenSource::acquire`].
+    async fn renew(&self, _client: &VaultClient) -> AttemptResult<TokenLease> {
+        Err(AttemptError {
+            class: ErrorClass::Fatal,
+            error: KmsError::invalid_operation("this token source does not support renewal"),
+        })
+    }
 }
 
 /// Token source for [`VaultAuthMethod::Token`]: always yields the token fixed
-/// at configuration time.
+/// at configuration time. The token carries no lease, so it is never renewed
+/// and never expires from the provider's point of view.
 pub(crate) struct StaticToken {
     token: TokenLease,
 }
@@ -92,14 +180,14 @@ pub(crate) struct StaticToken {
 impl StaticToken {
     pub(crate) fn new(token: String) -> Self {
         Self {
-            token: TokenLease::new(token),
+            token: TokenLease::new(token, None),
         }
     }
 }
 
 #[async_trait]
 impl TokenSource for StaticToken {
-    async fn acquire(&self) -> Result<TokenLease> {
+    async fn acquire(&self) -> AttemptResult<TokenLease> {
         Ok(self.token.clone())
     }
 }
@@ -111,16 +199,247 @@ impl fmt::Debug for StaticToken {
     }
 }
 
-/// Map the configured auth method onto a token source.
+/// Token source for [`VaultAuthMethod::AppRole`]: exchanges `role_id` +
+/// `secret_id` for a lease-bound token via the AppRole auth engine.
+pub(crate) struct AppRoleLogin {
+    /// Unauthenticated client used only for the login exchange.
+    login_client: VaultClient,
+    mount: String,
+    role_id: String,
+    /// Inline secret_id fallback, used when no file is configured.
+    secret_id: SecretString,
+    /// Secret-id file, re-read on every login so external rotation of the
+    /// secret_id is picked up without a restart. Takes precedence over the
+    /// inline value.
+    secret_id_file: Option<PathBuf>,
+}
+
+impl AppRoleLogin {
+    pub(crate) fn new(
+        settings: &VaultConnectionSettings,
+        mount: String,
+        role_id: String,
+        secret_id: String,
+        secret_id_file: Option<PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            login_client: settings.build_login_client()?,
+            mount,
+            role_id,
+            secret_id: SecretString::new(secret_id),
+            secret_id_file,
+        })
+    }
+
+    /// Resolve the secret_id for one login attempt.
+    ///
+    /// File problems are fatal for the attempt (replaying the same read within
+    /// one retry cycle cannot help), but the renewal loop keeps retrying on
+    /// its cadence, so repairing the file heals the source without a restart.
+    async fn resolve_secret_id(&self) -> AttemptResult<SecretString> {
+        let Some(path) = &self.secret_id_file else {
+            return Ok(self.secret_id.clone());
+        };
+
+        let mut raw = tokio::fs::read_to_string(path).await.map_err(|error| AttemptError {
+            class: ErrorClass::Fatal,
+            error: KmsError::configuration_error(format!("Failed to read AppRole secret_id file {}: {error}", path.display())),
+        })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            raw.zeroize();
+            return Err(AttemptError {
+                class: ErrorClass::Fatal,
+                error: KmsError::configuration_error(format!("AppRole secret_id file {} is empty", path.display())),
+            });
+        }
+        let secret_id = SecretString::new(trimmed.to_string());
+        raw.zeroize();
+        Ok(secret_id)
+    }
+}
+
+#[async_trait]
+impl TokenSource for AppRoleLogin {
+    async fn acquire(&self) -> AttemptResult<TokenLease> {
+        let secret_id = self.resolve_secret_id().await?;
+        let auth = vaultrs::auth::approle::login(&self.login_client, &self.mount, &self.role_id, secret_id.expose())
+            .await
+            .map_err(|error| attempt_error("AppRole login", error))?;
+        Ok(TokenLease::from_auth(auth))
+    }
+
+    async fn renew(&self, client: &VaultClient) -> AttemptResult<TokenLease> {
+        let auth = vaultrs::token::renew_self(client, None)
+            .await
+            .map_err(|error| attempt_error("token renewal", error))?;
+        Ok(TokenLease::from_auth(auth))
+    }
+}
+
+impl fmt::Debug for AppRoleLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The login client embeds Vault client settings and must stay out of
+        // Debug output; role_id is not a secret in Vault's AppRole model.
+        f.debug_struct("AppRoleLogin")
+            .field("mount", &self.mount)
+            .field("role_id", &self.role_id)
+            .field("secret_id", &self.secret_id)
+            .field("secret_id_file", &self.secret_id_file)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Token source for [`VaultAuthMethod::TokenFile`]: reads an agent-managed
+/// token file (for example a Vault Agent auto-auth sink).
 ///
-/// AppRole is still rejected at construction time; PR-2 replaces this arm with
-/// an `AppRoleLogin` source.
-pub(crate) fn token_source_for(auth_method: &VaultAuthMethod) -> Result<Box<dyn TokenSource>> {
+/// The agent owns the token's lifecycle; this source only tracks the file.
+/// Every read grants the token an observed validity of `validity`, so the
+/// renewal loop re-reads the file at half that interval and installs a new
+/// client generation from whatever the file holds. A file that disappears or
+/// turns empty keeps failing the refresh until the fail-closed window trips,
+/// and heals the provider as soon as it is restored.
+pub(crate) struct TokenFileSource {
+    path: PathBuf,
+    /// Observed validity granted per successful read; the renewal loop
+    /// re-reads at half this value.
+    validity: Duration,
+    /// Digest of the last token read, to tell agent-driven rotations apart
+    /// from plain refreshes in the logs. Never holds the token itself.
+    last_digest: std::sync::Mutex<Option<[u8; 32]>>,
+}
+
+impl TokenFileSource {
+    pub(crate) fn new(path: PathBuf, validity: Duration) -> Self {
+        Self {
+            path,
+            validity,
+            last_digest: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn fatal(error: KmsError) -> AttemptError {
+        AttemptError {
+            class: ErrorClass::Fatal,
+            error,
+        }
+    }
+
+    /// Reject a token file readable by group or other, mirroring the SFTP
+    /// host-key rule: a Vault token grants use of the KMS keys, so a mode
+    /// wider than owner-only is a deployment error, not a warning.
+    #[cfg(unix)]
+    fn check_permissions(&self, metadata: &std::fs::Metadata) -> AttemptResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(Self::fatal(KmsError::configuration_error(format!(
+                "Vault token file {} has insecure permissions {mode:#o} (group and other permission bits must be unset)",
+                self.path.display()
+            ))));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TokenSource for TokenFileSource {
+    async fn acquire(&self) -> AttemptResult<TokenLease> {
+        // Synchronous reads on purpose: the token file is tiny, this runs at
+        // the renewal cadence, and staying off the blocking pool keeps the
+        // paused-clock tests of the renewal timing deterministic.
+        let metadata = std::fs::metadata(&self.path).map_err(|error| {
+            Self::fatal(KmsError::configuration_error(format!(
+                "Failed to read Vault token file {}: {error}",
+                self.path.display()
+            )))
+        })?;
+        #[cfg(unix)]
+        self.check_permissions(&metadata)?;
+
+        let mut raw = std::fs::read_to_string(&self.path).map_err(|error| {
+            Self::fatal(KmsError::configuration_error(format!(
+                "Failed to read Vault token file {}: {error}",
+                self.path.display()
+            )))
+        })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            raw.zeroize();
+            return Err(Self::fatal(KmsError::configuration_error(format!(
+                "Vault token file {} is empty",
+                self.path.display()
+            ))));
+        }
+
+        let digest: [u8; 32] = sha2::Sha256::digest(trimmed.as_bytes()).into();
+        let previous = self
+            .last_digest
+            .lock()
+            .expect("token file digest mutex poisoned")
+            .replace(digest);
+        if previous.is_some_and(|previous| previous != digest) {
+            info!(
+                path = %self.path.display(),
+                modified = ?metadata.modified().ok(),
+                "Vault token file rotated; installing a new client generation"
+            );
+        }
+
+        let token = trimmed.to_string();
+        raw.zeroize();
+        Ok(TokenLease::new(
+            token,
+            Some(LeaseInfo {
+                ttl: self.validity,
+                renewable: false,
+            }),
+        ))
+    }
+}
+
+impl fmt::Debug for TokenFileSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The token itself is never stored on the source; only its digest is.
+        f.debug_struct("TokenFileSource")
+            .field("path", &self.path)
+            .field("validity", &self.validity)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Map the configured auth method onto a token source.
+pub(crate) fn token_source_for(
+    auth_method: &VaultAuthMethod,
+    settings: &VaultConnectionSettings,
+) -> Result<Box<dyn TokenSource>> {
     match auth_method {
         VaultAuthMethod::Token { token } => Ok(Box::new(StaticToken::new(token.clone()))),
-        VaultAuthMethod::AppRole { .. } => Err(KmsError::backend_error(
-            "AppRole authentication not yet implemented. Please use token authentication.",
-        )),
+        VaultAuthMethod::AppRole {
+            role_id,
+            secret_id,
+            secret_id_file,
+            mount,
+            ..
+        } => Ok(Box::new(AppRoleLogin::new(
+            settings,
+            mount.clone(),
+            role_id.clone(),
+            secret_id.clone(),
+            secret_id_file.clone(),
+        )?)),
+        VaultAuthMethod::TokenFile {
+            path,
+            poll_interval_secs,
+            ..
+        } => {
+            let poll_interval = Duration::from_secs(poll_interval_secs.unwrap_or(DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS).max(1));
+            // Validity is twice the poll interval because the renewal loop
+            // fires at half the lease TTL: the file is then re-read once per
+            // poll interval, and a file that stops being readable expires the
+            // token after roughly two missed polls minus the safety window.
+            Ok(Box::new(TokenFileSource::new(path.clone(), poll_interval * 2)))
+        }
     }
 }
 
@@ -135,7 +454,7 @@ pub(crate) struct VaultConnectionSettings {
 
 impl VaultConnectionSettings {
     /// Build an authenticated client for one generation.
-    fn build_client(&self, token: &TokenLease) -> Result<VaultClient> {
+    fn build_client(&self, token: &str) -> Result<VaultClient> {
         let mut settings_builder = VaultClientSettingsBuilder::default();
         settings_builder.address(&self.address);
         // Defense in depth against stalled connections: vaultrs leaves the
@@ -143,7 +462,7 @@ impl VaultConnectionSettings {
         // request would otherwise wait forever regardless of the
         // operation-level retry policy.
         settings_builder.timeout(Some(self.attempt_timeout));
-        settings_builder.token(token.expose());
+        settings_builder.token(token);
 
         if let Some(namespace) = &self.namespace {
             settings_builder.namespace(Some(namespace.clone()));
@@ -155,6 +474,51 @@ impl VaultConnectionSettings {
 
         VaultClient::new(settings).map_err(|e| KmsError::backend_error(format!("Failed to create Vault client: {e}")))
     }
+
+    /// Build the tokenless client used for login exchanges.
+    fn build_login_client(&self) -> Result<VaultClient> {
+        self.build_client("")
+    }
+}
+
+/// Refresh and fail-closed tuning for a [`VaultCredentialProvider`].
+#[derive(Debug, Clone)]
+pub(crate) struct VaultCredentialPolicy {
+    /// Retry budget for one login/renewal cycle.
+    pub(crate) retry: RetryPolicy,
+    /// Fail-closed margin: once the current token is within this window of
+    /// expiry without a successful refresh, [`VaultCredentialProvider::current`]
+    /// refuses to hand it out.
+    pub(crate) safety_window: Duration,
+    /// Pause between refresh cycles after a failed one.
+    pub(crate) retry_interval: Duration,
+}
+
+impl VaultCredentialPolicy {
+    /// Derive the policy from the KMS configuration.
+    ///
+    /// The default safety window equals the per-attempt timeout: a request
+    /// issued now can stay in flight for up to one attempt timeout, so the
+    /// token must outlive at least that.
+    pub(crate) fn from_kms_config(config: &KmsConfig, auth_method: &VaultAuthMethod) -> Self {
+        let retry = RetryPolicy::from_config(config);
+        let safety_window = match auth_method {
+            VaultAuthMethod::AppRole {
+                refresh_safety_window_secs: Some(secs),
+                ..
+            }
+            | VaultAuthMethod::TokenFile {
+                refresh_safety_window_secs: Some(secs),
+                ..
+            } => Duration::from_secs(*secs),
+            _ => retry.attempt_timeout,
+        };
+        Self {
+            retry,
+            safety_window,
+            retry_interval: DEFAULT_REFRESH_RETRY_INTERVAL,
+        }
+    }
 }
 
 /// One authenticated client generation.
@@ -164,10 +528,27 @@ impl VaultConnectionSettings {
 /// client out from under an in-flight request.
 pub(crate) struct VaultClientHandle {
     /// Monotonic counter identifying the credential generation this client was
-    /// built from. Static tokens never rotate, so only generation 0 exists
-    /// today; rotation (PR-2) bumps it on every re-authentication.
+    /// built from; bumped on every successful refresh.
     pub(crate) generation: u64,
     pub(crate) client: VaultClient,
+    /// When this generation's token was issued (or last renewed).
+    issued_at: Instant,
+    /// Lease of this generation's token; `None` when it never expires.
+    lease: Option<LeaseInfo>,
+}
+
+impl VaultClientHandle {
+    /// Absolute expiry of this generation's token.
+    fn expires_at(&self) -> Option<Instant> {
+        self.lease.map(|lease| self.issued_at + lease.ttl)
+    }
+
+    /// When the renewal task should refresh this generation: half the TTL,
+    /// leaving the second half as budget for retries before the fail-closed
+    /// window is reached.
+    fn renew_at(&self) -> Option<Instant> {
+        self.lease.map(|lease| self.issued_at + lease.ttl / 2)
+    }
 }
 
 impl fmt::Debug for VaultClientHandle {
@@ -176,46 +557,215 @@ impl fmt::Debug for VaultClientHandle {
         // never appear in Debug output.
         f.debug_struct("VaultClientHandle")
             .field("generation", &self.generation)
+            .field("lease", &self.lease)
             .finish_non_exhaustive()
     }
 }
 
 /// Owns the authenticated Vault client for a backend and hands out
 /// per-request snapshots.
-///
-/// The provider keeps neither the settings nor the source after construction
-/// because a static token can never be refreshed. Rotation (PR-2) will retain
-/// both and add a refresh path that acquires a fresh lease, rebuilds the
-/// client, and stores it under a bumped generation.
 pub(crate) struct VaultCredentialProvider {
+    settings: VaultConnectionSettings,
+    source: Box<dyn TokenSource>,
+    policy: VaultCredentialPolicy,
     current: ArcSwap<VaultClientHandle>,
+    /// Serializes refreshes so concurrent triggers coalesce into one login.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl VaultCredentialProvider {
     /// Authenticate with `source` and build the initial client generation.
-    pub(crate) async fn new(settings: VaultConnectionSettings, source: Box<dyn TokenSource>) -> Result<Self> {
-        let lease = source.acquire().await?;
-        let client = settings.build_client(&lease)?;
+    pub(crate) async fn new(
+        settings: VaultConnectionSettings,
+        source: Box<dyn TokenSource>,
+        policy: VaultCredentialPolicy,
+    ) -> Result<Self> {
+        let startup_cancel = CancellationToken::new();
+        let lease = policy::execute("vault_login", OpClass::Auth, &policy.retry, &startup_cancel, || source.acquire()).await?;
+        let client = settings.build_client(lease.expose())?;
         Ok(Self {
-            current: ArcSwap::from_pointee(VaultClientHandle { generation: 0, client }),
+            current: ArcSwap::from_pointee(VaultClientHandle {
+                generation: 0,
+                client,
+                issued_at: Instant::now(),
+                lease: lease.lease_info(),
+            }),
+            settings,
+            source,
+            policy,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
-    /// Snapshot the current client generation.
+    /// Snapshot the current generation without the expiry gate. Internal use
+    /// (renewal scheduling) and tests only; request paths go through
+    /// [`VaultCredentialProvider::current`].
+    pub(crate) fn snapshot(&self) -> Arc<VaultClientHandle> {
+        self.current.load_full()
+    }
+
+    /// Snapshot the current client generation for a single request.
     ///
     /// Take one snapshot per Vault call: the returned `Arc` pins the
     /// generation for exactly that call, so a concurrent rotation applies to
     /// the next call without interrupting this one.
-    pub(crate) fn current(&self) -> Arc<VaultClientHandle> {
-        self.current.load_full()
+    ///
+    /// Fails closed when the token is inside the safety window of its expiry:
+    /// a request signed with such a token could lapse mid-flight, so refusing
+    /// it locally is strictly safer than an unpredictable remote failure.
+    pub(crate) fn current(&self) -> Result<Arc<VaultClientHandle>> {
+        let handle = self.current.load_full();
+        if let Some(expires_at) = handle.expires_at() {
+            let now = Instant::now();
+            if now + self.policy.safety_window >= expires_at {
+                return Err(KmsError::credentials_unavailable(format!(
+                    "Vault token (generation {}) is within {:?} of expiry and has not been refreshed; refusing to use it",
+                    handle.generation, self.policy.safety_window
+                )));
+            }
+        }
+        Ok(handle)
+    }
+
+    /// Refresh the credentials if generation `observed` is still current.
+    ///
+    /// Single-flight: concurrent callers serialize on the refresh lock, and a
+    /// caller that finds a newer generation already installed returns without
+    /// touching Vault. Renewable tokens are renewed in place; anything else
+    /// (or a failed renewal) falls back to a fresh login.
+    pub(crate) async fn refresh(&self, observed: u64, cancel: &CancellationToken) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
+        let current = self.snapshot();
+        if current.generation != observed {
+            return Ok(());
+        }
+
+        let renewable = current.lease.map(|lease| lease.renewable).unwrap_or(false);
+        let renewed = if renewable {
+            match policy::execute("vault_token_renew", OpClass::Auth, &self.policy.retry, cancel, || {
+                self.source.renew(&current.client)
+            })
+            .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error @ KmsError::OperationCancelled { .. }) => return Err(error),
+                Err(error) => {
+                    warn!(
+                        generation = current.generation,
+                        error = %error,
+                        "Vault token renewal failed; falling back to a fresh login"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let lease = match renewed {
+            Some(lease) => lease,
+            None => policy::execute("vault_login", OpClass::Auth, &self.policy.retry, cancel, || self.source.acquire()).await?,
+        };
+
+        let client = self.settings.build_client(lease.expose())?;
+        self.current.store(Arc::new(VaultClientHandle {
+            generation: current.generation + 1,
+            client,
+            issued_at: Instant::now(),
+            lease: lease.lease_info(),
+        }));
+        Ok(())
+    }
+
+    /// Spawn the background renewal task for lease-bound credentials.
+    ///
+    /// Returns `None` when the current token never expires (static tokens):
+    /// there is nothing to renew. The returned handle cancels the task when
+    /// dropped, tying the task's lifetime to whoever owns the handle (the
+    /// service version that owns this backend).
+    pub(crate) fn spawn_renewal_task(self: &Arc<Self>) -> Option<CredentialTaskHandle> {
+        self.snapshot().lease?;
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(renewal_loop(Arc::clone(self), cancel.clone()));
+        Some(CredentialTaskHandle {
+            cancel,
+            join: std::sync::Mutex::new(Some(join)),
+        })
     }
 }
 
 impl fmt::Debug for VaultCredentialProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VaultCredentialProvider")
+            .field("source", &self.source)
             .field("current", &self.current.load())
-            .finish()
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Drive credential refreshes until cancelled.
+///
+/// Each cycle sleeps until the current generation's renewal point (half TTL),
+/// then refreshes. A failed cycle logs, waits `retry_interval`, and tries
+/// again immediately (the renewal point is already in the past), so the
+/// provider keeps trying to recover even after the fail-closed window has
+/// been reached.
+async fn renewal_loop(provider: Arc<VaultCredentialProvider>, cancel: CancellationToken) {
+    loop {
+        let handle = provider.snapshot();
+        let Some(renew_at) = handle.renew_at() else {
+            // The current generation never expires; nothing left to schedule.
+            return;
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep_until(renew_at) => {}
+        }
+
+        match provider.refresh(handle.generation, &cancel).await {
+            Ok(()) => {}
+            Err(KmsError::OperationCancelled { .. }) => return,
+            Err(error) => {
+                warn!(
+                    generation = handle.generation,
+                    error = %error,
+                    "Vault credential refresh failed; retrying until the credentials recover"
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(provider.policy.retry_interval) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Owner handle for a spawned renewal task.
+///
+/// Dropping the handle cancels the task, so hanging it off the service version
+/// recycles the task on stop and reconfigure without explicit lifecycle calls.
+pub(crate) struct CredentialTaskHandle {
+    cancel: CancellationToken,
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl CredentialTaskHandle {
+    /// Cancel the renewal task and wait for it to exit.
+    pub(crate) async fn shutdown(&self) {
+        self.cancel.cancel();
+        let join = self.join.lock().expect("credential task join mutex poisoned").take();
+        if let Some(join) = join {
+            let _ = join.await;
+        }
+    }
+}
+
+impl Drop for CredentialTaskHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -223,8 +773,10 @@ impl fmt::Debug for VaultCredentialProvider {
 mod tests {
     use super::*;
     use crate::config::REDACTED_SECRET;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     const TEST_TOKEN: &str = "vault-token-debug-leak-canary";
+    const TEST_SECRET_ID: &str = "approle-secret-id-leak-canary";
 
     fn test_settings() -> VaultConnectionSettings {
         VaultConnectionSettings {
@@ -234,19 +786,113 @@ mod tests {
         }
     }
 
-    /// Building a provider never contacts Vault, so these tests run offline.
-    async fn test_provider() -> VaultCredentialProvider {
-        VaultCredentialProvider::new(test_settings(), Box::new(StaticToken::new(TEST_TOKEN.to_string())))
+    /// Tight retry budget so paused-clock tests stay deterministic: one
+    /// attempt per cycle, failed cycles spaced by `retry_interval`.
+    fn test_policy(safety_window: Duration, retry_interval: Duration) -> VaultCredentialPolicy {
+        VaultCredentialPolicy {
+            retry: RetryPolicy {
+                attempt_timeout: Duration::from_secs(1),
+                op_deadline: Duration::from_secs(1),
+                max_attempts: 1,
+                base_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            },
+            safety_window,
+            retry_interval,
+        }
+    }
+
+    /// Shared observable state of a [`ScriptedSource`].
+    #[derive(Debug, Default)]
+    struct ScriptedState {
+        login_calls: AtomicU32,
+        renew_calls: AtomicU32,
+        fail_login: AtomicBool,
+        fail_renew: AtomicBool,
+    }
+
+    /// Token source with scriptable outcomes for driving the provider without
+    /// a Vault server.
+    #[derive(Debug)]
+    struct ScriptedSource {
+        state: Arc<ScriptedState>,
+        ttl: Duration,
+        renewable: bool,
+        login_delay: Duration,
+    }
+
+    impl ScriptedSource {
+        fn lease(&self) -> Option<LeaseInfo> {
+            (!self.ttl.is_zero()).then_some(LeaseInfo {
+                ttl: self.ttl,
+                renewable: self.renewable,
+            })
+        }
+
+        fn failure() -> AttemptError {
+            AttemptError {
+                class: ErrorClass::RetryableStatus,
+                error: KmsError::backend_error("scripted auth failure (503)"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TokenSource for ScriptedSource {
+        async fn acquire(&self) -> AttemptResult<TokenLease> {
+            if !self.login_delay.is_zero() {
+                tokio::time::sleep(self.login_delay).await;
+            }
+            let call = self.state.login_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_login.load(Ordering::SeqCst) {
+                return Err(Self::failure());
+            }
+            Ok(TokenLease::new(format!("scripted-login-{call}"), self.lease()))
+        }
+
+        async fn renew(&self, _client: &VaultClient) -> AttemptResult<TokenLease> {
+            let call = self.state.renew_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_renew.load(Ordering::SeqCst) {
+                return Err(Self::failure());
+            }
+            Ok(TokenLease::new(format!("scripted-renew-{call}"), self.lease()))
+        }
+    }
+
+    async fn scripted_provider(
+        ttl: Duration,
+        renewable: bool,
+        policy: VaultCredentialPolicy,
+    ) -> (Arc<VaultCredentialProvider>, Arc<ScriptedState>) {
+        let state = Arc::new(ScriptedState::default());
+        let source = ScriptedSource {
+            state: state.clone(),
+            ttl,
+            renewable,
+            login_delay: Duration::ZERO,
+        };
+        let provider = VaultCredentialProvider::new(test_settings(), Box::new(source), policy)
             .await
-            .expect("provider construction must not require a live Vault")
+            .expect("scripted provider must build without a live Vault");
+        (Arc::new(provider), state)
+    }
+
+    async fn static_provider() -> VaultCredentialProvider {
+        VaultCredentialProvider::new(
+            test_settings(),
+            Box::new(StaticToken::new(TEST_TOKEN.to_string())),
+            test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .await
+        .expect("static provider must build without a live Vault")
     }
 
     #[tokio::test]
     async fn test_static_token_snapshots_pin_one_generation() {
-        let provider = test_provider().await;
+        let provider = static_provider().await;
 
-        let first = provider.current();
-        let second = provider.current();
+        let first = provider.current().expect("static tokens never expire");
+        let second = provider.current().expect("static tokens never expire");
 
         assert_eq!(first.generation, 0);
         assert!(
@@ -256,49 +902,456 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_static_token_spawns_no_renewal_task() {
+        let provider = Arc::new(static_provider().await);
+        assert!(provider.spawn_renewal_task().is_none(), "a token without a lease has nothing to renew");
+    }
+
+    #[tokio::test]
     async fn test_static_token_source_yields_configured_token() {
-        let source = token_source_for(&VaultAuthMethod::Token {
-            token: TEST_TOKEN.to_string(),
-        })
+        let settings = test_settings();
+        let source = token_source_for(
+            &VaultAuthMethod::Token {
+                token: TEST_TOKEN.to_string(),
+            },
+            &settings,
+        )
         .expect("token auth must map to a source");
 
         let lease = source.acquire().await.expect("static acquire cannot fail");
         assert_eq!(lease.expose(), TEST_TOKEN);
+        assert!(lease.lease_info().is_none(), "static tokens must not carry a lease");
     }
 
-    /// Behavior pin: AppRole keeps failing at construction with the same
-    /// user-visible message until the login source lands (PR-2).
-    #[test]
-    fn test_approle_auth_method_still_rejected() {
-        let error = token_source_for(&VaultAuthMethod::AppRole {
-            role_id: "role".to_string(),
-            secret_id: "approle-secret-canary".to_string(),
-        })
-        .expect_err("approle must stay rejected until the login source lands");
+    #[tokio::test]
+    async fn test_approle_auth_method_maps_to_login_source() {
+        let settings = test_settings();
+        let source = token_source_for(&VaultAuthMethod::approle("role".to_string(), TEST_SECRET_ID.to_string()), &settings)
+            .expect("approle auth must map to a login source");
 
-        let rendered = error.to_string();
-        assert!(rendered.contains("AppRole authentication not yet implemented"), "got: {rendered}");
-        assert!(!rendered.contains("approle-secret-canary"), "error must not echo the secret id");
+        assert!(format!("{source:?}").contains("AppRoleLogin"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_renewal_task_renews_at_half_ttl() {
+        let (provider, state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .await;
+        let task = provider.spawn_renewal_task().expect("lease-bound tokens need renewal");
+
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert_eq!(state.renew_calls.load(Ordering::SeqCst), 0, "renewal must not run before half TTL");
+        assert_eq!(provider.snapshot().generation, 0);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(state.renew_calls.load(Ordering::SeqCst), 1, "renewal must run at half TTL");
+        assert_eq!(state.login_calls.load(Ordering::SeqCst), 1, "renewable tokens must not re-login");
+        assert_eq!(provider.snapshot().generation, 1, "a successful renewal must install a new generation");
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_renewal_falls_back_to_login() {
+        let (provider, state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .await;
+        state.fail_renew.store(true, Ordering::SeqCst);
+        let task = provider.spawn_renewal_task().expect("renewal task");
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(state.renew_calls.load(Ordering::SeqCst), 1, "renewal must be attempted first");
+        assert_eq!(
+            state.login_calls.load(Ordering::SeqCst),
+            2,
+            "failed renewal must fall back to a fresh login"
+        );
+        assert_eq!(provider.snapshot().generation, 1);
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_current_fails_closed_inside_safety_window_and_recovers() {
+        let (provider, state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .await;
+        state.fail_renew.store(true, Ordering::SeqCst);
+        state.fail_login.store(true, Ordering::SeqCst);
+        let task = provider.spawn_renewal_task().expect("renewal task");
+
+        // Refresh cycles at 30s, 35s, ... keep failing; the token stays usable
+        // until 50s (60s TTL minus the 10s safety window).
+        tokio::time::sleep(Duration::from_secs(49)).await;
+        provider
+            .current()
+            .expect("token outside the safety window must still be served");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let error = provider
+            .current()
+            .expect_err("token inside the safety window must be refused");
+        assert!(
+            matches!(error, KmsError::CredentialsUnavailable { .. }),
+            "expected CredentialsUnavailable, got {error:?}"
+        );
+
+        // Recovery: the next retry cycle succeeds, installs a fresh
+        // generation, and the provider serves requests again.
+        state.fail_renew.store(false, Ordering::SeqCst);
+        state.fail_login.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let handle = provider.current().expect("provider must recover after a successful refresh");
+        assert!(handle.generation >= 1);
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_recycles_renewal_task_promptly() {
+        let (provider, _state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .await;
+        let task = provider.spawn_renewal_task().expect("renewal task");
+
+        tokio::time::timeout(Duration::from_secs(1), task.shutdown())
+            .await
+            .expect("cancelled renewal task must exit promptly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dropping_task_handle_cancels_renewal_task() {
+        let (provider, _state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .await;
+        let task = provider.spawn_renewal_task().expect("renewal task");
+        let cancel_probe = task.cancel.clone();
+
+        drop(task);
+
+        tokio::time::timeout(Duration::from_secs(1), cancel_probe.cancelled())
+            .await
+            .expect("dropping the handle must cancel the renewal task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_refreshes_coalesce_into_one_login() {
+        let state = Arc::new(ScriptedState::default());
+        let source = ScriptedSource {
+            state: state.clone(),
+            ttl: Duration::from_secs(60),
+            renewable: false,
+            login_delay: Duration::from_millis(100),
+        };
+        let provider = Arc::new(
+            VaultCredentialProvider::new(
+                test_settings(),
+                Box::new(source),
+                test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+            )
+            .await
+            .expect("provider"),
+        );
+        assert_eq!(state.login_calls.load(Ordering::SeqCst), 1, "initial login");
+
+        let cancel = CancellationToken::new();
+        let first = {
+            let provider = provider.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { provider.refresh(0, &cancel).await })
+        };
+        let second = {
+            let provider = provider.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { provider.refresh(0, &cancel).await })
+        };
+        first.await.expect("join").expect("refresh");
+        second.await.expect("join").expect("refresh");
+
+        assert_eq!(
+            state.login_calls.load(Ordering::SeqCst),
+            2,
+            "concurrent refreshes of the same generation must coalesce into one login"
+        );
+        assert_eq!(provider.snapshot().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn test_approle_secret_id_file_missing_fails_fatally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = AppRoleLogin::new(
+            &test_settings(),
+            "approle".to_string(),
+            "role".to_string(),
+            String::new(),
+            Some(dir.path().join("absent-secret-id")),
+        )
+        .expect("source");
+
+        let failure = source
+            .resolve_secret_id()
+            .await
+            .expect_err("missing secret_id file must fail the attempt");
+        assert_eq!(failure.class, ErrorClass::Fatal);
+        assert!(matches!(failure.error, KmsError::ConfigurationError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_approle_secret_id_file_empty_fails_fatally() {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(file.path(), "  \n\t\n").expect("write whitespace");
+        let source = AppRoleLogin::new(
+            &test_settings(),
+            "approle".to_string(),
+            "role".to_string(),
+            String::new(),
+            Some(file.path().to_path_buf()),
+        )
+        .expect("source");
+
+        let failure = source
+            .resolve_secret_id()
+            .await
+            .expect_err("effectively empty secret_id file must fail the attempt");
+        assert_eq!(failure.class, ErrorClass::Fatal);
+        assert!(failure.error.to_string().contains("is empty"));
+    }
+
+    #[tokio::test]
+    async fn test_approle_secret_id_file_takes_precedence_and_is_trimmed() {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(file.path(), format!("  {TEST_SECRET_ID}\n")).expect("write secret");
+        let source = AppRoleLogin::new(
+            &test_settings(),
+            "approle".to_string(),
+            "role".to_string(),
+            "inline-secret-id-must-lose".to_string(),
+            Some(file.path().to_path_buf()),
+        )
+        .expect("source");
+
+        let secret_id = source.resolve_secret_id().await.expect("readable file must resolve");
+        assert_eq!(secret_id.expose(), TEST_SECRET_ID);
     }
 
     /// Leak regression: the Debug output of every credential-carrying type
-    /// must stay free of the token literal.
+    /// must stay free of token and secret_id literals.
     #[tokio::test]
     async fn test_credential_types_debug_redacts_token() {
-        let provider = test_provider().await;
-        let handle = provider.current();
-        let lease = TokenLease::new(TEST_TOKEN.to_string());
-        let source = StaticToken::new(TEST_TOKEN.to_string());
+        let provider = static_provider().await;
+        let handle = provider.current().expect("static token");
+        let lease = TokenLease::new(
+            TEST_TOKEN.to_string(),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(60),
+                renewable: true,
+            }),
+        );
+        let static_source = StaticToken::new(TEST_TOKEN.to_string());
+        let approle_source = AppRoleLogin::new(
+            &test_settings(),
+            "approle".to_string(),
+            "leak-test-role-id".to_string(),
+            TEST_SECRET_ID.to_string(),
+            None,
+        )
+        .expect("approle source");
 
         for rendered in [
             format!("{provider:?}"),
             format!("{handle:?}"),
             format!("{lease:?}"),
-            format!("{source:?}"),
+            format!("{static_source:?}"),
+            format!("{approle_source:?}"),
         ] {
             assert!(!rendered.contains(TEST_TOKEN), "debug output must not leak the vault token: {rendered}");
+            assert!(
+                !rendered.contains(TEST_SECRET_ID),
+                "debug output must not leak the approle secret_id: {rendered}"
+            );
         }
 
         assert!(format!("{lease:?}").contains(REDACTED_SECRET));
+        let approle_rendered = format!("{approle_source:?}");
+        assert!(approle_rendered.contains("leak-test-role-id"), "role_id is not a secret");
+        assert!(approle_rendered.contains(REDACTED_SECRET));
+    }
+
+    /// Write a token file with owner-only permissions, as a Vault Agent sink
+    /// would.
+    fn write_owner_only(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).expect("write token file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod token file");
+        }
+    }
+
+    async fn token_file_provider(path: std::path::PathBuf, policy: VaultCredentialPolicy) -> Arc<VaultCredentialProvider> {
+        Arc::new(
+            VaultCredentialProvider::new(test_settings(), Box::new(TokenFileSource::new(path, Duration::from_secs(60))), policy)
+                .await
+                .expect("token file provider must build without a live Vault"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_token_file_source_reads_and_trims_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, &format!("  {TEST_TOKEN}\n"));
+        let source = TokenFileSource::new(path, Duration::from_secs(60));
+
+        let lease = source.acquire().await.expect("readable token file must resolve");
+        assert_eq!(lease.expose(), TEST_TOKEN);
+        let lease_info = lease.lease_info().expect("token file leases carry an observed validity");
+        assert_eq!(lease_info.ttl, Duration::from_secs(60));
+        assert!(!lease_info.renewable, "agent-managed tokens are refreshed by re-reading, not renew-self");
+    }
+
+    #[tokio::test]
+    async fn test_token_file_missing_fails_fatally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = TokenFileSource::new(dir.path().join("absent-token"), Duration::from_secs(60));
+
+        let failure = source.acquire().await.expect_err("missing token file must fail the attempt");
+        assert_eq!(failure.class, ErrorClass::Fatal);
+        assert!(matches!(failure.error, KmsError::ConfigurationError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_token_file_empty_fails_fatally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, "  \n\t\n");
+        let source = TokenFileSource::new(path, Duration::from_secs(60));
+
+        let failure = source
+            .acquire()
+            .await
+            .expect_err("effectively empty token file must fail the attempt");
+        assert_eq!(failure.class, ErrorClass::Fatal);
+        assert!(failure.error.to_string().contains("is empty"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_token_file_rejects_group_or_other_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, TEST_TOKEN);
+        let source = TokenFileSource::new(path.clone(), Duration::from_secs(60));
+
+        for mode in [0o640u32, 0o604, 0o622, 0o660] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let failure = source
+                .acquire()
+                .await
+                .expect_err("token file readable or writable beyond the owner must be rejected");
+            assert_eq!(failure.class, ErrorClass::Fatal, "mode {mode:#o}");
+            let rendered = failure.error.to_string();
+            assert!(rendered.contains("insecure permissions"), "mode {mode:#o}: {rendered}");
+            assert!(!rendered.contains(TEST_TOKEN), "permission errors must not echo the token");
+        }
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        source.acquire().await.expect("owner-only token file must resolve");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_token_file_replacement_installs_new_generation_next_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, "agent-token-v1");
+        let provider = token_file_provider(path.clone(), test_policy(Duration::from_secs(10), Duration::from_secs(5))).await;
+        let task = provider.spawn_renewal_task().expect("token file credentials are lease-bound");
+
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert_eq!(provider.snapshot().generation, 0, "no re-read before half the observed validity");
+
+        // Atomic replacement, as a Vault Agent sink writes: temp file + rename.
+        let staged = dir.path().join("vault-token.tmp");
+        write_owner_only(&staged, "agent-token-v2");
+        std::fs::rename(&staged, &path).expect("atomic replace");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            provider.snapshot().generation,
+            1,
+            "the poll after a rotation must install a new generation"
+        );
+
+        // A poll without a rotation still installs a fresh generation: each
+        // successful read re-extends the token's observed validity.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(provider.snapshot().generation, 2);
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_token_file_deletion_fails_closed_and_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, "agent-token-v1");
+        let provider = token_file_provider(path.clone(), test_policy(Duration::from_secs(10), Duration::from_secs(5))).await;
+        let task = provider.spawn_renewal_task().expect("renewal task");
+
+        std::fs::remove_file(&path).expect("remove token file");
+
+        // Polls at 30s, 35s, ... keep failing; the last read keeps the token
+        // usable until 50s (60s observed validity minus the 10s safety window).
+        tokio::time::sleep(Duration::from_secs(49)).await;
+        provider
+            .current()
+            .expect("token outside the safety window must still be served");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let error = provider
+            .current()
+            .expect_err("token inside the safety window must be refused");
+        assert!(
+            matches!(error, KmsError::CredentialsUnavailable { .. }),
+            "expected CredentialsUnavailable, got {error:?}"
+        );
+
+        // Restoring the file heals the provider on the next retry cycle.
+        write_owner_only(&path, "agent-token-v2");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let handle = provider.current().expect("provider must recover once the token file is back");
+        assert!(handle.generation >= 1);
+
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_token_file_debug_redacts_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault-token");
+        write_owner_only(&path, TEST_TOKEN);
+        let source = TokenFileSource::new(path.clone(), Duration::from_secs(60));
+        source.acquire().await.expect("token file must resolve");
+
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains(TEST_TOKEN), "debug output must not leak the vault token: {rendered}");
+        assert!(rendered.contains("vault-token"), "the file path is not a secret");
     }
 }
