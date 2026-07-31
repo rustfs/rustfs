@@ -33,9 +33,11 @@ use std::time::Duration;
 
 use metrics_util::MetricKind;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-use rustfs_kms::backends::KmsClient;
-use rustfs_kms::backends::vault::VaultKmsClient;
-use rustfs_kms::{KmsConfig, KmsError, VaultAuthMethod, VaultConfig};
+use rustfs_kms::backends::KmsBackend as KmsBackendTrait;
+use rustfs_kms::backends::vault::VaultKmsBackend;
+use rustfs_kms::{
+    BackendConfig, DescribeKeyRequest, KmsBackend as KmsBackendKind, KmsConfig, KmsError, VaultAuthMethod, VaultConfig,
+};
 
 const OPERATIONS_TOTAL: &str = "rustfs_kms_backend_operations_total";
 const ATTEMPT_FAILURES_TOTAL: &str = "rustfs_kms_backend_attempt_failures_total";
@@ -54,11 +56,20 @@ fn vault_config(address: &str, token: &str) -> VaultConfig {
     }
 }
 
-fn kms_config(attempt_timeout: Duration, retry_attempts: u32) -> KmsConfig {
+fn kms_config(vault_config: VaultConfig, attempt_timeout: Duration, retry_attempts: u32) -> KmsConfig {
     KmsConfig {
+        backend: KmsBackendKind::VaultKv2,
+        backend_config: BackendConfig::VaultKv2(Box::new(vault_config)),
+        allow_insecure_dev_defaults: true,
         timeout: attempt_timeout,
         retry_attempts,
         ..KmsConfig::default()
+    }
+}
+
+fn describe_key_request(key_id: &str) -> DescribeKeyRequest {
+    DescribeKeyRequest {
+        key_id: key_id.to_string(),
     }
 }
 
@@ -118,11 +129,10 @@ fn connection_refused_is_retried_within_budget() {
 
     let snapshot = record_metrics(|| {
         Box::pin(async move {
-            let client = VaultKmsClient::new(vault_config(&address, "unused"), &kms_config(Duration::from_secs(2), 2))
+            let client = VaultKmsBackend::new(kms_config(vault_config(&address, "unused"), Duration::from_secs(2), 2))
                 .await
                 .expect("client construction performs no network calls");
-            let error = client
-                .describe_key("fault-injection-refused", None)
+            let error = KmsBackendTrait::describe_key(&client, describe_key_request("fault-injection-refused"))
                 .await
                 .expect_err("a refused connection must fail the operation");
             assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
@@ -166,11 +176,10 @@ fn stalled_connection_is_cut_off_by_the_attempt_timeout() {
                 }
             });
 
-            let client = VaultKmsClient::new(vault_config(&address, "unused"), &kms_config(Duration::from_millis(250), 1))
+            let client = VaultKmsBackend::new(kms_config(vault_config(&address, "unused"), Duration::from_millis(250), 1))
                 .await
                 .expect("client construction performs no network calls");
-            let error = client
-                .describe_key("fault-injection-stalled", None)
+            let error = KmsBackendTrait::describe_key(&client, describe_key_request("fault-injection-stalled"))
                 .await
                 .expect_err("a stalled request must be cut off by the attempt timeout");
             assert!(
@@ -201,11 +210,10 @@ fn real_vault_invalid_token_is_fatal_and_never_retried() {
     let snapshot = record_metrics(|| {
         Box::pin(async {
             let config = vault_config(&real_vault_address(), "fault-injection-invalid-token");
-            let client = VaultKmsClient::new(config, &kms_config(Duration::from_secs(5), 3))
+            let client = VaultKmsBackend::new(kms_config(config, Duration::from_secs(5), 3))
                 .await
                 .expect("client construction performs no network calls");
-            let error = client
-                .describe_key("fault-injection-forbidden", None)
+            let error = KmsBackendTrait::describe_key(&client, describe_key_request("fault-injection-forbidden"))
                 .await
                 .expect_err("an invalid token must be rejected");
             assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
@@ -235,11 +243,10 @@ fn real_vault_missing_key_is_resolved_in_one_attempt() {
     let snapshot = record_metrics(|| {
         Box::pin(async move {
             let config = vault_config(&real_vault_address(), &token);
-            let client = VaultKmsClient::new(config, &kms_config(Duration::from_secs(5), 3))
+            let client = VaultKmsBackend::new(kms_config(config, Duration::from_secs(5), 3))
                 .await
                 .expect("client construction performs no network calls");
-            let error = client
-                .describe_key("fault-injection-definitely-missing", None)
+            let error = KmsBackendTrait::describe_key(&client, describe_key_request("fault-injection-definitely-missing"))
                 .await
                 .expect_err("a missing key must resolve to key-not-found");
             assert!(matches!(error, KmsError::KeyNotFound { .. }), "got {error:?}");
