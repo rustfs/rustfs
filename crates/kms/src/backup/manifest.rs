@@ -355,8 +355,10 @@ struct ManifestProbe {
 ///
 /// The manifest is the authoritative description of one backup bundle: what
 /// was captured, under which snapshot generation, protected by which backup
-/// KEK, and which restore responsibility applies. Field order is part of the
-/// canonical digest form and is frozen for this format version.
+/// KEK, and which restore responsibility applies. The digest's canonical
+/// form is the manifest's JSON value with the digest hex emptied (see
+/// [`Self::compute_digest`]); decoders verify it against the raw stored
+/// bytes and never re-serialize parsed fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupManifest {
@@ -415,8 +417,14 @@ impl BackupManifest {
     ///
     /// Fail-closed order: truncated or malformed input, then unknown format
     /// version, then a missing completeness marker, then schema decoding
-    /// (unknown fields, duplicate fields, missing fields), then semantic
-    /// validation including digest verification.
+    /// (unknown fields, duplicate fields, missing fields), then digest
+    /// verification against the raw input bytes, then semantic validation.
+    ///
+    /// The digest is verified against the bytes as stored — parsed typed
+    /// fields are never re-serialized for verification, so a field whose
+    /// string form does not round-trip byte-identically through its parsed
+    /// representation (timestamps in environment-dependent time zone
+    /// spellings, for example) cannot produce a spurious mismatch.
     pub fn decode(bytes: &[u8]) -> Result<Self, BackupError> {
         let probe: ManifestProbe = serde_json::from_slice(bytes).map_err(map_serde_error)?;
         if probe.format_version != Self::FORMAT_VERSION {
@@ -429,7 +437,9 @@ impl BackupManifest {
             return Err(BackupError::incomplete_bundle("manifest has no completeness marker"));
         }
         let manifest: Self = serde_json::from_slice(bytes).map_err(map_serde_error)?;
-        manifest.validate()?;
+        manifest.validate_pre_digest()?;
+        Self::verify_digest_in_bytes(bytes, &manifest.manifest_digest)?;
+        manifest.validate_content()?;
         Ok(manifest)
     }
 
@@ -449,23 +459,27 @@ impl BackupManifest {
         Ok(self)
     }
 
-    /// Compute the digest over the canonical manifest bytes.
+    /// Compute the digest over the canonical manifest form.
     ///
-    /// Canonical form: compact JSON serialization of this manifest with the
-    /// digest hex emptied. Field order is struct declaration order and is
-    /// frozen for format version 1, so the same manifest content always
-    /// hashes to the same value.
+    /// Canonical form: the JSON *value* of the manifest with the digest hex
+    /// emptied, serialized compactly by `serde_json`'s value serializer. The
+    /// value layer is what makes sealing and decoding agree byte-for-byte:
+    /// a decoder recovers the identical value from the raw stored bytes
+    /// without round-tripping any typed field through parse-and-reprint.
     pub fn compute_digest(&self) -> Result<ContentDigest, BackupError> {
         let mut unsealed = self.clone();
         unsealed.manifest_digest = ContentDigest::placeholder(self.manifest_digest.algorithm);
-        let canonical = serde_json::to_vec(&unsealed)
+        let value = serde_json::to_value(&unsealed)
             .map_err(|error| BackupError::corrupted(format!("manifest canonicalization failed: {error}")))?;
-        match self.manifest_digest.algorithm {
-            DigestAlgorithm::Sha256 => Ok(ContentDigest::sha256_of(&canonical)),
-        }
+        Self::digest_of_canonical_value(&value, self.manifest_digest.algorithm)
     }
 
-    /// Verify the sealed digest against the current manifest content.
+    /// Verify the sealed digest against the current in-memory content.
+    ///
+    /// This is the producer-side check (sealing and [`Self::encode`]).
+    /// Decoders must use the raw stored bytes instead (see [`Self::decode`]):
+    /// re-serializing parsed fields is not guaranteed to reproduce the
+    /// stored spelling byte-for-byte.
     pub fn verify_digest(&self) -> Result<(), BackupError> {
         if !self.manifest_digest.is_well_formed() {
             return Err(BackupError::corrupted("manifest digest is not a well-formed digest value"));
@@ -478,6 +492,33 @@ impl BackupManifest {
         Ok(())
     }
 
+    /// Verify a declared digest against raw manifest bytes, normalizing only
+    /// through the JSON value layer and emptying the digest slot in place.
+    fn verify_digest_in_bytes(bytes: &[u8], declared: &ContentDigest) -> Result<(), BackupError> {
+        if !declared.is_well_formed() {
+            return Err(BackupError::corrupted("manifest digest is not a well-formed digest value"));
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).map_err(map_serde_error)?;
+        let Some(slot) = value.get_mut("manifest_digest").and_then(|digest| digest.get_mut("hex")) else {
+            return Err(BackupError::corrupted("manifest has no digest slot"));
+        };
+        *slot = serde_json::Value::String(String::new());
+        if Self::digest_of_canonical_value(&value, declared.algorithm)? != *declared {
+            return Err(BackupError::corrupted(
+                "manifest digest mismatch: content does not match the sealed digest",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest_of_canonical_value(value: &serde_json::Value, algorithm: DigestAlgorithm) -> Result<ContentDigest, BackupError> {
+        let canonical = serde_json::to_vec(value)
+            .map_err(|error| BackupError::corrupted(format!("manifest canonicalization failed: {error}")))?;
+        match algorithm {
+            DigestAlgorithm::Sha256 => Ok(ContentDigest::sha256_of(&canonical)),
+        }
+    }
+
     /// Look up a required artifact by kind, failing closed when absent.
     pub fn require_artifact(&self, kind: ArtifactKind) -> Result<&ArtifactDescriptor, BackupError> {
         self.artifacts
@@ -486,11 +527,21 @@ impl BackupManifest {
             .ok_or_else(|| BackupError::missing_artifact(artifact_kind_name(kind)))
     }
 
-    /// Validate the full manifest contract.
+    /// Validate the full manifest contract against the in-memory content.
     ///
-    /// This is decode-side validation and also guards [`Self::encode`], so a
-    /// producer cannot publish a manifest a decoder would reject.
+    /// This guards [`Self::encode`], so a producer cannot publish a manifest
+    /// a decoder would reject. [`Self::decode`] runs the same checks but
+    /// verifies the digest against the raw input bytes instead.
     pub fn validate(&self) -> Result<(), BackupError> {
+        self.validate_pre_digest()?;
+        self.verify_digest()?;
+        self.validate_content()
+    }
+
+    /// Checks that must run before any digest verification: an unknown
+    /// version or an unsealed bundle is reported as its own typed error, not
+    /// as a digest mismatch.
+    fn validate_pre_digest(&self) -> Result<(), BackupError> {
         if self.format_version != Self::FORMAT_VERSION {
             return Err(BackupError::UnknownVersion {
                 found: self.format_version,
@@ -500,7 +551,12 @@ impl BackupManifest {
         if self.completeness != CompletenessState::Complete {
             return Err(BackupError::incomplete_bundle("completeness marker records an in-progress bundle"));
         }
-        self.verify_digest()?;
+        Ok(())
+    }
+
+    /// Semantic validation of everything except version, completeness, and
+    /// digest integrity.
+    fn validate_content(&self) -> Result<(), BackupError> {
         require_non_empty("backup_id", &self.backup_id)?;
         require_non_empty("rustfs_version", &self.rustfs_version)?;
         require_non_empty("deployment_identity", &self.deployment_identity)?;
@@ -736,7 +792,7 @@ mod tests {
     /// canonical form and frozen. If serialization layout or field order
     /// changes, this value changes and the fixture test fails — which is the
     /// point: that is a format-version bump, not a patch.
-    const FIXTURE_DIGEST_HEX: &str = "01accb3e2bc51e12d17d1efc52ad6ab9441c50bec52c3fb29e0a9f92b725cdaa";
+    const FIXTURE_DIGEST_HEX: &str = "a8b104d61c358cd75cc9a7691d2f7d2d96f73c53653bef8940a49e96dbdf7775";
 
     fn fixture() -> String {
         FIXTURE.replace("SEALED_DIGEST_HEX", FIXTURE_DIGEST_HEX)
@@ -1010,12 +1066,39 @@ mod tests {
         let with_discovery = fixture().replace("\"completeness\"", "\"capability_discovery\": [1], \"completeness\"");
         expect_corrupted(BackupManifest::decode(with_discovery.as_bytes()), "reserved");
 
-        // Explicit null carries no data and is tolerated as absence; digest
-        // verification still passes because null slots are skipped on
-        // serialization.
+        // An explicit null slot decodes as absence at the schema layer, but
+        // sealed bundles never contain the key (`skip_serializing_if`), so
+        // inserting one after sealing is a byte-level modification and the
+        // raw-bytes digest check rejects it.
         let with_null = fixture().replace("\"completeness\"", "\"key_versions\": null, \"completeness\"");
-        let decoded = BackupManifest::decode(with_null.as_bytes()).expect("null reserved slot should decode");
-        assert_eq!(decoded.key_versions, None);
+        expect_corrupted(BackupManifest::decode(with_null.as_bytes()), "digest mismatch");
+    }
+
+    #[test]
+    fn digest_verification_survives_non_round_tripping_timestamp_spellings() {
+        // A legacy `created_at` spelling (no time zone annotation) parses via
+        // the compat fallback and re-serializes differently ("+00:00[UTC]"),
+        // and host-dependent zone spellings can do the same. Digest
+        // verification therefore operates on the raw stored bytes and must
+        // never re-serialize parsed fields.
+        let sealed = seal(local_manifest_unsealed());
+        let mut value = serde_json::to_value(&sealed).expect("manifest should convert to a value");
+        value["created_at"] = serde_json::Value::String("2026-07-30T00:00:00+00:00".to_string());
+        value["manifest_digest"]["hex"] = serde_json::Value::String(String::new());
+        let canonical = serde_json::to_vec(&value).expect("canonical bytes");
+        let digest = ContentDigest::sha256_of(&canonical);
+        value["manifest_digest"]["hex"] = serde_json::Value::String(digest.hex);
+        let bytes = serde_json::to_vec(&value).expect("manifest bytes");
+
+        let decoded = BackupManifest::decode(&bytes).expect("a non-round-tripping timestamp spelling must not break decoding");
+
+        // Precondition: the spelling really does not survive a typed
+        // round-trip — otherwise this test is vacuous.
+        let reserialized = serde_json::to_value(&decoded).expect("decoded manifest should convert to a value");
+        assert_ne!(reserialized["created_at"], value["created_at"]);
+        // Which is exactly why the producer-side (in-memory) digest check
+        // cannot be used on decoded manifests.
+        assert!(decoded.verify_digest().is_err());
     }
 
     #[test]
