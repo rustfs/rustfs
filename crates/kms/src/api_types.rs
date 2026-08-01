@@ -16,8 +16,8 @@
 
 use crate::config::{
     BackendConfig, CacheConfig, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend,
-    KmsConfig, LocalConfig, StaticConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, redacted_secret,
-    redacted_secret_option,
+    KmsConfig, LocalConfig, StaticConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig,
+    allow_immediate_deletion_from_env, redacted_secret, redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
@@ -506,7 +506,10 @@ impl ConfigureLocalKmsRequest {
                 file_permissions: self.file_permissions,
             }),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
-            allow_immediate_deletion: false,
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
@@ -544,7 +547,10 @@ impl ConfigureVaultKmsRequest {
                 },
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
-            allow_immediate_deletion: false,
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
@@ -582,7 +588,10 @@ impl ConfigureVaultTransitKmsRequest {
                 },
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
-            allow_immediate_deletion: false,
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
@@ -606,7 +615,10 @@ impl ConfigureStaticKmsRequest {
                 secret_key: self.secret_key.clone(),
             }),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
-            allow_immediate_deletion: false,
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),

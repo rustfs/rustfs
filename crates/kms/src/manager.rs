@@ -659,6 +659,7 @@ mod tests {
                         key_id: AUDITED_KEY_ID.to_string(),
                         pending_window_in_days: None,
                         force_immediate: None,
+                        confirm_key_id: None,
                     },
                     context,
                 )

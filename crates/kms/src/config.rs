@@ -172,11 +172,16 @@ pub struct KmsConfig {
     /// object encrypted under the key with it, so the waiting window (plus
     /// `CancelKeyDeletion`) is the only recovery path. Operators who genuinely
     /// need immediate deletion — throwaway test clusters, key material that was
-    /// never used — must turn this on in server configuration; the request must
-    /// still echo the key id back for confirmation. Deliberately not part of the
-    /// admin configure API: flipping the gate is an operator action, not
-    /// something a `kms:Configure` holder can do remotely.
-    #[serde(default)]
+    /// never used — must turn it on through server configuration
+    /// ([`ENV_KMS_ALLOW_IMMEDIATE_DELETION`]); the request must still echo the
+    /// key id back for confirmation.
+    ///
+    /// Not part of the serialized configuration, and not settable through the
+    /// admin configure API. It is per-server operator state that has to be
+    /// re-stated to survive a restart: persisting it would carry one operator's
+    /// one-time enablement into the cluster-wide config that every node reloads,
+    /// long after the deletion it was turned on for.
+    #[serde(skip)]
     pub allow_immediate_deletion: bool,
     /// Timeout for a single backend attempt.
     ///
@@ -1833,22 +1838,26 @@ mod tests {
         assert_eq!(refresh_safety_window_secs, None);
     }
 
-    /// The gate is off unless the operator turns it on, including for configs
-    /// persisted before the field existed: an absent value must never be read
-    /// as permission to skip the deletion waiting window.
+    /// The gate lives in server configuration only: it never rides along in a
+    /// serialized config, and a stored config that claims it must not be
+    /// believed. Otherwise one operator's one-time enablement would reach every
+    /// node that later reloads that config.
     #[test]
-    fn immediate_deletion_gate_defaults_off_and_reads_old_persisted_configs() {
-        let mut persisted =
+    fn immediate_deletion_gate_is_server_local_and_never_persisted() {
+        let persisted =
             serde_json::to_value(KmsConfig::default().with_immediate_deletion_allowed()).expect("kms config should serialize");
-        assert_eq!(persisted["allow_immediate_deletion"], serde_json::json!(true));
-        persisted
+        assert!(
+            persisted.get("allow_immediate_deletion").is_none(),
+            "the gate must not be written into a persisted config: {persisted}"
+        );
+
+        let mut forged = persisted;
+        forged
             .as_object_mut()
             .expect("a persisted config must be a JSON object")
-            .remove("allow_immediate_deletion")
-            .expect("current configs must carry the field");
-
-        let restored: KmsConfig = serde_json::from_value(persisted).expect("a config without the gate must still load");
-        assert!(!restored.allow_immediate_deletion, "an absent gate must fail closed");
+            .insert("allow_immediate_deletion".to_string(), serde_json::json!(true));
+        let restored: KmsConfig = serde_json::from_value(forged).expect("an unknown gate field must not break loading");
+        assert!(!restored.allow_immediate_deletion, "a stored gate must fail closed");
 
         with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, Some("true"))], || {
             assert!(
