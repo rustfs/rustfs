@@ -59,7 +59,14 @@ const METADATA_CAS_ATTEMPTS: usize = 3;
 /// TTL bound on cached metadata records. This caps how long one node can keep
 /// acting on lifecycle state another node has since changed (disable,
 /// schedule-deletion): the divergence window is one TTL instead of "until
-/// process restart". Matches the manager-level `KmsCache` TTL.
+/// process restart".
+///
+/// Deliberately fixed rather than derived from `CacheConfig`: this cache gates
+/// cryptographic operations through `ensure_key_state_allows`, so its staleness
+/// window must not follow a knob an operator turns to tune the manager-level
+/// describe cache. It happens to equal `config::DEFAULT_CACHE_TTL` today, but
+/// that is a coincidence rather than a contract, and binding the two would let
+/// a later change to the operator-facing default silently widen this window.
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Capacity bound on the metadata cache so an unbounded key namespace cannot

@@ -46,7 +46,7 @@ pub struct KmsManager {
 impl KmsManager {
     /// Create a new KMS manager with the given backend and config
     pub fn new(backend: Arc<dyn KmsBackend>, config: KmsConfig) -> Self {
-        let cache = Arc::new(RwLock::new(KmsCache::new(config.cache_config.max_keys as u64)));
+        let cache = Arc::new(RwLock::new(KmsCache::new(&config.cache_config)));
         if config.allow_immediate_deletion {
             warn!(
                 "KMS immediate key deletion is enabled: a DeleteKey request may destroy key material without any waiting window, and every object encrypted under that key becomes permanently unreadable"
@@ -462,6 +462,7 @@ mod tests {
     use jiff::Zoned;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     /// Sink that keeps every record so tests can assert on the audit trail.
@@ -969,6 +970,45 @@ mod tests {
         // Test health check
         let health = manager.health_check().await.expect("Health check failed");
         assert!(health);
+    }
+
+    #[tokio::test]
+    async fn configured_cache_ttl_bounds_how_long_metadata_is_reused() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let mut config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        config.cache_config.ttl = Duration::from_millis(100);
+
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
+        let manager = KmsManager::new(backend, config);
+
+        let key_id = manager
+            .create_key(CreateKeyRequest {
+                key_name: Some("cache-ttl-wiring".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create key")
+            .key_id;
+
+        // Creating the key populated the cache, so this describe is served from it.
+        manager
+            .describe_key(DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect("describe should succeed");
+        assert_eq!(manager.cache_stats().await.expect("cache is enabled").hits, 1);
+
+        // Past the configured lifetime the entry is gone and the describe falls
+        // through to the backend. A cache built with a hardcoded lifetime would
+        // still be serving the entry here.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        manager
+            .describe_key(DescribeKeyRequest { key_id })
+            .await
+            .expect("describe should succeed");
+
+        let stats = manager.cache_stats().await.expect("cache is enabled");
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
     }
 
     #[tokio::test]
