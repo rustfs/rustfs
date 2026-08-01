@@ -28,7 +28,7 @@ Instrumentation boundary: the Local and Static backends do not flow through the 
 
 ### Key metadata cache metrics
 
-Emitted by the manager-level key metadata cache (`crates/kms/src/cache.rs`), which every backend shares. Publication is gated by the cache's `enable_metrics` setting (on by default); the counters behind the admin status API are maintained either way, so turning the metrics off does not blind `kms service-status`.
+Emitted by the manager-level key metadata cache (`crates/kms/src/cache.rs`), which every backend shares. Publication is gated by the cache's `enable_metrics` setting, which defaults to on and which no configure-request field sets today, so in practice these are always published. The counters behind the admin status API are maintained either way, so the switch could never blind `kms service-status`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
