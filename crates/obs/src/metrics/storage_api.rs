@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
-use rustfs_ecstore::api::bucket::replication::{DurableMrfBacklog, get_global_replication_stats, read_durable_mrf_backlog};
+use rustfs_ecstore::api::bucket::replication::{
+    DurableMrfBucketBacklog, durable_mrf_backlog_summary_snapshot, get_global_replication_stats,
+};
 pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
     get_total_usable_capacity_free as obs_get_total_usable_capacity_free,
@@ -78,6 +80,42 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+struct ObsBucketReplicationRuntimeSnapshot {
+    total_failed_bytes: u64,
+    total_failed_count: u64,
+    last_min_failed_bytes: u64,
+    last_min_failed_count: u64,
+    last_hour_failed_bytes: u64,
+    last_hour_failed_count: u64,
+    sent_bytes: u64,
+    sent_count: u64,
+    resync_started_count: u64,
+    resync_completed_count: u64,
+    resync_failed_count: u64,
+    resync_canceled_count: u64,
+    resync_duration_ms: u64,
+    current_backlog_count: u64,
+    current_backlog_bytes: u64,
+    targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ObsBucketReplicationProxySnapshot {
+    proxied_get_requests_total: u64,
+    proxied_get_requests_failures: u64,
+    proxied_head_requests_total: u64,
+    proxied_head_requests_failures: u64,
+    proxied_put_requests_total: u64,
+    proxied_put_requests_failures: u64,
+    proxied_put_tagging_requests_total: u64,
+    proxied_put_tagging_requests_failures: u64,
+    proxied_get_tagging_requests_total: u64,
+    proxied_get_tagging_requests_failures: u64,
+    proxied_delete_tagging_requests_total: u64,
+    proxied_delete_tagging_requests_failures: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ObsReplicationSiteStatsSnapshot {
     pub(crate) average_active_workers: f64,
     pub(crate) average_queued_bytes: i64,
@@ -108,26 +146,47 @@ fn replication_backlog_count(failed_counts: impl Iterator<Item = i64>, queued_co
     failed_backlog.saturating_add(i64_to_u64_floor_zero(queued_count))
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-struct DurableMrfBucketSnapshot {
-    count: u64,
-    bytes: u64,
-}
-
-fn durable_mrf_bucket_snapshots(backlog: &DurableMrfBacklog) -> HashMap<String, DurableMrfBucketSnapshot> {
-    if !backlog.available {
-        return HashMap::new();
+fn bucket_replication_stats_snapshot_from_parts(
+    bucket: String,
+    runtime: ObsBucketReplicationRuntimeSnapshot,
+    proxy: ObsBucketReplicationProxySnapshot,
+    durable_mrf_available: bool,
+    durable_bucket: DurableMrfBucketBacklog,
+) -> ObsBucketReplicationStatsSnapshot {
+    ObsBucketReplicationStatsSnapshot {
+        bucket,
+        total_failed_bytes: runtime.total_failed_bytes,
+        total_failed_count: runtime.total_failed_count,
+        last_min_failed_bytes: runtime.last_min_failed_bytes,
+        last_min_failed_count: runtime.last_min_failed_count,
+        last_hour_failed_bytes: runtime.last_hour_failed_bytes,
+        last_hour_failed_count: runtime.last_hour_failed_count,
+        sent_bytes: runtime.sent_bytes,
+        sent_count: runtime.sent_count,
+        proxied_get_requests_total: proxy.proxied_get_requests_total,
+        proxied_get_requests_failures: proxy.proxied_get_requests_failures,
+        proxied_head_requests_total: proxy.proxied_head_requests_total,
+        proxied_head_requests_failures: proxy.proxied_head_requests_failures,
+        proxied_put_requests_total: proxy.proxied_put_requests_total,
+        proxied_put_requests_failures: proxy.proxied_put_requests_failures,
+        proxied_put_tagging_requests_total: proxy.proxied_put_tagging_requests_total,
+        proxied_put_tagging_requests_failures: proxy.proxied_put_tagging_requests_failures,
+        proxied_get_tagging_requests_total: proxy.proxied_get_tagging_requests_total,
+        proxied_get_tagging_requests_failures: proxy.proxied_get_tagging_requests_failures,
+        proxied_delete_tagging_requests_total: proxy.proxied_delete_tagging_requests_total,
+        proxied_delete_tagging_requests_failures: proxy.proxied_delete_tagging_requests_failures,
+        resync_started_count: runtime.resync_started_count,
+        resync_completed_count: runtime.resync_completed_count,
+        resync_failed_count: runtime.resync_failed_count,
+        resync_canceled_count: runtime.resync_canceled_count,
+        resync_duration_ms: runtime.resync_duration_ms,
+        current_backlog_count: runtime.current_backlog_count,
+        current_backlog_bytes: runtime.current_backlog_bytes,
+        durable_mrf_available,
+        durable_mrf_backlog_count: durable_bucket.count,
+        durable_mrf_backlog_bytes: durable_bucket.bytes,
+        targets: runtime.targets,
     }
-
-    let mut buckets = HashMap::new();
-    for entry in &backlog.entries {
-        let bucket = buckets
-            .entry(entry.bucket.clone())
-            .or_insert_with(DurableMrfBucketSnapshot::default);
-        bucket.count = bucket.count.saturating_add(1);
-        bucket.bytes = bucket.bytes.saturating_add(i64_to_u64_floor_zero(entry.size));
-    }
-    buckets
 }
 
 pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketReplicationStatsSnapshot> {
@@ -137,14 +196,25 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
     } else {
         HashMap::new()
     };
-    let durable_mrf = if let Some(store) = obs_resolve_object_store_handle() {
-        read_durable_mrf_backlog(store).await
+    let durable_mrf_summary = if obs_resolve_object_store_handle().is_some() {
+        durable_mrf_backlog_summary_snapshot()
     } else {
-        DurableMrfBacklog::default()
+        Default::default()
     };
-    let durable_buckets = durable_mrf_bucket_snapshots(&durable_mrf);
-    let mut bucket_names = all_bucket_stats.keys().cloned().collect::<HashSet<_>>();
-    bucket_names.extend(durable_buckets.keys().cloned());
+    let durable_mrf_available = durable_mrf_summary.available;
+    let durable_buckets = durable_mrf_summary
+        .buckets
+        .into_iter()
+        .map(|bucket| (bucket.bucket.clone(), bucket))
+        .collect::<HashMap<String, DurableMrfBucketBacklog>>();
+    let mut bucket_names = Vec::with_capacity(all_bucket_stats.len().saturating_add(durable_buckets.len()));
+    bucket_names.extend(all_bucket_stats.keys().cloned());
+    bucket_names.extend(
+        durable_buckets
+            .keys()
+            .filter(|bucket| !all_bucket_stats.contains_key(*bucket))
+            .cloned(),
+    );
     let mut buckets = Vec::with_capacity(bucket_names.len());
 
     for bucket in bucket_names {
@@ -154,52 +224,7 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
         } else {
             Default::default()
         };
-        let mut total_failed_bytes = 0u64;
-        let mut total_failed_count = 0u64;
-        let mut last_min_failed_bytes = 0u64;
-        let mut last_min_failed_count = 0u64;
-        let mut last_hour_failed_bytes = 0u64;
-        let mut last_hour_failed_count = 0u64;
-        let mut sent_bytes = 0u64;
-        let mut sent_count = 0u64;
-        let mut targets = Vec::with_capacity(bucket_stats.map(|stats| stats.stats.len()).unwrap_or(0));
-
-        if let Some(bucket_stats) = bucket_stats {
-            for (target_arn, target_stats) in &bucket_stats.stats {
-                total_failed_bytes = total_failed_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
-                total_failed_count = total_failed_count.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
-
-                let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
-                last_min_failed_bytes = last_min_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_min.size));
-                last_min_failed_count = last_min_failed_count.saturating_add(i64_to_u64_floor_zero(last_min.count));
-
-                let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
-                last_hour_failed_bytes = last_hour_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_hour.size));
-                last_hour_failed_count = last_hour_failed_count.saturating_add(i64_to_u64_floor_zero(last_hour.count));
-
-                sent_bytes = sent_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
-                sent_count = sent_count.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
-
-                targets.push(ObsBucketReplicationTargetStatsSnapshot {
-                    target_arn: target_arn.clone(),
-                    bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
-                    current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
-                    latency_ms: target_stats.latency.curr,
-                });
-            }
-        }
-        let durable_bucket = durable_buckets.get(&bucket).cloned().unwrap_or_default();
-
-        buckets.push(ObsBucketReplicationStatsSnapshot {
-            bucket,
-            total_failed_bytes,
-            total_failed_count,
-            last_min_failed_bytes,
-            last_min_failed_count,
-            last_hour_failed_bytes,
-            last_hour_failed_count,
-            sent_bytes,
-            sent_count,
+        let proxy = ObsBucketReplicationProxySnapshot {
             proxied_get_requests_total: i64_to_u64_floor_zero(proxy.get_total),
             proxied_get_requests_failures: i64_to_u64_floor_zero(proxy.get_failed),
             proxied_head_requests_total: i64_to_u64_floor_zero(proxy.head_total),
@@ -212,32 +237,67 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             proxied_get_tagging_requests_failures: i64_to_u64_floor_zero(proxy.get_tag_failed),
             proxied_delete_tagging_requests_total: i64_to_u64_floor_zero(proxy.delete_tag_total),
             proxied_delete_tagging_requests_failures: i64_to_u64_floor_zero(proxy.delete_tag_failed),
-            resync_started_count: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_started_count))
-                .unwrap_or(0),
-            resync_completed_count: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_completed_count))
-                .unwrap_or(0),
-            resync_failed_count: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_failed_count))
-                .unwrap_or(0),
-            resync_canceled_count: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_canceled_count))
-                .unwrap_or(0),
-            resync_duration_ms: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_duration_ms))
-                .unwrap_or(0),
-            current_backlog_count: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count))
-                .unwrap_or(0),
-            current_backlog_bytes: bucket_stats
-                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes))
-                .unwrap_or(0),
-            durable_mrf_available: durable_mrf.available,
-            durable_mrf_backlog_count: durable_bucket.count,
-            durable_mrf_backlog_bytes: durable_bucket.bytes,
-            targets,
-        });
+        };
+        let mut runtime = ObsBucketReplicationRuntimeSnapshot {
+            targets: Vec::with_capacity(bucket_stats.map(|stats| stats.stats.len()).unwrap_or(0)),
+            ..Default::default()
+        };
+
+        if let Some(bucket_stats) = bucket_stats {
+            for (target_arn, target_stats) in &bucket_stats.stats {
+                runtime.total_failed_bytes = runtime
+                    .total_failed_bytes
+                    .saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
+                runtime.total_failed_count = runtime
+                    .total_failed_count
+                    .saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
+
+                let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
+                runtime.last_min_failed_bytes = runtime
+                    .last_min_failed_bytes
+                    .saturating_add(i64_to_u64_floor_zero(last_min.size));
+                runtime.last_min_failed_count = runtime
+                    .last_min_failed_count
+                    .saturating_add(i64_to_u64_floor_zero(last_min.count));
+
+                let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
+                runtime.last_hour_failed_bytes = runtime
+                    .last_hour_failed_bytes
+                    .saturating_add(i64_to_u64_floor_zero(last_hour.size));
+                runtime.last_hour_failed_count = runtime
+                    .last_hour_failed_count
+                    .saturating_add(i64_to_u64_floor_zero(last_hour.count));
+
+                runtime.sent_bytes = runtime
+                    .sent_bytes
+                    .saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
+                runtime.sent_count = runtime
+                    .sent_count
+                    .saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
+
+                runtime.targets.push(ObsBucketReplicationTargetStatsSnapshot {
+                    target_arn: target_arn.clone(),
+                    bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
+                    current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
+                    latency_ms: target_stats.latency.curr,
+                });
+            }
+            runtime.resync_started_count = i64_to_u64_floor_zero(bucket_stats.resync_started_count);
+            runtime.resync_completed_count = i64_to_u64_floor_zero(bucket_stats.resync_completed_count);
+            runtime.resync_failed_count = i64_to_u64_floor_zero(bucket_stats.resync_failed_count);
+            runtime.resync_canceled_count = i64_to_u64_floor_zero(bucket_stats.resync_canceled_count);
+            runtime.resync_duration_ms = i64_to_u64_floor_zero(bucket_stats.resync_duration_ms);
+            runtime.current_backlog_count = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count);
+            runtime.current_backlog_bytes = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes);
+        }
+        let durable_bucket = durable_buckets.get(&bucket).cloned().unwrap_or_default();
+        buckets.push(bucket_replication_stats_snapshot_from_parts(
+            bucket,
+            runtime,
+            proxy,
+            durable_mrf_available,
+            durable_bucket,
+        ));
     }
 
     buckets
@@ -289,7 +349,6 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_ecstore::api::bucket::replication::{MrfOpKind, MrfReplicateEntry};
 
     #[test]
     fn obs_replication_numeric_conversions_floor_negative_values() {
@@ -315,70 +374,79 @@ mod tests {
     }
 
     #[test]
-    fn durable_mrf_bucket_snapshots_aggregate_valid_entries_by_bucket() {
-        let snapshots = durable_mrf_bucket_snapshots(&DurableMrfBacklog {
-            available: true,
-            entries: vec![
-                MrfReplicateEntry {
-                    bucket: "b1".to_string(),
-                    object: "o1".to_string(),
-                    size: 1024,
-                    version_id: None,
-                    retry_count: 0,
-                    op: MrfOpKind::Object,
-                    delete_marker_version_id: None,
-                    delete_marker: false,
-                    delete_marker_mtime: None,
-                },
-                MrfReplicateEntry {
-                    bucket: "b1".to_string(),
-                    object: "o2".to_string(),
-                    size: 512,
-                    version_id: None,
-                    retry_count: 0,
-                    op: MrfOpKind::Object,
-                    delete_marker_version_id: None,
-                    delete_marker: false,
-                    delete_marker_mtime: None,
-                },
-                MrfReplicateEntry {
-                    bucket: "b2".to_string(),
-                    object: "delete".to_string(),
-                    size: 0,
-                    version_id: None,
-                    retry_count: 0,
-                    op: MrfOpKind::Delete,
-                    delete_marker_version_id: None,
-                    delete_marker: false,
-                    delete_marker_mtime: None,
-                },
-            ],
-        });
+    fn bucket_replication_snapshot_maps_runtime_and_durable_backlog() {
+        let snapshot = bucket_replication_stats_snapshot_from_parts(
+            "runtime-bucket".to_string(),
+            ObsBucketReplicationRuntimeSnapshot {
+                current_backlog_count: 3,
+                current_backlog_bytes: 4096,
+                resync_failed_count: 2,
+                ..Default::default()
+            },
+            ObsBucketReplicationProxySnapshot {
+                proxied_get_requests_total: 7,
+                proxied_get_requests_failures: 1,
+                ..Default::default()
+            },
+            true,
+            DurableMrfBucketBacklog {
+                bucket: "runtime-bucket".to_string(),
+                count: 5,
+                bytes: 8192,
+            },
+        );
 
-        assert_eq!(snapshots["b1"].count, 2);
-        assert_eq!(snapshots["b1"].bytes, 1536);
-        assert_eq!(snapshots["b2"].count, 1);
-        assert_eq!(snapshots["b2"].bytes, 0);
+        assert_eq!(snapshot.bucket, "runtime-bucket");
+        assert_eq!(snapshot.current_backlog_count, 3);
+        assert_eq!(snapshot.current_backlog_bytes, 4096);
+        assert!(snapshot.durable_mrf_available);
+        assert_eq!(snapshot.durable_mrf_backlog_count, 5);
+        assert_eq!(snapshot.durable_mrf_backlog_bytes, 8192);
+        assert_eq!(snapshot.resync_failed_count, 2);
+        assert_eq!(snapshot.proxied_get_requests_total, 7);
+        assert_eq!(snapshot.proxied_get_requests_failures, 1);
     }
 
     #[test]
-    fn durable_mrf_bucket_snapshots_do_not_report_unavailable_as_zero() {
-        let snapshots = durable_mrf_bucket_snapshots(&DurableMrfBacklog {
-            available: false,
-            entries: vec![MrfReplicateEntry {
-                bucket: "b1".to_string(),
-                object: "o1".to_string(),
-                size: 1024,
-                version_id: None,
-                retry_count: 0,
-                op: MrfOpKind::Object,
-                delete_marker_version_id: None,
-                delete_marker: false,
-                delete_marker_mtime: None,
-            }],
-        });
+    fn bucket_replication_snapshot_reports_durable_only_bucket() {
+        let snapshot = bucket_replication_stats_snapshot_from_parts(
+            "durable-only".to_string(),
+            ObsBucketReplicationRuntimeSnapshot::default(),
+            ObsBucketReplicationProxySnapshot::default(),
+            true,
+            DurableMrfBucketBacklog {
+                bucket: "durable-only".to_string(),
+                count: 11,
+                bytes: 2048,
+            },
+        );
 
-        assert!(snapshots.is_empty());
+        assert_eq!(snapshot.bucket, "durable-only");
+        assert_eq!(snapshot.current_backlog_count, 0);
+        assert!(snapshot.durable_mrf_available);
+        assert_eq!(snapshot.durable_mrf_backlog_count, 11);
+        assert_eq!(snapshot.durable_mrf_backlog_bytes, 2048);
+    }
+
+    #[test]
+    fn bucket_replication_snapshot_preserves_durable_mrf_unavailable_state() {
+        let snapshot = bucket_replication_stats_snapshot_from_parts(
+            "runtime-only".to_string(),
+            ObsBucketReplicationRuntimeSnapshot {
+                current_backlog_count: 1,
+                current_backlog_bytes: 512,
+                ..Default::default()
+            },
+            ObsBucketReplicationProxySnapshot::default(),
+            false,
+            DurableMrfBucketBacklog::default(),
+        );
+
+        assert_eq!(snapshot.current_backlog_count, 1);
+        assert_eq!(snapshot.current_backlog_bytes, 512);
+        assert!(!snapshot.durable_mrf_available);
+        assert_eq!(snapshot.durable_mrf_backlog_count, 0);
+        assert_eq!(snapshot.durable_mrf_backlog_bytes, 0);
     }
 }
 
@@ -386,9 +454,10 @@ pub(crate) mod metrics {
     pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, StorageAdminApi};
 
     pub(crate) use super::{
-        ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsStore, obs_bucket_replication_stats_snapshot, obs_expiry_state_handle,
-        obs_get_global_bucket_monitor, obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free,
-        obs_is_disk_compression_enabled, obs_load_compression_total_from_memory, obs_load_data_usage_from_backend,
-        obs_replication_site_stats_snapshot, obs_resolve_object_store_handle, obs_transition_state_handle,
+        ObsBucketBandwidthMonitor, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore,
+        obs_bucket_replication_stats_snapshot, obs_expiry_state_handle, obs_get_global_bucket_monitor, obs_get_quota_config,
+        obs_get_total_usable_capacity, obs_get_total_usable_capacity_free, obs_is_disk_compression_enabled,
+        obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_replication_site_stats_snapshot,
+        obs_resolve_object_store_handle, obs_transition_state_handle,
     };
 }
