@@ -19,6 +19,7 @@ use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOpera
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
+use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
 use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
@@ -467,6 +468,8 @@ async fn configure_and_start_kms(
 pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
+
+    log_sse_kms_key_policy_mode();
 
     // A key referenced by any bucket's encryption configuration must never be
     // deleted. Register the gate before the service can start so every
