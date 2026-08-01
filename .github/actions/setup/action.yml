@@ -25,9 +25,13 @@ inputs:
     required: false
     default: "rustfs-deps"
   cache-save-if:
-    description: "Condition for saving cache"
+    description: >-
+      Whether to save the cache. The fail-safe default is 'false': a caller that
+      wants to populate a cache must opt in explicitly, so a forgotten input
+      costs a cold cache (minutes) rather than silently consuming the
+      repository-wide 10GB Actions cache quota and evicting other lanes.
     required: false
-    default: "true"
+    default: "false"
   install-cross-tools:
     description: "Install cross-compilation tools"
     required: false

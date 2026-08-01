@@ -75,10 +75,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      # cargo-deny compiles nothing, so the full setup composite (apt packages,
+      # protoc, flatc, nextest, rustfmt/clippy) was pure overhead here. It does
+      # still need a real cargo: `cargo deny check` runs `cargo metadata`, and
+      # Cargo.toml pins datafusion and s3s as git dependencies, which must be
+      # materialised into ~/.cargo/git — a cold clone is hundreds of MB, so the
+      # cache stays.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Was relying on the composite's default, which used to be "true": every
+      # PR touching Cargo.toml/Cargo.lock saved a second, PR-scoped copy of this
+      # cache and pushed the main-scoped lanes out of the 10GB quota. The
+      # default is now "false", but state it explicitly — see
+      # scripts/security/check_cache_save_if.sh.
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          cache-shared-key: rustfs-cargo-deny
+          cache-all-crates: true
+          cache-on-failure: true
+          shared-key: rustfs-cargo-deny
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
@@ -99,6 +116,9 @@ jobs:
 
       - name: Report unpinned GitHub Actions
         run: ./scripts/security/check_workflow_pins.sh --enforce
+
+      - name: Check setup cache-save-if is explicit
+        run: ./scripts/security/check_cache_save_if.sh
 
       - name: Check preview release workflow policy
         run: ./scripts/security/check_preview_release_workflow.sh
