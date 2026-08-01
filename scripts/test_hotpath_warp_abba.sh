@@ -107,6 +107,26 @@ rg -qx 'performance_conclusion=not_measured_dry_run' "${TMP_DIR}/unmanaged-exter
 if "$RUNNER" \
   --baseline-bin /usr/bin/true \
   --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --endpoint 127.0.0.1:9 \
+  --allow-unmanaged-external \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --health-timeout 1 \
+  --out-dir "${TMP_DIR}/unmanaged-external-nonformal" >/dev/null 2>&1; then
+  echo "expected unmanaged external mode to fail readiness in this test" >&2
+  exit 1
+fi
+rg -qx 'external=true' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'external_isolation=unmanaged' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'evidence_mode=external-unmanaged-nonformal' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'formal_evidence=false' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'performance_conclusion=not_formal_unmanaged_external' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
   --endpoint 127.0.0.1:9000 \
   --warp-bin /usr/bin/true \
   --rounds 3 \
@@ -129,5 +149,10 @@ if "$RUNNER" \
   echo "expected a formal external deploy hook to write evidence" >&2
   exit 1
 fi
+rg -qx 'external=true' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'external_isolation=deploy-hook-attested' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'evidence_mode=external-deploy-hook-attested' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'formal_evidence=true' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
 
 echo "hotpath warp ABBA tests passed"
