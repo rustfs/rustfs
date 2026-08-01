@@ -36,14 +36,9 @@ pub fn is_configured() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct AuthZPlugin {
-    client: OpaHttpClient,
+    client: reqwest::Client,
     args: Args,
 }
-
-#[cfg(feature = "hotpath")]
-type OpaHttpClient = hotpath::wrap::reqwest::Client;
-#[cfg(not(feature = "hotpath"))]
-type OpaHttpClient = reqwest::Client;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpaConfigError {
@@ -61,6 +56,44 @@ pub enum OpaConfigError {
     InvalidStatus(reqwest::StatusCode),
     #[error("Error connecting to OPA: {0}")]
     Connection(reqwest::Error),
+}
+
+impl OpaConfigError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingRequiredEnv(_) => "missing_required_env",
+            Self::InvalidEnvVars(_) => "invalid_env_vars",
+            Self::EnvRead { .. } => "env_read_failed",
+            Self::InvalidStatus(_) => "invalid_status",
+            Self::Connection(_) => "connection_failed",
+        }
+    }
+}
+
+fn redact_opa_connection_error(error: reqwest::Error) -> OpaConfigError {
+    OpaConfigError::Connection(error.without_url())
+}
+
+fn opa_request_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_status() {
+        "status"
+    } else if error.is_builder() {
+        "builder"
+    } else if error.is_redirect() {
+        "redirect"
+    } else {
+        "other"
+    }
 }
 
 fn check() -> Result<(), OpaConfigError> {
@@ -90,7 +123,7 @@ async fn validate(config: &Args) -> Result<(), OpaConfigError> {
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_secs(1))
         .build()
-        .map_err(OpaConfigError::Connection)?;
+        .map_err(redact_opa_connection_error)?;
 
     let mut request = client.post(&config.url);
     if !config.auth_token.is_empty() {
@@ -109,7 +142,7 @@ async fn validate(config: &Args) -> Result<(), OpaConfigError> {
             };
         }
         Err(err) => {
-            return Err(OpaConfigError::Connection(err));
+            return Err(redact_opa_connection_error(err));
         }
     };
     Ok(())
@@ -155,9 +188,6 @@ impl AuthZPlugin {
                 reqwest::Client::new()
             });
 
-        #[cfg(feature = "hotpath")]
-        let client = hotpath::http!(client, label = "Policy::OPA");
-
         Self { client, args: config }
     }
 
@@ -173,7 +203,13 @@ impl AuthZPlugin {
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    error!("OPA returned non-success status: {}", status);
+                    error!(
+                        component = "policy",
+                        subsystem = "opa",
+                        result = "request_rejected",
+                        status = %status,
+                        "OPA request rejected"
+                    );
                     return false;
                 }
 
@@ -183,13 +219,25 @@ impl AuthZPlugin {
                         OpaResponseEnum::AllowResult(response) => response.result.allow,
                     },
                     Err(err) => {
-                        error!("Error parsing OPA response: {:?}", err);
+                        error!(
+                            component = "policy",
+                            subsystem = "opa",
+                            result = "response_decode_failed",
+                            error_kind = opa_request_error_kind(&err),
+                            "OPA response decoding failed"
+                        );
                         false
                     }
                 }
             }
             Err(err) => {
-                error!("Error sending request to OPA: {:?}", err);
+                error!(
+                    component = "policy",
+                    subsystem = "opa",
+                    result = "request_failed",
+                    error_kind = opa_request_error_kind(&err),
+                    "OPA request failed"
+                );
                 false
             }
         }
@@ -258,7 +306,34 @@ enum OpaResponseEnum {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
     use temp_env;
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock test log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn assert_reqwest_client(_: &reqwest::Client) {}
 
     #[test]
     fn test_check_valid_config() {
@@ -344,5 +419,129 @@ mod tests {
             auth_token: "".to_string(),
         };
         assert!(!args_disabled.enable());
+    }
+
+    #[test]
+    fn test_sensitive_opa_endpoints_never_use_hotpath_http_wrapper() {
+        let endpoints = [
+            "https://profile-user:profile-token@10.24.0.5/private/opa?access_token=query-secret",
+            "https://service.internal.example/private/path?token=another-secret",
+        ];
+
+        for endpoint in endpoints {
+            let plugin = AuthZPlugin::new(Args {
+                url: endpoint.to_string(),
+                auth_token: "opa-auth-token".to_string(),
+            });
+
+            assert_reqwest_client(&plugin.client);
+            assert_eq!(plugin.args.url, endpoint);
+        }
+    }
+
+    #[test]
+    fn test_opa_connection_error_removes_sensitive_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test listener");
+        let port = listener.local_addr().expect("read local test listener address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept local test request");
+            let mut request = [0_u8; 1024];
+            stream.read(&mut request).expect("read local test request");
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write local test response");
+        });
+        let endpoint = format!("http://profile-user:profile-token@127.0.0.1:{port}/private/opa?access_token=query-secret");
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio test runtime");
+        let error = runtime.block_on(async {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build local test client")
+                .get(&endpoint)
+                .send()
+                .await
+                .expect("send local test request")
+                .error_for_status()
+                .expect_err("test response should be an HTTP error")
+        });
+        server.join().expect("join local test server");
+        assert!(error.url().is_some(), "fixture must carry the endpoint before redaction");
+
+        let OpaConfigError::Connection(error) = redact_opa_connection_error(error) else {
+            panic!("expected a redacted OPA connection error");
+        };
+        let rendered = error.to_string();
+        assert!(error.url().is_none());
+        for leaked in ["profile-user", "profile-token", "127.0.0.1", "private/opa", "query-secret"] {
+            assert!(!rendered.contains(leaked), "redacted error leaked {leaked}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn test_is_allowed_rejection_log_redacts_sensitive_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test listener");
+        let port = listener.local_addr().expect("read local test listener address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept local test request");
+            let mut request = [0_u8; 1024];
+            stream.read(&mut request).expect("read local test request");
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write local test response");
+        });
+        let endpoint = format!("http://opa-user:opa-token@127.0.0.1:{port}/private/allow?access_token=query-secret");
+        let plugin = AuthZPlugin::new(Args {
+            url: endpoint.to_string(),
+            auth_token: "authorization-secret".to_string(),
+        });
+        let groups = None;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = PArgs {
+            account: "account",
+            groups: &groups,
+            action: crate::policy::action::Action::None,
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "object",
+            claims: &claims,
+            deny_only: false,
+        };
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio test runtime");
+            assert!(!runtime.block_on(plugin.is_allowed(&args)));
+        });
+        server.join().expect("join local test server");
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(!rendered.is_empty(), "OPA request failure did not reach the test log sink");
+        assert!(
+            rendered.contains("request_rejected"),
+            "OPA request failure did not retain its stable result category"
+        );
+        assert!(rendered.contains("500 Internal Server Error"));
+        for leaked in [
+            "opa-user",
+            "opa-token",
+            "127.0.0.1",
+            "private/allow",
+            "query-secret",
+            "authorization-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "OPA request log leaked {leaked}: {rendered}");
+        }
     }
 }
