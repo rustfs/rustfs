@@ -140,6 +140,7 @@ jobs:
   test-and-lint:
     name: Test and Lint
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     env:
@@ -290,6 +291,7 @@ jobs:
   test-ilm-integration-serial:
     name: ILM Integration (serial)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 45
     env:
@@ -327,6 +329,7 @@ jobs:
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 60
     env:
@@ -354,6 +357,7 @@ jobs:
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 60
     strategy:
@@ -389,6 +393,7 @@ jobs:
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
     env:
@@ -419,6 +424,7 @@ jobs:
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
     env:
@@ -455,6 +461,7 @@ jobs:
     # suite (measured 4m17s / 7m19s / 7m31s on runs 30678272341 / 30678117601 /
     # 30662728539) and kept the cancellation run in progress for minutes.
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
     # a container, applies no seccomp filter that would block io_uring_setup — so
     # the probe succeeds and the tests exercise the real UringBackend/FdCache/
