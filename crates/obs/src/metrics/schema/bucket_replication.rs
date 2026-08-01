@@ -33,6 +33,8 @@ const RESYNC_COMPLETED_TOTAL: &str = "resync_completed_total";
 const RESYNC_FAILED_TOTAL: &str = "resync_failed_total";
 const RESYNC_CANCELED_TOTAL: &str = "resync_canceled_total";
 const RESYNC_DURATION_MS_TOTAL: &str = "resync_duration_ms_total";
+const CURRENT_BACKLOG_COUNT: &str = "current_backlog_count";
+const CURRENT_BACKLOG_BYTES: &str = "current_backlog_bytes";
 
 pub static BUCKET_REPL_LAST_HR_FAILED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
@@ -75,6 +77,24 @@ pub static BUCKET_REPL_LATENCY_MS_MD: LazyLock<MetricDescriptor> = LazyLock::new
         MetricName::LatencyMilliSec,
         "Replication latency on a bucket in milliseconds",
         &[BUCKET_L, OPERATION_L, RANGE_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(CURRENT_BACKLOG_BYTES),
+        "Current number of bytes admitted to the in-memory replication worker queues for a bucket",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(CURRENT_BACKLOG_COUNT),
+        "Current number of objects admitted to the in-memory replication worker queues for a bucket",
+        &[BUCKET_L],
         subsystems::BUCKET_REPLICATION,
     )
 });

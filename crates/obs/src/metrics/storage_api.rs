@@ -68,6 +68,8 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
     pub(crate) resync_failed_count: u64,
     pub(crate) resync_canceled_count: u64,
     pub(crate) resync_duration_ms: u64,
+    pub(crate) current_backlog_count: u64,
+    pub(crate) current_backlog_bytes: u64,
     pub(crate) targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
 }
 
@@ -172,6 +174,8 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             resync_failed_count: i64_to_u64_floor_zero(bucket_stats.resync_failed_count),
             resync_canceled_count: i64_to_u64_floor_zero(bucket_stats.resync_canceled_count),
             resync_duration_ms: i64_to_u64_floor_zero(bucket_stats.resync_duration_ms),
+            current_backlog_count: i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count),
+            current_backlog_bytes: i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes),
             targets,
         });
     }
