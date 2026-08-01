@@ -173,7 +173,7 @@ tower-http = { version = "0.7.0" }
 # Serialization and Data Formats
 apache-avro = "0.21.0"
 bytes = { version = "1.12.1" }
-bytesize = "2.4.2"
+bytesize = "2.6.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
@@ -235,7 +235,7 @@ aws-smithy-types = { version = "1.6.1" }
 base64 = "0.23.0"
 base64-simd = "0.8.0"
 brotli = "8.0.4"
-clap = { version = "4.6.4" }
+clap = { version = "4.6.5" }
 const-str = { version = "1.1.0" }
 convert_case = "0.11.0"
 criterion = { version = "0.8" }
@@ -340,7 +340,7 @@ libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "10.0.1" }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.62.4" }
+russh = { version = "0.62.5" }
 russh-sftp = "2.3.0"
 
 # WebDAV
