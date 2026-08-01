@@ -107,6 +107,17 @@ impl KeyCensus {
             KeyStatus::PendingDeletion => self.pending_deletion += 1,
             KeyStatus::Deleted => self.tombstones += 1,
             KeyStatus::Active | KeyStatus::Disabled => {
+                // A missing rotation time means either "never rotated" or "the
+                // build that rotated it did not record when". Both fall back to
+                // creation, and the two are not worth separate series: for the
+                // first, creation *is* the correct baseline; for the second it
+                // is an upper bound on the true age, so the gauge can only
+                // overstate how overdue a key is, never hide an overdue one.
+                // The overstatement is self-healing — the next rotation stamps
+                // the record — and erring loud is the right direction for a
+                // rotation-readiness alert. Backends never fabricate a
+                // timestamp to close the gap, so nothing here can turn an
+                // unstamped key into a freshly rotated one.
                 let rotated_at = key.rotated_at.as_ref().unwrap_or(&key.created_at);
                 self.oldest_rotation_age_seconds = self.oldest_rotation_age_seconds.max(seconds_between(rotated_at, now));
             }

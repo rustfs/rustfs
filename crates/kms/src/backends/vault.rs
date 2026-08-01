@@ -80,6 +80,19 @@ struct VaultKeyData {
     /// persistence landed, so it must stay optional for backward compatibility.
     #[serde(default)]
     deletion_date: Option<Zoned>,
+    /// When the key's material last became current through a rotation.
+    ///
+    /// Written by [`VaultKmsClient::rotate_key`] as part of the same
+    /// check-and-set that switches the current version, so it can only be set on
+    /// a rotation that actually committed. `None` means "no rotation time on
+    /// record", which covers two cases that are deliberately not distinguished
+    /// here: a key that was never rotated, and a key rotated by a build that
+    /// predates this field. Nothing is back-filled — inventing a timestamp for
+    /// the second case would report a rotation that this node never observed.
+    /// See [`crate::deletion_worker`] for why collapsing the two is safe for the
+    /// rotation-age gauge.
+    #[serde(default)]
+    rotated_at: Option<Zoned>,
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
     /// Version that pre-versioning envelopes (no `master_key_version`) resolve to.
@@ -966,7 +979,7 @@ impl VaultKmsClient {
                         description: existing.description,
                         metadata: existing.metadata,
                         created_at: existing.created_at,
-                        rotated_at: None,
+                        rotated_at: existing.rotated_at,
                         created_by: None,
                         deletion_date: existing.deletion_date,
                     })
@@ -993,6 +1006,7 @@ impl VaultKmsClient {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: None,
+            rotated_at: None,
             encrypted_key_material: encrypted_material,
             baseline_version: None,
         };
@@ -1039,7 +1053,7 @@ impl VaultKmsClient {
             metadata: key_data.metadata,
             tags: key_data.tags,
             created_at: key_data.created_at,
-            rotated_at: None,
+            rotated_at: key_data.rotated_at,
             created_by: None,
         })
     }
@@ -1268,8 +1282,15 @@ impl VaultKmsClient {
 
         // Step 3: switch the current pointer. The top-level copy of the material is
         // the fast path for new encryptions and must always match `version`.
+        //
+        // The rotation timestamp rides along on this same write: it marks the
+        // moment the new material became current, and persisting it here means it
+        // commits if and only if the rotation does. A rotation that fails after
+        // freezing the version record leaves the key unrotated and unstamped, so
+        // the recorded time never runs ahead of the current version.
         key_data.version = new_version;
         key_data.encrypted_key_material = new_material;
+        key_data.rotated_at = Some(Zoned::now());
         self.cas_store_key_data(key_id, &key_data, cas).await?;
 
         info!(key_id, version = new_version, "Vault KMS master key rotated");
@@ -1283,7 +1304,9 @@ impl VaultKmsClient {
             description: key_data.description.clone(),
             metadata: key_data.metadata.clone(),
             created_at: key_data.created_at.clone(),
-            rotated_at: Some(Zoned::now()),
+            // The persisted value, not a fresh `now()`: what the caller is told
+            // must be what a later describe of the same key reports.
+            rotated_at: key_data.rotated_at.clone(),
             created_by: None,
             deletion_date: key_data.deletion_date.clone(),
         })
@@ -1737,6 +1760,7 @@ mod tests {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: None,
+            rotated_at: None,
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: None,
         }
@@ -2082,6 +2106,7 @@ mod tests {
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: Some(1),
             deletion_date: None,
+            rotated_at: None,
         };
 
         let mut value = serde_json::to_value(&key_data).expect("serialize key data");
@@ -2445,6 +2470,7 @@ mod tests {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: Some(deadline.clone()),
+            rotated_at: None,
             encrypted_key_material: "material".to_string(),
             baseline_version: None,
         };
@@ -3448,6 +3474,141 @@ mod tests {
             serde_json::json!(1),
             "the first rotation must pin the baseline: {baseline_commit}"
         );
+    }
+
+    /// The rotation-age gauge ages a key from `rotated_at`, falling back to
+    /// `created_at`. A rotation that commits without recording its time makes a
+    /// key rotated many times read exactly like one that was never rotated, so
+    /// the commit must carry the timestamp and a later describe must report it.
+    /// Reverting either half turns this test red.
+    #[tokio::test]
+    async fn wired_rotate_persists_rotation_time_and_describe_reports_it() {
+        let created_at = Zoned::now() - Duration::from_secs(365 * 86400);
+        let mut key_data = healthy_key_data();
+        key_data.created_at = created_at.clone();
+        key_data.version = 2;
+        key_data.baseline_version = Some(1);
+        key_data.description = Some("payload key".to_string());
+        key_data.metadata.insert("owner".to_string(), "platform".to_string());
+        key_data.tags.insert("env".to_string(), "prod".to_string());
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+            // Version 3's material record, then the pointer switch.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client.rotate_key("wired-key", None).await.expect("rotate a healthy key");
+        let reported = rotated.rotated_at.clone().expect("a committed rotation must report its time");
+
+        let bodies = vault.request_bodies();
+        let committed = parse_write_body(&bodies[4]);
+        let persisted: VaultKeyData =
+            serde_json::from_value(committed["data"].clone()).expect("the committed record must deserialize");
+        assert_eq!(
+            persisted.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(reported.timestamp()),
+            "the rotation must persist the time it reports: {committed}"
+        );
+
+        // The rest of the record rides through the read-modify-write untouched;
+        // a rotation that dropped any of it would corrupt the key.
+        assert_eq!(persisted.version, 3, "{committed}");
+        assert_eq!(persisted.created_at.timestamp(), created_at.timestamp(), "{committed}");
+        assert_eq!(persisted.baseline_version, Some(1), "{committed}");
+        assert_eq!(persisted.description.as_deref(), Some("payload key"), "{committed}");
+        assert_eq!(persisted.metadata.get("owner").map(String::as_str), Some("platform"), "{committed}");
+        assert_eq!(persisted.tags.get("env").map(String::as_str), Some("prod"), "{committed}");
+
+        // Describing the committed record must report the rotation, not the
+        // creation a year earlier that the gauge would otherwise fall back to.
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&persisted))]).await;
+        let described = client
+            .describe_key("wired-key", None)
+            .await
+            .expect("describe the rotated key");
+        assert_eq!(
+            described.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(reported.timestamp()),
+            "describe must report the persisted rotation time"
+        );
+        assert_ne!(
+            described.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(created_at.timestamp()),
+            "a rotated key must not be aged from its creation"
+        );
+    }
+
+    /// A record written before rotation timestamps were persisted carries no
+    /// rotation time. Reporting one anyway — the current time, the read time —
+    /// would tell the rotation-age gauge the key was just rotated and silence a
+    /// genuinely overdue key, so the absence has to travel as `None`.
+    #[tokio::test]
+    async fn wired_describe_key_invents_no_rotation_time_for_legacy_records() {
+        let mut key_data = healthy_key_data();
+        key_data.created_at = Zoned::now() - Duration::from_secs(365 * 86400);
+        key_data.version = 4;
+        key_data.baseline_version = Some(1);
+
+        let mut record = kv2_read_data(&key_data);
+        record["data"]
+            .as_object_mut()
+            .expect("key record must be a JSON object")
+            .remove("rotated_at")
+            .expect("current records must carry the field");
+
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(record)]).await;
+        let described = client
+            .describe_key("wired-key", None)
+            .await
+            .expect("a record without the field must still describe");
+        assert!(
+            described.rotated_at.is_none(),
+            "an unstamped record must not be reported as freshly rotated, got {:?}",
+            described.rotated_at
+        );
+        assert_eq!(
+            described.created_at.timestamp(),
+            key_data.created_at.timestamp(),
+            "the rest of the legacy record must survive the read"
+        );
+        assert_eq!(described.version, 4);
+    }
+
+    /// The persisted KV2 record round-trips its rotation time, and records
+    /// written before the field existed keep deserializing (as None) with the
+    /// rest of their contents intact.
+    #[test]
+    fn vault_key_data_rotated_at_round_trips_and_stays_backward_compatible() {
+        let rotated_at = Zoned::now();
+        let mut key_data = healthy_key_data();
+        key_data.rotated_at = Some(rotated_at.clone());
+        key_data.baseline_version = Some(1);
+        key_data.version = 2;
+        key_data.tags.insert("env".to_string(), "prod".to_string());
+
+        let mut value = serde_json::to_value(&key_data).expect("serialize");
+        let restored: VaultKeyData = serde_json::from_value(value.clone()).expect("round trip");
+        assert_eq!(
+            restored.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(rotated_at.timestamp()),
+            "the rotation time must survive the KV2 round trip"
+        );
+
+        value
+            .as_object_mut()
+            .expect("record must be a JSON object")
+            .remove("rotated_at")
+            .expect("current records must carry the field");
+        let legacy: VaultKeyData = serde_json::from_value(value).expect("legacy record must deserialize");
+        assert!(legacy.rotated_at.is_none());
+        assert_eq!(legacy.version, 2);
+        assert_eq!(legacy.baseline_version, Some(1));
+        assert_eq!(legacy.tags.get("env").map(String::as_str), Some("prod"));
     }
 
     /// Reading a pre-versioning envelope against a key whose baseline was erased

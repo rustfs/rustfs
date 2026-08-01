@@ -48,12 +48,14 @@ Published by the background deletion worker (`crates/kms/src/deletion_worker.rs`
 | --- | --- | --- | --- |
 | `rustfs_kms_pending_deletion_keys` | gauge | — | Keys scheduled for deletion whose deadline has not passed |
 | `rustfs_kms_deletion_tombstone_keys` | gauge | — | Keys left tombstoned by an interrupted removal, still awaiting the sweep |
-| `rustfs_kms_oldest_key_rotation_age_seconds` | gauge | — | Seconds since the least recently rotated usable key was rotated, counting from creation for keys never rotated; `0` when there are none |
+| `rustfs_kms_oldest_key_rotation_age_seconds` | gauge | — | Seconds since the least recently rotated usable key was rotated, counting from creation for keys with no recorded rotation; `0` when there are none |
 | `rustfs_kms_deletion_sweep_keys_total` | counter | `outcome` | Keys the sweep acted on, by outcome |
 
 `outcome` is `removed`, `blocked` (live configuration — the default key, or a reference reported by the injected checker — still points at the key, so the sweep refuses to remove it), `skipped` (pending but not yet due, or the state changed between inspection and removal), or `failed` (the removal attempt failed and is retried next sweep). Every series is emitted at zero from the first sweep on, so a `rate()` over it is defined immediately.
 
 The three gauges are republished only by a sweep that saw the whole key set; a sweep that could not finish listing leaves the previous, complete values standing rather than understating them. Keys already on their way out are excluded from the rotation-age gauge, so it does not stay pinned high by a key that will never be rotated again.
+
+The rotation age comes from whatever the backend reports as the last rotation, and backends only report a rotation they recorded themselves. A key rotated before its backend persisted rotation timestamps therefore ages from creation until its next rotation stamps the record: the gauge overstates that key's age rather than inventing a rotation it cannot vouch for, so an alert on it fires early rather than late. Backends that cannot rotate at all (Local, Static) age every key from creation by construction.
 
 ### Vault credential metrics
 
