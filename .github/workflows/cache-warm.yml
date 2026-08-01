@@ -26,10 +26,8 @@
 # superseded runs (which is correct — nobody needs test results for a commit
 # that is already three merges behind) while the caches still get written.
 #
-# The group below deliberately does NOT cancel in progress. GitHub keeps at most
-# one running plus one pending run per group, so a burst of merges collapses
-# into "current run finishes, newest queued run follows" rather than a pile-up.
-# That also bounds this workflow to one self-hosted runner at a time.
+# The group below deliberately does NOT cancel in progress; see the comment on
+# it for how that bounds concurrency and why it is scoped by event.
 #
 # Each job below owns exactly one shared-key and is the only place that sets
 # cache-save-if to anything but 'false' for it; every lane in ci.yml reads.
@@ -77,8 +75,21 @@ on:
 permissions:
   contents: read
 
+# Scoped by event. A push run and a dispatch run do not compete: GitHub keeps
+# one running plus one pending per group, so with a single shared group a
+# manually dispatched run was displaced as pending by the next merge and
+# cancelled — observed three times in a row, which made the --timings gate in
+# rustfs/backlog#1601 effectively impossible to trigger while main was busy.
+#
+# Still no cancel-in-progress: a burst of merges collapses into "current run
+# finishes, newest queued run follows" rather than a pile-up, which is what
+# bounds this workflow to one self-hosted runner per event type.
+#
+# The two paths can now overlap and race to save the same key. That is benign:
+# the loser finds the key already present and skips, and both builds produce the
+# same artifacts from the same commit.
 concurrency:
-  group: cache-warm
+  group: cache-warm-${{ github.event_name }}
   cancel-in-progress: false
 
 env:
