@@ -18,6 +18,7 @@ use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::KmsBackend;
 use crate::cache::{KmsCache, KmsCacheStats};
 use crate::config::{ENV_KMS_ALLOW_IMMEDIATE_DELETION, KmsConfig};
+use crate::deletion_worker::DeletionReferenceChecker;
 use crate::error::{KmsError, Result};
 use crate::types::{
     CancelKeyDeletionRequest, CancelKeyDeletionResponse, CreateKeyRequest, CreateKeyResponse,
@@ -41,6 +42,7 @@ pub struct KmsManager {
     backend_kind: &'static str,
     audit_sink: Option<Arc<dyn KmsAuditSink>>,
     allow_immediate_deletion: bool,
+    reference_checker: Option<Arc<dyn DeletionReferenceChecker>>,
 }
 
 impl KmsManager {
@@ -60,7 +62,19 @@ impl KmsManager {
             backend_kind: config.backend.as_str(),
             audit_sink: None,
             allow_immediate_deletion: config.allow_immediate_deletion,
+            reference_checker: None,
         }
+    }
+
+    /// Consult `checker` before immediate deletion destroys key material.
+    ///
+    /// This is the same checker the deletion worker consults before it removes
+    /// an expired key; installing it here extends that gate to the one
+    /// deletion path that never reaches the worker. It can only add a refusal:
+    /// without a checker the manager behaves exactly as before.
+    pub fn with_deletion_reference_checker(mut self, checker: Option<Arc<dyn DeletionReferenceChecker>>) -> Self {
+        self.reference_checker = checker;
+        self
     }
 
     /// Send an audit record for every management operation to `sink`.
@@ -262,6 +276,9 @@ impl KmsManager {
     /// defensive assertion for callers that hold a backend handle directly.
     async fn delete_key_inner(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
         self.check_deletion_request(&request)?;
+        if request.force_immediate.unwrap_or(false) {
+            self.refuse_referenced_immediate_deletion(&request.key_id).await?;
+        }
 
         let response = self.backend.delete_key(request).await?;
 
@@ -310,6 +327,41 @@ impl KmsManager {
             "immediate KMS key deletion accepted; key material is destroyed without a waiting window and cannot be recovered"
         );
         Ok(())
+    }
+
+    /// Refuse an immediate deletion while configuration still points at the
+    /// key.
+    ///
+    /// A scheduled deletion is re-checked against these same references by the
+    /// deletion worker before it destroys anything, and stays cancellable
+    /// until then. Immediate deletion has neither property: it destroys
+    /// material on the spot and never reaches the worker, so the check has to
+    /// happen here or not at all.
+    ///
+    /// Only ever a refusal. An empty reference set is not a clearance — it
+    /// means the sources consulted here raised no objection, while the caller
+    /// still had to pass the server-side opt-in and the key-id confirmation to
+    /// get this far. With no checker installed the manager has no
+    /// configuration source to consult and behaves as it did before, matching
+    /// the deletion worker, which also skips a checker it was not given.
+    async fn refuse_referenced_immediate_deletion(&self, key_id: &str) -> Result<()> {
+        let mut references = Vec::new();
+        if self.default_key_id.as_deref() == Some(key_id) {
+            references.push("kms-service-default-key".to_string());
+        }
+        if let Some(checker) = &self.reference_checker {
+            references.extend(checker.references(key_id).await);
+        }
+        if references.is_empty() {
+            return Ok(());
+        }
+
+        warn!(
+            key_id,
+            ?references,
+            "immediate KMS key deletion refused; configuration still references the key"
+        );
+        Err(KmsError::key_still_referenced(key_id, references))
     }
 
     /// Cancel key deletion

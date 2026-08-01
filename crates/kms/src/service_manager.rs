@@ -634,7 +634,13 @@ impl KmsServiceManager {
         };
 
         // Create KMS manager
-        let mut kms_manager = KmsManager::new(backend, config.clone());
+        //
+        // The deletion reference checker is handed to the manager as well as to
+        // the worker: immediate deletion destroys material without ever
+        // reaching the worker, so that path has to consult the same gate
+        // itself.
+        let mut kms_manager =
+            KmsManager::new(backend, config.clone()).with_deletion_reference_checker(self.deletion_reference_checker());
         if let Some(sink) = self.audit_sink() {
             kms_manager = kms_manager.with_audit_sink(sink);
         }
