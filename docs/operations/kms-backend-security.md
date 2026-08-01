@@ -170,7 +170,9 @@ Two consequences follow from that last row: **SSE-S3 key auto-creation and the s
 
 Key versions are opaque. AWS addresses backing keys internally and picks the right one to decrypt with, so RustFS reports `key_version` as 1 and cannot enumerate versions. Rotation uses `RotateKeyOnDemand`, which retains prior backing keys for decryption; AWS's separate automatic yearly rotation is neither enabled nor reported on by RustFS.
 
-The AWS backend is not configurable through the KMS admin API — use the environment variables above at startup.
+The KMS admin API accepts the AWS backend as `"backend_type": "AWS"` (aliases `aws`, `aws-kms`, `aws_kms`, `AwsKms`) on `/v3/kms/configure` and `/v3/kms/reconfigure`. The body carries `region` (**required**), and optionally `endpoint_url`, `default_key_id`, and the shared timeout/retry/cache settings. It accepts no credential fields at all — unknown fields are rejected — because every node resolves credentials through its own provider chain.
+
+`region` is mandatory on this path even though `RUSTFS_KMS_AWS_REGION` is optional at startup: the admin configuration is persisted once and replayed on every node, so a request that left the region to each node's ambient chain would let nodes address different regions, and therefore different keys, while reporting an identical configuration. `default_key_id` must be an AWS key id or ARN that already exists — this backend never creates keys by name.
 
 ## Local backend durability and deployment support matrix
 

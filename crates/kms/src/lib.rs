@@ -83,9 +83,9 @@ pub mod types;
 
 // Re-export public API
 pub use api_types::{
-    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureStaticKmsRequest,
-    ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest,
-    StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
+    CacheSummary, ConfigureAwsKmsRequest, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest,
+    ConfigureStaticKmsRequest, ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse,
+    StartKmsRequest, StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use audit::{KmsAuditOperation, KmsAuditOutcome, KmsAuditRecord, KmsAuditSink, redact_encryption_context};
