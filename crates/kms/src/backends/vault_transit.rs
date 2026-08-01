@@ -2258,4 +2258,89 @@ mod tests {
             "the sweep must not touch the transit key after backing off: {requests:?}"
         );
     }
+
+    /// The forward half of the rotation contract on the Transit path: a data key
+    /// generated before a rotation must still be decryptable after it.
+    ///
+    /// Transit key material never leaves Vault, so an offline responder cannot
+    /// prove the cryptographic round trip — `test_transit_old_ciphertext_decrypts_after_rotate`
+    /// keeps that against a live Vault. What this pins is the wiring the client
+    /// owns and could regress on its own: the historical `vault:v1:` ciphertext
+    /// is forwarded to Vault byte for byte after the rotation bumped the
+    /// recorded version, and nothing on the decrypt path gates on that version.
+    #[tokio::test]
+    async fn wired_transit_pre_rotation_data_key_is_decrypted_unchanged() {
+        const CIPHERTEXT_V1: &str = "vault:v1:scripted-pre-rotation";
+        const RECOVERED_DEK: [u8; 32] = [0x37u8; 32];
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            // generate_data_key: state gate reads the metadata record, then the
+            // transit encrypt returns first-version ciphertext.
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": CIPHERTEXT_V1 })),
+            // rotate: the state gate hits the metadata cache, the rotation
+            // commits, and the versioned read+write records the version bump.
+            ScriptedResponse::ok(serde_json::json!({})),
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // decrypt of the pre-rotation envelope; Vault owns the transit
+            // crypto, so the recovered material is the responder's to hand back.
+            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode(RECOVERED_DEK) })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(
+                &GenerateKeyRequest {
+                    master_key_id: "wired-key".to_string(),
+                    key_spec: "AES_256".to_string(),
+                    key_length: Some(32),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("generate_data_key must produce an envelope");
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&data_key.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope.encrypted_key, CIPHERTEXT_V1.as_bytes());
+
+        let rotated = client.rotate_key("wired-key", None).await.expect("rotation must commit");
+        assert_eq!(rotated.version, 2, "the rotation must record the version bump");
+
+        let plaintext = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: data_key.ciphertext.clone(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("a pre-rotation data key must stay decryptable");
+        assert_eq!(
+            plaintext,
+            RECOVERED_DEK.to_vec(),
+            "the decrypt must hand back the recovered material, not merely avoid an error"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 7, "{requests:?}");
+        assert_eq!(requests[6], "POST /v1/transit/decrypt/wired-key", "{requests:?}");
+
+        // The version the rotation recorded, and the ciphertext the decrypt sent:
+        // the client must forward the historical version verbatim instead of
+        // re-stamping it to (or pinning the request at) the current one.
+        let bodies = vault.request_bodies();
+        let recorded: serde_json::Value = serde_json::from_str(&bodies[5]).expect("metadata write body must be JSON");
+        assert_eq!(recorded["data"]["current_version"], serde_json::json!(2), "{recorded}");
+        let decrypt_body: serde_json::Value = serde_json::from_str(&bodies[6]).expect("decrypt body must be JSON");
+        assert_eq!(
+            decrypt_body["ciphertext"],
+            serde_json::json!(CIPHERTEXT_V1),
+            "the pre-rotation ciphertext must reach Vault unchanged: {decrypt_body}"
+        );
+    }
 }
