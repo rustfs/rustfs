@@ -53,6 +53,7 @@ on:
       - ".github/workflows/build.yml"
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
+      - "flake.lock"
 
 permissions:
   contents: read
@@ -110,6 +111,8 @@ jobs:
 
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
+      - name: Check CI paths stay in sync
+        run: ./scripts/check_ci_paths_sync.sh
 
   test-and-lint:
     name: Test and Lint

@@ -19,9 +19,12 @@ on:
   schedule:
     - cron: '0 5 * * 0' # Weekly on Sunday 05:00 UTC (staggered after the midnight ci/build crons)
 
+# GITHUB_TOKEN only needs to read the repository here: the branch push and the
+# pull request are both created by update-flake-lock using the
+# FLAKE_UPDATE_TOKEN PAT below, not by this token. Leaving write on it hands a
+# repo-write credential to an unattended weekly job that does not use it.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
