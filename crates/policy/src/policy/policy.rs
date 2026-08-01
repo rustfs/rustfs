@@ -1760,6 +1760,391 @@ mod test {
         );
     }
 
+    fn kms_args<'a>(
+        action: Action,
+        key_id: &'a str,
+        conditions: &'a HashMap<String, Vec<String>>,
+        claims: &'a HashMap<String, Value>,
+    ) -> Args<'a> {
+        Args {
+            account: "testuser",
+            groups: &None,
+            action,
+            bucket: "",
+            conditions,
+            is_owner: false,
+            object: key_id,
+            claims,
+            deny_only: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_key_resource_scopes_by_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DisableKey"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DisableKeyAction);
+
+        assert!(
+            policy.is_allowed(&kms_args(action, "key-a", &conditions, &claims)).await,
+            "the granted key must be allowed"
+        );
+        assert!(
+            !policy.is_allowed(&kms_args(action, "key-b", &conditions, &claims)).await,
+            "a key outside the granted resource must be denied"
+        );
+        assert!(
+            !policy
+                .is_allowed(&kms_args(Action::KmsAction(KmsAction::EnableKeyAction), "key-a", &conditions, &claims))
+                .await,
+            "an action outside the grant must stay denied even for the granted key"
+        );
+        assert!(
+            policy.is_allowed(&kms_args(action, "", &conditions, &claims)).await,
+            "call sites that do not pass a key resource keep the legacy match-every-key behaviour"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_wildcard_key_resource() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey"],
+      "Resource": ["arn:aws:kms:::key/app-*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::GenerateDataKeyAction);
+
+        assert!(
+            policy
+                .is_allowed(&kms_args(action, "app-primary", &conditions, &claims))
+                .await
+        );
+        assert!(
+            !policy
+                .is_allowed(&kms_args(action, "backup-primary", &conditions, &claims))
+                .await
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_without_resource_matches_every_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        for key_id in ["", "key-a", "any-other-key"] {
+            assert!(
+                policy
+                    .is_allowed(&kms_args(Action::KmsAction(KmsAction::DisableKeyAction), key_id, &conditions, &claims))
+                    .await,
+                "resource-less KMS statement must keep matching every key (key_id: {key_id:?})"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_deny_with_wildcard_resource_overrides_allow() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["kms:DisableKey"],
+      "Resource": ["arn:aws:kms:::key/*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        assert!(
+            !policy
+                .is_allowed(&kms_args(Action::KmsAction(KmsAction::DisableKeyAction), "key-a", &conditions, &claims))
+                .await,
+            "a wildcard Deny must override the narrower Allow"
+        );
+        assert!(
+            policy
+                .is_allowed(&kms_args(Action::KmsAction(KmsAction::RotateKeyAction), "key-a", &conditions, &claims))
+                .await,
+            "actions outside the Deny keep the Allow"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_not_resource_excludes_keys() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DescribeKey"],
+      "NotResource": ["arn:aws:kms:::key/prod-*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DescribeKeyAction);
+
+        assert!(policy.is_allowed(&kms_args(action, "dev-key", &conditions, &claims)).await);
+        assert!(!policy.is_allowed(&kms_args(action, "prod-key", &conditions, &claims)).await);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_statement_with_s3_resource_is_treated_as_unscoped() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        // Statements combining KMS actions with S3 resources predate KMS resource
+        // support and were always evaluated as if unscoped. Pin that they still
+        // match every key (a warning is logged during evaluation).
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DisableKey"],
+      "Resource": ["arn:aws:s3:::somebucket/*"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DisableKeyAction);
+
+        for key_id in ["", "key-a"] {
+            assert!(
+                policy.is_allowed(&kms_args(action, key_id, &conditions, &claims)).await,
+                "malformed KMS statement with S3 resources must keep matching every key (key_id: {key_id:?})"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_kms_alias_resource_parses_but_matches_no_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:DescribeKey"],
+      "Resource": ["arn:aws:kms:::alias/app-alias"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let action = Action::KmsAction(KmsAction::DescribeKeyAction);
+
+        assert!(
+            !policy.is_allowed(&kms_args(action, "app-alias", &conditions, &claims)).await,
+            "alias patterns are parse-only until alias resolution lands and must not match key requests"
+        );
+        assert!(
+            policy.is_allowed(&kms_args(action, "", &conditions, &claims)).await,
+            "call sites without a key resource keep the legacy match-every-key behaviour"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kms_resource_policy_round_trips() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+      "Resource": ["arn:aws:kms:::key/app-*", "arn:aws:kms:::alias/app-alias"]
+    }
+  ]
+}"#,
+        )
+        .expect("KMS resource policy should parse");
+
+        let json = serde_json::to_string(&policy).expect("policy should serialize");
+        let round_trip = Policy::parse_config(json.as_bytes()).expect("serialized KMS resource policy should re-parse");
+        assert_eq!(round_trip.statements[0].resources, policy.statements[0].resources);
+        assert_eq!(round_trip.statements[0].actions, policy.statements[0].actions);
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("JSON valid");
+        let resources: Vec<_> = value["Statement"][0]["Resource"]
+            .as_array()
+            .expect("Resource should serialize as an array")
+            .iter()
+            .map(|resource| resource.as_str().expect("Resource entries should be strings"))
+            .collect();
+        assert_eq!(resources, vec!["arn:aws:kms:::key/app-*", "arn:aws:kms:::alias/app-alias"]);
+    }
+
+    #[test]
+    fn test_kms_resource_with_non_kms_action_is_invalid() {
+        for action in ["s3:GetObject", "admin:ServerInfo", "sts:AssumeRole"] {
+            let data = format!(
+                r#"{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{
+      "Effect": "Allow",
+      "Action": ["{action}"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }}
+  ]
+}}"#
+            );
+
+            let result = Policy::parse_config(data.as_bytes());
+            assert!(
+                matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::KmsResourceWithNonKmsAction)),
+                "{action} with a KMS resource should fail with KmsResourceWithNonKmsAction, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_policy_with_kms_statement_is_invalid() {
+        for statement in [
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["kms:GenerateDataKey"],"Resource":["arn:aws:s3:::bucket/*"]}"#,
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject"],"Resource":["arn:aws:kms:::key/key-a"]}"#,
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"NotAction":["kms:*"],"Resource":["arn:aws:s3:::bucket/*"]}"#,
+        ] {
+            let data = format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#);
+            let policy: BucketPolicy =
+                serde_json::from_str(&data).expect("bucket policy with KMS content should still deserialize");
+            let result = policy.is_valid();
+            assert!(
+                matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::KmsUnsupportedInBucketPolicy)),
+                "bucket policy statement {statement} should fail with KmsUnsupportedInBucketPolicy, got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stored_bucket_policy_with_kms_statement_loads_and_is_ignored() -> Result<()> {
+        // Policies stored before KMS statements were rejected at validation must keep
+        // deserializing, and their KMS statements must not affect bucket traffic.
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["kms:GenerateDataKey"],
+      "Resource": ["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let conditions = HashMap::new();
+        let args = BucketPolicyArgs {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "a.txt",
+        };
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "the S3 statement must keep working alongside an ignored KMS statement"
+        );
+
+        let put_args = BucketPolicyArgs {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "a.txt",
+        };
+        assert!(
+            !bucket_policy.is_allowed(&put_args).await,
+            "the ignored KMS statement must not grant anything"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_mixed_action_families_are_invalid_even_with_resource() {
         let data = r#"

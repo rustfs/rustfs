@@ -728,6 +728,8 @@ pub enum KmsAction {
     ListKeysAction,
     #[strum(serialize = "kms:DescribeKey")]
     DescribeKeyAction,
+    #[strum(serialize = "kms:Decrypt")]
+    DecryptAction,
 }
 
 #[cfg(test)]
@@ -764,6 +766,7 @@ mod tests {
             ("kms:RotateKey", KmsAction::RotateKeyAction),
             ("kms:ListKeys", KmsAction::ListKeysAction),
             ("kms:DescribeKey", KmsAction::DescribeKeyAction),
+            ("kms:Decrypt", KmsAction::DecryptAction),
         ] {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));

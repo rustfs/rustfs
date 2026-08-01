@@ -105,33 +105,78 @@ CI) fails the build if anything is committed under `docs/superpowers/`, even via
 
 ## Verification Before PR
 
-Convert changes into independently verifiable outcomes. Prefer focused tests for behavior changes and run the relevant checks before declaring completion.
-Non-exempt changes must also pass Adversarial Validation (next section) before the checks below count as completion.
+Convert changes into independently verifiable outcomes. This section controls
+agent-run local validation; preparing a commit or PR does not by itself require
+the broadest gate. Inspect only the final task-owned diff, classify it by
+behavioral impact rather than line count or path alone, and run the smallest
+set of checks that provides meaningful coverage. Do not let unrelated
+worktree changes or a generic contributor checklist expand the scope.
+Non-exempt changes must also pass Adversarial Validation (next section) before
+the checks below count as completion.
 
-For code changes, run and pass the following before opening a PR:
+### Validation floor
 
-```bash
-make pre-pr
-```
+- Every change that is not documentation-only must finish with
+  `cargo fmt --all --check` passing. An umbrella gate that runs this exact
+  check satisfies the requirement; do not run it twice. Use `cargo fmt --all`
+  only when formatting needs to be fixed. Run the configured formatter or
+  validator for other changed languages when one exists.
+- Documentation-only or instruction-only means all task-owned changes are
+  prose or documentation assets and cannot affect runtime, builds, CI,
+  dependencies, generated code, or tests. Run `git diff --check` and any
+  relevant documentation guard, but skip Cargo formatting, compilation,
+  Clippy, tests, `make pre-commit`, and `make pre-pr`.
+- Behavior changes require relevant existing or new tests. Prefer the most
+  focused test or affected package. A passing targeted test can also provide
+  sufficient compilation coverage when it builds every changed target and
+  feature involved; do not add a redundant `cargo check` in that case.
+- `cargo check` supplements compilation coverage; it never substitutes for a
+  behavioral test. If a relevant test cannot reasonably be added or run, use
+  the narrowest compilation check and report the reason and remaining risk.
 
-Before committing code changes, prefer focused verification for the touched
-surface and use the faster local gate when a broad smoke check is needed:
+### Validation tiers
 
-```bash
-make pre-commit
-```
+1. **Documentation/instruction-only:** Apply the exemption above. Run a guard
+   such as `make doc-paths-check` only when it is relevant to the edited text.
+2. **Non-behavioral source change:** For comments, formatting, or another
+   demonstrably non-executable change, run the formatting floor. Compilation,
+   Clippy, and tests may be skipped only when the edit cannot affect
+   compilation or runtime behavior; run targeted doctests if executable
+   documentation examples changed.
+3. **Localized or bounded behavior change:** Run the formatting floor and the
+   narrowest relevant tests. Add package-scoped `cargo check` or Clippy only
+   for changed targets, features, APIs, error handling, async behavior, or
+   control flow not already covered. When several crates are affected but the
+   dependency set is identifiable, validate those packages and known
+   dependents instead of the whole workspace. Use `make pre-commit` only when
+   a repository-wide fast gate adds useful confidence beyond those checks.
+4. **Broad or high-risk change:** Run `make pre-pr` only when targeted coverage
+   cannot bound the impact, including:
+   - dependency, feature, build-script, procedural-macro, code-generation,
+     toolchain, or CI changes that alter compilation or the test matrix;
+   - cross-crate public APIs, shared foundational code, or broad refactors with
+     an unbounded dependent set;
+   - locking, storage durability or formats, erasure coding, replication,
+     RPC/protocol compatibility, IAM/KMS/auth, cryptography, or other
+     security-sensitive behavior;
+   - a targeted check that reveals wider impact, an explicit user request, or
+     a release policy that requires the full gate.
 
-For migration batches, do not run the full `make pre-pr` gate before every
-intermediate commit. Use focused tests and `make pre-commit` during
-development, then reserve `make pre-pr` for the final PR-ready branch.
+Documentation-only and non-behavioral classifications take precedence over
+path-based triggers. A small diff can still be high-risk, while a CI comment,
+manifest comment, or release-note edit does not require full validation.
 
-Before pushing code changes, make sure formatting is clean:
+`make pre-pr` includes `make pre-commit` coverage. Never run both for the same
+unchanged diff, and do not repeat equivalent checks during PR preparation or
+because a local hook already ran them. Rerun only checks whose scope is affected
+by later edits. Full workspace checks do not replace a relevant integration or
+E2E test for changed behavior; run that focused test when required and
+available, or report why it was not run and the remaining risk.
 
-- Run `cargo fmt --all`.
-- Run `cargo fmt --all --check` and ensure no files are modified unexpectedly.
+If `make` is unavailable, run the equivalent checks defined under
+`.config/make/`. At handoff, list the checks actually run, checks intentionally
+skipped, and the reason for the selected tier.
 
-If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
-Documentation-only or instruction-only changes are exempt from the verification commands above (including the `.config/make/` equivalents), though any locally installed git pre-commit hooks may still run on commit unless explicitly skipped.
 After build-based verification completes, clean generated build artifacts before wrapping up to avoid unnecessary disk usage.
 Do not open a PR with code changes when the required checks fail.
 Make a failing check pass by fixing the cause, never by weakening the gate:

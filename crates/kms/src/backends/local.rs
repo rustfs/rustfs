@@ -46,7 +46,10 @@ use zeroize::Zeroizing;
 /// `key_dir` is accepted, so identifiers already in use by existing deployments keep
 /// resolving. Only separators, traversal and the degenerate cases are refused, which is
 /// what stops `key_dir.join(...)` from escaping.
-fn validate_key_id(key_id: &str) -> Result<()> {
+///
+/// pub(crate) because the backup restore path applies the same containment
+/// rule to key identifiers recovered from bundle artifacts.
+pub(crate) fn validate_key_id(key_id: &str) -> Result<()> {
     if key_id.is_empty() {
         return Err(KmsError::invalid_key("key identifier must not be empty"));
     }
@@ -68,7 +71,15 @@ fn validate_key_id(key_id: &str) -> Result<()> {
     }
 }
 
-const LOCAL_KMS_MASTER_KEY_SALT_FILE: &str = ".master-key.salt";
+// The salt and restore-marker file names are pub(crate) so the backup/restore
+// modules (`crate::backup`) address the exact on-disk names instead of copies
+// that could drift.
+pub(crate) const LOCAL_KMS_MASTER_KEY_SALT_FILE: &str = ".master-key.salt";
+/// Commit marker of an in-progress Local restore cutover (see
+/// `crate::backup::local_restore`). Its presence means the key directory is
+/// mid-cutover: startup must fail closed until the restore is rolled forward
+/// or explicitly aborted.
+pub(crate) const LOCAL_RESTORE_COMMIT_MARKER_FILE: &str = ".restore-commit.json";
 // The KDF parameters are pub(crate) so the backup manifest contract
 // (`crate::backup`) records the exact compiled-in derivation instead of a
 // copy that could drift.
@@ -87,7 +98,11 @@ pub(crate) const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
 /// `foo.tmp-<uuid>` is stored as `foo.tmp-<uuid>.key` — so the `.key` guard
 /// plus the exact hyphenated-UUID check makes it impossible to match an
 /// authoritative file.
-fn is_orphan_commit_temp_name(file_name: &str) -> bool {
+///
+/// pub(crate) because the backup restore path applies the same classification
+/// when it re-enters an interrupted run: a leftover commit temp is never
+/// authoritative state, so it does not make a target non-empty.
+pub(crate) fn is_orphan_commit_temp_name(file_name: &str) -> bool {
     if file_name.ends_with(".key") {
         return false;
     }
@@ -110,12 +125,15 @@ fn is_orphan_commit_temp_name(file_name: &str) -> bool {
 ///
 /// This intentionally mirrors ecstore's fsync helpers without depending on the
 /// ecstore crate: the KMS backend stays decoupled from storage internals.
-mod durable_file {
+///
+/// pub(crate) because the backup restore path (`crate::backup::local_restore`)
+/// commits staged files and its cutover marker through the same protocol.
+pub(crate) mod durable_file {
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
 
     /// How the fully written temp file becomes visible under its final name.
-    pub(super) enum Publish {
+    pub(crate) enum Publish {
         /// Atomically replace whatever is at the destination via `rename`.
         Replace,
         /// Publish via `hard_link`, failing with [`CommitError::AlreadyExists`]
@@ -124,7 +142,7 @@ mod durable_file {
     }
 
     #[derive(Debug)]
-    pub(super) enum CommitError {
+    pub(crate) enum CommitError {
         AlreadyExists,
         Io(io::Error),
         /// Test-only simulated crash: the protocol stops after the given step
@@ -158,14 +176,14 @@ mod durable_file {
     /// to prove that every interrupted prefix recovers to either the complete
     /// old state or the complete new state.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum CommitStep {
+    pub(crate) enum CommitStep {
         TempWritten,
         FileSynced,
         Published,
         DirSynced,
     }
 
-    pub(super) async fn commit(
+    pub(crate) async fn commit(
         temp_path: PathBuf,
         final_path: PathBuf,
         content: Vec<u8>,
@@ -179,12 +197,47 @@ mod durable_file {
 
     /// Remove a published file durably: without the parent directory fsync a
     /// deleted key could resurface after power loss.
-    pub(super) async fn remove_durably(path: PathBuf) -> io::Result<()> {
+    pub(crate) async fn remove_durably(path: PathBuf) -> io::Result<()> {
         tokio::task::spawn_blocking(move || {
             std::fs::remove_file(&path)?;
             let parent = path
                 .parent()
                 .ok_or_else(|| io::Error::other("path has no parent directory"))?;
+            fsync_dir(parent)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// Publish an already-durable file under a second name via `hard_link`,
+    /// then fsync the destination's parent directory.
+    ///
+    /// This is the restore cutover primitive: the source (a staged file that
+    /// went through [`commit`]) is already durable, so linking plus a parent
+    /// fsync is a complete publish. `AlreadyExists` is idempotent success only
+    /// when the destination content is byte-identical to the source — that is
+    /// exactly the re-entry case of a cutover interrupted after this link —
+    /// and a hard failure otherwise, so the primitive can never clobber or
+    /// silently accept foreign state.
+    pub(crate) async fn link_durably(source: PathBuf, dest: PathBuf) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            match std::fs::hard_link(&source, &dest) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let existing = std::fs::read(&dest)?;
+                    let staged = std::fs::read(&source)?;
+                    if existing != staged {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("destination {} already exists with different content", dest.display()),
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            let parent = dest
+                .parent()
+                .ok_or_else(|| io::Error::other("destination has no parent directory"))?;
             fsync_dir(parent)
         })
         .await
@@ -355,7 +408,7 @@ mod durable_file {
     /// Test-only failpoints simulating a crash after a given commit step.
     /// Armed per directory so parallel tests never affect each other.
     #[cfg(test)]
-    pub(super) mod failpoint {
+    pub(crate) mod failpoint {
         use super::CommitStep;
         use std::path::{Path, PathBuf};
         use std::sync::Mutex;
@@ -460,6 +513,11 @@ impl LocalKmsClient {
             debug!(path = ?config.key_dir, "KMS key directory created");
         }
 
+        // The restore-marker guard must run before anything else touches the
+        // directory (in particular before salt load/creation): a directory
+        // mid-cutover holds an arbitrary mix of old and new state.
+        Self::ensure_no_restore_marker(&config).await?;
+
         // Initialize master cipher if master key is provided
         let (master_cipher, legacy_master_cipher) = if let Some(ref master_key) = config.master_key {
             let salt = Self::load_or_create_master_key_salt(&config).await?;
@@ -491,6 +549,7 @@ impl LocalKmsClient {
         if !fs::try_exists(&config.key_dir).await? {
             return Err(KmsError::configuration_error("Local KMS key directory does not exist"));
         }
+        Self::ensure_no_restore_marker(&config).await?;
 
         let (master_cipher, legacy_master_cipher) = if let Some(ref master_key) = config.master_key {
             let legacy_key = Self::derive_legacy_master_key(master_key)?;
@@ -567,8 +626,36 @@ impl LocalKmsClient {
         Self::master_key_salt_path(&self.config)
     }
 
+    /// Operator-configured master key string, exposed for the backup export
+    /// module so it can record a one-way verifier in the bundle manifest.
+    /// Never log or persist this value.
+    pub(crate) fn configured_master_key(&self) -> Option<&str> {
+        self.config.master_key.as_deref()
+    }
+
+    /// Fail closed while a restore cutover marker is present: the directory
+    /// then holds an arbitrary mix of pre-restore and restored state, and the
+    /// only valid next steps are re-running the restore with the same bundle
+    /// (roll forward) or explicitly aborting it. This mirrors the missing-salt
+    /// guard: startup must never paper over a half-applied restore.
+    async fn ensure_no_restore_marker(config: &LocalConfig) -> Result<()> {
+        let marker = config.key_dir.join(LOCAL_RESTORE_COMMIT_MARKER_FILE);
+        if fs::try_exists(&marker).await? {
+            return Err(KmsError::configuration_error(format!(
+                "Local KMS key directory has an unfinished restore (marker {} present); \
+                 re-run the restore with the same bundle to roll it forward or abort it explicitly",
+                marker.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
-    fn derive_master_key(master_key: &str, salt: &[u8]) -> Result<Key<Aes256Gcm>> {
+    ///
+    /// pub(crate) because the backup restore path derives the same key from
+    /// the operator-supplied master key and the bundled salt for its verifier
+    /// check and staged decryption probe.
+    pub(crate) fn derive_master_key(master_key: &str, salt: &[u8]) -> Result<Key<Aes256Gcm>> {
         let params = Params::new(
             LOCAL_KMS_ARGON2_M_COST_KIB,
             LOCAL_KMS_ARGON2_T_COST,
@@ -585,7 +672,7 @@ impl LocalKmsClient {
         Ok(key)
     }
 
-    fn derive_legacy_master_key(master_key: &str) -> Result<Key<Aes256Gcm>> {
+    pub(crate) fn derive_legacy_master_key(master_key: &str) -> Result<Key<Aes256Gcm>> {
         let mut hasher = Sha256::new();
         hasher.update(master_key.as_bytes());
         hasher.update(b"rustfs-kms-local");
@@ -2451,6 +2538,34 @@ mod tests {
         assert!(!is_orphan_commit_temp_name(&format!("mykey.tmp-{}", uuid.simple())));
         assert!(!is_orphan_commit_temp_name(&format!(".tmp-{uuid}")));
         assert!(!is_orphan_commit_temp_name("mykey.tmp-"));
+    }
+
+    #[tokio::test]
+    async fn link_durably_publishes_no_clobber_and_is_content_idempotent() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let source = temp_dir.path().join("staged");
+        let dest = temp_dir.path().join("published");
+        fs::write(&source, b"staged-content").await.expect("write source");
+
+        durable_file::link_durably(source.clone(), dest.clone())
+            .await
+            .expect("first link must succeed");
+        assert_eq!(fs::read(&dest).await.expect("read dest"), b"staged-content");
+
+        // Re-entry with identical content is idempotent success — exactly the
+        // resumed-cutover case.
+        durable_file::link_durably(source.clone(), dest.clone())
+            .await
+            .expect("re-linking identical content must be idempotent");
+
+        // Existing content that differs is a hard failure, never a clobber.
+        let foreign = temp_dir.path().join("foreign");
+        fs::write(&foreign, b"different-content").await.expect("write foreign");
+        let error = durable_file::link_durably(foreign, dest.clone())
+            .await
+            .expect_err("differing content must not be clobbered");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&dest).await.expect("dest unchanged"), b"staged-content");
     }
 
     #[tokio::test]

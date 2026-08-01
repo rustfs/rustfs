@@ -267,12 +267,13 @@ pub mod config {
     pub mod com {
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
-            ServerConfigCorruptError, ServerConfigSnapshot, delete_config, is_server_config_corrupt_error, lookup_configs,
-            read_config, read_config_no_lock, read_config_with_metadata, read_config_without_migrate,
-            read_config_without_migrate_no_lock, read_existing_server_config_no_lock, read_server_config_snapshot, save_config,
-            save_config_no_lock, save_config_with_opts, save_server_config, save_server_config_no_lock,
-            save_server_config_snapshot, server_config_path, try_migrate_server_config, with_config_object_read_lock,
-            with_config_object_write_lock, with_server_config_read_lock, with_server_config_write_lock,
+            ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config,
+            is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
+            read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
+            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_server_config,
+            save_server_config_no_lock, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+            server_config_path, try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock,
+            with_server_config_read_lock, with_server_config_write_lock,
         };
     }
 
