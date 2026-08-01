@@ -27,11 +27,11 @@
 //! server, so they are `#[ignore]`d in CI. Static is covered by its own
 //! stateless contract below.
 
+use super::KmsBackend;
 use super::local::LocalKmsBackend;
 use super::static_kms::StaticKmsBackend;
 use super::vault::VaultKmsBackend;
 use super::vault_transit::VaultTransitKmsBackend;
-use super::{KmsBackend, KmsClient};
 use crate::config::KmsConfig;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
@@ -45,6 +45,24 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+fn expect_unsupported<T: std::fmt::Debug>(result: Result<T>) {
+    match result {
+        Err(KmsError::UnsupportedCapability { .. }) => {}
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+}
+
+/// Rotation while not Enabled: backends with rotation support must reject it
+/// through the state machine; backends without it report the capability gap.
+async fn expect_rotate_rejected(backend: &dyn KmsBackend, key_id: &str) {
+    let result = backend.rotate_key(key_id).await;
+    if backend.capabilities().rotate {
+        expect_invalid_key_state(result, "");
+    } else {
+        expect_unsupported(result);
+    }
+}
 
 fn expect_invalid_key_state<T: std::fmt::Debug>(result: Result<T>, expected_fragment: &str) {
     match result {
@@ -117,11 +135,9 @@ async fn assert_key_state(backend: &dyn KmsBackend, key_id: &str, expected: KeyS
     assert_eq!(described.key_metadata.key_state, expected, "unexpected state for key {key_id}");
 }
 
-/// Drives one freshly created (Enabled) key through the full state matrix.
-///
-/// `backend` is the product surface; `client` drives the lifecycle
-/// transitions not yet exposed through `KmsBackend`.
-async fn assert_state_machine_contract(backend: &dyn KmsBackend, client: &dyn KmsClient, key_id: &str) {
+/// Drives one freshly created (Enabled) key through the full state matrix,
+/// entirely through the `KmsBackend` product surface.
+async fn assert_state_machine_contract(backend: &dyn KmsBackend, key_id: &str) {
     // Enabled: cryptographic use is allowed. Keep an envelope around to prove
     // decryption keeps working in later states.
     let data_key = backend
@@ -134,16 +150,13 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, client: &dyn Km
         .expect("Enabled key must encrypt");
 
     // Enabled -> Disabled.
-    client
-        .disable_key(key_id, None)
-        .await
-        .expect("disable from Enabled must succeed");
+    backend.disable_key(key_id).await.expect("disable from Enabled must succeed");
     assert_key_state(backend, key_id, KeyState::Disabled).await;
 
     // Disabled: new cryptographic use and rotation are rejected...
     expect_invalid_key_state(backend.encrypt(encrypt_request(key_id)).await, "disabled");
     expect_invalid_key_state(backend.generate_data_key(generate_request(key_id)).await, "disabled");
-    expect_invalid_key_state(client.rotate_key(key_id, None).await, "");
+    expect_rotate_rejected(backend, key_id).await;
     // ...but decryption of existing data keeps working (explicit AWS deviation)...
     let decrypted = backend
         .decrypt(decrypt_request(data_key.ciphertext_blob.clone()))
@@ -151,17 +164,14 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, client: &dyn Km
         .expect("decrypt with a disabled key must keep working");
     assert_eq!(decrypted.plaintext, data_key.plaintext_key, "decrypt must recover the original data key");
     // ...disable stays idempotent, cancel has nothing to cancel, and enable recovers.
-    client.disable_key(key_id, None).await.expect("disable must be idempotent");
+    backend.disable_key(key_id).await.expect("disable must be idempotent");
     expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "not pending deletion");
-    client
-        .enable_key(key_id, None)
-        .await
-        .expect("enable from Disabled must succeed");
+    backend.enable_key(key_id).await.expect("enable from Disabled must succeed");
     assert_key_state(backend, key_id, KeyState::Enabled).await;
 
     // Disabled keys may still be scheduled for deletion.
-    client
-        .disable_key(key_id, None)
+    backend
+        .disable_key(key_id)
         .await
         .expect("disable before scheduling must succeed");
     backend
@@ -173,10 +183,9 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, client: &dyn Km
     // PendingDeletion: everything except decryption and cancellation is rejected.
     expect_invalid_key_state(backend.encrypt(encrypt_request(key_id)).await, "pending deletion");
     expect_invalid_key_state(backend.generate_data_key(generate_request(key_id)).await, "pending deletion");
-    expect_invalid_key_state(client.enable_key(key_id, None).await, "pending deletion");
-    expect_invalid_key_state(client.disable_key(key_id, None).await, "pending deletion");
-    expect_invalid_key_state(client.rotate_key(key_id, None).await, "");
-    expect_invalid_key_state(client.schedule_key_deletion(key_id, 7, None).await, "pending deletion");
+    expect_invalid_key_state(backend.enable_key(key_id).await, "pending deletion");
+    expect_invalid_key_state(backend.disable_key(key_id).await, "pending deletion");
+    expect_rotate_rejected(backend, key_id).await;
     expect_invalid_key_state(backend.delete_key(schedule_request(key_id)).await, "pending deletion");
     let decrypted = backend
         .decrypt(decrypt_request(data_key.ciphertext_blob.clone()))
@@ -215,7 +224,7 @@ async fn local_fixture() -> (tempfile::TempDir, KmsConfig, LocalKmsBackend, Stri
 #[tokio::test]
 async fn local_backend_state_machine_contract() {
     let (_temp_dir, _config, backend, key_id) = local_fixture().await;
-    assert_state_machine_contract(&backend, backend.lifecycle_client(), &key_id).await;
+    assert_state_machine_contract(&backend, &key_id).await;
 }
 
 /// SSE-shaped regression: disabling a key must not break decryption of data
@@ -256,10 +265,7 @@ async fn static_backend_stateless_contract() {
     rand::rng().fill(&mut raw_key[..]);
     let config = KmsConfig::static_kms(key_id.to_string(), BASE64.encode(raw_key));
     let static_backend = StaticKmsBackend::new(config).await.expect("static backend should build");
-    // StaticKmsBackend implements both traits with overlapping method names,
-    // so pin each surface once instead of qualifying every call.
     let backend: &dyn KmsBackend = &static_backend;
-    let client: &dyn KmsClient = &static_backend;
 
     let data_key = backend
         .generate_data_key(generate_request(key_id))
@@ -275,9 +281,11 @@ async fn static_backend_stateless_contract() {
     expect_invalid_key_state(backend.create_key(create_request("another-key".to_string())).await, "read-only");
     expect_invalid_key_state(backend.delete_key(schedule_request(key_id)).await, "read-only");
     expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "read-only");
-    expect_invalid_key_state(client.disable_key(key_id, None).await, "read-only");
-    expect_invalid_key_state(client.schedule_key_deletion(key_id, 7, None).await, "read-only");
-    expect_invalid_key_state(client.rotate_key(key_id, None).await, "read-only");
+    // Enable/disable and rotation are capability gaps at the product
+    // surface, not state-machine rejections.
+    expect_unsupported(backend.enable_key(key_id).await);
+    expect_unsupported(backend.disable_key(key_id).await);
+    expect_unsupported(backend.rotate_key(key_id).await);
 }
 
 fn vault_dev_config(constructor: fn(url::Url, String) -> KmsConfig) -> KmsConfig {
@@ -298,7 +306,15 @@ async fn vault_kv2_backend_state_machine_contract() {
         .await
         .expect("key should be created");
 
-    assert_state_machine_contract(&backend, backend.lifecycle_client(), &created.key_id).await;
+    assert_state_machine_contract(&backend, &created.key_id).await;
+
+    // KV2 additionally supports version-retaining rotation, which must only
+    // work while the key is Enabled (the shared matrix covered the
+    // rejections).
+    backend
+        .rotate_key(&created.key_id)
+        .await
+        .expect("rotation of an Enabled KV2 key must succeed");
 
     // Cleanup: leave the key pending deletion so repeated runs stay tidy.
     let _ = backend.delete_key(schedule_request(&created.key_id)).await;
@@ -316,13 +332,12 @@ async fn vault_transit_backend_state_machine_contract() {
         .await
         .expect("key should be created");
 
-    assert_state_machine_contract(&backend, backend.lifecycle_client(), &created.key_id).await;
+    assert_state_machine_contract(&backend, &created.key_id).await;
 
     // Transit additionally supports rotation, which must only work while the
     // key is Enabled (the shared matrix already covered the rejections).
     backend
-        .lifecycle_client()
-        .rotate_key(&created.key_id, None)
+        .rotate_key(&created.key_id)
         .await
         .expect("rotation of an Enabled transit key must succeed");
 

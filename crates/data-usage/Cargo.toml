@@ -27,7 +27,14 @@ categories = ["data-structures", "filesystem"]
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "rustfs-filemeta/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-filemeta/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-filemeta/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 serde = { workspace = true, features = ["derive"] }
 rmp-serde = { workspace = true }
 async-trait = { workspace = true }

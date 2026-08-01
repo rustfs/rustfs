@@ -27,7 +27,14 @@ categories = ["web-programming", "development-tools", "filesystem"]
 [lib]
 doctest = false
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-filemeta/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-filemeta/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-filemeta/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 async-trait.workspace = true
 # Storage-facing replication contracts are isolated in src/replication.rs until
 # the underlying wire types can move without creating a replication/storage-api cycle.

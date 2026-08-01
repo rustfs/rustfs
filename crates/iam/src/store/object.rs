@@ -469,6 +469,7 @@ impl ObjectStore {
         });
     }
 
+    #[hotpath::measure]
     async fn list_all_iamconfig_items(&self) -> Result<HashMap<String, Vec<String>>> {
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
@@ -508,6 +509,7 @@ impl ObjectStore {
         Ok(res)
     }
 
+    #[hotpath::measure]
     async fn load_policy_doc_concurrent(&self, names: &[String], mode: LoadMode) -> Result<Vec<PolicyDoc>> {
         let mut futures = Vec::with_capacity(names.len());
 

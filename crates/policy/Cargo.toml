@@ -30,9 +30,27 @@ workspace = true
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath", "hotpath/reqwest-0-13"]
-hotpath-alloc = ["hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/reqwest-0-13",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-crypto/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-crypto/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-crypto/hotpath-cpu",
+]
 
 [dependencies]
 rustfs-credentials = { workspace = true }

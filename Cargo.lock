@@ -3672,6 +3672,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "hotpath",
  "http 1.5.0",
  "http-body-util",
  "hyper",
@@ -9039,6 +9040,7 @@ dependencies = [
  "const-str",
  "futures",
  "hashbrown 0.17.1",
+ "hotpath",
  "metrics",
  "rustfs-config",
  "rustfs-s3-types",
@@ -9059,6 +9061,7 @@ dependencies = [
  "base64-simd",
  "bytes",
  "crc-fast",
+ "hotpath",
  "http 1.5.0",
  "md-5 0.11.0",
  "pretty_assertions",
@@ -9072,6 +9075,7 @@ name = "rustfs-common"
 version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
+ "hotpath",
  "metrics",
  "rmp-serde",
  "s3s",
@@ -9086,6 +9090,7 @@ dependencies = [
 name = "rustfs-concurrency"
 version = "1.0.0-beta.12"
 dependencies = [
+ "hotpath",
  "insta",
  "rustfs-io-core",
  "serde",
@@ -9099,6 +9104,7 @@ name = "rustfs-config"
 version = "1.0.0-beta.12"
 dependencies = [
  "const-str",
+ "hotpath",
  "serde",
  "serde_json",
 ]
@@ -9109,6 +9115,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
+ "hotpath",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -9124,6 +9131,7 @@ dependencies = [
  "argon2",
  "base64-simd",
  "chacha20poly1305",
+ "hotpath",
  "jsonwebtoken 11.0.0",
  "pbkdf2 0.13.0",
  "rand 0.10.2",
@@ -9141,6 +9149,7 @@ name = "rustfs-data-usage"
 version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
+ "hotpath",
  "rmp-serde",
  "rustfs-filemeta",
  "serde",
@@ -9286,6 +9295,7 @@ dependencies = [
 name = "rustfs-extension-schema"
 version = "1.0.0-beta.12"
 dependencies = [
+ "hotpath",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -9324,6 +9334,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.0",
  "futures",
+ "hotpath",
  "http 1.5.0",
  "metrics",
  "rustfs-common",
@@ -9355,6 +9366,7 @@ dependencies = [
  "async-trait",
  "base64-simd",
  "futures",
+ "hotpath",
  "http 1.5.0",
  "jsonwebtoken 11.0.0",
  "moka",
@@ -9389,6 +9401,7 @@ name = "rustfs-io-core"
 version = "1.0.0-beta.12"
 dependencies = [
  "bytes",
+ "hotpath",
  "memmap2",
  "rustfs-io-metrics",
  "thiserror 2.0.19",
@@ -9401,6 +9414,7 @@ name = "rustfs-io-metrics"
 version = "1.0.0-beta.12"
 dependencies = [
  "criterion",
+ "hotpath",
  "metrics",
  "metrics-util",
  "num_cpus",
@@ -9467,6 +9481,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "bytes",
  "futures",
+ "hotpath",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
@@ -9499,9 +9514,12 @@ dependencies = [
  "base64 0.23.0",
  "chacha20poly1305",
  "hex",
+ "hotpath",
  "insta",
  "jiff",
  "md-5 0.11.0",
+ "metrics",
+ "metrics-util",
  "moka",
  "rand 0.10.2",
  "reqwest",
@@ -9529,6 +9547,7 @@ name = "rustfs-lifecycle"
 version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
+ "hotpath",
  "metrics",
  "metrics-util",
  "proptest",
@@ -9553,6 +9572,7 @@ dependencies = [
  "async-trait",
  "crossbeam-queue",
  "futures",
+ "hotpath",
  "parking_lot",
  "rand 0.10.2",
  "rustfs-io-metrics",
@@ -9574,6 +9594,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
  "flate2",
+ "hotpath",
  "regex",
  "serde",
  "serde_json",
@@ -9591,6 +9612,7 @@ name = "rustfs-madmin"
 version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
+ "hotpath",
  "humantime",
  "hyper",
  "rmp-serde",
@@ -9611,6 +9633,7 @@ dependencies = [
  "criterion",
  "form_urlencoded",
  "hashbrown 0.17.1",
+ "hotpath",
  "metrics",
  "percent-encoding",
  "quick-xml",
@@ -9640,6 +9663,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "criterion",
  "futures",
+ "hotpath",
  "rustfs-config",
  "rustfs-io-metrics",
  "rustfs-utils",
@@ -9658,6 +9682,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "bytes",
  "criterion",
+ "hotpath",
  "metrics",
  "metrics-util",
  "moka",
@@ -9680,6 +9705,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "glob",
+ "hotpath",
  "jiff",
  "libc",
  "metrics",
@@ -9765,6 +9791,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.13.0",
+ "hotpath",
  "http 1.5.0",
  "http-body-util",
  "hyper",
@@ -9817,6 +9844,7 @@ name = "rustfs-protos"
 version = "1.0.0-beta.12"
 dependencies = [
  "flatbuffers",
+ "hotpath",
  "prost 0.14.4",
  "rmp-serde",
  "rustfs-common",
@@ -9841,6 +9869,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "byteorder",
  "bytes",
+ "hotpath",
  "regex",
  "rmp",
  "rmp-serde",
@@ -9899,6 +9928,7 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hmac 0.13.0",
+ "hotpath",
  "minlz",
  "pin-project-lite",
  "rand 0.10.2",
@@ -9916,6 +9946,7 @@ dependencies = [
 name = "rustfs-s3-ops"
 version = "1.0.0-beta.12"
 dependencies = [
+ "hotpath",
  "rustfs-s3-types",
 ]
 
@@ -9923,6 +9954,7 @@ dependencies = [
 name = "rustfs-s3-types"
 version = "1.0.0-beta.12"
 dependencies = [
+ "hotpath",
  "serde",
  "serde_json",
 ]
@@ -9937,6 +9969,7 @@ dependencies = [
  "datafusion",
  "futures",
  "futures-core",
+ "hotpath",
  "http 1.5.0",
  "metrics",
  "parking_lot",
@@ -9965,6 +9998,7 @@ dependencies = [
  "datafusion",
  "derive_builder",
  "futures",
+ "hotpath",
  "parking_lot",
  "rustfs-s3select-api",
  "s3s",
@@ -9982,6 +10016,7 @@ dependencies = [
  "futures",
  "hex-simd",
  "hmac 0.13.0",
+ "hotpath",
  "http 1.5.0",
  "metrics",
  "rand 0.10.2",
@@ -10014,6 +10049,7 @@ dependencies = [
 name = "rustfs-security-governance"
 version = "1.0.0-beta.12"
 dependencies = [
+ "hotpath",
  "thiserror 2.0.19",
 ]
 
@@ -10023,6 +10059,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "base64-simd",
  "bytes",
+ "hotpath",
  "http 1.5.0",
  "hyper",
  "rustfs-utils",
@@ -10039,6 +10076,7 @@ name = "rustfs-storage-api"
 version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
+ "hotpath",
  "insta",
  "rustfs-filemeta",
  "serde",
@@ -10060,6 +10098,7 @@ dependencies = [
  "deadpool-postgres",
  "futures-util",
  "hashbrown 0.17.1",
+ "hotpath",
  "hyper",
  "hyper-rustls",
  "lapin",
@@ -10105,6 +10144,7 @@ dependencies = [
 name = "rustfs-test-utils"
 version = "1.0.0-beta.12"
 dependencies = [
+ "hotpath",
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-storage-api",
@@ -10121,6 +10161,7 @@ name = "rustfs-tls-runtime"
 version = "1.0.0-beta.12"
 dependencies = [
  "arc-swap",
+ "hotpath",
  "metrics",
  "rcgen",
  "rustfs-common",
@@ -10142,6 +10183,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "axum",
+ "hotpath",
  "http 1.5.0",
  "ipnetwork",
  "metrics",
@@ -10188,6 +10230,7 @@ dependencies = [
  "hex-simd",
  "highway",
  "hmac 0.13.0",
+ "hotpath",
  "http 1.5.0",
  "hyper",
  "local-ip-address",
@@ -10220,6 +10263,7 @@ dependencies = [
  "astral-tokio-tar",
  "async-compression",
  "criterion",
+ "hotpath",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

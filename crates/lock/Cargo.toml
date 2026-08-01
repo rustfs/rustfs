@@ -28,7 +28,21 @@ documentation = "https://docs.rs/rustfs-lock/latest/rustfs_lock/"
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/parking_lot",
+    "rustfs-io-metrics/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-io-metrics/hotpath-alloc", "rustfs-utils/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-io-metrics/hotpath-cpu", "rustfs-utils/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-io-metrics = { workspace = true }
 rustfs-utils = { workspace = true }
 async-trait.workspace = true
