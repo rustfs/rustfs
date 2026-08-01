@@ -233,6 +233,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             let active_counter = self.active_lrg_workers.clone();
             let storage = self.storage.clone();
+            let stats = self.stats.clone();
 
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
@@ -241,10 +242,18 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
                     match operation {
                         ReplicationOperation::Object(obj_info) => {
+                            let bucket = obj_info.bucket.clone();
+                            let size = obj_info.size;
+                            let delete_marker = obj_info.delete_marker;
+                            let op_type = obj_info.op_type;
                             replicate_object(*obj_info, storage.clone()).await;
+                            stats.dec_q(&bucket, size, delete_marker, op_type);
                         }
                         ReplicationOperation::Delete(del_info) => {
+                            let bucket = del_info.bucket.clone();
+                            let op_type = del_info.op_type;
                             replicate_delete(*del_info, storage.clone()).await;
+                            stats.dec_q(&bucket, 0, true, op_type);
                         }
                     }
 
@@ -310,23 +319,22 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
                     match operation {
                         ReplicationOperation::Object(obj_info) => {
-                            stats
-                                .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
-
+                            let bucket = obj_info.bucket.clone();
+                            let size = obj_info.size;
+                            let delete_marker = obj_info.delete_marker;
+                            let op_type = obj_info.op_type;
                             // Perform actual replication (placeholder)
-                            replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
+                            replicate_object(*obj_info, storage.clone()).await;
 
-                            stats
-                                .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
+                            stats.dec_q(&bucket, size, delete_marker, op_type);
                         }
                         ReplicationOperation::Delete(del_info) => {
-                            stats.inc_q(&del_info.bucket, 0, true, del_info.op_type).await;
+                            let bucket = del_info.bucket.clone();
+                            let op_type = del_info.op_type;
                             // Perform actual delete replication (placeholder)
-                            replicate_delete(del_info.as_ref().clone(), storage.clone()).await;
+                            replicate_delete(*del_info, storage.clone()).await;
 
-                            stats.dec_q(&del_info.bucket, 0, true, del_info.op_type).await;
+                            stats.dec_q(&bucket, 0, true, op_type);
                         }
                     }
 
@@ -379,16 +387,18 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     active_counter.fetch_add(1, Ordering::SeqCst);
                     match operation {
                         ReplicationOperation::Object(obj_info) => {
-                            stats
-                                .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
-                            replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
-                            stats
-                                .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
+                            let bucket = obj_info.bucket.clone();
+                            let size = obj_info.size;
+                            let delete_marker = obj_info.delete_marker;
+                            let op_type = obj_info.op_type;
+                            replicate_object(*obj_info, storage.clone()).await;
+                            stats.dec_q(&bucket, size, delete_marker, op_type);
                         }
                         ReplicationOperation::Delete(del_info) => {
+                            let bucket = del_info.bucket.clone();
+                            let op_type = del_info.op_type;
                             replicate_delete(*del_info, storage.clone()).await;
+                            stats.dec_q(&bucket, 0, true, op_type);
                         }
                     }
                     active_counter.fetch_sub(1, Ordering::SeqCst);
@@ -529,9 +539,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             if !lrg_workers.is_empty() {
                 let index = (hash as usize) % lrg_workers.len();
 
-                if let Some(worker) = lrg_workers.get(index)
-                    && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
-                {
+                if let Some(worker) = lrg_workers.get(index) {
+                    self.stats.inc_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+                    if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
+                        return ReplicationQueueAdmission::Queued;
+                    }
+                    self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
                     let existing = lrg_workers.len();
@@ -548,8 +562,6 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     }
                     return admission;
                 }
-
-                return ReplicationQueueAdmission::Queued;
             }
             return ReplicationQueueAdmission::Missed;
         }
@@ -562,9 +574,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Missed;
         };
 
+        self.stats.inc_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
         if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
             return ReplicationQueueAdmission::Queued;
         }
+        self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
 
         // Queue to MRF if all workers are busy.
         let admission = queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "object").await;
@@ -586,9 +600,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Missed;
         };
 
+        self.stats.inc_q(&doi.bucket, 0, true, doi.op_type);
         if channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_ok() {
             return ReplicationQueueAdmission::Queued;
         }
+        self.stats.dec_q(&doi.bucket, 0, true, doi.op_type);
 
         let admission = queue_mrf_save_admission(
             &self.mrf_save_tx,
@@ -872,24 +888,22 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             match operation {
                 ReplicationOperation::Object(obj_info) => {
-                    stats
-                        .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
-
+                    let bucket = obj_info.bucket.clone();
+                    let size = obj_info.size;
+                    let delete_marker = obj_info.delete_marker;
+                    let op_type = obj_info.op_type;
                     // Perform actual replication (placeholder)
-                    replicate_object(obj_info.as_ref().clone(), self.storage.clone()).await;
+                    replicate_object(*obj_info, self.storage.clone()).await;
 
-                    stats
-                        .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
+                    stats.dec_q(&bucket, size, delete_marker, op_type);
                 }
                 ReplicationOperation::Delete(del_info) => {
-                    stats.inc_q(&del_info.bucket, 0, true, del_info.op_type).await;
-
+                    let bucket = del_info.bucket.clone();
+                    let op_type = del_info.op_type;
                     // Perform actual delete replication (placeholder)
-                    replicate_delete(del_info.as_ref().clone(), self.storage.clone()).await;
+                    replicate_delete(*del_info, self.storage.clone()).await;
 
-                    stats.dec_q(&del_info.bucket, 0, true, del_info.op_type).await;
+                    stats.dec_q(&bucket, 0, true, op_type);
                 }
             }
 
@@ -898,16 +912,30 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Worker function for handling large object replication operations
-    async fn add_large_worker(&self, mut rx: Receiver<ReplicationOperation>, active_counter: Arc<AtomicI32>, storage: Arc<S>) {
+    async fn add_large_worker(
+        &self,
+        mut rx: Receiver<ReplicationOperation>,
+        active_counter: Arc<AtomicI32>,
+        stats: Arc<ReplicationStats>,
+        storage: Arc<S>,
+    ) {
         while let Some(operation) = rx.recv().await {
             active_counter.fetch_add(1, Ordering::SeqCst);
 
             match operation {
                 ReplicationOperation::Object(obj_info) => {
+                    let bucket = obj_info.bucket.clone();
+                    let size = obj_info.size;
+                    let delete_marker = obj_info.delete_marker;
+                    let op_type = obj_info.op_type;
                     replicate_object(*obj_info, storage.clone()).await;
+                    stats.dec_q(&bucket, size, delete_marker, op_type);
                 }
                 ReplicationOperation::Delete(del_info) => {
+                    let bucket = del_info.bucket.clone();
+                    let op_type = del_info.op_type;
                     replicate_delete(*del_info, storage.clone()).await;
+                    stats.dec_q(&bucket, 0, true, op_type);
                 }
             }
 
@@ -927,18 +955,19 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             match operation {
                 ReplicationOperation::Object(obj_info) => {
-                    stats
-                        .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
-
+                    let bucket = obj_info.bucket.clone();
+                    let size = obj_info.size;
+                    let delete_marker = obj_info.delete_marker;
+                    let op_type = obj_info.op_type;
                     replicate_object(obj_info.as_ref().clone(), self.storage.clone()).await;
 
-                    stats
-                        .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
+                    stats.dec_q(&bucket, size, delete_marker, op_type);
                 }
                 ReplicationOperation::Delete(del_info) => {
+                    let bucket = del_info.bucket.clone();
+                    let op_type = del_info.op_type;
                     replicate_delete(*del_info, self.storage.clone()).await;
+                    stats.dec_q(&bucket, 0, true, op_type);
                 }
             }
 
@@ -2016,6 +2045,74 @@ mod tests {
         })
     }
 
+    async fn current_queue(pool: &ReplicationPool<LoadResyncNodeStore>, bucket: &str) -> (i64, i64) {
+        let stats = pool.stats.get_latest_replication_stats(bucket).await;
+        (stats.replication_stats.q_stat.curr.count, stats.replication_stats.q_stat.curr.bytes)
+    }
+
+    #[tokio::test]
+    async fn regular_worker_admission_counts_channel_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "admission-bucket".to_string(),
+                name: "object".to_string(),
+                size: 4096,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "admission-bucket").await, (1, 4096));
+    }
+
+    #[tokio::test]
+    async fn large_worker_admission_counts_channel_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.lrg_workers.write().await.push(tx);
+        let size = 128 * 1024 * 1024;
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "large-admission-bucket".to_string(),
+                name: "large-object".to_string(),
+                size,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "large-admission-bucket").await, (1, size));
+    }
+
+    #[tokio::test]
+    async fn delete_admission_counts_channel_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_delete_task(DeletedObjectReplicationInfo {
+                bucket: "delete-admission-bucket".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "deleted-object".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "delete-admission-bucket").await, (1, 0));
+    }
+
     fn load_resync_test_metadata() -> Vec<u8> {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
@@ -2299,6 +2396,37 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_rolls_back_runtime_backlog_when_worker_queue_is_full() {
+        let shared = empty_resync_shared_state();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(ReplicationOperation::Object(Box::new(ReplicateObjectInfo {
+            bucket: "runtime-backlog".to_string(),
+            name: "already-buffered".to_string(),
+            size: 1,
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        })))
+        .expect("test setup should fill the worker queue");
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "runtime-backlog".to_string(),
+                name: "fallback-object".to_string(),
+                size: 2048,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        let queued = pool.stats.get_latest_replication_stats("runtime-backlog").await;
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 0);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 0);
     }
 
     #[test]
