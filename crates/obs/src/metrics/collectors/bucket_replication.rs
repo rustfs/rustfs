@@ -17,7 +17,8 @@
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::bucket_replication::{
     BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD,
-    BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_LAST_HR_FAILED_BYTES_MD, BUCKET_REPL_LAST_HR_FAILED_COUNT_MD,
+    BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
+    BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_LAST_HR_FAILED_BYTES_MD, BUCKET_REPL_LAST_HR_FAILED_COUNT_MD,
     BUCKET_REPL_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_LATENCY_MS_MD,
     BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD,
     BUCKET_REPL_PROXIED_GET_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_GET_REQUESTS_TOTAL_MD,
@@ -32,7 +33,7 @@ use crate::metrics::schema::bucket_replication::{
 };
 use std::borrow::Cow;
 
-const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 27;
+const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 30;
 
 #[derive(Debug, Clone, Default)]
 pub struct BucketReplicationTargetStats {
@@ -80,6 +81,9 @@ pub struct BucketReplicationStats {
     pub resync_duration_ms: u64,
     pub current_backlog_count: u64,
     pub current_backlog_bytes: u64,
+    pub durable_mrf_available: bool,
+    pub durable_mrf_backlog_count: u64,
+    pub durable_mrf_backlog_bytes: u64,
     pub targets: Vec<BucketReplicationTargetStats>,
 }
 
@@ -260,6 +264,21 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
             PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD, stat.current_backlog_bytes as f64)
                 .with_label(BUCKET_L, bucket_label.clone()),
         );
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD,
+                if stat.durable_mrf_available { 1.0 } else { 0.0 },
+            )
+            .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, stat.durable_mrf_backlog_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD, stat.durable_mrf_backlog_bytes as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
 
         for target in &stat.targets {
             let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
@@ -311,6 +330,9 @@ mod tests {
             resync_duration_ms: 1500,
             current_backlog_count: 3,
             current_backlog_bytes: 4096,
+            durable_mrf_available: true,
+            durable_mrf_backlog_count: 2,
+            durable_mrf_backlog_bytes: 2048,
             targets: vec![BucketReplicationTargetStats {
                 target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
                 bandwidth_limit_bytes_per_sec: 2048,
@@ -320,7 +342,7 @@ mod tests {
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 28);
+        assert_eq!(metrics.len(), 31);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
@@ -392,6 +414,27 @@ mod tests {
         assert!(metrics.iter().any(|metric| {
             metric.name == backlog_bytes_name
                 && metric.value == 4096.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let durable_available_name = BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == durable_available_name
+                && metric.value == 1.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let durable_count_name = BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == durable_count_name
+                && metric.value == 2.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let durable_bytes_name = BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == durable_bytes_name
+                && metric.value == 2048.0
                 && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         }));
     }

@@ -225,6 +225,9 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
             resync_duration_ms: stats.resync_duration_ms,
             current_backlog_count: stats.current_backlog_count,
             current_backlog_bytes: stats.current_backlog_bytes,
+            durable_mrf_available: stats.durable_mrf_available,
+            durable_mrf_backlog_count: stats.durable_mrf_backlog_count,
+            durable_mrf_backlog_bytes: stats.durable_mrf_backlog_bytes,
             targets: stats
                 .targets
                 .into_iter()

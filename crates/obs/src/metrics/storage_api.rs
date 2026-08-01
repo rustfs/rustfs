@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
-use rustfs_ecstore::api::bucket::replication::get_global_replication_stats;
+use rustfs_ecstore::api::bucket::replication::{DurableMrfBacklog, get_global_replication_stats, read_durable_mrf_backlog};
 pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
     get_total_usable_capacity_free as obs_get_total_usable_capacity_free,
@@ -70,6 +71,9 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
     pub(crate) resync_duration_ms: u64,
     pub(crate) current_backlog_count: u64,
     pub(crate) current_backlog_bytes: u64,
+    pub(crate) durable_mrf_available: bool,
+    pub(crate) durable_mrf_backlog_count: u64,
+    pub(crate) durable_mrf_backlog_bytes: u64,
     pub(crate) targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
 }
 
@@ -104,16 +108,52 @@ fn replication_backlog_count(failed_counts: impl Iterator<Item = i64>, queued_co
     failed_backlog.saturating_add(i64_to_u64_floor_zero(queued_count))
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DurableMrfBucketSnapshot {
+    count: u64,
+    bytes: u64,
+}
+
+fn durable_mrf_bucket_snapshots(backlog: &DurableMrfBacklog) -> HashMap<String, DurableMrfBucketSnapshot> {
+    if !backlog.available {
+        return HashMap::new();
+    }
+
+    let mut buckets = HashMap::new();
+    for entry in &backlog.entries {
+        let bucket = buckets
+            .entry(entry.bucket.clone())
+            .or_insert_with(DurableMrfBucketSnapshot::default);
+        bucket.count = bucket.count.saturating_add(1);
+        bucket.bytes = bucket.bytes.saturating_add(i64_to_u64_floor_zero(entry.size));
+    }
+    buckets
+}
+
 pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketReplicationStatsSnapshot> {
-    let Some(stats) = get_global_replication_stats() else {
-        return Vec::new();
+    let stats = get_global_replication_stats();
+    let all_bucket_stats = if let Some(stats) = &stats {
+        stats.get_all().await
+    } else {
+        HashMap::new()
     };
+    let durable_mrf = if let Some(store) = obs_resolve_object_store_handle() {
+        read_durable_mrf_backlog(store).await
+    } else {
+        DurableMrfBacklog::default()
+    };
+    let durable_buckets = durable_mrf_bucket_snapshots(&durable_mrf);
+    let mut bucket_names = all_bucket_stats.keys().cloned().collect::<HashSet<_>>();
+    bucket_names.extend(durable_buckets.keys().cloned());
+    let mut buckets = Vec::with_capacity(bucket_names.len());
 
-    let all_bucket_stats = stats.get_all().await;
-    let mut buckets = Vec::with_capacity(all_bucket_stats.len());
-
-    for (bucket, bucket_stats) in all_bucket_stats {
-        let proxy = stats.get_proxy_stats(&bucket).await;
+    for bucket in bucket_names {
+        let bucket_stats = all_bucket_stats.get(&bucket);
+        let proxy = if let Some(stats) = &stats {
+            stats.get_proxy_stats(&bucket).await
+        } else {
+            Default::default()
+        };
         let mut total_failed_bytes = 0u64;
         let mut total_failed_count = 0u64;
         let mut last_min_failed_bytes = 0u64;
@@ -122,30 +162,33 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
         let mut last_hour_failed_count = 0u64;
         let mut sent_bytes = 0u64;
         let mut sent_count = 0u64;
-        let mut targets = Vec::with_capacity(bucket_stats.stats.len());
+        let mut targets = Vec::with_capacity(bucket_stats.map(|stats| stats.stats.len()).unwrap_or(0));
 
-        for (target_arn, target_stats) in bucket_stats.stats {
-            total_failed_bytes = total_failed_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
-            total_failed_count = total_failed_count.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
+        if let Some(bucket_stats) = bucket_stats {
+            for (target_arn, target_stats) in &bucket_stats.stats {
+                total_failed_bytes = total_failed_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
+                total_failed_count = total_failed_count.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
 
-            let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
-            last_min_failed_bytes = last_min_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_min.size));
-            last_min_failed_count = last_min_failed_count.saturating_add(i64_to_u64_floor_zero(last_min.count));
+                let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
+                last_min_failed_bytes = last_min_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_min.size));
+                last_min_failed_count = last_min_failed_count.saturating_add(i64_to_u64_floor_zero(last_min.count));
 
-            let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
-            last_hour_failed_bytes = last_hour_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_hour.size));
-            last_hour_failed_count = last_hour_failed_count.saturating_add(i64_to_u64_floor_zero(last_hour.count));
+                let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
+                last_hour_failed_bytes = last_hour_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_hour.size));
+                last_hour_failed_count = last_hour_failed_count.saturating_add(i64_to_u64_floor_zero(last_hour.count));
 
-            sent_bytes = sent_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
-            sent_count = sent_count.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
+                sent_bytes = sent_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
+                sent_count = sent_count.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
 
-            targets.push(ObsBucketReplicationTargetStatsSnapshot {
-                target_arn,
-                bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
-                current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
-                latency_ms: target_stats.latency.curr,
-            });
+                targets.push(ObsBucketReplicationTargetStatsSnapshot {
+                    target_arn: target_arn.clone(),
+                    bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
+                    current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
+                    latency_ms: target_stats.latency.curr,
+                });
+            }
         }
+        let durable_bucket = durable_buckets.get(&bucket).cloned().unwrap_or_default();
 
         buckets.push(ObsBucketReplicationStatsSnapshot {
             bucket,
@@ -169,13 +212,30 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             proxied_get_tagging_requests_failures: i64_to_u64_floor_zero(proxy.get_tag_failed),
             proxied_delete_tagging_requests_total: i64_to_u64_floor_zero(proxy.delete_tag_total),
             proxied_delete_tagging_requests_failures: i64_to_u64_floor_zero(proxy.delete_tag_failed),
-            resync_started_count: i64_to_u64_floor_zero(bucket_stats.resync_started_count),
-            resync_completed_count: i64_to_u64_floor_zero(bucket_stats.resync_completed_count),
-            resync_failed_count: i64_to_u64_floor_zero(bucket_stats.resync_failed_count),
-            resync_canceled_count: i64_to_u64_floor_zero(bucket_stats.resync_canceled_count),
-            resync_duration_ms: i64_to_u64_floor_zero(bucket_stats.resync_duration_ms),
-            current_backlog_count: i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count),
-            current_backlog_bytes: i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes),
+            resync_started_count: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_started_count))
+                .unwrap_or(0),
+            resync_completed_count: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_completed_count))
+                .unwrap_or(0),
+            resync_failed_count: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_failed_count))
+                .unwrap_or(0),
+            resync_canceled_count: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_canceled_count))
+                .unwrap_or(0),
+            resync_duration_ms: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.resync_duration_ms))
+                .unwrap_or(0),
+            current_backlog_count: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count))
+                .unwrap_or(0),
+            current_backlog_bytes: bucket_stats
+                .map(|bucket_stats| i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes))
+                .unwrap_or(0),
+            durable_mrf_available: durable_mrf.available,
+            durable_mrf_backlog_count: durable_bucket.count,
+            durable_mrf_backlog_bytes: durable_bucket.bytes,
             targets,
         });
     }
@@ -229,6 +289,7 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_ecstore::api::bucket::replication::{MrfOpKind, MrfReplicateEntry};
 
     #[test]
     fn obs_replication_numeric_conversions_floor_negative_values() {
@@ -251,6 +312,73 @@ mod tests {
     #[test]
     fn replication_backlog_count_keeps_legacy_failed_backlog_semantics() {
         assert_eq!(replication_backlog_count([9].into_iter(), 0), 9);
+    }
+
+    #[test]
+    fn durable_mrf_bucket_snapshots_aggregate_valid_entries_by_bucket() {
+        let snapshots = durable_mrf_bucket_snapshots(&DurableMrfBacklog {
+            available: true,
+            entries: vec![
+                MrfReplicateEntry {
+                    bucket: "b1".to_string(),
+                    object: "o1".to_string(),
+                    size: 1024,
+                    version_id: None,
+                    retry_count: 0,
+                    op: MrfOpKind::Object,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                },
+                MrfReplicateEntry {
+                    bucket: "b1".to_string(),
+                    object: "o2".to_string(),
+                    size: 512,
+                    version_id: None,
+                    retry_count: 0,
+                    op: MrfOpKind::Object,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                },
+                MrfReplicateEntry {
+                    bucket: "b2".to_string(),
+                    object: "delete".to_string(),
+                    size: 0,
+                    version_id: None,
+                    retry_count: 0,
+                    op: MrfOpKind::Delete,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                },
+            ],
+        });
+
+        assert_eq!(snapshots["b1"].count, 2);
+        assert_eq!(snapshots["b1"].bytes, 1536);
+        assert_eq!(snapshots["b2"].count, 1);
+        assert_eq!(snapshots["b2"].bytes, 0);
+    }
+
+    #[test]
+    fn durable_mrf_bucket_snapshots_do_not_report_unavailable_as_zero() {
+        let snapshots = durable_mrf_bucket_snapshots(&DurableMrfBacklog {
+            available: false,
+            entries: vec![MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "o1".to_string(),
+                size: 1024,
+                version_id: None,
+                retry_count: 0,
+                op: MrfOpKind::Object,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+            }],
+        });
+
+        assert!(snapshots.is_empty());
     }
 }
 
