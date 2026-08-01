@@ -55,7 +55,10 @@ pub(crate) use health::{
     HealthPayloadContext, HealthReadinessSource, build_component_details, build_health_payload, health_check_state,
     readiness_source_for_probe,
 };
-pub(crate) use health::{HealthProbe, build_health_response_parts, collect_probe_readiness, probe_from_path};
+pub(crate) use health::{
+    HealthProbe, build_health_response_parts, collect_probe_readiness, kms_probe_staleness_limit, kms_ready_from_probe,
+    probe_from_path,
+};
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
 pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
