@@ -1,0 +1,196 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Sole writer of the Rust dependency caches that ci.yml restores.
+#
+# Why this is a separate workflow rather than steps inside ci.yml: ci.yml's
+# concurrency group cancels in-progress runs on main pushes, and merges land far
+# faster than its 70-minute pipeline. Measured over 15 consecutive main pushes:
+# 12 cancelled, 2 failed, 0 succeeded. A cancelled run never reaches
+# Swatinem/rust-cache's post step (cache-on-failure does not cover cancellation),
+# so the writer lanes were saving nothing and every PR paid a cold restore —
+# 11.8-20.9 minutes of "Setup Rust environment" against 0.7-3.4 warm.
+#
+# Splitting cache writing out of the test pipeline lets ci.yml keep cancelling
+# superseded runs (which is correct — nobody needs test results for a commit
+# that is already three merges behind) while the caches still get written.
+#
+# The group below deliberately does NOT cancel in progress. GitHub keeps at most
+# one running plus one pending run per group, so a burst of merges collapses
+# into "current run finishes, newest queued run follows" rather than a pile-up.
+# That also bounds this workflow to one self-hosted runner at a time.
+#
+# Each job below owns exactly one shared-key and is the only place that sets
+# cache-save-if to anything but 'false' for it; every lane in ci.yml reads.
+# scripts/security/check_cache_save_if.sh keeps the declarations explicit.
+#
+# The builds are supersets of what the reading lanes compile, because a reader
+# restores only what the writer saved. Feature resolution matters here: a lane
+# built with e2e-test-hooks resolves dependency features differently, which
+# changes -Cmetadata, so the plain build does not cover it. See
+# rustfs/backlog#1600.
+
+name: Cache Warm
+
+on:
+  push:
+    branches: [ main ]
+    # Mirrors ci.yml's push paths-ignore: if a commit cannot change what ci.yml
+    # compiles, it cannot change what ci.yml needs restored either.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "scripts/probe.sh"
+      - "LICENSE*"
+      - ".gitignore"
+      - ".dockerignore"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-warm
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Readers: test-and-lint, test-ilm-integration-serial, build-rustfs-debug-binary,
+  # e2e-tests, e2e-full.
+  warm-ci-dev:
+    name: Warm ci-dev
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: 'true'
+
+      # --all-targets covers the test binaries nextest builds, including
+      # e2e_test, which test-and-lint's own run excludes. The second build adds
+      # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
+      # and that no lint lane enables.
+      - name: Build ci-dev superset
+        env:
+          # Same limit ci.yml puts on its nextest step: this builds the same
+          # ~100 workspace test binaries, and three concurrent links saturate the
+          # self-hosted runner's overlay I/O and can wedge Cargo (#5394).
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo build --workspace --all-targets
+          cargo build -p rustfs --bins --features e2e-test-hooks
+
+  # Readers: test-and-lint-rio-v2, build-rustfs-debug-binary-rio-v2.
+  warm-ci-feat-rio:
+    name: Warm ci-feat-rio
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-feat-rio
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: 'true'
+
+      - name: Build ci-feat-rio superset
+        run: |
+          cargo build -p rustfs -p rustfs-ecstore --all-targets --features rio-v2
+          cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
+
+  # Readers: the swift and sftp legs of test-and-lint-protocols. Built in
+  # sequence rather than as `--features swift,sftp`, which is a combination no
+  # lane actually compiles; running both leaves the union in target/.
+  warm-ci-feat-proto:
+    name: Warm ci-feat-proto
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-feat-proto
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: 'true'
+
+      - name: Build ci-feat-proto superset
+        run: |
+          cargo build -p rustfs -p rustfs-protocols --all-targets --features swift
+          cargo build -p rustfs -p rustfs-protocols --all-targets --features sftp
+
+  # Reader: uring-integration. Runs on ubuntu-latest to match it: rust-cache's
+  # key covers runner.os and arch but not the runner label or image, so a cache
+  # written on sm-standard-4 would be restored by the hosted runner as if it
+  # belonged to it.
+  warm-ci-uring:
+    name: Warm ci-uring
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-uring
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: 'true'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build ci-uring superset
+        run: cargo build -p rustfs-ecstore --all-targets

@@ -169,9 +169,14 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
+          # Every lane in this workflow reads its cache and none writes it.
+          # cache-warm.yml is the sole writer for all four keys: this workflow
+          # cancels superseded runs on main, and a cancelled run never reaches
+          # rust-cache's post step, so writing from here saved nothing (12 of 15
+          # consecutive main-push runs were cancelled). See rustfs/backlog#1600.
           cache-shared-key: ci-dev
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: 'false'
 
       - name: Prepare test evidence
         run: |
@@ -182,19 +187,6 @@ jobs:
             echo "runner=${RUNNER_NAME}"
             echo "started_at=$(date --utc --iso-8601=seconds)"
           } > artifacts/test-and-lint/run-metadata.txt
-
-      # This job is the sole writer of the ci-dev cache, so what it builds is
-      # what every reader restores. Its own steps are not a superset of theirs:
-      # clippy only emits metadata, the nextest pass excludes e2e_test, and
-      # nothing here enables e2e-test-hooks (a different feature set means a
-      # different -Cmetadata). Without these two builds the readers restore a
-      # cache that is missing exactly the dependencies they need. Runs on main
-      # only, so it costs nothing on the PR critical path.
-      - name: Warm shared cache superset (main only)
-        if: github.ref == 'refs/heads/main'
-        run: |
-          cargo build --tests -p e2e_test
-          cargo build -p rustfs --bins --features e2e-test-hooks
 
       # Clippy runs before the test pass: lint failures are the most common
       # CI-only breakage and should surface in minutes, not after 20+ minutes
@@ -415,14 +407,7 @@ jobs:
           rust-version: stable
           cache-shared-key: ci-feat-rio
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Sole writer of ci-feat-rio. The reader (build-rustfs-debug-binary-rio-v2)
-      # builds with rio-v2,e2e-test-hooks, which this job never enables, so warm
-      # that combination here or the reader restores a cache without it.
-      - name: Warm shared cache superset (main only)
-        if: github.ref == 'refs/heads/main'
-        run: cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
+          cache-save-if: 'false'
 
       - name: Run rio-v2 clippy lints
         run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
@@ -464,15 +449,7 @@ jobs:
           rust-version: stable
           cache-shared-key: ci-feat-proto
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.features.name == 'swift' }}
-
-      # The swift leg is the sole writer of ci-feat-proto, shared with the sftp
-      # leg. Build the other leg's feature set too so the saved target/ holds
-      # the union; running them in sequence is safer than `--features
-      # swift,sftp`, which is a combination no lane actually compiles.
-      - name: Warm shared cache superset (main only)
-        if: github.ref == 'refs/heads/main' && matrix.features.name == 'swift'
-        run: cargo clippy -p rustfs -p rustfs-protocols --all-targets --features sftp -- -D warnings
+          cache-save-if: 'false'
 
       - name: Run clippy with ${{ matrix.features.name }}
         run: |
@@ -575,10 +552,11 @@ jobs:
           # sm-standard-4 are therefore indistinguishable to it, so sharing a key
           # would let two different system images overwrite each other's
           # artifacts, and would make a 2-core hosted runner unpack ci-dev's ~3GB
-          # instead of this lane's ~1.3GB.
+          # instead of this lane's ~1.3GB. cache-warm.yml warms this key on
+          # ubuntu-latest for the same reason.
           cache-shared-key: ci-uring
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: 'false'
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
