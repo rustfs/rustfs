@@ -159,33 +159,51 @@ BAD_EVIDENCE_HOOK="${TMP_DIR}/bad-evidence-hook.sh"
 cat >"$BAD_EVIDENCE_HOOK" <<'HOOK'
 #!/usr/bin/env bash
 set -euo pipefail
-cat >"$HOTPATH_ABBA_DEPLOY_EVIDENCE_FILE" <<EOF
-leg=$HOTPATH_ABBA_LEG
-phase=$HOTPATH_ABBA_PHASE
-bucket=wrong-bucket
-binary_sha256=$HOTPATH_ABBA_BINARY_SHA256
+leg="$HOTPATH_ABBA_LEG"
+phase="$HOTPATH_ABBA_PHASE"
+bucket="$HOTPATH_ABBA_BUCKET"
+binary_sha256="$HOTPATH_ABBA_BINARY_SHA256"
 dataset_reset=true
+
+case "${BAD_EVIDENCE_FIELD:?missing BAD_EVIDENCE_FIELD}" in
+  leg) leg=wrong-leg ;;
+  phase) phase=wrong-phase ;;
+  bucket) bucket=wrong-bucket ;;
+  binary_sha256) binary_sha256=wrong-sha256 ;;
+  dataset_reset) dataset_reset=false ;;
+  *) echo "unknown BAD_EVIDENCE_FIELD=$BAD_EVIDENCE_FIELD" >&2; exit 2 ;;
+esac
+
+cat >"$HOTPATH_ABBA_DEPLOY_EVIDENCE_FILE" <<EOF
+leg=$leg
+phase=$phase
+bucket=$bucket
+binary_sha256=$binary_sha256
+dataset_reset=$dataset_reset
 EOF
 HOOK
 chmod +x "$BAD_EVIDENCE_HOOK"
 
-if "$RUNNER" \
-  --baseline-bin /usr/bin/true \
-  --candidate-bin /usr/bin/true \
-  --baseline-revision baseline-test \
-  --candidate-revision candidate-test \
-  --endpoint 127.0.0.1:9000 \
-  --deploy-hook "$BAD_EVIDENCE_HOOK" \
-  --warp-bin /usr/bin/true \
-  --rounds 3 \
-  --out-dir "${TMP_DIR}/bad-deploy-evidence" >/dev/null 2>&1; then
-  echo "expected a formal external deploy hook with wrong evidence to fail" >&2
-  exit 1
-fi
-rg -qx 'external=true' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
-rg -qx 'external_isolation=deploy-hook-attested' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
-rg -qx 'evidence_mode=external-deploy-hook-attested' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
-rg -qx 'formal_evidence=true' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
-rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
+for bad_field in leg phase bucket binary_sha256 dataset_reset; do
+  bad_out_dir="${TMP_DIR}/bad-deploy-evidence-${bad_field}"
+  if BAD_EVIDENCE_FIELD="$bad_field" "$RUNNER" \
+    --baseline-bin /usr/bin/true \
+    --candidate-bin /usr/bin/true \
+    --baseline-revision baseline-test \
+    --candidate-revision candidate-test \
+    --endpoint 127.0.0.1:9000 \
+    --deploy-hook "$BAD_EVIDENCE_HOOK" \
+    --warp-bin /usr/bin/true \
+    --rounds 3 \
+    --out-dir "$bad_out_dir" >/dev/null 2>&1; then
+    echo "expected a formal external deploy hook with wrong $bad_field evidence to fail" >&2
+    exit 1
+  fi
+  rg -qx 'external=true' "$bad_out_dir/manifest.env"
+  rg -qx 'external_isolation=deploy-hook-attested' "$bad_out_dir/manifest.env"
+  rg -qx 'evidence_mode=external-deploy-hook-attested' "$bad_out_dir/manifest.env"
+  rg -qx 'formal_evidence=true' "$bad_out_dir/manifest.env"
+  rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "$bad_out_dir/manifest.env"
+done
 
 echo "hotpath warp ABBA tests passed"
