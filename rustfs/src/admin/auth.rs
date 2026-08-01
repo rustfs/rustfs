@@ -290,12 +290,13 @@ mod tests {
     use rustfs_iam::manager::IamCache;
     use rustfs_iam::store::{GroupInfo, MappedPolicy, UserType};
     use rustfs_policy::auth::UserIdentity;
-    use rustfs_policy::policy::PolicyDoc;
-    use rustfs_policy::policy::action::AdminAction;
+    use rustfs_policy::policy::action::{AdminAction, KmsAction};
+    use rustfs_policy::policy::{Policy, PolicyDoc};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
+    use time::OffsetDateTime;
 
     /// A `Store` whose methods are never invoked by these tests: the gate only
     /// reaches the persistence layer for non-owner principals, and the
@@ -425,14 +426,14 @@ mod tests {
         }
     }
 
-    /// Build an `IamSys` backed by an empty in-memory cache. The cache is
-    /// constructed directly (all fields are public, mirroring the iam crate's
-    /// own `build_test_iam_cache`) so no cluster-backed `ObjectStore` or disk
-    /// load is required. Readiness state is irrelevant: the gate calls
-    /// `is_allowed` directly, which does not gate on `is_ready`.
-    fn iam_sys_with_empty_store() -> Arc<IamSys<EmptyStore>> {
+    /// An `IamCache` over an empty in-memory snapshot. It is constructed
+    /// directly (all fields are public, mirroring the iam crate's own
+    /// `build_test_iam_cache`) so no cluster-backed `ObjectStore` or disk load is
+    /// required. Readiness state is irrelevant: the gate calls `is_allowed`
+    /// directly, which does not gate on `is_ready`.
+    fn iam_cache_with_empty_store() -> IamCache<EmptyStore> {
         let (send_chan, _rx) = tokio::sync::mpsc::channel::<i64>(1);
-        let cache = IamCache {
+        IamCache {
             cache: Cache::default(),
             api: EmptyStore,
             state: Arc::new(AtomicU8::new(0)),
@@ -443,9 +444,46 @@ mod tests {
             sync_failures: AtomicU64::new(0),
             sync_successes: AtomicU64::new(0),
             last_sync_duration_millis: AtomicU64::new(0),
-        };
-        Arc::new(IamSys::new(Arc::new(cache)))
+        }
     }
+
+    fn iam_sys_with_empty_store() -> Arc<IamSys<EmptyStore>> {
+        Arc::new(IamSys::new(Arc::new(iam_cache_with_empty_store())))
+    }
+
+    /// Same in-memory `IamSys`, with one regular (non-owner, non-temp,
+    /// non-service) account carrying `document` as its only attached policy. All
+    /// three cache entries the evaluation path consults are pre-seeded, so no
+    /// `EmptyStore` method is ever reached.
+    fn iam_sys_with_policy(account: &str, document: &str) -> Arc<IamSys<EmptyStore>> {
+        let store = iam_cache_with_empty_store();
+        let now = OffsetDateTime::now_utc();
+        let cache = &store.cache;
+
+        cache.add_or_update_user(
+            account,
+            &UserIdentity::new(Credentials {
+                access_key: account.to_string(),
+                secret_key: "kms-operator-secret".to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }),
+            now,
+        );
+        cache.add_or_update_policy_doc(
+            KMS_TEST_POLICY_NAME,
+            &PolicyDoc {
+                policy: Policy::parse_config(document.as_bytes()).expect("test policy should parse"),
+                ..Default::default()
+            },
+            now,
+        );
+        cache.add_or_update_user_policy(account, &MappedPolicy::new(KMS_TEST_POLICY_NAME), now);
+
+        Arc::new(IamSys::new(Arc::new(store)))
+    }
+
+    const KMS_TEST_POLICY_NAME: &str = "kms-key-a-only";
 
     fn ctx_for<'a>(headers: &'a HeaderMap, cred: &'a Credentials, is_owner: bool) -> AuthContext<'a> {
         AuthContext {
@@ -523,6 +561,75 @@ mod tests {
 
         let unscoped = AdminResourceScope::kms_key("");
         assert_eq!(unscoped.object, "", "an absent key id must stay unscoped");
+    }
+
+    const KMS_OPERATOR: &str = "kms-operator";
+
+    fn kms_disable_key_actions() -> Vec<Action> {
+        vec![Action::KmsAction(KmsAction::DisableKeyAction)]
+    }
+
+    async fn gate_for_key(iam: Arc<IamSys<EmptyStore>>, key_id: &str, is_owner: bool) -> S3Result<()> {
+        let headers = HeaderMap::new();
+        let cred = Credentials {
+            access_key: KMS_OPERATOR.to_string(),
+            secret_key: "kms-operator-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        let ctx = ctx_for(&headers, &cred, is_owner);
+        let scope = AdminResourceScope::kms_key(key_id);
+
+        evaluate_admin_actions(iam, &ctx, &kms_disable_key_actions(), scope.bucket, scope.object).await
+    }
+
+    /// End-to-end through the gate: a `kms:DisableKey` grant limited to `key/A`
+    /// authorizes key A and denies key B with `AccessDenied`. This is the seam the
+    /// per-handler tests cannot reach — it pins that the scope actually travels
+    /// into the policy verdict rather than being dropped on the way
+    /// (rustfs/backlog#1582).
+    #[tokio::test]
+    async fn kms_scoped_gate_denies_a_key_outside_the_policy_scope() {
+        let document = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"],"Resource":["arn:aws:kms:::key/key-a"]}
+        ]}"#;
+
+        let allowed = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, document), "key-a", false).await;
+        assert!(allowed.is_ok(), "the key the policy names must pass the gate");
+
+        assert_access_denied(gate_for_key(iam_sys_with_policy(KMS_OPERATOR, document), "key-b", false).await);
+    }
+
+    /// Compatibility pins for the same gate: a resource-less KMS statement keeps
+    /// authorizing every key, and the owner short-circuit is unaffected by scoping.
+    #[tokio::test]
+    async fn kms_scoped_gate_keeps_unscoped_policies_and_owners_unrestricted() {
+        let unscoped = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"]}
+        ]}"#;
+        let scoped = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"],"Resource":["arn:aws:kms:::key/key-a"]}
+        ]}"#;
+
+        for key in ["key-a", "key-b"] {
+            let res = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, unscoped), key, false).await;
+            assert!(res.is_ok(), "a resource-less KMS statement must keep authorizing {key}");
+
+            let res = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, scoped), key, true).await;
+            assert!(res.is_ok(), "the owner short-circuit must still authorize {key}");
+        }
+    }
+
+    /// An endpoint with no target key passes an empty scope, which must behave
+    /// exactly like the unscoped gate it replaced.
+    #[tokio::test]
+    async fn kms_gate_without_a_target_key_matches_every_key() {
+        let scoped = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"],"Resource":["arn:aws:kms:::key/key-a"]}
+        ]}"#;
+
+        let res = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, scoped), "", false).await;
+        assert!(res.is_ok(), "an absent key id must keep the pre-resource-scoping verdict");
     }
 
     /// The multi-action loop authorizes as soon as one candidate action passes
