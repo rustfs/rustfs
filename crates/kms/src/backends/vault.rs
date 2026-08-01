@@ -3571,4 +3571,226 @@ mod tests {
             "a successful read must not pay for the lost-baseline diagnosis"
         );
     }
+
+    /// The Vault-side state of one KV2 key: the top-level record plus the
+    /// immutable version records rotations froze.
+    ///
+    /// The scripted responder serves canned responses, so a multi-operation
+    /// scenario has to carry the state between operations itself. Rotations
+    /// fold what they *wrote* back into this state (see [`Self::apply_writes`]),
+    /// which is what makes the rotation regressions below real: the material a
+    /// later decrypt resolves is the material the rotation persisted, not a
+    /// fixture the test invented.
+    struct KeyState {
+        key_data: VaultKeyData,
+        version_records: Vec<VaultKeyVersionRecord>,
+    }
+
+    impl KeyState {
+        /// A never-rotated key: no version records exist yet.
+        fn new(key_data: VaultKeyData) -> Self {
+            Self {
+                key_data,
+                version_records: Vec::new(),
+            }
+        }
+
+        fn version_record(&self, version: u32) -> &VaultKeyVersionRecord {
+            self.version_records
+                .iter()
+                .find(|record| record.version == version)
+                .unwrap_or_else(|| panic!("no version record was frozen for version {version}"))
+        }
+
+        /// The versions-directory listing; a key with no records has no
+        /// directory at all.
+        fn versions_listing(&self) -> ScriptedResponse {
+            if self.version_records.is_empty() {
+                return ScriptedResponse::error(404, "not found");
+            }
+            let keys: Vec<String> = self.version_records.iter().map(|record| record.version.to_string()).collect();
+            ScriptedResponse::ok(serde_json::json!({ "keys": keys }))
+        }
+
+        /// Fold the writes an operation made into the state, so the next
+        /// operation reads exactly what Vault would now hold.
+        fn apply_writes(&mut self, requests: &[String], bodies: &[String]) {
+            for (line, body) in requests.iter().zip(bodies) {
+                let Some(path) = line.strip_prefix("POST ") else {
+                    continue;
+                };
+                let data = parse_write_body(body)["data"].clone();
+                if path.contains("/versions/") {
+                    let record: VaultKeyVersionRecord = serde_json::from_value(data).expect("version record write body");
+                    self.version_records.retain(|existing| existing.version != record.version);
+                    self.version_records.push(record);
+                } else {
+                    self.key_data = serde_json::from_value(data).expect("key record write body");
+                }
+            }
+        }
+    }
+
+    /// Encrypt against a scripted Vault serving `state`.
+    async fn encrypt_scripted(state: &KeyState, plaintext: &[u8]) -> EncryptResponse {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: plaintext.to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("encrypt must produce an envelope")
+    }
+
+    /// Rotate against a scripted Vault seeded with `state`, and return the state
+    /// Vault holds afterwards.
+    ///
+    /// The first rotation freezes the baseline before creating the next version
+    /// (four writes); later rotations skip that step (two writes).
+    async fn rotate_scripted(state: &KeyState) -> KeyState {
+        let writes = if state.key_data.baseline_version.is_none() { 4 } else { 2 };
+        let mut responses = vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&state.key_data)),
+            state.versions_listing(),
+        ];
+        responses.extend((0..writes).map(|_| ScriptedResponse::ok(kv2_write_ack())));
+        let (vault, client) = scripted_client(responses).await;
+
+        let rotated = client.rotate_key("wired-key", None).await.expect("rotation must commit");
+        assert_eq!(rotated.version, state.key_data.version + 1, "a rotation must advance the version");
+
+        let mut next = KeyState {
+            key_data: state.key_data.clone(),
+            version_records: state.version_records.clone(),
+        };
+        next.apply_writes(&vault.requests(), &vault.request_bodies());
+        next
+    }
+
+    /// Decrypt against a scripted Vault serving `state`, scripting the
+    /// version-record read the envelope's own version calls for. Returns the
+    /// plaintext together with the requests the decrypt made.
+    async fn decrypt_scripted(state: &KeyState, ciphertext: &[u8]) -> (Vec<u8>, Vec<String>) {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(ciphertext).expect("envelope must parse");
+        let mut responses = vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))];
+        if let Some(version) = envelope.master_key_version
+            && version != state.key_data.version
+        {
+            responses.push(ScriptedResponse::ok(kv2_read_version_record_data(state.version_record(version))));
+        }
+        let (vault, client) = scripted_client(responses).await;
+
+        let plaintext = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: ciphertext.to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("the envelope must decrypt against the rotated key");
+        (plaintext, vault.requests())
+    }
+
+    /// The forward half of the rotation contract: data written before a rotation
+    /// stays readable after it, with no live Vault involved.
+    ///
+    /// The negative half (a regressed pointer must fail closed) is covered by
+    /// `wired_decrypt_fails_closed_when_current_version_regressed`; this pins the
+    /// path that must keep working, which the fail-closed guards could otherwise
+    /// tighten into a rotation that orphans every existing object.
+    #[tokio::test]
+    async fn wired_kv2_envelope_from_before_rotation_still_decrypts() {
+        const PLAINTEXT: &[u8] = b"written-before-the-rotation";
+        let state_v1 = KeyState::new(healthy_key_data());
+
+        let encrypted_v1 = encrypt_scripted(&state_v1, PLAINTEXT).await;
+        let envelope_v1: DataKeyEnvelope = serde_json::from_slice(&encrypted_v1.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope_v1.master_key_version, Some(1));
+
+        let state_v2 = rotate_scripted(&state_v1).await;
+        assert_eq!(state_v2.key_data.version, 2);
+        assert_eq!(state_v2.key_data.baseline_version, Some(1));
+        assert_ne!(
+            state_v2.key_data.encrypted_key_material, state_v1.key_data.encrypted_key_material,
+            "the rotation must have replaced the current material, or the decrypt below proves nothing"
+        );
+
+        let (plaintext, requests) = decrypt_scripted(&state_v2, &encrypted_v1.ciphertext).await;
+        assert_eq!(
+            plaintext, PLAINTEXT,
+            "the pre-rotation envelope must yield its original plaintext, not merely avoid an error"
+        );
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key/versions/1".to_string(),
+            ],
+            "the old envelope must resolve through the immutable v1 record"
+        );
+
+        // The rotation is not cosmetic: new writes go to the rotated version and
+        // still round-trip, so both generations are live at once.
+        let encrypted_v2 = encrypt_scripted(&state_v2, b"written-after-the-rotation").await;
+        let envelope_v2: DataKeyEnvelope = serde_json::from_slice(&encrypted_v2.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope_v2.master_key_version, Some(2), "new envelopes must carry the rotated version");
+        assert_eq!(encrypted_v2.key_version, 2);
+        let (plaintext_v2, requests_v2) = decrypt_scripted(&state_v2, &encrypted_v2.ciphertext).await;
+        assert_eq!(plaintext_v2, b"written-after-the-rotation".to_vec());
+        assert_eq!(
+            requests_v2.len(),
+            1,
+            "an envelope on the current version must not read a version record: {requests_v2:?}"
+        );
+    }
+
+    /// Old envelopes must survive more than one generation: the baseline is
+    /// frozen once and every intermediate version keeps its own record, so both
+    /// a pre-rotation envelope and one written between the two rotations still
+    /// decrypt after the second.
+    #[tokio::test]
+    async fn wired_kv2_envelopes_survive_consecutive_rotations() {
+        let state_v1 = KeyState::new(healthy_key_data());
+        let encrypted_v1 = encrypt_scripted(&state_v1, b"generation-1").await;
+
+        let state_v2 = rotate_scripted(&state_v1).await;
+        let encrypted_v2 = encrypt_scripted(&state_v2, b"generation-2").await;
+        assert_eq!(encrypted_v2.key_version, 2);
+
+        let state_v3 = rotate_scripted(&state_v2).await;
+        assert_eq!(state_v3.key_data.version, 3);
+        assert_eq!(
+            state_v3.key_data.baseline_version,
+            Some(1),
+            "the baseline is frozen once and carried through later rotations"
+        );
+        let mut recorded: Vec<u32> = state_v3.version_records.iter().map(|record| record.version).collect();
+        recorded.sort_unstable();
+        assert_eq!(recorded, vec![1, 2, 3], "every version that ever wrapped a DEK must keep a record");
+
+        for (ciphertext, expected, version) in [
+            (&encrypted_v1.ciphertext, b"generation-1".as_slice(), 1u32),
+            (&encrypted_v2.ciphertext, b"generation-2".as_slice(), 2),
+        ] {
+            let (plaintext, requests) = decrypt_scripted(&state_v3, ciphertext).await;
+            assert_eq!(
+                plaintext, expected,
+                "an envelope from version {version} must survive two rotations intact"
+            );
+            assert!(
+                requests[1].ends_with(&format!("/versions/{version}")),
+                "the decrypt must resolve the version that wrapped it: {requests:?}"
+            );
+        }
+    }
 }
