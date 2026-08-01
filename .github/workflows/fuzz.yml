@@ -93,7 +93,6 @@ jobs:
         with:
           rust-version: nightly
           cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
 
       - name: Install cargo-fuzz

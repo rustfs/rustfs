@@ -68,8 +68,8 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-coverage
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: 'false'
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2

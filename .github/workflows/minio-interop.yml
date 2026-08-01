@@ -64,7 +64,6 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-minio-interop
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Generate real MinIO fixtures via Docker

@@ -96,8 +96,8 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-dev
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: 'true'
+          install-build-packaging-tools: 'false'
 
       # --all-targets covers the test binaries nextest builds, including
       # e2e_test, which test-and-lint's own run excludes. The second build adds
@@ -131,8 +131,8 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-feat-rio
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: 'true'
+          install-build-packaging-tools: 'false'
 
       - name: Build ci-feat-rio superset
         run: |
@@ -159,8 +159,8 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-feat-proto
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: 'true'
+          install-build-packaging-tools: 'false'
 
       - name: Build ci-feat-proto superset
         run: |
@@ -186,8 +186,8 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-uring
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: 'true'
+          install-build-packaging-tools: 'false'
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

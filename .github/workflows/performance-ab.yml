@@ -106,7 +106,6 @@ jobs:
           rust-version: stable
           cache-shared-key: warp-ab-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release rustfs
         run: cargo build --release --bin rustfs
@@ -157,7 +156,6 @@ jobs:
           rust-version: stable
           cache-shared-key: warp-ab-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install warp
         run: |

@@ -40,28 +40,43 @@ inputs:
     description: "Target architecture to add"
     required: false
     default: ""
-  github-token:
-    description: "GitHub token for API access"
+  install-build-packaging-tools:
+    description: >-
+      Install musl-tools/zip/unzip, needed for musl linking and release
+      packaging. Off for CI test lanes, which use none of them.
     required: false
-    default: ""
+    default: "true"
+  install-test-tools:
+    description: >-
+      Install cargo-nextest and the rustfmt/clippy components. Off for release
+      and audit lanes, which run no tests and no lints.
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
   steps:
+    # protobuf-compiler is deliberately absent: the setup-protoc step below
+    # installs 34.1 into the tool cache and prepends it to PATH, so the apt
+    # build (older, and never version-matched) was shadowed on every run and
+    # simply never used.
     - name: Install system dependencies (Ubuntu)
       if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          musl-tools \
           build-essential \
           pkg-config \
           libssl-dev \
-          ripgrep \
-          unzip \
-          zip \
-          protobuf-compiler
+          ripgrep
+
+    # musl-gcc is needed by the native musl release leg, and zip/unzip by the
+    # release packaging steps. No CI test lane touches any of them.
+    - name: Install packaging and cross-linking dependencies (Ubuntu)
+      if: runner.os == 'Linux' && inputs.install-build-packaging-tools == 'true'
+      shell: bash
+      run: sudo apt-get install -y musl-tools zip unzip
 
     - name: Install protoc
       uses: rustfs/setup-protoc@a3705324d8f9bf5b6c3573fb6cf8ae421db55dd6 # v3.0.1
@@ -79,7 +94,7 @@ runs:
       with:
         toolchain: ${{ inputs.rust-version }}
         targets: ${{ inputs.target }}
-        components: rustfmt, clippy
+        components: ${{ inputs.install-test-tools == 'true' && 'rustfmt, clippy' || '' }}
 
     - name: Install Zig
       if: inputs.install-cross-tools == 'true'
@@ -90,6 +105,7 @@ runs:
       uses: taiki-e/install-action@a21ae4029b089b9ddc45704028756f51ab8abe48 # cargo-zigbuild
 
     - name: Install cargo-nextest
+      if: inputs.install-test-tools == 'true'
       uses: taiki-e/install-action@96c7780c1d8a2b8723e12031def873a434d39d8d # nextest
 
     - name: Setup Rust cache
