@@ -66,6 +66,9 @@ const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
 const KMS_RESTORE: AdminActionRef = AdminActionRef::new("kms:Restore");
 const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
+const KMS_TAG_RESOURCE: AdminActionRef = AdminActionRef::new("kms:TagResource");
+const KMS_UNTAG_RESOURCE: AdminActionRef = AdminActionRef::new("kms:UntagResource");
+const KMS_UPDATE_KEY_DESCRIPTION: AdminActionRef = AdminActionRef::new("kms:UpdateKeyDescription");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
 const LIST_TIER: AdminActionRef = AdminActionRef::new("ListTierAction");
@@ -802,6 +805,19 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_RESTORE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort", KMS_RESTORE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/update-description",
+        KMS_UPDATE_KEY_DESCRIPTION,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag", KMS_TAG_RESOURCE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/untag",
+        KMS_UNTAG_RESOURCE,
+        RouteRiskLevel::High,
+    ),
     public(
         HttpMethod::Get,
         "/rustfs/admin/v3/oidc/providers",
@@ -1845,6 +1861,23 @@ mod tests {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_RESTORE);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/dry-run", KMS_RESTORE);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort", KMS_RESTORE);
+        assert_action(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/kms/keys/update-description",
+            KMS_UPDATE_KEY_DESCRIPTION,
+        );
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag", KMS_TAG_RESOURCE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag", KMS_UNTAG_RESOURCE);
+
+        // Key metadata updates must not fall back to the service-configuration
+        // action: holding it would otherwise imply the right to relabel keys.
+        for path in [
+            "/rustfs/admin/v3/kms/keys/update-description",
+            "/rustfs/admin/v3/kms/keys/tag",
+            "/rustfs/admin/v3/kms/keys/untag",
+        ] {
+            assert_not_action(HttpMethod::Post, path, KMS_CONFIGURE);
+        }
     }
 
     /// Backup and restore expose the whole key inventory at once, so no other
@@ -1885,6 +1918,9 @@ mod tests {
             (HttpMethod::Post, "/rustfs/admin/v3/kms/configure"),
             (HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete"),
             (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/update-description"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag"),
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }
