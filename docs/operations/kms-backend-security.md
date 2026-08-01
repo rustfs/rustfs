@@ -51,7 +51,7 @@ Notes:
 
 ## Master key rotation: retention, destruction, and upgrade ordering
 
-Rotation support differs per backend. Local and Static reject rotation outright (`InvalidOperation`); their single key material is never overwritten. Vault Transit delegates rotation to the Transit engine's own key versioning (ciphertext is version-prefixed, e.g. `vault:v1:...`). Vault KV2 rotates by retaining every historical version, as described below. Rotation is currently only reachable through the backend-level `KmsClient::rotate_key` API; it is not exposed through the admin or S3 surface.
+Rotation support differs per backend. Local and Static reject rotation outright (`InvalidOperation`); their single key material is never overwritten. Vault Transit delegates rotation to the Transit engine's own key versioning (ciphertext is version-prefixed, e.g. `vault:v1:...`). Vault KV2 rotates by retaining every historical version, as described below. Rotation is reachable through the admin API as `POST /rustfs/admin/v3/kms/keys/rotate`, which the route policy classifies as high risk and gates behind `kms:RotateKey`; it is not exposed through the S3 surface. The upgrade ordering constraint below therefore applies to an operator action, not only to a call from inside the process.
 
 ### Vault KV2 versioned retention model
 
