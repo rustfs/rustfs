@@ -49,6 +49,13 @@
 //! generation rolled back, and cluster/namespace/mount identity drift. A
 //! dry-run reports them all; an actual restore refuses on the first one.
 //!
+//! Verification is split by what it costs: every coordinate that follows from
+//! the bundle and the caller's target description — cluster, namespace, KV
+//! mount, KV prefix, Transit mount — is settled first, and any disagreement
+//! there is returned before a single Vault request goes out. A target whose
+//! coordinates already drifted is not the deployment the bundle describes, so
+//! it is neither probed nor read through.
+//!
 //! # Writes
 //!
 //! [`dry_run_vault_restore`] issues reads only. [`restore_vault_backup`]
@@ -78,7 +85,7 @@ use crate::backup::dry_run::{
 use crate::backup::error::BackupError;
 use crate::backup::local_export::{BackupKek, decrypt_bundle_artifact, read_bundle_manifest};
 use crate::backup::local_restore::RestoreConflictPolicy;
-use crate::backup::manifest::{ArtifactKind, BackupManifest, ContentDigest, VaultExternalReferences};
+use crate::backup::manifest::{ArtifactKind, BackupManifest, ContentDigest, VaultExternalReferences, VaultTransitReference};
 use crate::config::{KmsConfig, VaultAuthMethod};
 use crate::error::{KmsError, Result};
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
@@ -731,16 +738,16 @@ fn marker_kv_path(prefix: &str) -> String {
     format!("{prefix}/{VAULT_RESTORE_MARKER_KEY}")
 }
 
-/// Verify the recovered external trust root against the bundle's references.
+/// Compare every coordinate that is decidable from the bundle and the caller's
+/// target description alone: cluster identity, namespace, and all three mount
+/// paths. Issues no request of any kind.
 ///
-/// Static coordinates (cluster, namespace, mounts) are compared first because
-/// they need no Vault call and because a mount mismatch would make every
-/// subsequent probe read the wrong thing. Reads only.
-async fn verify_trust_root(
-    client: &VaultRestoreClient,
-    references: &VaultExternalReferences,
-    target: &VaultRestoreTarget,
-) -> Result<Vec<VaultRestoreMismatch>> {
+/// Returns the Transit coordinates to probe only when they agree, so a caller
+/// cannot accidentally probe a mount the bundle does not describe.
+fn compare_coordinates<'a>(
+    references: &'a VaultExternalReferences,
+    target: &'a VaultRestoreTarget,
+) -> (Vec<VaultRestoreMismatch>, Option<(&'a VaultTransitReference, &'a str)>) {
     let mut mismatches = Vec::new();
 
     if references.cluster_id != target.cluster_id {
@@ -768,29 +775,46 @@ async fn verify_trust_root(
         }
     }
 
-    let Some(transit) = references.transit.as_ref() else {
-        return Ok(mismatches);
+    let probe = match (references.transit.as_ref(), target.transit_mount.as_deref()) {
+        (None, _) => None,
+        (Some(transit), Some(mount)) if transit.mount_path == mount => Some((transit, mount)),
+        (Some(transit), observed) => {
+            mismatches.push(VaultRestoreMismatch::Mount {
+                dependency: "vault transit mount".to_string(),
+                expected: transit.mount_path.clone(),
+                observed: observed.unwrap_or("<none>").to_string(),
+            });
+            None
+        }
     };
-    let Some(target_mount) = target.transit_mount.as_ref() else {
-        mismatches.push(VaultRestoreMismatch::Mount {
-            dependency: "vault transit mount".to_string(),
-            expected: transit.mount_path.clone(),
-            observed: "<none>".to_string(),
-        });
-        return Ok(mismatches);
-    };
-    if &transit.mount_path != target_mount {
-        mismatches.push(VaultRestoreMismatch::Mount {
-            dependency: "vault transit mount".to_string(),
-            expected: transit.mount_path.clone(),
-            observed: target_mount.clone(),
-        });
+    (mismatches, probe)
+}
+
+/// Verify the recovered external trust root against the bundle's references.
+///
+/// Locally decidable coordinates are settled first and, when any of them
+/// disagrees, the verdict is returned without issuing a single Vault request:
+/// a target whose coordinates already drifted is by definition not the one the
+/// bundle describes, and probing it would both read through the wrong mount
+/// and touch a deployment this restore has no business talking to. Only once
+/// they all agree does the Transit read happen. Reads only.
+async fn verify_trust_root(
+    client: &VaultRestoreClient,
+    references: &VaultExternalReferences,
+    target: &VaultRestoreTarget,
+) -> Result<Vec<VaultRestoreMismatch>> {
+    let (mut mismatches, probe) = compare_coordinates(references, target);
+    if !mismatches.is_empty() {
         return Ok(mismatches);
     }
+    // Every remaining check needs the network; nothing above this line did.
+    let Some((transit, target_mount)) = probe else {
+        return Ok(mismatches);
+    };
 
     match client.read_transit_key(target_mount, &transit.key_name).await? {
         None => mismatches.push(VaultRestoreMismatch::TransitKeyMissing {
-            mount_path: target_mount.clone(),
+            mount_path: target_mount.to_string(),
             key_name: transit.key_name.clone(),
         }),
         Some(observed) => {
@@ -1539,6 +1563,47 @@ mod tests {
             .collect();
         assert_eq!(dependencies, ["vault namespace", "vault kv mount", "vault transit mount"]);
         assert!(vault.requests().is_empty(), "coordinate drift must not probe the target");
+    }
+
+    #[tokio::test]
+    async fn every_locally_decidable_drift_is_settled_without_a_vault_request() {
+        let temp = TempDir::new().expect("temp dir");
+        let bundle = standard_bundle(temp.path()).await;
+
+        // Each of these leaves the Transit mount agreeing with the bundle, so
+        // only the ordering of the checks — coordinates first, network second
+        // — can keep the Transit read from going out.
+        let drifts: [(&str, fn(&mut VaultRestoreTarget)); 4] = [
+            ("vault cluster identity", |target| target.cluster_id = "vault-cluster-b".to_string()),
+            ("vault namespace", |target| target.namespace = Some("tenant-b".to_string())),
+            ("vault kv mount", |target| target.kv_mount = "other-kv".to_string()),
+            ("vault kv path prefix", |target| {
+                target.kv_path_prefix = "rustfs/kms/elsewhere".to_string()
+            }),
+        ];
+
+        for (dependency, drift) in drifts {
+            let (vault, client, mut target) = scripted_client(Vec::new()).await;
+            drift(&mut target);
+
+            let report =
+                dry_run_vault_restore(&test_kek(), &client, &request(bundle.clone(), target, RestoreConflictPolicy::Fail))
+                    .await
+                    .expect("dry-run should report rather than fail");
+
+            assert!(!report.restore_permitted(), "{dependency} drift must refuse the restore");
+            let dependencies: Vec<&str> = report
+                .external_mismatches
+                .iter()
+                .map(|mismatch| mismatch.dependency.as_str())
+                .collect();
+            assert_eq!(dependencies, [dependency]);
+            assert!(
+                vault.requests().is_empty(),
+                "{dependency} drift probed the target: {:?}",
+                vault.requests()
+            );
+        }
     }
 
     #[tokio::test]
