@@ -17,17 +17,19 @@
 use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::KmsBackend;
 use crate::cache::{KmsCache, KmsCacheStats};
-use crate::config::KmsConfig;
-use crate::error::Result;
+use crate::config::{ENV_KMS_ALLOW_IMMEDIATE_DELETION, KmsConfig};
+use crate::error::{KmsError, Result};
 use crate::types::{
-    CancelKeyDeletionRequest, CancelKeyDeletionResponse, CreateKeyRequest, CreateKeyResponse, DecryptRequest, DecryptResponse,
-    DeleteKeyRequest, DeleteKeyResponse, DescribeKeyRequest, DescribeKeyResponse, EncryptRequest, EncryptResponse,
-    GenerateDataKeyRequest, GenerateDataKeyResponse, ListKeysRequest, ListKeysResponse, OperationContext,
+    CancelKeyDeletionRequest, CancelKeyDeletionResponse, CreateKeyRequest, CreateKeyResponse,
+    DEFAULT_PENDING_DELETION_WINDOW_DAYS, DecryptRequest, DecryptResponse, DeleteKeyRequest, DeleteKeyResponse,
+    DescribeKeyRequest, DescribeKeyResponse, EncryptRequest, EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse,
+    ListKeysRequest, ListKeysResponse, MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 /// KMS Manager coordinates operations between backends and caching
 #[derive(Clone)]
@@ -38,12 +40,18 @@ pub struct KmsManager {
     enable_cache: bool,
     backend_kind: &'static str,
     audit_sink: Option<Arc<dyn KmsAuditSink>>,
+    allow_immediate_deletion: bool,
 }
 
 impl KmsManager {
     /// Create a new KMS manager with the given backend and config
     pub fn new(backend: Arc<dyn KmsBackend>, config: KmsConfig) -> Self {
         let cache = Arc::new(RwLock::new(KmsCache::new(config.cache_config.max_keys as u64)));
+        if config.allow_immediate_deletion {
+            warn!(
+                "KMS immediate key deletion is enabled: a DeleteKey request may destroy key material without any waiting window, and every object encrypted under that key becomes permanently unreadable"
+            );
+        }
         Self {
             backend,
             cache,
@@ -51,6 +59,7 @@ impl KmsManager {
             enable_cache: config.enable_cache,
             backend_kind: config.backend.as_str(),
             audit_sink: None,
+            allow_immediate_deletion: config.allow_immediate_deletion,
         }
     }
 
@@ -225,7 +234,8 @@ impl KmsManager {
         Ok(())
     }
 
-    /// Delete a key
+    /// Delete a key, either scheduled behind the waiting window or — when the
+    /// server allows it — immediately.
     ///
     /// Audited as an internal operation; callers serving an authenticated
     /// request should use [`Self::delete_key_with_context`].
@@ -246,7 +256,13 @@ impl KmsManager {
         result
     }
 
+    /// This is the single enforcement point for the waiting window: every
+    /// admin-facing deletion goes through here, so the checks below run before
+    /// any backend sees the request. The backends repeat the window bound as a
+    /// defensive assertion for callers that hold a backend handle directly.
     async fn delete_key_inner(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
+        self.check_deletion_request(&request)?;
+
         let response = self.backend.delete_key(request).await?;
 
         // Remove from cache if enabled and key is being deleted
@@ -256,6 +272,44 @@ impl KmsManager {
         }
 
         Ok(response)
+    }
+
+    /// Gate a deletion request before it reaches the backend.
+    ///
+    /// Immediate deletion is unrecoverable, so it needs both a server-side
+    /// opt-in and a per-request confirmation that echoes the key id; without
+    /// either, the request is refused rather than downgraded to a scheduled
+    /// deletion, so a caller never believes a key is gone when it is not.
+    fn check_deletion_request(&self, request: &DeleteKeyRequest) -> Result<()> {
+        if !request.force_immediate.unwrap_or(false) {
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
+            }
+            return Ok(());
+        }
+
+        if !self.allow_immediate_deletion {
+            return Err(KmsError::invalid_operation(format!(
+                "immediate deletion of key {} is not allowed; schedule the deletion and wait out the pending window, or set {ENV_KMS_ALLOW_IMMEDIATE_DELETION}=true on the server",
+                request.key_id
+            )));
+        }
+
+        if request.confirm_key_id.as_deref() != Some(request.key_id.as_str()) {
+            return Err(KmsError::invalid_operation(format!(
+                "immediate deletion of key {} requires confirm_key_id to repeat the key id exactly",
+                request.key_id
+            )));
+        }
+
+        warn!(
+            key_id = %request.key_id,
+            "immediate KMS key deletion accepted; key material is destroyed without a waiting window and cannot be recovered"
+        );
+        Ok(())
     }
 
     /// Cancel key deletion
@@ -1018,5 +1072,197 @@ mod tests {
             })
             .await
             .expect("second data key should decrypt with its own context");
+    }
+
+    /// Manager over a local backend, with the immediate-deletion gate set as
+    /// the server operator would set it.
+    async fn deletion_manager(temp_dir: &tempfile::TempDir, allow_immediate_deletion: bool) -> KmsManager {
+        let mut config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        config.allow_immediate_deletion = allow_immediate_deletion;
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
+        KmsManager::new(backend, config)
+    }
+
+    async fn create_named_key(manager: &KmsManager, key_name: &str) -> String {
+        manager
+            .create_key(CreateKeyRequest {
+                key_name: Some(key_name.to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create key")
+            .key_id
+    }
+
+    /// Data key generated up front, decrypted again afterwards: a refused
+    /// deletion must leave the master key material byte-for-byte usable, not
+    /// merely leave a metadata record behind.
+    async fn data_key_probe(manager: &KmsManager, key_id: &str) -> (Vec<u8>, Vec<u8>) {
+        let generated = manager
+            .generate_data_key(GenerateDataKeyRequest {
+                key_id: key_id.to_string(),
+                key_spec: KeySpec::Aes256,
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("Failed to generate data key");
+        (generated.plaintext_key, generated.ciphertext_blob)
+    }
+
+    async fn assert_key_material_intact(manager: &KmsManager, key_id: &str, probe: &(Vec<u8>, Vec<u8>)) {
+        let state = manager
+            .describe_key(DescribeKeyRequest {
+                key_id: key_id.to_string(),
+            })
+            .await
+            .expect("a key that was not deleted must still be describable")
+            .key_metadata
+            .key_state;
+        assert_eq!(state, KeyState::Enabled, "a refused deletion must not change the key state");
+
+        let decrypted = manager
+            .decrypt(DecryptRequest {
+                ciphertext: probe.1.clone(),
+                encryption_context: HashMap::new(),
+                grant_tokens: Vec::new(),
+            })
+            .await
+            .expect("key material must still decrypt data keys issued before the refused deletion");
+        assert_eq!(decrypted.plaintext, probe.0, "decrypted data key must match the original plaintext");
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_is_refused_under_default_config() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false).await;
+        let key_id = create_named_key(&manager, "default-config-force-delete").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        // Confirmation present and correct: the server-side gate alone must
+        // refuse this, no matter how well-formed the request is.
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("immediate deletion must be refused unless the server allows it");
+        assert!(
+            matches!(error, KmsError::InvalidOperation { .. }),
+            "expected InvalidOperation, got {error:?}"
+        );
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_requires_a_matching_confirmation() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true).await;
+        let key_id = create_named_key(&manager, "confirmation-required").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        for confirmation in [None, Some(String::new()), Some(format!("{key_id}-typo"))] {
+            let result = manager
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.clone(),
+                    force_immediate: Some(true),
+                    confirm_key_id: confirmation.clone(),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "confirmation {confirmation:?} must be refused, got {result:?}"
+            );
+        }
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_succeeds_with_a_matching_confirmation() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true).await;
+        let key_id = create_named_key(&manager, "confirmed-force-delete").await;
+
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("a confirmed immediate deletion must be allowed once the server enables it");
+
+        let error = manager
+            .describe_key(DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect_err("an immediately deleted key must be gone");
+        assert!(matches!(error, KmsError::KeyNotFound { .. }), "expected KeyNotFound, got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn pending_window_outside_the_supported_range_is_refused() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false).await;
+        let key_id = create_named_key(&manager, "window-bounds").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        for days in [0, MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let result = manager
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.clone(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+        }
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_deletion_keeps_its_existing_behaviour() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false).await;
+
+        for (name, days) in [
+            ("schedule-default-window", None),
+            ("schedule-min-window", Some(MIN_PENDING_DELETION_WINDOW_DAYS)),
+            ("schedule-max-window", Some(MAX_PENDING_DELETION_WINDOW_DAYS)),
+        ] {
+            let key_id = create_named_key(&manager, name).await;
+            let response = manager
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.clone(),
+                    pending_window_in_days: days,
+                    ..Default::default()
+                })
+                .await
+                .expect("scheduling a deletion inside the window must still succeed");
+            assert!(response.deletion_date.is_some(), "a scheduled deletion must report its deadline");
+            assert_eq!(response.key_metadata.key_state, KeyState::PendingDeletion);
+
+            manager
+                .cancel_key_deletion(CancelKeyDeletionRequest { key_id: key_id.clone() })
+                .await
+                .expect("a scheduled deletion must still be cancellable");
+            let state = manager
+                .describe_key(DescribeKeyRequest { key_id })
+                .await
+                .expect("describe should succeed")
+                .key_metadata
+                .key_state;
+            assert_eq!(state, KeyState::Enabled, "cancelling must restore the key");
+        }
     }
 }

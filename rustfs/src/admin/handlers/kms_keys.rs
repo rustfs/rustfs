@@ -1131,6 +1131,9 @@ impl Operation for DeleteKmsKeyHandler {
             key_id: request.key_id.clone(),
             pending_window_in_days: request.pending_window_in_days,
             force_immediate: request.force_immediate,
+            // The endpoint does not accept a confirmation yet, so an immediate
+            // deletion asked for here is always refused by the service gate.
+            confirm_key_id: None,
         };
 
         match manager.delete_key_with_context(kms_request, audit.context()).await {

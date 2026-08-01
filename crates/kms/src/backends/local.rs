@@ -1617,9 +1617,15 @@ impl KmsBackend for LocalKmsBackend {
             // Schedule for deletion (default 30 days)
             ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
@@ -2678,6 +2684,7 @@ mod tests {
                 key_id: "durable-key".to_string(),
                 pending_window_in_days: None,
                 force_immediate: Some(true),
+                confirm_key_id: None,
             })
             .await
             .expect("delete key");

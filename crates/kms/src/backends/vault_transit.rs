@@ -1219,9 +1219,15 @@ impl KmsBackend for VaultTransitKmsBackend {
         } else {
             ensure_key_state_permits(&key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30"));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let scheduled = Zoned::now() + Duration::from_secs(days as u64 * 86400);
