@@ -1427,11 +1427,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn test_get_opts_validates_raw_length_before_delimiter_conversion() {
-        let temp_root = tempfile::tempdir().expect("create s3select test temp root");
-        let env = rustfs_test_utils::TestECStoreEnv::builder()
-            .base_dir(temp_root.path())
-            .build()
-            .await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
         let bucket = "s3select-multi-byte-delimiter";
         let object = "input.csv";
         let input_bytes = b"a&&1\n";
@@ -1475,7 +1471,7 @@ mod test {
             json_sub_path: None,
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
-            store: env.ecstore,
+            store: Arc::clone(&env.ecstore),
         };
 
         let result = store
