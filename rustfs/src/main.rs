@@ -62,6 +62,8 @@ fn main() {
 #[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 mod tests {
     #[test]
+    // SAFETY: This test inspects a live allocation pointer with mimalloc's heap
+    // ownership API without dereferencing or extending the pointer lifetime.
     #[allow(unsafe_code)]
     fn hotpath_allocation_workload_uses_mimalloc() {
         let _guard = hotpath::MeasurementGuardSync::new("rustfs::tests::hotpath_allocation_workload_uses_mimalloc", false, false);
@@ -74,6 +76,8 @@ mod tests {
     }
 
     #[test]
+    // SAFETY: This test directly exercises the allocator wrapper and releases
+    // every successful allocation with the matching layout.
     #[allow(unsafe_code)]
     fn mimalloc_allocator_forwards_extended_global_alloc_operations() {
         use std::alloc::{GlobalAlloc, Layout};
