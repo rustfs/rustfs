@@ -226,8 +226,18 @@ jobs:
           # the label name "sm-standard-4" had led everyone, including the
           # original mitigation, to assume 4 cores.
           #
-          # Raised to 3 on main pushes only; PRs keep 2 so the merge path is
-          # untouched while the experiment runs. Baseline over 17 samples at 2:
+          # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
+          # merge path is untouched while the experiment runs.
+          #
+          # Dispatch is included because push alone cannot supply the samples:
+          # this workflow cancels superseded runs on main, and only 4 of the last
+          # 20 push-triggered Test and Lint jobs reached a terminal state — at
+          # that rate ten samples would take roughly fifty merges. The
+          # concurrency group is scoped by event_name, so a dispatched run has
+          # its own group and is not cancelled by merge traffic, which makes the
+          # sample collectable on demand rather than by waiting.
+          #
+          # Baseline over 17 samples at 2:
           # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2
           # criterion is that ratio dropping at least 10% (below ~1.76) with no
           # 75m timeout and no run showing three consecutive samples of
@@ -238,7 +248,7 @@ jobs:
           # Must stay step-level: rust-cache hashes CARGO/CC/CFLAGS/CXX/CMAKE/RUST
           # prefixed variables from process.env into the cache key, so promoting
           # this to job level would rotate every key on this lane.
-          CARGO_BUILD_JOBS: ${{ github.event_name == 'push' && '3' || '2' }}
+          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
         run: |
           mkdir -p artifacts/test-and-lint
           ./scripts/ci/resource_sampler.sh start nextest
