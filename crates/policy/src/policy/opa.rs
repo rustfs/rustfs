@@ -32,9 +32,14 @@ impl Args {
 
 #[derive(Debug, Clone)]
 pub struct AuthZPlugin {
-    client: reqwest::Client,
+    client: OpaHttpClient,
     args: Args,
 }
+
+#[cfg(feature = "hotpath")]
+type OpaHttpClient = hotpath::wrap::reqwest::Client;
+#[cfg(not(feature = "hotpath"))]
+type OpaHttpClient = reqwest::Client;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpaConfigError {
@@ -140,6 +145,9 @@ impl AuthZPlugin {
                 error!("failed to build OPA HTTP client, falling back to default reqwest client: {err}");
                 reqwest::Client::new()
             });
+
+        #[cfg(feature = "hotpath")]
+        let client = hotpath::http!(client, label = "Policy::OPA");
 
         Self { client, args: config }
     }

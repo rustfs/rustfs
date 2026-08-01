@@ -117,9 +117,14 @@ mod tests {
             .key("assets/explicit-copy.js")
             .copy_source(format!("{bucket}/{key}"))
             .metadata_directive(MetadataDirective::Copy)
+            .customize()
+            .mutate_request(|request| {
+                request.headers_mut().insert("content-type", "application/octet-stream");
+                request.headers_mut().insert("x-amz-meta-request-only", "ignored");
+            })
             .send()
             .await
-            .expect("explicit COPY directive failed");
+            .expect("explicit COPY directive with request metadata failed");
         let explicit_copy_head = client
             .head_object()
             .bucket(bucket)
@@ -128,6 +133,18 @@ mod tests {
             .await
             .expect("HEAD failed after explicit COPY");
         assert_eq!(explicit_copy_head.cache_control(), Some("max-age=60"));
+        assert_eq!(explicit_copy_head.content_type(), Some("text/javascript; charset=utf-8"));
+        assert_eq!(
+            explicit_copy_head.metadata().and_then(|metadata| metadata.get("mtime")),
+            Some(&"1777992333".to_string())
+        );
+        assert_eq!(
+            explicit_copy_head
+                .metadata()
+                .and_then(|metadata| metadata.get("request-only")),
+            None,
+            "COPY must ignore request metadata"
+        );
         assert_eq!(
             explicit_copy_head.website_redirect_location(),
             None,
@@ -569,20 +586,6 @@ mod tests {
         assert_eq!(
             invalid_directive.as_service_error().and_then(|error| error.code()),
             Some("InvalidArgument")
-        );
-
-        let ignored_replacement = client
-            .copy_object()
-            .bucket(bucket)
-            .key(key)
-            .copy_source(format!("{bucket}/{key}"))
-            .content_type("application/ignored")
-            .send()
-            .await
-            .expect_err("Replacement fields without REPLACE should be rejected");
-        assert_eq!(
-            ignored_replacement.as_service_error().and_then(|error| error.code()),
-            Some("InvalidRequest")
         );
 
         let unchanged = client

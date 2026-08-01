@@ -159,6 +159,7 @@ impl ErasureSetHealer {
 
     /// execute erasure set heal with resume
     #[tracing::instrument(skip(self, buckets), fields(set_disk_id = %set_disk_id, bucket_count = buckets.len()))]
+    #[hotpath::measure]
     pub async fn heal_erasure_set(&self, buckets: &[String], set_disk_id: &str) -> Result<()> {
         debug!(
             target: "rustfs::heal::erasure_healer",

@@ -28,7 +28,32 @@ categories = ["development-tools", "filesystem"]
 name = "metrics_pipeline"
 harness = false
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "rustfs-common/hotpath",
+    "rustfs-s3-ops/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-s3-ops/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-s3-ops/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 metrics = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-s3-ops = { workspace = true }

@@ -27,7 +27,14 @@ categories = ["web-programming", "development-tools"]
 [lib]
 doctest = false
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 moka = { workspace = true, features = ["future"] }

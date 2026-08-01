@@ -14,9 +14,7 @@
 
 //! Local file-based KMS backend implementation
 
-use crate::backends::{
-    BackendCapabilities, BackendInfo, ExpiredKeyRemoval, KmsBackend, KmsClient, StateGatedOperation, ensure_key_status_permits,
-};
+use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -399,6 +397,20 @@ pub struct LocalKmsClient {
     /// Per-key write locks serializing read-modify-write updates within this
     /// process (see [`Self::lock_key_for_write`]).
     key_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Directory-wide writer fence for backup export (see
+    /// [`Self::acquire_export_fence`]). Writers hold the read side; an export
+    /// snapshot holds the write side so it observes a single-generation view.
+    export_fence: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// Guard pairing the export-fence read lock with a per-key write mutex.
+///
+/// Dropping it releases both, so every existing `lock_key_for_write` call
+/// site participates in the export fence without changes.
+#[must_use]
+struct KeyWriteGuard {
+    _fence: tokio::sync::OwnedRwLockReadGuard<()>,
+    _key: tokio::sync::OwnedMutexGuard<()>,
 }
 
 // pub(crate) so the backup contract tests can anchor the manifest's
@@ -465,6 +477,7 @@ impl LocalKmsClient {
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
             key_write_locks: Mutex::new(HashMap::new()),
+            export_fence: Arc::new(tokio::sync::RwLock::new(())),
         };
         client.validate_existing_keys().await?;
         Ok(client)
@@ -507,6 +520,7 @@ impl LocalKmsClient {
             legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
             key_write_locks: Mutex::new(HashMap::new()),
+            export_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -517,12 +531,40 @@ impl LocalKmsClient {
     /// delete with a rewrite. Cross-process writers sharing a key directory
     /// remain unsupported. Entries live for the client's lifetime; the table
     /// is bounded by the number of distinct key ids this process touches.
-    async fn lock_key_for_write(&self, key_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn lock_key_for_write(&self, key_id: &str) -> KeyWriteGuard {
+        // Fence first, per-key mutex second: the ordering is uniform across
+        // all writers, so an export waiting on the write side can never
+        // deadlock with a writer holding a key mutex.
+        let fence = Arc::clone(&self.export_fence).read_owned().await;
         let lock = {
             let mut locks = self.key_write_locks.lock().expect("Local KMS key write lock table poisoned");
             Arc::clone(locks.entry(key_id.to_string()).or_default())
         };
-        lock.lock_owned().await
+        KeyWriteGuard {
+            _fence: fence,
+            _key: lock.lock_owned().await,
+        }
+    }
+
+    /// Block every key-directory writer while a backup export collects its
+    /// snapshot, so all records belong to one generation.
+    ///
+    /// Mutating operations hold the read side (via [`Self::lock_key_for_write`]
+    /// or [`Self::save_new_master_key`]); the export holds the write side only
+    /// for the collection phase, never while encrypting or writing the bundle.
+    pub(crate) async fn acquire_export_fence(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.export_fence).write_owned().await
+    }
+
+    /// Key directory root, exposed for the backup export module.
+    pub(crate) fn key_directory(&self) -> &Path {
+        &self.config.key_dir
+    }
+
+    /// Absolute path of the master-key KDF salt file, exposed for the backup
+    /// export module.
+    pub(crate) fn master_key_salt_file(&self) -> PathBuf {
+        Self::master_key_salt_path(&self.config)
     }
 
     /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
@@ -799,6 +841,11 @@ impl LocalKmsClient {
     }
 
     async fn save_new_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
+        // Creates never take the per-key write lock (`NoClobber` publishing
+        // already linearizes them), so they join the export fence here. This
+        // must stay the only fence acquisition on the create path: the fence
+        // read lock is not reentrant while an export waits for the write side.
+        let _fence = Arc::clone(&self.export_fence).read_owned().await;
         let key_path = self.master_key_path(&master_key.key_id)?;
         let content = self.encode_master_key(master_key, key_material)?;
         let temp_path = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
@@ -937,9 +984,12 @@ impl LocalKmsClient {
     }
 }
 
-#[async_trait]
-impl KmsClient for LocalKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo> {
+impl LocalKmsClient {
+    pub(crate) async fn generate_data_key(
+        &self,
+        request: &GenerateKeyRequest,
+        context: Option<&OperationContext>,
+    ) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
         let key_info = self.describe_key(&request.master_key_id, context).await?;
@@ -980,7 +1030,7 @@ impl KmsClient for LocalKmsClient {
         Ok(data_key)
     }
 
-    async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse> {
+    pub(crate) async fn encrypt(&self, request: &EncryptRequest, context: Option<&OperationContext>) -> Result<EncryptResponse> {
         debug!("Encrypting data with key: {}", request.key_id);
 
         // Verify key exists and its state allows encryption
@@ -997,7 +1047,7 @@ impl KmsClient for LocalKmsClient {
         })
     }
 
-    async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    pub(crate) async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
         debug!("Decrypting data");
 
         // Parse the data key envelope from ciphertext
@@ -1031,7 +1081,14 @@ impl KmsClient for LocalKmsClient {
         Ok(plaintext)
     }
 
-    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn create_key(
+        &self,
+        key_id: &str,
+        algorithm: &str,
+        context: Option<&OperationContext>,
+    ) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {}", key_id);
 
         // Check if key already exists
@@ -1060,14 +1117,18 @@ impl KmsClient for LocalKmsClient {
         Ok(master_key)
     }
 
-    async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
+    pub(crate) async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
         debug!("Describing key: {}", key_id);
 
         let master_key = self.load_master_key(key_id).await?;
         Ok(master_key.into())
     }
 
-    async fn list_keys(&self, request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
+    pub(crate) async fn list_keys(
+        &self,
+        request: &ListKeysRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<ListKeysResponse> {
         debug!("Listing keys");
 
         let mut keys = Vec::new();
@@ -1111,7 +1172,7 @@ impl KmsClient for LocalKmsClient {
         })
     }
 
-    async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    pub(crate) async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Enabling key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
@@ -1129,7 +1190,7 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    pub(crate) async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Disabling key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
@@ -1146,7 +1207,9 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn schedule_key_deletion(
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn schedule_key_deletion(
         &self,
         key_id: &str,
         pending_window_days: u32,
@@ -1170,7 +1233,9 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Canceling deletion for key: {}", key_id);
 
         let _write_guard = self.lock_key_for_write(key_id).await;
@@ -1190,7 +1255,9 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
+    /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
+    #[cfg(test)]
+    pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         if !fs::try_exists(self.master_key_path(key_id)?).await? {
             return Err(KmsError::key_not_found(key_id));
         }
@@ -1199,7 +1266,7 @@ impl KmsClient for LocalKmsClient {
         ))
     }
 
-    async fn health_check(&self) -> Result<()> {
+    pub(crate) async fn health_check(&self) -> Result<()> {
         // Check if key directory is accessible
         if !self.config.key_dir.exists() {
             return Err(KmsError::backend_error("Key directory does not exist"));
@@ -1209,17 +1276,6 @@ impl KmsClient for LocalKmsClient {
         let _ = fs::read_dir(&self.config.key_dir).await?;
 
         Ok(())
-    }
-
-    fn backend_info(&self) -> BackendInfo {
-        BackendInfo::new(
-            "local".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-            self.config.key_dir.to_string_lossy().to_string(),
-            true, // We'll assume healthy for now
-        )
-        .with_metadata("key_dir".to_string(), self.config.key_dir.to_string_lossy().to_string())
-        .with_metadata("encrypted_at_rest".to_string(), self.master_cipher.is_some().to_string())
     }
 }
 

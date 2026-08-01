@@ -1,0 +1,188 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# RustFS KMS backend — Prometheus alerting rules
+# =============================================================================
+#
+# Metric source: the KMS operation-policy choke point in
+# crates/kms/src/policy.rs. All label values are static enum strings
+# (operation, op_class, outcome, error_class); key identifiers, key material,
+# and tokens never appear in labels.
+#
+# Response procedures: docs/operations/kms-observability-runbook.md
+#
+# IMPORTANT — threshold status: every numeric threshold below is a
+# conservative default chosen without a production baseline. Calibrate against
+# a staging baseline before relying on these alerts for paging, and prefer
+# loosening over tightening until the baseline exists. Formal SLO targets are
+# deliberately not encoded here (see rustfs/backlog#1584).
+#
+# NOTE: prometheus.yml loads /etc/prometheus/rules/*.yml — keep the .yml
+# extension or the file is silently ignored by the docker-compose stack.
+#
+# Validate: promtool check rules rustfs-kms-alerts.yml
+# =============================================================================
+
+groups:
+  # ==========================================================================
+  # Critical alerts — immediate action required
+  # ==========================================================================
+  - name: rustfs-kms-critical
+    interval: 30s
+    rules:
+      # ------------------------------------------------------------------
+      # 1. KmsBackendFatalErrors
+      #    Any attempt failure classified as fatal (non-retryable): auth
+      #    or permission errors, malformed requests, missing keys. The
+      #    policy never retries these, so even a low rate means real
+      #    operations are failing right now.
+      # ------------------------------------------------------------------
+      - alert: KmsBackendFatalErrors
+        expr: |
+          sum by (operation) (rate(rustfs_kms_backend_attempt_failures_total{error_class="fatal"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: kms
+        annotations:
+          summary: "KMS backend fatal errors on operation {{ $labels.operation }}"
+          description: >-
+            Attempt failures classified as fatal are occurring at
+            {{ $value | printf "%.3f" }}/s on operation
+            {{ $labels.operation }}. Fatal failures are not retried:
+            each one is a KMS backend call that failed permanently
+            (authentication, permissions, malformed request, or a
+            missing key/version).
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendfatalerrors"
+
+      # ------------------------------------------------------------------
+      # 2. KmsBackendHighErrorRate
+      #    Sustained share of operations terminating without success
+      #    (fatal, budget_exhausted, deadline_exceeded). The cancelled
+      #    outcome is excluded because shutdowns legitimately produce it.
+      #    The traffic guard keeps a single failure on a near-idle
+      #    cluster from firing the alert.
+      #    Threshold: 5% for 10m — conservative default, calibrate
+      #    against a staging baseline.
+      # ------------------------------------------------------------------
+      - alert: KmsBackendHighErrorRate
+        expr: |
+          (
+            sum(rate(rustfs_kms_backend_operations_total{outcome!~"success|cancelled"}[5m]))
+            /
+            clamp_min(sum(rate(rustfs_kms_backend_operations_total[5m])), 1e-9)
+          ) > 0.05
+          and
+          sum(rate(rustfs_kms_backend_operations_total[5m])) > 0.02
+        for: 10m
+        labels:
+          severity: critical
+          component: kms
+        annotations:
+          summary: "KMS backend non-success ratio above 5% for 10m"
+          description: >-
+            {{ $value | humanizePercentage }} of KMS backend operations
+            are terminating in fatal, budget_exhausted, or
+            deadline_exceeded. Object encryption and decryption paths
+            depending on the KMS are degraded or failing.
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendhigherrorrate"
+
+  # ==========================================================================
+  # Warning alerts — investigation needed
+  # ==========================================================================
+  - name: rustfs-kms-warning
+    interval: 30s
+    rules:
+      # ------------------------------------------------------------------
+      # 3. KmsBackendP99LatencyHigh
+      #    p99 wall-clock duration of whole operations (attempts plus
+      #    backoff) is sustained above 2 seconds. Because the histogram
+      #    includes retries, a high p99 usually means the retry policy
+      #    is absorbing backend failures, not that every call is slow.
+      #    Threshold: 2s for 10m — conservative default, calibrate
+      #    against a staging baseline.
+      # ------------------------------------------------------------------
+      - alert: KmsBackendP99LatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(rustfs_kms_backend_operation_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+          component: kms
+        annotations:
+          summary: "KMS backend operation p99 latency above 2s for 10m"
+          description: >-
+            The 99th-percentile KMS backend operation duration is
+            {{ $value | humanizeDuration }}, including retries and
+            backoff. Encryption and decryption latency is leaking into
+            S3 request latency.
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendp99latencyhigh"
+
+      # ------------------------------------------------------------------
+      # 4. KmsBackendAttemptFailureSpike
+      #    Aggregate attempt-failure rate (all error classes) sustained
+      #    above an absolute floor. An absolute threshold is used instead
+      #    of an offset-1d baseline ratio because fresh deployments have
+      #    no baseline and an empty offset vector would keep a ratio
+      #    alert from ever firing; switch to a baseline-relative form
+      #    (see rustfs-get-optimization-alerts.yaml for the pattern)
+      #    once a stable staging baseline exists.
+      #    Threshold: 0.5/s for 10m — conservative default, calibrate
+      #    against a staging baseline.
+      # ------------------------------------------------------------------
+      - alert: KmsBackendAttemptFailureSpike
+        expr: |
+          sum(rate(rustfs_kms_backend_attempt_failures_total[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: kms
+        annotations:
+          summary: "KMS backend attempt failures above 0.5/s for 10m"
+          description: >-
+            KMS backend attempts are failing at
+            {{ $value | printf "%.2f" }}/s across all error classes.
+            The retry policy may still be masking these from callers —
+            check the error-class breakdown before it stops absorbing
+            them.
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendattemptfailurespike"
+
+      # ------------------------------------------------------------------
+      # 5. KmsBackendRetryBudgetExhausted
+      #    Operations are running out of retry budget (budget_exhausted)
+      #    or operation deadline (deadline_exceeded). These surface to
+      #    callers as failed KMS operations even though every individual
+      #    failure was retryable — the backend is unhealthy for longer
+      #    than the policy can bridge.
+      #    Threshold: 0.05/s for 10m — conservative default, calibrate
+      #    against a staging baseline.
+      # ------------------------------------------------------------------
+      - alert: KmsBackendRetryBudgetExhausted
+        expr: |
+          sum by (outcome) (rate(rustfs_kms_backend_operations_total{outcome=~"budget_exhausted|deadline_exceeded"}[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: kms
+        annotations:
+          summary: "KMS backend operations exhausting retry budget ({{ $labels.outcome }})"
+          description: >-
+            KMS backend operations are terminating as
+            {{ $labels.outcome }} at {{ $value | printf "%.3f" }}/s.
+            Retryable failures are outlasting the retry budget, so
+            callers are seeing hard failures.
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendretrybudgetexhausted"

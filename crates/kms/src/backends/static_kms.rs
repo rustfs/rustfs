@@ -21,7 +21,7 @@
 //!
 //! encrypted_data(plaintext_len+16) || nonce (12 bytes)
 
-use crate::backends::{BackendCapabilities, BackendInfo, KmsBackend, KmsClient};
+use crate::backends::{BackendCapabilities, KmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
 use crate::encryption::DataKeyEnvelope;
 use crate::error::{KmsError, Result};
@@ -98,9 +98,10 @@ impl StaticKmsBackend {
     }
 }
 
-#[async_trait]
-impl KmsClient for StaticKmsBackend {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
+impl StaticKmsBackend {
+    /// Generate a fresh data key and wrap it in the standard KMS envelope,
+    /// authenticated against the canonical encryption context.
+    pub(crate) fn generate_data_key_envelope(&self, request: &GenerateKeyRequest) -> Result<DataKeyInfo> {
         if request.master_key_id != self.key_id {
             return Err(KmsError::key_not_found(&request.master_key_id));
         }
@@ -151,7 +152,8 @@ impl KmsClient for StaticKmsBackend {
         ))
     }
 
-    async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
+    /// Encrypt caller-provided plaintext into the standard KMS envelope.
+    pub(crate) fn encrypt_to_envelope(&self, request: &EncryptRequest) -> Result<EncryptResponse> {
         if request.key_id != self.key_id {
             return Err(KmsError::key_not_found(&request.key_id));
         }
@@ -196,7 +198,8 @@ impl KmsClient for StaticKmsBackend {
         })
     }
 
-    async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    /// Open a KMS envelope produced by this backend.
+    pub(crate) fn decrypt_envelope(&self, request: &DecryptRequest) -> Result<Vec<u8>> {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|error| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {error}")))?;
         if envelope.master_key_id != self.key_id {
@@ -235,14 +238,8 @@ impl KmsClient for StaticKmsBackend {
         Ok(plaintext)
     }
 
-    async fn create_key(&self, key_id: &str, _algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
-        if key_id == self.key_id {
-            return Err(KmsError::key_already_exists(key_id));
-        }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot create new keys"))
-    }
-
-    async fn describe_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<KeyInfo> {
+    /// Describe the single configured key.
+    pub(crate) fn configured_key_info(&self, key_id: &str) -> Result<KeyInfo> {
         if key_id != self.key_id {
             return Err(KmsError::key_not_found(key_id));
         }
@@ -263,7 +260,8 @@ impl KmsClient for StaticKmsBackend {
         })
     }
 
-    async fn list_keys(&self, request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
+    /// List the single configured key, honouring the pagination marker.
+    pub(crate) fn list_configured_key(&self, request: &ListKeysRequest) -> Result<ListKeysResponse> {
         let key_info = KeyInfo {
             key_id: self.key_id.clone(),
             description: Some("Static single-key KMS backend".to_string()),
@@ -295,57 +293,6 @@ impl KmsClient for StaticKmsBackend {
             truncated: false,
         })
     }
-
-    async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        if key_id != self.key_id {
-            return Err(KmsError::key_not_found(key_id));
-        }
-        // Static KMS key is always enabled
-        Ok(())
-    }
-
-    async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        if key_id != self.key_id {
-            return Err(KmsError::key_not_found(key_id));
-        }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot disable keys"))
-    }
-
-    async fn schedule_key_deletion(
-        &self,
-        key_id: &str,
-        _pending_window_days: u32,
-        _context: Option<&OperationContext>,
-    ) -> Result<()> {
-        if key_id != self.key_id {
-            return Err(KmsError::key_not_found(key_id));
-        }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot schedule key deletion"))
-    }
-
-    async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        if key_id != self.key_id {
-            return Err(KmsError::key_not_found(key_id));
-        }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot cancel key deletion"))
-    }
-
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
-        if key_id != self.key_id {
-            return Err(KmsError::key_not_found(key_id));
-        }
-        Err(KmsError::invalid_operation("Static KMS is read-only: cannot rotate keys"))
-    }
-
-    async fn health_check(&self) -> Result<()> {
-        // Static KMS is always healthy if it was successfully initialized
-        Ok(())
-    }
-
-    fn backend_info(&self) -> BackendInfo {
-        BackendInfo::new("static".to_string(), env!("CARGO_PKG_VERSION").to_string(), "local".to_string(), true)
-            .with_metadata("key_id".to_string(), self.key_id.clone())
-    }
 }
 
 #[async_trait]
@@ -359,12 +306,12 @@ impl KmsBackend for StaticKmsBackend {
     }
 
     async fn encrypt(&self, request: EncryptRequest) -> Result<EncryptResponse> {
-        <Self as KmsClient>::encrypt(self, &request, None).await
+        self.encrypt_to_envelope(&request)
     }
 
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         let key_id = self.key_id.clone();
-        let plaintext = <Self as KmsClient>::decrypt(self, &request, None).await?;
+        let plaintext = self.decrypt_envelope(&request)?;
         Ok(DecryptResponse {
             plaintext,
             key_id,
@@ -380,7 +327,7 @@ impl KmsBackend for StaticKmsBackend {
             encryption_context: request.encryption_context,
             grant_tokens: Vec::new(),
         };
-        let data_key = <Self as KmsClient>::generate_data_key(self, &gen_req, None).await?;
+        let data_key = self.generate_data_key_envelope(&gen_req)?;
 
         let plaintext_key = data_key
             .plaintext
@@ -395,7 +342,7 @@ impl KmsBackend for StaticKmsBackend {
     }
 
     async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse> {
-        let key_info = <Self as KmsClient>::describe_key(self, &request.key_id, None).await?;
+        let key_info = self.configured_key_info(&request.key_id)?;
         let key_metadata = KeyMetadata {
             key_id: key_info.key_id.clone(),
             key_state: if key_info.status == KeyStatus::Active {
@@ -415,7 +362,7 @@ impl KmsBackend for StaticKmsBackend {
     }
 
     async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse> {
-        <Self as KmsClient>::list_keys(self, &request, None).await
+        self.list_configured_key(&request)
     }
 
     async fn delete_key(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
@@ -446,7 +393,7 @@ impl KmsBackend for StaticKmsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{KmsBackend as KmsBackendTrait, KmsClient};
+    use crate::backends::KmsBackend as KmsBackendTrait;
     use crate::config::{BackendConfig, KmsBackend, StaticConfig};
     use crate::encryption::is_data_key_envelope;
     use base64::Engine as _;
@@ -491,8 +438,8 @@ mod tests {
         // Generate data key
         let request = GenerateKeyRequest::new(key_id.clone(), "AES_256".to_string())
             .with_context("bucket".to_string(), "test-bucket".to_string());
-        let data_key = KmsClient::generate_data_key(&backend, &request, None)
-            .await
+        let data_key = backend
+            .generate_data_key_envelope(&request)
             .expect("Failed to generate data key");
 
         assert_eq!(data_key.key_id, key_id);
@@ -509,9 +456,7 @@ mod tests {
         // Decrypt the data key
         let decrypt_request =
             DecryptRequest::new(data_key.ciphertext.clone()).with_context("bucket".to_string(), "test-bucket".to_string());
-        let decrypted = KmsClient::decrypt(&backend, &decrypt_request, None)
-            .await
-            .expect("Failed to decrypt");
+        let decrypted = backend.decrypt_envelope(&decrypt_request).expect("Failed to decrypt");
 
         assert_eq!(decrypted.as_slice(), data_key.plaintext.as_deref().expect("plaintext should exist"));
     }
@@ -523,8 +468,8 @@ mod tests {
             .with_context("bucket".to_string(), "source-bucket".to_string())
             .with_context("object".to_string(), "source-object".to_string());
 
-        let data_key = KmsClient::generate_data_key(&backend, &request, None)
-            .await
+        let data_key = backend
+            .generate_data_key_envelope(&request)
             .expect("generate static KMS data key");
 
         assert!(
@@ -568,8 +513,8 @@ mod tests {
         let (backend, key_id, _key) = create_test_backend().await;
         let request = GenerateKeyRequest::new(key_id, "AES_256".to_string())
             .with_context("bucket".to_string(), "source-bucket".to_string());
-        let generated = KmsClient::generate_data_key(&backend, &request, None)
-            .await
+        let generated = backend
+            .generate_data_key_envelope(&request)
             .expect("generate context-bound data key");
         let mut envelope: DataKeyEnvelope = serde_json::from_slice(&generated.ciphertext).expect("parse static KMS envelope");
         envelope
@@ -578,8 +523,8 @@ mod tests {
         let decrypt_request = DecryptRequest::new(serde_json::to_vec(&envelope).expect("serialize tampered envelope"))
             .with_context("bucket".to_string(), "different-bucket".to_string());
 
-        let error = KmsClient::decrypt(&backend, &decrypt_request, None)
-            .await
+        let error = backend
+            .decrypt_envelope(&decrypt_request)
             .expect_err("tampering with authenticated envelope context must fail");
 
         assert!(matches!(error, KmsError::CryptographicError { .. }));
@@ -590,7 +535,7 @@ mod tests {
         let (backend, _key_id, _key) = create_test_backend().await;
 
         let request = GenerateKeyRequest::new("wrong-key-id".to_string(), "AES_256".to_string());
-        let result = KmsClient::generate_data_key(&backend, &request, None).await;
+        let result = backend.generate_data_key_envelope(&request);
         assert!(result.is_err());
         assert!(result.expect_err("should be Err").to_string().contains("wrong-key-id"));
     }
@@ -602,7 +547,7 @@ mod tests {
         // Ciphertext too short
         let short = vec![0u8; 10];
         let request = DecryptRequest::new(short);
-        let result = KmsClient::decrypt(&backend, &request, None).await;
+        let result = backend.decrypt_envelope(&request);
         assert!(result.is_err());
     }
 
@@ -612,9 +557,7 @@ mod tests {
 
         // Generate a valid ciphertext first
         let gen_request = GenerateKeyRequest::new(key_id, "AES_256".to_string());
-        let data_key = KmsClient::generate_data_key(&backend, &gen_request, None)
-            .await
-            .expect("generate");
+        let data_key = backend.generate_data_key_envelope(&gen_request).expect("generate");
 
         // Tamper with the ciphertext (flip a bit in the encrypted portion)
         let mut tampered = data_key.ciphertext.clone();
@@ -623,7 +566,7 @@ mod tests {
         }
 
         let request = DecryptRequest::new(tampered);
-        let result = KmsClient::decrypt(&backend, &request, None).await;
+        let result = backend.decrypt_envelope(&request);
         assert!(result.is_err());
     }
 
@@ -632,7 +575,14 @@ mod tests {
         let (backend, key_id, _key) = create_test_backend().await;
 
         // Creating the pre-configured key should return KeyAlreadyExists
-        let result = KmsClient::create_key(&backend, &key_id, "AES_256", None).await;
+        let result = KmsBackendTrait::create_key(
+            &backend,
+            CreateKeyRequest {
+                key_name: Some(key_id.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.expect_err("should be Err").to_string().contains("already exists"));
     }
@@ -642,7 +592,14 @@ mod tests {
         let (backend, _key_id, _key) = create_test_backend().await;
 
         // Creating any other key should return invalid operation (read-only)
-        let result = KmsClient::create_key(&backend, "other-key", "AES_256", None).await;
+        let result = KmsBackendTrait::create_key(
+            &backend,
+            CreateKeyRequest {
+                key_name: Some("other-key".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
         assert!(result.is_err());
         let err_msg = result.expect_err("should be Err").to_string();
         assert!(err_msg.contains("read-only") || err_msg.contains("cannot create"));
@@ -652,15 +609,13 @@ mod tests {
     async fn test_describe_key() {
         let (backend, key_id, _key) = create_test_backend().await;
 
-        let key_info = KmsClient::describe_key(&backend, &key_id, None)
-            .await
-            .expect("describe_key should succeed");
+        let key_info = backend.configured_key_info(&key_id).expect("describe_key should succeed");
         assert_eq!(key_info.key_id, key_id);
         assert_eq!(key_info.status, KeyStatus::Active);
         assert_eq!(key_info.algorithm, "AES_256");
 
         // Wrong key ID
-        let result = KmsClient::describe_key(&backend, "nonexistent", None).await;
+        let result = backend.configured_key_info("nonexistent");
         assert!(result.is_err());
     }
 
@@ -668,8 +623,8 @@ mod tests {
     async fn test_list_keys() {
         let (backend, key_id, _key) = create_test_backend().await;
 
-        let response = KmsClient::list_keys(&backend, &ListKeysRequest::default(), None)
-            .await
+        let response = backend
+            .list_configured_key(&ListKeysRequest::default())
             .expect("list_keys should succeed");
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.keys[0].key_id, key_id);
@@ -677,61 +632,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_disable_key_returns_error() {
+    async fn lifecycle_mutations_are_unsupported_at_the_product_surface() {
         let (backend, key_id, _key) = create_test_backend().await;
 
-        let result = KmsClient::disable_key(&backend, &key_id, None).await;
-        assert!(result.is_err());
-        assert!(result.expect_err("should be Err").to_string().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn test_enable_key_is_noop() {
-        let (backend, key_id, _key) = create_test_backend().await;
-
-        // Enable should succeed (no-op for static KMS)
-        KmsClient::enable_key(&backend, &key_id, None)
-            .await
-            .expect("enable_key should be no-op");
-
-        // Wrong key should still fail
-        let result = KmsClient::enable_key(&backend, "wrong", None).await;
-        assert!(result.is_err());
+        // The static backend advertises no enable/disable or rotation
+        // capability, so the shared KmsBackend defaults reject all three.
+        for result in [
+            KmsBackendTrait::enable_key(&backend, &key_id).await,
+            KmsBackendTrait::disable_key(&backend, &key_id).await,
+            KmsBackendTrait::rotate_key(&backend, &key_id).await,
+        ] {
+            let error = result.expect_err("static lifecycle mutations must be rejected");
+            assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "got {error:?}");
+        }
     }
 
     #[tokio::test]
     async fn test_delete_key_returns_error() {
         let (backend, key_id, _key) = create_test_backend().await;
 
-        let result = KmsClient::schedule_key_deletion(&backend, &key_id, 7, None).await;
+        let result = KmsBackendTrait::delete_key(
+            &backend,
+            DeleteKeyRequest {
+                key_id: key_id.clone(),
+                pending_window_in_days: Some(7),
+                force_immediate: None,
+            },
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.expect_err("should be Err").to_string().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn test_rotate_key_returns_error() {
-        let (backend, key_id, _key) = create_test_backend().await;
-
-        let result = KmsClient::rotate_key(&backend, &key_id, None).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_health_check() {
         let (backend, _key_id, _key) = create_test_backend().await;
 
-        KmsClient::health_check(&backend).await.expect("health_check should succeed");
-    }
-
-    #[tokio::test]
-    async fn test_backend_info() {
-        let (backend, key_id, _key) = create_test_backend().await;
-
-        let info = KmsClient::backend_info(&backend);
-        assert_eq!(info.backend_type, "static");
-        assert_eq!(info.endpoint, "local");
-        assert!(info.healthy);
-        assert_eq!(info.metadata.get("key_id"), Some(&key_id));
+        KmsBackendTrait::health_check(&backend)
+            .await
+            .expect("health_check should succeed");
     }
 
     #[tokio::test]
@@ -740,17 +679,13 @@ mod tests {
 
         let plaintext = b"Hello, static KMS world!";
         let enc_request = EncryptRequest::new(key_id.clone(), plaintext.to_vec());
-        let enc_response = KmsClient::encrypt(&backend, &enc_request, None)
-            .await
-            .expect("encrypt should succeed");
+        let enc_response = backend.encrypt_to_envelope(&enc_request).expect("encrypt should succeed");
 
         assert_eq!(enc_response.key_id, key_id);
         assert!(!enc_response.ciphertext.is_empty());
 
         let dec_request = DecryptRequest::new(enc_response.ciphertext);
-        let decrypted = KmsClient::decrypt(&backend, &dec_request, None)
-            .await
-            .expect("decrypt should succeed");
+        let decrypted = backend.decrypt_envelope(&dec_request).expect("decrypt should succeed");
 
         assert_eq!(decrypted, plaintext);
     }
