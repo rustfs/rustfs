@@ -560,7 +560,6 @@ async fn fsync_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::KmsClient;
     use crate::config::LocalConfig;
     use std::sync::Arc;
     use tempfile::TempDir;

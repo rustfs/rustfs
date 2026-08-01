@@ -60,6 +60,16 @@
 | `CodecStreamingFallbackSpike` | 警告 | Codec streaming 回退 > 10x 基线，持续 10 分钟 |
 | `IoQueueSaturation` | 警告 | IO 队列利用率 > 90%，持续 5 分钟 |
 
+文件 `prometheus-rules/rustfs-kms-alerts.yml` 包含 KMS 后端操作指标的告警规则。阈值为保守默认值，待 staging 基线校准；响应流程见 `docs/operations/kms-observability-runbook.md`，配套仪表盘为 `deploy/observability/grafana/rustfs-kms-observability.json`。
+
+| 告警 | 级别 | 条件 |
+|------|------|------|
+| `KmsBackendFatalErrors` | 严重 | fatal（不可重试）尝试失败 > 0，持续 5 分钟 |
+| `KmsBackendHighErrorRate` | 严重 | 非 success 操作占比 > 5%，持续 10 分钟（含流量下限保护） |
+| `KmsBackendP99LatencyHigh` | 警告 | 操作 p99 耗时（含重试）> 2s，持续 10 分钟 |
+| `KmsBackendAttemptFailureSpike` | 警告 | 尝试失败率 > 0.5/s，持续 10 分钟 |
+| `KmsBackendRetryBudgetExhausted` | 警告 | budget_exhausted / deadline_exceeded 结果 > 0.05/s，持续 10 分钟 |
+
 ### 启用告警规则
 
 在 Prometheus 配置中添加告警规则文件：
