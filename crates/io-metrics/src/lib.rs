@@ -2195,7 +2195,11 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
     }
 }
 
-/// Track encoded bytes currently queued between erasure encode and disk writers.
+/// Track encoded bytes in the queue hand-off between erasure encode and disk writers.
+///
+/// This is queue occupancy, not a per-request or process-RSS memory limit. The
+/// erasure encoder settles it on failed/cancelled sends, receiver drop, and
+/// consumer hand-off before shard writes begin.
 #[inline(always)]
 pub fn add_ec_encode_inflight_bytes(bytes: usize) {
     let next = EC_ENCODE_INFLIGHT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;

@@ -30,6 +30,8 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::sync::mpsc;
 use tracing::error;
 
+/// Queue-capacity input for encoded blocks awaiting shard writers; it is not a
+/// per-PUT or process-RSS memory limit.
 const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
 const ENV_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: &str = "RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS";
 const ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: &str = "RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST";
@@ -133,20 +135,73 @@ fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }
 
-async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
-    while let Some(block) = rx.recv().await {
-        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+/// Owns an encoded queue entry's gauge contribution until ownership transfers
+/// to its receiver. Dropping a pending send or failed send compensates it.
+struct QueuedInflightBytes {
+    bytes: usize,
+}
+
+impl QueuedInflightBytes {
+    fn new(bytes: usize) -> Self {
+        rustfs_io_metrics::add_ec_encode_inflight_bytes(bytes);
+        Self { bytes }
     }
+
+    fn hand_off(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for QueuedInflightBytes {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(self.bytes);
+        }
+    }
+}
+
+/// The receiver owns queue accounting after a successful send. On cancellation
+/// it closes first, so an in-flight producer send fails and compensates itself,
+/// then synchronously settles every already-buffered entry.
+struct InflightQueueReceiver<T> {
+    receiver: mpsc::Receiver<T>,
+    bytes: fn(&T) -> usize,
+}
+
+impl<T> InflightQueueReceiver<T> {
+    fn new(receiver: mpsc::Receiver<T>, bytes: fn(&T) -> usize) -> Self {
+        Self { receiver, bytes }
+    }
+
+    async fn recv(&mut self) -> Option<T> {
+        self.receiver.recv().await
+    }
+
+    async fn drain(&mut self) {
+        while let Some(entry) = self.recv().await {
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes((self.bytes)(&entry));
+        }
+    }
+}
+
+impl<T> Drop for InflightQueueReceiver<T> {
+    fn drop(&mut self) {
+        self.receiver.close();
+        while let Ok(entry) = self.receiver.try_recv() {
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes((self.bytes)(&entry));
+        }
+    }
+}
+
+async fn send_queued<T>(sender: &mpsc::Sender<T>, entry: T, bytes: usize) -> Result<(), mpsc::error::SendError<T>> {
+    let accounting = QueuedInflightBytes::new(bytes);
+    sender.send(entry).await?;
+    accounting.hand_off();
+    Ok(())
 }
 
 fn queued_batch_bytes(batch: &[Vec<Bytes>]) -> usize {
     batch.iter().map(|block| queued_block_bytes(block)).sum()
-}
-
-async fn drain_queued_batched_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Vec<Bytes>>>) {
-    while let Some(batch) = rx.recv().await {
-        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_batch_bytes(&batch));
-    }
 }
 
 fn dominant_error_summary_label(summary: &WriteQuorumFailureSummary) -> &'static str {
@@ -540,11 +595,13 @@ impl Erasure {
             ));
         }
 
-        // Bound queued encoded blocks by memory budget to avoid per-request spikes.
+        // Bound queued encoded blocks by a queue budget; this does not bound
+        // reader, encoder, writer, allocator, or process-RSS memory.
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = erasure_encode_max_inflight_bytes();
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
+        let (tx, rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
+        let mut rx = InflightQueueReceiver::new(rx, |block| queued_block_bytes(block));
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
@@ -567,10 +624,8 @@ impl Erasure {
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
                             buf = BytesMut::with_capacity(ingest_capacity);
                             let queued_bytes = queued_block_bytes(&res);
-                            rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
-                            if let Err(err) = tx.send(res).await {
-                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+                            if let Err(err) = send_queued(&tx, res, queued_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
@@ -598,10 +653,8 @@ impl Erasure {
                             let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
                             buf = returned_buf;
                             let queued_bytes = queued_block_bytes(&res);
-                            rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
-                            if let Err(err) = tx.send(res).await {
-                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+                            if let Err(err) = send_queued(&tx, res, queued_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
@@ -654,7 +707,7 @@ impl Erasure {
         if let Some(err) = write_err {
             task.abort();
             let _ = task.await;
-            drain_queued_inflight_bytes(&mut rx).await;
+            rx.drain().await;
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
@@ -692,7 +745,8 @@ impl Erasure {
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
         let batch_blocks = encode_batch_block_count().min(inflight_blocks);
         let channel_capacity = inflight_blocks.div_ceil(batch_blocks).max(1);
-        let (tx, mut rx) = mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity);
+        let (tx, rx) = mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity);
+        let mut rx = InflightQueueReceiver::new(rx, |batch| queued_batch_bytes(batch));
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
@@ -713,10 +767,8 @@ impl Erasure {
                         pending_batch.push(res);
 
                         if pending_batch.len() >= batch_blocks {
-                            rustfs_io_metrics::add_ec_encode_inflight_bytes(pending_batch_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
-                            if let Err(err) = tx.send(pending_batch).await {
-                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(pending_batch_bytes);
+                            if let Err(err) = send_queued(&tx, pending_batch, pending_batch_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_batched_send_wait", send_wait_stage_start);
@@ -742,10 +794,8 @@ impl Erasure {
             }
 
             if !pending_batch.is_empty() {
-                rustfs_io_metrics::add_ec_encode_inflight_bytes(pending_batch_bytes);
                 let send_wait_stage_start = stage_timer_if_enabled();
-                if let Err(err) = tx.send(pending_batch).await {
-                    rustfs_io_metrics::remove_ec_encode_inflight_bytes(pending_batch_bytes);
+                if let Err(err) = send_queued(&tx, pending_batch, pending_batch_bytes).await {
                     return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                 }
                 record_internal_stage_if_enabled("erasure_encode_batched_send_wait", send_wait_stage_start);
@@ -780,7 +830,7 @@ impl Erasure {
         if let Some(err) = write_err {
             task.abort();
             let _ = task.await;
-            drain_queued_batched_inflight_bytes(&mut rx).await;
+            rx.drain().await;
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
@@ -1329,25 +1379,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_queued_inflight_bytes_consumes_pending_blocks() {
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(vec![Bytes::from_static(b"queued")]).await.unwrap();
-        drop(tx);
+    #[serial_test::serial]
+    async fn queued_inflight_bytes_are_settled_on_all_queue_exit_paths() {
+        let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let (tx, rx) = mpsc::channel(1);
+        let rx = InflightQueueReceiver::new(rx, |block: &Vec<Bytes>| queued_block_bytes(block));
+        let queued = vec![Bytes::from_static(b"queued")];
+        let queued_bytes = queued_block_bytes(&queued);
 
-        drain_queued_inflight_bytes(&mut rx).await;
+        send_queued(&tx, queued, queued_bytes)
+            .await
+            .expect("first queue entry should fit");
 
-        assert!(rx.recv().await.is_none());
+        let blocked = vec![Bytes::from_static(b"blocked")];
+        let blocked_bytes = queued_block_bytes(&blocked);
+        {
+            let pending_send = send_queued(&tx, blocked, blocked_bytes);
+            tokio::pin!(pending_send);
+            assert!(
+                futures::poll!(pending_send.as_mut()).is_pending(),
+                "full queue must suspend producer send"
+            );
+        }
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline + u64::try_from(queued_bytes).expect("queue bytes fit the gauge"),
+            "dropping a pending producer send must compensate its bytes"
+        );
+
+        drop(rx);
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "dropping the receiver must settle every buffered entry"
+        );
+
+        let rejected = vec![Bytes::from_static(b"rejected")];
+        let rejected_bytes = queued_block_bytes(&rejected);
+        assert!(
+            send_queued(&tx, rejected, rejected_bytes).await.is_err(),
+            "closed receiver must reject a new send"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "failed sends must compensate their bytes"
+        );
     }
 
     #[tokio::test]
-    async fn drain_queued_batched_inflight_bytes_consumes_pending_batches() {
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(vec![vec![Bytes::from_static(b"queued")]]).await.unwrap();
+    #[serial_test::serial]
+    async fn queued_batch_drain_settles_all_buffered_blocks() {
+        let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let (tx, rx) = mpsc::channel(2);
+        let mut rx = InflightQueueReceiver::new(rx, |batch: &Vec<Vec<Bytes>>| queued_batch_bytes(batch));
+        let batch = vec![vec![Bytes::from_static(b"queued")], vec![Bytes::from_static(b"batch")]];
+        let batch_bytes = queued_batch_bytes(&batch);
+
+        send_queued(&tx, batch, batch_bytes).await.expect("batch should be queued");
         drop(tx);
+        rx.drain().await;
 
-        drain_queued_batched_inflight_bytes(&mut rx).await;
-
-        assert!(rx.recv().await.is_none());
+        assert!(rx.recv().await.is_none(), "draining must consume every queued batch");
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "draining a batch queue must settle all contained block bytes"
+        );
     }
 
     #[tokio::test]
