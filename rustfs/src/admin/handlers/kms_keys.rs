@@ -467,7 +467,7 @@ mod tests {
         }
     }
 
-    fn delete_query(query: &str) -> Result<DeleteKmsKeyRequest, DeleteKmsKeyResponse> {
+    fn delete_query(query: &str) -> Result<DeleteKmsKeyRequest, Box<DeleteKmsKeyResponse>> {
         let uri: Uri = format!("/rustfs/admin/v3/kms/keys/delete?{query}")
             .parse()
             .expect("uri should parse");
@@ -1327,16 +1327,22 @@ const IMMEDIATE_DELETION_QUERY_RETIRED: &str = "immediate deletion is no longer 
 /// accident. An immediate-deletion attempt made this way is refused rather
 /// than downgraded to a scheduled deletion, so the caller cannot mistake one
 /// outcome for the other.
-fn delete_request_from_query(uri: &hyper::Uri) -> Result<DeleteKmsKeyRequest, DeleteKmsKeyResponse> {
+///
+/// The refusal is boxed because it is a full response body, not an error code:
+/// carrying one inline would make every `Ok` of this function as wide as the
+/// widest failure it can describe.
+fn delete_request_from_query(uri: &hyper::Uri) -> Result<DeleteKmsKeyRequest, Box<DeleteKmsKeyResponse>> {
     let query_params = extract_query_params(uri);
-    let refuse = |key_id: &str, message: &str| DeleteKmsKeyResponse {
-        success: false,
-        message: message.to_string(),
-        key_id: key_id.to_string(),
-        deletion_date: None,
-        // The request never reached the KMS service, so nothing was collected;
-        // this is not a report that found no references.
-        impact: None,
+    let refuse = |key_id: &str, message: &str| {
+        Box::new(DeleteKmsKeyResponse {
+            success: false,
+            message: message.to_string(),
+            key_id: key_id.to_string(),
+            deletion_date: None,
+            // The request never reached the KMS service, so nothing was
+            // collected; this is not a report that found no references.
+            impact: None,
+        })
     };
 
     let Some(key_id) = query_params.get("keyId") else {
