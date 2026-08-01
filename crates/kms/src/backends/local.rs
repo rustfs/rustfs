@@ -2692,6 +2692,41 @@ mod tests {
         assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "delete must fsync the key directory");
     }
 
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn delete_key_refuses_a_window_outside_the_supported_range() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "window-bounds-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+        let backend = LocalKmsBackend { client };
+
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+        }
+
+        let state = backend
+            .describe_key(DescribeKeyRequest {
+                key_id: key_id.to_string(),
+            })
+            .await
+            .expect("describe should succeed")
+            .key_metadata
+            .key_state;
+        assert_eq!(state, KeyState::Enabled, "a refused window must not schedule the key");
+    }
+
     #[tokio::test]
     async fn interrupted_update_commit_recovers_to_complete_old_or_new_state() {
         use durable_file::{CommitStep, failpoint};

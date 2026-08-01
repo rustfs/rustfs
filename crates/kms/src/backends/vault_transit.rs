@@ -1825,6 +1825,48 @@ mod tests {
         assert_eq!(requests[6], "POST /v1/transit/keys/wired-key/rotate", "{requests:?}");
     }
 
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn wired_backend_delete_refuses_a_window_outside_the_supported_range() {
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+            let vault = ScriptedVault::serve(vec![
+                // The state gate reads the transit key, then its metadata record.
+                ScriptedResponse::ok(transit_key_read_data("wired-key")),
+                ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ])
+            .await;
+            let config = KmsConfig::vault_transit(
+                url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+                "scripted-token".to_string(),
+            )
+            .with_insecure_development_defaults();
+            let backend = VaultTransitKmsBackend::new(config)
+                .await
+                .expect("vault transit backend should build");
+
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: "wired-key".to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+
+            let requests = vault.requests();
+            assert!(
+                !requests.iter().any(|line| line.starts_with("POST ")),
+                "a refused window must not write anything: {requests:?}"
+            );
+        }
+    }
+
     /// KV2 secret-metadata read payload (`kv2::read_metadata`) pinning the
     /// current secret version used as the check-and-set base.
     fn kv2_metadata_read_data(current_version: u64) -> serde_json::Value {

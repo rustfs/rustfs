@@ -1833,6 +1833,34 @@ mod tests {
         assert_eq!(refresh_safety_window_secs, None);
     }
 
+    /// The gate is off unless the operator turns it on, including for configs
+    /// persisted before the field existed: an absent value must never be read
+    /// as permission to skip the deletion waiting window.
+    #[test]
+    fn immediate_deletion_gate_defaults_off_and_reads_old_persisted_configs() {
+        let mut persisted =
+            serde_json::to_value(KmsConfig::default().with_immediate_deletion_allowed()).expect("kms config should serialize");
+        assert_eq!(persisted["allow_immediate_deletion"], serde_json::json!(true));
+        persisted
+            .as_object_mut()
+            .expect("a persisted config must be a JSON object")
+            .remove("allow_immediate_deletion")
+            .expect("current configs must carry the field");
+
+        let restored: KmsConfig = serde_json::from_value(persisted).expect("a config without the gate must still load");
+        assert!(!restored.allow_immediate_deletion, "an absent gate must fail closed");
+
+        with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, Some("true"))], || {
+            assert!(
+                allow_immediate_deletion_from_env(),
+                "the gate must be reachable from server configuration"
+            );
+        });
+        with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, None::<&str>)], || {
+            assert!(!allow_immediate_deletion_from_env());
+        });
+    }
+
     #[test]
     fn test_validate_rejects_incomplete_approle() {
         let mut config = KmsConfig::vault_approle(

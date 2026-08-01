@@ -2799,6 +2799,45 @@ mod tests {
         );
     }
 
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn wired_schedule_deletion_refuses_a_window_outside_the_supported_range() {
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let vault = ScriptedVault::serve(vec![
+                // describe_key: key info plus stored metadata.
+                ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+                ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ])
+            .await;
+            let config = KmsConfig::vault(
+                url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+                "scripted-token".to_string(),
+            )
+            .with_insecure_development_defaults();
+            let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: "wired-key".to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+
+            let requests = vault.requests();
+            assert!(
+                !requests.iter().any(|line| line.starts_with("POST ")),
+                "a refused window must not write anything: {requests:?}"
+            );
+        }
+    }
+
     /// Conflict semantics are re-read *and* re-gate: when the re-read after a
     /// lost race shows the key was concurrently scheduled for deletion, the
     /// state gate rejects the retry instead of blindly re-applying it.
