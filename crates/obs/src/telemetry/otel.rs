@@ -39,7 +39,7 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::build_env_filter;
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
@@ -68,7 +68,7 @@ use std::{fs, io::IsTerminal, time::Duration};
 use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
 
 const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_io_get_object_request_duration_seconds",
@@ -82,6 +82,26 @@ const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+const REDACTED_PROFILING_ENDPOINT: &str = "[redacted]";
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+fn log_profiler_failure(result: &'static str, error_kind: &'static str) {
+    warn!(
+        backend = "pyroscope",
+        endpoint = REDACTED_PROFILING_ENDPOINT,
+        result,
+        error_kind,
+        "Profiling export agent initialization failed"
+    );
+}
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -158,9 +178,7 @@ pub(super) fn init_observability_http(
         logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
-        otel_bridge = logger_provider
-            .as_ref()
-            .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
+        otel_bridge = logger_provider.as_ref().map(OpenTelemetryTracingBridge::new);
 
         // No separate formatting layer is added here; when OTLP logging is
         // active, the OpenTelemetry bridge is the authoritative sink for
@@ -256,6 +274,7 @@ pub(super) fn init_observability_http(
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
+        .with(pyroscope_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer_opt)
         .with(stdout_layer_opt)
@@ -531,6 +550,11 @@ pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
         return None;
     };
 
+    if url::Url::parse(endpoint).is_err() {
+        log_profiler_failure("profiling_endpoint_invalid", "invalid_endpoint");
+        return None;
+    }
+
     // Configure Pyroscope Agent
     let backend = pprof_backend(PprofConfig::default(), BackendConfig::default());
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
@@ -542,28 +566,16 @@ pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
         .build()
     {
         Ok(agent) => agent,
-        Err(err) => {
-            warn!(
-                backend = "pyroscope",
-                endpoint,
-                result = "profiling_agent_build_failed",
-                error = %err,
-                "Profiling export agent initialization failed"
-            );
+        Err(_) => {
+            log_profiler_failure("profiling_agent_build_failed", "build");
             return None;
         }
     };
 
     match agent.start() {
         Ok(agent) => Some(agent),
-        Err(err) => {
-            warn!(
-                backend = "pyroscope",
-                endpoint,
-                result = "profiling_agent_start_failed",
-                error = ?err,
-                "Profiling export agent failed to start"
-            );
+        Err(_) => {
+            log_profiler_failure("profiling_agent_start_failed", "start");
             None
         }
     }
@@ -650,6 +662,34 @@ fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_mil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::io::{self, Write};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    const LOG_TRACER_CHILD_ENV: &str = "RUSTFS_OBS_LOG_TRACER_CHILD";
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("lock test log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     /// Valid ratios should produce trace-id-ratio sampling.
@@ -765,5 +805,108 @@ mod tests {
         assert!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0001));
         assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
+    }
+
+    #[cfg(all(
+        feature = "pyroscope",
+        any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+    ))]
+    #[test]
+    fn test_init_profiler_invalid_endpoint_redacts_sensitive_components() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5:invalid/private/profiles?access_token=query-secret";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+
+        let config = OtelConfig {
+            profiling_export_enabled: Some(true),
+            profiling_endpoint: Some(endpoint.to_string()),
+            ..OtelConfig::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || assert!(init_profiler(&config).is_none()));
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(rendered.contains(REDACTED_PROFILING_ENDPOINT));
+        assert!(rendered.contains("error_kind=\"invalid_endpoint\""));
+        for leaked in [
+            "profile-user",
+            "profile-token",
+            "10.24.0.5",
+            "private/profiles",
+            "query-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "profiling log leaked {leaked}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn test_pyroscope_upload_failure_targets_stay_filtered_when_env_filter_enables_them() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5/private/profiles?access_token=query-secret";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let env_filter = tracing_subscriber::EnvFilter::new("pyroscope=trace")
+            .add_directive("trace".parse().expect("parse trace filter directive"))
+            .add_directive("Pyroscope::Session=trace".parse().expect("parse Pyroscope filter directive"));
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(pyroscope_log_filter())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(writer),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "pyroscope::session", "SessionManager - Failed to send session: {endpoint}");
+            tracing::error!(target: "Pyroscope::Session", "SessionManager - Failed to send session: {endpoint}");
+        });
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(rendered.is_empty(), "filtered Pyroscope upload failure reached a log sink: {rendered}");
+    }
+
+    #[test]
+    fn test_pyroscope_log_facade_upload_failure_is_filtered() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5/private/profiles?access_token=query-secret";
+        if env::var_os(LOG_TRACER_CHILD_ENV).is_some() {
+            tracing_subscriber::registry()
+                .with(build_env_filter("info", None))
+                .with(pyroscope_log_filter())
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).without_time())
+                .try_init()
+                .expect("install isolated LogTracer subscriber");
+            log::error!(target: "pyroscope::session", "SessionManager - Failed to send session: {endpoint}");
+            log::error!(target: "Pyroscope::Session", "SessionManager - Failed to send session: {endpoint}");
+            return;
+        }
+
+        let output = Command::new(env::current_exe().expect("resolve test executable"))
+            .args([
+                "--exact",
+                "telemetry::otel::tests::test_pyroscope_log_facade_upload_failure_is_filtered",
+                "--nocapture",
+            ])
+            .env(LOG_TRACER_CHILD_ENV, "1")
+            .env("RUST_LOG", "trace,pyroscope=trace,Pyroscope::Session=trace")
+            .output()
+            .expect("run isolated LogTracer test process");
+        assert!(output.status.success(), "isolated LogTracer test failed: {output:?}");
+
+        let rendered = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        for leaked in [
+            "profile-user",
+            "profile-token",
+            "10.24.0.5",
+            "private/profiles",
+            "query-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "LogTracer path leaked {leaked}: {rendered}");
+        }
     }
 }

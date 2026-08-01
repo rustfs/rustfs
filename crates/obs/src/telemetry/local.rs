@@ -36,7 +36,7 @@ use crate::cleaner::LogCleaner;
 use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
 use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
-use crate::telemetry::filter::build_env_filter;
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
@@ -319,6 +319,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(pyroscope_log_filter())
         .with(ErrorLayer::default())
         .with(fmt_layer)
         .try_init()
@@ -431,6 +432,7 @@ fn init_file_logging_internal(
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(pyroscope_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer)
         .with(stdout_layer)

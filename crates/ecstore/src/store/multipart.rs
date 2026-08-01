@@ -238,7 +238,7 @@ impl ECStore {
     }
 
     #[instrument(skip(self, data))]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_put_object_part(
         &self,
         bucket: &str,
