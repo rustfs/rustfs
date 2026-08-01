@@ -166,11 +166,19 @@ jobs:
       - name: Report cache input sizes
         if: always()
         run: |
+          # tee, not a plain redirect: sent only to $GITHUB_STEP_SUMMARY these
+          # numbers are readable in the UI but absent from the job log, and the
+          # REST API exposes the log, not the summary — which made the figures
+          # unreachable for exactly the scripted comparison they exist for.
+          sizes="$(du -sh ~/.cargo/registry/src ~/.cargo/registry/cache \
+                          ~/.cargo/registry/index ~/.cargo/git target 2>/dev/null || true)"
+          echo "cache-input-sizes-begin"
+          printf '%s\n' "$sizes"
+          echo "cache-input-sizes-end"
           {
             echo "### Cache input sizes (ci-dev)"
             echo '```'
-            du -sh ~/.cargo/registry/src ~/.cargo/registry/cache ~/.cargo/registry/index \
-                   ~/.cargo/git target 2>/dev/null || true
+            printf '%s\n' "$sizes"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
