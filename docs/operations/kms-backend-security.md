@@ -103,11 +103,15 @@ Even with every node on the same build, some state is process-local. These windo
 | What can diverge | Bound | Mechanism |
 | --- | --- | --- |
 | Transit key lifecycle state used by the `encrypt` and `generate_data_key` gates | ≤ 300 s (`METADATA_CACHE_TTL`) | Each node caches Transit metadata in process, TTL- and capacity-bounded, with targeted invalidation when a data-path call reports the key is gone server-side. A disable or schedule-deletion performed on one node is enforced on the others within one TTL at the latest, sooner if they hit that signal. |
-| `describe_key` output | ≤ 300 s | The manager-level key metadata cache. This is a reporting cache; the KV2 state gates do not read it. |
+| `describe_key` output | One metadata cache TTL: 300 s by default, otherwise whatever `cache_ttl_seconds` was configured with, clamped to 24 h | The manager-level key metadata cache, built from the configured cache settings. This is a reporting cache; the KV2 state gates do not read it. |
 | KV2 key lifecycle state | None | The KV2 backend re-reads the key record from Vault for every lifecycle and data-key operation, so a committed disable is effective on every upgraded node immediately. |
 | Active KMS configuration | One best-effort reload broadcast; unbounded for any peer that did not apply it | See below. |
 
 Builds older than rustfs/rustfs#5520 held the Transit metadata cache with no TTL and no capacity bound. On such a node the divergence window is not 300 seconds but "until the process restarts": it can keep encrypting under a key that another node disabled, indefinitely.
+
+The `describe_key` bound is the only one on that list an operator sets, so compute it rather than assuming the default: the window is the `cache_ttl_seconds` the KMS configure request was given, 300 s when it was omitted, clamped down to 24 h at use if it is larger (clamped rather than rejected, so an oversized setting still starts). Zero is refused outright while caching is enabled. `kms service-status` and the KMS configuration endpoint report the effective, post-clamp value, so the number the admin API shows is the number the cache honours. Note that this is the Transit row's neighbour and not its equal: `METADATA_CACHE_TTL` above is a separate, deliberately non-tunable 300 s, because that cache does gate cryptographic operations.
+
+One upgrade caveat: builds older than rustfs/rustfs#5569 ignored `cache_ttl_seconds` and ran a hardcoded 300 s, while their configure converters persisted 3600 s as the default value. A cluster configured through the admin API before that fix therefore widens its `describe_key` staleness window from an effective 300 s to the 3600 s already stored in `config/kms_config.json`, with no configuration change of its own. Read the reported value back after upgrading instead of assuming it stayed at 300 s. No cryptographic or authorization path widens with it — encrypt, decrypt and data-key generation go straight to the backend and never read this cache.
 
 ### Configuration changes converge through a best-effort peer reload
 
