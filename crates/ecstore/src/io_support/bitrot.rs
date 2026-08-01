@@ -768,10 +768,18 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct TestRemoteDataTransport {
         bytes: Arc<Mutex<Vec<u8>>>,
+        write_error: Option<io::ErrorKind>,
     }
 
     #[cfg(feature = "hotpath")]
     impl TestRemoteDataTransport {
+        fn with_write_error(kind: io::ErrorKind) -> Self {
+            Self {
+                bytes: Arc::default(),
+                write_error: Some(kind),
+            }
+        }
+
         fn bytes(&self) -> Vec<u8> {
             self.bytes
                 .lock()
@@ -784,11 +792,15 @@ mod tests {
     #[derive(Debug)]
     struct TestRemoteWriter {
         bytes: Arc<Mutex<Vec<u8>>>,
+        write_error: Option<io::ErrorKind>,
     }
 
     #[cfg(feature = "hotpath")]
     impl tokio::io::AsyncWrite for TestRemoteWriter {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if let Some(kind) = self.write_error {
+                return Poll::Ready(Err(io::Error::from(kind)));
+            }
             self.bytes
                 .lock()
                 .expect("test remote transport bytes lock should not be poisoned")
@@ -815,6 +827,7 @@ mod tests {
         async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
             Ok(Box::new(TestRemoteWriter {
                 bytes: Arc::clone(&self.bytes),
+                write_error: self.write_error,
             }))
         }
 
@@ -855,7 +868,7 @@ mod tests {
     }
 
     #[cfg(feature = "hotpath")]
-    async fn remote_test_disk() -> (DiskStore, TestRemoteDataTransport) {
+    async fn remote_test_disk(transport: TestRemoteDataTransport) -> (DiskStore, TestRemoteDataTransport) {
         use crate::disk::endpoint::Endpoint;
 
         let endpoint = Endpoint {
@@ -865,7 +878,6 @@ mod tests {
             set_idx: 0,
             disk_idx: 0,
         };
-        let transport = TestRemoteDataTransport::default();
         let remote = RemoteDisk::new(
             &endpoint,
             &DiskOption {
@@ -1021,7 +1033,7 @@ mod tests {
             .expect("mmap-copy fallback stream should preserve bytes");
         assert_eq!(fallback_read, fallback_payload);
 
-        let (remote_disk, remote_transport) = remote_test_disk().await;
+        let (remote_disk, remote_transport) = remote_test_disk(TestRemoteDataTransport::default()).await;
         let remote_payload = b"remote shard bytes";
         let mut remote_writer = create_bitrot_writer(
             false,
@@ -1074,6 +1086,43 @@ mod tests {
         }
         assert_eq!(remote_read, remote_payload);
 
+        let (failing_remote_disk, _) = remote_test_disk(TestRemoteDataTransport::with_write_error(io::ErrorKind::Other)).await;
+        let mut failing_writer = create_bitrot_writer(
+            false,
+            Some(&failing_remote_disk),
+            bucket,
+            "obj/hotpath-remote-write-error-part.1",
+            4,
+            shard_size,
+            HashAlgorithm::None,
+        )
+        .await
+        .expect("failing remote bitrot writer should open before its first write");
+        let write_error = failing_writer
+            .write(b"fail")
+            .await
+            .expect_err("raw shard writer failures must remain visible through the bitrot writer");
+        assert_eq!(write_error.kind(), io::ErrorKind::Other);
+
+        let (would_block_remote_disk, _) =
+            remote_test_disk(TestRemoteDataTransport::with_write_error(io::ErrorKind::WouldBlock)).await;
+        let mut would_block_writer = create_bitrot_writer(
+            false,
+            Some(&would_block_remote_disk),
+            bucket,
+            "obj/hotpath-remote-write-would-block-part.1",
+            4,
+            shard_size,
+            HashAlgorithm::None,
+        )
+        .await
+        .expect("would-block remote bitrot writer should open before its first write");
+        let would_block = would_block_writer
+            .write(b"wait")
+            .await
+            .expect_err("would-block must remain visible to the caller");
+        assert_eq!(would_block.kind(), io::ErrorKind::WouldBlock);
+
         drop(guard);
         let report = std::fs::read_to_string(&report_path).expect("HotPath I/O report should be written");
         let report: serde_json::Value = serde_json::from_str(&report).expect("HotPath I/O report should be valid JSON");
@@ -1089,6 +1138,13 @@ mod tests {
             assert!(byte_count > 0, "report must include fixed label {label}");
             byte_count
         };
+        let io_errors = |label: &str, direction: &str| {
+            entries
+                .iter()
+                .filter(|entry| entry["label"].as_str().is_some_and(|entry_label| entry_label == label))
+                .filter_map(|entry| entry[direction]["errors"].as_u64())
+                .sum::<u64>()
+        };
         let payload_len = u64::try_from(payload.len()).expect("test payload length should fit u64");
         assert_eq!(
             io_bytes(RAW_SHARD_READ_LOCAL_LABEL, "read"),
@@ -1102,6 +1158,11 @@ mod tests {
         assert_eq!(
             io_bytes(RAW_SHARD_WRITE_REMOTE_LABEL, "write"),
             u64::try_from(remote_payload.len()).expect("remote payload length should fit u64")
+        );
+        assert_eq!(
+            io_errors(RAW_SHARD_WRITE_REMOTE_LABEL, "write"),
+            1,
+            "the wrapper must record the real remote writer failure without changing it, while excluding WouldBlock"
         );
         for label in [
             RAW_SHARD_READ_LOCAL_LABEL,
