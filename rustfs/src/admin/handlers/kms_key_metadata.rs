@@ -350,11 +350,16 @@ async fn handle_metadata_request(
 
     let (key_id, update) = parse(&body)?;
 
+    // An authorized attempt that never reached the KMS is still an attempt: audit
+    // it before answering, or a caller could probe these endpoints while the
+    // service is down and leave no trace.
     let Some(service_manager) = current_kms_runtime_service_manager() else {
+        audit.finish_with_class(audit_operation, Some("service_unavailable"));
         return unavailable_response("kms service manager is not initialized", key_id);
     };
 
     let Some(service) = service_manager.get_encryption_service().await else {
+        audit.finish_with_class(audit_operation, Some("service_unavailable"));
         return unavailable_response("kms service is not running", key_id);
     };
 
