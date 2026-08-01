@@ -173,8 +173,9 @@ pub mod bucket {
 
     pub mod replication {
         pub use crate::bucket::replication::replication_pool::{
-            DurableMrfBacklogSummary, DurableMrfBucketBacklog, MrfBacklogObservabilitySummary, MrfBucketBacklogObservability,
-            durable_mrf_backlog_summary_snapshot, mrf_backlog_observability_snapshot,
+            DurableMrfBacklogSummary, DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBacklogObservabilitySummary,
+            MrfBucketBacklogObservability, durable_mrf_backlog_summary_snapshot, durable_mrf_target_backlog_snapshot,
+            mrf_backlog_observability_snapshot,
         };
         pub use crate::bucket::replication::{
             BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool,
@@ -183,13 +184,13 @@ pub mod bucket {
             ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
             ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
             ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
-            ReplicationType, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType,
-            delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
-            get_global_replication_stats, init_background_replication, read_durable_mrf_backlog, replication_state_to_filemeta,
-            replication_status_to_filemeta, replication_statuses_map, replication_target_arns, resync_start_conflict_id,
-            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
-            should_use_existing_delete_replication_source, unsupported_replication_config_field,
-            validate_replication_config_target_arns, version_purge_status_to_filemeta,
+            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
+            VersionPurgeStatusType, delete_replication_state_from_config, delete_replication_version_id,
+            get_global_replication_pool, get_global_replication_stats, init_background_replication, read_durable_mrf_backlog,
+            replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map, replication_target_arns,
+            resync_start_conflict_id, should_remove_replication_target, should_schedule_delete_replication,
+            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+            unsupported_replication_config_field, validate_replication_config_target_arns, version_purge_status_to_filemeta,
         };
     }
 

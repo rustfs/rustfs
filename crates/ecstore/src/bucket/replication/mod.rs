@@ -78,7 +78,7 @@ pub use replication_queue_boundary::{
 };
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
-pub use replication_state::ReplicationStats;
+pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
 pub use replication_stats_boundary::BucketStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;

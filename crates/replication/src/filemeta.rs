@@ -593,6 +593,9 @@ pub struct MrfReplicateEntry {
     // to preserve pre-existing behaviour (backlog#867).
     #[serde(rename = "deleteMarkerMtime", skip_serializing_if = "Option::is_none", default)]
     pub delete_marker_mtime: Option<i64>,
+
+    #[serde(rename = "targetARNs", skip_serializing_if = "Vec::is_empty", default)]
+    pub target_arns: Vec<String>,
 }
 
 fn retry_count_to_mrf(retry_count: u32) -> i32 {
@@ -671,6 +674,18 @@ impl ReplicateDecision {
             }
         }
         if result.is_empty() { None } else { Some(result) }
+    }
+
+    pub fn replicate_target_arns(&self) -> Vec<String> {
+        let mut arns = self
+            .targets_map
+            .values()
+            .filter(|target| target.replicate && !target.arn.is_empty())
+            .map(|target| target.arn.clone())
+            .collect::<Vec<_>>();
+        arns.sort();
+        arns.dedup();
+        arns
     }
 }
 
@@ -799,6 +814,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: self.dsc.replicate_target_arns(),
         }
     }
 
@@ -853,6 +869,7 @@ impl ReplicateObjectInfo {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: self.dsc.replicate_target_arns(),
         }
     }
 }
@@ -993,6 +1010,62 @@ impl Default for ResyncDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replicate_decision_returns_sorted_unique_replicating_target_arns() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-b".to_string(),
+            replicate: true,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-a".to_string(),
+            replicate: true,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-c".to_string(),
+            replicate: false,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: String::new(),
+            replicate: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            decision.replicate_target_arns(),
+            vec!["arn:target-a".to_string(), "arn:target-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn replicate_object_info_mrf_entry_carries_replicating_targets() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-a".to_string(),
+            replicate: true,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-b".to_string(),
+            replicate: false,
+            ..Default::default()
+        });
+        let info = ReplicateObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 42,
+            dsc: decision,
+            ..Default::default()
+        };
+
+        let entry = info.to_mrf_entry();
+
+        assert_eq!(entry.target_arns, vec!["arn:target-a".to_string()]);
+    }
 
     #[test]
     fn target_state_reads_resync_timestamp_from_target_reset_header_key() {

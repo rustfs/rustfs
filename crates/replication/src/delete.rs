@@ -49,6 +49,11 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
                 .delete_object
                 .delete_marker_mtime
                 .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
+            target_arns: if self.target_arn.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.target_arn.clone()]
+            },
         }
     }
 
@@ -111,6 +116,7 @@ mod tests {
                 delete_marker_mtime: Some(mtime),
                 ..Default::default()
             },
+            target_arn: "arn:target-a".to_string(),
             ..Default::default()
         };
 
@@ -129,6 +135,7 @@ mod tests {
             Some(mtime.unix_timestamp_nanos() as i64),
             "delete-marker mtime must be persisted in the MRF entry"
         );
+        assert_eq!(entry.target_arns, vec!["arn:target-a".to_string()]);
         assert_eq!(info.get_object(), "object");
     }
 
@@ -148,6 +155,7 @@ mod tests {
         };
 
         assert_eq!(info.to_mrf_entry().delete_marker_mtime, None);
+        assert!(info.to_mrf_entry().target_arns.is_empty());
     }
 
     #[test]
