@@ -32,6 +32,7 @@ pub mod ilm_transition;
 pub mod inspect_archive;
 pub mod is_admin;
 pub mod kms;
+pub mod kms_audit;
 pub mod kms_dynamic;
 pub mod kms_key_lifecycle;
 pub mod kms_keys;

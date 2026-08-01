@@ -206,6 +206,12 @@ async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, 
             durable_mrf_available: stats.durable_mrf_available,
             durable_mrf_backlog_count: stats.durable_mrf_backlog_count,
             durable_mrf_backlog_bytes: stats.durable_mrf_backlog_bytes,
+            mrf_pending_count: stats.mrf_pending_count,
+            mrf_pending_bytes: stats.mrf_pending_bytes,
+            mrf_dropped_count: stats.mrf_dropped_count,
+            mrf_missed_count: stats.mrf_missed_count,
+            mrf_flush_failures: stats.mrf_flush_failures,
+            mrf_last_flush_duration_millis: stats.mrf_last_flush_duration_millis,
         });
         detail_stats.push(bucket_replication_detail_from_snapshot(stats));
     }

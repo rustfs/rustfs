@@ -29,8 +29,9 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::{Client, Config};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
-use http::header::{CONTENT_TYPE, HOST};
+use http::header::{CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -38,6 +39,10 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use local_ip_address::local_ip;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{KeyValue, any_value::Value as AnyValue};
+use opentelemetry_proto::tonic::metrics::v1::{Metric, metric, number_data_point};
+use prost::Message;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     SanType, generate_simple_self_signed,
@@ -56,6 +61,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
@@ -64,11 +70,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep, timeout};
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+type BacklogMetricPoints = Arc<Mutex<BTreeMap<String, BTreeMap<String, (u64, f64)>>>>;
 
 /// A replication source server validates the remote target endpoint, and the e2e
 /// target runs on loopback (127.0.0.1), which RustFS's SSRF egress guard rejects by
@@ -107,6 +115,252 @@ const REPL17_KMS_KEY_ID: &str = "repl17-local-key";
 const REPL17_SSEC_KEY: &str = "01234567890123456789012345678901";
 const REPLICATION_FAILED_EVENT: &str = "s3:Replication:OperationFailedReplication";
 const REPLICATION_EVENT_MAX_BUFFER_BYTES: usize = 1024 * 1024;
+const OTLP_METRICS_BODY_LIMIT: u64 = 4 * 1024 * 1024;
+const BUCKET_LABEL: &str = "bucket";
+const TOTAL_FAILED_COUNT_METRIC: &str = "rustfs_bucket_replication_total_failed_count";
+const CURRENT_BACKLOG_COUNT_METRIC: &str = "rustfs_bucket_replication_current_backlog_count";
+const CURRENT_BACKLOG_BYTES_METRIC: &str = "rustfs_bucket_replication_current_backlog_bytes";
+const MRF_PENDING_COUNT_METRIC: &str = "rustfs_bucket_replication_mrf_pending_count";
+const MRF_PENDING_BYTES_METRIC: &str = "rustfs_bucket_replication_mrf_pending_bytes";
+
+struct ReplicationBacklogMetricCollector {
+    endpoint: String,
+    values: BacklogMetricPoints,
+    task: JoinHandle<()>,
+}
+
+impl ReplicationBacklogMetricCollector {
+    async fn start() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
+        let values = Arc::new(Mutex::new(BTreeMap::new()));
+        let task_values = values.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let values = task_values.clone();
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request| handle_backlog_metric_export(request, values.clone())),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        Ok(Self { endpoint, values, task })
+    }
+
+    fn root_endpoint(&self) -> &str {
+        self.endpoint.trim_end_matches("/v1/metrics")
+    }
+
+    async fn bucket_metric_value(&self, metric: &str, bucket: &str) -> f64 {
+        self.values
+            .lock()
+            .await
+            .get(metric)
+            .and_then(|buckets| buckets.get(bucket))
+            .map(|(_, value)| *value)
+            .unwrap_or_default()
+    }
+
+    async fn wait_for_bucket_metric(
+        &self,
+        metric: &str,
+        bucket: &str,
+        expected: impl Fn(f64) -> bool,
+        description: &str,
+    ) -> Result<f64, Box<dyn Error + Send + Sync>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let value = self.bucket_metric_value(metric, bucket).await;
+            if expected(value) {
+                return Ok(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let snapshot = self.values.lock().await.clone();
+                return Err(format!("timed out waiting for {metric} on bucket {bucket} to satisfy {description}; last={value}, snapshot={snapshot:?}").into());
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+impl Drop for ReplicationBacklogMetricCollector {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn handle_backlog_metric_export(
+    request: Request<Incoming>,
+    values: BacklogMetricPoints,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if request.uri().path() != "/v1/metrics" {
+        return Ok(empty_http_response(StatusCode::NOT_FOUND));
+    }
+
+    let gzip = request
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("gzip"));
+    let Ok(collected) = request.into_body().collect().await else {
+        return Ok(empty_http_response(StatusCode::BAD_REQUEST));
+    };
+    let body = collected.to_bytes();
+    if body.len() as u64 > OTLP_METRICS_BODY_LIMIT {
+        return Ok(empty_http_response(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let payload = if gzip {
+        let mut decoder = GzDecoder::new(body.as_ref());
+        let mut decoded = Vec::new();
+        if decoder
+            .by_ref()
+            .take(OTLP_METRICS_BODY_LIMIT + 1)
+            .read_to_end(&mut decoded)
+            .is_err()
+            || decoded.len() as u64 > OTLP_METRICS_BODY_LIMIT
+        {
+            return Ok(empty_http_response(StatusCode::BAD_REQUEST));
+        }
+        decoded
+    } else {
+        body.to_vec()
+    };
+
+    match ExportMetricsServiceRequest::decode(payload.as_slice()) {
+        Ok(export) => {
+            let mut values = values.lock().await;
+            record_backlog_metrics(&export, &mut values);
+            Ok(empty_http_response(StatusCode::OK))
+        }
+        Err(_) => Ok(empty_http_response(StatusCode::BAD_REQUEST)),
+    }
+}
+
+fn empty_http_response(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .expect("static HTTP response is valid")
+}
+
+fn record_backlog_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, BTreeMap<String, (u64, f64)>>) {
+    for resource_metrics in &export.resource_metrics {
+        for scope_metrics in &resource_metrics.scope_metrics {
+            for metric in &scope_metrics.metrics {
+                record_backlog_metric(metric, values);
+            }
+        }
+    }
+}
+
+fn record_backlog_metric(metric: &Metric, values: &mut BTreeMap<String, BTreeMap<String, (u64, f64)>>) {
+    if ![
+        TOTAL_FAILED_COUNT_METRIC,
+        CURRENT_BACKLOG_COUNT_METRIC,
+        CURRENT_BACKLOG_BYTES_METRIC,
+        MRF_PENDING_COUNT_METRIC,
+        MRF_PENDING_BYTES_METRIC,
+    ]
+    .contains(&metric.name.as_str())
+    {
+        return;
+    }
+
+    let points = match &metric.data {
+        Some(metric::Data::Gauge(gauge)) => gauge.data_points.as_slice(),
+        Some(metric::Data::Sum(sum)) => sum.data_points.as_slice(),
+        _ => return,
+    };
+    for point in points {
+        let Some(bucket) = attribute_string(&point.attributes, BUCKET_LABEL) else {
+            continue;
+        };
+        let Some(value) = number_point_value(point.value.as_ref()) else {
+            continue;
+        };
+        values
+            .entry(metric.name.clone())
+            .or_default()
+            .entry(bucket.to_string())
+            .and_modify(|current| {
+                if point.time_unix_nano >= current.0 {
+                    *current = (point.time_unix_nano, value);
+                }
+            })
+            .or_insert((point.time_unix_nano, value));
+    }
+}
+
+fn number_point_value(value: Option<&number_data_point::Value>) -> Option<f64> {
+    match value? {
+        number_data_point::Value::AsDouble(value) => Some(*value),
+        number_data_point::Value::AsInt(value) => Some(*value as f64),
+    }
+}
+
+fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<&'a str> {
+    attributes.iter().find_map(|attribute| {
+        if attribute.key != wanted_key {
+            return None;
+        }
+        match attribute.value.as_ref()?.value.as_ref()? {
+            AnyValue::StringValue(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+struct SlowReplicationTargetGuard {
+    task: Option<JoinHandle<()>>,
+}
+
+impl SlowReplicationTargetGuard {
+    async fn bind(address: &str, response_delay: Duration) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let listener = TcpListener::bind(address).await?;
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |_request| async move {
+                                sleep(response_delay).await;
+                                Ok::<_, Infallible>(empty_http_response(StatusCode::SERVICE_UNAVAILABLE))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        Ok(Self { task: Some(task) })
+    }
+
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SlowReplicationTargetGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
@@ -3653,6 +3907,139 @@ async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
         assert!(
             target_state.iter().any(|entry| entry.key == key && !entry.delete_marker),
             "target missing object {key} after outage recovery; state={target_state:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// backlog#1610 - black-box bucket replication backlog observability.
+///
+/// The source exports metrics through the same OTLP path production uses. A slow
+/// loopback target keeps replication workers occupied long enough for the metrics
+/// runtime to publish non-zero bucket backlog gauges; after the real target
+/// returns, replication must converge and the exported current/MRF pending gauges
+/// must settle back to zero even though the historical failed counter remains
+/// non-zero.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -> TestResult {
+    init_logging();
+
+    let collector = ReplicationBacklogMetricCollector::start().await?;
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let metric_root = collector.root_endpoint().to_string();
+    let metric_endpoint = collector.endpoint.clone();
+    let mut source_env_vars: Vec<(&str, &str)> = replication_fast_env().into_iter().collect();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env_vars.extend_from_slice(FAST_SCANNER_ENV);
+    source_env_vars.extend_from_slice(&[
+        ("RUSTFS_OBS_ENDPOINT", metric_root.as_str()),
+        ("RUSTFS_OBS_METRIC_ENDPOINT", metric_endpoint.as_str()),
+        ("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "true"),
+        ("RUSTFS_OBS_TRACES_EXPORT_ENABLED", "false"),
+        ("RUSTFS_OBS_LOGS_EXPORT_ENABLED", "false"),
+        ("RUSTFS_OBS_METER_INTERVAL", "1"),
+        ("RUSTFS_OBS_USE_STDOUT", "false"),
+        ("RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL_SEC", "1"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "repl-backlog-metrics-src";
+    let target_bucket = "repl-backlog-metrics-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("before-outage.txt")
+        .body(ByteStream::from_static(b"baseline written before backlog metrics outage"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    target_env.stop_server();
+    let slow_target = SlowReplicationTargetGuard::bind(&target_env.address, Duration::from_secs(5)).await?;
+
+    let outage_keys = ["metrics-outage-1.txt", "metrics-outage-2.txt", "metrics-outage-3.txt"];
+    for key in outage_keys {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from(
+                format!("written while backlog metrics target was slow: {key}").into_bytes(),
+            ))
+            .send()
+            .await?;
+    }
+
+    let current_backlog = collector
+        .wait_for_bucket_metric(
+            CURRENT_BACKLOG_COUNT_METRIC,
+            source_bucket,
+            |value| value >= 1.0,
+            "be at least 1 during outage",
+        )
+        .await?;
+    let current_bytes = collector
+        .wait_for_bucket_metric(
+            CURRENT_BACKLOG_BYTES_METRIC,
+            source_bucket,
+            |value| value > 0.0,
+            "report bytes during outage",
+        )
+        .await?;
+    assert!(
+        current_bytes >= current_backlog,
+        "backlog bytes should be at least the object count while queued; count={current_backlog}, bytes={current_bytes}"
+    );
+    let failed_count = collector
+        .wait_for_bucket_metric(
+            TOTAL_FAILED_COUNT_METRIC,
+            source_bucket,
+            |value| value >= 1.0,
+            "record at least one failed replication attempt during outage",
+        )
+        .await?;
+
+    slow_target.stop().await;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    for metric in [
+        CURRENT_BACKLOG_COUNT_METRIC,
+        CURRENT_BACKLOG_BYTES_METRIC,
+        MRF_PENDING_COUNT_METRIC,
+        MRF_PENDING_BYTES_METRIC,
+    ] {
+        collector
+            .wait_for_bucket_metric(metric, source_bucket, |value| value == 0.0, "settle back to zero after recovery")
+            .await?;
+    }
+    let final_failed_count = collector.bucket_metric_value(TOTAL_FAILED_COUNT_METRIC, source_bucket).await;
+    assert!(
+        final_failed_count >= failed_count,
+        "historical failed counter should remain non-zero after recovery while current backlog is zero; before={failed_count}, after={final_failed_count}"
+    );
+
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    for key in ["before-outage.txt"].into_iter().chain(outage_keys) {
+        assert!(
+            target_state.iter().any(|entry| entry.key == key && !entry.delete_marker),
+            "target missing object {key} after backlog metrics recovery; state={target_state:?}"
         );
     }
 

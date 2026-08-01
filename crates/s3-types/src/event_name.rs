@@ -87,11 +87,13 @@ pub enum EventName {
     ObjectCreatedCreateMultipartUpload,
     ObjectRemovedDeleteObjects,
 
-    // KMS management-plane events. They travel to the audit sink only and are
-    // never produced by the bucket notification path, so no compound `s3:`
-    // event expands to them. New variants must keep being appended here: the
-    // discriminant of every preceding variant is a `mask()` bit position, and
-    // inserting in the middle would silently renumber existing bits.
+    // KMS management-plane events, covering both key operations and the
+    // service-control endpoints that change which backend holds the keys. They
+    // travel to the audit sink only and are never produced by the bucket
+    // notification path, so no compound `s3:` event expands to them. New
+    // variants must keep being appended here: the discriminant of every
+    // preceding variant is a `mask()` bit position, and inserting in the middle
+    // would silently renumber existing bits.
     KmsKeyCreated,
     KmsKeyRotated,
     KmsKeyEnabled,
@@ -100,6 +102,9 @@ pub enum EventName {
     KmsKeyDeletionCancelled,
     KmsKeyDeleted,
     KmsKeyAccessed,
+    KmsServiceConfigured,
+    KmsServiceStarted,
+    KmsServiceStopped,
 }
 
 // Single event type sequential array for Everything.expand()
@@ -211,6 +216,9 @@ impl EventName {
             "kms:Key:DeletionCancelled" => Ok(EventName::KmsKeyDeletionCancelled),
             "kms:Key:Deleted" => Ok(EventName::KmsKeyDeleted),
             "kms:Key:Accessed" => Ok(EventName::KmsKeyAccessed),
+            "kms:Service:Configured" => Ok(EventName::KmsServiceConfigured),
+            "kms:Service:Started" => Ok(EventName::KmsServiceStarted),
+            "kms:Service:Stopped" => Ok(EventName::KmsServiceStopped),
             // `Everything` has no string representation (`as_str` yields ""), so it
             // cannot be parsed back from a string. Every other variant round-trips.
             _ => Err(ParseEventNameError(s.to_string())),
@@ -284,6 +292,9 @@ impl EventName {
             EventName::KmsKeyDeletionCancelled => "kms:Key:DeletionCancelled",
             EventName::KmsKeyDeleted => "kms:Key:Deleted",
             EventName::KmsKeyAccessed => "kms:Key:Accessed",
+            EventName::KmsServiceConfigured => "kms:Service:Configured",
+            EventName::KmsServiceStarted => "kms:Service:Started",
+            EventName::KmsServiceStopped => "kms:Service:Stopped",
         }
     }
 
@@ -407,6 +418,9 @@ impl EventName {
                 | EventName::KmsKeyDeletionCancelled
                 | EventName::KmsKeyDeleted
                 | EventName::KmsKeyAccessed
+                | EventName::KmsServiceConfigured
+                | EventName::KmsServiceStarted
+                | EventName::KmsServiceStopped
         )
     }
 }
@@ -630,6 +644,9 @@ mod tests {
         EventName::KmsKeyDeletionCancelled,
         EventName::KmsKeyDeleted,
         EventName::KmsKeyAccessed,
+        EventName::KmsServiceConfigured,
+        EventName::KmsServiceStarted,
+        EventName::KmsServiceStopped,
     ];
 
     /// Every KMS management-plane event.
@@ -642,6 +659,9 @@ mod tests {
         EventName::KmsKeyDeletionCancelled,
         EventName::KmsKeyDeleted,
         EventName::KmsKeyAccessed,
+        EventName::KmsServiceConfigured,
+        EventName::KmsServiceStarted,
+        EventName::KmsServiceStopped,
     ];
 
     /// Regression for backlog#965: `mask()` used to recurse forever for the

@@ -28,6 +28,8 @@ script-tests: ## Run shell script tests
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh
+	./scripts/test_hotpath_warp_ab_gate.sh
+	./scripts/test_hotpath_warp_abba.sh
 	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh

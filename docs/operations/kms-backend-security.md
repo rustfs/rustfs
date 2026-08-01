@@ -45,7 +45,7 @@ path "secret/metadata/rustfs/kms/keys/*" {
 Notes:
 
 - The trailing wildcards also cover the per-version material records that rotation creates under `.../keys/{key_id}/versions/{N}`; no extra policy paths are needed.
-- `delete` on the metadata path is required for permanent key deletion (`force_immediate`); drop it if you never hard-delete keys.
+- `delete` on the metadata path is required for permanent key deletion (`force_immediate`); drop it if you never hard-delete keys. RustFS refuses `force_immediate` unless the server sets `RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION=true`, so leaving that gate off keeps the capability unreachable no matter what the Vault policy allows.
 - Do not attach `sudo`, wildcard mounts, or Transit paths to this policy; the KV2 backend does not use them.
 - Auditing KV reads on the key prefix is strongly recommended: every read event is a potential master-key disclosure.
 
@@ -63,7 +63,7 @@ Decryption loads exactly the version recorded in the envelope and fails closed w
 
 - Every version record that any stored DEK envelope references must remain readable. Until an object rewrap/migration capability exists, assume **every** version of a rotated key is referenced: destroying a version record permanently orphans all objects whose DEKs it wrapped.
 - Version records are ordinary KV v2 secrets under the key subtree. Never run `kv metadata delete` or `kv destroy` against `{prefix}/{key_id}/versions/*`, and do not apply `delete-version-after` or retention tooling to that subtree. RustFS-managed retention does not rely on KV2's own secret versioning (each version record has a single KV revision), so KV `max-versions` settings do not protect or endanger history — but metadata deletion always removes a record entirely.
-- Permanent key deletion through RustFS (`force_immediate` after `PendingDeletion`) purges the key's version records together with the key record; that is the only supported way to remove them.
+- Permanent key deletion through RustFS (`force_immediate` after `PendingDeletion`) purges the key's version records together with the key record; that is the only supported way to remove them. It is refused by default: the server must set `RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION=true`, and the request must echo the key id back as `confirm_key_id`. Leave the gate off unless you are actively destroying keys, and turn it off again afterwards — the pending-deletion window plus `CancelKeyDeletion` is the only recovery path for objects encrypted under the key.
 - For Vault Transit, retention is governed by the Transit key's `min_decryption_version`: never raise it above the oldest version that may still protect live ciphertext.
 
 ### Upgrade before first rotation (hard constraint)

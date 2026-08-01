@@ -1068,6 +1068,7 @@ mod tests {
                     key_id: "test-key".to_string(),
                     pending_window_in_days: Some(days),
                     force_immediate: None,
+                    confirm_key_id: None,
                 })
                 .await
                 .expect_err("an out-of-range window must be rejected");
@@ -1086,6 +1087,7 @@ mod tests {
                 key_id: "test-key".to_string(),
                 pending_window_in_days: None,
                 force_immediate: Some(true),
+                confirm_key_id: None,
             })
             .await
             .expect_err("immediate deletion must be rejected");
@@ -1228,6 +1230,7 @@ mod tests {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await
             .expect("scheduling deletion must succeed");
@@ -1246,6 +1249,7 @@ mod tests {
                 key_id,
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await
             .expect("re-scheduling deletion must succeed");

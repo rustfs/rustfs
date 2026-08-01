@@ -225,8 +225,34 @@ jobs:
           cp target/release/rustfs baseline-bin/rustfs
           echo "built=true" >> "$GITHUB_OUTPUT"
 
+      - name: Build baseline on cache miss (different candidate)
+        id: baseline_build
+        if: >-
+          steps.baseline_cache.outputs.cache-hit != 'true' &&
+          steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
+        run: |
+          set -euo pipefail
+          baseline_root="$RUNNER_TEMP/rustfs-baseline-${{ github.run_id }}"
+          baseline_target="$RUNNER_TEMP/rustfs-baseline-target-${{ github.run_id }}"
+          git worktree add --detach "$baseline_root" "${{ steps.commits.outputs.baseline_sha }}"
+          cargo build --release --manifest-path "$baseline_root/Cargo.toml" --bin rustfs --target-dir "$baseline_target"
+          mkdir -p baseline-bin
+          cp "$baseline_target/release/rustfs" baseline-bin/rustfs
+          git worktree remove --force "$baseline_root"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build candidate binary
+        id: candidate_build
+        if: steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
+        run: |
+          set -euo pipefail
+          cargo build --release --bin rustfs
+          mkdir -p candidate-bin
+          cp target/release/rustfs candidate-bin/rustfs
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
       - name: Save self-healed baseline to cache
-        if: steps.selfheal.outputs.built == 'true'
+        if: steps.selfheal.outputs.built == 'true' || steps.baseline_build.outputs.built == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: baseline-bin/rustfs
@@ -238,10 +264,9 @@ jobs:
           INPUT_DURATION: ${{ github.event.inputs.duration }}
         run: |
           set -euo pipefail
-          # Budget note: with perf-3's cached baseline the nightly does no source
-          # build on a cache hit, so the wall-clock is dominated by the short warp
-          # matrix — duration/rounds/cooldown are kept small to fit all 24 cells
-          # (6 workloads x 2 phases x 2 drive-sync) rather than dropping cells.
+          # The formal runner executes A1 baseline -> B1 candidate -> B2 candidate
+          # -> A2 baseline for each workload and drive-sync cell. It requires three
+          # rounds per leg to emit tail latency and error-rate evidence.
           # --health-timeout 180 outlasts the server's own 120s startup-readiness
           # budget, which the rig's previous 60s health poll undershot (the first
           # two nightly failures). perf-6 recalibrates these once the noise study
@@ -251,39 +276,42 @@ jobs:
           candidate_sha="${{ steps.commits.outputs.candidate_sha }}"
           baseline_hit="${{ steps.baseline_cache.outputs.cache-hit }}"
           selfheal_built="${{ steps.selfheal.outputs.built }}"
+          baseline_built="${{ steps.baseline_build.outputs.built }}"
+          candidate_built="${{ steps.candidate_build.outputs.built }}"
 
-          args=(--duration "$duration" --rounds 2 --cooldown 5 --health-timeout 180)
+          args=(--duration "$duration" --rounds 3 --cooldown 5 --health-timeout 180 --baseline-revision "$baseline_sha" --candidate-revision "$candidate_sha")
 
-          if [[ "$baseline_hit" == "true" || "$selfheal_built" == "true" ]]; then
+          if [[ "$baseline_hit" == "true" || "$selfheal_built" == "true" || "$baseline_built" == "true" ]]; then
             chmod +x baseline-bin/rustfs
             base_bin="$PWD/baseline-bin/rustfs"
             args+=(--baseline-bin "$base_bin")
             if [[ "$baseline_hit" == "true" ]]; then
               base_src="actions-cache (rustfs-baseline-$baseline_sha)"
-            else
+            elif [[ "$selfheal_built" == "true" ]]; then
               base_src="source build (cache self-heal, saved as rustfs-baseline-$baseline_sha)"
+            else
+              base_src="isolated origin/main source build (saved as rustfs-baseline-$baseline_sha)"
             fi
             if [[ "$candidate_sha" == "$baseline_sha" ]]; then
               # Nightly on main: the candidate is the same commit as the baseline,
               # so reuse the one binary for both phases and skip all builds.
-              args+=(--candidate-bin "$base_bin" --skip-build)
+              args+=(--candidate-bin "$base_bin")
               cand_src="same binary as baseline (same commit)"
-            else
+            elif [[ "$candidate_built" == "true" ]]; then
+              chmod +x candidate-bin/rustfs
+              args+=(--candidate-bin "$PWD/candidate-bin/rustfs")
               cand_src="source build of the checked-out ref"
+            else
+              echo "::error::candidate binary was not built" >&2
+              exit 2
             fi
           else
-            # Cache miss with candidate != baseline (opt-in PR gate only): fall
-            # back to the source double-build. With the post-#4806 LTO profile
-            # this will overrun the job budget and alert; rerun once the push
-            # cache build for origin/main has completed, or wait for perf-7's
-            # merge-base caching.
-            args+=(--baseline-ref origin/main)
-            base_src="source build of origin/main (cache miss)"
-            cand_src="source build of the checked-out ref"
+            echo "::error::baseline binary was not restored or built" >&2
+            exit 2
           fi
 
-          args+=(--provenance-note "baseline commit: $baseline_sha - $base_src")
-          args+=(--provenance-note "candidate commit: $candidate_sha - $cand_src")
+          echo "baseline binary: $base_src"
+          echo "candidate binary: $cand_src"
 
           if [[ "${{ steps.exempt.outputs.allow_regression }}" == "true" ]]; then
             args+=(--allow-regression --exemption-reason "labeled perf-deliberate-tradeoff / dispatch override")
@@ -291,7 +319,7 @@ jobs:
           # Do not let a gate FAIL abort the job here; capture status and surface
           # it after the PR comment is posted.
           set +e
-          bash scripts/run_hotpath_warp_ab.sh "${args[@]}"
+          bash scripts/run_hotpath_warp_abba.sh "${args[@]}"
           echo "status=$?" >> "$GITHUB_OUTPUT"
           set -e
           # Locate the newest run dir + gate.md for the summary/comment/artifact
@@ -299,10 +327,10 @@ jobs:
           # holds server-logs/ for diagnosis.
           # Run dirs are UTC-timestamp names (no special chars); ls is safe here.
           # shellcheck disable=SC2012
-          run_dir="$(ls -td target/hotpath-ab/*/ 2>/dev/null | head -n1 || true)"
+          run_dir="$(ls -td target/hotpath-abba/*/ 2>/dev/null | head -n1 || true)"
           echo "run_dir=${run_dir%/}" >> "$GITHUB_OUTPUT"
           # shellcheck disable=SC2012
-          gate_md="$(ls -t target/hotpath-ab/*/gate.md 2>/dev/null | head -n1 || true)"
+          gate_md="$(ls -t target/hotpath-abba/*/candidate_gate.md 2>/dev/null | head -n1 || true)"
           echo "gate_md=$gate_md" >> "$GITHUB_OUTPUT"
 
       - name: Upload A/B results
@@ -310,10 +338,10 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: hotpath-warp-ab-${{ github.run_number }}
-          # Includes per-cell median_summary.csv / baseline_compare.csv, gate.md,
+          # Includes per-cell median_summary.csv / baseline_compare.csv, both gates,
           # and server-logs/ (rustfs.log + startup env per phase) so a failed run
           # is diagnosable. Short retention: this is churny nightly debug data.
-          path: target/hotpath-ab/
+          path: target/hotpath-abba/
           if-no-files-found: warn
           retention-days: 14
 
