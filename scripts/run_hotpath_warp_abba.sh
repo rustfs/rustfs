@@ -423,6 +423,33 @@ isolation_mode() {
   fi
 }
 
+evidence_mode() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo dry-run
+  elif [[ "$EXTERNAL" != "true" ]]; then
+    echo local-formal
+  elif [[ -n "$DEPLOY_HOOK" ]]; then
+    echo external-deploy-hook-attested
+  else
+    echo external-unmanaged-nonformal
+  fi
+}
+
+formal_evidence() {
+  case "$(evidence_mode)" in
+    local-formal|external-deploy-hook-attested) echo true ;;
+    *) echo false ;;
+  esac
+}
+
+performance_conclusion() {
+  case "$(evidence_mode)" in
+    dry-run) echo not_measured_dry_run ;;
+    external-unmanaged-nonformal) echo not_formal_unmanaged_external ;;
+    *) echo not_claimed_gate_and_artifacts_required ;;
+  esac
+}
+
 write_manifest() {
   local baseline_sha candidate_sha workloads matrix
   baseline_sha="$(sha256_file "$BASELINE_BIN" 2>/dev/null || echo unknown)"
@@ -447,6 +474,9 @@ workloads=$workloads
 drive_sync_matrix=$matrix
 external=$EXTERNAL
 external_isolation=$(isolation_mode)
+evidence_mode=$(evidence_mode)
+formal_evidence=$(formal_evidence)
+performance_conclusion=$(performance_conclusion)
 dataset_namespace=$DATASET_NAMESPACE
 local_run_data_root=$RUN_DATA_ROOT
 bucket_isolation=per-leg

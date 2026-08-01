@@ -730,6 +730,13 @@ pub enum KmsAction {
     DescribeKeyAction,
     #[strum(serialize = "kms:Decrypt")]
     DecryptAction,
+    /// Export a KMS backup bundle. Separate from every key action because a
+    /// bundle carries the material of every key at once.
+    #[strum(serialize = "kms:Backup")]
+    BackupAction,
+    /// Preflight or execute a KMS restore.
+    #[strum(serialize = "kms:Restore")]
+    RestoreAction,
 }
 
 #[cfg(test)]
@@ -767,6 +774,8 @@ mod tests {
             ("kms:ListKeys", KmsAction::ListKeysAction),
             ("kms:DescribeKey", KmsAction::DescribeKeyAction),
             ("kms:Decrypt", KmsAction::DecryptAction),
+            ("kms:Backup", KmsAction::BackupAction),
+            ("kms:Restore", KmsAction::RestoreAction),
         ] {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));

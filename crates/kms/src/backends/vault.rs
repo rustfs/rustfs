@@ -641,26 +641,59 @@ impl VaultKmsClient {
         .await
     }
 
-    /// Fail closed when the version history extends more than one step past
-    /// the current version.
+    /// The version numbers of a key's immutable version records.
     ///
-    /// A record exactly one above current is the footprint of an interrupted
-    /// rotation (material persisted, pointer switch never committed) and is
-    /// recovered by the next rotation's adopt path. Anything further ahead
-    /// cannot come from the rotation protocol: it means the top-level record
-    /// regressed (for example a historical lost update rolled back committed
-    /// rotations), and extending the history from the rolled-back state would
-    /// re-mint version numbers that already have immutable records.
-    async fn ensure_current_version_not_behind(&self, key_id: &str, current_version: u32) -> Result<()> {
-        let max_recorded = self
+    /// Entries that are not version numbers are ignored: the rotation protocol
+    /// only ever creates numeric records under the versions directory, so
+    /// anything else is not part of the history this reasons about.
+    async fn recorded_version_numbers(&self, key_id: &str) -> Result<Vec<u32>> {
+        Ok(self
             .list_key_version_records(key_id)
             .await?
             .unwrap_or_default()
             .iter()
             .filter_map(|entry| entry.trim_end_matches('/').parse::<u32>().ok())
-            .max();
+            .collect())
+    }
 
-        match max_recorded {
+    /// Fail closed when the version history contradicts the key record.
+    ///
+    /// Both contradictions below mean the record no longer describes the history
+    /// the rotation protocol produced, and rotating on top of either would make
+    /// the inconsistency permanent.
+    ///
+    /// * **Version records without a baseline.** The first rotation freezes the
+    ///   then-current material as a version record and pins `baseline_version` to
+    ///   it in the same commit, so records can only exist without a baseline if
+    ///   the baseline was dropped afterwards. A node older than versioned rotation
+    ///   does exactly that: it does not know the field, and every lifecycle write
+    ///   rewrites the whole record, so one enable/disable/tag from such a node
+    ///   erases it. Rotating here would freeze a *new* baseline at the current
+    ///   version and permanently resolve every pre-versioning envelope to material
+    ///   that never wrapped it — the point of no return this guard blocks.
+    /// * **A record more than one version above current.** A record exactly one
+    ///   above current is the footprint of an interrupted rotation (material
+    ///   persisted, pointer switch never committed) and is recovered by the next
+    ///   rotation's adopt path. Anything further ahead cannot come from the
+    ///   rotation protocol: it means the top-level record regressed (for example a
+    ///   historical lost update rolled back committed rotations), and extending the
+    ///   history from the rolled-back state would re-mint version numbers that
+    ///   already have immutable records.
+    async fn ensure_version_history_consistent(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
+        let recorded = self.recorded_version_numbers(key_id).await?;
+
+        if key_data.baseline_version.is_none()
+            && let Some(oldest_recorded) = recorded.iter().min().copied()
+        {
+            warn!(
+                key_id,
+                oldest_recorded, "Vault KMS key has version records but no baseline version; refusing to rotate"
+            );
+            return Err(KmsError::baseline_version_lost(key_id, oldest_recorded));
+        }
+
+        let current_version = key_data.version;
+        match recorded.iter().max().copied() {
             Some(max_recorded) if max_recorded > current_version.saturating_add(1) => Err(KmsError::internal_error(format!(
                 "current version {current_version} of key {key_id} is behind existing version record {max_recorded}; refusing to extend an inconsistent version history"
             ))),
@@ -830,13 +863,72 @@ impl VaultKmsClient {
         let key_material = self
             .get_key_material_for_version(&envelope.master_key_id, &key_data, version)
             .await?;
-        let plaintext = self
+        let plaintext = match self
             .dek_crypto
             .decrypt(&key_material, &envelope.encrypted_key, &envelope.nonce)
-            .await?;
+            .await
+        {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                return Err(self
+                    .explain_unwrap_failure(&envelope.master_key_id, &key_data, envelope.master_key_version, error)
+                    .await);
+            }
+        };
 
         debug!("Vault KMS data decrypted");
         Ok(plaintext)
+    }
+
+    /// Re-report a failure to unwrap a data key as the lost-baseline diagnosis
+    /// when that is what the key record shows.
+    ///
+    /// Only a pre-versioning envelope (no `master_key_version`) read against a key
+    /// with no `baseline_version` can qualify: every other envelope was unwrapped
+    /// with the version it or the baseline named. Such an envelope resolves to the
+    /// *current* version, which is correct for a key that was never rotated and
+    /// wrong for one whose baseline was erased — and the immutable version records
+    /// tell those two apart.
+    ///
+    /// Deliberately runs after the unwrap fails, never before it. A version-less
+    /// envelope written by an old node *after* a rotation is genuinely wrapped with
+    /// the current material and still decrypts, so refusing up front on the same
+    /// evidence would break reads that work today. Nothing is risked by trying
+    /// first: the wrapping is AES-256-GCM, so a wrong master key version cannot
+    /// yield plaintext, only this authentication failure. The extra listing is
+    /// therefore paid once per already-failing read instead of on every read of
+    /// pre-versioning data.
+    async fn explain_unwrap_failure(
+        &self,
+        key_id: &str,
+        key_data: &VaultKeyData,
+        envelope_version: Option<u32>,
+        error: KmsError,
+    ) -> KmsError {
+        if envelope_version.is_some() || key_data.baseline_version.is_some() {
+            return error;
+        }
+
+        match self.recorded_version_numbers(key_id).await {
+            Ok(recorded) => match recorded.iter().min().copied() {
+                Some(oldest_recorded) => {
+                    warn!(
+                        key_id,
+                        oldest_recorded,
+                        "Vault KMS pre-versioning data key failed to unwrap and the key has version records but no baseline version"
+                    );
+                    KmsError::baseline_version_lost(key_id, oldest_recorded)
+                }
+                // No version records: the key was never rotated by a versioning
+                // build, so the current version really is the right one and the
+                // failure has some other cause.
+                None => error,
+            },
+            Err(list_error) => {
+                warn!(key_id, %list_error, "Vault KMS could not list key version records while diagnosing a failed unwrap");
+                error
+            }
+        }
     }
 
     pub(crate) async fn create_key(
@@ -1097,6 +1189,10 @@ impl VaultKmsClient {
     /// or interrupted rotation never exposes half-committed material. Concurrent
     /// rotations are serialized by the check-and-set writes: at most one caller
     /// commits each version and the losers fail without side effects on current.
+    ///
+    /// The whole protocol is refused up front, before any write, when the persisted
+    /// version history contradicts the key record — see
+    /// [`Self::ensure_version_history_consistent`].
     pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Rotating master key: {}", key_id);
 
@@ -1109,10 +1205,11 @@ impl VaultKmsClient {
         decode_stored_key_material(key_id, &key_data.encrypted_key_material)
             .inspect_err(|error| warn!(key_id, %error, "Vault KMS key material failed validation"))?;
 
-        // A version history that already extends past what this rotation would
-        // commit means the current pointer regressed; fail closed instead of
-        // re-minting version numbers that have immutable records.
-        self.ensure_current_version_not_behind(key_id, key_data.version).await?;
+        // The version history must still agree with the key record: a history
+        // that extends past what this rotation would commit means the current
+        // pointer regressed, and a history without a baseline means the baseline
+        // was erased after the fact. Both fail closed before any write.
+        self.ensure_version_history_consistent(key_id, &key_data).await?;
 
         // Step 1: freeze the baseline on first rotation.
         if key_data.baseline_version.is_none() {
@@ -3088,9 +3185,13 @@ mod tests {
     /// would collide with immutable records.
     #[tokio::test]
     async fn wired_rotate_fails_closed_when_version_history_regressed() {
+        // The baseline is intact, so this isolates the monotonicity guard from
+        // the lost-baseline guard that also inspects the version listing.
+        let mut key_data = healthy_key_data();
+        key_data.baseline_version = Some(1);
         let (vault, client) = scripted_client(vec![
             ScriptedResponse::ok(kv2_metadata_read_data(4)),
-            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
             // Version records reach 3 while the current pointer says 1.
             ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2", "3"] })),
         ])
@@ -3155,6 +3256,319 @@ mod tests {
             committed["data"]["encrypted_key_material"],
             serde_json::json!(adopted_material),
             "{committed}"
+        );
+    }
+
+    /// The mixed-version corruption path: a node older than versioned rotation
+    /// performed a lifecycle write, which rewrites the whole key record and
+    /// silently drops the `baseline_version` it does not know. Version records
+    /// without a baseline can only mean that, so the next rotation must refuse
+    /// instead of freezing a fresh baseline at the current version — which would
+    /// resolve every pre-versioning envelope to material that never wrapped it.
+    #[tokio::test]
+    async fn wired_rotate_refuses_when_baseline_was_erased() {
+        let mut key_data = healthy_key_data();
+        key_data.version = 2;
+        key_data.baseline_version = None;
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            // The key was rotated once, so records for versions 1 and 2 exist —
+            // the baseline the first rotation pinned is gone from the record.
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+        ])
+        .await;
+
+        let error = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect_err("a key whose baseline was erased must not rotate");
+        assert!(
+            matches!(
+                &error,
+                KmsError::BaselineVersionLost { key_id, oldest_version: 1 } if key_id == "wired-key"
+            ),
+            "the refusal must name the baseline to restore: {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=3".to_string(),
+                "LIST /v1/secret/metadata/rustfs/kms/keys/wired-key/versions".to_string(),
+            ],
+            "the refusal must be decided from reads alone"
+        );
+        assert!(
+            !requests.iter().any(|line| line.starts_with("POST ")),
+            "nothing may be written once the baseline is known lost: {requests:?}"
+        );
+    }
+
+    /// A key whose baseline is intact keeps rotating: the guard must key off the
+    /// contradiction, not off the presence of version records.
+    #[tokio::test]
+    async fn wired_rotate_with_intact_baseline_still_commits() {
+        let mut key_data = healthy_key_data();
+        key_data.version = 2;
+        key_data.baseline_version = Some(1);
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+            // Version 3's material record, then the pointer switch.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect("a key with an intact baseline must still rotate");
+        assert_eq!(rotated.version, 3);
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=3".to_string(),
+                "LIST /v1/secret/metadata/rustfs/kms/keys/wired-key/versions".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key/versions/3".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+            ],
+            "an intact baseline skips the freeze step and commits the usual two writes"
+        );
+
+        let bodies = vault.request_bodies();
+        let record = parse_write_body(&bodies[3]);
+        assert_eq!(
+            record["options"]["cas"],
+            serde_json::json!(0),
+            "version records are create-only: {record}"
+        );
+        let committed = parse_write_body(&bodies[4]);
+        assert_eq!(committed["options"]["cas"], serde_json::json!(3), "{committed}");
+        assert_eq!(committed["data"]["version"], serde_json::json!(3), "{committed}");
+        assert_eq!(
+            committed["data"]["baseline_version"],
+            serde_json::json!(1),
+            "the existing baseline must be carried over untouched: {committed}"
+        );
+    }
+
+    /// A never-rotated key legitimately has no baseline and no version records,
+    /// so its first rotation must still freeze one. The guard must not read this
+    /// state as an erased baseline.
+    #[tokio::test]
+    async fn wired_first_rotate_of_never_rotated_key_still_freezes_baseline() {
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(7)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // The versions directory does not exist yet.
+            ScriptedResponse::error(404, "not found"),
+            // Freeze version 1, persist the baseline, create version 2, switch.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect("the first rotation of a never-rotated key must commit");
+        assert_eq!(rotated.version, 2);
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=7".to_string(),
+                "LIST /v1/secret/metadata/rustfs/kms/keys/wired-key/versions".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key/versions/1".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key/versions/2".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+            ],
+            "{requests:?}"
+        );
+
+        let bodies = vault.request_bodies();
+        let frozen = parse_write_body(&bodies[3]);
+        assert_eq!(
+            frozen["data"]["encrypted_key_material"],
+            serde_json::json!(healthy_key_data().encrypted_key_material),
+            "the baseline record must freeze the pre-rotation material: {frozen}"
+        );
+        let baseline_commit = parse_write_body(&bodies[4]);
+        assert_eq!(
+            baseline_commit["data"]["baseline_version"],
+            serde_json::json!(1),
+            "the first rotation must pin the baseline: {baseline_commit}"
+        );
+    }
+
+    /// Reading a pre-versioning envelope against a key whose baseline was erased
+    /// resolves to the current version, whose material never wrapped it. The
+    /// unwrap therefore fails (AES-GCM cannot yield plaintext under the wrong
+    /// key); the failure must name the erased baseline instead of surfacing an
+    /// undiagnosable authentication error.
+    #[tokio::test]
+    async fn wired_decrypt_reports_erased_baseline_for_pre_versioning_envelope() {
+        let baseline_material = [0x41u8; 32];
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&baseline_material, b"dek-plaintext")
+            .await
+            .expect("wrap test DEK under the baseline material");
+        // A pre-versioning envelope: no master_key_version field.
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        // The key has been rotated (current material differs from the baseline's)
+        // and its baseline pointer was erased by an older node.
+        let mut key_data = healthy_key_data();
+        key_data.version = 2;
+        key_data.baseline_version = None;
+        key_data.encrypted_key_material = rotated_material();
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+        ])
+        .await;
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("the wrong master key version cannot unwrap the data key");
+        assert!(
+            matches!(
+                &error,
+                KmsError::BaselineVersionLost { key_id, oldest_version: 1 } if key_id == "wired-key"
+            ),
+            "the failure must point at the erased baseline: {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "the diagnosis costs one listing after the failure: {requests:?}");
+        assert!(requests[1].contains("/versions"), "{requests:?}");
+    }
+
+    /// Without version records the key was never rotated by a versioning build,
+    /// so the current version really is the right one for a pre-versioning
+    /// envelope and an unwrap failure has some other cause. Misreporting it as a
+    /// lost baseline would send operators after a baseline that never existed.
+    #[tokio::test]
+    async fn wired_decrypt_keeps_original_error_when_key_was_never_rotated() {
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&[0x41u8; 32], b"dek-plaintext")
+            .await
+            .expect("wrap test DEK");
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        let (vault, client) = scripted_client(vec![
+            // The key record holds different material than the envelope was
+            // wrapped with, but has no version history at all.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::error(404, "not found"),
+        ])
+        .await;
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("the mismatched material must still fail the unwrap");
+        assert!(
+            matches!(error, KmsError::CryptographicError { .. }),
+            "a key with no version records must keep its original failure: {error:?}"
+        );
+        assert_eq!(vault.requests().len(), 2);
+    }
+
+    /// The common upgrade shape — pre-versioning envelopes against a key that was
+    /// never rotated — must keep decrypting with exactly one Vault read. The
+    /// diagnosis above may not add a listing to reads that succeed.
+    #[tokio::test]
+    async fn wired_decrypt_of_pre_versioning_envelope_adds_no_request() {
+        let key_data = healthy_key_data();
+        let key_material = general_purpose::STANDARD
+            .decode(&key_data.encrypted_key_material)
+            .expect("decode fixture material");
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&key_material, b"dek-plaintext")
+            .await
+            .expect("wrap test DEK under the current material");
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&key_data))]).await;
+
+        let plaintext = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("a pre-versioning envelope on a never-rotated key must decrypt");
+        assert_eq!(plaintext, b"dek-plaintext".to_vec());
+        assert_eq!(
+            vault.requests(),
+            vec!["GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string()],
+            "a successful read must not pay for the lost-baseline diagnosis"
         );
     }
 }

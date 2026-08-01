@@ -1151,60 +1151,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         dobj.delete_object.version_id
     };
 
-    let _rcfg = match get_replication_config(&bucket).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            debug!(
-                event = EVENT_REPLICATION_DELETE_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_missing",
-                "Skipping replication delete because replication config is missing"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: dobj.delete_object.object_name.clone(),
-                    version_id,
-                    delete_marker: dobj.delete_object.delete_marker,
-                    ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-
-            return;
-        }
-        Err(err) => {
-            debug!(
-                event = EVENT_REPLICATION_DELETE_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                error = %err,
-                reason = "replication_config_lookup_failed",
-                "Skipping replication delete because replication config lookup failed"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: dobj.delete_object.object_name.clone(),
-                    version_id,
-                    delete_marker: dobj.delete_object.delete_marker,
-                    ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return;
-        }
-    };
-
     if dobj.delete_object.delete_marker
         && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
     {
