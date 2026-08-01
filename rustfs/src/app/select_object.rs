@@ -129,7 +129,15 @@ async fn send_select_events(
         return;
     }
 
-    while let Some(result) = output.next().await {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            result = output.next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
         let batch = match result {
             Ok(batch) => batch,
             Err(err) => {
@@ -820,6 +828,47 @@ mod tests {
             .expect_err("terminal event should be an error");
         assert_eq!(timeout_error.code(), &S3ErrorCode::Busy);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn producer_drops_query_stream_when_receiver_closes() {
+        let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::once(async move {
+                let _stream_dropped = stream_dropped_tx;
+                futures::future::pending::<Result<RecordBatch, DataFusionError>>().await
+            }),
+        ));
+        let (tx, mut rx) = mpsc::channel(2);
+        let terminal_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("test channel should reserve terminal capacity");
+        let validation = SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        };
+        let mut producer = tokio::spawn(send_select_events_until_deadline(
+            output,
+            tx,
+            terminal_permit,
+            validation,
+            Instant::now() + std::time::Duration::from_secs(300),
+            300,
+        ));
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        drop(rx);
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut producer)
+            .await
+            .expect("producer should observe the closed receiver")
+            .expect("producer task should complete successfully");
+        assert!(
+            stream_dropped_rx.await.is_err(),
+            "query stream should be dropped when the receiver closes"
+        );
     }
 
     #[test]
