@@ -22,12 +22,14 @@
 //! every node of a deployment concurrently — a key is only ever removed while
 //! its (re-read) record is an expired pending deletion or a tombstone.
 
+use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::{ExpiredKeyRemoval, KmsBackend};
-use crate::types::{KeyStatus, ListKeysRequest};
+use crate::error::Result;
+use crate::types::{KeyStatus, ListKeysRequest, OperationContext};
 use async_trait::async_trait;
 use jiff::Zoned;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -68,6 +70,8 @@ pub(crate) struct DeletionWorker {
     default_key_id: Option<String>,
     reference_checker: Option<Arc<dyn DeletionReferenceChecker>>,
     interval: Duration,
+    backend_kind: &'static str,
+    audit_sink: Option<Arc<dyn KmsAuditSink>>,
 }
 
 impl DeletionWorker {
@@ -75,13 +79,22 @@ impl DeletionWorker {
         backend: Arc<dyn KmsBackend>,
         default_key_id: Option<String>,
         reference_checker: Option<Arc<dyn DeletionReferenceChecker>>,
+        backend_kind: &'static str,
     ) -> Self {
         Self {
             backend,
             default_key_id,
             reference_checker,
+            backend_kind,
+            audit_sink: None,
             interval: DEFAULT_SWEEP_INTERVAL,
         }
+    }
+
+    /// Audit each irreversible key removal to `sink`.
+    pub(crate) fn with_audit_sink(mut self, sink: Option<Arc<dyn KmsAuditSink>>) -> Self {
+        self.audit_sink = sink;
+        self
     }
 
     pub(crate) fn spawn(self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
@@ -168,14 +181,42 @@ impl DeletionWorker {
 
         // The backend re-checks state and deadline under its own write
         // synchronization, so a cancellation racing this sweep wins there.
-        match self.backend.remove_expired_key(key_id, now).await {
-            Ok(ExpiredKeyRemoval::Removed) => report.removed.push(key_id.to_string()),
+        let started = Instant::now();
+        let outcome = self.backend.remove_expired_key(key_id, now).await;
+        match &outcome {
+            Ok(ExpiredKeyRemoval::Removed) => {
+                report.removed.push(key_id.to_string());
+                self.audit_removal(key_id, started, &outcome);
+            }
             Ok(ExpiredKeyRemoval::StateChanged | ExpiredKeyRemoval::NotExpired) => report.skipped += 1,
             Err(error) => {
                 warn!(key_id, %error, "failed to remove expired KMS key; will retry next sweep");
                 report.failed += 1;
+                self.audit_removal(key_id, started, &outcome);
             }
         }
+    }
+
+    /// Record an attempted destruction of key material.
+    ///
+    /// Only attempts that reached the backend are audited: a key the sweep
+    /// declined to touch (not yet due, still referenced, state changed under
+    /// us) was never at risk, and recording it as a deletion event would
+    /// drown the real ones.
+    fn audit_removal(&self, key_id: &str, started: Instant, outcome: &Result<ExpiredKeyRemoval>) {
+        let Some(sink) = self.audit_sink.as_ref() else {
+            return;
+        };
+
+        // Removal runs on a background sweep, so there is no request
+        // principal to attribute it to.
+        let context = OperationContext::internal();
+        sink.emit(
+            KmsAuditRecord::new(KmsAuditOperation::DeleteKey, &context, self.backend_kind)
+                .with_key_id(Some(key_id))
+                .with_latency(started.elapsed())
+                .with_result(outcome),
+        );
     }
 }
 
@@ -216,7 +257,7 @@ mod tests {
     }
 
     fn worker(backend: Arc<LocalKmsBackend>) -> DeletionWorker {
-        DeletionWorker::new(backend, None, None)
+        DeletionWorker::new(backend, None, None, "local")
     }
 
     fn after_window() -> Zoned {
@@ -307,7 +348,7 @@ mod tests {
         schedule(&backend, &key_id).await;
 
         // Blocked while it is the configured default key.
-        let as_default = DeletionWorker::new(backend.clone(), Some(key_id.clone()), None);
+        let as_default = DeletionWorker::new(backend.clone(), Some(key_id.clone()), None, "local");
         let report = as_default.sweep(&after_window()).await;
         assert_eq!(report.blocked, vec![key_id.clone()]);
         assert!(report.removed.is_empty());
@@ -317,6 +358,7 @@ mod tests {
             backend.clone(),
             None,
             Some(Arc::new(StaticReferences(vec!["bucket:sse-bucket".to_string()]))),
+            "local",
         );
         let report = with_references.sweep(&after_window()).await;
         assert_eq!(report.blocked, vec![key_id.clone()]);
@@ -327,9 +369,51 @@ mod tests {
             .expect("blocked key must still exist");
 
         // Removed once nothing references it anymore.
-        let unreferenced = DeletionWorker::new(backend.clone(), None, Some(Arc::new(StaticReferences(Vec::new()))));
+        let unreferenced = DeletionWorker::new(backend.clone(), None, Some(Arc::new(StaticReferences(Vec::new()))), "local");
         let report = unreferenced.sweep(&after_window()).await;
         assert_eq!(report.removed, vec![key_id.clone()]);
+    }
+
+    #[tokio::test]
+    async fn only_attempted_removals_are_audited() {
+        #[derive(Default)]
+        struct CapturingSink {
+            records: std::sync::Mutex<Vec<KmsAuditRecord>>,
+        }
+
+        impl KmsAuditSink for CapturingSink {
+            fn emit(&self, record: KmsAuditRecord) {
+                self.records.lock().expect("sink lock should not be poisoned").push(record);
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let backend = local_backend(&temp_dir).await;
+        let key_id = create_key(&backend, "audited-removal").await;
+        schedule(&backend, &key_id).await;
+
+        let sink = Arc::new(CapturingSink::default());
+        let worker = DeletionWorker::new(backend.clone(), None, None, "local").with_audit_sink(Some(sink.clone()));
+
+        // A key that is not yet due was never at risk, so it produces no record.
+        worker.sweep(&Zoned::now()).await;
+        assert!(
+            sink.records.lock().expect("sink lock").is_empty(),
+            "a key the sweep declined to touch must not be audited as a deletion"
+        );
+
+        worker.sweep(&after_window()).await;
+
+        let records = sink.records.lock().expect("sink lock");
+        assert_eq!(records.len(), 1, "the removal should be audited exactly once");
+        let record = &records[0];
+        assert_eq!(record.operation, crate::audit::KmsAuditOperation::DeleteKey);
+        assert_eq!(record.event, rustfs_s3_types::EventName::KmsKeyDeleted);
+        assert_eq!(record.outcome, crate::audit::KmsAuditOutcome::Success);
+        assert_eq!(record.key_id.as_deref(), Some(key_id.as_str()));
+        assert_eq!(record.backend, "local");
+        // Background work has no request principal to attribute.
+        assert_eq!(record.principal, OperationContext::INTERNAL_PRINCIPAL);
     }
 
     #[tokio::test]

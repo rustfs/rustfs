@@ -484,6 +484,20 @@ impl OperationContext {
         }
     }
 
+    /// Principal recorded for work the server starts on its own behalf.
+    ///
+    /// Namespaced so it can never collide with an access key or an IAM ARN,
+    /// which keeps "no human did this" distinguishable from "we lost track of
+    /// who did this" in the audit trail.
+    pub const INTERNAL_PRINCIPAL: &'static str = "rustfs:internal";
+
+    /// Context for an operation with no authenticated caller, such as
+    /// background maintenance or a call made while serving a data-plane
+    /// request that carries its own audit entry.
+    pub fn internal() -> Self {
+        Self::new(Self::INTERNAL_PRINCIPAL.to_string())
+    }
+
     /// Add additional context
     ///
     /// # Arguments
