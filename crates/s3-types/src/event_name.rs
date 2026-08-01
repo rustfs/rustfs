@@ -86,6 +86,20 @@ pub enum EventName {
     ObjectRemovedAbortMultipartUpload,
     ObjectCreatedCreateMultipartUpload,
     ObjectRemovedDeleteObjects,
+
+    // KMS management-plane events. They travel to the audit sink only and are
+    // never produced by the bucket notification path, so no compound `s3:`
+    // event expands to them. New variants must keep being appended here: the
+    // discriminant of every preceding variant is a `mask()` bit position, and
+    // inserting in the middle would silently renumber existing bits.
+    KmsKeyCreated,
+    KmsKeyRotated,
+    KmsKeyEnabled,
+    KmsKeyDisabled,
+    KmsKeyDeletionScheduled,
+    KmsKeyDeletionCancelled,
+    KmsKeyDeleted,
+    KmsKeyAccessed,
 }
 
 // Single event type sequential array for Everything.expand()
@@ -186,6 +200,17 @@ impl EventName {
             "s3:Scanner:LargeVersions" => Ok(EventName::ScannerLargeVersions),
             "s3:Scanner:BigPrefix" => Ok(EventName::ScannerBigPrefix),
             "s3:Scanner:*" => Ok(EventName::ObjectScannerAll),
+            // KMS events use their own namespace so a `s3:` wildcard in a bucket
+            // notification config can never select them. They still round-trip
+            // because audit entries are persisted and replayed by the store targets.
+            "kms:Key:Created" => Ok(EventName::KmsKeyCreated),
+            "kms:Key:Rotated" => Ok(EventName::KmsKeyRotated),
+            "kms:Key:Enabled" => Ok(EventName::KmsKeyEnabled),
+            "kms:Key:Disabled" => Ok(EventName::KmsKeyDisabled),
+            "kms:Key:DeletionScheduled" => Ok(EventName::KmsKeyDeletionScheduled),
+            "kms:Key:DeletionCancelled" => Ok(EventName::KmsKeyDeletionCancelled),
+            "kms:Key:Deleted" => Ok(EventName::KmsKeyDeleted),
+            "kms:Key:Accessed" => Ok(EventName::KmsKeyAccessed),
             // `Everything` has no string representation (`as_str` yields ""), so it
             // cannot be parsed back from a string. Every other variant round-trips.
             _ => Err(ParseEventNameError(s.to_string())),
@@ -251,6 +276,14 @@ impl EventName {
             EventName::ObjectRemovedAbortMultipartUpload => "s3:ObjectRemoved:AbortMultipartUpload",
             EventName::ObjectCreatedCreateMultipartUpload => "s3:ObjectCreated:CreateMultipartUpload",
             EventName::ObjectRemovedDeleteObjects => "s3:ObjectRemoved:DeleteObjects",
+            EventName::KmsKeyCreated => "kms:Key:Created",
+            EventName::KmsKeyRotated => "kms:Key:Rotated",
+            EventName::KmsKeyEnabled => "kms:Key:Enabled",
+            EventName::KmsKeyDisabled => "kms:Key:Disabled",
+            EventName::KmsKeyDeletionScheduled => "kms:Key:DeletionScheduled",
+            EventName::KmsKeyDeletionCancelled => "kms:Key:DeletionCancelled",
+            EventName::KmsKeyDeleted => "kms:Key:Deleted",
+            EventName::KmsKeyAccessed => "kms:Key:Accessed",
         }
     }
 
@@ -355,6 +388,25 @@ impl EventName {
                 | EventName::ObjectRemovedNoOP
                 | EventName::ObjectRemovedAbortMultipartUpload
                 | EventName::ObjectRemovedDeleteObjects
+        )
+    }
+
+    /// Returns `true` for KMS management-plane events.
+    ///
+    /// These are audit-only: they are never emitted through the bucket
+    /// notification pipeline, and no `s3:` event selector expands to them.
+    #[inline]
+    pub fn is_kms(&self) -> bool {
+        matches!(
+            self,
+            EventName::KmsKeyCreated
+                | EventName::KmsKeyRotated
+                | EventName::KmsKeyEnabled
+                | EventName::KmsKeyDisabled
+                | EventName::KmsKeyDeletionScheduled
+                | EventName::KmsKeyDeletionCancelled
+                | EventName::KmsKeyDeleted
+                | EventName::KmsKeyAccessed
         )
     }
 }
@@ -570,6 +622,26 @@ mod tests {
         EventName::ObjectRemovedAbortMultipartUpload,
         EventName::ObjectCreatedCreateMultipartUpload,
         EventName::ObjectRemovedDeleteObjects,
+        EventName::KmsKeyCreated,
+        EventName::KmsKeyRotated,
+        EventName::KmsKeyEnabled,
+        EventName::KmsKeyDisabled,
+        EventName::KmsKeyDeletionScheduled,
+        EventName::KmsKeyDeletionCancelled,
+        EventName::KmsKeyDeleted,
+        EventName::KmsKeyAccessed,
+    ];
+
+    /// Every KMS management-plane event.
+    const KMS_EVENT_NAMES: &[EventName] = &[
+        EventName::KmsKeyCreated,
+        EventName::KmsKeyRotated,
+        EventName::KmsKeyEnabled,
+        EventName::KmsKeyDisabled,
+        EventName::KmsKeyDeletionScheduled,
+        EventName::KmsKeyDeletionCancelled,
+        EventName::KmsKeyDeleted,
+        EventName::KmsKeyAccessed,
     ];
 
     /// Regression for backlog#965: `mask()` used to recurse forever for the
@@ -679,6 +751,54 @@ mod tests {
         ];
         for ev in not_removed {
             assert!(!ev.is_removed(), "{ev} should not be classified as a removal event");
+        }
+    }
+
+    /// KMS events are audit-plane only. No `s3:` selector — including the
+    /// catch-all `Everything` and every compound "All" type — may share a bit
+    /// with them, otherwise a bucket notification rule would silently start
+    /// matching KMS activity.
+    #[test]
+    fn test_kms_event_masks_are_disjoint_from_every_s3_selector() {
+        let s3_selectors: Vec<EventName> = ALL_EVENT_NAMES.iter().copied().filter(|ev| !ev.is_kms()).collect();
+
+        let mut seen = 0u64;
+        for kms in KMS_EVENT_NAMES {
+            let mask = kms.mask();
+            assert_ne!(mask, 0, "KMS event {kms} must have a non-zero mask");
+            assert_eq!(seen & mask, 0, "KMS event {kms} mask overlaps another KMS event");
+            seen |= mask;
+
+            for s3 in &s3_selectors {
+                assert_eq!(s3.mask() & mask, 0, "KMS event {kms} mask collides with S3 selector {s3}");
+            }
+        }
+    }
+
+    /// KMS event names must live in their own namespace so that neither a
+    /// `s3:` prefix filter nor an `s3:...:*` wildcard can select them.
+    #[test]
+    fn test_kms_event_names_are_outside_the_s3_namespace() {
+        for ev in KMS_EVENT_NAMES {
+            assert!(ev.is_kms(), "{ev} should be classified as a KMS event");
+            assert!(ev.as_str().starts_with("kms:"), "unexpected KMS event name {:?}", ev.as_str());
+            assert_eq!(EventName::parse(ev.as_str()).as_ref(), Ok(ev), "KMS event {ev} must round-trip");
+            assert_eq!(ev.expand(), vec![*ev], "KMS event {ev} must expand to itself only");
+        }
+
+        for ev in ALL_EVENT_NAMES.iter().filter(|ev| !ev.is_kms()) {
+            assert!(!ev.as_str().starts_with("kms:"), "{ev} must not claim the KMS namespace");
+        }
+    }
+
+    /// `mask()` shifts by `discriminant - 1`, so the enum may hold at most 64
+    /// mask-bearing variants. Appending past that overflows the shift instead
+    /// of failing loudly, so keep the budget check next to the variants.
+    #[test]
+    fn test_mask_bit_budget_is_not_exhausted() {
+        for ev in ALL_EVENT_NAMES {
+            let value = *ev as u32;
+            assert!(value <= 64, "{ev} has discriminant {value}; mask() only has 64 bits to hand out");
         }
     }
 

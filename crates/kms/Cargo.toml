@@ -64,6 +64,10 @@ md-5 = { workspace = true }
 arc-swap = { workspace = true }
 rustfs-utils = { workspace = true }
 rustfs-security-governance = { workspace = true }
+# `EventName` for KMS audit records. A leaf crate with no rustfs dependencies,
+# so the audit sink can live outside this crate without a second, drifting
+# copy of the event vocabulary.
+rustfs-s3-types = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }

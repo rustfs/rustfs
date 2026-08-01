@@ -22,6 +22,8 @@ mod pattern_rules_test;
 #[cfg(test)]
 mod pattern_test;
 mod rules_map;
+#[cfg(test)]
+mod rules_map_test;
 mod subscriber_index;
 mod subscriber_snapshot;
 mod target_id_set;
