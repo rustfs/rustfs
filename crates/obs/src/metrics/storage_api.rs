@@ -98,8 +98,10 @@ fn i32_to_u64_floor_zero(value: i32) -> u64 {
     u64::try_from(value.max(0)).unwrap_or(0)
 }
 
-fn replication_recent_backlog_count(queued_count: i64) -> u64 {
-    i64_to_u64_floor_zero(queued_count)
+fn replication_backlog_count(failed_counts: impl Iterator<Item = i64>, queued_count: i64) -> u64 {
+    let failed_backlog = failed_counts.map(i64_to_u64_floor_zero).sum::<u64>();
+
+    failed_backlog.saturating_add(i64_to_u64_floor_zero(queued_count))
 }
 
 pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketReplicationStatsSnapshot> {
@@ -199,7 +201,13 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
         .flat_map(|bucket| bucket.stats.values())
         .map(|stat| stat.xfer_rate_lrg.peak + stat.xfer_rate_sml.peak)
         .sum::<f64>();
-    let recent_backlog_count = replication_recent_backlog_count(site_metrics.queued.curr.count);
+    let recent_backlog_count = replication_backlog_count(
+        all_bucket_stats
+            .values()
+            .flat_map(|bucket| bucket.stats.values())
+            .map(|stat| stat.failed.count),
+        site_metrics.queued.curr.count,
+    );
 
     ObsReplicationSiteStatsSnapshot {
         average_active_workers: site_metrics.active_workers.avg,
@@ -231,13 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn replication_recent_backlog_count_uses_current_queue_only() {
-        assert_eq!(replication_recent_backlog_count(7), 7);
+    fn replication_backlog_count_uses_failed_targets_and_current_queue() {
+        assert_eq!(replication_backlog_count([3, 5].into_iter(), 7), 15);
     }
 
     #[test]
-    fn replication_recent_backlog_count_floors_negative_queue_values() {
-        assert_eq!(replication_recent_backlog_count(-2), 0);
+    fn replication_backlog_count_floors_negative_failed_and_queue_values() {
+        assert_eq!(replication_backlog_count([-3, 4].into_iter(), -2), 4);
+    }
+
+    #[test]
+    fn replication_backlog_count_keeps_legacy_failed_backlog_semantics() {
+        assert_eq!(replication_backlog_count([9].into_iter(), 0), 9);
     }
 }
 
