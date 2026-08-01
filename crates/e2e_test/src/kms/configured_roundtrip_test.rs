@@ -126,6 +126,51 @@ async fn assert_key_deletion_lifecycle(base_url: &str, access_key: &str, secret_
     assert_eq!(cancelled["success"], true);
     assert_eq!(cancelled["key_metadata"]["key_state"], "Enabled");
 
+    // A window outside 7-30 days is refused at the endpoint, whatever the
+    // backend: the bound is enforced once in the service, so no backend can
+    // stretch or skip it (rustfs/backlog#1585).
+    for days in [6, 31] {
+        let refused = kms_admin_request(
+            base_url,
+            http::Method::DELETE,
+            "/rustfs/admin/v3/kms/keys/delete",
+            Some(
+                &serde_json::json!({
+                    "key_id": key_id,
+                    "pending_window_in_days": days
+                })
+                .to_string(),
+            ),
+            access_key,
+            secret_key,
+        )
+        .await
+        .err()
+        .ok_or_else(|| format!("a {days}-day deletion window must be refused"))?;
+        assert!(
+            refused.to_string().contains("400 Bad Request"),
+            "a {days}-day deletion window must report a client error: {refused}"
+        );
+    }
+
+    // Immediate deletion is no longer reachable through the query string, so it
+    // fails before the service gate is even consulted.
+    let refused = kms_admin_request(
+        base_url,
+        http::Method::DELETE,
+        &format!("/rustfs/admin/v3/kms/keys/delete?keyId={key_id}&force_immediate=true"),
+        None,
+        access_key,
+        secret_key,
+    )
+    .await
+    .err()
+    .ok_or("immediate KMS key deletion must not be reachable through the query string")?;
+    assert!(
+        refused.to_string().contains("400 Bad Request"),
+        "a query-string immediate deletion must report a client error: {refused}"
+    );
+
     // A default server refuses to skip the waiting window (rustfs/backlog#1585):
     // immediate deletion is unrecoverable and takes every object encrypted under
     // the key with it, so the endpoint must reject it rather than honour it.
@@ -151,7 +196,7 @@ async fn assert_key_deletion_lifecycle(base_url: &str, access_key: &str, secret_
         "refused immediate deletion must report a client error: {refused}"
     );
 
-    // The refused request left the key alone, so the window-bounded path still
+    // The refused requests left the key alone, so the window-bounded path still
     // has something to schedule.
     let described = kms_admin_request(
         base_url,

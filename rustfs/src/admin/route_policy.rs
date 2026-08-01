@@ -766,11 +766,16 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reconfigure", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys", KMS_CONFIGURE, RouteRiskLevel::High),
+    // Critical rather than High: destroying a master key makes every object
+    // encrypted under it permanently unreadable, and nothing on the server can
+    // bring those objects back (rustfs/backlog#1585). The waiting window and
+    // cancel-deletion are the only recovery path, which is why the route below
+    // that reopens it stays merely High.
     admin(
         HttpMethod::Delete,
         "/rustfs/admin/v3/kms/keys/delete",
         KMS_DELETE_KEY,
-        RouteRiskLevel::High,
+        RouteRiskLevel::Critical,
     ),
     admin(
         HttpMethod::Post,
@@ -1880,6 +1885,39 @@ mod tests {
         }
     }
 
+    /// `Critical` marks the routes whose worst case is permanent loss of user
+    /// data, so the inventory is pinned in both directions: the KMS key
+    /// deletion route may not be quietly downgraded, and no other route may be
+    /// promoted without the same review.
+    #[test]
+    fn route_policy_reserves_critical_risk_for_unrecoverable_destruction() {
+        let critical = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .filter(|spec| spec.risk_level() == RouteRiskLevel::Critical)
+            .map(|spec| route_key(spec.method(), spec.path()))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            critical,
+            BTreeSet::from([route_key(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete")]),
+            "the Critical set changed; classify the new route deliberately or restore the old one"
+        );
+    }
+
+    /// The routes that recover from, or merely describe, a pending deletion are
+    /// not Critical: refusing them is what leaves an operator without a way
+    /// back.
+    #[test]
+    fn route_policy_keeps_kms_deletion_recovery_below_critical() {
+        for (method, path) in [
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+            (HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}"),
+            (HttpMethod::Get, "/rustfs/admin/v3/kms/keys"),
+        ] {
+            assert_risk_below_critical(method, path);
+        }
+    }
+
     /// Backup and restore expose the whole key inventory at once, so no other
     /// KMS action may reach them: holding `kms:Configure` or a per-key action
     /// must not be enough.
@@ -2037,6 +2075,14 @@ mod tests {
             .find(|spec| spec.method() == method && spec.path() == path)
             .expect("expected direct route policy");
         assert_ne!(spec.access().admin_action(), Some(action));
+    }
+
+    fn assert_risk_below_critical(method: HttpMethod, path: &str) {
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == method && spec.path() == path)
+            .expect("expected direct route policy");
+        assert_ne!(spec.risk_level(), RouteRiskLevel::Critical, "{path} must not be Critical");
     }
 
     fn assert_public(method: HttpMethod, path: &str, kind: PublicRouteKind) {

@@ -371,11 +371,13 @@ impl Operation for DescribeKeyHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, GenerateDataKeyApiRequest,
-        extract_key_id, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
-        kms_list_keys_actions, scoped_key_id,
+        CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, DeleteKmsKeyResponse,
+        GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id, kms_create_key_actions,
+        kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id,
     };
     use http::Uri;
+    use hyper::StatusCode;
+    use rustfs_kms::KmsError;
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use rustfs_policy::policy::{Args, Policy};
     use std::collections::HashMap;
@@ -461,6 +463,98 @@ mod tests {
             let err = result.expect_err("unknown KMS key request field should fail");
             assert!(err.to_string().contains("unknown field"));
         }
+    }
+
+    fn delete_query(query: &str) -> Result<DeleteKmsKeyRequest, DeleteKmsKeyResponse> {
+        let uri: Uri = format!("/rustfs/admin/v3/kms/keys/delete?{query}")
+            .parse()
+            .expect("uri should parse");
+        delete_request_from_query(&uri)
+    }
+
+    /// The query string can no longer ask for immediate deletion in any form
+    /// (rustfs/backlog#1585). Refusing beats downgrading to a scheduled
+    /// deletion: a caller who asked for destruction must not read the answer as
+    /// "destroyed".
+    #[test]
+    fn delete_query_cannot_request_immediate_deletion() {
+        for query in [
+            "keyId=key-a&force_immediate=true",
+            "keyId=key-a&force_immediate=True",
+            "keyId=key-a&force_immediate=1",
+            "keyId=key-a&force_immediate=",
+            "keyId=key-a&confirm_key_id=key-a",
+            "keyId=key-a&force_immediate=false&confirm_key_id=key-a",
+        ] {
+            let Err(refused) = delete_query(query) else {
+                panic!("{query} must be refused");
+            };
+            assert!(!refused.success, "{query} must not report success");
+            assert_eq!(refused.key_id, "key-a");
+            assert!(refused.deletion_date.is_none(), "{query} must not report a deletion date");
+            assert!(
+                refused.message.contains("JSON body"),
+                "{query} must point the caller at the body form: {}",
+                refused.message
+            );
+        }
+    }
+
+    /// The scheduled path keeps its query form, including the explicit
+    /// `force_immediate=false` some clients send.
+    #[test]
+    fn delete_query_still_schedules_a_deletion() {
+        for (query, expected_window) in [
+            ("keyId=key-a", None),
+            ("keyId=key-a&force_immediate=false", None),
+            ("keyId=key-a&pending_window_in_days=7", Some(7)),
+        ] {
+            let request = delete_query(query).expect("a scheduled deletion must still parse from the query");
+            assert_eq!(request.key_id, "key-a");
+            assert_eq!(request.pending_window_in_days, expected_window);
+            assert_eq!(request.force_immediate, None, "{query} must reach the service as scheduled");
+            assert_eq!(request.confirm_key_id, None, "{query} must not carry a confirmation");
+        }
+    }
+
+    #[test]
+    fn delete_query_without_a_key_id_is_refused() {
+        let uri: Uri = "/rustfs/admin/v3/kms/keys/delete".parse().expect("uri should parse");
+        let refused = delete_request_from_query(&uri).expect_err("a delete without a key must be refused");
+        assert!(refused.message.contains("keyId"));
+        assert!(refused.key_id.is_empty());
+    }
+
+    /// The body form still carries both immediate-deletion fields; the service
+    /// gate, not the transport, decides whether they are honoured.
+    #[test]
+    fn delete_body_still_carries_the_confirmation_fields() {
+        let request =
+            serde_json::from_str::<DeleteKmsKeyRequest>(r#"{"key_id":"key-a","force_immediate":true,"confirm_key_id":"key-a"}"#)
+                .expect("delete body should parse");
+
+        assert_eq!(request.force_immediate, Some(true));
+        assert_eq!(request.confirm_key_id.as_deref(), Some("key-a"));
+    }
+
+    /// A refused waiting window and a refused immediate deletion are the
+    /// caller's input to fix, so the endpoint answers 400 rather than blaming
+    /// the backend.
+    #[test]
+    fn refused_deletions_report_a_client_error() {
+        for error in [
+            KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30"),
+            KmsError::invalid_operation("immediate deletion of key key-a is not allowed"),
+            KmsError::validation_error("bad input"),
+        ] {
+            assert_eq!(delete_key_error_status(&error), StatusCode::BAD_REQUEST, "{error} must be a 400");
+        }
+
+        assert_eq!(delete_key_error_status(&KmsError::key_not_found("key-a")), StatusCode::NOT_FOUND);
+        assert_eq!(
+            delete_key_error_status(&KmsError::backend_error("vault is down")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -1043,6 +1137,66 @@ pub struct DeleteKmsKeyResponse {
     pub deletion_date: Option<String>,
 }
 
+const IMMEDIATE_DELETION_QUERY_RETIRED: &str = "immediate deletion is no longer accepted as a query parameter; send it as a JSON body with force_immediate and confirm_key_id set to the key id";
+
+/// Delete request carried entirely by the query string, which can only ever
+/// schedule a deletion.
+///
+/// Immediate deletion destroys key material outright and takes every object
+/// encrypted under the key with it, so it is reachable only through the JSON
+/// body form (rustfs/backlog#1585): a URL travels through shell history, proxy
+/// logs and browser bars, and asking for it there is far too easy to do by
+/// accident. An immediate-deletion attempt made this way is refused rather
+/// than downgraded to a scheduled deletion, so the caller cannot mistake one
+/// outcome for the other.
+fn delete_request_from_query(uri: &hyper::Uri) -> Result<DeleteKmsKeyRequest, DeleteKmsKeyResponse> {
+    let query_params = extract_query_params(uri);
+    let refuse = |key_id: &str, message: &str| DeleteKmsKeyResponse {
+        success: false,
+        message: message.to_string(),
+        key_id: key_id.to_string(),
+        deletion_date: None,
+    };
+
+    let Some(key_id) = query_params.get("keyId") else {
+        return Err(refuse("", "missing required parameter: 'keyId'"));
+    };
+
+    // `force_immediate=false` is the scheduled path spelled out, so it stays
+    // accepted; anything else in that parameter is an immediate-deletion
+    // attempt, including a value that does not parse as a boolean.
+    if query_params.get("force_immediate").is_some_and(|value| value != "false") || query_params.contains_key("confirm_key_id") {
+        return Err(refuse(key_id, IMMEDIATE_DELETION_QUERY_RETIRED));
+    }
+
+    Ok(DeleteKmsKeyRequest {
+        key_id: key_id.clone(),
+        pending_window_in_days: query_params.get("pending_window_in_days").and_then(|s| s.parse::<u32>().ok()),
+        force_immediate: None,
+        confirm_key_id: None,
+    })
+}
+
+/// Status for a deletion the KMS refused.
+///
+/// A rejected waiting window and a refused immediate deletion both arrive as
+/// [`KmsError::InvalidOperation`], and both are the caller's input to fix, so
+/// they must surface as 400 rather than as a server fault.
+fn delete_key_error_status(error: &KmsError) -> StatusCode {
+    match error {
+        KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
+        KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
+        // Damaged or missing key material is an integrity fault of an existing
+        // key: it must surface as a server error, never as NOT_FOUND (the key
+        // exists) and never as a retryable backend outage.
+        KmsError::MaterialMissing { .. }
+        | KmsError::MaterialCorrupt { .. }
+        | KmsError::MaterialAuthenticationFailed { .. }
+        | KmsError::UnsupportedFormatVersion { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Delete a KMS key
 pub struct DeleteKmsKeyHandler;
 
@@ -1081,31 +1235,15 @@ impl Operation for DeleteKmsKeyHandler {
         let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let request: DeleteKmsKeyRequest = if body.is_empty() {
-            let query_params = extract_query_params(&req.uri);
-            let Some(key_id) = query_params.get("keyId") else {
-                let response = DeleteKmsKeyResponse {
-                    success: false,
-                    message: "missing required parameter: 'keyId'".to_string(),
-                    key_id: "".to_string(),
-                    deletion_date: None,
-                };
-                let data =
-                    serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-                let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
-                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
-            };
-
-            // Extract pending_window_in_days and force_immediate from query parameters
-            let pending_window_in_days = query_params.get("pending_window_in_days").and_then(|s| s.parse::<u32>().ok());
-            let force_immediate = query_params.get("force_immediate").and_then(|s| s.parse::<bool>().ok());
-            let confirm_key_id = query_params.get("confirm_key_id").map(|s| s.to_string());
-
-            DeleteKmsKeyRequest {
-                key_id: key_id.clone(),
-                pending_window_in_days,
-                force_immediate,
-                confirm_key_id,
+            match delete_request_from_query(&req.uri) {
+                Ok(request) => request,
+                Err(response) => {
+                    let data = serde_json::to_vec(&response)
+                        .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
+                    return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+                }
             }
         } else {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
@@ -1183,18 +1321,7 @@ impl Operation for DeleteKmsKeyHandler {
                     error = %e,
                     "admin kms keys state"
                 );
-                let status = match &e {
-                    KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
-                    KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
-                    // Damaged or missing key material is an integrity fault of an existing
-                    // key: it must surface as a server error, never as NOT_FOUND (the key
-                    // exists) and never as a retryable backend outage.
-                    KmsError::MaterialMissing { .. }
-                    | KmsError::MaterialCorrupt { .. }
-                    | KmsError::MaterialAuthenticationFailed { .. }
-                    | KmsError::UnsupportedFormatVersion { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-                    _ => StatusCode::INTERNAL_SERVER_ERROR,
-                };
+                let status = delete_key_error_status(&e);
                 let response = DeleteKmsKeyResponse {
                     success: false,
                     message: format!("Failed to delete key: {e}"),

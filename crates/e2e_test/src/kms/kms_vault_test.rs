@@ -417,6 +417,22 @@ async fn test_vault_kms_key_crud(
 
     info!("✅ Read: Successfully listed keys, found test key");
 
+    // A waiting window outside 7-30 days is refused at the endpoint for this
+    // backend too: the bound is enforced once in the service (rustfs/backlog#1585).
+    for days in [6, 31] {
+        let window_error = crate::common::execute_awscurl(
+            &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}&pending_window_in_days={days}"),
+            "DELETE",
+            None,
+            access_key,
+            secret_key,
+        )
+        .await
+        .err()
+        .ok_or_else(|| format!("A {days}-day deletion window must be refused"))?;
+        info!("✅ Delete window {} correctly refused: {}", days, window_error);
+    }
+
     // Delete
     let delete_response = crate::common::execute_awscurl(
         &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}"),
@@ -449,9 +465,10 @@ async fn test_vault_kms_key_crud(
 
     info!("✅ Delete verification: Key state correctly changed to: {}", key_state);
 
-    // Force Delete - a default server refuses to skip the waiting window
-    // (rustfs/backlog#1585): destroying the key material immediately would take
-    // every object encrypted under the key with it.
+    // Force Delete - the query string can no longer ask for immediate deletion,
+    // and a default server refuses it in any case (rustfs/backlog#1585):
+    // destroying the key material immediately would take every object encrypted
+    // under the key with it.
     let force_delete_error = crate::common::execute_awscurl(
         &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}&force_immediate=true"),
         "DELETE",

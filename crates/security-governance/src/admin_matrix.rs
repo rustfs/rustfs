@@ -63,6 +63,14 @@ pub enum RouteRiskLevel {
     Normal,
     Sensitive,
     High,
+    /// A single authorized request can destroy stored data beyond every
+    /// recovery path the server offers — no undo, no waiting window, no
+    /// backup taken on the caller's behalf.
+    ///
+    /// This is deliberately narrower than [`Self::High`], which covers routes
+    /// that change state an operator can put back. Reserve it for routes whose
+    /// worst case is permanent loss of user data.
+    Critical,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
