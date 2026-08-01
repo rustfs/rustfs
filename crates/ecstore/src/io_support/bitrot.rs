@@ -19,7 +19,9 @@ use crate::diagnostics::get::{
     GET_STAGE_READER_MMAP_PATH_RESOLVE, GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS,
     GET_STAGE_READER_OPEN_STREAM, GET_STAGE_READER_STREAM_FIRST_READ, record_get_stage_duration_if_enabled,
 };
-use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, FileWriter, MmapCopyStageMetrics, error::DiskError};
+#[cfg(feature = "hotpath")]
+use crate::disk::FileWriter;
+use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, MmapCopyStageMetrics, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_config::{
@@ -36,7 +38,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::debug;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hotpath"))]
 tokio::task_local! {
     static FORCE_MMAP_COPY_FAILURE_FOR_TEST: ();
 }
@@ -366,14 +368,14 @@ async fn open_disk_reader(
             direct_read_copy_stage: GET_STAGE_READER_MMAP_DIRECT_READ_COPY,
         });
         let mmap_result = {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "hotpath"))]
             if FORCE_MMAP_COPY_FAILURE_FOR_TEST.try_with(|_| ()).is_ok() {
                 Err(DiskError::other("forced mmap-copy failure for test"))
             } else {
                 disk.read_file_mmap_copy_with_metrics(bucket, path, offset, length, mmap_metrics)
                     .await
             }
-            #[cfg(not(test))]
+            #[cfg(not(all(test, feature = "hotpath")))]
             {
                 disk.read_file_mmap_copy_with_metrics(bucket, path, offset, length, mmap_metrics)
                     .await
@@ -414,10 +416,11 @@ async fn open_disk_reader(
                 }
 
                 return match stream_result {
-                    Ok(reader) => Ok(wrap_first_read_metrics(
-                        instrument_raw_shard_reader(reader, disk.is_local()),
-                        metrics_path,
-                    )),
+                    Ok(reader) => {
+                        #[cfg(feature = "hotpath")]
+                        let reader = instrument_raw_shard_reader(reader, disk.is_local());
+                        Ok(wrap_first_read_metrics(reader, metrics_path))
+                    }
                     Err(_) => Err(err),
                 };
             }
@@ -425,7 +428,9 @@ async fn open_disk_reader(
     }
 
     let stream_start = stage_metrics_enabled.then(Instant::now);
-    let reader = instrument_raw_shard_reader(disk.read_file_stream(bucket, path, offset, length).await?, disk.is_local());
+    let reader = disk.read_file_stream(bucket, path, offset, length).await?;
+    #[cfg(feature = "hotpath")]
+    let reader = instrument_raw_shard_reader(reader, disk.is_local());
     if let Some(metrics_path) = metrics_path {
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_OPEN_STREAM, stream_start);
     }
@@ -467,11 +472,6 @@ fn instrument_raw_shard_reader(reader: FileReader, is_local: bool) -> FileReader
     }
 }
 
-#[cfg(not(feature = "hotpath"))]
-fn instrument_raw_shard_reader(reader: FileReader, _is_local: bool) -> FileReader {
-    reader
-}
-
 #[cfg(feature = "hotpath")]
 fn instrument_raw_shard_writer(writer: FileWriter, is_local: bool) -> FileWriter {
     // `io!` aggregates by call site, so the local and remote branches must remain distinct.
@@ -480,11 +480,6 @@ fn instrument_raw_shard_writer(writer: FileWriter, is_local: bool) -> FileWriter
     } else {
         Box::new(hotpath::io!(writer, label = RAW_SHARD_WRITE_REMOTE_LABEL))
     }
-}
-
-#[cfg(not(feature = "hotpath"))]
-fn instrument_raw_shard_writer(writer: FileWriter, _is_local: bool) -> FileWriter {
-    writer
 }
 
 fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksum_algo: HashAlgorithm) -> (usize, usize) {
@@ -745,7 +740,9 @@ pub async fn create_bitrot_writer(
             0
         };
 
-        let file = instrument_raw_shard_writer(disk.create_file("", volume, path, length).await?, disk.is_local());
+        let file = disk.create_file("", volume, path, length).await?;
+        #[cfg(feature = "hotpath")]
+        let file = instrument_raw_shard_writer(file, disk.is_local());
         CustomWriter::new_tokio_writer(file)
     } else {
         return Err(DiskError::DiskNotFound);
@@ -758,17 +755,22 @@ pub async fn create_bitrot_writer(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "hotpath")]
     use crate::cluster::rpc::RemoteDisk;
+    #[cfg(feature = "hotpath")]
     use crate::cluster::rpc::internode_data_transport::{
         InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
     };
+    #[cfg(feature = "hotpath")]
     use crate::disk::{Disk, DiskOption, error::Result};
 
+    #[cfg(feature = "hotpath")]
     #[derive(Debug, Clone, Default)]
     struct TestRemoteDataTransport {
         bytes: Arc<Mutex<Vec<u8>>>,
     }
 
+    #[cfg(feature = "hotpath")]
     impl TestRemoteDataTransport {
         fn bytes(&self) -> Vec<u8> {
             self.bytes
@@ -778,11 +780,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "hotpath")]
     #[derive(Debug)]
     struct TestRemoteWriter {
         bytes: Arc<Mutex<Vec<u8>>>,
     }
 
+    #[cfg(feature = "hotpath")]
     impl tokio::io::AsyncWrite for TestRemoteWriter {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
             self.bytes
@@ -801,6 +805,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "hotpath")]
     #[async_trait::async_trait]
     impl InternodeDataTransport for TestRemoteDataTransport {
         async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
@@ -849,6 +854,7 @@ mod tests {
         (disk, dir)
     }
 
+    #[cfg(feature = "hotpath")]
     async fn remote_test_disk() -> (DiskStore, TestRemoteDataTransport) {
         use crate::disk::endpoint::Endpoint;
 
