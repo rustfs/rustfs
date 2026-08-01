@@ -104,7 +104,9 @@ pub(crate) fn classify_vaultrs(error: &vaultrs::error::ClientError) -> ErrorClas
     }
 }
 
-fn classify_status(code: u16) -> ErrorClass {
+/// Retry classification of an HTTP status, shared by every backend that talks
+/// to an external KMS over HTTP.
+pub(crate) fn classify_status(code: u16) -> ErrorClass {
     match code {
         429 | 500 | 502 | 503 | 504 => ErrorClass::RetryableStatus,
         _ => ErrorClass::Fatal,

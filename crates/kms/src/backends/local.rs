@@ -1386,7 +1386,8 @@ impl LocalKmsBackend {
             crate::config::BackendConfig::Local(local_config) => local_config.clone(),
             crate::config::BackendConfig::VaultKv2(_)
             | crate::config::BackendConfig::VaultTransit(_)
-            | crate::config::BackendConfig::Static(_) => {
+            | crate::config::BackendConfig::Static(_)
+            | crate::config::BackendConfig::Aws(_) => {
                 return Err(KmsError::configuration_error("Expected Local backend configuration"));
             }
         };

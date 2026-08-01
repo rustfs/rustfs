@@ -53,6 +53,7 @@ fn backend_name(backend: &KmsBackend) -> &'static str {
         KmsBackend::VaultKv2 => "vault-kv2",
         KmsBackend::VaultTransit => "vault-transit",
         KmsBackend::Static => "static",
+        KmsBackend::Aws => "aws",
     }
 }
 
