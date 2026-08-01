@@ -492,13 +492,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn the_kms_readiness_check_stays_opt_in() {
-        assert!(
-            !rustfs_config::DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE,
-            "flipping this default is a deployment behaviour change, not a code change"
-        );
-    }
+    /// Flipping this default is a deployment behaviour change, not a code
+    /// change: it would start failing readiness on clusters that never asked
+    /// for the KMS to gate it. Pinned at compile time so the constant cannot
+    /// drift without this line being edited too.
+    const _: () = assert!(!rustfs_config::DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE);
 
     #[test]
     #[serial]
