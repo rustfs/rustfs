@@ -82,6 +82,14 @@ pub struct KmsStatusResponse {
 pub struct CacheStatsResponse {
     pub hit_count: u64,
     pub miss_count: u64,
+    /// Entries currently cached. Additive field: omitted by older servers, so
+    /// it must stay defaulted for consumers.
+    #[serde(default)]
+    pub entry_count: u64,
+    /// Entries dropped since process start, whatever the cause. Additive
+    /// field, same compatibility rule as `entry_count`.
+    #[serde(default)]
+    pub eviction_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,9 +201,11 @@ impl Operation for KmsStatusHandler {
             }
         };
 
-        let cache_stats = service.cache_stats().await.map(|(hits, misses)| CacheStatsResponse {
-            hit_count: hits,
-            miss_count: misses,
+        let cache_stats = service.cache_stats().await.map(|stats| CacheStatsResponse {
+            hit_count: stats.hits,
+            miss_count: stats.misses,
+            entry_count: stats.entries,
+            eviction_count: stats.evictions,
         });
         let config = kms_service_manager_from_context().get_redacted_config().await;
 

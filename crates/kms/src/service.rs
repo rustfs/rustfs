@@ -14,6 +14,7 @@
 
 //! Object encryption service for S3-compatible encryption
 
+use crate::cache::KmsCacheStats;
 use crate::encryption::ciphers::{create_cipher, generate_iv};
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
@@ -207,9 +208,9 @@ impl ObjectEncryptionService {
     /// Get cache statistics
     ///
     /// # Returns
-    /// Option with (hits, misses) if caching is enabled
+    /// A [`KmsCacheStats`] snapshot if caching is enabled, `None` otherwise
     ///
-    pub async fn cache_stats(&self) -> Option<(u64, u64)> {
+    pub async fn cache_stats(&self) -> Option<KmsCacheStats> {
         self.kms_manager.cache_stats().await
     }
 
