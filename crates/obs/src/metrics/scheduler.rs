@@ -80,7 +80,8 @@ use crate::metrics::runtime_sources::bucket_monitor_available;
 use crate::metrics::schema::audit::{AUDIT_FAILED_MESSAGES_MD, AUDIT_TARGET_QUEUE_LENGTH_MD, AUDIT_TOTAL_MESSAGES_MD};
 use crate::metrics::schema::bucket_replication::{
     BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD,
-    BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
+    BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD,
+    BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
     BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD,
     BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD, BUCKET_REPL_MRF_FLUSH_FAILURES_MD,
     BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD, BUCKET_REPL_MRF_MISSED_COUNT_MD, BUCKET_REPL_MRF_PENDING_BYTES_MD,
@@ -638,7 +639,7 @@ fn repl_backlog_target_live_keys(stats: &[BucketReplicationBacklogStats]) -> Has
     stats
         .iter()
         .flat_map(|stat| {
-            stat.durable_mrf_targets
+            stat.target_backlogs
                 .iter()
                 .map(|target| (stat.bucket.clone(), target.target_arn.clone()))
         })
@@ -1077,10 +1078,20 @@ fn collect_repl_backlog_target_zero_tombstone_metrics(zero_tombstones: &HashMap<
         return Vec::new();
     }
 
-    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 2);
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
     for (bucket, target_arn) in zero_tombstones.keys() {
         let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
         let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, 0.0)
                 .with_label(BUCKET_L, bucket_label.clone())
@@ -1130,7 +1141,9 @@ fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> u
         (BUCKET_L, Cow::Owned(bucket.to_string())),
         (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
     ];
-    retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(), &labels)
+    retire_metric_series(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(), &labels)
 }
 
@@ -1151,10 +1164,10 @@ fn expire_repl_backlog_zero_tombstones(monitor_available: bool, zero_tombstones:
 }
 
 fn expire_repl_backlog_target_zero_tombstones(
-    durable_mrf_available: bool,
+    target_metrics_available: bool,
     zero_tombstones: &mut HashMap<ReplBwKey, u8>,
 ) -> Vec<ReplBwKey> {
-    if !durable_mrf_available {
+    if !target_metrics_available {
         return Vec::new();
     }
 
@@ -1489,6 +1502,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
                             let (bucket_replication, bucket_replication_backlog) = collect_bucket_replication_stats_bundle().await;
                             let durable_mrf_available = bucket_replication_backlog.iter().any(|stat| stat.durable_mrf_available);
+                            let backlog_target_metrics_available =
+                                durable_mrf_available || monitor_available || !bucket_replication_backlog.is_empty();
                             update_repl_backlog_zero_tombstones(
                                 monitor_available,
                                 &mut has_seen_valid_backlog_snapshot,
@@ -1497,7 +1512,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 repl_backlog_live_keys(&bucket_replication_backlog),
                                 repl_bw_zero_tombstone_cycles,
                             );
-                            if durable_mrf_available {
+                            if backlog_target_metrics_available {
                                 update_series_zero_tombstones(
                                     &mut has_seen_valid_backlog_target_snapshot,
                                     &mut prev_backlog_target_live_keys,
@@ -1522,7 +1537,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 let _ = retire_repl_backlog_metric_series(&bucket);
                             }
                             for (bucket, target_arn) in expire_repl_backlog_target_zero_tombstones(
-                                durable_mrf_available,
+                                backlog_target_metrics_available,
                                 &mut backlog_target_zero_tombstones,
                             ) {
                                 let _ = retire_repl_backlog_target_metric_series(&bucket, &target_arn);
@@ -2357,8 +2372,10 @@ mod tests {
         assert_eq!(zero_tombstones.get(&key), Some(&2));
 
         let metrics = collect_repl_backlog_target_zero_tombstone_metrics(&zero_tombstones);
-        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics.len(), 4);
         let expected_names = HashSet::from([
+            BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(),
             BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(),
             BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(),
         ]);
@@ -2386,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn repl_backlog_target_tombstones_do_not_advance_when_durable_mrf_unavailable() {
+    fn repl_backlog_target_tombstones_do_not_advance_when_target_metrics_unavailable() {
         let key = repl_bw_key("videos", "arn:rustfs:replication:target-b");
         let mut zero_tombstones = HashMap::from([(key.clone(), 1)]);
 

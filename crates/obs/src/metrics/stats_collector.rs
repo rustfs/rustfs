@@ -212,11 +212,13 @@ async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, 
             mrf_missed_count: stats.mrf_missed_count,
             mrf_flush_failures: stats.mrf_flush_failures,
             mrf_last_flush_duration_millis: stats.mrf_last_flush_duration_millis,
-            durable_mrf_targets: stats
-                .durable_mrf_targets
+            target_backlogs: stats
+                .target_backlogs
                 .iter()
                 .map(|target| BucketReplicationTargetBacklogStats {
                     target_arn: target.target_arn.clone(),
+                    current_backlog_count: target.current_backlog_count,
+                    current_backlog_bytes: target.current_backlog_bytes,
                     durable_mrf_backlog_count: target.durable_mrf_backlog_count,
                     durable_mrf_backlog_bytes: target.durable_mrf_backlog_bytes,
                 })

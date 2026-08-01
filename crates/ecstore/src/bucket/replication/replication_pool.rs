@@ -760,6 +760,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
+        let target_arns = ri.dsc.replicate_target_arns();
         // If object is large, queue it to a static set of large workers
         if should_queue_large_object(ri.size) {
             use std::collections::hash_map::DefaultHasher;
@@ -776,10 +777,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
                 if let Some(worker) = lrg_workers.get(index) {
                     self.stats.inc_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+                    self.stats.inc_target_q(&ri.bucket, &target_arns, ri.size);
                     if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
                         return ReplicationQueueAdmission::Queued;
                     }
                     self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+                    self.stats.dec_target_q(&ri.bucket, &target_arns, ri.size);
 
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
@@ -808,10 +811,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         };
 
         self.stats.inc_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+        self.stats.inc_target_q(&ri.bucket, &target_arns, ri.size);
         if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
             return ReplicationQueueAdmission::Queued;
         }
         self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+        self.stats.dec_target_q(&ri.bucket, &target_arns, ri.size);
 
         // Queue to MRF if all workers are busy.
         let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "object").await;
@@ -825,6 +830,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica delete task
     pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
+        let target_arns = if doi.target_arn.is_empty() {
+            Vec::new()
+        } else {
+            vec![doi.target_arn.clone()]
+        };
         let ch = self
             .worker_queue_channel(&doi.op_type, &doi.bucket, &doi.delete_object.object_name, 0)
             .await;
@@ -834,10 +844,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         };
 
         self.stats.inc_q(&doi.bucket, 0, true, doi.op_type);
+        self.stats.inc_target_q(&doi.bucket, &target_arns, 0);
         if channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_ok() {
             return ReplicationQueueAdmission::Queued;
         }
         self.stats.dec_q(&doi.bucket, 0, true, doi.op_type);
+        self.stats.dec_target_q(&doi.bucket, &target_arns, 0);
 
         let admission = self.queue_mrf_save_admission(doi.to_mrf_entry(), "delete").await;
 
@@ -856,9 +868,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let bucket = entry.bucket.clone();
         let size = entry.size;
         let is_delete = matches!(entry.op, MrfOpKind::Delete);
+        let target_arns = entry.target_arns.clone();
         let admission = queue_mrf_save_entry(&self.mrf_save_tx, entry, queue_type).await;
         if admission == ReplicationQueueAdmission::Queued {
             self.stats.inc_q(&bucket, size, is_delete, ReplicationType::Heal);
+            self.stats.inc_target_q(&bucket, &target_arns, size);
         }
         admission
     }
@@ -1534,6 +1548,7 @@ struct ReplicationBacklogGuard {
     size: i64,
     is_delete_marker: bool,
     op_type: ReplicationType,
+    target_arns: Vec<String>,
 }
 
 impl ReplicationBacklogGuard {
@@ -1544,16 +1559,23 @@ impl ReplicationBacklogGuard {
             size: object.size,
             is_delete_marker: object.delete_marker,
             op_type: object.op_type,
+            target_arns: object.dsc.replicate_target_arns(),
         }
     }
 
     fn for_delete(stats: Arc<ReplicationStats>, delete: &DeletedObjectReplicationInfo) -> Self {
+        let target_arns = if delete.target_arn.is_empty() {
+            Vec::new()
+        } else {
+            vec![delete.target_arn.clone()]
+        };
         Self {
             stats,
             bucket: delete.bucket.clone(),
             size: 0,
             is_delete_marker: true,
             op_type: delete.op_type,
+            target_arns,
         }
     }
 }
@@ -1561,6 +1583,7 @@ impl ReplicationBacklogGuard {
 impl Drop for ReplicationBacklogGuard {
     fn drop(&mut self) {
         self.stats.dec_q(&self.bucket, self.size, self.is_delete_marker, self.op_type);
+        self.stats.dec_target_q(&self.bucket, &self.target_arns, self.size);
     }
 }
 
@@ -1607,6 +1630,7 @@ async fn queue_mrf_save_entry(
 fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
     for entry in entries {
         stats.dec_q(&entry.bucket, entry.size, matches!(entry.op, MrfOpKind::Delete), ReplicationType::Heal);
+        stats.dec_target_q(&entry.bucket, &entry.target_arns, entry.size);
     }
 }
 
@@ -1998,6 +2022,7 @@ async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> Replica
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
     use super::super::replication_resync_boundary::{decode_mrf_file, encode_mrf_file, encode_resync_file};
     use super::super::replication_storage_boundary::{
         DeletedObject, FileInfo, GetObjectReader, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, PutObjReader,
@@ -2343,6 +2368,22 @@ mod tests {
         (stats.replication_stats.q_stat.curr.count, stats.replication_stats.q_stat.curr.bytes)
     }
 
+    fn current_target_queue(pool: &ReplicationPool<LoadResyncNodeStore>, bucket: &str, target_arn: &str) -> Option<(u64, u64)> {
+        pool.stats
+            .runtime_target_backlog_snapshot()
+            .into_iter()
+            .find(|target| target.bucket == bucket && target.target_arn == target_arn)
+            .map(|target| (target.count, target.bytes))
+    }
+
+    fn test_replicate_decision(target_arns: &[&str]) -> ReplicateDecision {
+        let mut decision = ReplicateDecision::default();
+        for target_arn in target_arns {
+            decision.set(ReplicateTargetDecision::new((*target_arn).to_string(), true, false));
+        }
+        decision
+    }
+
     async fn wait_for_current_queue(pool: &ReplicationPool<LoadResyncNodeStore>, bucket: &str, expected: (i64, i64)) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -2374,6 +2415,35 @@ mod tests {
 
         assert_eq!(admission, ReplicationQueueAdmission::Queued);
         assert_eq!(current_queue(&pool, "admission-bucket").await, (1, 4096));
+    }
+
+    #[tokio::test]
+    async fn regular_worker_admission_counts_target_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "target-admission-bucket".to_string(),
+                name: "object".to_string(),
+                size: 4096,
+                op_type: ReplicationType::Object,
+                dsc: test_replicate_decision(&["arn:rustfs:replication:target-b", "arn:rustfs:replication:target-a"]),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "target-admission-bucket").await, (1, 4096));
+        assert_eq!(
+            current_target_queue(&pool, "target-admission-bucket", "arn:rustfs:replication:target-a"),
+            Some((1, 4096))
+        );
+        assert_eq!(
+            current_target_queue(&pool, "target-admission-bucket", "arn:rustfs:replication:target-b"),
+            Some((1, 4096))
+        );
     }
 
     #[tokio::test]
@@ -2417,6 +2487,33 @@ mod tests {
 
         assert_eq!(admission, ReplicationQueueAdmission::Queued);
         assert_eq!(current_queue(&pool, "delete-admission-bucket").await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn delete_admission_counts_target_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_delete_task(DeletedObjectReplicationInfo {
+                bucket: "delete-target-admission-bucket".to_string(),
+                target_arn: "arn:rustfs:replication:target-a".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "deleted-object".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "delete-target-admission-bucket").await, (1, 0));
+        assert_eq!(
+            current_target_queue(&pool, "delete-target-admission-bucket", "arn:rustfs:replication:target-a"),
+            Some((1, 0))
+        );
     }
 
     #[tokio::test]
@@ -2785,6 +2882,7 @@ mod tests {
                 name: "fallback-object".to_string(),
                 size: 2048,
                 op_type: ReplicationType::Object,
+                dsc: test_replicate_decision(&["arn:rustfs:replication:target-a"]),
                 ..Default::default()
             })
             .await;
@@ -2793,6 +2891,10 @@ mod tests {
         let queued = pool.stats.get_latest_replication_stats("runtime-backlog").await;
         assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
         assert_eq!(queued.replication_stats.q_stat.curr.bytes, 2048);
+        assert_eq!(
+            current_target_queue(&pool, "runtime-backlog", "arn:rustfs:replication:target-a"),
+            Some((1, 2048))
+        );
     }
 
     #[test]
@@ -2931,12 +3033,14 @@ mod tests {
     async fn replication_backlog_guard_decrements_on_drop() {
         let stats = Arc::new(ReplicationStats::new());
         stats.inc_q("guard-bucket", 256, false, ReplicationType::Object);
+        stats.inc_target_q("guard-bucket", &["arn:rustfs:replication:target-a".to_string()], 256);
 
         {
             let object = ReplicateObjectInfo {
                 bucket: "guard-bucket".to_string(),
                 size: 256,
                 op_type: ReplicationType::Object,
+                dsc: test_replicate_decision(&["arn:rustfs:replication:target-a"]),
                 ..Default::default()
             };
             let _guard = ReplicationBacklogGuard::for_object(stats.clone(), &object);
@@ -2945,6 +3049,30 @@ mod tests {
         let queued = stats.get_latest_replication_stats("guard-bucket").await;
         assert_eq!(queued.replication_stats.q_stat.curr.count, 0);
         assert_eq!(queued.replication_stats.q_stat.curr.bytes, 0);
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn dec_mrf_entries_decrements_target_backlog() {
+        let stats = ReplicationStats::new();
+        let entry = MrfReplicateEntry {
+            bucket: "mrf-target-drain-bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 1024,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: vec!["arn:rustfs:replication:target-a".to_string()],
+        };
+
+        stats.inc_q(&entry.bucket, entry.size, false, ReplicationType::Heal);
+        stats.inc_target_q(&entry.bucket, &entry.target_arns, entry.size);
+        dec_mrf_entries(&stats, std::slice::from_ref(&entry));
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
     }
 
     #[test]
