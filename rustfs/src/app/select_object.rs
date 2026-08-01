@@ -129,15 +129,13 @@ async fn send_select_events(
         return;
     }
 
-    loop {
-        let result = tokio::select! {
-            biased;
-            _ = tx.closed() => return,
-            result = output.next() => result,
-        };
-        let Some(result) = result else {
-            break;
-        };
+    let receiver_closed = tx.closed();
+    tokio::pin!(receiver_closed);
+    while let Some(result) = tokio::select! {
+        biased;
+        _ = &mut receiver_closed => return,
+        result = output.next() => result,
+    } {
         let batch = match result {
             Ok(batch) => batch,
             Err(err) => {
@@ -831,6 +829,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn producer_preserves_finite_stream_terminal_events() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![datafusion::arrow::datatypes::Field::new(
+            "value",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        )]));
+        let batch = |value| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::StringArray::from(vec![value]))])
+                .expect("test record batch should be valid")
+        };
+        let batches = [Ok(batch("a")), Ok(batch("b"))];
+        let output = Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::iter(batches)));
+        let (tx, mut rx) = mpsc::channel(8);
+        let validation = SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        };
+
+        send_select_events(output, &tx, validation).await;
+        drop(tx);
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        for expected in [b"a\n".as_slice(), b"b\n".as_slice()] {
+            let Some(Ok(SelectObjectContentEvent::Records(records))) = rx.recv().await else {
+                panic!("producer should emit a records event for each batch");
+            };
+            assert_eq!(records.payload.as_deref(), Some(expected));
+        }
+        let Some(Ok(SelectObjectContentEvent::Stats(stats))) = rx.recv().await else {
+            panic!("producer should emit final stats");
+        };
+        assert_eq!(stats.details.and_then(|details| details.bytes_returned), Some(4));
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::End(_)))));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn producer_drops_query_stream_when_receiver_closes() {
         let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let output = Box::pin(RecordBatchStreamAdapter::new(
@@ -841,33 +876,59 @@ mod tests {
             }),
         ));
         let (tx, mut rx) = mpsc::channel(2);
-        let terminal_permit = tx
-            .clone()
-            .try_reserve_owned()
-            .expect("test channel should reserve terminal capacity");
         let validation = SelectValidation {
             output_format: SelectOutputFormat::Csv(CSVOutput::default()),
             progress_enabled: false,
         };
-        let mut producer = tokio::spawn(send_select_events_until_deadline(
-            output,
-            tx,
-            terminal_permit,
-            validation,
-            Instant::now() + std::time::Duration::from_secs(300),
-            300,
-        ));
+        let producer = send_select_events(output, &tx, validation);
+        tokio::pin!(producer);
 
+        assert!(futures::poll!(producer.as_mut()).is_pending());
         assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
         drop(rx);
 
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut producer)
-            .await
-            .expect("producer should observe the closed receiver")
-            .expect("producer task should complete successfully");
+        assert!(
+            futures::poll!(producer.as_mut()).is_ready(),
+            "producer should observe the closed receiver"
+        );
         assert!(
             stream_dropped_rx.await.is_err(),
             "query stream should be dropped when the receiver closes"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn producer_prefers_closed_receiver_over_ready_query_stream() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stream_polled_tx, stream_polled_rx) = tokio::sync::oneshot::channel::<()>();
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::once(async move {
+                ready_rx.await.expect("test should release the query stream");
+                let _ = stream_polled_tx.send(());
+                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+            }),
+        ));
+        let (tx, mut rx) = mpsc::channel(2);
+        let validation = SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        };
+        let producer = send_select_events(output, &tx, validation);
+        tokio::pin!(producer);
+
+        assert!(futures::poll!(producer.as_mut()).is_pending());
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        drop(rx);
+        ready_tx.send(()).expect("test should make the query stream ready");
+
+        assert!(
+            futures::poll!(producer.as_mut()).is_ready(),
+            "producer should prioritize the closed receiver"
+        );
+        assert!(
+            stream_polled_rx.await.is_err(),
+            "closed receiver should win before the ready query stream is consumed"
         );
     }
 
