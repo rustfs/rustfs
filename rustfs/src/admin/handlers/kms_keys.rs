@@ -19,6 +19,7 @@ use crate::admin::auth::{validate_admin_request, validate_admin_request_with_kms
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::kms_deletion_gate::current_key_impact;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
@@ -372,12 +373,13 @@ impl Operation for DescribeKeyHandler {
 mod tests {
     use super::{
         CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, DeleteKmsKeyResponse,
-        GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id, kms_create_key_actions,
-        kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id,
+        DescribeKmsKeyResponse, GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id,
+        kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
+        kms_list_keys_actions, scoped_key_id,
     };
     use http::Uri;
     use hyper::StatusCode;
-    use rustfs_kms::KmsError;
+    use rustfs_kms::{KeyImpactReport, KeyReference, KeyReferenceKind, KmsError, ReferenceScope};
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use rustfs_policy::policy::{Args, Policy};
     use std::collections::HashMap;
@@ -555,6 +557,15 @@ mod tests {
             delete_key_error_status(&KmsError::backend_error("vault is down")),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A key the deployment still points at is refused with 409, not 400: the
+    /// request is well formed and the key exists, and what has to change to
+    /// make it succeed is the configuration, not the request.
+    #[test]
+    fn a_still_referenced_key_reports_a_conflict() {
+        let error = KmsError::key_still_referenced("key-a", vec!["bucket:sse-bucket".to_string()]);
+        assert_eq!(delete_key_error_status(&error), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -792,6 +803,101 @@ mod tests {
                 !block.contains("validate_admin_request_with_kms_key("),
                 "{handler} has no target key and must not claim a KMS resource scope"
             );
+        }
+    }
+
+    fn referenced_impact() -> KeyImpactReport {
+        let mut impact = KeyImpactReport::configuration_layer("key-a");
+        impact.push_reference(KeyReference {
+            kind: KeyReferenceKind::BucketDefaultEncryption,
+            id: "sse-bucket".to_string(),
+            detail: "bucket default encryption names this key".to_string(),
+        });
+        impact
+    }
+
+    /// Scheduling a deletion for a key that bucket configuration still points
+    /// at succeeds — it destroys nothing and stays cancellable — but the
+    /// caller has to be told, in the same response, what will refuse the
+    /// destruction once the window runs out.
+    #[test]
+    fn a_scheduled_deletion_succeeds_and_still_names_what_will_block_it() {
+        let response = DeleteKmsKeyResponse {
+            success: true,
+            message: "key deleted successfully".to_string(),
+            key_id: "key-a".to_string(),
+            deletion_date: Some("2026-01-01T00:00:00Z".to_string()),
+            impact: Some(referenced_impact()),
+        };
+
+        let json = serde_json::to_value(&response).expect("response should serialize");
+        assert_eq!(json["success"], true, "an outstanding reference must not change the outcome of a schedule");
+        assert_eq!(json["impact"]["references"][0]["kind"], "bucket-default-encryption");
+        assert_eq!(json["impact"]["references"][0]["id"], "sse-bucket");
+    }
+
+    /// The impact section is exhaustive only over what it read, and says so.
+    /// A caller must be able to tell an empty reference list apart from a
+    /// key that nothing uses, because this report cannot distinguish them.
+    #[test]
+    fn the_impact_section_states_its_coverage_and_claims_no_key_is_unused() {
+        let empty = DescribeKmsKeyResponse {
+            success: true,
+            message: "Key described successfully".to_string(),
+            key_metadata: None,
+            impact: Some(KeyImpactReport::configuration_layer("key-a")),
+        };
+
+        let json = serde_json::to_value(&empty).expect("response should serialize");
+        assert_eq!(json["impact"]["references"].as_array().expect("references is an array").len(), 0);
+        assert_eq!(json["impact"]["completeness"], "exact");
+        assert_eq!(json["impact"]["coverage"]["scanned"][0], "bucket-default-encryption");
+        assert_eq!(
+            json["impact"]["coverage"]["not_scanned"][0],
+            "object-envelopes",
+            "an empty reference list is only honest next to the scopes it did not read"
+        );
+
+        let referenced = serde_json::to_value(DeleteKmsKeyResponse {
+            success: true,
+            message: String::new(),
+            key_id: "key-a".to_string(),
+            deletion_date: None,
+            impact: Some(referenced_impact()),
+        })
+        .expect("response should serialize");
+
+        for body in [json.to_string(), referenced.to_string()] {
+            for forbidden in ["in_use", "unused", "unreferenced", "safe_to_delete", "deletable"] {
+                assert!(!body.contains(forbidden), "the impact section must not carry a `{forbidden}` claim");
+            }
+        }
+    }
+
+    /// The impact section is a report, never an input to a decision here. The
+    /// deletion worker's fail-closed gate stays the only thing that decides
+    /// whether material is destroyed; a handler that branched on this report
+    /// would be treating "nothing found in the configuration layer" as
+    /// "nothing uses this key", which it is not.
+    #[test]
+    fn handlers_report_the_key_impact_without_acting_on_it() {
+        let src = include_str!("kms_keys.rs");
+
+        for handler in ["DeleteKmsKeyHandler", "DescribeKmsKeyHandler"] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("current_key_impact("),
+                "{handler} must report the configuration impact of the key it operates on"
+            );
+            for decision in [
+                "if impact",
+                "impact.blocks_destruction",
+                "impact.references.is_empty",
+                "!impact",
+                "match impact",
+            ] {
+                assert!(!block.contains(decision), "{handler} must not branch on the impact report (`{decision}`)");
+            }
         }
     }
 
@@ -1167,6 +1273,9 @@ fn delete_request_from_query(uri: &hyper::Uri) -> Result<DeleteKmsKeyRequest, De
         message: message.to_string(),
         key_id: key_id.to_string(),
         deletion_date: None,
+        // The request never reached the KMS service, so nothing was collected;
+        // this is not a report that found no references.
+        impact: None,
     };
 
     let Some(key_id) = query_params.get("keyId") else {
@@ -1204,6 +1313,10 @@ fn delete_key_error_status(error: &KmsError) -> StatusCode {
         | KmsError::MaterialCorrupt { .. }
         | KmsError::MaterialAuthenticationFailed { .. }
         | KmsError::UnsupportedFormatVersion { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // The request was well formed and the key exists; it is the state of
+        // the deployment around it that refuses, and that state can change
+        // without the caller changing anything about the request.
+        KmsError::KeyStillReferenced { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -1266,6 +1379,7 @@ impl Operation for DeleteKmsKeyHandler {
                 message: "kms service manager is not initialized".to_string(),
                 key_id: request.key_id,
                 deletion_date: None,
+                impact: None,
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -1280,6 +1394,7 @@ impl Operation for DeleteKmsKeyHandler {
                 message: "kms service is not running".to_string(),
                 key_id: request.key_id,
                 deletion_date: None,
+                impact: None,
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -1294,6 +1409,13 @@ impl Operation for DeleteKmsKeyHandler {
             force_immediate: request.force_immediate,
             confirm_key_id: request.confirm_key_id.clone(),
         };
+
+        // Collected before the request is carried out, so the response
+        // describes the deployment the caller is acting on. It is reported,
+        // never acted on here: the deletion worker re-runs this check against
+        // live configuration before it destroys anything, which is the gate
+        // that decides the outcome.
+        let impact = current_key_impact(&request.key_id, manager.get_default_key_id().map(String::as_str)).await;
 
         match manager.delete_key_with_context(kms_request, audit.context()).await {
             Ok(kms_response) => {
@@ -1311,6 +1433,7 @@ impl Operation for DeleteKmsKeyHandler {
                     message: "key deleted successfully".to_string(),
                     key_id: kms_response.key_id,
                     deletion_date: kms_response.deletion_date,
+                    impact: Some(impact),
                 };
 
                 let data =
@@ -1338,6 +1461,7 @@ impl Operation for DeleteKmsKeyHandler {
                     message: format!("Failed to delete key: {e}"),
                     key_id: request.key_id,
                     deletion_date: None,
+                    impact: Some(impact),
                 };
 
                 let data =
@@ -1692,6 +1816,7 @@ impl Operation for DescribeKmsKeyHandler {
                 success: false,
                 message: "missing required parameter: 'keyId'".to_string(),
                 key_metadata: None,
+                impact: None,
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -1705,6 +1830,7 @@ impl Operation for DescribeKmsKeyHandler {
                 success: false,
                 message: "kms service manager is not initialized".to_string(),
                 key_metadata: None,
+                impact: None,
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -1718,6 +1844,7 @@ impl Operation for DescribeKmsKeyHandler {
                 success: false,
                 message: "kms service is not running".to_string(),
                 key_metadata: None,
+                impact: None,
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -1741,10 +1868,15 @@ impl Operation for DescribeKmsKeyHandler {
                     state = "completed",
                     "admin kms keys state"
                 );
+                // Read-only: the same configuration-layer facts the delete
+                // path reports, so the blast radius of a deletion can be
+                // inspected without scheduling one first.
+                let impact = current_key_impact(key_id, manager.get_default_key_id().map(String::as_str)).await;
                 let response = DescribeKmsKeyResponse {
                     success: true,
                     message: "Key described successfully".to_string(),
                     key_metadata: Some(kms_response.key_metadata),
+                    impact: Some(impact),
                 };
 
                 let data =
@@ -1783,6 +1915,7 @@ impl Operation for DescribeKmsKeyHandler {
                     success: false,
                     message: format!("Failed to describe key: {e}"),
                     key_metadata: None,
+                    impact: None,
                 };
 
                 let data =
