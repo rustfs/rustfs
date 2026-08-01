@@ -107,10 +107,6 @@ jobs:
           cache-save-if: 'true'
           install-build-packaging-tools: 'false'
 
-      # --all-targets covers the test binaries nextest builds, including
-      # e2e_test, which test-and-lint's own run excludes. The second build adds
-      # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
-      # and that no lint lane enables.
       # rustfs/backlog#1601 gate. sccache can only cache compilation units whose
       # --emit includes link, so it covers workspace rlibs and nothing else:
       # clippy is metadata-only, and the ~100 test binaries, the rustfs bin and
@@ -138,6 +134,10 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # --all-targets covers the test binaries nextest builds, including
+      # e2e_test, which test-and-lint's own run excludes. The second build adds
+      # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
+      # and that no lint lane enables.
       - name: Build ci-dev superset
         env:
           # Same limit ci.yml puts on its nextest step: this builds the same
@@ -147,6 +147,21 @@ jobs:
         run: |
           cargo build --workspace --all-targets
           cargo build -p rustfs --bins --features e2e-test-hooks
+
+      # Runs before rust-cache's post step, so these are the sizes it is about
+      # to archive. Reported so the cache-all-crates decision stays evidence-led:
+      # registry/src is what that flag prunes, registry/cache is what the pruned
+      # sources are re-unpacked from. See rustfs/backlog#1600.
+      - name: Report cache input sizes
+        if: always()
+        run: |
+          {
+            echo "### Cache input sizes (ci-dev)"
+            echo '```'
+            du -sh ~/.cargo/registry/src ~/.cargo/registry/cache ~/.cargo/registry/index \
+                   ~/.cargo/git target 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Readers: test-and-lint-rio-v2, build-rustfs-debug-binary-rio-v2.
   warm-ci-feat-rio:
