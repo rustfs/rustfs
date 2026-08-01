@@ -80,6 +80,19 @@ struct VaultKeyData {
     /// persistence landed, so it must stay optional for backward compatibility.
     #[serde(default)]
     deletion_date: Option<Zoned>,
+    /// When the key's material last became current through a rotation.
+    ///
+    /// Written by [`VaultKmsClient::rotate_key`] as part of the same
+    /// check-and-set that switches the current version, so it can only be set on
+    /// a rotation that actually committed. `None` means "no rotation time on
+    /// record", which covers two cases that are deliberately not distinguished
+    /// here: a key that was never rotated, and a key rotated by a build that
+    /// predates this field. Nothing is back-filled — inventing a timestamp for
+    /// the second case would report a rotation that this node never observed.
+    /// See [`crate::deletion_worker`] for why collapsing the two is safe for the
+    /// rotation-age gauge.
+    #[serde(default)]
+    rotated_at: Option<Zoned>,
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
     /// Version that pre-versioning envelopes (no `master_key_version`) resolve to.
@@ -966,7 +979,7 @@ impl VaultKmsClient {
                         description: existing.description,
                         metadata: existing.metadata,
                         created_at: existing.created_at,
-                        rotated_at: None,
+                        rotated_at: existing.rotated_at,
                         created_by: None,
                         deletion_date: existing.deletion_date,
                     })
@@ -993,6 +1006,7 @@ impl VaultKmsClient {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: None,
+            rotated_at: None,
             encrypted_key_material: encrypted_material,
             baseline_version: None,
         };
@@ -1039,7 +1053,7 @@ impl VaultKmsClient {
             metadata: key_data.metadata,
             tags: key_data.tags,
             created_at: key_data.created_at,
-            rotated_at: None,
+            rotated_at: key_data.rotated_at,
             created_by: None,
         })
     }
@@ -1263,8 +1277,15 @@ impl VaultKmsClient {
 
         // Step 3: switch the current pointer. The top-level copy of the material is
         // the fast path for new encryptions and must always match `version`.
+        //
+        // The rotation timestamp rides along on this same write: it marks the
+        // moment the new material became current, and persisting it here means it
+        // commits if and only if the rotation does. A rotation that fails after
+        // freezing the version record leaves the key unrotated and unstamped, so
+        // the recorded time never runs ahead of the current version.
         key_data.version = new_version;
         key_data.encrypted_key_material = new_material;
+        key_data.rotated_at = Some(Zoned::now());
         self.cas_store_key_data(key_id, &key_data, cas).await?;
 
         info!(key_id, version = new_version, "Vault KMS master key rotated");
@@ -1278,7 +1299,9 @@ impl VaultKmsClient {
             description: key_data.description.clone(),
             metadata: key_data.metadata.clone(),
             created_at: key_data.created_at.clone(),
-            rotated_at: Some(Zoned::now()),
+            // The persisted value, not a fresh `now()`: what the caller is told
+            // must be what a later describe of the same key reports.
+            rotated_at: key_data.rotated_at.clone(),
             created_by: None,
             deletion_date: key_data.deletion_date.clone(),
         })
@@ -1732,6 +1755,7 @@ mod tests {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: None,
+            rotated_at: None,
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: None,
         }
@@ -2048,6 +2072,7 @@ mod tests {
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: Some(1),
             deletion_date: None,
+            rotated_at: None,
         };
 
         let mut value = serde_json::to_value(&key_data).expect("serialize key data");
@@ -2411,6 +2436,7 @@ mod tests {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: Some(deadline.clone()),
+            rotated_at: None,
             encrypted_key_material: "material".to_string(),
             baseline_version: None,
         };
