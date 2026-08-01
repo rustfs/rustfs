@@ -448,6 +448,13 @@ jobs:
 
   uring-integration:
     name: io_uring Integration (real)
+    # The pull_request trigger includes `closed` purely so the concurrency
+    # group cancels in-flight runs of a closed PR; every other job opts out of
+    # that run with this guard (or is skipped through its `needs` chain). This
+    # job had neither, so each closed/merged PR really ran the whole io_uring
+    # suite (measured 4m17s / 7m19s / 7m31s on runs 30678272341 / 30678117601 /
+    # 30662728539) and kept the cancellation run in progress for minutes.
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
     # a container, applies no seccomp filter that would block io_uring_setup — so
     # the probe succeeds and the tests exercise the real UringBackend/FdCache/
@@ -746,7 +753,13 @@ jobs:
   # evaluates ILM within ~2s of the due time, well inside the poll window.
   s3-lifecycle-behavior-tests:
     name: S3 Lifecycle Behavior Tests
-    needs: [ build-rustfs-debug-binary ]
+    # Also gated on e2e-tests, matching s3-implemented-tests: when the e2e smoke
+    # suite is already red this lane cannot tell us anything new, and it holds a
+    # sm-standard-4 for up to 30 minutes doing so. Both lanes only download the
+    # prebuilt debug binary (no cargo build), and s3-implemented-tests — which
+    # already waits on e2e-tests — finishes later anyway, so a green PR's total
+    # wall clock is unchanged.
+    needs: [ build-rustfs-debug-binary, e2e-tests ]
     runs-on: sm-standard-4
     timeout-minutes: 30
     steps:
