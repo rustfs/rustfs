@@ -18,7 +18,10 @@ use crate::backends::vault_credentials::{
     CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
     token_source_for,
 };
-use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits};
+use crate::backends::{
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits,
+    ensure_tag_keys_are_mutable,
+};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -908,6 +911,46 @@ impl VaultTransitKmsClient {
         .map(|_| ())
     }
 
+    /// Replace the key's description; `None` clears it.
+    ///
+    /// Metadata edits carry no state gate: they neither use nor invalidate key
+    /// material, so they stay available for whatever lifecycle state the key
+    /// is in.
+    pub(crate) async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.mutate_key_metadata(key_id, |metadata| {
+            metadata.description = description.map(str::to_string);
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Add or overwrite tags, leaving every other tag untouched.
+    pub(crate) async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        ensure_tag_keys_are_mutable(tags.keys().map(String::as_str))?;
+        self.mutate_key_metadata(key_id, |metadata| {
+            metadata
+                .tags
+                .extend(tags.iter().map(|(key, value)| (key.clone(), value.clone())));
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Remove tags; tags that are not set are ignored.
+    pub(crate) async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        ensure_tag_keys_are_mutable(tag_keys.iter().map(String::as_str))?;
+        self.mutate_key_metadata(key_id, |metadata| {
+            for tag_key in tag_keys {
+                metadata.tags.remove(tag_key);
+            }
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
     #[cfg(test)]
     pub(crate) async fn schedule_key_deletion(
@@ -1237,6 +1280,18 @@ impl KmsBackend for VaultTransitKmsBackend {
         self.client.rotate_key(key_id, None).await.map(|_| ())
     }
 
+    async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.client.update_key_description(key_id, description).await
+    }
+
+    async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        self.client.tag_key(key_id, tags).await
+    }
+
+    async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        self.client.untag_key(key_id, tag_keys).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
@@ -1251,6 +1306,7 @@ impl KmsBackend for VaultTransitKmsBackend {
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(true)
+            .with_update_key_metadata(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {

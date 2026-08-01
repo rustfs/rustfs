@@ -20,6 +20,7 @@ use crate::backends::vault_credentials::{
 };
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits, ensure_key_status_permits,
+    ensure_tag_keys_are_mutable,
 };
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -1020,6 +1021,67 @@ impl VaultKmsClient {
         Ok(())
     }
 
+    /// Replace the key's description; `None` clears it.
+    ///
+    /// The write goes through the check-and-set read-modify-write loop, so a
+    /// rotation or state transition landing in between is carried over instead
+    /// of clobbered. A description that already matches is not rewritten.
+    pub(crate) async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.update_key_data_with_cas(key_id, |key_data| {
+            if key_data.description.as_deref() == description {
+                return Ok(CasMutation::Skip(()));
+            }
+            key_data.description = description.map(str::to_string);
+            Ok(CasMutation::Write(()))
+        })
+        .await?;
+
+        debug!(key_id, "Vault KMS key description updated");
+        Ok(())
+    }
+
+    /// Add or overwrite tags, leaving every other tag untouched.
+    pub(crate) async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        ensure_tag_keys_are_mutable(tags.keys().map(String::as_str))?;
+
+        self.update_key_data_with_cas(key_id, |key_data| {
+            let mut changed = false;
+            for (tag_key, value) in tags {
+                changed |= key_data.tags.insert(tag_key.clone(), value.clone()).as_ref() != Some(value);
+            }
+            Ok(if changed {
+                CasMutation::Write(())
+            } else {
+                CasMutation::Skip(())
+            })
+        })
+        .await?;
+
+        debug!(key_id, "Vault KMS key tags updated");
+        Ok(())
+    }
+
+    /// Remove tags; tags that are not set are ignored.
+    pub(crate) async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        ensure_tag_keys_are_mutable(tag_keys.iter().map(String::as_str))?;
+
+        self.update_key_data_with_cas(key_id, |key_data| {
+            let mut changed = false;
+            for tag_key in tag_keys {
+                changed |= key_data.tags.remove(tag_key).is_some();
+            }
+            Ok(if changed {
+                CasMutation::Write(())
+            } else {
+                CasMutation::Skip(())
+            })
+        })
+        .await?;
+
+        debug!(key_id, "Vault KMS key tags removed");
+        Ok(())
+    }
+
     /// Rotate the master key while keeping every historical version decryptable.
     ///
     /// Commit protocol (all writes check-and-set, in this order):
@@ -1447,6 +1509,18 @@ impl KmsBackend for VaultKmsBackend {
         self.client.rotate_key(key_id, None).await.map(|_| ())
     }
 
+    async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.client.update_key_description(key_id, description).await
+    }
+
+    async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        self.client.tag_key(key_id, tags).await
+    }
+
+    async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        self.client.untag_key(key_id, tag_keys).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
@@ -1462,6 +1536,7 @@ impl KmsBackend for VaultKmsBackend {
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(true)
+            .with_update_key_metadata(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
@@ -2842,6 +2917,63 @@ mod tests {
             writeback["data"]["encrypted_key_material"],
             serde_json::json!(healthy_key_data().encrypted_key_material),
             "the write-back must preserve the material of the freshly read record: {writeback}"
+        );
+    }
+
+    /// Tag updates are check-and-set read-modify-writes over the live record,
+    /// never blind overwrites: they preserve the material and the tags they did
+    /// not address.
+    #[tokio::test]
+    async fn wired_tag_key_writeback_is_check_and_set() {
+        let mut key_data = healthy_key_data();
+        key_data.tags = HashMap::from([("name".to_string(), "wired-key".to_string())]);
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        client
+            .tag_key("wired-key", &HashMap::from([("team".to_string(), "storage".to_string())]))
+            .await
+            .expect("tagging must succeed");
+
+        let bodies = vault.request_bodies();
+        let writeback = parse_write_body(&bodies[2]);
+        assert_eq!(writeback["options"]["cas"], serde_json::json!(1), "{writeback}");
+        assert_eq!(writeback["data"]["tags"]["team"], serde_json::json!("storage"), "{writeback}");
+        assert_eq!(
+            writeback["data"]["tags"]["name"],
+            serde_json::json!("wired-key"),
+            "a tag update must not drop tags it did not address: {writeback}"
+        );
+        assert_eq!(
+            writeback["data"]["encrypted_key_material"],
+            serde_json::json!(healthy_key_data().encrypted_key_material),
+            "the write-back must preserve the material of the freshly read record: {writeback}"
+        );
+    }
+
+    /// Rejecting the identity tag happens before any Vault call, so a rejected
+    /// request cannot leave a partial write behind.
+    #[tokio::test]
+    async fn wired_identity_tag_update_is_rejected_before_any_vault_call() {
+        let (vault, client) = scripted_client(Vec::new()).await;
+
+        for result in [
+            client
+                .tag_key("wired-key", &HashMap::from([("name".to_string(), "other".to_string())]))
+                .await,
+            client.untag_key("wired-key", &["name".to_string()]).await,
+        ] {
+            let error = result.expect_err("the identity tag must not be writable");
+            assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+        }
+        assert!(
+            vault.request_bodies().is_empty(),
+            "a rejected metadata update must not reach Vault: {:?}",
+            vault.request_bodies()
         );
     }
 

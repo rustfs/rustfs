@@ -432,6 +432,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_updates_report_the_capability_gap() {
+        let (backend, key_id, _key) = create_test_backend().await;
+        assert!(
+            !backend.capabilities().update_key_metadata,
+            "Static KMS owns no mutable key record, so it must not advertise metadata updates"
+        );
+
+        for (operation, result) in [
+            ("update_key_description", backend.update_key_description(&key_id, Some("new")).await),
+            (
+                "tag_key",
+                backend
+                    .tag_key(&key_id, &HashMap::from([("team".to_string(), "storage".to_string())]))
+                    .await,
+            ),
+            ("untag_key", backend.untag_key(&key_id, &["team".to_string()]).await),
+        ] {
+            let error = result.expect_err("Static KMS is read-only: metadata updates must be rejected");
+            assert!(
+                matches!(error, KmsError::UnsupportedCapability { .. }),
+                "expected UnsupportedCapability for {operation}, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_generate_and_decrypt_data_key() {
         let (backend, key_id, _key) = create_test_backend().await;
 
