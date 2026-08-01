@@ -50,12 +50,18 @@ on:
       - "**/*.svg"
       - ".gitignore"
       - ".dockerignore"
+      - "flake.lock"
   schedule:
     - cron: "0 1 * * 0" # Weekly on Sunday 01:00 UTC (staggered after the ci.yml midnight cron)
   workflow_dispatch:
     inputs:
       build_docker:
-        description: "Build and push Docker images after binary build"
+        # Advisory only. docker.yml triggers on workflow_run and its job-level
+        # condition requires the triggering event to be a tag push, so a manual
+        # dispatch of this workflow never produces images regardless of this
+        # value. Kept because the summary step reports it; wiring it up would
+        # mean teaching docker.yml's version parser a second event shape.
+        description: "Build and push Docker images after binary build (ignored: dispatch runs never reach docker.yml)"
         required: false
         default: true
         type: boolean

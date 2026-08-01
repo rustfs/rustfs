@@ -33,6 +33,7 @@ on:
       - ".github/workflows/build.yml"
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
+      - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
@@ -54,6 +55,7 @@ on:
       - ".github/workflows/build.yml"
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
+      - "flake.lock"
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -142,6 +144,8 @@ jobs:
 
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
+      - name: Check CI paths stay in sync
+        run: ./scripts/check_ci_paths_sync.sh
 
   test-and-lint:
     name: Test and Lint
