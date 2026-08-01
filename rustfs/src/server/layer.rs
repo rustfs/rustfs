@@ -23,6 +23,7 @@ use crate::server::{
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
     MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests,
     build_health_response_parts, collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
+    kms_probe_staleness_limit, kms_ready_from_probe,
 };
 use crate::storage_api::server::layer::apply_cors_headers;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
@@ -1281,7 +1282,9 @@ async fn health_kms_ready() -> bool {
         return true;
     };
 
-    matches!(service_manager.get_status().await, rustfs_kms::KmsServiceStatus::Running)
+    let service_running = matches!(service_manager.get_status().await, rustfs_kms::KmsServiceStatus::Running);
+    let probe_status = service_manager.probe_status();
+    kms_ready_from_probe(service_running, probe_status.as_deref(), kms_probe_staleness_limit())
 }
 
 async fn build_public_health_http_response<RestBody, GrpcBody>(
