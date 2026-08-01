@@ -365,8 +365,48 @@ pub mod default {
 
     use super::Policy;
 
+    /// Name of the built-in policy granting KMS key lifecycle management.
+    pub const KMS_KEY_ADMINISTRATOR: &str = "KMSKeyAdministrator";
+    /// Name of the built-in policy granting cryptographic use of KMS keys.
+    pub const KMS_KEY_USER: &str = "KMSKeyUser";
+    /// Name of the built-in policy granting read-only visibility into KMS keys.
+    pub const KMS_AUDITOR: &str = "KMSAuditor";
+
+    /// Every KMS key, in the resource grammar identity policies use.
+    ///
+    /// The built-in KMS policies ship unscoped so they behave like the other canned
+    /// policies; an operator narrows a copy to `arn:aws:kms:::key/<key_id>` per workload.
+    const ALL_KMS_KEYS: &str = "*";
+
+    /// A KMS statement allowing `actions` on every key.
+    fn kms_allow(actions: Vec<Action>) -> Statement {
+        Statement {
+            sid: "".into(),
+            effect: Effect::Allow,
+            actions: ActionSet(actions),
+            not_actions: ActionSet(Default::default()),
+            resources: ResourceSet(vec![Resource::Kms(ALL_KMS_KEYS.into())]),
+            conditions: Functions::default(),
+            ..Default::default()
+        }
+    }
+
+    /// The `sts:AssumeRole` grant every canned policy carries so an STS session may
+    /// assume it.
+    fn assume_role_allow() -> Statement {
+        Statement {
+            sid: "".into(),
+            effect: Effect::Allow,
+            actions: ActionSet(vec![Action::StsAction(StsAction::AssumeRoleAction)]),
+            not_actions: ActionSet(Default::default()),
+            resources: ResourceSet(Default::default()),
+            conditions: Functions::default(),
+            ..Default::default()
+        }
+    }
+
     #[allow(clippy::incompatible_msrv)]
-    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 5]> = LazyLock::new(|| {
+    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 8]> = LazyLock::new(|| {
         [
             (
                 "readwrite",
@@ -534,6 +574,65 @@ pub mod default {
                     ],
                 },
             ),
+            // KMS role templates. They deliberately carry no S3 or admin grants, so an
+            // operator combines one with a data-plane policy ("readwrite,KMSKeyUser").
+            //
+            // None of them grants kms:Configure, kms:ServiceControl, kms:ClearCache,
+            // kms:Backup or kms:Restore: those act on the KMS service or on the material
+            // of every key at once, which is a cluster-administration power rather than a
+            // key-management one, and they stay with consoleAdmin. Key creation currently
+            // shares kms:Configure with backend configuration, so it stays there too.
+            (
+                KMS_KEY_ADMINISTRATOR,
+                Policy {
+                    id: "".into(),
+                    version: DEFAULT_VERSION.into(),
+                    statements: vec![
+                        // Separation of duties: a key administrator governs a key's
+                        // lifecycle but is never able to encrypt or decrypt with it.
+                        kms_allow(vec![
+                            Action::KmsAction(KmsAction::DescribeKeyAction),
+                            Action::KmsAction(KmsAction::ListKeysAction),
+                            Action::KmsAction(KmsAction::EnableKeyAction),
+                            Action::KmsAction(KmsAction::DisableKeyAction),
+                            Action::KmsAction(KmsAction::RotateKeyAction),
+                            Action::KmsAction(KmsAction::DeleteKeyAction),
+                        ]),
+                        assume_role_allow(),
+                    ],
+                },
+            ),
+            (
+                KMS_KEY_USER,
+                Policy {
+                    id: "".into(),
+                    version: DEFAULT_VERSION.into(),
+                    statements: vec![
+                        // The two actions the SSE-KMS data path evaluates, plus the
+                        // metadata read a client needs to tell which key it is using.
+                        kms_allow(vec![
+                            Action::KmsAction(KmsAction::GenerateDataKeyAction),
+                            Action::KmsAction(KmsAction::DecryptAction),
+                            Action::KmsAction(KmsAction::DescribeKeyAction),
+                        ]),
+                        assume_role_allow(),
+                    ],
+                },
+            ),
+            (
+                KMS_AUDITOR,
+                Policy {
+                    id: "".into(),
+                    version: DEFAULT_VERSION.into(),
+                    statements: vec![
+                        kms_allow(vec![
+                            Action::KmsAction(KmsAction::DescribeKeyAction),
+                            Action::KmsAction(KmsAction::ListKeysAction),
+                        ]),
+                        assume_role_allow(),
+                    ],
+                },
+            ),
         ]
     });
 }
@@ -542,6 +641,7 @@ pub mod default {
 mod test {
     use super::*;
     use crate::error::Result;
+    use crate::policy::action::{AdminAction, KmsAction, S3Action};
 
     #[tokio::test]
     async fn test_parse_policy() -> Result<()> {
@@ -707,6 +807,186 @@ mod test {
                 .validate()
                 .unwrap_or_else(|err| panic!("default policy {name} should validate: {err}"));
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Built-in KMS role templates
+    // ------------------------------------------------------------------------
+
+    fn default_policy(name: &str) -> &'static Policy {
+        default::DEFAULT_POLICIES
+            .iter()
+            .find_map(|(candidate, policy)| (*candidate == name).then_some(policy))
+            .unwrap_or_else(|| panic!("built-in policy {name} should exist"))
+    }
+
+    /// Evaluate `policy` for `account` against `action` on `key_id`.
+    ///
+    /// Mirrors the admin and SSE call sites: the requested key identifier travels in
+    /// `object` with `bucket` left empty. An empty `key_id` is the unscoped call.
+    async fn kms_allows(policy: &Policy, account: &str, action: KmsAction, key_id: &str) -> bool {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        policy
+            .is_allowed(&Args {
+                account,
+                groups: &None,
+                action: Action::KmsAction(action),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: false,
+                object: key_id,
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    }
+
+    const KMS_LIFECYCLE_ACTIONS: [KmsAction; 4] = [
+        KmsAction::EnableKeyAction,
+        KmsAction::DisableKeyAction,
+        KmsAction::RotateKeyAction,
+        KmsAction::DeleteKeyAction,
+    ];
+
+    const KMS_CRYPTO_ACTIONS: [KmsAction; 2] = [KmsAction::GenerateDataKeyAction, KmsAction::DecryptAction];
+
+    /// Actions that act on the service or on every key's material at once. No role
+    /// template may confer them.
+    const KMS_CLUSTER_ADMIN_ACTIONS: [KmsAction; 6] = [
+        KmsAction::AllActions,
+        KmsAction::ConfigureAction,
+        KmsAction::ServiceControlAction,
+        KmsAction::ClearCacheAction,
+        KmsAction::BackupAction,
+        KmsAction::RestoreAction,
+    ];
+
+    const KMS_ROLE_TEMPLATES: [&str; 3] = [default::KMS_KEY_ADMINISTRATOR, default::KMS_KEY_USER, default::KMS_AUDITOR];
+
+    #[tokio::test]
+    async fn kms_key_administrator_manages_keys_but_cannot_use_them() {
+        let policy = default_policy(default::KMS_KEY_ADMINISTRATOR);
+
+        for action in KMS_LIFECYCLE_ACTIONS {
+            assert!(
+                kms_allows(policy, "keyadmin", action, "app-key").await,
+                "KMSKeyAdministrator should allow {action:?}"
+            );
+        }
+        assert!(kms_allows(policy, "keyadmin", KmsAction::DescribeKeyAction, "app-key").await);
+        assert!(kms_allows(policy, "keyadmin", KmsAction::ListKeysAction, "").await);
+
+        for action in KMS_CRYPTO_ACTIONS {
+            assert!(
+                !kms_allows(policy, "keyadmin", action, "app-key").await,
+                "KMSKeyAdministrator must not allow {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_key_user_uses_keys_but_cannot_manage_them() {
+        let policy = default_policy(default::KMS_KEY_USER);
+
+        for action in KMS_CRYPTO_ACTIONS {
+            assert!(
+                kms_allows(policy, "appuser", action, "app-key").await,
+                "KMSKeyUser should allow {action:?}"
+            );
+        }
+        assert!(kms_allows(policy, "appuser", KmsAction::DescribeKeyAction, "app-key").await);
+
+        for action in KMS_LIFECYCLE_ACTIONS {
+            assert!(
+                !kms_allows(policy, "appuser", action, "app-key").await,
+                "KMSKeyUser must not allow {action:?}"
+            );
+        }
+        assert!(!kms_allows(policy, "appuser", KmsAction::ListKeysAction, "").await);
+    }
+
+    #[tokio::test]
+    async fn kms_auditor_only_reads_key_metadata() {
+        let policy = default_policy(default::KMS_AUDITOR);
+
+        assert!(kms_allows(policy, "auditor", KmsAction::DescribeKeyAction, "app-key").await);
+        assert!(kms_allows(policy, "auditor", KmsAction::ListKeysAction, "").await);
+
+        for action in KMS_LIFECYCLE_ACTIONS.iter().chain(KMS_CRYPTO_ACTIONS.iter()) {
+            assert!(
+                !kms_allows(policy, "auditor", *action, "app-key").await,
+                "KMSAuditor must not allow {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_role_templates_withhold_service_and_bundle_actions() {
+        for name in KMS_ROLE_TEMPLATES {
+            let policy = default_policy(name);
+            for action in KMS_CLUSTER_ADMIN_ACTIONS {
+                assert!(
+                    !kms_allows(policy, "someone", action, "app-key").await,
+                    "{name} must not allow {action:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_role_templates_grant_nothing_outside_kms() {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let foreign_actions = [
+            Action::S3Action(S3Action::GetObjectAction),
+            Action::S3Action(S3Action::PutObjectAction),
+            Action::AdminAction(AdminAction::ServerInfoAdminAction),
+        ];
+
+        for name in KMS_ROLE_TEMPLATES {
+            let policy = default_policy(name);
+            for action in &foreign_actions {
+                let allowed = policy
+                    .is_allowed(&Args {
+                        account: "someone",
+                        groups: &None,
+                        action: *action,
+                        bucket: "any-bucket",
+                        conditions: &conditions,
+                        is_owner: false,
+                        object: "any-object",
+                        claims: &claims,
+                        deny_only: false,
+                    })
+                    .await;
+                assert!(!allowed, "{name} must not allow {action:?}");
+            }
+        }
+    }
+
+    /// The narrowing an operator is told to apply must actually deny the other keys.
+    #[tokio::test]
+    async fn narrowed_kms_role_template_denies_other_keys() -> Result<()> {
+        let narrowed = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
+      "Resource": ["arn:aws:kms:::key/reports-*"]
+    }
+  ]
+}"#,
+        )?;
+
+        assert!(kms_allows(&narrowed, "appuser", KmsAction::GenerateDataKeyAction, "reports-2026").await);
+        assert!(kms_allows(&narrowed, "appuser", KmsAction::DecryptAction, "reports-2026").await);
+        assert!(!kms_allows(&narrowed, "appuser", KmsAction::DecryptAction, "payroll-2026").await);
+        assert!(!kms_allows(&narrowed, "appuser", KmsAction::DisableKeyAction, "reports-2026").await);
+
+        Ok(())
     }
 
     #[tokio::test]
