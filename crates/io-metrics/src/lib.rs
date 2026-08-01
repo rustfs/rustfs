@@ -3046,6 +3046,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ec_encode_payload_stage_guards_are_noop_when_disabled() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+
+        let producer_current_before = current_ec_encode_producer_bytes();
+        let producer_peak_before = current_ec_encode_producer_bytes_peak();
+        let writer_current_before = current_ec_encode_writer_bytes();
+        let writer_peak_before = current_ec_encode_writer_bytes_peak();
+
+        let producer = track_ec_encode_producer_bytes(1024);
+        let writer = track_ec_encode_writer_bytes(2048);
+        assert_eq!(current_ec_encode_producer_bytes(), producer_current_before);
+        assert_eq!(current_ec_encode_producer_bytes_peak(), producer_peak_before);
+        assert_eq!(current_ec_encode_writer_bytes(), writer_current_before);
+        assert_eq!(current_ec_encode_writer_bytes_peak(), writer_peak_before);
+
+        drop((producer, writer));
+        assert_eq!(current_ec_encode_producer_bytes(), producer_current_before);
+        assert_eq!(current_ec_encode_producer_bytes_peak(), producer_peak_before);
+        assert_eq!(current_ec_encode_writer_bytes(), writer_current_before);
+        assert_eq!(current_ec_encode_writer_bytes_peak(), writer_peak_before);
+    }
+
+    #[test]
     fn test_ec_encode_producer_peak_exports_the_high_water_mark() {
         let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(current_ec_encode_producer_bytes(), 0, "test must start without producer stage ownership");
