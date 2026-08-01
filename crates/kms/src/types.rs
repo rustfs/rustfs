@@ -893,15 +893,37 @@ impl std::str::FromStr for EncryptionAlgorithm {
     }
 }
 
+/// Shortest pending-deletion waiting window a caller may ask for, in days.
+///
+/// The window is enforced once, in [`crate::manager::KmsManager::delete_key`];
+/// backends keep the same bound as a defensive check for direct callers.
+pub const MIN_PENDING_DELETION_WINDOW_DAYS: u32 = 7;
+
+/// Longest pending-deletion waiting window a caller may ask for, in days.
+pub const MAX_PENDING_DELETION_WINDOW_DAYS: u32 = 30;
+
+/// Waiting window applied when a delete request does not name one.
+pub const DEFAULT_PENDING_DELETION_WINDOW_DAYS: u32 = MAX_PENDING_DELETION_WINDOW_DAYS;
+
 /// Request to delete a key
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteKeyRequest {
     /// Key ID to delete
     pub key_id: String,
-    /// Number of days to wait before deletion (7-30 days, optional)
+    /// Number of days to wait before deletion (7-30 days, optional, defaults to 30)
     pub pending_window_in_days: Option<u32>,
-    /// Force immediate deletion (for development/testing only)
+    /// Destroy the key material right away instead of scheduling it.
+    ///
+    /// Refused unless the server enables `allow_immediate_deletion`; see
+    /// [`crate::manager::KmsManager::delete_key`] for the gate.
     pub force_immediate: Option<bool>,
+    /// Key id echoed back by the caller to confirm an immediate deletion.
+    ///
+    /// Must equal `key_id` exactly whenever `force_immediate` is set. Optional
+    /// with a serde default because this type is part of the admin API
+    /// contract: clients that never ask for immediate deletion are unaffected.
+    #[serde(default)]
+    pub confirm_key_id: Option<String>,
 }
 
 /// Response from delete key operation

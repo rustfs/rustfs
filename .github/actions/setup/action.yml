@@ -111,7 +111,18 @@ runs:
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
-        cache-all-crates: true
+        # false is rust-cache's own default. With true, cleanup.ts returns
+        # *before* pruning ~/.cargo/registry/src, and config.ts archives the
+        # whole registry — so every cache carried the unpacked source tree of
+        # every dependency, not just "a few extra crates".
+        #
+        # No coverage is lost: getPackages runs `cargo metadata --all-features`,
+        # a strict superset of any single lane's feature closure, and -sys crates
+        # are explicitly exempted from pruning (their src timestamps would
+        # otherwise trigger rebuilds). Anything pruned is re-unpacked from the
+        # .crate files still in registry/cache, whose mtimes crates.io
+        # normalises, so cargo fingerprints stay valid.
+        cache-all-crates: false
         cache-on-failure: true
         shared-key: ${{ inputs.cache-shared-key }}
         save-if: ${{ inputs.cache-save-if }}

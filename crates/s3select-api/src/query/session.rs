@@ -349,15 +349,17 @@ impl SessionCtxFactory {
         };
         let rt = RuntimeEnvBuilder::new().with_memory_limit(memory_limit_bytes, 1.0).build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
-        let config = if context
+        let custom_two_byte_record_delimiter = context
             .input
             .request
             .input_serialization
             .csv
             .as_ref()
             .and_then(|csv| csv.record_delimiter.as_deref())
-            .is_some_and(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != b"\r\n")
-        {
+            .is_some_and(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != b"\r\n");
+        let scan_range_requires_single_file_scan =
+            context.input.request.scan_range.is_some() && context.input.request.input_serialization.parquet.is_none();
+        let config = if custom_two_byte_record_delimiter || scan_range_requires_single_file_scan {
             config.with_repartition_file_scans(false)
         } else {
             config
@@ -487,11 +489,20 @@ fn test_parquet_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::execution::memory_pool::MemoryLimit;
-    use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
-        SelectObjectContentRequest,
+    use crate::storage_api::SelectPutObjReader;
+    use crate::storage_api::object_store::ObjectIO as _;
+    use datafusion::{
+        datasource::{
+            file_format::csv::CsvFormat,
+            listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+        },
+        execution::memory_pool::MemoryLimit,
     };
+    use s3s::dto::{
+        CSVInput, CSVOutput, ExpressionType, InputSerialization, JSONInput, OutputSerialization, ParquetInput, ScanRange,
+        SelectObjectContentInput, SelectObjectContentRequest,
+    };
+    use std::io::Write as _;
 
     fn test_context() -> Context {
         Context {
@@ -540,6 +551,64 @@ mod tests {
             .expect("session should be created with configured target partitions");
 
         assert_eq!(session.inner().config().target_partitions(), 3);
+        assert!(session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn parquet_scan_range_keeps_file_repartitioning() {
+        let mut context = test_context();
+        let request = &mut Arc::make_mut(&mut context.input).request;
+        request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(0),
+        });
+        request.input_serialization.csv = None;
+        request.input_serialization.parquet = Some(ParquetInput {});
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("Parquet ScanRange session should be created");
+
+        assert!(session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn json_lines_scan_range_disables_file_repartitioning() {
+        let mut context = test_context();
+        let request = &mut Arc::make_mut(&mut context.input).request;
+        request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(0),
+        });
+        request.input_serialization.csv = None;
+        request.input_serialization.json = Some(JSONInput::default());
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("JSON LINES ScanRange session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn csv_scan_range_disables_file_repartitioning() {
+        let mut context = test_context();
+        Arc::make_mut(&mut context.input).request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(0),
+        });
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("CSV ScanRange session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
     }
 
     #[tokio::test]
@@ -552,7 +621,7 @@ mod tests {
             .csv
             .as_mut()
             .expect("test context should use CSV")
-            .record_delimiter = Some("aa".to_string());
+            .record_delimiter = Some("^Y".to_string());
         let session = SessionCtxFactory::new(true)
             .with_target_partitions(4)
             .create_session_ctx(&context)
@@ -635,6 +704,94 @@ mod tests {
         assert!(Arc::strong_count(&query_guard) > 1);
         drop(session);
         assert_eq!(Arc::strong_count(&query_guard), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn scan_range_is_preserved_across_large_csv_partition_boundary() {
+        const ROW_COUNT: usize = 200_000;
+        const ROW_WIDTH: usize = 7;
+        const SELECTED_ROW: usize = 100_000;
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        let mut data = Vec::with_capacity(ROW_COUNT * ROW_WIDTH);
+        for row in 0..ROW_COUNT {
+            writeln!(&mut data, "{row:06}").expect("write fixed-width CSV test row");
+        }
+        assert!(data.len() > 1024 * 1024);
+
+        let mut context = test_context();
+        let selected_start = i64::try_from(SELECTED_ROW * ROW_WIDTH).expect("selected row offset should fit in i64");
+        Arc::make_mut(&mut context.input).request.scan_range = Some(ScanRange {
+            start: Some(selected_start),
+            end: Some(selected_start),
+        });
+        env.make_bucket(&context.input.bucket, false).await;
+        let mut reader = SelectPutObjReader::from_vec(data);
+        env.ecstore
+            .put_object(&context.input.bucket, &context.input.key, &mut reader, &Default::default())
+            .await
+            .expect("put large ScanRange CSV fixture");
+
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("query permit should be available");
+        let query_tracker = QueryExecutionTracker::new(
+            &QueryExecutionOwner::new(),
+            Arc::new(permit),
+            Instant::now() + std::time::Duration::from_secs(300),
+            300,
+        );
+        let session = SessionCtxFactory::new(false)
+            .with_target_partitions(2)
+            .create_session_ctx_with_tracker_and_store(&context, query_tracker, Arc::clone(&env.ecstore))
+            .await
+            .expect("create production ScanRange session");
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+
+        let table_path = ListingTableUrl::parse(format!("s3://{}/{}", context.input.bucket, context.input.key))
+            .expect("parse ScanRange table URL");
+        let listing_options =
+            ListingOptions::new(Arc::new(CsvFormat::default().with_schema_infer_max_rec(0).with_has_header(false)))
+                .with_file_extension(".csv");
+        let schema = listing_options
+            .infer_schema(session.inner(), &table_path)
+            .await
+            .expect("infer ScanRange CSV schema");
+        let table = ListingTable::try_new(
+            ListingTableConfig::new(table_path)
+                .with_listing_options(listing_options)
+                .with_schema(schema),
+        )
+        .expect("build ScanRange listing table");
+        let query_context = SessionContext::new_with_state(session.inner().clone());
+        query_context
+            .register_table("scan_input", Arc::new(table))
+            .expect("register ScanRange listing table");
+
+        let batches = query_context
+            .sql("SELECT * FROM scan_input")
+            .await
+            .expect("plan ScanRange CSV query")
+            .collect()
+            .await
+            .expect("execute ScanRange CSV query");
+        let mut values = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("ScanRange CSV column should be Utf8");
+            for row in 0..batch.num_rows() {
+                values.push(column.value(row).to_string());
+            }
+        }
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(values, [format!("{SELECTED_ROW:06}")]);
     }
 
     #[tokio::test]

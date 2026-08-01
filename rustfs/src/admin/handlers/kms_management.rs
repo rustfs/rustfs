@@ -344,7 +344,7 @@ impl Operation for KmsConfigHandler {
             backend: backend_name(&config.backend).to_string(),
             cache_enabled: config.enable_cache,
             cache_max_keys: config.cache_config.max_keys,
-            cache_ttl_seconds: config.cache_config.ttl.as_secs(),
+            cache_ttl_seconds: config.cache_config.effective_ttl().as_secs(),
             default_key_id: service.get_default_key_id().cloned(),
         };
 

@@ -108,6 +108,7 @@ fn schedule_request(key_id: &str) -> DeleteKeyRequest {
         key_id: key_id.to_string(),
         pending_window_in_days: Some(7),
         force_immediate: None,
+        confirm_key_id: None,
     }
 }
 

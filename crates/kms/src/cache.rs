@@ -14,15 +14,12 @@
 
 //! Caching layer for KMS operations to improve performance
 
+use crate::config::CacheConfig;
 use crate::types::KeyMetadata;
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-/// Default lifetime of a cached key metadata entry.
-const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -31,6 +28,10 @@ const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(300);
 // hit nor miss counts; the numbers below are the cache's own, not derived.
 // Label values are exclusively static strings (lookup result, removal cause) —
 // key identifiers and key metadata must never reach a metric label.
+//
+// Publication is gated by `CacheConfig::enable_metrics`; the atomics backing
+// `KmsCache::stats` are maintained regardless, so the admin status API keeps
+// reporting real numbers with the metrics switch off.
 // ---------------------------------------------------------------------------
 
 /// Counter: key metadata lookups, by `result` (`hit` or `miss`).
@@ -94,38 +95,44 @@ pub struct KmsCacheStats {
 pub struct KmsCache {
     key_metadata_cache: Cache<String, KeyMetadata>,
     counters: Arc<CacheCounters>,
+    metrics_enabled: bool,
 }
 
 impl KmsCache {
-    /// Create a new KMS cache with the specified capacity
+    /// Create a new KMS cache from the operator-supplied cache configuration
+    ///
+    /// The entry lifetime is [`CacheConfig::effective_ttl`] rather than the raw
+    /// configured value: this value arrives straight from the admin configure
+    /// API, and moka panics when built with a time-to-live beyond 1000 years.
     ///
     /// # Arguments
-    /// * `capacity` - Maximum number of entries in the cache
+    /// * `config` - Capacity, metadata lifetime and metrics switch to build with
     ///
     /// # Returns
     /// A new instance of `KmsCache`
     ///
-    pub fn new(capacity: u64) -> Self {
-        Self::with_ttl(capacity, DEFAULT_METADATA_TTL)
-    }
-
-    /// Create a new KMS cache with an explicit metadata time-to-live
-    fn with_ttl(capacity: u64, metadata_ttl: Duration) -> Self {
-        describe_metrics();
+    pub fn new(config: &CacheConfig) -> Self {
+        let metrics_enabled = config.enable_metrics;
+        if metrics_enabled {
+            describe_metrics();
+        }
 
         let counters = Arc::new(CacheCounters::default());
         let eviction_counters = Arc::clone(&counters);
 
         Self {
             key_metadata_cache: Cache::builder()
-                .max_capacity(capacity)
-                .time_to_live(metadata_ttl)
+                .max_capacity(config.max_keys as u64)
+                .time_to_live(config.effective_ttl())
                 .eviction_listener(move |_key: Arc<String>, _metadata: KeyMetadata, cause: RemovalCause| {
                     eviction_counters.evictions.fetch_add(1, Ordering::Relaxed);
-                    metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL, "cause" => removal_cause_label(cause)).increment(1);
+                    if metrics_enabled {
+                        metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL, "cause" => removal_cause_label(cause)).increment(1);
+                    }
                 })
                 .build(),
             counters,
+            metrics_enabled,
         }
     }
 
@@ -216,11 +223,15 @@ impl KmsCache {
             (&self.counters.misses, "miss")
         };
         counter.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!(METRIC_CACHE_LOOKUPS_TOTAL, "result" => result).increment(1);
+        if self.metrics_enabled {
+            metrics::counter!(METRIC_CACHE_LOOKUPS_TOTAL, "result" => result).increment(1);
+        }
     }
 
     fn record_entry_count(&self) {
-        metrics::gauge!(METRIC_CACHE_ENTRIES).set(self.key_metadata_cache.entry_count() as f64);
+        if self.metrics_enabled {
+            metrics::gauge!(METRIC_CACHE_ENTRIES).set(self.key_metadata_cache.entry_count() as f64);
+        }
     }
 }
 
@@ -237,6 +248,14 @@ mod tests {
         fn contains_key_metadata_for_tests(&self, key_id: &str) -> bool {
             self.key_metadata_cache.contains_key(key_id)
         }
+    }
+
+    /// A cache holding `max_keys` entries for the default lifetime.
+    fn sized(max_keys: usize) -> KmsCache {
+        KmsCache::new(&CacheConfig {
+            max_keys,
+            ..Default::default()
+        })
     }
 
     fn test_metadata(key_id: &str) -> KeyMetadata {
@@ -315,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_operations() {
-        let mut cache = KmsCache::new(100);
+        let mut cache = sized(100);
 
         // Test key metadata caching
         let metadata = KeyMetadata {
@@ -346,10 +365,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_with_custom_ttl() {
-        let mut cache = KmsCache::with_ttl(
-            100,
-            Duration::from_millis(100), // Short TTL for testing
-        );
+        let mut cache = KmsCache::new(&CacheConfig {
+            max_keys: 100,
+            ttl: Duration::from_millis(100), // Short TTL for testing
+            ..Default::default()
+        });
 
         let metadata = KeyMetadata {
             key_id: "ttl-test-key".to_string(),
@@ -377,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_contains_methods() {
-        let mut cache = KmsCache::new(100);
+        let mut cache = sized(100);
 
         assert!(!cache.contains_key_metadata_for_tests("nonexistent"));
 
@@ -401,7 +421,7 @@ mod tests {
     #[test]
     fn lookups_report_real_hit_and_miss_counts() {
         let (stats, snapshot) = record_metrics(|| async {
-            let mut cache = KmsCache::new(100);
+            let mut cache = sized(100);
 
             assert!(cache.get_key_metadata("absent").await.is_none());
             cache.put_key_metadata("present", &test_metadata("present")).await;
@@ -418,9 +438,38 @@ mod tests {
     }
 
     #[test]
+    fn disabling_metrics_stops_publication_without_blinding_the_status_api() {
+        let (stats, snapshot) = record_metrics(|| async {
+            let mut cache = KmsCache::new(&CacheConfig {
+                max_keys: 1,
+                enable_metrics: false,
+                ..Default::default()
+            });
+
+            assert!(cache.get_key_metadata("absent").await.is_none());
+            cache.put_key_metadata("first", &test_metadata("first")).await;
+            assert!(cache.get_key_metadata("first").await.is_some());
+            // Capacity is one, so this insert evicts "first".
+            cache.put_key_metadata("second", &test_metadata("second")).await;
+
+            cache.stats()
+        });
+
+        // The counters behind the admin status API keep moving...
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.evictions, 1);
+
+        // ...while nothing reaches the metrics recorder.
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_LOOKUPS_TOTAL, &[]), 0);
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[]), 0);
+        assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), None);
+    }
+
+    #[test]
     fn removals_report_their_cause_and_the_resulting_entry_count() {
         let (stats, snapshot) = record_metrics(|| async {
-            let mut cache = KmsCache::new(100);
+            let mut cache = sized(100);
 
             cache.put_key_metadata("key", &test_metadata("key")).await;
             cache.put_key_metadata("key", &test_metadata("key")).await;
@@ -439,7 +488,7 @@ mod tests {
     #[test]
     fn capacity_pressure_reports_size_evictions() {
         let (stats, snapshot) = record_metrics(|| async {
-            let mut cache = KmsCache::with_ttl(1, DEFAULT_METADATA_TTL);
+            let mut cache = sized(1);
 
             cache.put_key_metadata("first", &test_metadata("first")).await;
             cache.put_key_metadata("second", &test_metadata("second")).await;
@@ -466,7 +515,11 @@ mod tests {
         let ttl = Duration::from_millis(100);
 
         let (stats, snapshot) = record_metrics(move || async move {
-            let mut cache = KmsCache::with_ttl(100, ttl);
+            let mut cache = KmsCache::new(&CacheConfig {
+                max_keys: 100,
+                ttl,
+                ..Default::default()
+            });
 
             cache.put_key_metadata("expiring", &test_metadata("expiring")).await;
             assert_eq!(cache.stats().entries, 1);

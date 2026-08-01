@@ -102,3 +102,34 @@ chmod +x "$FAKE_WARP"
   --require-server-provenance >/dev/null 2>&1
 
 rg -q '^32767B,warp,1,1,128,ok,0,[^,]+,[^,]+,653.90 MiB/s,685663846.400000,20925.58,3.5 ms,3.500000,[^,]+,3.6 ms,3.600000,24.1 ms,24.100000$' "${TMP_DIR}/fake-warp-run/round_results.csv"
+
+"$RUNNER" \
+  --tool warp \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key test-access \
+  --secret-key test-secret \
+  --sizes 32767B \
+  --rounds 1 \
+  --retry-per-round 1 \
+  --cooldown-secs 0 \
+  --duration 1s \
+  --out-dir "${TMP_DIR}/fake-warp-candidate" \
+  --warp-bin "$FAKE_WARP" \
+  --baseline-csv "${TMP_DIR}/fake-warp-run/median_summary.csv" \
+  --server-image-ref rustfs/rustfs:bench \
+  --server-image-digest sha256:0123456789abcdef \
+  --server-revision 9f61bad94 \
+  --require-server-provenance >/dev/null 2>&1
+
+awk -F',' '
+  NR == 1 {
+    if (NF != 25 || $15 != "delta_p90_latency_pct" || $18 != "delta_p99_latency_pct" || $25 != "delta_error_rate_pct") exit 1
+  }
+  NR == 2 {
+    if ($15 != "0.00" || $18 != "0.00" || $23 != "0.00" || $25 != "0.00") exit 1
+    found = 1
+  }
+  END { exit found ? 0 : 1 }
+' "${TMP_DIR}/fake-warp-candidate/baseline_compare.csv"
+
+echo "object batch benchmark enhanced tests passed"

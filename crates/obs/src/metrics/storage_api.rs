@@ -18,7 +18,8 @@ use std::time::Duration;
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
 use rustfs_ecstore::api::bucket::replication::{
-    DurableMrfBucketBacklog, durable_mrf_backlog_summary_snapshot, get_global_replication_stats,
+    DurableMrfBucketBacklog, MrfBucketBacklogObservability, durable_mrf_backlog_summary_snapshot, get_global_replication_stats,
+    mrf_backlog_observability_snapshot,
 };
 pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
@@ -76,6 +77,12 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
     pub(crate) durable_mrf_available: bool,
     pub(crate) durable_mrf_backlog_count: u64,
     pub(crate) durable_mrf_backlog_bytes: u64,
+    pub(crate) mrf_pending_count: u64,
+    pub(crate) mrf_pending_bytes: u64,
+    pub(crate) mrf_dropped_count: u64,
+    pub(crate) mrf_missed_count: u64,
+    pub(crate) mrf_flush_failures: u64,
+    pub(crate) mrf_last_flush_duration_millis: u64,
     pub(crate) targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
 }
 
@@ -152,6 +159,7 @@ fn bucket_replication_stats_snapshot_from_parts(
     proxy: ObsBucketReplicationProxySnapshot,
     durable_mrf_available: bool,
     durable_bucket: DurableMrfBucketBacklog,
+    mrf_observability: MrfBucketBacklogObservability,
 ) -> ObsBucketReplicationStatsSnapshot {
     ObsBucketReplicationStatsSnapshot {
         bucket,
@@ -185,6 +193,12 @@ fn bucket_replication_stats_snapshot_from_parts(
         durable_mrf_available,
         durable_mrf_backlog_count: durable_bucket.count,
         durable_mrf_backlog_bytes: durable_bucket.bytes,
+        mrf_pending_count: mrf_observability.pending_count,
+        mrf_pending_bytes: mrf_observability.pending_bytes,
+        mrf_dropped_count: mrf_observability.dropped_count,
+        mrf_missed_count: mrf_observability.missed_count,
+        mrf_flush_failures: mrf_observability.flush_failure_count,
+        mrf_last_flush_duration_millis: mrf_observability.last_flush_duration_millis,
         targets: runtime.targets,
     }
 }
@@ -196,7 +210,8 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
     } else {
         HashMap::new()
     };
-    let durable_mrf_summary = if obs_resolve_object_store_handle().is_some() {
+    let replication_storage_available = obs_resolve_object_store_handle().is_some();
+    let durable_mrf_summary = if replication_storage_available {
         durable_mrf_backlog_summary_snapshot()
     } else {
         Default::default()
@@ -207,12 +222,33 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
         .into_iter()
         .map(|bucket| (bucket.bucket.clone(), bucket))
         .collect::<HashMap<String, DurableMrfBucketBacklog>>();
-    let mut bucket_names = Vec::with_capacity(all_bucket_stats.len().saturating_add(durable_buckets.len()));
+    let mrf_observability = if replication_storage_available {
+        mrf_backlog_observability_snapshot()
+    } else {
+        Default::default()
+    };
+    let mrf_observability_buckets = mrf_observability
+        .buckets
+        .into_iter()
+        .map(|bucket| (bucket.bucket.clone(), bucket))
+        .collect::<HashMap<String, MrfBucketBacklogObservability>>();
+    let mut bucket_names = Vec::with_capacity(
+        all_bucket_stats
+            .len()
+            .saturating_add(durable_buckets.len())
+            .saturating_add(mrf_observability_buckets.len()),
+    );
     bucket_names.extend(all_bucket_stats.keys().cloned());
     bucket_names.extend(
         durable_buckets
             .keys()
             .filter(|bucket| !all_bucket_stats.contains_key(*bucket))
+            .cloned(),
+    );
+    bucket_names.extend(
+        mrf_observability_buckets
+            .keys()
+            .filter(|bucket| !all_bucket_stats.contains_key(*bucket) && !durable_buckets.contains_key(*bucket))
             .cloned(),
     );
     let mut buckets = Vec::with_capacity(bucket_names.len());
@@ -291,12 +327,14 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             runtime.current_backlog_bytes = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes);
         }
         let durable_bucket = durable_buckets.get(&bucket).cloned().unwrap_or_default();
+        let mrf_observability = mrf_observability_buckets.get(&bucket).cloned().unwrap_or_default();
         buckets.push(bucket_replication_stats_snapshot_from_parts(
             bucket,
             runtime,
             proxy,
             durable_mrf_available,
             durable_bucket,
+            mrf_observability,
         ));
     }
 
@@ -394,6 +432,15 @@ mod tests {
                 count: 5,
                 bytes: 8192,
             },
+            MrfBucketBacklogObservability {
+                bucket: "runtime-bucket".to_string(),
+                pending_count: 1,
+                pending_bytes: 512,
+                dropped_count: 2,
+                missed_count: 3,
+                flush_failure_count: 4,
+                last_flush_duration_millis: 5,
+            },
         );
 
         assert_eq!(snapshot.bucket, "runtime-bucket");
@@ -402,6 +449,12 @@ mod tests {
         assert!(snapshot.durable_mrf_available);
         assert_eq!(snapshot.durable_mrf_backlog_count, 5);
         assert_eq!(snapshot.durable_mrf_backlog_bytes, 8192);
+        assert_eq!(snapshot.mrf_pending_count, 1);
+        assert_eq!(snapshot.mrf_pending_bytes, 512);
+        assert_eq!(snapshot.mrf_dropped_count, 2);
+        assert_eq!(snapshot.mrf_missed_count, 3);
+        assert_eq!(snapshot.mrf_flush_failures, 4);
+        assert_eq!(snapshot.mrf_last_flush_duration_millis, 5);
         assert_eq!(snapshot.resync_failed_count, 2);
         assert_eq!(snapshot.proxied_get_requests_total, 7);
         assert_eq!(snapshot.proxied_get_requests_failures, 1);
@@ -419,6 +472,7 @@ mod tests {
                 count: 11,
                 bytes: 2048,
             },
+            MrfBucketBacklogObservability::default(),
         );
 
         assert_eq!(snapshot.bucket, "durable-only");
@@ -426,6 +480,39 @@ mod tests {
         assert!(snapshot.durable_mrf_available);
         assert_eq!(snapshot.durable_mrf_backlog_count, 11);
         assert_eq!(snapshot.durable_mrf_backlog_bytes, 2048);
+    }
+
+    #[test]
+    fn bucket_replication_snapshot_reports_mrf_observability_only_bucket() {
+        let snapshot = bucket_replication_stats_snapshot_from_parts(
+            "mrf-observability-only".to_string(),
+            ObsBucketReplicationRuntimeSnapshot::default(),
+            ObsBucketReplicationProxySnapshot::default(),
+            true,
+            DurableMrfBucketBacklog::default(),
+            MrfBucketBacklogObservability {
+                bucket: "mrf-observability-only".to_string(),
+                pending_count: 13,
+                pending_bytes: 4096,
+                dropped_count: 1,
+                missed_count: 2,
+                flush_failure_count: 3,
+                last_flush_duration_millis: 4,
+            },
+        );
+
+        assert_eq!(snapshot.bucket, "mrf-observability-only");
+        assert_eq!(snapshot.current_backlog_count, 0);
+        assert_eq!(snapshot.current_backlog_bytes, 0);
+        assert!(snapshot.durable_mrf_available);
+        assert_eq!(snapshot.durable_mrf_backlog_count, 0);
+        assert_eq!(snapshot.durable_mrf_backlog_bytes, 0);
+        assert_eq!(snapshot.mrf_pending_count, 13);
+        assert_eq!(snapshot.mrf_pending_bytes, 4096);
+        assert_eq!(snapshot.mrf_dropped_count, 1);
+        assert_eq!(snapshot.mrf_missed_count, 2);
+        assert_eq!(snapshot.mrf_flush_failures, 3);
+        assert_eq!(snapshot.mrf_last_flush_duration_millis, 4);
     }
 
     #[test]
@@ -440,6 +527,7 @@ mod tests {
             ObsBucketReplicationProxySnapshot::default(),
             false,
             DurableMrfBucketBacklog::default(),
+            MrfBucketBacklogObservability::default(),
         );
 
         assert_eq!(snapshot.current_backlog_count, 1);

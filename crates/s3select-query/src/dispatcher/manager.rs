@@ -1033,8 +1033,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn csv_query_uses_single_byte_record_delimiter() {
-        const ROW_COUNT: usize = 3;
+    async fn csv_query_uses_custom_record_delimiter_across_file_partitions() {
+        const ROW_COUNT: usize = 200_000;
 
         let mut input = test_input();
         let csv = input
@@ -1052,7 +1052,7 @@ mod tests {
         let dispatcher = SimpleQueryDispatcherBuilder::default()
             .with_input(Arc::clone(&input))
             .with_default_table_provider(Arc::new(BaseTableProvider::default()))
-            .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
+            .with_session_factory(Arc::new(SessionCtxFactory::new(true).with_target_partitions(2)))
             .with_parser(Arc::new(DefaultParser::default()))
             .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)))
             .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
@@ -1065,6 +1065,8 @@ mod tests {
             .build_query_state_machine(query)
             .await
             .expect("query should acquire admission");
+        let data = b"value^".repeat(ROW_COUNT);
+        assert!(data.len() > 1024 * 1024);
         let store_url = ObjectStoreUrl::parse("s3://test-bucket").expect("test object store URL should be valid");
         let store = query_state_machine
             .session
@@ -1073,9 +1075,9 @@ mod tests {
             .object_store(&store_url)
             .expect("test object store should be registered");
         store
-            .put(&Path::from("test.csv"), b"value^".repeat(ROW_COUNT).into())
+            .put(&Path::from("test.csv"), data.into())
             .await
-            .expect("CSV fixture should be stored");
+            .expect("large CSV fixture should be stored");
 
         let logical_plan = dispatcher
             .build_logical_plan(Arc::clone(&query_state_machine))

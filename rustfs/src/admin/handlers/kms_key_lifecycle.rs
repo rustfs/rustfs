@@ -14,6 +14,7 @@
 
 //! KMS key lifecycle admin API handlers: enable, disable and rotate.
 
+use super::kms_audit::KmsAdminAudit;
 use super::kms_keys::{extract_query_params, scoped_key_id};
 use crate::admin::auth::validate_admin_request_with_kms_key;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
@@ -24,8 +25,8 @@ use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{
-    KmsError, KmsManager,
-    types::{DescribeKeyRequest, KeyMetadata},
+    KmsAuditOperation, KmsError, KmsManager,
+    types::{DescribeKeyRequest, KeyMetadata, OperationContext},
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
@@ -60,6 +61,15 @@ enum LifecycleOperation {
 }
 
 impl LifecycleOperation {
+    /// The KMS audit operation this endpoint is recorded as.
+    fn audit_operation(self) -> KmsAuditOperation {
+        match self {
+            Self::Enable => KmsAuditOperation::EnableKey,
+            Self::Disable => KmsAuditOperation::DisableKey,
+            Self::Rotate => KmsAuditOperation::RotateKey,
+        }
+    }
+
     fn action(self) -> &'static str {
         match self {
             Self::Enable => "enable_key",
@@ -148,11 +158,12 @@ async fn execute_lifecycle(
     manager: &KmsManager,
     key_id: &str,
     operation: LifecycleOperation,
+    context: &OperationContext,
 ) -> (StatusCode, KmsKeyLifecycleResponse) {
     let result = match operation {
-        LifecycleOperation::Enable => manager.enable_key(key_id).await,
-        LifecycleOperation::Disable => manager.disable_key(key_id).await,
-        LifecycleOperation::Rotate => manager.rotate_key(key_id).await,
+        LifecycleOperation::Enable => manager.enable_key_with_context(key_id, context).await,
+        LifecycleOperation::Disable => manager.disable_key_with_context(key_id, context).await,
+        LifecycleOperation::Rotate => manager.rotate_key_with_context(key_id, context).await,
     };
 
     match result {
@@ -256,21 +267,23 @@ async fn handle_lifecycle_request(
     // on, so it has to be resolved before the gate runs. A read failure is
     // surfaced only afterwards so an unauthorized caller still sees AccessDenied.
     let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+    let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
+    let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
 
-    validate_admin_request_with_kms_key(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        actions,
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        body.as_ref()
-            .ok()
-            .and_then(|body| scoped_key_id(body, &req.uri))
-            .as_deref()
-            .unwrap_or_default(),
-    )
-    .await?;
+    audit.gate(
+        validate_admin_request_with_kms_key(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            actions,
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            scoped.as_deref().unwrap_or_default(),
+        )
+        .await,
+        operation.audit_operation(),
+        scoped.as_deref(),
+    )?;
 
     let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -300,7 +313,7 @@ async fn handle_lifecycle_request(
         return unavailable_response("kms service is not running", request.key_id);
     };
 
-    let (status, response) = execute_lifecycle(&manager, &request.key_id, operation).await;
+    let (status, response) = execute_lifecycle(&manager, &request.key_id, operation, audit.context()).await;
     json_response(status, &response)
 }
 
@@ -383,18 +396,21 @@ mod tests {
         let manager = local_manager(&temp_dir).await;
         let key_id = create_key(&manager, "lifecycle-round-trip").await;
 
-        let (status, response) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Disable).await;
+        let (status, response) =
+            execute_lifecycle(&manager, &key_id, LifecycleOperation::Disable, &OperationContext::internal()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(response.success);
         assert_eq!(key_state(&response), KeyState::Disabled);
 
-        let (status, response) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Enable).await;
+        let (status, response) =
+            execute_lifecycle(&manager, &key_id, LifecycleOperation::Enable, &OperationContext::internal()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(response.success);
         assert_eq!(key_state(&response), KeyState::Enabled);
 
         // Enabling an already enabled key stays idempotent.
-        let (status, response) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Enable).await;
+        let (status, response) =
+            execute_lifecycle(&manager, &key_id, LifecycleOperation::Enable, &OperationContext::internal()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(key_state(&response), KeyState::Enabled);
     }
@@ -405,7 +421,8 @@ mod tests {
         let manager = local_manager(&temp_dir).await;
         let key_id = create_key(&manager, "rotate-unsupported").await;
 
-        let (status, response) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Rotate).await;
+        let (status, response) =
+            execute_lifecycle(&manager, &key_id, LifecycleOperation::Rotate, &OperationContext::internal()).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_ne!(status, StatusCode::NOT_FOUND);
         assert!(!response.success);
@@ -416,9 +433,10 @@ mod tests {
         );
 
         // A disabled key must not change the picture: rotation stays rejected.
-        let (status, _) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Disable).await;
+        let (status, _) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Disable, &OperationContext::internal()).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, response) = execute_lifecycle(&manager, &key_id, LifecycleOperation::Rotate).await;
+        let (status, response) =
+            execute_lifecycle(&manager, &key_id, LifecycleOperation::Rotate, &OperationContext::internal()).await;
         assert_ne!(status, StatusCode::OK);
         assert!(!response.success);
     }
@@ -428,7 +446,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let manager = local_manager(&temp_dir).await;
 
-        let (status, response) = execute_lifecycle(&manager, "no-such-key", LifecycleOperation::Enable).await;
+        let (status, response) =
+            execute_lifecycle(&manager, "no-such-key", LifecycleOperation::Enable, &OperationContext::internal()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!response.success);
     }

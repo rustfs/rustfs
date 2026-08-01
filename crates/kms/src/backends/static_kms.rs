@@ -683,6 +683,7 @@ mod tests {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             },
         )
         .await;
