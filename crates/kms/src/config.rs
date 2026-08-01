@@ -130,6 +130,21 @@ pub enum KmsBackend {
     Static,
 }
 
+impl KmsBackend {
+    /// Stable identifier for logs, metrics, and audit records.
+    ///
+    /// External consumers key off these values, so treat them as a wire
+    /// contract rather than a rendering detail.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KmsBackend::VaultKv2 => "vault-kv2",
+            KmsBackend::VaultTransit => "vault-transit",
+            KmsBackend::Local => "local",
+            KmsBackend::Static => "static",
+        }
+    }
+}
+
 /// Main KMS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KmsConfig {

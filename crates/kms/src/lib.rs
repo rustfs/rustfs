@@ -65,6 +65,7 @@
 
 // Core modules
 pub mod api_types;
+pub mod audit;
 pub mod backends;
 pub mod backup;
 mod cache;
@@ -86,6 +87,7 @@ pub use api_types::{
     StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
+pub use audit::{KmsAuditOperation, KmsAuditOutcome, KmsAuditRecord, KmsAuditSink, redact_encryption_context};
 pub use config::*;
 pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;

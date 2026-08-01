@@ -112,6 +112,23 @@ impl ObjectEncryptionService {
         self.kms_manager.create_key(request).await
     }
 
+    /// Create a new master key on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - CreateKeyRequest with key parameters
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// CreateKeyResponse with created key details
+    ///
+    pub async fn create_key_with_context(
+        &self,
+        request: CreateKeyRequest,
+        context: &OperationContext,
+    ) -> Result<CreateKeyResponse> {
+        self.kms_manager.create_key_with_context(request, context).await
+    }
+
     /// Describe a master key (delegates to KMS manager)
     ///
     /// # Arguments
@@ -124,6 +141,23 @@ impl ObjectEncryptionService {
         self.kms_manager.describe_key(request).await
     }
 
+    /// Describe a master key on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - DescribeKeyRequest with key ID
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// DescribeKeyResponse with key metadata
+    ///
+    pub async fn describe_key_with_context(
+        &self,
+        request: DescribeKeyRequest,
+        context: &OperationContext,
+    ) -> Result<DescribeKeyResponse> {
+        self.kms_manager.describe_key_with_context(request, context).await
+    }
+
     /// List master keys (delegates to KMS manager)
     ///
     /// # Arguments
@@ -134,6 +168,19 @@ impl ObjectEncryptionService {
     ///
     pub async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse> {
         self.kms_manager.list_keys(request).await
+    }
+
+    /// List master keys on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - ListKeysRequest with listing parameters
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// ListKeysResponse with list of keys
+    ///
+    pub async fn list_keys_with_context(&self, request: ListKeysRequest, context: &OperationContext) -> Result<ListKeysResponse> {
+        self.kms_manager.list_keys_with_context(request, context).await
     }
 
     /// Generate a data encryption key (delegates to KMS manager)

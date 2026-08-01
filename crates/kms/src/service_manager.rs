@@ -14,6 +14,7 @@
 
 //! KMS service manager for dynamic configuration and runtime management
 
+use crate::audit::KmsAuditSink;
 use crate::backends::vault_credentials::CredentialTaskHandle;
 use crate::backends::{KmsBackend, local::LocalKmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
@@ -171,6 +172,8 @@ pub struct KmsServiceManager {
     lifecycle_mutex: Arc<Mutex<()>>,
     /// External reference checker consulted before expired keys are removed
     deletion_reference_checker: std::sync::RwLock<Option<Arc<dyn DeletionReferenceChecker>>>,
+    /// External sink receiving audit records for management operations
+    audit_sink: std::sync::RwLock<Option<Arc<dyn KmsAuditSink>>>,
 }
 
 impl KmsServiceManager {
@@ -185,7 +188,24 @@ impl KmsServiceManager {
             version_counter: Arc::new(AtomicU64::new(0)),
             lifecycle_mutex: Arc::new(Mutex::new(())),
             deletion_reference_checker: std::sync::RwLock::new(None),
+            audit_sink: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Install the sink that receives an audit record for every KMS
+    /// management operation. Takes effect for services built by the next
+    /// start or reconfigure.
+    ///
+    /// Without a sink no records are built, so KMS operations are unaffected
+    /// when auditing is not configured.
+    pub fn set_audit_sink(&self, sink: Arc<dyn KmsAuditSink>) {
+        if let Ok(mut slot) = self.audit_sink.write() {
+            *slot = Some(sink);
+        }
+    }
+
+    fn audit_sink(&self) -> Option<Arc<dyn KmsAuditSink>> {
+        self.audit_sink.read().ok().and_then(|slot| slot.clone())
     }
 
     /// Install the reference checker consulted before the deletion worker
@@ -585,7 +605,11 @@ impl KmsServiceManager {
         };
 
         // Create KMS manager
-        let kms_manager = Arc::new(KmsManager::new(backend, config.clone()));
+        let mut kms_manager = KmsManager::new(backend, config.clone());
+        if let Some(sink) = self.audit_sink() {
+            kms_manager = kms_manager.with_audit_sink(sink);
+        }
+        let kms_manager = Arc::new(kms_manager);
 
         // Create encryption service
         let encryption_service = Arc::new(ObjectEncryptionService::new((*kms_manager).clone()));
@@ -629,7 +653,13 @@ impl KmsServiceManager {
             return None;
         }
         let cancel = CancellationToken::new();
-        let worker = DeletionWorker::new(backend, config.default_key_id.clone(), self.deletion_reference_checker());
+        let worker = DeletionWorker::new(
+            backend,
+            config.default_key_id.clone(),
+            self.deletion_reference_checker(),
+            config.backend.as_str(),
+        )
+        .with_audit_sink(self.audit_sink());
         let task = worker.spawn(cancel.clone());
         Some(Arc::new(DeletionWorkerHandle {
             cancel,

@@ -14,8 +14,8 @@
 
 //! KMS key lifecycle admin API handlers: enable, disable and rotate.
 
-use super::kms_keys::extract_query_params;
-use crate::admin::auth::validate_admin_request;
+use super::kms_keys::{extract_query_params, scoped_key_id};
+use crate::admin::auth::validate_admin_request_with_kms_key;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_kms_runtime_service_manager;
 use crate::auth::{check_key_valid, get_session_token};
@@ -252,21 +252,27 @@ async fn handle_lifecycle_request(
 
     let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-    validate_admin_request(
+    // The body (or the `keyId` query parameter) names the key this operation acts
+    // on, so it has to be resolved before the gate runs. A read failure is
+    // surfaced only afterwards so an unauthorized caller still sees AccessDenied.
+    let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+
+    validate_admin_request_with_kms_key(
         &req.headers,
         &cred,
         owner,
         false,
         actions,
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        body.as_ref()
+            .ok()
+            .and_then(|body| scoped_key_id(body, &req.uri))
+            .as_deref()
+            .unwrap_or_default(),
     )
     .await?;
 
-    let body = req
-        .input
-        .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
-        .await
-        .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+    let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
     let request: KmsKeyLifecycleRequest = if body.is_empty() {
         let query_params = extract_query_params(&req.uri);
@@ -335,6 +341,7 @@ impl Operation for RotateKmsKeyHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Uri;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::config::KmsConfig;
     use rustfs_kms::types::{CreateKeyRequest, KeyState};
@@ -445,6 +452,47 @@ mod tests {
         for actions in [kms_enable_key_actions(), kms_disable_key_actions(), kms_rotate_key_actions()] {
             assert!(!actions.contains(&Action::AdminAction(AdminAction::ServerInfoAdminAction)));
         }
+    }
+
+    /// The lifecycle gate must be scoped to the key the request names, and the
+    /// key must be resolved the same way for authorization and for execution.
+    #[test]
+    fn lifecycle_requests_authorize_against_the_key_they_operate_on() {
+        let src = include_str!("kms_key_lifecycle.rs");
+        let handler = src
+            .split_once("async fn handle_lifecycle_request(")
+            .expect("lifecycle entry point should exist")
+            .1;
+        let handler = &handler[..handler.find("\nfn kms_service_manager_from_context").unwrap_or(handler.len())];
+
+        assert!(
+            handler.contains("validate_admin_request_with_kms_key("),
+            "lifecycle requests must scope authorization to the requested key"
+        );
+        assert!(
+            handler.contains("scoped_key_id(body, &req.uri)"),
+            "authorization must resolve the key exactly as execution does"
+        );
+
+        let uri: Uri = "/rustfs/admin/v3/kms/keys/disable?keyId=query-key"
+            .parse()
+            .expect("uri should parse");
+        let body = br#"{"key_id":"body-key"}"#;
+
+        assert_eq!(scoped_key_id(body, &uri).as_deref(), Some("body-key"));
+        assert_eq!(
+            scoped_key_id(body, &uri).as_deref(),
+            Some(
+                serde_json::from_slice::<KmsKeyLifecycleRequest>(body)
+                    .expect("lifecycle body should parse")
+                    .key_id
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            scoped_key_id(b"", &uri).as_deref(),
+            extract_query_params(&uri).get("keyId").map(String::as_str)
+        );
     }
 
     #[test]

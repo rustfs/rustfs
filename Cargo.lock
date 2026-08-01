@@ -9521,6 +9521,7 @@ dependencies = [
  "moka",
  "rand 0.10.2",
  "reqwest",
+ "rustfs-s3-types",
  "rustfs-security-governance",
  "rustfs-utils",
  "rustify",
