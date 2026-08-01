@@ -143,11 +143,16 @@ impl KmsCache {
 
         if cached.is_none() {
             // TTL expiry is the one way the entry set shrinks without a write,
-            // and a miss is where it surfaces: moka reaps expired entries in
-            // the maintenance it runs on this very lookup, which reaches the
-            // eviction listener but never `record_entry_count`. Republishing
-            // here keeps a cache that only expires — no put, remove or clear
-            // to follow — from reporting a population that is already gone.
+            // and a miss is where it surfaces. moka expires lazily: the miss is
+            // reported at once, but the removal that decrements `entry_count`
+            // and reaches the eviction listener lands in the maintenance pass
+            // moka runs opportunistically on reads, on its own interval. So
+            // this converges the gauge within a housekeeping interval rather
+            // than on the first miss — enough to stop a cache that only ever
+            // expires, with no put, remove or clear to follow, from reporting a
+            // population that is gone. Forcing `run_pending_tasks` would
+            // tighten that at the cost of taking moka's maintenance lock on
+            // every miss, for a gauge `entry_count` only approximates anyway.
             // Hits, the hot path, are left alone.
             self.record_entry_count();
         }
