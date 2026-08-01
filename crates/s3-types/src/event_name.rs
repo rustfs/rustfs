@@ -153,6 +153,31 @@ const SINGLE_AWS_AND_EXTENSION_EVENTS_AFTER_COMPAT: [EventName; 5] = [
 
 const LAST_SINGLE_TYPE_VALUE: u32 = EventName::IntelligentTiering as u32;
 
+/// The discriminant of the last `EventName` variant in declaration order.
+///
+/// Anchoring this on the final variant is what makes the budget assertion below
+/// meaningful: `mask()` turns a leaf variant's discriminant `v` into the bit
+/// `1 << (v - 1)`, so the highest discriminant is also the highest bit index in
+/// use. Keep this pointing at whatever variant is declared last.
+const LAST_EVENT_NAME_VALUE: u32 = EventName::KmsServiceStopped as u32;
+
+/// `mask()` returns a `u64`, so discriminants may run from 1 to 64 inclusive.
+///
+/// Past that, `1u64 << (v - 1)` shifts by 64 or more: a debug build panics with
+/// "attempt to shift left with overflow", and a release build silently masks the
+/// shift amount down and hands back a bit that already belongs to another event.
+/// Either way the failure is far away from the line that added the variant, so
+/// fail the build right here instead.
+///
+/// To widen the budget, change `mask()`'s return type to a wider integer or a
+/// bitset and update every caller that stores or compares an event mask.
+const _: () = assert!(
+    LAST_EVENT_NAME_VALUE <= u64::BITS,
+    "EventName has outgrown the 64-bit mask budget: the last variant's discriminant exceeds 64, \
+     so EventName::mask() can no longer give every event its own bit. Widen the mask type \
+     (see the note on EventName::mask) instead of adding more variants."
+);
+
 impl EventName {
     /// The parsed string is EventName.
     pub fn parse(s: &str) -> Result<Self, ParseEventNameError> {
@@ -356,6 +381,25 @@ impl EventName {
 
     /// Returns the mask of type.
     /// The compound "All" type will be expanded.
+    ///
+    /// # Bit budget
+    ///
+    /// A leaf event's mask is `1 << (discriminant - 1)`, so the enum can hold at
+    /// most **64 variants** in total — compound "All" variants included, because
+    /// they consume discriminants even though they own no bit of their own and
+    /// so push every later leaf further up the range.
+    ///
+    /// The last variant is currently `KmsServiceStopped` at discriminant
+    /// `LAST_EVENT_NAME_VALUE`, leaving `64 - LAST_EVENT_NAME_VALUE` free slots.
+    /// Before adding an event, check that number; if the budget is gone, widen
+    /// the mask beyond `u64` rather than reusing a bit.
+    ///
+    /// Three guards back this up: the `const` assertion next to
+    /// `LAST_EVENT_NAME_VALUE` fails the build once that discriminant passes 64;
+    /// `test_event_name_discriminants_are_dense_and_fully_listed` fails if the
+    /// anchor is left stale or a variant goes unlisted; and
+    /// `test_every_event_mask_is_nonzero_and_leaf_bits_are_unique` fails on the
+    /// bit collision a wrapped shift produces in release builds.
     pub fn mask(&self) -> u64 {
         let value = *self as u32;
         if value > 0 && value <= LAST_SINGLE_TYPE_VALUE {
@@ -583,6 +627,85 @@ mod tests {
         assert!(EventName::try_from_event_str("s3:Invalid").is_err());
     }
 
+    /// Compile-time tripwire for `ALL_EVENT_NAMES`.
+    ///
+    /// The match below is exhaustive on purpose and does nothing at runtime.
+    /// Adding a variant to `EventName` makes it non-exhaustive, so the build
+    /// stops here rather than silently leaving the new variant out of
+    /// `ALL_EVENT_NAMES` — which would let every mask test below pass while the
+    /// new event goes unchecked. When the compiler stops you here:
+    ///
+    /// 1. Re-read the bit budget documented on `EventName::mask`; the enum has
+    ///    room for 64 variants total and only a few slots are still free.
+    /// 2. Move `LAST_EVENT_NAME_VALUE` if the new variant is now the last one.
+    /// 3. Add the variant to `ALL_EVENT_NAMES`, and to `KMS_EVENT_NAMES` if it
+    ///    is a KMS management-plane event.
+    fn assert_every_variant_is_listed(ev: EventName) {
+        match ev {
+            EventName::ObjectAccessedGet
+            | EventName::ObjectAccessedGetRetention
+            | EventName::ObjectAccessedGetLegalHold
+            | EventName::ObjectAccessedHead
+            | EventName::ObjectAccessedAttributes
+            | EventName::ObjectCreatedCompleteMultipartUpload
+            | EventName::ObjectCreatedCopy
+            | EventName::ObjectCreatedPost
+            | EventName::ObjectCreatedPut
+            | EventName::ObjectCreatedPutRetention
+            | EventName::ObjectCreatedPutLegalHold
+            | EventName::ObjectTaggingPut
+            | EventName::ObjectTaggingDelete
+            | EventName::ObjectRemovedDelete
+            | EventName::ObjectRemovedDeleteMarkerCreated
+            | EventName::ObjectRemovedDeleteAllVersions
+            | EventName::ObjectRemovedNoOP
+            | EventName::BucketCreated
+            | EventName::BucketRemoved
+            | EventName::ObjectReplicationFailed
+            | EventName::ObjectReplicationComplete
+            | EventName::ObjectReplicationMissedThreshold
+            | EventName::ObjectReplicationReplicatedAfterThreshold
+            | EventName::ObjectReplicationNotTracked
+            | EventName::ObjectRestorePost
+            | EventName::ObjectRestoreCompleted
+            | EventName::ObjectTransitionFailed
+            | EventName::ObjectTransitionComplete
+            | EventName::ScannerManyVersions
+            | EventName::ScannerLargeVersions
+            | EventName::ScannerBigPrefix
+            | EventName::LifecycleDelMarkerExpirationDelete
+            | EventName::ObjectAclPut
+            | EventName::LifecycleExpirationDelete
+            | EventName::LifecycleExpirationDeleteMarkerCreated
+            | EventName::LifecycleTransition
+            | EventName::IntelligentTiering
+            | EventName::ObjectAccessedAll
+            | EventName::ObjectCreatedAll
+            | EventName::ObjectRemovedAll
+            | EventName::ObjectReplicationAll
+            | EventName::ObjectRestoreAll
+            | EventName::ObjectTaggingAll
+            | EventName::LifecycleExpirationAll
+            | EventName::ObjectTransitionAll
+            | EventName::ObjectScannerAll
+            | EventName::Everything
+            | EventName::ObjectRemovedAbortMultipartUpload
+            | EventName::ObjectCreatedCreateMultipartUpload
+            | EventName::ObjectRemovedDeleteObjects
+            | EventName::KmsKeyCreated
+            | EventName::KmsKeyRotated
+            | EventName::KmsKeyEnabled
+            | EventName::KmsKeyDisabled
+            | EventName::KmsKeyDeletionScheduled
+            | EventName::KmsKeyDeletionCancelled
+            | EventName::KmsKeyDeleted
+            | EventName::KmsKeyAccessed
+            | EventName::KmsServiceConfigured
+            | EventName::KmsServiceStarted
+            | EventName::KmsServiceStopped => {}
+        }
+    }
+
     /// Every `EventName` variant in declaration order. Kept exhaustive so the
     /// `mask()` regressions below cover single, compound, and internal events.
     const ALL_EVENT_NAMES: &[EventName] = &[
@@ -663,6 +786,87 @@ mod tests {
         EventName::KmsServiceStarted,
         EventName::KmsServiceStopped,
     ];
+
+    /// `LAST_EVENT_NAME_VALUE` must really be the highest discriminant, and
+    /// `ALL_EVENT_NAMES` must really cover every variant.
+    ///
+    /// The `const` assertion in the parent module only bounds whatever
+    /// `LAST_EVENT_NAME_VALUE` points at, so a stale anchor would let the enum
+    /// grow past 64 unnoticed. Discriminants are dense (1..=N, no gaps), so
+    /// checking that `ALL_EVENT_NAMES` holds each value in `1..=LAST` exactly
+    /// once pins both facts at the same time.
+    #[test]
+    fn test_event_name_discriminants_are_dense_and_fully_listed() {
+        assert_every_variant_is_listed(EventName::Everything);
+
+        let mut seen = vec![false; LAST_EVENT_NAME_VALUE as usize + 1];
+        for ev in ALL_EVENT_NAMES {
+            let value = *ev as u32;
+            assert!(
+                (1..=LAST_EVENT_NAME_VALUE).contains(&value),
+                "{ev:?} has discriminant {value}, outside 1..={LAST_EVENT_NAME_VALUE}; \
+                 LAST_EVENT_NAME_VALUE must point at the last variant in declaration order"
+            );
+            assert!(!seen[value as usize], "discriminant {value} listed twice in ALL_EVENT_NAMES");
+            seen[value as usize] = true;
+        }
+
+        for (value, present) in seen.iter().enumerate().skip(1) {
+            assert!(*present, "discriminant {value} is missing from ALL_EVENT_NAMES");
+        }
+        assert_eq!(
+            ALL_EVENT_NAMES.len(),
+            LAST_EVENT_NAME_VALUE as usize,
+            "ALL_EVENT_NAMES must list every variant exactly once"
+        );
+    }
+
+    /// The mask space must not be exhausted: every variant needs a non-zero
+    /// mask, and every leaf must own a bit no other leaf uses.
+    ///
+    /// Once a discriminant passes 64, `1 << (v - 1)` wraps in release builds and
+    /// hands back a bit that already belongs to an earlier event, so this fails
+    /// on the collision even in the release profile where the shift does not
+    /// panic.
+    #[test]
+    fn test_every_event_mask_is_nonzero_and_leaf_bits_are_unique() {
+        let mut leaf_bits = 0u64;
+        for ev in ALL_EVENT_NAMES {
+            let mask = ev.mask();
+            assert_ne!(mask, 0, "{ev:?} has an empty mask — the mask bit budget is exhausted");
+
+            // A leaf is exactly what `mask()` treats as one: it expands to itself.
+            let expanded = ev.expand();
+            if matches!(expanded.as_slice(), [only] if only == ev) {
+                assert_eq!(mask.count_ones(), 1, "leaf {ev:?} must own exactly one bit, got mask {mask:#x}");
+                assert_eq!(
+                    leaf_bits & mask,
+                    0,
+                    "leaf {ev:?} reuses a bit already taken by another event (mask {mask:#x}) — \
+                     the 64-bit mask budget has been exceeded"
+                );
+                leaf_bits |= mask;
+            }
+        }
+    }
+
+    /// The highest bit in use must still land inside the `u64`.
+    ///
+    /// `test_mask_bit_budget_is_not_exhausted` below bounds every listed
+    /// discriminant; this one pins the top of the range specifically, so the
+    /// variant most likely to fall off the edge is asserted by name rather than
+    /// only as one element of an array someone may forget to extend.
+    #[test]
+    fn test_last_variant_still_gets_its_own_bit() {
+        let last = EventName::KmsServiceStopped;
+        assert_ne!(last.mask(), 0, "the last variant's mask overflowed to zero");
+        assert_eq!(
+            last.mask(),
+            1u64 << (LAST_EVENT_NAME_VALUE - 1),
+            "the last variant must own the top bit of the range"
+        );
+        assert_eq!(last.mask().count_ones(), 1, "the last variant is a leaf and must own exactly one bit");
+    }
 
     /// Regression for backlog#965: `mask()` used to recurse forever for the
     /// three internal leaf events, overflowing the stack. Every variant must

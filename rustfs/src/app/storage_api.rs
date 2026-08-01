@@ -649,8 +649,8 @@ pub(crate) mod bucket {
             oi: &crate::storage::storage_api::StorageObjectInfo,
             del_opts: &crate::storage::storage_api::StorageObjectOptions,
             gerr: Option<String>,
-        ) -> ReplicateDecision {
-            ReplicationObjectBridge::check_delete(bucket, dobj, oi, del_opts, gerr).await
+        ) -> Result<ReplicateDecision, crate::storage::storage_api::StorageError> {
+            ReplicationObjectBridge::check_delete_strict(bucket, dobj, oi, del_opts, gerr).await
         }
 
         pub(crate) fn delete_replication_version_id(
@@ -751,21 +751,6 @@ pub(crate) mod bucket {
             replication_contracts::should_remove_replication_target(target_arn, is_replication_service, target_arns)
         }
 
-        pub(crate) fn should_schedule_delete_replication(
-            opts: &crate::storage::storage_api::StorageObjectOptions,
-            replication_source: &crate::storage::storage_api::StorageObjectInfo,
-            deleted_delete_marker_version: bool,
-        ) -> bool {
-            replication_contracts::should_schedule_delete_replication(replication_contracts::ReplicationDeleteScheduleInput {
-                replication_request: opts.replication_request,
-                version_id_requested: opts.version_id.is_some(),
-                source_delete_marker: replication_source.delete_marker,
-                source_replication_status: &replication_source.replication_status,
-                source_version_purge_status: &replication_source.version_purge_status,
-                deleted_delete_marker_version,
-            })
-        }
-
         pub(crate) fn should_use_existing_delete_replication_info(
             opts: &crate::storage::storage_api::StorageObjectOptions,
         ) -> bool {
@@ -789,6 +774,10 @@ pub(crate) mod bucket {
             config: &s3s::dto::ReplicationConfiguration,
         ) -> Result<(), ReplicationTargetValidationError> {
             replication_contracts::validate_replication_config_target_arns(configured_arns, config)
+        }
+
+        pub(crate) fn unsupported_replication_config_field(config: &s3s::dto::ReplicationConfiguration) -> Option<&'static str> {
+            replication_contracts::unsupported_replication_config_field(config)
         }
     }
 

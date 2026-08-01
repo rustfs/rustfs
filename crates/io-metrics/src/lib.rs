@@ -3046,6 +3046,90 @@ mod tests {
     }
 
     #[test]
+    fn test_ec_encode_payload_stage_guards_are_noop_when_disabled() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+
+        let producer_current_before = current_ec_encode_producer_bytes();
+        let producer_peak_before = current_ec_encode_producer_bytes_peak();
+        let writer_current_before = current_ec_encode_writer_bytes();
+        let writer_peak_before = current_ec_encode_writer_bytes_peak();
+
+        let producer = track_ec_encode_producer_bytes(1024);
+        let writer = track_ec_encode_writer_bytes(2048);
+        assert_eq!(current_ec_encode_producer_bytes(), producer_current_before);
+        assert_eq!(current_ec_encode_producer_bytes_peak(), producer_peak_before);
+        assert_eq!(current_ec_encode_writer_bytes(), writer_current_before);
+        assert_eq!(current_ec_encode_writer_bytes_peak(), writer_peak_before);
+
+        drop((producer, writer));
+        assert_eq!(current_ec_encode_producer_bytes(), producer_current_before);
+        assert_eq!(current_ec_encode_producer_bytes_peak(), producer_peak_before);
+        assert_eq!(current_ec_encode_writer_bytes(), writer_current_before);
+        assert_eq!(current_ec_encode_writer_bytes_peak(), writer_peak_before);
+    }
+
+    fn assert_concurrent_ec_encode_stage_guards_aggregate_and_settle(
+        track: fn(usize) -> EcEncodePayloadStageGuard,
+        current: fn() -> u64,
+        peak: fn() -> u64,
+    ) {
+        const WORKERS: usize = 4;
+        const STAGE_BYTES: usize = 1536;
+
+        let current_before = current();
+        let peak_before = peak();
+        let entered = Arc::new(Barrier::new(WORKERS + 1));
+        let release = Arc::new(Barrier::new(WORKERS + 1));
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for _ in 0..WORKERS {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            workers.push(std::thread::spawn(move || {
+                let stage = track(STAGE_BYTES);
+                entered.wait();
+                release.wait();
+                drop(stage);
+            }));
+        }
+
+        entered.wait();
+        let expected_delta = u64::try_from(WORKERS).expect("worker count should fit in u64")
+            * u64::try_from(STAGE_BYTES).expect("stage bytes should fit in u64");
+        assert_eq!(current(), current_before + expected_delta);
+        assert!(
+            peak() >= peak_before.max(current_before + expected_delta),
+            "stage peak must expose process-wide concurrent ownership"
+        );
+
+        release.wait();
+        for worker in workers {
+            worker.join().expect("stage worker should not panic");
+        }
+        assert_eq!(current(), current_before);
+    }
+
+    #[test]
+    fn test_ec_encode_payload_stage_guards_track_concurrent_ownership() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(true);
+
+        assert_concurrent_ec_encode_stage_guards_aggregate_and_settle(
+            track_ec_encode_producer_bytes,
+            current_ec_encode_producer_bytes,
+            current_ec_encode_producer_bytes_peak,
+        );
+        assert_concurrent_ec_encode_stage_guards_aggregate_and_settle(
+            track_ec_encode_writer_bytes,
+            current_ec_encode_writer_bytes,
+            current_ec_encode_writer_bytes_peak,
+        );
+
+        set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
     fn test_ec_encode_producer_peak_exports_the_high_water_mark() {
         let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(current_ec_encode_producer_bytes(), 0, "test must start without producer stage ownership");

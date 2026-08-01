@@ -82,14 +82,21 @@ const ERROR_CLASS_ACCESS_DENIED: &str = "access_denied";
 
 /// KMS admin operations audited by the handler itself.
 ///
-/// The KMS manager audits everything it serves, but two groups never reach it
+/// The KMS manager audits everything it serves, but three groups never reach it
 /// with a caller context: data-key derivation goes through
-/// `ObjectEncryptionService`, which has no context-aware entry point, and the
-/// service-control endpoints act on the service rather than on a key.
+/// `ObjectEncryptionService`, which has no context-aware entry point, the
+/// service-control endpoints act on the service rather than on a key, and the
+/// key metadata updates have no context-aware KMS entry point either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KmsAdminOperation {
     /// Derivation of a data key from a master key.
     GenerateDataKey,
+    /// Replacement of a key's description.
+    UpdateKeyDescription,
+    /// Addition or overwrite of key tags.
+    TagResource,
+    /// Removal of key tags.
+    UntagResource,
     /// Installation of a KMS configuration.
     Configure,
     /// Replacement of the running configuration.
@@ -98,6 +105,16 @@ pub(super) enum KmsAdminOperation {
     Start,
     /// Stop of the KMS service.
     Stop,
+    /// Export of a backup bundle.
+    Backup,
+    /// Readiness lookup for the backup subsystem.
+    BackupStatus,
+    /// Zero-write restore preflight.
+    RestoreDryRun,
+    /// Execution of a restore.
+    Restore,
+    /// Roll-back of an interrupted restore.
+    RestoreAbort,
 }
 
 impl KmsAdminOperation {
@@ -105,10 +122,18 @@ impl KmsAdminOperation {
     fn as_str(self) -> &'static str {
         match self {
             Self::GenerateDataKey => "GenerateDataKey",
+            Self::UpdateKeyDescription => "UpdateKeyDescription",
+            Self::TagResource => "TagResource",
+            Self::UntagResource => "UntagResource",
             Self::Configure => "Configure",
             Self::Reconfigure => "Reconfigure",
             Self::Start => "Start",
             Self::Stop => "Stop",
+            Self::Backup => "Backup",
+            Self::BackupStatus => "BackupStatus",
+            Self::RestoreDryRun => "RestoreDryRun",
+            Self::Restore => "Restore",
+            Self::RestoreAbort => "RestoreAbort",
         }
     }
 
@@ -118,9 +143,25 @@ impl KmsAdminOperation {
             // Deriving a data key uses the master key without changing it,
             // which is what the access event already denotes.
             Self::GenerateDataKey => EventName::KmsKeyAccessed,
+            // The event vocabulary has no key-metadata event, and these
+            // operations touch neither key material nor key state. Consumers
+            // separate them from a plain access by the recorded operation name.
+            Self::UpdateKeyDescription | Self::TagResource | Self::UntagResource => EventName::KmsKeyAccessed,
             Self::Configure | Self::Reconfigure => EventName::KmsServiceConfigured,
             Self::Start => EventName::KmsServiceStarted,
             Self::Stop => EventName::KmsServiceStopped,
+            // A backup reads the material of every key, and a restore
+            // preflight reads a bundle without touching the target: both are
+            // key access. The `kmsOperation` tag distinguishes them, and the
+            // event-name space is a fixed 64-bit mask that is nearly full, so
+            // these reuse the existing access event rather than claiming two
+            // more bits of it.
+            Self::Backup | Self::BackupStatus | Self::RestoreDryRun => EventName::KmsKeyAccessed,
+            // A restore publishes key material into the target directory.
+            Self::Restore => EventName::KmsKeyCreated,
+            // Aborting an interrupted restore removes the material a partial
+            // cutover had already published.
+            Self::RestoreAbort => EventName::KmsKeyDeleted,
         }
     }
 }
@@ -541,10 +582,18 @@ mod tests {
     fn handler_owned_operations_map_to_kms_events() {
         for operation in [
             KmsAdminOperation::GenerateDataKey,
+            KmsAdminOperation::UpdateKeyDescription,
+            KmsAdminOperation::TagResource,
+            KmsAdminOperation::UntagResource,
             KmsAdminOperation::Configure,
             KmsAdminOperation::Reconfigure,
             KmsAdminOperation::Start,
             KmsAdminOperation::Stop,
+            KmsAdminOperation::Backup,
+            KmsAdminOperation::BackupStatus,
+            KmsAdminOperation::RestoreDryRun,
+            KmsAdminOperation::Restore,
+            KmsAdminOperation::RestoreAbort,
         ] {
             assert!(
                 operation.event().is_kms(),

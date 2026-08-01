@@ -190,7 +190,7 @@ pub mod bucket {
             replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map, replication_target_arns,
             resync_start_conflict_id, should_remove_replication_target, should_schedule_delete_replication,
             should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
-            validate_replication_config_target_arns, version_purge_status_to_filemeta,
+            unsupported_replication_config_field, validate_replication_config_target_arns, version_purge_status_to_filemeta,
         };
     }
 

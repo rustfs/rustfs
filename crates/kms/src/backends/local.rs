@@ -1765,6 +1765,10 @@ impl KmsBackend for LocalKmsBackend {
         self.client.health_check().await.map(|_| true)
     }
 
+    fn local_backup_client(&self) -> Option<&LocalKmsClient> {
+        Some(&self.client)
+    }
+
     fn capabilities(&self) -> BackendCapabilities {
         // Rotation stays unadvertised until historical key versions can be
         // retained (see LocalKmsClient::rotate_key); without version history

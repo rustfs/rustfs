@@ -179,6 +179,20 @@ impl RemoteTargetRequest {
             return Err(s3_error!(InvalidRequest, "credentials.secretKey is required"));
         }
 
+        for (unsupported, configured) in [
+            ("disableProxy", self.disable_proxy),
+            ("healthCheckDuration", self.health_check_duration != 0),
+            ("edge", self.edge),
+            ("edgeSyncBeforeExpiry", self.edge_sync_before_expiry),
+        ] {
+            if configured {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "remote target field {unsupported} is not supported by this RustFS version"
+                ));
+            }
+        }
+
         Ok(BucketTarget {
             source_bucket: self.source_bucket,
             endpoint: self.endpoint,
@@ -1295,6 +1309,27 @@ mod tests {
         };
 
         assert!(err.to_string().contains("credentials.secretKey is required"));
+    }
+
+    #[test]
+    fn remote_target_request_rejects_unimplemented_fields() {
+        for (field, value) in [
+            ("disableProxy", serde_json::json!(true)),
+            ("healthCheckDuration", serde_json::json!(5)),
+            ("edge", serde_json::json!(true)),
+            ("edgeSyncBeforeExpiry", serde_json::json!(true)),
+        ] {
+            let mut request = valid_remote_target_request();
+            request[field] = value;
+            let request: RemoteTargetRequest =
+                serde_json::from_value(request).expect("unsupported field should still deserialize");
+            let err = request
+                .into_bucket_target()
+                .expect_err("unimplemented remote target fields must not be persisted");
+
+            assert!(err.to_string().contains(field));
+            assert!(err.to_string().contains("not supported by this RustFS version"));
+        }
     }
 
     #[test]
