@@ -45,9 +45,9 @@ use rustfs_protos::proto_gen::node_service::{
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ScannerActivityRequest,
-    ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest,
-    StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
-    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
@@ -71,6 +71,12 @@ use uuid::Uuid;
 
 pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
 pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
+/// Dynamic config subsystem for the cluster-persisted KMS configuration.
+///
+/// KMS configuration lives in its own cluster object rather than in the server
+/// config document, so it is not a `ServerConfig` subsystem; it only shares the
+/// reload signal transport.
+pub const KMS_SIGNAL_SUBSYSTEM: &str = "kms";
 const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
 const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
@@ -99,8 +105,13 @@ fn decode_bucket_stats_response(response: GetBucketStatsDataResponse) -> Result<
 }
 
 fn validate_signal_service_protocol(sig: u64, sub_sys: &str, protocol_version: u32) -> Result<()> {
+    // The version stays pinned to DYNAMIC_CONFIG_PROTOCOL_VERSION rather than
+    // being bumped per subsystem: the comparison is shared, so raising it would
+    // retire peers that already converge scanner and heal config correctly.
+    // Subsystems added after a peer was built are rejected by that peer's own
+    // subsystem allow-list, which surfaces as an explicit failed signal.
     if sig == SERVICE_SIGNAL_RELOAD_DYNAMIC
-        && matches!(sub_sys, SCANNER_SUB_SYS | HEAL_SUB_SYS)
+        && matches!(sub_sys, SCANNER_SUB_SYS | HEAL_SUB_SYS | KMS_SIGNAL_SUBSYSTEM)
         && protocol_version < rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION
     {
         return Err(Error::other(format!("peer does not support dynamic {sub_sys} config convergence")));
@@ -1500,6 +1511,22 @@ impl PeerRestClient {
     }
 
     pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, _exec_at: SystemTime) -> Result<()> {
+        self.signal_service_checked(sig, sub_sys, dry_run).await.map(|_| ())
+    }
+
+    /// Report the KMS configuration fingerprint the peer is currently running.
+    ///
+    /// Sent as a dry-run reload signal so the peer answers without swapping its
+    /// own configuration. `None` means the peer has no KMS configuration. The
+    /// fingerprint is advisory and feeds cluster status reporting only, so the
+    /// response is not proof-signed.
+    pub async fn kms_config_fingerprint(&self) -> Result<Option<String>> {
+        self.signal_service_checked(SERVICE_SIGNAL_RELOAD_DYNAMIC, KMS_SIGNAL_SUBSYSTEM, true)
+            .await
+            .map(|response| response.config_fingerprint)
+    }
+
+    async fn signal_service_checked(&self, sig: u64, sub_sys: &str, dry_run: bool) -> Result<SignalServiceResponse> {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
@@ -1520,7 +1547,7 @@ impl PeerRestClient {
                     return Err(Error::other(""));
                 }
                 validate_signal_service_protocol(sig, sub_sys, response.protocol_version)?;
-                Ok(())
+                Ok(response)
             }
             .await,
         )
@@ -2345,6 +2372,19 @@ mod tests {
             .expect("unrelated dynamic config keeps its existing compatibility contract");
         validate_signal_service_protocol(SERVICE_SIGNAL_REFRESH_CONFIG, SCANNER_SUB_SYS, 0)
             .expect("full refresh compatibility is guarded by its scanner preflight");
+    }
+
+    #[test]
+    fn dynamic_kms_config_requires_versioned_peer_acknowledgement() {
+        let err = validate_signal_service_protocol(SERVICE_SIGNAL_RELOAD_DYNAMIC, KMS_SIGNAL_SUBSYSTEM, 0)
+            .expect_err("an unversioned peer must not claim KMS config convergence");
+        assert!(err.to_string().contains("does not support dynamic"));
+        validate_signal_service_protocol(
+            SERVICE_SIGNAL_RELOAD_DYNAMIC,
+            KMS_SIGNAL_SUBSYSTEM,
+            rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION,
+        )
+        .expect("a current peer should support dynamic KMS config");
     }
 
     #[test]

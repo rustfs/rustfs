@@ -36,6 +36,8 @@ dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::is_notify_modul
 dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_audit_module_enabled
 dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_notify_module_enabled
 dep|rustfs/src/storage/rpc/http_service.rs|infra->interface|crate::server::RPC_PREFIX
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::current_kms_config_fingerprint
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::reload_persisted_kms_config
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state

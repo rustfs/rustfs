@@ -419,15 +419,15 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::{
-        AuthenticatedChannel, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
-        PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing,
-        ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers, gen_tonic_replay_scope_headers,
-        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
-        verify_tonic_rpc_signature_with_bootstrap,
+        AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
+        tonic_boot_epoch_response_headers, verify_rpc_signature, verify_tonic_boot_epoch_response,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 

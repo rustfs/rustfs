@@ -14,10 +14,13 @@
 
 //! KMS management route registration.
 
+use super::kms_dynamic::current_kms_config_fingerprint;
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
+use crate::admin::runtime_sources::{
+    current_kms_runtime_service_manager, current_notification_system, current_or_init_kms_runtime_service_manager,
+};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};
@@ -76,6 +79,79 @@ pub struct KmsStatusResponse {
     /// older servers, so it must stay optional for consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<rustfs_kms::backends::BackendCapabilities>,
+    /// Per-node fingerprint of the running KMS configuration. Additive field:
+    /// omitted by older servers, so it must stay optional for consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_config: Option<KmsClusterConfigStatus>,
+}
+
+/// Cluster-wide view of which KMS configuration each node is running.
+///
+/// KMS configuration is applied per node, so a runtime change that fails to
+/// reach a peer leaves that peer serving a different backend. Comparing
+/// redacted fingerprints makes that divergence observable and alertable.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KmsClusterConfigStatus {
+    /// True only when every node answered with the same fingerprint.
+    pub consistent: bool,
+    pub nodes: Vec<KmsNodeConfigStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KmsNodeConfigStatus {
+    /// Peer address, or `local` for the node serving this request.
+    pub host: String,
+    /// `None` when the node has no KMS configuration, or could not be asked at
+    /// all, in which case `error` carries the reason.
+    pub config_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+const LOCAL_NODE_HOST: &str = "local";
+const UNKNOWN_PEER_HOST: &str = "<unknown>";
+
+/// Collect the configuration fingerprint of this node and of every peer.
+async fn collect_cluster_config_status() -> KmsClusterConfigStatus {
+    let mut nodes = vec![KmsNodeConfigStatus {
+        host: LOCAL_NODE_HOST.to_string(),
+        config_fingerprint: current_kms_config_fingerprint().await,
+        error: None,
+    }];
+
+    if let Some(notification_sys) = current_notification_system() {
+        for peer in notification_sys.kms_config_fingerprints().await {
+            nodes.push(KmsNodeConfigStatus {
+                host: if peer.host.is_empty() {
+                    UNKNOWN_PEER_HOST.to_string()
+                } else {
+                    peer.host
+                },
+                config_fingerprint: peer.fingerprint,
+                error: peer.err.map(|err| err.to_string()),
+            });
+        }
+    }
+
+    let consistent = cluster_config_is_consistent(&nodes);
+    KmsClusterConfigStatus { consistent, nodes }
+}
+
+/// Whether every node was observed running the same KMS configuration.
+///
+/// A node that could not be asked, or that answered without a fingerprint,
+/// counts as divergent: the field exists to refuse agreement that was never
+/// observed, so an unreachable peer never reads as converged.
+fn cluster_config_is_consistent(nodes: &[KmsNodeConfigStatus]) -> bool {
+    let Some(first) = nodes.first() else {
+        return false;
+    };
+    if first.config_fingerprint.is_none() {
+        return false;
+    }
+    nodes
+        .iter()
+        .all(|node| node.error.is_none() && node.config_fingerprint == first.config_fingerprint)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,6 +295,7 @@ impl Operation for KmsStatusHandler {
             cache_stats,
             default_key_id: service.get_default_key_id().cloned(),
             capabilities: Some(service.backend_capabilities()),
+            cluster_config: Some(collect_cluster_config_status().await),
         };
 
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -383,5 +460,84 @@ mod tests {
         let capabilities = serialized.get("capabilities").expect("capabilities must be present when set");
         assert_eq!(capabilities.get("encrypt"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(capabilities.get("rotate"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    fn node(host: &str, fingerprint: Option<&str>, error: Option<&str>) -> super::KmsNodeConfigStatus {
+        super::KmsNodeConfigStatus {
+            host: host.to_string(),
+            config_fingerprint: fingerprint.map(str::to_string),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cluster_config_is_consistent_only_when_every_node_reports_the_same_fingerprint() {
+        assert!(super::cluster_config_is_consistent(&[
+            node("local", Some("abc"), None),
+            node("peer-1", Some("abc"), None),
+        ]));
+        assert!(!super::cluster_config_is_consistent(&[
+            node("local", Some("abc"), None),
+            node("peer-1", Some("def"), None),
+        ]));
+    }
+
+    #[test]
+    fn cluster_config_consistency_never_claims_agreement_it_did_not_observe() {
+        // An unreachable peer, a peer whose build does not report a
+        // fingerprint, and a node without any configuration all have to read as
+        // divergent rather than silently agreeing.
+        assert!(!super::cluster_config_is_consistent(&[
+            node("local", Some("abc"), None),
+            node("peer-1", None, Some("peer is not reachable")),
+        ]));
+        assert!(!super::cluster_config_is_consistent(&[
+            node("local", Some("abc"), None),
+            node("peer-1", None, None),
+        ]));
+        assert!(!super::cluster_config_is_consistent(&[
+            node("local", None, None),
+            node("peer-1", None, None),
+        ]));
+        assert!(!super::cluster_config_is_consistent(&[]));
+    }
+
+    /// The `cluster_config` field is additive for the same reason
+    /// `capabilities` is: older servers omit it and consumers must keep
+    /// deserializing their payloads.
+    #[test]
+    fn kms_status_response_cluster_config_field_is_additive() {
+        let legacy_json = serde_json::json!({
+            "backend_type": "local",
+            "backend_status": "healthy",
+            "cache_enabled": true,
+            "cache_stats": null,
+            "default_key_id": null,
+        });
+        let legacy: super::KmsStatusResponse =
+            serde_json::from_value(legacy_json).expect("legacy status payload should deserialize");
+        assert!(legacy.cluster_config.is_none());
+        let serialized = serde_json::to_value(&legacy).expect("status response should serialize");
+        assert!(serialized.get("cluster_config").is_none(), "unset cluster config must be omitted");
+
+        let with_cluster_config = super::KmsStatusResponse {
+            cluster_config: Some(super::KmsClusterConfigStatus {
+                consistent: false,
+                nodes: vec![node("local", Some("abc"), None), node("peer-1", None, Some("unreachable"))],
+            }),
+            ..legacy
+        };
+        let serialized = serde_json::to_value(&with_cluster_config).expect("status response should serialize");
+        let cluster_config = serialized
+            .get("cluster_config")
+            .expect("cluster config must be present when set");
+        assert_eq!(cluster_config.get("consistent"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(
+            cluster_config
+                .get("nodes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
     }
 }

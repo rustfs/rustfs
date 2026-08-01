@@ -817,6 +817,11 @@ message SignalServiceResponse {
   bool success = 1;
   optional string error_info = 2;
   uint32 protocol_version = 3;
+  // Redacted fingerprint of the KMS configuration this node is running.
+  // Only set for the "kms" dynamic config subsystem, and left unset when the
+  // responder has no KMS configuration. Peers built before that subsystem
+  // reject the signal outright rather than answering without this field.
+  optional string config_fingerprint = 4;
 }
 
 message ScannerActivityRequest {
