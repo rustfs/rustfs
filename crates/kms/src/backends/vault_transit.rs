@@ -61,10 +61,12 @@ const METADATA_CAS_ATTEMPTS: usize = 3;
 /// schedule-deletion): the divergence window is one TTL instead of "until
 /// process restart".
 ///
-/// Deliberately fixed rather than taken from `CacheConfig::ttl`: this cache
-/// gates cryptographic operations, so its staleness window is not something an
-/// operator tuning the manager-level describe cache should be able to widen.
-/// The value matches `config::DEFAULT_CACHE_TTL`.
+/// Deliberately fixed rather than derived from `CacheConfig`: this cache gates
+/// cryptographic operations through `ensure_key_state_allows`, so its staleness
+/// window must not follow a knob an operator turns to tune the manager-level
+/// describe cache. It happens to equal `config::DEFAULT_CACHE_TTL` today, but
+/// that is a coincidence rather than a contract, and binding the two would let
+/// a later change to the operator-facing default silently widen this window.
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Capacity bound on the metadata cache so an unbounded key namespace cannot
