@@ -347,7 +347,7 @@ russh-sftp = "2.3.0"
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "1cdadea43e9c5a0f054b65be21200ce580e4eb13" }
 hotpath = { version = "0.22.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }

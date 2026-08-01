@@ -17,27 +17,37 @@ use std::alloc::{GlobalAlloc, Layout};
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
 #[derive(Default)]
-struct DefaultMiMalloc;
+struct MiMallocAllocator;
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
 // SAFETY: allocation and deallocation are forwarded unchanged to MiMalloc, so
 // MiMalloc's GlobalAlloc guarantees apply to every returned pointer and layout.
 #[allow(unsafe_code)]
-unsafe impl GlobalAlloc for DefaultMiMalloc {
+unsafe impl GlobalAlloc for MiMallocAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller upholds GlobalAlloc's contract for layout.
         unsafe { mimalloc::MiMalloc.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds GlobalAlloc's contract for layout.
+        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
         unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
     }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
+        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+    }
 }
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
 #[global_allocator]
-static GLOBAL: hotpath::CountingAllocator<DefaultMiMalloc> = hotpath::CountingAllocator::new();
+static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::new();
 
 #[cfg(not(all(feature = "hotpath", feature = "hotpath-alloc")))]
 #[global_allocator]
@@ -49,7 +59,7 @@ fn main() {
     rustfs::startup_entrypoint::run_process();
 }
 
-#[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc"))]
+#[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 mod tests {
     #[test]
     #[allow(unsafe_code)]

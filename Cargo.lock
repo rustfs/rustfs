@@ -5835,8 +5835,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libmimalloc-sys"
 version = "0.1.49"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=1cdadea43e9c5a0f054b65be21200ce580e4eb13#1cdadea43e9c5a0f054b65be21200ce580e4eb13"
 dependencies = [
  "cc",
  "cty",
@@ -6245,8 +6244,7 @@ dependencies = [
 [[package]]
 name = "mimalloc"
 version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=1cdadea43e9c5a0f054b65be21200ce580e4eb13#1cdadea43e9c5a0f054b65be21200ce580e4eb13"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -11598,7 +11596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
