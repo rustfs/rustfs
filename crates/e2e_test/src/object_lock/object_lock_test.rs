@@ -26,6 +26,7 @@
 
 use super::common::*;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTimeFormat};
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier, ObjectLockLegalHoldStatus,
@@ -2119,6 +2120,127 @@ async fn test_multipart_default_retention_fixed_at_create() {
 // ============================================================================
 // Versioning Auto-Enable Tests
 // ============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_unretained_object_lock_object_delete_and_bucket_cleanup() {
+    init_logging();
+    info!("🧪 Test: Unretained Object Lock object delete and bucket cleanup (Issue #5339)");
+
+    let mut env = ObjectLockTestEnvironment::new()
+        .await
+        .expect("failed to create Object Lock test environment");
+    env.start_rustfs().await.expect("failed to start RustFS");
+
+    let bucket = "test-object-lock-delete-cleanup";
+    let key = "unretained-object";
+
+    env.create_object_lock_bucket(bucket)
+        .await
+        .expect("failed to create Object Lock bucket");
+    let client = env.s3_client();
+
+    let put_response = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"unretained data"))
+        .send()
+        .await
+        .expect("failed to upload unretained object");
+    let object_version_id = put_response
+        .version_id()
+        .expect("Object Lock buckets must create versioned objects")
+        .to_string();
+
+    let delete_response = client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("failed to create delete marker");
+    assert_eq!(delete_response.delete_marker(), Some(true));
+    let delete_marker_version_id = delete_response
+        .version_id()
+        .expect("Deleting without a version ID must create a delete marker")
+        .to_string();
+
+    let get_error = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("GET must not return an object hidden by a delete marker");
+    assert_eq!(get_error.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(get_error.as_service_error().and_then(|error| error.code()), Some("NoSuchKey"));
+
+    let listed_objects = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("failed to list current objects");
+    assert!(
+        listed_objects.contents().iter().all(|object| object.key() != Some(key)),
+        "ListObjectsV2 must hide objects whose latest version is a delete marker"
+    );
+
+    let listed_versions = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("failed to list object versions");
+    assert!(
+        listed_versions
+            .versions()
+            .iter()
+            .any(|version| version.key() == Some(key) && version.version_id() == Some(object_version_id.as_str())),
+        "The data version must remain until it is explicitly deleted"
+    );
+    assert!(
+        listed_versions
+            .delete_markers()
+            .iter()
+            .any(|marker| marker.key() == Some(key) && marker.version_id() == Some(delete_marker_version_id.as_str())),
+        "ListObjectVersions must expose the delete marker"
+    );
+
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(object_version_id)
+        .send()
+        .await
+        .expect("failed to delete the data version");
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(delete_marker_version_id)
+        .send()
+        .await
+        .expect("failed to delete the delete marker");
+
+    let remaining_versions = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("failed to list versions after cleanup");
+    assert!(remaining_versions.versions().is_empty());
+    assert!(remaining_versions.delete_markers().is_empty());
+
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("Deleting every version must remove xl.meta so the bucket can be deleted normally");
+}
 
 #[tokio::test]
 #[serial]
