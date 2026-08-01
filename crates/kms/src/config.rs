@@ -147,6 +147,7 @@ impl KmsBackend {
             KmsBackend::VaultTransit => "vault-transit",
             KmsBackend::Local => "local",
             KmsBackend::Static => "static",
+            KmsBackend::Aws => "aws",
         }
     }
 }
@@ -1631,6 +1632,43 @@ mod tests {
                 assert_eq!(secret_id_file.as_deref(), Some(std::path::Path::new("/etc/rustfs/approle-secret-id")));
                 assert!(secret_id.is_empty());
                 assert_eq!(mount, DEFAULT_VAULT_APPROLE_MOUNT);
+            },
+        );
+    }
+
+    /// The AWS backend reads only non-credential settings from the
+    /// environment; access keys, profiles, and role assumption stay with the
+    /// aws-config provider chain.
+    #[test]
+    fn test_from_env_selects_aws_backend_without_credentials() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("aws")),
+                (ENV_KMS_AWS_REGION, Some("eu-central-1")),
+                (ENV_KMS_AWS_ENDPOINT_URL, None::<&str>),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                assert_eq!(config.backend, KmsBackend::Aws);
+                let aws = config.aws_kms_config().expect("aws backend config");
+                assert_eq!(aws.region.as_deref(), Some("eu-central-1"));
+                assert_eq!(aws.endpoint_url, None);
+            },
+        );
+    }
+
+    /// A plaintext endpoint override exposes every KMS request, including the
+    /// plaintext data keys, so it stays behind the explicit development opt-in.
+    #[test]
+    fn test_from_env_rejects_plaintext_aws_endpoint() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("aws")),
+                (ENV_KMS_AWS_REGION, Some("us-east-1")),
+                (ENV_KMS_AWS_ENDPOINT_URL, Some("http://localhost:4566")),
+            ],
+            || {
+                KmsConfig::from_env().expect_err("a plaintext AWS endpoint must be rejected by default");
             },
         );
     }

@@ -33,9 +33,15 @@
 //!   re-enabled. The shared contract-test driver is not applicable here for
 //!   exactly this reason.
 //! - `CancelKeyDeletion` leaves the key `Disabled` in AWS, not `Enabled`.
-//! - Key identifiers are assigned by AWS. `CreateKeyRequest::key_name` cannot
-//!   name a key; alias management is out of scope, so the name is only carried
-//!   through as a tag by the caller.
+//! - Key identifiers are assigned by AWS. Every other backend treats
+//!   `CreateKeyRequest::key_name` as the identifier the key will answer to, and
+//!   alias management is out of scope here, so a named create is *refused*
+//!   rather than silently creating a key the caller cannot address. Honouring
+//!   it silently would make each caller-by-name flow — SSE-S3 auto-creation
+//!   and the synthetic probe both describe-then-create — recreate an
+//!   unreachable key on every attempt. Consequently SSE-S3 key auto-creation
+//!   and the probe are unavailable on this backend: keys must be pre-created
+//!   and referenced by AWS key id or ARN.
 //! - Versions are opaque: AWS addresses backing keys internally and decrypts
 //!   with the right one automatically, so `key_version` is reported as 1.
 //!
@@ -60,7 +66,6 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_types::Blob;
 use jiff::Zoned;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 
 use super::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
@@ -178,6 +183,12 @@ fn map_sdk_error<E: ProvideErrorMetadata>(operation: &str, key_id: Option<&str>,
         }
         "InvalidCiphertextException" | "IncorrectKeyException" | "IncorrectKeyMaterialException" => {
             KmsError::cryptographic_error(operation.to_string(), detail)
+        }
+        // Malformed input — most often a key identifier that is neither an AWS
+        // key id, an ARN, nor an alias. Reported as a parameter problem so
+        // callers stop rather than treating it as a backend outage to retry.
+        "ValidationException" | "InvalidArnException" | "InvalidMarkerException" => {
+            KmsError::invalid_parameter(format!("AWS KMS rejected {operation}{subject} as invalid: {detail}"))
         }
         _ => KmsError::backend_error(format!("AWS KMS {operation}{subject} failed: {detail}")),
     }
@@ -363,11 +374,15 @@ impl KmsBackend for AwsKmsBackend {
         if request.key_usage != KeyUsage::EncryptDecrypt {
             return Err(KmsError::unsupported_capability(BACKEND_NAME, "create_key with SIGN_VERIFY usage"));
         }
-        if let Some(key_name) = &request.key_name {
-            info!(
-                requested_key_name = key_name,
-                "AWS KMS assigns key identifiers; the requested name is not used as the key id"
-            );
+        // AWS assigns the identifier itself and this backend does not manage
+        // aliases, so a key created here can never answer to the requested
+        // name. Reporting the gap keeps describe-then-create callers from
+        // creating a fresh, unreachable key on every attempt.
+        if request.key_name.is_some() {
+            return Err(KmsError::unsupported_capability(
+                BACKEND_NAME,
+                "create_key with a caller-assigned key name; AWS assigns key identifiers",
+            ));
         }
 
         let description = request.description.clone();
@@ -942,6 +957,7 @@ mod tests {
             (400, "InvalidCiphertextException", |error| {
                 matches!(error, KmsError::CryptographicError { .. })
             }),
+            (400, "ValidationException", |error| matches!(error, KmsError::InvalidOperation { .. })),
             (403, "UnrecognizedClientException", |error| {
                 matches!(error, KmsError::CredentialsUnavailable { .. })
             }),
@@ -1073,6 +1089,23 @@ mod tests {
         assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "unexpected error: {error:?}");
         assert_eq!(http_client.actual_requests().count(), 0);
         assert!(!backend.capabilities().physical_delete);
+    }
+
+    /// A caller-assigned key name cannot be honoured by AWS. Refusing it keeps
+    /// describe-then-create callers (SSE-S3 auto-creation, the synthetic
+    /// probe) from creating a fresh, unreachable key on every attempt.
+    #[tokio::test]
+    async fn caller_assigned_key_names_are_unsupported() {
+        let (http_client, backend) = scripted_backend(Vec::new());
+        let error = backend
+            .create_key(CreateKeyRequest {
+                key_name: Some("rustfs-internal-kms-probe".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a named create must be rejected");
+        assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "unexpected error: {error:?}");
+        assert_eq!(http_client.actual_requests().count(), 0, "no key may be created in AWS");
     }
 
     /// Signing keys are outside the envelope-encryption surface this backend
