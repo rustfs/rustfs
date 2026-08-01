@@ -16,9 +16,9 @@ expression: "serde_json::to_value(&summary).expect(\"KMS config summary should s
   "cache_summary": {
     "enable_metrics": true,
     "max_keys": 1000,
-    "ttl_seconds": 3600
+    "ttl_seconds": 300
   },
-  "cache_ttl_seconds": 3600,
+  "cache_ttl_seconds": 300,
   "default_key_id": "rustfs-master-key",
   "enable_cache": true,
   "max_cached_keys": 1000,

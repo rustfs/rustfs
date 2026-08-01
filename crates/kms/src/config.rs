@@ -50,6 +50,19 @@ pub(crate) const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Upper bound applied to `KmsConfig::retry_attempts` when deriving backend behavior.
 pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 10;
 
+/// Default number of key metadata entries the cache holds.
+pub const DEFAULT_MAX_CACHED_KEYS: usize = 1000;
+
+/// Default lifetime of a cached key metadata entry.
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Upper bound applied to `CacheConfig::ttl` when building the metadata cache.
+///
+/// Out-of-range values are clamped at use rather than rejected, matching
+/// `MAX_OPERATION_TIMEOUT`, so existing deployments with an oversized setting
+/// keep starting after an upgrade.
+pub(crate) const MAX_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 fn default_vault_transit_metadata_kv_mount() -> String {
     DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string()
 }
@@ -555,19 +568,37 @@ pub struct TlsConfig {
 pub struct CacheConfig {
     /// Maximum number of keys to cache
     pub max_keys: usize,
-    /// TTL for cached keys
+    /// Lifetime of a cached key metadata entry.
+    ///
+    /// This bounds how long a describe can answer from metadata that another
+    /// node has since changed (disable, schedule-deletion); encrypt, decrypt
+    /// and data key generation never read the cache. Values above 24 hours are
+    /// clamped at use (see [`CacheConfig::effective_ttl`]).
     pub ttl: Duration,
-    /// Enable cache metrics
+    /// Publish the `rustfs_kms_metadata_cache_*` metrics.
+    ///
+    /// Only metrics-recorder output is gated: the counters behind the admin
+    /// status API are maintained either way.
     pub enable_metrics: bool,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_keys: 1000,
-            ttl: Duration::from_secs(3600), // 1 hour
+            max_keys: DEFAULT_MAX_CACHED_KEYS,
+            ttl: DEFAULT_CACHE_TTL,
             enable_metrics: true,
         }
+    }
+}
+
+impl CacheConfig {
+    /// Metadata lifetime with the configured value clamped to the supported maximum.
+    ///
+    /// This is the value the cache is built with and the value reported back to
+    /// operators, so what the admin API advertises is what the cache does.
+    pub fn effective_ttl(&self) -> Duration {
+        self.ttl.min(MAX_CACHE_TTL)
     }
 }
 
@@ -906,8 +937,17 @@ impl KmsConfig {
         }
 
         // Validate cache configuration
-        if self.enable_cache && self.cache_config.max_keys == 0 {
-            return Err(KmsError::configuration_error("Cache max_keys must be greater than 0"));
+        if self.enable_cache {
+            if self.cache_config.max_keys == 0 {
+                return Err(KmsError::configuration_error("Cache max_keys must be greater than 0"));
+            }
+
+            // A zero TTL expires every entry on insert, which is a cache that
+            // cannot serve anything; reject it instead of silently disabling
+            // the cache the operator asked for.
+            if self.cache_config.ttl.is_zero() {
+                return Err(KmsError::configuration_error("Cache ttl must be greater than 0"));
+            }
         }
 
         Ok(())
@@ -1236,6 +1276,60 @@ mod tests {
 
         let local_config = config.local_config().expect("Should have local config");
         assert_eq!(local_config.key_dir, temp_dir.path());
+    }
+
+    #[test]
+    fn oversized_cache_ttl_is_clamped_not_rejected() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+
+        assert_eq!(config.cache_config.ttl, DEFAULT_CACHE_TTL);
+        assert_eq!(config.cache_config.effective_ttl(), DEFAULT_CACHE_TTL);
+
+        // An oversized lifetime must not keep the service from starting, and
+        // must not reach moka, whose builder panics beyond 1000 years.
+        let config = KmsConfig {
+            cache_config: CacheConfig {
+                ttl: Duration::from_secs(u64::MAX),
+                ..Default::default()
+            },
+            ..config
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cache_config.effective_ttl(), MAX_CACHE_TTL);
+
+        // In-range values pass through unchanged.
+        let config = KmsConfig {
+            cache_config: CacheConfig {
+                ttl: Duration::from_secs(600),
+                ..Default::default()
+            },
+            ..config
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cache_config.effective_ttl(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn zero_cache_ttl_is_rejected_only_while_caching_is_enabled() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig {
+            cache_config: CacheConfig {
+                ttl: Duration::ZERO,
+                ..Default::default()
+            },
+            ..KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults()
+        };
+
+        // A cache that expires every entry on insert is a misconfiguration, not
+        // a way to turn caching off.
+        assert!(config.validate().is_err());
+
+        let config = KmsConfig {
+            enable_cache: false,
+            ..config
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
