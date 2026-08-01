@@ -46,6 +46,20 @@ impl<'a> AdminResourceScope<'a> {
     pub fn bucket_object(bucket: &'a str, object: &'a str) -> Self {
         Self { bucket, object }
     }
+
+    /// Scope an admin request to a single KMS key.
+    ///
+    /// The policy crate carries the requested key identifier in the object slot
+    /// with an empty bucket (see `Statement::kms_key_scope_matches`); `Args` has
+    /// no dedicated field for it. An empty `key_id` means the caller could not
+    /// name a target key, which keeps the pre-resource-scoping behaviour where a
+    /// KMS statement matches every key.
+    pub fn kms_key(key_id: &'a str) -> Self {
+        Self {
+            bucket: "",
+            object: key_id,
+        }
+    }
 }
 
 pub async fn validate_admin_request(
@@ -172,6 +186,34 @@ pub async fn validate_admin_request_with_bucket_object(
     };
 
     evaluate_admin_actions(iam_store, &ctx, &actions, resource.bucket, resource.object).await
+}
+
+/// Admin gate for KMS endpoints that act on one key.
+///
+/// `key_id` is the identifier as requested (before any alias resolution), so a
+/// policy scoped to `arn:aws:kms:::key/<id>` only authorizes that key. Endpoints
+/// without a target key pass `""` and stay unscoped, which is also what a
+/// malformed request resolves to: the request is rejected on its own parse error
+/// right after the gate, so no key is ever touched under an unscoped decision.
+pub async fn validate_admin_request_with_kms_key(
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    deny_only: bool,
+    actions: Vec<Action>,
+    remote_addr: Option<std::net::SocketAddr>,
+    key_id: &str,
+) -> S3Result<()> {
+    validate_admin_request_with_bucket_object(
+        headers,
+        cred,
+        is_owner,
+        deny_only,
+        actions,
+        remote_addr,
+        AdminResourceScope::kms_key(key_id),
+    )
+    .await
 }
 
 /// Unified authentication request handler for both UI and CLI
@@ -469,6 +511,18 @@ mod tests {
 
         let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
         assert_access_denied(res);
+    }
+
+    /// KMS scoping rides the object slot with an empty bucket, matching the
+    /// contract the policy crate evaluates KMS statements against.
+    #[test]
+    fn kms_scope_carries_the_key_id_in_the_object_slot() {
+        let scope = AdminResourceScope::kms_key("key-a");
+        assert_eq!(scope.bucket, "");
+        assert_eq!(scope.object, "key-a");
+
+        let unscoped = AdminResourceScope::kms_key("");
+        assert_eq!(unscoped.object, "", "an absent key id must stay unscoped");
     }
 
     /// The multi-action loop authorizes as soon as one candidate action passes
