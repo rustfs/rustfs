@@ -447,6 +447,46 @@ mod tests {
     }
 
     #[test]
+    fn backlog_metrics_are_bucket_scoped_without_target_labels() {
+        let stats = vec![BucketReplicationStats {
+            bucket: "scope-bucket".to_string(),
+            current_backlog_count: 5,
+            current_backlog_bytes: 8192,
+            durable_mrf_available: true,
+            durable_mrf_backlog_count: 2,
+            durable_mrf_backlog_bytes: 4096,
+            targets: vec![BucketReplicationTargetStats {
+                target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        let metrics = collect_bucket_replication_metrics(&stats);
+        let backlog_names = [
+            BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD.get_full_metric_name(),
+        ];
+
+        for name in backlog_names {
+            let metric = metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .expect("backlog metric should be emitted");
+            assert!(
+                metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == BUCKET_L && value == "scope-bucket")
+            );
+            assert!(!metric.labels.iter().any(|(key, _)| *key == TARGET_ARN_L));
+        }
+    }
+
+    #[test]
     fn test_collect_bucket_replication_bandwidth_metrics() {
         let stats = vec![BucketReplicationBandwidthStats {
             bucket: "b1".to_string(),
