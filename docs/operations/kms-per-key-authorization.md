@@ -21,7 +21,7 @@ Rules worth knowing before writing a policy:
 - A statement carrying a KMS resource with non-KMS actions is rejected.
 - A KMS statement with **no** resource matches every key. This is the legacy form and stays valid, so existing policies keep their current effect.
 - A KMS statement whose resources are S3 ARNs predates KMS resources. It is still loadable, but the S3 patterns never constrained key access, so evaluation ignores them, treats the statement as unscoped, and logs a warning. Rewrite these with real KMS resources.
-- Bucket policies reject `kms:` statements outright. KMS grants belong to identities.
+- `PutBucketPolicy` rejects any statement carrying a `kms:` action or a KMS resource. KMS grants belong to identities. Bucket policies stored before this check still load; evaluation skips their pure-KMS statements and warns.
 - `Deny` wins, as everywhere else: a `Deny` on `arn:aws:kms:::key/payroll-*` overrides an `Allow` on `arn:aws:kms:::*`.
 - The key identifier matched is the one the request names, before any alias resolution.
 
