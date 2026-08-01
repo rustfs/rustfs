@@ -74,7 +74,7 @@ This is the sharpest instance of a broader class of constraints; the rest are co
 
 ## Mixed-version clusters during a rolling upgrade
 
-During a rolling upgrade the cluster runs two RustFS builds at once. That window matters more for KMS than for most subsystems, because KMS state is shared three ways: **Vault** holds the key records and Transit metadata, **cluster storage** holds the persisted KMS configuration, and **each node's process memory** holds caches and the live backend instance. Nodes on different builds agree on the first, may disagree on the third, and — for configuration — can disagree for as long as the operator leaves them running.
+During a rolling upgrade the cluster runs two RustFS builds at once. That window matters more for KMS than for most subsystems, because KMS state is shared three ways: **Vault** holds the key records and Transit metadata, **cluster storage** holds the persisted KMS configuration, and **each node's process memory** holds caches and the live backend instance. Nodes on different builds agree on the first, may disagree on the third, and — for configuration — can disagree for as long as the operator leaves them running, because the reload broadcast that converges configuration is one of the things an older build rejects.
 
 This section states only what is true of the current implementation. It is written for the KV2 and Transit backends; the Local backend is unsupported for multi-node deployments regardless of version (see the [deployment support matrix](#deployment-support-matrix)).
 
@@ -105,21 +105,23 @@ Even with every node on the same build, some state is process-local. These windo
 | Transit key lifecycle state used by the `encrypt` and `generate_data_key` gates | ≤ 300 s (`METADATA_CACHE_TTL`) | Each node caches Transit metadata in process, TTL- and capacity-bounded, with targeted invalidation when a data-path call reports the key is gone server-side. A disable or schedule-deletion performed on one node is enforced on the others within one TTL at the latest, sooner if they hit that signal. |
 | `describe_key` output | ≤ 300 s | The manager-level key metadata cache. This is a reporting cache; the KV2 state gates do not read it. |
 | KV2 key lifecycle state | None | The KV2 backend re-reads the key record from Vault for every lifecycle and data-key operation, so a committed disable is effective on every upgraded node immediately. |
-| Active KMS configuration | Until the remaining nodes are restarted | See below. |
+| Active KMS configuration | One best-effort reload broadcast; unbounded for any peer that did not apply it | See below. |
 
 Builds older than rustfs/rustfs#5520 held the Transit metadata cache with no TTL and no capacity bound. On such a node the divergence window is not 300 seconds but "until the process restarts": it can keep encrypting under a key that another node disabled, indefinitely.
 
-### Configuration is persisted cluster-wide but applied per node
+### Configuration changes converge through a best-effort peer reload
 
-`POST /rustfs/admin/v3/kms/reconfigure` currently does two things: it switches the KMS service **on the node that handled the request**, and it persists the new configuration to cluster storage at `config/kms_config.json`. It does not notify peers. Every other node keeps running the configuration it started with until it is restarted, at which point it loads the persisted configuration during startup.
+`POST /rustfs/admin/v3/kms/configure` and `POST /rustfs/admin/v3/kms/reconfigure` persist the new configuration to cluster storage at `config/kms_config.json`, switch the KMS service **on the node that handled the request**, and then broadcast a reload signal to every peer. A peer that accepts the signal re-reads the persisted configuration and reconfigures itself, so a runtime change normally reaches the whole cluster without any restart. A peer already running that exact configuration treats the signal as a no-op.
 
-The practical consequences today:
+Convergence is best effort by contract, and the request never fails on account of a peer: the local node has already switched, and KMS configuration has no quorum or authoritative holder to roll back to. What that leaves:
 
-- The configuration-split window has no upper bound other than the operator restarting the remaining nodes. Convergence is a restart, not a timeout.
-- During the window both configurations are live. If the reconfiguration changed backends, or changed the Vault mount or key prefix, different nodes write new key material to different places, and a key created through one node is invisible to the others.
-- `kms status` reflects the node that answered the request, so a single successful status response is not evidence that the cluster is consistent. Query every node.
+- The broadcast is sent **once**, with no background retry. A peer that is unreachable, that rejects the signal because its build predates the KMS subsystem, or whose reload itself fails keeps serving its previous configuration until a later `reconfigure` reaches it, or until it restarts and loads the persisted configuration during startup. For those peers the split window is still unbounded.
+- The admin response reports success either way, but its message names every peer that did not converge, and the server logs one `kms_peer_config_reload_failed` warning per peer. Read the message: an operation that reports success can still have left the cluster split.
+- For as long as a split lasts, both configurations are live. If the change switched backends, or changed the Vault mount or key prefix, different nodes write new key material to different places, and a key created through one node is invisible to the others.
 
-Treat `reconfigure` as the first step of a cluster-wide operation, not as the operation itself.
+`GET /rustfs/admin/v3/kms/service-status` makes the split observable from a single request: it returns a `cluster_config` object holding one redacted configuration fingerprint per node plus a `consistent` flag. `consistent` is true only when every node answered with the same fingerprint — an unreachable peer, a peer whose build reports no fingerprint, and a node with no configuration at all each read as divergent rather than as agreement. Secrets are substituted out before a configuration is fingerprinted, so two nodes on the same backend holding different credentials still fingerprint alike; the field detects a configuration split, not a credential split.
+
+Treat a `configure` or `reconfigure` whose response names unconverged peers as an unfinished cluster-wide operation: re-issue it once those peers are reachable, or restart them.
 
 ### Recommended rolling upgrade order
 
@@ -130,7 +132,7 @@ Follow the node-at-a-time procedure in the [multi-node restart runbook](rolling-
 3. **Verify no node is left behind** before unfreezing. A single old node is enough to reintroduce blind writes and to strip `baseline_version` on its next lifecycle write.
 4. **Resume administrative traffic.**
 5. **Only then perform the first rotation of any key.** Once the whole cluster understands `master_key_version`, rotation is safe; before that it is not.
-6. **If the KMS configuration was changed at any point**, restart the nodes that did not handle the request so they reload the persisted configuration, and confirm each one reports the intended backend.
+6. **If the KMS configuration was changed at any point**, confirm `cluster_config.consistent` is true in the `service-status` response, and re-issue the change — or restart the node — for every peer still reporting a different fingerprint. A peer whose build predates the reload signal never converges on its own.
 
 ### Do not do these during a mixed-version window
 
@@ -138,7 +140,7 @@ Follow the node-at-a-time procedure in the [multi-node restart runbook](rolling-
 - **Issue any KV2 lifecycle write to an old node.** Its blind write can clobber a concurrent check-and-set commit and will drop `baseline_version` from the record.
 - **Create the same key ID from two nodes.** The create path is create-only on upgraded builds, but an old node's blind write does not honor that: the later writer's material wins and every DEK already wrapped with the earlier material becomes permanently unwrappable.
 - **Assume a disable or schedule-deletion took effect cluster-wide.** Old Transit nodes cache lifecycle state without expiry; confirm per node, or restart the old nodes, before treating a key as no longer in use.
-- **Reconfigure the KMS backend and consider it done.** The change applies to one node and is persisted; the rest need a restart.
+- **Reconfigure the KMS backend and consider it done.** The reload broadcast is exactly what an old build rejects, so during a mixed-version window the change reaches only the node that served it and the already-upgraded peers. Check the response message and `cluster_config.consistent` before assuming otherwise.
 - **Delete or prune version records** under `{prefix}/{key_id}/versions/*` for any reason. This is never safe, mixed-version or not; see [Retention and destruction preconditions](#retention-and-destruction-preconditions).
 
 ## Choosing between Vault KV2 and Vault Transit
