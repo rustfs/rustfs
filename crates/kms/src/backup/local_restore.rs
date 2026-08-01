@@ -1995,7 +1995,7 @@ mod tests {
     /// verifies it and moves on, leaving the decision to the admin layer.
     #[tokio::test]
     async fn a_config_artifact_is_verified_but_never_restored() {
-        let (client, source_dir) = source_with_keys(Some(TEST_MASTER_KEY), &["alpha"]).await;
+        let (client, _source_dir) = source_with_keys(Some(TEST_MASTER_KEY), &["alpha"]).await;
         let bundle_parent = TempDir::new().expect("bundle parent");
         let config_bytes = br#"{"backend":"local","note":"sanitized"}"#.to_vec();
         let (bundle, manifest) = export_bundle_with_config(&client, bundle_parent.path(), Some(config_bytes.clone())).await;

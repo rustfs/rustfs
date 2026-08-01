@@ -643,6 +643,11 @@ async fn execute_backup(
     context: &BackupContext,
     request: &KmsBackupRequest,
 ) -> Result<KmsBackupResponse, Failure> {
+    // Two independent gates on purpose. The configuration decides what this
+    // deployment is allowed to export, so it is checked first and cannot be
+    // circumvented by whatever handle a caller managed to obtain; the client
+    // lookup then supplies the fence the export actually needs.
+    context.local_config()?;
     let Some(client) = manager.local_backup_client() else {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
@@ -678,11 +683,11 @@ async fn execute_backup(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("backup export failed: {error}")))?;
 
     Ok(KmsBackupResponse {
-        backup_id: manifest.backup_id.clone(),
+        backup_id: manifest.backup_id,
         snapshot_generation: manifest.snapshot_generation,
-        deployment_identity: manifest.deployment_identity.clone(),
+        deployment_identity: manifest.deployment_identity,
         artifact_count: manifest.artifacts.len(),
-        manifest_digest: manifest.manifest_digest.hex.clone(),
+        manifest_digest: manifest.manifest_digest.hex,
         backup_kek_id: context.environment.kek_id.clone(),
         backup_kek_version: context.environment.kek_version,
         sanitized_config_included: true,
@@ -1170,7 +1175,9 @@ mod tests {
     use rustfs_kms::types::CreateKeyRequest;
     use std::collections::BTreeMap;
 
-    const TEST_KEK_B64: &str = "YmFja3VwLWtlay1tYXRlcmlhbC0zMi1ieXRlcy0h";
+    /// Base64 of `backup-kek-material-32-bytes!!!!`; ASCII so the test can
+    /// also use its raw bytes as a differently spelled configuration secret.
+    const TEST_KEK_B64: &str = "YmFja3VwLWtlay1tYXRlcmlhbC0zMi1ieXRlcyEhISE=";
     const DEPLOYMENT: &str = "deployment-under-test";
 
     fn test_kek_bytes() -> Vec<u8> {
@@ -1179,6 +1186,47 @@ mod tests {
 
     fn local_config(key_dir: PathBuf) -> KmsConfig {
         KmsConfig::local(key_dir).with_insecure_development_defaults()
+    }
+
+    fn local_config_with_master_key(key_dir: PathBuf, master_key: &str) -> KmsConfig {
+        KmsConfig {
+            backend_config: BackendConfig::Local(LocalConfig {
+                key_dir: key_dir.clone(),
+                master_key: Some(master_key.to_string()),
+                file_permissions: Some(0o600),
+            }),
+            ..local_config(key_dir)
+        }
+    }
+
+    fn vault_kv2_config(auth_method: VaultAuthMethod) -> KmsConfig {
+        KmsConfig {
+            backend: KmsBackend::VaultKv2,
+            backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                auth_method,
+                ..VaultConfig::default()
+            })),
+            ..KmsConfig::default()
+        }
+    }
+
+    fn vault_transit_config() -> KmsConfig {
+        KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::default()),
+            ..KmsConfig::default()
+        }
+    }
+
+    fn static_kms_config(secret_key: String) -> KmsConfig {
+        KmsConfig {
+            backend: KmsBackend::Static,
+            backend_config: BackendConfig::Static(StaticConfig {
+                key_id: "static-key".to_string(),
+                secret_key,
+            }),
+            ..KmsConfig::default()
+        }
     }
 
     fn environment(root: PathBuf, config: &KmsConfig) -> BackupEnvironment {
@@ -1276,12 +1324,7 @@ mod tests {
         let material = test_kek_bytes();
 
         // Local master key supplied as the same base64 spelling.
-        let mut config = local_config(PathBuf::from("/tmp/keys"));
-        config.backend_config = BackendConfig::Local(LocalConfig {
-            key_dir: PathBuf::from("/tmp/keys"),
-            master_key: Some(TEST_KEK_B64.to_string()),
-            file_permissions: Some(0o600),
-        });
+        let config = local_config_with_master_key(PathBuf::from("/tmp/keys"), TEST_KEK_B64);
         let error = BackupEnvironment::build(PathBuf::from("/tmp/root"), TEST_KEK_B64, "kek".to_string(), 1, &config)
             .expect_err("reusing the master key must be refused");
         assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
@@ -1289,24 +1332,17 @@ mod tests {
 
         // Same secret, different spelling: the raw bytes of the master key are
         // the KEK material.
-        let raw_master_key = String::from_utf8(material.clone()).expect("test KEK is ASCII");
-        config.backend_config = BackendConfig::Local(LocalConfig {
-            key_dir: PathBuf::from("/tmp/keys"),
-            master_key: Some(raw_master_key),
-            file_permissions: Some(0o600),
-        });
+        let raw_master_key = String::from_utf8(material).expect("test KEK is ASCII");
+        let config = local_config_with_master_key(PathBuf::from("/tmp/keys"), &raw_master_key);
         assert!(
             BackupEnvironment::build(PathBuf::from("/tmp/root"), TEST_KEK_B64, "kek".to_string(), 1, &config).is_err(),
             "re-encoding the same secret must not bypass the separation rule"
         );
 
         // A Vault token is a business trust root too.
-        let mut vault = VaultConfig::default();
-        vault.auth_method = VaultAuthMethod::Token {
+        let vault_config = vault_kv2_config(VaultAuthMethod::Token {
             token: TEST_KEK_B64.to_string(),
-        };
-        let mut vault_config = KmsConfig::default();
-        vault_config.backend_config = BackendConfig::VaultKv2(Box::new(vault));
+        });
         assert!(
             BackupEnvironment::build(PathBuf::from("/tmp/root"), TEST_KEK_B64, "kek".to_string(), 1, &vault_config).is_err(),
             "a Vault token must not double as the backup KEK"
@@ -1334,31 +1370,12 @@ mod tests {
         let approle_secret = "approle-secret-id-super-secret";
         let static_key = BASE64.encode([0x7c; 32]);
 
-        let mut local = KmsConfig::local(PathBuf::from("/var/lib/rustfs/kms"));
-        local.backend_config = BackendConfig::Local(LocalConfig {
-            key_dir: PathBuf::from("/var/lib/rustfs/kms"),
-            master_key: Some(master_key.to_string()),
-            file_permissions: Some(0o600),
-        });
-
-        let mut vault = VaultConfig::default();
-        vault.auth_method = VaultAuthMethod::Token {
+        let local = local_config_with_master_key(PathBuf::from("/var/lib/rustfs/kms"), master_key);
+        let kv2 = vault_kv2_config(VaultAuthMethod::Token {
             token: vault_token.to_string(),
-        };
-        let mut kv2 = KmsConfig::default();
-        kv2.backend_config = BackendConfig::VaultKv2(Box::new(vault));
-
-        let mut approle_vault = VaultConfig::default();
-        approle_vault.auth_method = VaultAuthMethod::approle("role-id".to_string(), approle_secret.to_string());
-        let mut approle = KmsConfig::default();
-        approle.backend_config = BackendConfig::VaultKv2(Box::new(approle_vault));
-
-        let mut static_config = KmsConfig::default();
-        static_config.backend = KmsBackend::Static;
-        static_config.backend_config = BackendConfig::Static(StaticConfig {
-            key_id: "static-key".to_string(),
-            secret_key: static_key.clone(),
         });
+        let approle = vault_kv2_config(VaultAuthMethod::approle("role-id".to_string(), approle_secret.to_string()));
+        let static_config = static_kms_config(static_key.clone());
 
         for config in [&local, &kv2, &approle, &static_config] {
             let rendered = serde_json::to_string(&SanitizedKmsConfig::from_config(config)).expect("sanitized config");
@@ -1393,8 +1410,9 @@ mod tests {
         .expect("export should succeed");
         assert_eq!(response.backup_id, "drill-0001");
         assert!(response.sanitized_config_included);
-        // Two key artifacts, the salt, and the configuration.
-        assert_eq!(response.artifact_count, 4);
+        // Two key artifacts plus the configuration. A dev-mode directory has
+        // no master-key salt, so no salt artifact exists to seal.
+        assert_eq!(response.artifact_count, 3);
 
         // The bundle must not contain the configured secrets in any artifact.
         let bundle_bytes = tree_fingerprint(&root.path().join("drill-0001"));
@@ -1528,9 +1546,7 @@ mod tests {
         let local = local_config(source.path().to_path_buf());
         let manager = manager_with_keys(&local, &["alpha"]).await;
 
-        let mut transit = KmsConfig::default();
-        transit.backend = KmsBackend::VaultTransit;
-        let context = backup_context(root.path().to_path_buf(), transit);
+        let context = backup_context(root.path().to_path_buf(), vault_transit_config());
 
         assert_eq!(
             declared_responsibility(&KmsBackend::VaultTransit),
@@ -1540,8 +1556,20 @@ mod tests {
         assert_eq!(declared_responsibility(&KmsBackend::Local), Some(BackupResponsibility::FullMaterial));
         assert_eq!(declared_responsibility(&KmsBackend::Aws), None);
 
-        // The Local manager can still export, which is exactly why the refusal
-        // has to be driven by the configured backend and not by the handle.
+        // The handle can still export, which is exactly why the refusal has to
+        // be driven by the configured backend rather than by the handle.
+        assert!(manager.local_backup_client().is_some());
+
+        let error = execute_backup(&manager, &context, &KmsBackupRequest { backup_id: None })
+            .await
+            .expect_err("a non-local configuration must not produce a full-material bundle");
+        assert_eq!(error.0, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("read backup root").count(),
+            0,
+            "a refused export must leave no bundle behind"
+        );
+
         let error = execute_restore_dry_run(
             &context,
             &KmsRestoreDryRunRequest {
@@ -1552,7 +1580,6 @@ mod tests {
         .await
         .expect_err("a non-local backend has no RustFS-side restore");
         assert_eq!(error.0, StatusCode::NOT_IMPLEMENTED);
-        assert!(manager.local_backup_client().is_some());
     }
 
     /// Nothing that reaches an audit trail or a log line may carry KEK
@@ -1562,12 +1589,7 @@ mod tests {
         let source = tempfile::tempdir().expect("temp dir");
         let root = tempfile::tempdir().expect("temp dir");
         let master_key = "local-master-key-super-secret";
-        let mut config = local_config(source.path().to_path_buf());
-        config.backend_config = BackendConfig::Local(LocalConfig {
-            key_dir: source.path().to_path_buf(),
-            master_key: Some(master_key.to_string()),
-            file_permissions: Some(0o600),
-        });
+        let config = local_config_with_master_key(source.path().to_path_buf(), master_key);
         let manager = manager_with_keys(&config, &["alpha"]).await;
         let context = backup_context(root.path().to_path_buf(), config);
 
