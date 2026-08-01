@@ -68,6 +68,8 @@ fn existing_vault_auth(config: &KmsConfig) -> Option<rustfs_kms::config::VaultAu
         rustfs_kms::config::BackendConfig::VaultTransit(vault) => Some(vault.auth_method.clone()),
         rustfs_kms::config::BackendConfig::Local(_) => None,
         rustfs_kms::config::BackendConfig::Static(_) => None,
+        // AWS credentials come from the aws-config chain, not from KMS config.
+        rustfs_kms::config::BackendConfig::Aws(_) => None,
     }
 }
 

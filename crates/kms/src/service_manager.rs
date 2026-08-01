@@ -626,6 +626,11 @@ impl KmsServiceManager {
                 let backend = crate::backends::static_kms::StaticKmsBackend::new(config.clone()).await?;
                 Arc::new(backend) as Arc<dyn KmsBackend>
             }
+            BackendConfig::Aws(_) => {
+                info!("Creating AWS KMS backend for version {}", version);
+                let backend = crate::backends::aws::AwsKmsBackend::new(config.clone()).await?;
+                Arc::new(backend) as Arc<dyn KmsBackend>
+            }
         };
 
         // Create KMS manager

@@ -34,6 +34,8 @@ pub const ENV_KMS_VAULT_APPROLE_SECRET_ID: &str = "RUSTFS_KMS_VAULT_APPROLE_SECR
 pub const ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE: &str = "RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE";
 pub const ENV_KMS_VAULT_APPROLE_MOUNT: &str = "RUSTFS_KMS_VAULT_APPROLE_MOUNT";
 pub const ENV_KMS_VAULT_TOKEN_FILE: &str = "RUSTFS_KMS_VAULT_TOKEN_FILE";
+pub const ENV_KMS_AWS_REGION: &str = "RUSTFS_KMS_AWS_REGION";
+pub const ENV_KMS_AWS_ENDPOINT_URL: &str = "RUSTFS_KMS_AWS_ENDPOINT_URL";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 pub const DEFAULT_VAULT_APPROLE_MOUNT: &str = "approle";
@@ -128,6 +130,10 @@ pub enum KmsBackend {
     /// Static single-key backend that derives DEKs from a pre-configured key
     #[serde(rename = "Static")]
     Static,
+    /// AWS KMS backend: AWS is the cryptographic source of truth and owns key
+    /// state, versioning, and the deletion window.
+    #[serde(rename = "AWS", alias = "AwsKms")]
+    Aws,
 }
 
 impl KmsBackend {
@@ -200,6 +206,9 @@ pub enum BackendConfig {
     VaultTransit(Box<VaultTransitConfig>),
     /// Static single-key backend configuration
     Static(StaticConfig),
+    /// AWS KMS backend configuration
+    #[serde(rename = "AWS", alias = "AwsKms")]
+    Aws(Box<AwsKmsConfig>),
 }
 
 impl Default for BackendConfig {
@@ -215,6 +224,7 @@ impl fmt::Debug for BackendConfig {
             Self::VaultKv2(config) => f.debug_tuple("VaultKv2").field(config).finish(),
             Self::VaultTransit(config) => f.debug_tuple("VaultTransit").field(config).finish(),
             Self::Static(config) => f.debug_tuple("Static").field(config).finish(),
+            Self::Aws(config) => f.debug_tuple("Aws").field(config).finish(),
         }
     }
 }
@@ -540,6 +550,25 @@ impl Default for CacheConfig {
     }
 }
 
+/// AWS KMS backend configuration.
+///
+/// Deliberately holds no credential material: the backend resolves credentials
+/// through the standard `aws-config` provider chain (environment, shared
+/// profile, container/IMDS role), so RustFS never stores, persists, or redacts
+/// AWS secrets of its own.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AwsKmsConfig {
+    /// AWS region hosting the KMS keys. When unset, the region is resolved by
+    /// the standard chain (`AWS_REGION`, profile, IMDS).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Override for the KMS endpoint, for local emulators and private
+    /// endpoints. Unset in production, where the SDK derives the regional
+    /// endpoint.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+}
+
 impl KmsConfig {
     /// Create a new KMS configuration for local backend (for development and testing only)
     pub fn local(key_dir: PathBuf) -> Self {
@@ -645,6 +674,29 @@ impl KmsConfig {
     pub fn static_config(&self) -> Option<&StaticConfig> {
         match &self.backend_config {
             BackendConfig::Static(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    /// Create a new KMS configuration for the AWS KMS backend.
+    ///
+    /// Credentials are resolved by the standard `aws-config` provider chain;
+    /// only the region is configured here.
+    pub fn aws(region: Option<String>) -> Self {
+        Self {
+            backend: KmsBackend::Aws,
+            backend_config: BackendConfig::Aws(Box::new(AwsKmsConfig {
+                region,
+                endpoint_url: None,
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Get the AWS configuration if backend is AWS KMS
+    pub fn aws_kms_config(&self) -> Option<&AwsKmsConfig> {
+        match &self.backend_config {
+            BackendConfig::Aws(config) => Some(config),
             _ => None,
         }
     }
@@ -805,6 +857,25 @@ impl KmsConfig {
                 // Validate that the key can be decoded (right length, valid base64)
                 config.decode_key()?;
             }
+            BackendConfig::Aws(config) => {
+                if let Some(region) = &config.region
+                    && region.is_empty()
+                {
+                    return Err(KmsError::configuration_error("AWS KMS region cannot be empty when set"));
+                }
+
+                if let Some(endpoint) = &config.endpoint_url {
+                    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                        return Err(KmsError::configuration_error("AWS KMS endpoint URL must use http or https scheme"));
+                    }
+                    // A plaintext endpoint override exposes every KMS request,
+                    // including plaintext data keys, so it stays gated on the
+                    // explicit development opt-in.
+                    if endpoint.starts_with("http://") && !self.allow_insecure_dev_defaults {
+                        return Err(development_default_error("AWS KMS endpoint URL must use https"));
+                    }
+                }
+            }
         }
 
         // Validate cache configuration
@@ -826,6 +897,7 @@ impl KmsConfig {
                 "vault" | "vault-kv2" | "vault_kv2" => KmsBackend::VaultKv2,
                 "vault-transit" | "vault_transit" => KmsBackend::VaultTransit,
                 "static" => KmsBackend::Static,
+                "aws" | "aws-kms" | "aws_kms" => KmsBackend::Aws,
                 _ => return Err(KmsError::configuration_error(format!("Unknown KMS backend: {backend_type}"))),
             };
         }
@@ -953,6 +1025,14 @@ impl KmsConfig {
                     secret_key,
                 });
                 config.default_key_id = Some(key_id);
+            }
+            KmsBackend::Aws => {
+                // Only non-credential settings are read here; access keys,
+                // profiles, and role assumption stay with the aws-config chain.
+                config.backend_config = BackendConfig::Aws(Box::new(AwsKmsConfig {
+                    region: get_env_opt_str(ENV_KMS_AWS_REGION),
+                    endpoint_url: get_env_opt_str(ENV_KMS_AWS_ENDPOINT_URL),
+                }));
             }
         }
 

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 
+pub mod aws;
 #[cfg(test)]
 mod contract_tests;
 pub mod local;
