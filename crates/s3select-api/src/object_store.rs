@@ -15,7 +15,10 @@
 use crate::{
     SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
     SelectStore,
-    query::session::{QueryExecutionGuard, QueryExecutionTracker},
+    query::{
+        parser::RustFsDialect,
+        session::{QueryExecutionGuard, QueryExecutionTracker},
+    },
     resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
     select_is_err_version_not_found,
 };
@@ -28,6 +31,10 @@ use datafusion::{
     object_store::{
         Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+    },
+    sql::sqlparser::{
+        ast::{ObjectNamePart, SetExpr, Statement, TableFactor},
+        parser::Parser as SqlParser,
     },
 };
 use futures::pin_mut;
@@ -837,72 +844,32 @@ impl<S> ScanRangeState<S> {
     }
 }
 
-/// Extract the JSON sub-path from a SQL expression's FROM clause.
-///
-/// Given `SELECT e.name FROM s3object.employees e WHERE …` this returns
-/// `Some("employees")`.  Returns `None` when the FROM target is plain
-/// `s3object` (no sub-path) or when the expression cannot be parsed.
 fn extract_json_sub_path_from_expression(expression: &str) -> Option<String> {
-    // Find " FROM " (case-insensitive).
-    let lower = expression.to_lowercase();
-    let from_pos = lower.find(" from ")?;
-    let after_from = expression[from_pos + 6..].trim_start();
-
-    // Must start with "s3object" (case-insensitive, ASCII-only for the prefix).
-    const S3OBJECT_LOWER: &str = "s3object";
-    let mut chars = after_from.char_indices();
-    for expected in S3OBJECT_LOWER.chars() {
-        let (idx, actual) = chars.next()?;
-        if actual.to_ascii_lowercase() != expected {
-            return None;
-        }
-        // When we have consumed the full prefix, `idx` is the byte index of
-        // the current character; use it plus its UTF-8 length as the slice
-        // boundary for the remaining string.
-        if expected == 't' {
-            let end_of_prefix = idx + actual.len_utf8();
-            let after_s3object = &after_from[end_of_prefix..];
-
-            // If the very next character is '.' there is a sub-path.
-            if let Some(rest) = after_s3object.strip_prefix('.') {
-                let rest = rest.trim_start();
-                if rest.is_empty() {
-                    return None;
-                }
-
-                // Support quoted identifiers: s3object."my.path" or s3object.'my path'
-                let mut chars = rest.chars();
-                if let Some(first) = chars.next()
-                    && (first == '"' || first == '\'')
-                {
-                    let quote = first;
-                    let inner = &rest[first.len_utf8()..];
-                    if let Some(end) = inner.find(quote) {
-                        let path = &inner[..end];
-                        if !path.trim().is_empty() {
-                            return Some(path.to_string());
-                        }
-                    }
-                    // Quoted but no closing quote or empty: treat as no sub-path.
-                    return None;
-                }
-
-                // Unquoted identifier: collect characters until whitespace, '[', or ']'.
-                let end = rest
-                    .find(|c: char| c.is_whitespace() || c == '[' || c == ']')
-                    .unwrap_or(rest.len());
-                let path = rest[..end].trim();
-                if !path.is_empty() {
-                    return Some(path.to_string());
-                }
-            }
-            return None;
-        }
+    let mut statements = SqlParser::parse_sql(&RustFsDialect, expression).ok()?;
+    if statements.len() != 1 {
+        return None;
     }
-
-    // We only reach here if the loop completed without hitting the 't'
-    // branch above, which would be unexpected given S3OBJECT_LOWER.
-    None
+    let Statement::Query(query) = statements.pop()? else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let [table] = select.from.as_slice() else {
+        return None;
+    };
+    let TableFactor::Table { name, .. } = &table.relation else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(table_name), ObjectNamePart::Identifier(sub_path)] = name.0.as_slice() else {
+        return None;
+    };
+    let is_s3_object = if table_name.quote_style.is_some() {
+        table_name.value == "S3Object"
+    } else {
+        table_name.value.eq_ignore_ascii_case("S3Object")
+    };
+    is_s3_object.then(|| sub_path.value.clone())
 }
 
 /// Build a lazy NDJSON stream from a JSON DOCUMENT reader.
@@ -1967,9 +1934,26 @@ mod test {
     }
 
     #[test]
-    fn test_extract_json_sub_path_with_bracket() {
-        // `FROM s3object.employees[*]` — bracket stops path collection.
+    fn test_extract_json_sub_path_rejects_unsupported_bracket_path() {
         let sql = "SELECT e.name FROM s3object.employees[*] e";
+        assert_eq!(extract_json_sub_path_from_expression(sql), None);
+    }
+
+    #[test]
+    fn test_extract_json_sub_path_ignores_from_in_string_literal() {
+        let sql = "SELECT ' from ' AS marker FROM S3Object.employees";
         assert_eq!(extract_json_sub_path_from_expression(sql), Some("employees".to_string()));
+    }
+
+    #[test]
+    fn test_extract_json_sub_path_ignores_from_in_comment() {
+        let sql = "SELECT /* from S3Object.wrong */ e.name FROM S3Object.employees AS e";
+        assert_eq!(extract_json_sub_path_from_expression(sql), Some("employees".to_string()));
+    }
+
+    #[test]
+    fn test_extract_json_sub_path_supports_quoted_identifier() {
+        let sql = "SELECT \" from \" FROM S3Object.\"employee data\"";
+        assert_eq!(extract_json_sub_path_from_expression(sql), Some("employee data".to_string()));
     }
 }
