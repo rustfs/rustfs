@@ -30,6 +30,10 @@ impl Args {
     }
 }
 
+pub fn is_configured() -> bool {
+    env::var_os(ENV_POLICY_PLUGIN_OPA_URL).is_some_and(|url| !url.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthZPlugin {
     client: OpaHttpClient,
@@ -88,7 +92,12 @@ async fn validate(config: &Args) -> Result<(), OpaConfigError> {
         .build()
         .map_err(OpaConfigError::Connection)?;
 
-    match client.post(&config.url).send().await {
+    let mut request = client.post(&config.url);
+    if !config.auth_token.is_empty() {
+        request = request.header("Authorization", format!("Bearer {}", config.auth_token));
+    }
+
+    match request.send().await {
         Ok(resp) => {
             match resp.status() {
                 reqwest::StatusCode::OK => {
