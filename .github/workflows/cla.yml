@@ -22,11 +22,18 @@ on:
   issue_comment:
     types: [created, edited]
 
+# Least privilege at the top, widened per job below. This workflow runs on
+# pull_request_target and issue_comment, so it holds full secrets on every fork
+# PR and on any comment anyone writes — the one place in this repository where a
+# compromised action would be handed a repo-write token. It does not check out
+# or execute PR code, so there is no pwn-request path today, but the blast
+# radius should not depend on that staying true.
+#
+# contents: write in particular was never used: the signature records are
+# written to rustfs/cla through the scoped app token created below, and nothing
+# here writes to this repository's contents.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  checks: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
@@ -36,14 +43,26 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request_target' && github.event.action == 'closed'
+    # Echoes one line; the run exists only so the concurrency group cancels the
+    # in-flight run of a closed PR.
+    permissions: {}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Explain cancellation run
         run: echo "PR closed; this run only cancels older runs in the same concurrency group."
 
   cla:
     if: ${{ (github.event_name != 'issue_comment' || github.event.issue.pull_request) && (github.event_name != 'pull_request_target' || github.event.action != 'closed') }}
+    # checks: write reports the merge-queue check run; pull-requests and issues
+    # let cla-bot comment and label. contents stays read — see the note above.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+      pull-requests: write
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Report CLA result for merge queue
         if: github.event_name == 'merge_group'

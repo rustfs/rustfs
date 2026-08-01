@@ -14,30 +14,125 @@
 
 //! Caching layer for KMS operations to improve performance
 
+use crate::config::CacheConfig;
 use crate::types::KeyMetadata;
 use moka::future::Cache;
-use std::time::Duration;
+use moka::notification::RemovalCause;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ---------------------------------------------------------------------------
+// Metrics
+//
+// Lookup outcomes and removals are counted here because moka exposes neither
+// hit nor miss counts; the numbers below are the cache's own, not derived.
+// Label values are exclusively static strings (lookup result, removal cause) —
+// key identifiers and key metadata must never reach a metric label.
+//
+// Publication is gated by `CacheConfig::enable_metrics`; the atomics backing
+// `KmsCache::stats` are maintained regardless, so the admin status API keeps
+// reporting real numbers with the metrics switch off.
+// ---------------------------------------------------------------------------
+
+/// Counter: key metadata lookups, by `result` (`hit` or `miss`).
+const METRIC_CACHE_LOOKUPS_TOTAL: &str = "rustfs_kms_metadata_cache_lookups_total";
+/// Counter: entries dropped from the cache, by `cause` (`expired`, `size`,
+/// `explicit`, `replaced`); only `expired` and `size` are true evictions, the
+/// rest are invalidations driven by key lifecycle operations.
+const METRIC_CACHE_EVICTIONS_TOTAL: &str = "rustfs_kms_metadata_cache_evictions_total";
+/// Gauge: entries currently held by the cache. Republished whenever the entry
+/// set can have changed — every write path, plus the lookups that miss, since
+/// TTL expiry drops entries without any write taking place.
+const METRIC_CACHE_ENTRIES: &str = "rustfs_kms_metadata_cache_entries";
+
+/// Register metric descriptions once per process.
+fn describe_metrics() {
+    static DESCRIBE: std::sync::Once = std::sync::Once::new();
+    DESCRIBE.call_once(|| {
+        metrics::describe_counter!(METRIC_CACHE_LOOKUPS_TOTAL, "Total KMS key metadata cache lookups, by hit or miss");
+        metrics::describe_counter!(
+            METRIC_CACHE_EVICTIONS_TOTAL,
+            "Total entries dropped from the KMS key metadata cache, by removal cause"
+        );
+        metrics::describe_gauge!(METRIC_CACHE_ENTRIES, "Entries currently held by the KMS key metadata cache");
+    });
+}
+
+fn removal_cause_label(cause: RemovalCause) -> &'static str {
+    match cause {
+        RemovalCause::Expired => "expired",
+        RemovalCause::Explicit => "explicit",
+        RemovalCause::Replaced => "replaced",
+        RemovalCause::Size => "size",
+    }
+}
+
+/// Cumulative cache counters. Shared with moka's eviction listener, which runs
+/// outside any `&self` borrow, hence the `Arc` and the atomics.
+#[derive(Debug, Default)]
+struct CacheCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// Snapshot of the KMS key metadata cache counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KmsCacheStats {
+    /// Entries currently held. Eventually consistent: moka applies pending
+    /// maintenance lazily.
+    pub entries: u64,
+    /// Lookups served from the cache since process start.
+    pub hits: u64,
+    /// Lookups that fell through to the backend since process start.
+    pub misses: u64,
+    /// Entries dropped since process start, whatever the cause (expiry,
+    /// capacity, invalidation, replacement).
+    pub evictions: u64,
+}
 
 /// KMS cache for storing frequently accessed keys and metadata
 pub struct KmsCache {
     key_metadata_cache: Cache<String, KeyMetadata>,
+    counters: Arc<CacheCounters>,
+    metrics_enabled: bool,
 }
 
 impl KmsCache {
-    /// Create a new KMS cache with the specified capacity
+    /// Create a new KMS cache from the operator-supplied cache configuration
+    ///
+    /// The entry lifetime is [`CacheConfig::effective_ttl`] rather than the raw
+    /// configured value: this value arrives straight from the admin configure
+    /// API, and moka panics when built with a time-to-live beyond 1000 years.
     ///
     /// # Arguments
-    /// * `capacity` - Maximum number of entries in the cache
+    /// * `config` - Capacity, metadata lifetime and metrics switch to build with
     ///
     /// # Returns
     /// A new instance of `KmsCache`
     ///
-    pub fn new(capacity: u64) -> Self {
+    pub fn new(config: &CacheConfig) -> Self {
+        let metrics_enabled = config.enable_metrics;
+        if metrics_enabled {
+            describe_metrics();
+        }
+
+        let counters = Arc::new(CacheCounters::default());
+        let eviction_counters = Arc::clone(&counters);
+
         Self {
             key_metadata_cache: Cache::builder()
-                .max_capacity(capacity)
-                .time_to_live(Duration::from_secs(300)) // 5 minutes default TTL
+                .max_capacity(config.max_keys as u64)
+                .time_to_live(config.effective_ttl())
+                .eviction_listener(move |_key: Arc<String>, _metadata: KeyMetadata, cause: RemovalCause| {
+                    eviction_counters.evictions.fetch_add(1, Ordering::Relaxed);
+                    if metrics_enabled {
+                        metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL, "cause" => removal_cause_label(cause)).increment(1);
+                    }
+                })
                 .build(),
+            counters,
+            metrics_enabled,
         }
     }
 
@@ -50,7 +145,26 @@ impl KmsCache {
     /// An `Option` containing the `KeyMetadata` if found, or `None` if not found
     ///
     pub async fn get_key_metadata(&self, key_id: &str) -> Option<KeyMetadata> {
-        self.key_metadata_cache.get(key_id).await
+        let cached = self.key_metadata_cache.get(key_id).await;
+        self.record_lookup(cached.is_some());
+
+        if cached.is_none() {
+            // TTL expiry is the one way the entry set shrinks without a write,
+            // and a miss is where it surfaces. moka expires lazily: the miss is
+            // reported at once, but the removal that decrements `entry_count`
+            // and reaches the eviction listener lands in the maintenance pass
+            // moka runs opportunistically on reads, on its own interval. So
+            // this converges the gauge within a housekeeping interval rather
+            // than on the first miss — enough to stop a cache that only ever
+            // expires, with no put, remove or clear to follow, from reporting a
+            // population that is gone. Forcing `run_pending_tasks` would
+            // tighten that at the cost of taking moka's maintenance lock on
+            // every miss, for a gauge `entry_count` only approximates anyway.
+            // Hits, the hot path, are left alone.
+            self.record_entry_count();
+        }
+
+        cached
     }
 
     /// Put key metadata into cache
@@ -62,6 +176,7 @@ impl KmsCache {
     pub async fn put_key_metadata(&mut self, key_id: &str, metadata: &KeyMetadata) {
         self.key_metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
         self.key_metadata_cache.run_pending_tasks().await;
+        self.record_entry_count();
     }
 
     /// Remove key metadata from cache
@@ -71,6 +186,11 @@ impl KmsCache {
     ///
     pub async fn remove_key_metadata(&mut self, key_id: &str) {
         self.key_metadata_cache.remove(key_id).await;
+
+        // Flush maintenance so the removal notification and the entry gauge
+        // describe the cache as it is once this call returns.
+        self.key_metadata_cache.run_pending_tasks().await;
+        self.record_entry_count();
     }
 
     /// Clear all cached entries
@@ -79,18 +199,39 @@ impl KmsCache {
 
         // Wait for invalidation to complete
         self.key_metadata_cache.run_pending_tasks().await;
+        self.record_entry_count();
     }
 
-    /// Get cache statistics (hit count, miss count)
+    /// Get cache statistics
     ///
     /// # Returns
-    /// A tuple containing total entries and total misses
+    /// A [`KmsCacheStats`] snapshot of entry count, hits, misses and evictions
     ///
-    pub fn stats(&self) -> (u64, u64) {
-        (
-            self.key_metadata_cache.entry_count(),
-            0u64, // moka doesn't provide miss count directly
-        )
+    pub fn stats(&self) -> KmsCacheStats {
+        KmsCacheStats {
+            entries: self.key_metadata_cache.entry_count(),
+            hits: self.counters.hits.load(Ordering::Relaxed),
+            misses: self.counters.misses.load(Ordering::Relaxed),
+            evictions: self.counters.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_lookup(&self, hit: bool) {
+        let (counter, result) = if hit {
+            (&self.counters.hits, "hit")
+        } else {
+            (&self.counters.misses, "miss")
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if self.metrics_enabled {
+            metrics::counter!(METRIC_CACHE_LOOKUPS_TOTAL, "result" => result).increment(1);
+        }
+    }
+
+    fn record_entry_count(&self) {
+        if self.metrics_enabled {
+            metrics::gauge!(METRIC_CACHE_ENTRIES).set(self.key_metadata_cache.entry_count() as f64);
+        }
     }
 }
 
@@ -99,40 +240,101 @@ mod tests {
     use super::*;
     use crate::types::{KeyState, KeyUsage};
     use jiff::Zoned;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::time::Duration;
 
-    #[derive(Debug, Clone)]
-    struct CacheInfo {
-        key_metadata_count: u64,
-    }
-
-    impl CacheInfo {
-        fn total_entries(&self) -> u64 {
-            self.key_metadata_count
-        }
-    }
-
     impl KmsCache {
-        fn with_ttl_for_tests(capacity: u64, metadata_ttl: Duration) -> Self {
-            Self {
-                key_metadata_cache: Cache::builder().max_capacity(capacity).time_to_live(metadata_ttl).build(),
-            }
-        }
-
-        fn info_for_tests(&self) -> CacheInfo {
-            CacheInfo {
-                key_metadata_count: self.key_metadata_cache.entry_count(),
-            }
-        }
-
         fn contains_key_metadata_for_tests(&self, key_id: &str) -> bool {
             self.key_metadata_cache.contains_key(key_id)
         }
     }
 
+    /// A cache holding `max_keys` entries for the default lifetime.
+    fn sized(max_keys: usize) -> KmsCache {
+        KmsCache::new(&CacheConfig {
+            max_keys,
+            ..Default::default()
+        })
+    }
+
+    fn test_metadata(key_id: &str) -> KeyMetadata {
+        KeyMetadata {
+            key_id: key_id.to_string(),
+            key_state: KeyState::Enabled,
+            key_usage: KeyUsage::EncryptDecrypt,
+            description: None,
+            creation_date: Zoned::now(),
+            deletion_date: None,
+            origin: "KMS".to_string(),
+            key_manager: "CUSTOMER".to_string(),
+            tags: std::collections::HashMap::new(),
+        }
+    }
+
+    type MetricEntry = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
+
+    /// Drive `test` on a current-thread runtime under a thread-local debugging
+    /// recorder and return its output plus one snapshot of everything emitted.
+    ///
+    /// A single snapshot per test on purpose: `Snapshotter::snapshot` drains
+    /// the recorded state, so taking it per assertion would leave every
+    /// assertion after the first with nothing to look at.
+    fn record_metrics<F, Fut, T>(test: F) -> (T, Vec<MetricEntry>)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let output = metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime must build");
+            runtime.block_on(test())
+        });
+        (output, snapshotter.snapshot().into_vec())
+    }
+
+    /// Sum of counters with `name` whose labels include every `(key, value)` pair.
+    fn counter_value(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)]) -> u64 {
+        snapshot
+            .iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                let key = composite.key();
+                let matches = composite.kind() == MetricKind::Counter
+                    && key.name() == name
+                    && labels
+                        .iter()
+                        .all(|(label, expected)| key.labels().any(|l| l.key() == *label && l.value() == *expected));
+                match (matches, value) {
+                    (true, DebugValue::Counter(count)) => Some(*count),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    /// Last value recorded for the unlabelled gauge `name`.
+    fn gauge_value(snapshot: &[MetricEntry], name: &str) -> Option<f64> {
+        snapshot.iter().find_map(|(composite, _unit, _description, value)| {
+            let matches = composite.kind() == MetricKind::Gauge && composite.key().name() == name;
+            match (matches, value) {
+                (true, DebugValue::Gauge(gauge)) => Some(**gauge),
+                _ => None,
+            }
+        })
+    }
+
     #[tokio::test]
     async fn test_cache_operations() {
-        let mut cache = KmsCache::new(100);
+        let mut cache = sized(100);
 
         // Test key metadata caching
         let metadata = KeyMetadata {
@@ -154,22 +356,20 @@ mod tests {
         assert_eq!(retrieved.expect("metadata should be cached").key_id, "test-key-1");
 
         // Test cache info
-        let info = cache.info_for_tests();
-        assert_eq!(info.key_metadata_count, 1);
-        assert_eq!(info.total_entries(), 1);
+        assert_eq!(cache.stats().entries, 1);
 
         // Test cache clearing
         cache.clear().await;
-        let info_after_clear = cache.info_for_tests();
-        assert_eq!(info_after_clear.total_entries(), 0);
+        assert_eq!(cache.stats().entries, 0);
     }
 
     #[tokio::test]
     async fn test_cache_with_custom_ttl() {
-        let mut cache = KmsCache::with_ttl_for_tests(
-            100,
-            Duration::from_millis(100), // Short TTL for testing
-        );
+        let mut cache = KmsCache::new(&CacheConfig {
+            max_keys: 100,
+            ttl: Duration::from_millis(100), // Short TTL for testing
+            ..Default::default()
+        });
 
         let metadata = KeyMetadata {
             key_id: "ttl-test-key".to_string(),
@@ -197,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_contains_methods() {
-        let mut cache = KmsCache::new(100);
+        let mut cache = sized(100);
 
         assert!(!cache.contains_key_metadata_for_tests("nonexistent"));
 
@@ -216,5 +416,126 @@ mod tests {
         cache.put_key_metadata("contains-test", &metadata).await;
 
         assert!(cache.contains_key_metadata_for_tests("contains-test"));
+    }
+
+    #[test]
+    fn lookups_report_real_hit_and_miss_counts() {
+        let (stats, snapshot) = record_metrics(|| async {
+            let mut cache = sized(100);
+
+            assert!(cache.get_key_metadata("absent").await.is_none());
+            cache.put_key_metadata("present", &test_metadata("present")).await;
+            assert!(cache.get_key_metadata("present").await.is_some());
+            assert!(cache.get_key_metadata("absent").await.is_none());
+
+            cache.stats()
+        });
+
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_LOOKUPS_TOTAL, &[("result", "hit")]), 1);
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_LOOKUPS_TOTAL, &[("result", "miss")]), 2);
+    }
+
+    #[test]
+    fn disabling_metrics_stops_publication_without_blinding_the_status_api() {
+        let (stats, snapshot) = record_metrics(|| async {
+            let mut cache = KmsCache::new(&CacheConfig {
+                max_keys: 1,
+                enable_metrics: false,
+                ..Default::default()
+            });
+
+            assert!(cache.get_key_metadata("absent").await.is_none());
+            cache.put_key_metadata("first", &test_metadata("first")).await;
+            assert!(cache.get_key_metadata("first").await.is_some());
+            // Capacity is one, so this insert evicts "first".
+            cache.put_key_metadata("second", &test_metadata("second")).await;
+
+            cache.stats()
+        });
+
+        // The counters behind the admin status API keep moving...
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.evictions, 1);
+
+        // ...while nothing reaches the metrics recorder.
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_LOOKUPS_TOTAL, &[]), 0);
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[]), 0);
+        assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), None);
+    }
+
+    #[test]
+    fn removals_report_their_cause_and_the_resulting_entry_count() {
+        let (stats, snapshot) = record_metrics(|| async {
+            let mut cache = sized(100);
+
+            cache.put_key_metadata("key", &test_metadata("key")).await;
+            cache.put_key_metadata("key", &test_metadata("key")).await;
+            cache.remove_key_metadata("key").await;
+
+            cache.stats()
+        });
+
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[("cause", "replaced")]), 1);
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[("cause", "explicit")]), 1);
+        assert_eq!(stats.evictions, 2);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), Some(0.0));
+    }
+
+    #[test]
+    fn capacity_pressure_reports_size_evictions() {
+        let (stats, snapshot) = record_metrics(|| async {
+            let mut cache = sized(1);
+
+            cache.put_key_metadata("first", &test_metadata("first")).await;
+            cache.put_key_metadata("second", &test_metadata("second")).await;
+
+            cache.stats()
+        });
+
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[("cause", "size")]), 1);
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), Some(1.0));
+    }
+
+    /// Entries that expire are dropped outside every write path, so the gauge
+    /// has to be republished from the lookup that observes the expiry — nothing
+    /// else runs afterwards to correct it.
+    ///
+    /// moka's clock is internal and cannot be driven by tokio's paused time,
+    /// hence the one short real sleep. The explicit `run_pending_tasks` stands
+    /// in for the maintenance moka schedules by itself on reads, so the test
+    /// does not depend on moka's internal 300ms housekeeping interval.
+    #[test]
+    fn expiry_without_further_writes_converges_the_entry_gauge() {
+        let ttl = Duration::from_millis(100);
+
+        let (stats, snapshot) = record_metrics(move || async move {
+            let mut cache = KmsCache::new(&CacheConfig {
+                max_keys: 100,
+                ttl,
+                ..Default::default()
+            });
+
+            cache.put_key_metadata("expiring", &test_metadata("expiring")).await;
+            assert_eq!(cache.stats().entries, 1);
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cache.key_metadata_cache.run_pending_tasks().await;
+
+            // The lookup that observes the expiry is the last thing to touch
+            // the cache: no put, remove or clear follows it.
+            assert!(cache.get_key_metadata("expiring").await.is_none());
+
+            cache.stats()
+        });
+
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[("cause", "expired")]), 1);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), Some(0.0));
     }
 }

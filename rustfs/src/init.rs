@@ -19,6 +19,7 @@ use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOpera
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
+use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
 use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
@@ -290,6 +291,7 @@ fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
             file_permissions: Some(0o600),
         }),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
@@ -327,6 +329,7 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
             tls: None,
         })),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
@@ -362,6 +365,7 @@ fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustf
             ..rustfs_kms::config::VaultTransitConfig::default()
         })),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
@@ -416,6 +420,7 @@ fn build_static_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::
         default_key_id: cfg.kms_default_key_id.clone().or(Some(key_id)),
         backend_config: rustfs_kms::config::BackendConfig::Static(static_config),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         ..Default::default()
     };
 
@@ -468,12 +473,20 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
 
+    log_sse_kms_key_policy_mode();
+
     // A key referenced by any bucket's encryption configuration must never be
     // deleted. Register the gate before the service can start so every
     // deletion-worker spawn observes it; the gate fails closed while the
     // object store is not ready.
     service_manager
         .set_deletion_reference_checker(std::sync::Arc::new(crate::kms_deletion_gate::BucketEncryptionReferenceChecker));
+
+    // Route KMS management records into the server's audit pipeline. Installed
+    // before the service can start so every service version built afterwards
+    // carries it; with no audit target configured the records are dropped and
+    // KMS operations are unaffected.
+    service_manager.set_audit_sink(std::sync::Arc::new(crate::admin::handlers::kms_audit::KmsAdminAuditSink));
 
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {

@@ -1,0 +1,15 @@
+---
+source: crates/kms/src/backends/aws.rs
+expression: capabilities_snapshot(backend.capabilities())
+---
+{
+  "decrypt": true,
+  "enable_disable": true,
+  "encrypt": true,
+  "generate_data_key": true,
+  "physical_delete": false,
+  "rotate": true,
+  "schedule_deletion": true,
+  "update_key_metadata": false,
+  "versioning": true
+}

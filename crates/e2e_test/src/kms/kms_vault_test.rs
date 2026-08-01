@@ -449,29 +449,31 @@ async fn test_vault_kms_key_crud(
 
     info!("✅ Delete verification: Key state correctly changed to: {}", key_state);
 
-    // Force Delete - Force immediate deletion for PendingDeletion key
-    let force_delete_response = crate::common::execute_awscurl(
+    // Force Delete - a default server refuses to skip the waiting window
+    // (rustfs/backlog#1585): destroying the key material immediately would take
+    // every object encrypted under the key with it.
+    let force_delete_error = crate::common::execute_awscurl(
         &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}&force_immediate=true"),
         "DELETE",
         None,
         access_key,
         secret_key,
     )
-    .await?;
+    .await
+    .expect_err("Immediate KMS key deletion must be refused on a default server");
+    info!("✅ Force Delete: correctly refused for key {}: {}", key_id, force_delete_error);
 
-    // Parse and validate the force delete response
-    let force_delete_result: serde_json::Value = serde_json::from_str(&force_delete_response)?;
-    assert_eq!(force_delete_result["success"], true, "Force delete operation must return success=true");
-    info!("✅ Force Delete: Successfully force deleted key: {}", key_id);
+    // The refused request must leave the key exactly as it was: still present,
+    // still pending deletion, still recoverable through cancel-deletion.
+    let describe_after_refusal =
+        crate::common::awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await?;
+    let describe_after_refusal: serde_json::Value = serde_json::from_str(&describe_after_refusal)?;
+    assert_eq!(
+        describe_after_refusal["key_metadata"]["key_state"], "PendingDeletion",
+        "A refused immediate deletion must leave the key pending deletion"
+    );
 
-    // Verify key no longer exists after force deletion (should return error)
-    let describe_force_deleted_result =
-        crate::common::awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await;
-
-    // After force deletion, key should not be found (GET should fail)
-    assert!(describe_force_deleted_result.is_err(), "Force deleted key should not be found");
-
-    info!("✅ Force Delete verification: Key was permanently deleted and is no longer accessible");
+    info!("✅ Force Delete verification: Key survived the refused immediate deletion");
 
     info!("Vault KMS key CRUD operations completed successfully");
     Ok(())

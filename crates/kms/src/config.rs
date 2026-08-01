@@ -24,6 +24,7 @@ use std::time::Duration;
 use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
+pub const ENV_KMS_ALLOW_IMMEDIATE_DELETION: &str = "RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
@@ -34,6 +35,8 @@ pub const ENV_KMS_VAULT_APPROLE_SECRET_ID: &str = "RUSTFS_KMS_VAULT_APPROLE_SECR
 pub const ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE: &str = "RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE";
 pub const ENV_KMS_VAULT_APPROLE_MOUNT: &str = "RUSTFS_KMS_VAULT_APPROLE_MOUNT";
 pub const ENV_KMS_VAULT_TOKEN_FILE: &str = "RUSTFS_KMS_VAULT_TOKEN_FILE";
+pub const ENV_KMS_AWS_REGION: &str = "RUSTFS_KMS_AWS_REGION";
+pub const ENV_KMS_AWS_ENDPOINT_URL: &str = "RUSTFS_KMS_AWS_ENDPOINT_URL";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 pub const DEFAULT_VAULT_APPROLE_MOUNT: &str = "approle";
@@ -46,6 +49,19 @@ pub(crate) const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Upper bound applied to `KmsConfig::retry_attempts` when deriving backend behavior.
 pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 10;
+
+/// Default number of key metadata entries the cache holds.
+pub const DEFAULT_MAX_CACHED_KEYS: usize = 1000;
+
+/// Default lifetime of a cached key metadata entry.
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Upper bound applied to `CacheConfig::ttl` when building the metadata cache.
+///
+/// Out-of-range values are clamped at use rather than rejected, matching
+/// `MAX_OPERATION_TIMEOUT`, so existing deployments with an oversized setting
+/// keep starting after an upgrade.
+pub(crate) const MAX_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn default_vault_transit_metadata_kv_mount() -> String {
     DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string()
@@ -128,6 +144,26 @@ pub enum KmsBackend {
     /// Static single-key backend that derives DEKs from a pre-configured key
     #[serde(rename = "Static")]
     Static,
+    /// AWS KMS backend: AWS is the cryptographic source of truth and owns key
+    /// state, versioning, and the deletion window.
+    #[serde(rename = "AWS", alias = "AwsKms")]
+    Aws,
+}
+
+impl KmsBackend {
+    /// Stable identifier for logs, metrics, and audit records.
+    ///
+    /// External consumers key off these values, so treat them as a wire
+    /// contract rather than a rendering detail.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KmsBackend::VaultKv2 => "vault-kv2",
+            KmsBackend::VaultTransit => "vault-transit",
+            KmsBackend::Local => "local",
+            KmsBackend::Static => "static",
+            KmsBackend::Aws => "aws",
+        }
+    }
 }
 
 /// Main KMS configuration
@@ -142,6 +178,24 @@ pub struct KmsConfig {
     /// Allow development-only insecure defaults such as plaintext local keys or HTTP Vault.
     #[serde(default)]
     pub allow_insecure_dev_defaults: bool,
+    /// Allow `DeleteKey` requests to skip the pending-deletion waiting window and
+    /// destroy key material right away.
+    ///
+    /// Off by default: an immediate deletion is unrecoverable and takes every
+    /// object encrypted under the key with it, so the waiting window (plus
+    /// `CancelKeyDeletion`) is the only recovery path. Operators who genuinely
+    /// need immediate deletion — throwaway test clusters, key material that was
+    /// never used — must turn it on through server configuration
+    /// ([`ENV_KMS_ALLOW_IMMEDIATE_DELETION`]); the request must still echo the
+    /// key id back for confirmation.
+    ///
+    /// Not part of the serialized configuration, and not settable through the
+    /// admin configure API. It is per-server operator state that has to be
+    /// re-stated to survive a restart: persisting it would carry one operator's
+    /// one-time enablement into the cluster-wide config that every node reloads,
+    /// long after the deletion it was turned on for.
+    #[serde(skip)]
+    pub allow_immediate_deletion: bool,
     /// Timeout for a single backend attempt.
     ///
     /// This bounds one outbound request, not the whole operation: the operation
@@ -165,6 +219,7 @@ impl Default for KmsConfig {
             default_key_id: None,
             backend_config: BackendConfig::default(),
             allow_insecure_dev_defaults: false,
+            allow_immediate_deletion: false,
             timeout: Duration::from_secs(30),
             retry_attempts: 3,
             enable_cache: true,
@@ -185,6 +240,9 @@ pub enum BackendConfig {
     VaultTransit(Box<VaultTransitConfig>),
     /// Static single-key backend configuration
     Static(StaticConfig),
+    /// AWS KMS backend configuration
+    #[serde(rename = "AWS", alias = "AwsKms")]
+    Aws(Box<AwsKmsConfig>),
 }
 
 impl Default for BackendConfig {
@@ -200,6 +258,7 @@ impl fmt::Debug for BackendConfig {
             Self::VaultKv2(config) => f.debug_tuple("VaultKv2").field(config).finish(),
             Self::VaultTransit(config) => f.debug_tuple("VaultTransit").field(config).finish(),
             Self::Static(config) => f.debug_tuple("Static").field(config).finish(),
+            Self::Aws(config) => f.debug_tuple("Aws").field(config).finish(),
         }
     }
 }
@@ -509,20 +568,57 @@ pub struct TlsConfig {
 pub struct CacheConfig {
     /// Maximum number of keys to cache
     pub max_keys: usize,
-    /// TTL for cached keys
+    /// Lifetime of a cached key metadata entry.
+    ///
+    /// This bounds how long a describe can answer from metadata that another
+    /// node has since changed (disable, schedule-deletion); encrypt, decrypt
+    /// and data key generation never read the cache. Values above 24 hours are
+    /// clamped at use (see [`CacheConfig::effective_ttl`]).
     pub ttl: Duration,
-    /// Enable cache metrics
+    /// Publish the `rustfs_kms_metadata_cache_*` metrics.
+    ///
+    /// Only metrics-recorder output is gated: the counters behind the admin
+    /// status API are maintained either way.
     pub enable_metrics: bool,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_keys: 1000,
-            ttl: Duration::from_secs(3600), // 1 hour
+            max_keys: DEFAULT_MAX_CACHED_KEYS,
+            ttl: DEFAULT_CACHE_TTL,
             enable_metrics: true,
         }
     }
+}
+
+impl CacheConfig {
+    /// Metadata lifetime with the configured value clamped to the supported maximum.
+    ///
+    /// This is the value the cache is built with and the value reported back to
+    /// operators, so what the admin API advertises is what the cache does.
+    pub fn effective_ttl(&self) -> Duration {
+        self.ttl.min(MAX_CACHE_TTL)
+    }
+}
+
+/// AWS KMS backend configuration.
+///
+/// Deliberately holds no credential material: the backend resolves credentials
+/// through the standard `aws-config` provider chain (environment, shared
+/// profile, container/IMDS role), so RustFS never stores, persists, or redacts
+/// AWS secrets of its own.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AwsKmsConfig {
+    /// AWS region hosting the KMS keys. When unset, the region is resolved by
+    /// the standard chain (`AWS_REGION`, profile, IMDS).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Override for the KMS endpoint, for local emulators and private
+    /// endpoints. Unset in production, where the SDK derives the regional
+    /// endpoint.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
 }
 
 impl KmsConfig {
@@ -634,6 +730,29 @@ impl KmsConfig {
         }
     }
 
+    /// Create a new KMS configuration for the AWS KMS backend.
+    ///
+    /// Credentials are resolved by the standard `aws-config` provider chain;
+    /// only the region is configured here.
+    pub fn aws(region: Option<String>) -> Self {
+        Self {
+            backend: KmsBackend::Aws,
+            backend_config: BackendConfig::Aws(Box::new(AwsKmsConfig {
+                region,
+                endpoint_url: None,
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Get the AWS configuration if backend is AWS KMS
+    pub fn aws_kms_config(&self) -> Option<&AwsKmsConfig> {
+        match &self.backend_config {
+            BackendConfig::Aws(config) => Some(config),
+            _ => None,
+        }
+    }
+
     /// Set default key ID
     pub fn with_default_key(mut self, key_id: String) -> Self {
         self.default_key_id = Some(key_id);
@@ -643,6 +762,12 @@ impl KmsConfig {
     /// Explicitly allow development-only KMS defaults.
     pub fn with_insecure_development_defaults(mut self) -> Self {
         self.allow_insecure_dev_defaults = true;
+        self
+    }
+
+    /// Explicitly allow deletions that bypass the pending-deletion waiting window.
+    pub fn with_immediate_deletion_allowed(mut self) -> Self {
+        self.allow_immediate_deletion = true;
         self
     }
 
@@ -790,11 +915,39 @@ impl KmsConfig {
                 // Validate that the key can be decoded (right length, valid base64)
                 config.decode_key()?;
             }
+            BackendConfig::Aws(config) => {
+                if let Some(region) = &config.region
+                    && region.is_empty()
+                {
+                    return Err(KmsError::configuration_error("AWS KMS region cannot be empty when set"));
+                }
+
+                if let Some(endpoint) = &config.endpoint_url {
+                    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                        return Err(KmsError::configuration_error("AWS KMS endpoint URL must use http or https scheme"));
+                    }
+                    // A plaintext endpoint override exposes every KMS request,
+                    // including plaintext data keys, so it stays gated on the
+                    // explicit development opt-in.
+                    if endpoint.starts_with("http://") && !self.allow_insecure_dev_defaults {
+                        return Err(development_default_error("AWS KMS endpoint URL must use https"));
+                    }
+                }
+            }
         }
 
         // Validate cache configuration
-        if self.enable_cache && self.cache_config.max_keys == 0 {
-            return Err(KmsError::configuration_error("Cache max_keys must be greater than 0"));
+        if self.enable_cache {
+            if self.cache_config.max_keys == 0 {
+                return Err(KmsError::configuration_error("Cache max_keys must be greater than 0"));
+            }
+
+            // A zero TTL expires every entry on insert, which is a cache that
+            // cannot serve anything; reject it instead of silently disabling
+            // the cache the operator asked for.
+            if self.cache_config.ttl.is_zero() {
+                return Err(KmsError::configuration_error("Cache ttl must be greater than 0"));
+            }
         }
 
         Ok(())
@@ -811,6 +964,7 @@ impl KmsConfig {
                 "vault" | "vault-kv2" | "vault_kv2" => KmsBackend::VaultKv2,
                 "vault-transit" | "vault_transit" => KmsBackend::VaultTransit,
                 "static" => KmsBackend::Static,
+                "aws" | "aws-kms" | "aws_kms" => KmsBackend::Aws,
                 _ => return Err(KmsError::configuration_error(format!("Unknown KMS backend: {backend_type}"))),
             };
         }
@@ -839,6 +993,7 @@ impl KmsConfig {
         config.enable_cache = get_env_bool("RUSTFS_KMS_ENABLE_CACHE", config.enable_cache);
         config.allow_insecure_dev_defaults =
             get_env_bool(ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS, config.allow_insecure_dev_defaults);
+        config.allow_immediate_deletion = get_env_bool(ENV_KMS_ALLOW_IMMEDIATE_DELETION, config.allow_immediate_deletion);
 
         // Backend-specific configuration
         match config.backend {
@@ -939,11 +1094,28 @@ impl KmsConfig {
                 });
                 config.default_key_id = Some(key_id);
             }
+            KmsBackend::Aws => {
+                // Only non-credential settings are read here; access keys,
+                // profiles, and role assumption stay with the aws-config chain.
+                config.backend_config = BackendConfig::Aws(Box::new(AwsKmsConfig {
+                    region: get_env_opt_str(ENV_KMS_AWS_REGION),
+                    endpoint_url: get_env_opt_str(ENV_KMS_AWS_ENDPOINT_URL),
+                }));
+            }
         }
 
         config.validate()?;
         Ok(config)
     }
+}
+
+/// Read the immediate-deletion gate from the environment.
+///
+/// Callers that assemble a [`KmsConfig`] field by field instead of going
+/// through [`KmsConfig::from_env`] use this, so the gate keeps one name, one
+/// default, and one place to look it up.
+pub fn allow_immediate_deletion_from_env() -> bool {
+    get_env_bool(ENV_KMS_ALLOW_IMMEDIATE_DELETION, false)
 }
 
 fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
@@ -1104,6 +1276,60 @@ mod tests {
 
         let local_config = config.local_config().expect("Should have local config");
         assert_eq!(local_config.key_dir, temp_dir.path());
+    }
+
+    #[test]
+    fn oversized_cache_ttl_is_clamped_not_rejected() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+
+        assert_eq!(config.cache_config.ttl, DEFAULT_CACHE_TTL);
+        assert_eq!(config.cache_config.effective_ttl(), DEFAULT_CACHE_TTL);
+
+        // An oversized lifetime must not keep the service from starting, and
+        // must not reach moka, whose builder panics beyond 1000 years.
+        let config = KmsConfig {
+            cache_config: CacheConfig {
+                ttl: Duration::from_secs(u64::MAX),
+                ..Default::default()
+            },
+            ..config
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cache_config.effective_ttl(), MAX_CACHE_TTL);
+
+        // In-range values pass through unchanged.
+        let config = KmsConfig {
+            cache_config: CacheConfig {
+                ttl: Duration::from_secs(600),
+                ..Default::default()
+            },
+            ..config
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cache_config.effective_ttl(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn zero_cache_ttl_is_rejected_only_while_caching_is_enabled() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = KmsConfig {
+            cache_config: CacheConfig {
+                ttl: Duration::ZERO,
+                ..Default::default()
+            },
+            ..KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults()
+        };
+
+        // A cache that expires every entry on insert is a misconfiguration, not
+        // a way to turn caching off.
+        assert!(config.validate().is_err());
+
+        let config = KmsConfig {
+            enable_cache: false,
+            ..config
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1540,6 +1766,43 @@ mod tests {
         );
     }
 
+    /// The AWS backend reads only non-credential settings from the
+    /// environment; access keys, profiles, and role assumption stay with the
+    /// aws-config provider chain.
+    #[test]
+    fn test_from_env_selects_aws_backend_without_credentials() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("aws")),
+                (ENV_KMS_AWS_REGION, Some("eu-central-1")),
+                (ENV_KMS_AWS_ENDPOINT_URL, None::<&str>),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                assert_eq!(config.backend, KmsBackend::Aws);
+                let aws = config.aws_kms_config().expect("aws backend config");
+                assert_eq!(aws.region.as_deref(), Some("eu-central-1"));
+                assert_eq!(aws.endpoint_url, None);
+            },
+        );
+    }
+
+    /// A plaintext endpoint override exposes every KMS request, including the
+    /// plaintext data keys, so it stays behind the explicit development opt-in.
+    #[test]
+    fn test_from_env_rejects_plaintext_aws_endpoint() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("aws")),
+                (ENV_KMS_AWS_REGION, Some("us-east-1")),
+                (ENV_KMS_AWS_ENDPOINT_URL, Some("http://localhost:4566")),
+            ],
+            || {
+                KmsConfig::from_env().expect_err("a plaintext AWS endpoint must be rejected by default");
+            },
+        );
+    }
+
     #[test]
     fn test_from_env_approle_requires_secret_id_or_file() {
         with_vars(
@@ -1667,6 +1930,38 @@ mod tests {
         assert_eq!(secret_id_file, None);
         assert_eq!(mount, DEFAULT_VAULT_APPROLE_MOUNT);
         assert_eq!(refresh_safety_window_secs, None);
+    }
+
+    /// The gate lives in server configuration only: it never rides along in a
+    /// serialized config, and a stored config that claims it must not be
+    /// believed. Otherwise one operator's one-time enablement would reach every
+    /// node that later reloads that config.
+    #[test]
+    fn immediate_deletion_gate_is_server_local_and_never_persisted() {
+        let persisted =
+            serde_json::to_value(KmsConfig::default().with_immediate_deletion_allowed()).expect("kms config should serialize");
+        assert!(
+            persisted.get("allow_immediate_deletion").is_none(),
+            "the gate must not be written into a persisted config: {persisted}"
+        );
+
+        let mut forged = persisted;
+        forged
+            .as_object_mut()
+            .expect("a persisted config must be a JSON object")
+            .insert("allow_immediate_deletion".to_string(), serde_json::json!(true));
+        let restored: KmsConfig = serde_json::from_value(forged).expect("an unknown gate field must not break loading");
+        assert!(!restored.allow_immediate_deletion, "a stored gate must fail closed");
+
+        with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, Some("true"))], || {
+            assert!(
+                allow_immediate_deletion_from_env(),
+                "the gate must be reachable from server configuration"
+            );
+        });
+        with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, None::<&str>)], || {
+            assert!(!allow_immediate_deletion_from_env());
+        });
     }
 
     #[test]

@@ -75,7 +75,7 @@ const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
-const SCANNER_LIST_PATH_RAW_TIMEOUT: Duration = Duration::from_secs(60);
+const SCANNER_LIST_PATH_RAW_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_ENTRY_PROGRESS_BATCH: u64 = 32;
 const SCANNER_ENTRY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
@@ -99,6 +99,21 @@ const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
 static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
 static SCANNER_INLINE_HEAL_METRICS_ONCE: Once = Once::new();
 static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
+
+#[cfg(test)]
+type ListPathRawTimeoutSnapshot = (bool, Option<Duration>, Option<Duration>);
+
+fn scanner_abandoned_child_list_options() -> ListPathRawOptions {
+    // A complete heal walk scales with bucket size and may legitimately take
+    // longer than a fixed wall-clock budget. Keep the total duration unbounded;
+    // Retain the scanner's per-read stall budget and keep cancellation controlled
+    // by the scanner cycle token.
+    ListPathRawOptions {
+        skip_walkdir_total_timeout: true,
+        walkdir_stall_timeout: Some(SCANNER_LIST_PATH_RAW_STALL_TIMEOUT),
+        ..Default::default()
+    }
+}
 
 pub fn data_usage_update_dir_cycles() -> u32 {
     rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES)
@@ -1281,6 +1296,8 @@ pub struct FolderScanner {
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
     pending_heals_changed: bool,
+    #[cfg(test)]
+    list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
 }
 
 impl FolderScanner {
@@ -2410,75 +2427,79 @@ impl FolderScanner {
                 let bucket_clone = bucket.clone();
                 let prefix_clone = prefix.clone();
                 let child_ctx_clone = child_ctx.clone();
+                #[cfg(test)]
+                let list_path_raw_options_observer = self.list_path_raw_options_observer.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = list_path_raw(
-                        child_ctx_clone.clone(),
-                        ListPathRawOptions {
-                            disks,
-                            bucket: bucket_clone.clone(),
-                            path: prefix_clone.clone(),
-                            recursive: true,
-                            report_not_found: true,
-                            min_disks: disks_quorum,
-                            walkdir_timeout: Some(SCANNER_LIST_PATH_RAW_TIMEOUT),
-                            walkdir_stall_timeout: Some(SCANNER_LIST_PATH_RAW_TIMEOUT),
-                            agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                                let entry_name = entry.name.clone();
-                                let agreed_tx = agreed_tx.clone();
-                                Box::pin(async move {
-                                    if let Err(e) = agreed_tx.send(entry_name).await {
-                                        error!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_FOLDER_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                                            entry = %entry.name,
-                                            state = "list_path_agreed_send_failed",
-                                            error = %e,
-                                            "Scanner list_path_raw agreed callback failed"
-                                        );
-                                    }
-                                })
-                            })),
-                            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                                let partial_tx = partial_tx.clone();
-                                Box::pin(async move {
-                                    if let Err(e) = partial_tx.send(entries).await {
-                                        error!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_FOLDER_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                                            state = "list_path_partial_send_failed",
-                                            error = %e,
-                                            "Scanner list_path_raw partial callback failed"
-                                        );
-                                    }
-                                })
-                            })),
-                            finished: Some(Box::new(move |errs: &[Option<DiskError>]| {
-                                let finished_tx = finished_tx.clone();
-                                let errs_clone = errs.to_vec();
-                                Box::pin(async move {
-                                    if let Err(e) = finished_tx.send(errs_clone).await {
-                                        error!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_FOLDER_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                                            state = "list_path_finished_send_failed",
-                                            error = %e,
-                                            "Scanner list_path_raw finished callback failed"
-                                        );
-                                    }
-                                })
-                            })),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    {
+                    let options = ListPathRawOptions {
+                        disks,
+                        bucket: bucket_clone.clone(),
+                        path: prefix_clone.clone(),
+                        recursive: true,
+                        report_not_found: true,
+                        min_disks: disks_quorum,
+                        agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                            let entry_name = entry.name.clone();
+                            let agreed_tx = agreed_tx.clone();
+                            Box::pin(async move {
+                                if let Err(e) = agreed_tx.send(entry_name).await {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        entry = %entry.name,
+                                        state = "list_path_agreed_send_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw agreed callback failed"
+                                    );
+                                }
+                            })
+                        })),
+                        partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                            let partial_tx = partial_tx.clone();
+                            Box::pin(async move {
+                                if let Err(e) = partial_tx.send(entries).await {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        state = "list_path_partial_send_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw partial callback failed"
+                                    );
+                                }
+                            })
+                        })),
+                        finished: Some(Box::new(move |errs: &[Option<DiskError>]| {
+                            let finished_tx = finished_tx.clone();
+                            let errs_clone = errs.to_vec();
+                            Box::pin(async move {
+                                if let Err(e) = finished_tx.send(errs_clone).await {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        state = "list_path_finished_send_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw finished callback failed"
+                                    );
+                                }
+                            })
+                        })),
+                        ..scanner_abandoned_child_list_options()
+                    };
+                    #[cfg(test)]
+                    if let Some(observer) = list_path_raw_options_observer {
+                        let _ = observer.send((
+                            options.skip_walkdir_total_timeout,
+                            options.walkdir_timeout,
+                            options.walkdir_stall_timeout,
+                        ));
+                    }
+                    if let Err(e) = list_path_raw(child_ctx_clone.clone(), options).await {
                         if is_missing_path_disk_error(&e) {
                             debug!(
                                 target: "rustfs::scanner::folder",
@@ -2820,6 +2841,8 @@ pub async fn scan_data_folder(
         skip_heal,
         local_disk,
         pending_heals_changed: false,
+        #[cfg(test)]
+        list_path_raw_options_observer: None,
     };
 
     // Check if context is cancelled
@@ -3026,6 +3049,7 @@ mod tests {
             skip_heal: Arc::new(AtomicBool::new(false)),
             local_disk: disk,
             pending_heals_changed: false,
+            list_path_raw_options_observer: None,
         };
 
         (scanner, temp_dir)
@@ -4210,6 +4234,8 @@ mod tests {
         scanner.heal_object_select = 1;
         scanner.disks = disks;
         scanner.disks_quorum = 2;
+        let (options_tx, mut options_rx) = mpsc::unbounded_channel();
+        scanner.list_path_raw_options_observer = Some(options_tx);
         scanner.old_cache.replace(
             &format!("{bucket}/{object}"),
             bucket,
@@ -4231,6 +4257,11 @@ mod tests {
             .expect("scan_folder should not hang after list_path_raw finishes")
             .expect("scan_folder should finish successfully");
 
+        let observed_options = tokio::time::timeout(Duration::from_secs(1), options_rx.recv())
+            .await
+            .expect("abandoned-child listing options should be observed promptly")
+            .expect("abandoned-child listing options channel should remain open");
+        assert_eq!(observed_options, (true, None, Some(SCANNER_LIST_PATH_RAW_STALL_TIMEOUT)));
         let root = scanner
             .new_cache
             .checked_flatten(bucket)

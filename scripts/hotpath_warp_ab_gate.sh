@@ -26,6 +26,7 @@ set -euo pipefail
 FAIL_PCT=10
 WARN_PCT=5
 ALLOW_REGRESSION="false"
+REQUIRE_TAIL_ERROR="false"
 MARKDOWN_OUT=""
 EXEMPTION_REASON="deliberate correctness tradeoff"
 declare -a COMPARE_CSVS=()
@@ -39,6 +40,8 @@ Usage: hotpath_warp_ab_gate.sh --compare-csv <file> [--compare-csv <file> ...] [
   --warn-pct <n>         Regression budget that warns (default 5).
   --allow-regression     Downgrade every FAIL to an exempted WARN (deliberate
                          correctness tradeoff); the gate then always exits 0.
+  --require-tail-error   Require the extended p90/p99/error-rate schema and
+                         reject missing tail/error or zero-success evidence.
   --exemption-reason <s> Reason recorded when --allow-regression is set.
   --markdown <file>      Also write the result table as Markdown to <file>.
   -h, --help             Show this help.
@@ -51,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --fail-pct) FAIL_PCT="$2"; shift 2 ;;
     --warn-pct) WARN_PCT="$2"; shift 2 ;;
     --allow-regression) ALLOW_REGRESSION="true"; shift ;;
+    --require-tail-error) REQUIRE_TAIL_ERROR="true"; shift ;;
     --exemption-reason) EXEMPTION_REASON="$2"; shift 2 ;;
     --markdown) MARKDOWN_OUT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -67,10 +71,24 @@ for csv in "${COMPARE_CSVS[@]}"; do
   [[ -f "$csv" ]] || { echo "error: compare CSV not found: $csv" >&2; exit 2; }
 done
 
+if [[ "$REQUIRE_TAIL_ERROR" == "true" ]]; then
+  strict_header='size,tool,concurrency,new_median_reqps,baseline_median_reqps,delta_reqps_pct,new_median_latency_ms,baseline_median_latency_ms,delta_latency_pct,new_median_throughput_bps,baseline_median_throughput_bps,delta_throughput_pct,new_median_p90_latency_ms,baseline_median_p90_latency_ms,delta_p90_latency_pct,new_median_p99_latency_ms,baseline_median_p99_latency_ms,delta_p99_latency_pct,new_ok_rounds,baseline_ok_rounds,new_failed_rounds,baseline_failed_rounds,new_error_rate_pct,baseline_error_rate_pct,delta_error_rate_pct'
+  for csv in "${COMPARE_CSVS[@]}"; do
+    [[ "$(head -n1 "$csv")" == "$strict_header" ]] || {
+      echo "error: strict mode requires the current tail/error compare schema: $csv" >&2
+      exit 2
+    }
+    awk 'NR == 2 { found = 1 } END { exit found ? 0 : 1 }' "$csv" || {
+      echo "error: strict mode requires at least one comparison row: $csv" >&2
+      exit 2
+    }
+  done
+fi
+
 # One awk pass over all CSVs. Emits TSV rows "verdict\tworkload\tmetric\tdelta"
 # on stdout and a final "OVERALL\t<verdict>" line. Verdict is PASS/WARN/FAIL.
 gate_output="$(
-  awk -v fail_pct="$FAIL_PCT" -v warn_pct="$WARN_PCT" '
+  awk -v fail_pct="$FAIL_PCT" -v warn_pct="$WARN_PCT" -v strict="$REQUIRE_TAIL_ERROR" '
     function classify(delta, higher_is_better,   regress) {
       if (delta == "" || delta == "N/A") return "SKIP"
       # Signed regression magnitude: positive means "worse than baseline".
@@ -85,15 +103,57 @@ gate_output="$(
       rank = (v == "FAIL") ? 3 : (v == "WARN") ? 2 : 1
       if (rank > worst) worst = rank
     }
+    function contract_failure(workload, metric) {
+      print "FAIL\t" workload "\t" metric "\tinvalid evidence"
+      if (3 > worst) worst = 3
+    }
+    function decimal(value) {
+      return value ~ /^-?[0-9]+([.][0-9]+)?$/
+    }
+    function count(value) {
+      return value ~ /^[0-9]+$/
+    }
+    function error_rate(value) {
+      return decimal(value) && value + 0 >= 0 && value + 0 <= 100
+    }
+    function error_delta(value) {
+      return decimal(value) && value + 0 >= -100 && value + 0 <= 100
+    }
+    function abs(value) {
+      return value < 0 ? -value : value
+    }
     BEGIN { worst = 1 }
     FNR == 1 { next }                      # skip each file header
     {
       n = split($0, f, ",")
-      if (n < 12) next
+      if (n < 12) {
+        if (strict == "true") contract_failure(FILENAME, "compare-schema")
+        next
+      }
       workload = f[1] "/" f[2] "@" f[3]    # size/tool@concurrency
       emit(classify(f[6],  1), workload, "reqps",      f[6])
       emit(classify(f[9],  0), workload, "latency",    f[9])
       emit(classify(f[12], 1), workload, "throughput", f[12])
+      if (strict == "true") {
+        valid = n == 25
+        for (i = 4; i <= 18; i++) {
+          if (!decimal(f[i])) valid = 0
+        }
+        for (i = 19; i <= 22; i++) {
+          if (!count(f[i])) valid = 0
+        }
+        if (f[19] + 0 == 0 || f[20] + 0 == 0 || !error_rate(f[23]) || !error_rate(f[24]) || !error_delta(f[25])) valid = 0
+        new_error_rate = f[21] / (f[19] + f[21]) * 100
+        baseline_error_rate = f[22] / (f[20] + f[22]) * 100
+        if (abs(f[23] - new_error_rate) > 0.005 || abs(f[24] - baseline_error_rate) > 0.005 || abs(f[25] - (new_error_rate - baseline_error_rate)) > 0.005) valid = 0
+        if (!valid) {
+          contract_failure(workload, "tail-error-evidence")
+          next
+        }
+        emit(classify(f[15], 0), workload, "p90-latency", f[15])
+        emit(classify(f[18], 0), workload, "p99-latency", f[18])
+        emit(classify(f[25], 0), workload, "error-rate", f[25])
+      }
     }
     END {
       print "OVERALL\t" (worst == 3 ? "FAIL" : worst == 2 ? "WARN" : "PASS")

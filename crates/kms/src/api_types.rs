@@ -15,9 +15,9 @@
 //! API types for KMS dynamic configuration
 
 use crate::config::{
-    BackendConfig, CacheConfig, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend,
-    KmsConfig, LocalConfig, StaticConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, redacted_secret,
-    redacted_secret_option,
+    BackendConfig, CacheConfig, DEFAULT_CACHE_TTL, DEFAULT_MAX_CACHED_KEYS, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX,
+    DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend, KmsConfig, LocalConfig, StaticConfig, TlsConfig, VaultAuthMethod,
+    VaultConfig, VaultTransitConfig, allow_immediate_deletion_from_env, redacted_secret, redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
@@ -418,14 +418,26 @@ pub enum BackendSummary {
         /// Configured key identifier
         key_id: String,
     },
+    /// AWS KMS backend summary
+    Aws {
+        /// Configured region, when pinned instead of resolved by the AWS chain
+        region: Option<String>,
+        /// Endpoint override, when set for an emulator or private endpoint
+        endpoint_url: Option<String>,
+    },
 }
 
 impl From<&KmsConfig> for KmsConfigSummary {
     fn from(config: &KmsConfig) -> Self {
+        // Report the lifetime the cache was built with, not the raw configured
+        // value: an oversized `ttl` is clamped rather than rejected, and this
+        // response is what operators check the cache against.
+        let cache_ttl_seconds = config.cache_config.effective_ttl().as_secs();
+
         let cache_summary = if config.enable_cache {
             Some(CacheSummary {
                 max_keys: config.cache_config.max_keys,
-                ttl_seconds: config.cache_config.ttl.as_secs(),
+                ttl_seconds: cache_ttl_seconds,
                 enable_metrics: config.cache_config.enable_metrics,
             })
         } else {
@@ -467,6 +479,10 @@ impl From<&KmsConfig> for KmsConfigSummary {
             BackendConfig::Static(static_config) => BackendSummary::Static {
                 key_id: static_config.key_id.clone(),
             },
+            BackendConfig::Aws(aws_config) => BackendSummary::Aws {
+                region: aws_config.region.clone(),
+                endpoint_url: aws_config.endpoint_url.clone(),
+            },
         };
 
         Self {
@@ -476,7 +492,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
             retry_attempts: config.retry_attempts,
             enable_cache: config.enable_cache,
             max_cached_keys: config.cache_config.max_keys,
-            cache_ttl_seconds: config.cache_config.ttl.as_secs(),
+            cache_ttl_seconds,
             cache_summary,
             backend_summary,
         }
@@ -495,13 +511,17 @@ impl ConfigureLocalKmsRequest {
                 file_permissions: self.file_permissions,
             }),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -532,13 +552,17 @@ impl ConfigureVaultKmsRequest {
                 },
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -569,13 +593,17 @@ impl ConfigureVaultTransitKmsRequest {
                 },
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -592,13 +620,17 @@ impl ConfigureStaticKmsRequest {
                 secret_key: self.secret_key.clone(),
             }),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -847,6 +879,7 @@ mod tests {
                 tls: None,
             })),
             allow_insecure_dev_defaults: true,
+            allow_immediate_deletion: false,
             timeout: Duration::from_secs(30),
             retry_attempts: 3,
             enable_cache: true,
@@ -858,8 +891,8 @@ mod tests {
         assert_eq!(summary.backend_type, KmsBackend::VaultTransit);
         assert_eq!(summary.timeout_seconds, 30);
         assert_eq!(summary.retry_attempts, 3);
-        assert_eq!(summary.max_cached_keys, 1000);
-        assert_eq!(summary.cache_ttl_seconds, 3600);
+        assert_eq!(summary.max_cached_keys, DEFAULT_MAX_CACHED_KEYS);
+        assert_eq!(summary.cache_ttl_seconds, DEFAULT_CACHE_TTL.as_secs());
 
         match summary.backend_summary {
             BackendSummary::VaultTransit {

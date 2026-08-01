@@ -32,7 +32,6 @@ workspace = true
 default = []
 hotpath = [
     "hotpath/hotpath",
-    "hotpath/reqwest-0-13",
     "rustfs-config/hotpath",
     "rustfs-credentials/hotpath",
     "rustfs-crypto/hotpath",
@@ -80,6 +79,7 @@ pollster.workspace = true
 proptest = "1"
 test-case.workspace = true
 temp-env = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [lib]
 doctest = false

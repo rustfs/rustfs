@@ -337,6 +337,15 @@ pub struct NotificationPeerErr {
     pub err: Option<Error>,
 }
 
+/// One peer's answer to a KMS configuration fingerprint probe.
+pub struct PeerKmsConfigFingerprint {
+    pub host: String,
+    /// `None` when the peer has no KMS configuration of its own, or could not
+    /// be asked at all, in which case `err` carries the reason.
+    pub fingerprint: Option<String>,
+    pub err: Option<Error>,
+}
+
 fn notification_peer_result<T>(host: String, result: Result<T>) -> NotificationPeerErr {
     NotificationPeerErr { host, err: result.err() }
 }
@@ -516,6 +525,47 @@ impl NotificationSys {
 
     pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
         self.signal_dynamic_config(sub_sys, false).await
+    }
+
+    /// Ask every peer to re-read the cluster-persisted KMS configuration.
+    ///
+    /// Best-effort by contract: the caller has already switched locally, so a
+    /// peer that fails is reported rather than rolled back. Peers built before
+    /// the KMS subsystem existed reject the signal with an explicit error.
+    pub async fn reload_kms_config(&self) -> Vec<NotificationPeerErr> {
+        self.reload_dynamic_config(crate::cluster::rpc::KMS_SIGNAL_SUBSYSTEM).await
+    }
+
+    /// Collect the KMS configuration fingerprint each peer is running.
+    ///
+    /// A peer whose build predates the KMS subsystem rejects the probe, so it
+    /// is reported as an error rather than silently agreeing with this node.
+    pub async fn kms_config_fingerprints(&self) -> Vec<PeerKmsConfigFingerprint> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            futures.push(async move {
+                let Some(client) = client else {
+                    return PeerKmsConfigFingerprint {
+                        host: String::new(),
+                        fingerprint: None,
+                        err: Some(Error::other("peer is not reachable")),
+                    };
+                };
+                match client.kms_config_fingerprint().await {
+                    Ok(fingerprint) => PeerKmsConfigFingerprint {
+                        host: client.host.to_string(),
+                        fingerprint,
+                        err: None,
+                    },
+                    Err(e) => PeerKmsConfigFingerprint {
+                        host: client.host.to_string(),
+                        fingerprint: None,
+                        err: Some(e),
+                    },
+                }
+            });
+        }
+        join_all(futures).await
     }
 
     pub async fn refresh_config_snapshot(&self) -> Vec<NotificationPeerErr> {

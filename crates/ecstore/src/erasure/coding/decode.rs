@@ -691,7 +691,7 @@ impl<R> ParallelReader<R>
 where
     R: crate::erasure::coding::ShardSource,
 {
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "ParallelReader")]
     pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
         // On the reconstruction-verifying GET path, read every live shard reader
         // in lockstep so all readers advance one block per stripe and stay
@@ -1505,7 +1505,7 @@ where
 }
 
 impl Erasure {
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub async fn decode<W, R>(
         &self,
         writer: &mut W,
@@ -1645,15 +1645,28 @@ impl Erasure {
             }
             Err(e) => {
                 record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
-                error!(
-                    block_offset,
-                    block_length,
-                    bytes_written = *written,
-                    stage = GET_STAGE_EMIT,
-                    reason = classify_io_error(&e).as_str(),
-                    error = ?e,
-                    "Erasure decode failed to emit reconstructed data"
-                );
+                let reason = classify_io_error(&e);
+                if reason == GetObjectFailureReason::DownstreamClosed {
+                    debug!(
+                        block_offset,
+                        block_length,
+                        bytes_written = *written,
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Erasure decode stopped after downstream closed"
+                    );
+                } else {
+                    error!(
+                        block_offset,
+                        block_length,
+                        bytes_written = *written,
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Erasure decode failed to emit reconstructed data"
+                    );
+                }
                 *ret_err = Some(e);
                 return StripeFlow::Stop;
             }
@@ -1945,7 +1958,7 @@ mod tests {
     use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use std::task::{Context, Poll};
@@ -2120,6 +2133,59 @@ mod tests {
         }
     }
 
+    struct DownstreamClosedWriter;
+
+    impl AsyncWrite for DownstreamClosedWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(crate::diagnostics::get::mark_get_object_downstream_closed(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "injected downstream close",
+            ))))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured logs mutex should not be poisoned").clone())
+                .expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
     #[test]
     fn parallel_reader_constructor_variants_preserve_read_cost_and_verification_flags() {
         let erasure = Erasure::new(2, 1, 64);
@@ -2213,6 +2279,47 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::BrokenPipe);
         assert_eq!(err.to_string(), "injected emit failure");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn erasure_decode_logs_reconstructed_downstream_close_at_debug() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let erasure = Erasure::new(2, 1, 64);
+        let data: Vec<u8> = (0..64).collect();
+        let shard_size = erasure.shard_size();
+        let encoded = erasure.encode_data(&data).expect("test data should encode");
+        let readers = vec![
+            None,
+            Some(BitrotReader::new(
+                Cursor::new(encoded[1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                Cursor::new(encoded[2].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+        ];
+
+        let mut writer = DownstreamClosedWriter;
+        let (written, err) = erasure.decode(&mut writer, readers, 0, data.len(), data.len()).await;
+
+        assert_eq!(written, 0);
+        assert_eq!(err.expect("downstream close must still terminate the GET").kind(), ErrorKind::BrokenPipe);
+        let captured = logs.contents();
+        assert!(captured.contains("Erasure decode stopped after downstream closed"));
+        assert!(!captured.contains("Erasure decode failed to emit reconstructed data"));
     }
 
     #[tokio::test]

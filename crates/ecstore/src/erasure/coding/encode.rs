@@ -28,8 +28,11 @@ use std::vec;
 use tokio::io::AsyncRead;
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::mpsc;
+use tokio::task::{JoinError, JoinHandle};
 use tracing::error;
 
+/// Queue-capacity input for encoded blocks awaiting shard writers; it is not a
+/// per-PUT or process-RSS memory limit.
 const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
 const ENV_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: &str = "RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS";
 const ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: &str = "RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST";
@@ -87,6 +90,33 @@ fn use_bytesmut_ingest() -> bool {
         rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
     })
 }
+
+/// Keeps the encoder producer scoped to its parent future. Tokio detaches a
+/// task when its `JoinHandle` is dropped, so the producer must be aborted when
+/// an upload is cancelled before the encode pipeline finishes.
+struct AbortOnDropTask<T>(JoinHandle<T>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self(task)
+    }
+
+    async fn abort_and_wait(&mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+
+    async fn join(&mut self) -> Result<T, JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Read up to `limit` bytes into `buf`'s uninitialized spare capacity, appending after its
 /// current length, and distinguish a clean EOF from a short read.
 ///
@@ -133,20 +163,63 @@ fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }
 
-async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
-    while let Some(block) = rx.recv().await {
-        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+/// Owns an encoded queue entry's gauge contribution until its consumer takes it.
+struct QueuedInflightBytes {
+    bytes: usize,
+}
+
+impl QueuedInflightBytes {
+    fn new(bytes: usize) -> Self {
+        rustfs_io_metrics::add_ec_encode_inflight_bytes(bytes);
+        Self { bytes }
     }
+
+    fn settle(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes != 0 {
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(bytes);
+        }
+    }
+}
+
+impl Drop for QueuedInflightBytes {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+/// Couples an encoded block with its queue gauge contribution. Keeping the
+/// guard in the queue entry also covers Tokio sends that complete through a
+/// permit after the receiver has closed.
+struct InflightEntry<T> {
+    entry: T,
+    accounting: QueuedInflightBytes,
+}
+
+impl<T> InflightEntry<T> {
+    fn new(entry: T, bytes: usize) -> Self {
+        Self {
+            entry,
+            accounting: QueuedInflightBytes::new(bytes),
+        }
+    }
+
+    fn into_inner(mut self) -> T {
+        self.accounting.settle();
+        self.entry
+    }
+}
+
+async fn send_queued<T>(
+    sender: &mpsc::Sender<InflightEntry<T>>,
+    entry: T,
+    bytes: usize,
+) -> Result<(), mpsc::error::SendError<InflightEntry<T>>> {
+    sender.send(InflightEntry::new(entry, bytes)).await
 }
 
 fn queued_batch_bytes(batch: &[Vec<Bytes>]) -> usize {
     batch.iter().map(|block| queued_block_bytes(block)).sum()
-}
-
-async fn drain_queued_batched_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Vec<Bytes>>>) {
-    while let Some(batch) = rx.recv().await {
-        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_batch_bytes(&batch));
-    }
 }
 
 fn dominant_error_summary_label(summary: &WriteQuorumFailureSummary) -> &'static str {
@@ -504,7 +577,7 @@ impl Erasure {
         Ok((reader, total))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub async fn encode<R>(
         self: Arc<Self>,
         reader: R,
@@ -540,13 +613,14 @@ impl Erasure {
             ));
         }
 
-        // Bound queued encoded blocks by memory budget to avoid per-request spikes.
+        // Bound queued encoded blocks by a queue budget; this does not bound
+        // reader, encoder, writer, allocator, or process-RSS memory.
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = erasure_encode_max_inflight_bytes();
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
+        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<Bytes>>>(inflight_blocks);
 
-        let task = tokio::spawn(async move {
+        let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
             let mut total = 0;
             if use_bytesmut_ingest {
@@ -567,10 +641,9 @@ impl Erasure {
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
                             buf = BytesMut::with_capacity(ingest_capacity);
                             let queued_bytes = queued_block_bytes(&res);
-                            rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
+                            let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
-                            if let Err(err) = tx.send(res).await {
-                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+                            if let Err(err) = send_queued(&tx, res, queued_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
@@ -598,10 +671,9 @@ impl Erasure {
                             let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
                             buf = returned_buf;
                             let queued_bytes = queued_block_bytes(&res);
-                            rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
+                            let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
-                            if let Err(err) = tx.send(res).await {
-                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+                            if let Err(err) = send_queued(&tx, res, queued_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
@@ -626,7 +698,7 @@ impl Erasure {
             }
 
             Ok((reader, total))
-        });
+        }));
 
         let mut writers = MultiWriter::new(writers, quorum);
 
@@ -638,11 +710,11 @@ impl Erasure {
                 break;
             };
             record_internal_stage_if_enabled("erasure_encode_recv_wait", recv_wait_stage_start);
+            let block = block.into_inner();
             if block.is_empty() {
                 break;
             }
-            let queued_bytes = queued_block_bytes(&block);
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+            let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(queued_block_bytes(&block));
             let write_stage_start = stage_timer_if_enabled();
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
@@ -652,9 +724,8 @@ impl Erasure {
         }
 
         if let Some(err) = write_err {
-            task.abort();
-            let _ = task.await;
-            drain_queued_inflight_bytes(&mut rx).await;
+            task.abort_and_wait().await;
+            drop(rx);
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
@@ -663,14 +734,14 @@ impl Erasure {
             return Err(err);
         }
 
-        let (reader, total) = task.await??;
+        let (reader, total) = task.join().await??;
         let shutdown_stage_start = stage_timer_if_enabled();
         writers.shutdown().await?;
         record_internal_stage_if_enabled("erasure_encode_shutdown", shutdown_stage_start);
         Ok((reader, total))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub async fn encode_batched<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -692,14 +763,15 @@ impl Erasure {
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
         let batch_blocks = encode_batch_block_count().min(inflight_blocks);
         let channel_capacity = inflight_blocks.div_ceil(batch_blocks).max(1);
-        let (tx, mut rx) = mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity);
+        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<Vec<Bytes>>>>(channel_capacity);
 
-        let task = tokio::spawn(async move {
+        let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
             let mut total = 0;
             let mut buf = vec![0u8; block_size];
             let mut pending_batch = Vec::with_capacity(batch_blocks);
             let mut pending_batch_bytes = 0usize;
+            let mut pending_batch_stage = None;
             loop {
                 match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
                     Ok(Some(n)) => {
@@ -711,15 +783,16 @@ impl Erasure {
                         let queued_bytes = queued_block_bytes(&res);
                         pending_batch_bytes = pending_batch_bytes.saturating_add(queued_bytes);
                         pending_batch.push(res);
+                        drop(pending_batch_stage.take());
+                        pending_batch_stage = Some(rustfs_io_metrics::track_ec_encode_producer_bytes(pending_batch_bytes));
 
                         if pending_batch.len() >= batch_blocks {
-                            rustfs_io_metrics::add_ec_encode_inflight_bytes(pending_batch_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
-                            if let Err(err) = tx.send(pending_batch).await {
-                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(pending_batch_bytes);
+                            if let Err(err) = send_queued(&tx, pending_batch, pending_batch_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_batched_send_wait", send_wait_stage_start);
+                            drop(pending_batch_stage.take());
                             pending_batch = Vec::with_capacity(batch_blocks);
                             pending_batch_bytes = 0;
                         }
@@ -742,17 +815,16 @@ impl Erasure {
             }
 
             if !pending_batch.is_empty() {
-                rustfs_io_metrics::add_ec_encode_inflight_bytes(pending_batch_bytes);
                 let send_wait_stage_start = stage_timer_if_enabled();
-                if let Err(err) = tx.send(pending_batch).await {
-                    rustfs_io_metrics::remove_ec_encode_inflight_bytes(pending_batch_bytes);
+                if let Err(err) = send_queued(&tx, pending_batch, pending_batch_bytes).await {
                     return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                 }
                 record_internal_stage_if_enabled("erasure_encode_batched_send_wait", send_wait_stage_start);
+                drop(pending_batch_stage);
             }
 
             Ok((reader, total))
-        });
+        }));
 
         let mut writers = MultiWriter::new(writers, quorum);
         let mut write_err = None;
@@ -763,7 +835,8 @@ impl Erasure {
                 break;
             };
             record_internal_stage_if_enabled("erasure_encode_batched_recv_wait", recv_wait_stage_start);
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_batch_bytes(&batch));
+            let batch = batch.into_inner();
+            let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(queued_batch_bytes(&batch));
             let write_stage_start = stage_timer_if_enabled();
             for block in batch {
                 if let Err(err) = writers.write(block).await {
@@ -778,9 +851,8 @@ impl Erasure {
         }
 
         if let Some(err) = write_err {
-            task.abort();
-            let _ = task.await;
-            drain_queued_batched_inflight_bytes(&mut rx).await;
+            task.abort_and_wait().await;
+            drop(rx);
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
@@ -789,7 +861,7 @@ impl Erasure {
             return Err(err);
         }
 
-        let (reader, total) = task.await??;
+        let (reader, total) = task.join().await??;
         let shutdown_stage_start = stage_timer_if_enabled();
         writers.shutdown().await?;
         record_internal_stage_if_enabled("erasure_encode_batched_shutdown", shutdown_stage_start);
@@ -798,7 +870,7 @@ impl Erasure {
 
     /// Fast path for small inline objects: skip tokio::spawn + mpsc channel.
     /// Reads all data, encodes directly, writes shards sequentially.
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub async fn encode_inline_small<R>(
         self: Arc<Self>,
         reader: R,
@@ -813,7 +885,7 @@ impl Erasure {
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
     /// pipeline in `encode()` while keeping the same writer/quorum/shutdown semantics.
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub async fn encode_single_block_non_inline<R>(
         self: Arc<Self>,
         reader: R,
@@ -839,7 +911,104 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::sync::oneshot;
+
+    struct PendingReader {
+        entered: Option<oneshot::Sender<()>>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl PendingReader {
+        fn new() -> (Self, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (dropped_tx, dropped_rx) = oneshot::channel();
+            (
+                Self {
+                    entered: Some(entered_tx),
+                    dropped: Some(dropped_tx),
+                },
+                entered_rx,
+                dropped_rx,
+            )
+        }
+    }
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingReader {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    struct BlocksThenPendingReader {
+        blocks_remaining: usize,
+        block: Vec<u8>,
+        blocked: Option<oneshot::Sender<()>>,
+        dropped: Option<oneshot::Sender<()>>,
+        final_block: Option<oneshot::Sender<()>>,
+    }
+
+    impl BlocksThenPendingReader {
+        fn new(
+            blocks_remaining: usize,
+            block_size: usize,
+        ) -> (Self, oneshot::Receiver<()>, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+            let (blocked_tx, blocked_rx) = oneshot::channel();
+            let (dropped_tx, dropped_rx) = oneshot::channel();
+            let (final_block_tx, final_block_rx) = oneshot::channel();
+            (
+                Self {
+                    blocks_remaining,
+                    block: vec![0x5a; block_size],
+                    blocked: Some(blocked_tx),
+                    dropped: Some(dropped_tx),
+                    final_block: Some(final_block_tx),
+                },
+                blocked_rx,
+                dropped_rx,
+                final_block_rx,
+            )
+        }
+    }
+
+    impl AsyncRead for BlocksThenPendingReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.blocks_remaining == 0 {
+                if let Some(blocked) = self.blocked.take() {
+                    let _ = blocked.send(());
+                }
+                return Poll::Pending;
+            }
+
+            if self.blocks_remaining == 1
+                && let Some(final_block) = self.final_block.take()
+            {
+                let _ = final_block.send(());
+            }
+            self.blocks_remaining -= 1;
+            buf.put_slice(&self.block);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for BlocksThenPendingReader {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
 
     fn erasure_with_zero_block_size() -> Erasure {
         let mut erasure = Erasure::default();
@@ -886,6 +1055,54 @@ mod tests {
     impl AsyncWrite for FailingWriteWriter {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FailAfterReaderBlocksWriter {
+        reader_blocked: oneshot::Receiver<()>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncWrite for FailAfterReaderBlocksWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            match Pin::new(&mut self.reader_blocked).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => {
+                    self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Poll::Ready(Err(std::io::Error::other("injected write failure after producer blocks")))
+                }
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct StallOnWriteWithSignal {
+        entered: Option<oneshot::Sender<()>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncWrite for StallOnWriteWithSignal {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            Poll::Pending
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -1044,6 +1261,262 @@ mod tests {
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
         BitrotWriterWrapper::new(CustomWriter::new_tokio_writer(writer), shard_size, HashAlgorithm::None)
+    }
+
+    #[derive(Clone, Copy)]
+    enum EncodePipeline {
+        Vec,
+        BytesMut,
+        Batched,
+    }
+
+    async fn aborting_encode_drops_blocked_producer(pipeline: EncodePipeline) {
+        const BLOCK_SIZE: usize = 16;
+
+        let gauge_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), BLOCK_SIZE))];
+        let (reader, entered, dropped) = PendingReader::new();
+        let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
+
+        let encode = match pipeline {
+            EncodePipeline::Vec => {
+                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await })
+            }
+            EncodePipeline::BytesMut => {
+                tokio::spawn(async move { erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await })
+            }
+            EncodePipeline::Batched => tokio::spawn(async move { erasure.encode_batched(reader, &mut writers, 1).await }),
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .expect("producer should enter the blocked reader before cancellation")
+            .expect("blocked reader should signal entry");
+        encode.abort();
+        assert!(matches!(encode.await, Err(err) if err.is_cancelled()), "encode task should be cancelled");
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("cancelling encode should drop the producer reader")
+            .expect("blocked reader should signal producer drop");
+        assert!(
+            committed.lock().expect("committed buffer should be lockable").is_empty(),
+            "cancelling before the first encoded block must not make data visible"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            gauge_baseline,
+            "cancelling the encode pipeline must preserve the inflight queue gauge"
+        );
+    }
+
+    async fn writer_error_aborts_blocked_producer(pipeline: EncodePipeline) {
+        let gauge_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let producer_baseline = rustfs_io_metrics::current_ec_encode_producer_bytes();
+        let writer_baseline = rustfs_io_metrics::current_ec_encode_writer_bytes();
+        let producer_peak_before = rustfs_io_metrics::current_ec_encode_producer_bytes_peak();
+        let writer_peak_before = rustfs_io_metrics::current_ec_encode_writer_bytes_peak();
+        let block_size = match pipeline {
+            EncodePipeline::Batched => usize::try_from(producer_peak_before.max(writer_peak_before).saturating_add(1))
+                .expect("stage peak fits the test address space"),
+            EncodePipeline::Vec | EncodePipeline::BytesMut => 16,
+        };
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+        let erasure = Arc::new(Erasure::new(1, 0, block_size));
+        let batch_blocks = encode_batch_block_count().min(encode_channel_capacity(
+            erasure.shard_size().saturating_mul(erasure.total_shard_count()),
+            erasure_encode_max_inflight_bytes(),
+        ));
+        let blocks_before_pending = match pipeline {
+            EncodePipeline::Batched => batch_blocks,
+            EncodePipeline::Vec | EncodePipeline::BytesMut => 1,
+        };
+        let (reader, reader_blocked, reader_dropped, _final_block) =
+            BlocksThenPendingReader::new(blocks_before_pending, block_size);
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writers = vec![Some(bitrot_writer(
+            FailAfterReaderBlocksWriter {
+                reader_blocked,
+                writes: writes.clone(),
+            },
+            block_size,
+        ))];
+
+        let result = match pipeline {
+            EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await,
+            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await,
+            EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, 1).await,
+        };
+
+        let err = match result {
+            Ok(_) => panic!("writer quorum failure should fail the encode pipeline"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Failed to write data"));
+        tokio::time::timeout(Duration::from_secs(1), reader_dropped)
+            .await
+            .expect("writer failure should abort the blocked producer")
+            .expect("blocked producer should signal reader drop");
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "writer failure must stop the pipeline before any additional shard write"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            gauge_baseline,
+            "writer failure must settle all queued and pending encoded bytes"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes(),
+            producer_baseline,
+            "writer failure must settle producer stage bytes for every ingest pipeline"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes(),
+            writer_baseline,
+            "writer failure must settle writer stage bytes for every ingest pipeline"
+        );
+        if matches!(pipeline, EncodePipeline::Batched) {
+            let expected_batch_bytes = u64::try_from(block_size)
+                .expect("block size fits the stage gauge")
+                .checked_mul(u64::try_from(batch_blocks).expect("batch block count fits the stage gauge"))
+                .expect("test batch payload fits the stage gauge");
+            assert!(
+                rustfs_io_metrics::current_ec_encode_producer_bytes_peak() >= producer_peak_before.max(expected_batch_bytes),
+                "batched producer must expose its full pending batch before writer failure"
+            );
+            assert!(
+                rustfs_io_metrics::current_ec_encode_writer_bytes_peak() >= writer_peak_before.max(expected_batch_bytes),
+                "batched writer must expose its full batch before writer failure"
+            );
+        }
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+    }
+
+    async fn aborting_full_queue_settles_pending_send() {
+        const BLOCK_SIZE: usize = 16;
+
+        let gauge_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let producer_baseline = rustfs_io_metrics::current_ec_encode_producer_bytes();
+        let writer_baseline = rustfs_io_metrics::current_ec_encode_writer_bytes();
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+        let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
+        let inflight_blocks = encode_channel_capacity(
+            erasure.shard_size().saturating_mul(erasure.total_shard_count()),
+            erasure_encode_max_inflight_bytes(),
+        );
+        let (reader, _reader_blocked, reader_dropped, final_block) =
+            BlocksThenPendingReader::new(inflight_blocks + 2, BLOCK_SIZE);
+        let (writer_entered_tx, writer_entered) = oneshot::channel();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writers = vec![Some(bitrot_writer(
+            StallOnWriteWithSignal {
+                entered: Some(writer_entered_tx),
+                writes: writes.clone(),
+            },
+            BLOCK_SIZE,
+        ))];
+        let erasure_for_task = erasure.clone();
+        let encode = tokio::spawn(async move { erasure_for_task.encode_with_ingest_mode(reader, &mut writers, 1, false).await });
+
+        tokio::time::timeout(Duration::from_secs(1), writer_entered)
+            .await
+            .expect("consumer should start the first writer call")
+            .expect("stalling writer should signal entry");
+        tokio::time::timeout(Duration::from_secs(1), final_block)
+            .await
+            .expect("producer should supply the block whose send fills the queue")
+            .expect("reader should signal final block");
+
+        let expected_queued_bytes =
+            u64::try_from((inflight_blocks + 1) * BLOCK_SIZE).expect("queued byte count should fit the gauge");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rustfs_io_metrics::current_ec_encode_inflight_bytes() < gauge_baseline + expected_queued_bytes {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer should account for the pending send after the queue fills");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rustfs_io_metrics::current_ec_encode_producer_bytes() == producer_baseline
+                || rustfs_io_metrics::current_ec_encode_writer_bytes() == writer_baseline
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full queue must retain producer and writer stage ownership before cancellation");
+
+        encode.abort();
+        assert!(matches!(encode.await, Err(err) if err.is_cancelled()), "encode task should be cancelled");
+        tokio::time::timeout(Duration::from_secs(1), reader_dropped)
+            .await
+            .expect("cancelling a full queue should abort its producer")
+            .expect("full-queue producer should signal reader drop");
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation must not resume the stalled writer"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            gauge_baseline,
+            "cancelling a full queue must settle queued and pending bytes"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes(),
+            producer_baseline,
+            "cancelling a full queue must settle the pending producer stage"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes(),
+            writer_baseline,
+            "cancelling a full queue must settle the stalled writer stage"
+        );
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_vec_encode_drops_blocked_producer() {
+        aborting_encode_drops_blocked_producer(EncodePipeline::Vec).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_bytesmut_encode_drops_blocked_producer() {
+        aborting_encode_drops_blocked_producer(EncodePipeline::BytesMut).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_batched_encode_drops_blocked_producer() {
+        aborting_encode_drops_blocked_producer(EncodePipeline::Batched).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn vec_writer_error_aborts_blocked_producer() {
+        writer_error_aborts_blocked_producer(EncodePipeline::Vec).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bytesmut_writer_error_aborts_blocked_producer() {
+        writer_error_aborts_blocked_producer(EncodePipeline::BytesMut).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn batched_writer_error_aborts_blocked_producer() {
+        writer_error_aborts_blocked_producer(EncodePipeline::Batched).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_full_queue_settles_pending_send() {
+        aborting_full_queue_settles_pending_send().await;
     }
 
     #[tokio::test]
@@ -1329,25 +1802,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_queued_inflight_bytes_consumes_pending_blocks() {
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(vec![Bytes::from_static(b"queued")]).await.unwrap();
-        drop(tx);
+    #[serial_test::serial]
+    async fn queued_inflight_bytes_are_settled_on_all_queue_exit_paths() {
+        let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let (tx, rx) = mpsc::channel(1);
+        let queued = vec![Bytes::from_static(b"queued")];
+        let queued_bytes = queued_block_bytes(&queued);
 
-        drain_queued_inflight_bytes(&mut rx).await;
+        send_queued(&tx, queued, queued_bytes)
+            .await
+            .expect("first queue entry should fit");
 
-        assert!(rx.recv().await.is_none());
+        let blocked = vec![Bytes::from_static(b"blocked")];
+        let blocked_bytes = queued_block_bytes(&blocked);
+        {
+            let pending_send = send_queued(&tx, blocked, blocked_bytes);
+            tokio::pin!(pending_send);
+            assert!(
+                futures::poll!(pending_send.as_mut()).is_pending(),
+                "full queue must suspend producer send"
+            );
+        }
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline + u64::try_from(queued_bytes).expect("queue bytes fit the gauge"),
+            "dropping a pending producer send must compensate its bytes"
+        );
+
+        drop(rx);
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "dropping the receiver must settle every buffered entry"
+        );
+
+        let rejected = vec![Bytes::from_static(b"rejected")];
+        let rejected_bytes = queued_block_bytes(&rejected);
+        assert!(
+            send_queued(&tx, rejected, rejected_bytes).await.is_err(),
+            "closed receiver must reject a new send"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "failed sends must compensate their bytes"
+        );
     }
 
     #[tokio::test]
-    async fn drain_queued_batched_inflight_bytes_consumes_pending_batches() {
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(vec![vec![Bytes::from_static(b"queued")]]).await.unwrap();
-        drop(tx);
+    #[serial_test::serial]
+    async fn queued_batch_entry_settles_bytes_before_handoff() {
+        let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let (tx, rx) = mpsc::channel(2);
+        let mut rx = rx;
+        let batch = vec![vec![Bytes::from_static(b"queued")], vec![Bytes::from_static(b"batch")]];
+        let batch_bytes = queued_batch_bytes(&batch);
 
-        drain_queued_batched_inflight_bytes(&mut rx).await;
+        send_queued(&tx, batch, batch_bytes).await.expect("batch should be queued");
+        let batch = rx.recv().await.expect("queued batch should be received").into_inner();
+        assert_eq!(batch_bytes, queued_batch_bytes(&batch));
 
-        assert!(rx.recv().await.is_none());
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "receiving a batch must settle all contained block bytes before shard writes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_entry_settles_when_a_closed_receiver_accepts_an_outstanding_permit() {
+        let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let (tx, mut rx) = mpsc::channel(1);
+        let permit = tx
+            .clone()
+            .reserve_owned()
+            .await
+            .expect("open receiver should reserve queue capacity");
+        rx.close();
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "an outstanding permit must leave the closed queue observably empty"
+        );
+
+        let block = vec![Bytes::from_static(b"late-permit")];
+        let block_bytes = queued_block_bytes(&block);
+        permit.send(InflightEntry::new(block, block_bytes));
+        drop(rx);
+
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "a queue entry sent through an outstanding permit must settle when Tokio drops it"
+        );
     }
 
     #[tokio::test]
@@ -1392,6 +1939,61 @@ mod tests {
                 "shard {index} should receive bytesmut-ingest data"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bytesmut_streaming_encode_observes_all_payload_stage_peaks() {
+        let queue_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let producer_peak_before = rustfs_io_metrics::current_ec_encode_producer_bytes_peak();
+        let queue_peak_before = rustfs_io_metrics::current_ec_encode_queue_bytes_peak();
+        let writer_peak_before = rustfs_io_metrics::current_ec_encode_writer_bytes_peak();
+        let prior_peak = producer_peak_before.max(queue_peak_before).max(writer_peak_before);
+        let block_size = usize::try_from(prior_peak.saturating_add(1)).expect("stage peak fits the test address space");
+        let erasure = Arc::new(Erasure::new(1, 0, block_size));
+        let encoded_block_bytes = erasure.shard_size() * erasure.total_shard_count();
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), block_size))];
+        let reader = tokio::io::BufReader::new(Cursor::new(vec![0x5a; block_size * 2]));
+
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+        let result = erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await;
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+
+        let (_reader, written) = result.expect("bytesmut streaming encode should complete");
+        assert_eq!(written, block_size * 2);
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            queue_baseline,
+            "completed streaming encode must not retain queue bytes"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes(),
+            0,
+            "completed streaming encode must not retain producer bytes"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes(),
+            0,
+            "completed streaming encode must not retain writer bytes"
+        );
+        let expected_peak = u64::try_from(encoded_block_bytes).expect("encoded block bytes fit the gauge");
+        assert!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes_peak() >= producer_peak_before.max(expected_peak),
+            "producer peak must observe encoded bytes before queue hand-off"
+        );
+        assert!(
+            rustfs_io_metrics::current_ec_encode_queue_bytes_peak() >= queue_peak_before.max(expected_peak),
+            "queue peak must observe encoded bytes pending shard writers"
+        );
+        assert!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes_peak() >= writer_peak_before.max(expected_peak),
+            "writer peak must observe encoded bytes after queue hand-off"
+        );
+        assert!(
+            !committed.lock().expect("committed buffer should be lockable").is_empty(),
+            "stage peak observation must not change writer commit behavior"
+        );
     }
 
     #[tokio::test]

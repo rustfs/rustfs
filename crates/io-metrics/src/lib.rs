@@ -49,7 +49,10 @@
 #[macro_use]
 extern crate metrics;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// Global switch for detailed per-stage PUT metrics (path label, stage durations).
 /// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
@@ -269,6 +272,12 @@ pub use collector::MetricsCollector;
 pub use performance::PerformanceMetrics;
 
 static EC_ENCODE_INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
+static EC_ENCODE_PRODUCER_BYTES_CURRENT: AtomicU64 = AtomicU64::new(0);
+static EC_ENCODE_PRODUCER_BYTES_PEAK: AtomicU64 = AtomicU64::new(0);
+static EC_ENCODE_QUEUE_BYTES_PEAK: AtomicU64 = AtomicU64::new(0);
+static EC_ENCODE_WRITER_BYTES_CURRENT: AtomicU64 = AtomicU64::new(0);
+static EC_ENCODE_WRITER_BYTES_PEAK: AtomicU64 = AtomicU64::new(0);
+static EC_ENCODE_PEAK_PUBLISH_LOCK: Mutex<()> = Mutex::new(());
 static GET_OBJECT_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
 const SHARD_READ_COST_LOCAL: &str = "local";
 const SHARD_READ_COST_REMOTE: &str = "remote";
@@ -311,6 +320,49 @@ fn saturating_sub_atomic(counter: &AtomicU64, bytes: u64) -> u64 {
             Err(actual) => current = actual,
         }
     }
+}
+
+#[inline(always)]
+fn update_peak_atomic(counter: &AtomicU64, value: u64) -> Option<u64> {
+    let mut peak = counter.load(Ordering::Relaxed);
+    loop {
+        if value <= peak {
+            return None;
+        }
+        match counter.compare_exchange_weak(peak, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(value),
+            Err(actual) => peak = actual,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EcEncodePeakMetric {
+    Producer,
+    Queue,
+    Writer,
+}
+
+fn publish_ec_encode_peak_with(counter: &AtomicU64, value: u64, before_publish_lock: impl FnOnce(), set_gauge: impl FnOnce(f64)) {
+    if update_peak_atomic(counter, value).is_none() {
+        return;
+    }
+    before_publish_lock();
+    let _guard = EC_ENCODE_PEAK_PUBLISH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    set_gauge(counter.load(Ordering::Relaxed) as f64);
+}
+
+fn publish_ec_encode_peak(counter: &AtomicU64, metric: EcEncodePeakMetric, value: u64) {
+    publish_ec_encode_peak_with(
+        counter,
+        value,
+        || {},
+        |peak| match metric {
+            EcEncodePeakMetric::Producer => gauge_set_cached!("rustfs_ec_encode_producer_bytes_peak", peak),
+            EcEncodePeakMetric::Queue => gauge_set_cached!("rustfs_ec_encode_queue_bytes_peak", peak),
+            EcEncodePeakMetric::Writer => gauge_set_cached!("rustfs_ec_encode_writer_bytes_peak", peak),
+        },
+    );
 }
 
 #[inline(always)]
@@ -2195,24 +2247,134 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
     }
 }
 
-/// Track encoded bytes currently queued between erasure encode and disk writers.
+/// Track encoded bytes in the queue hand-off between erasure encode and disk writers.
+///
+/// This is queue occupancy, not a per-request or process-RSS memory limit. The
+/// erasure encoder settles it on failed/cancelled sends, receiver drop, and
+/// consumer hand-off before shard writes begin.
 #[inline(always)]
 pub fn add_ec_encode_inflight_bytes(bytes: usize) {
     let next = EC_ENCODE_INFLIGHT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
-    gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
+    gauge_set_cached!("rustfs_ec_encode_inflight_bytes_current", next as f64);
+    if put_stage_metrics_enabled() {
+        publish_ec_encode_peak(&EC_ENCODE_QUEUE_BYTES_PEAK, EcEncodePeakMetric::Queue, next);
+    }
 }
 
 /// Remove encoded bytes from the tracked erasure encode in-flight gauge.
 #[inline(always)]
 pub fn remove_ec_encode_inflight_bytes(bytes: usize) {
     let next = saturating_sub_atomic(&EC_ENCODE_INFLIGHT_BYTES, bytes as u64);
-    gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
+    gauge_set_cached!("rustfs_ec_encode_inflight_bytes_current", next as f64);
 }
 
 /// Return the current tracked EC encode in-flight bytes.
 #[inline(always)]
 pub fn current_ec_encode_inflight_bytes() -> u64 {
     EC_ENCODE_INFLIGHT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Tracks encoded payload bytes held before queue hand-off or during shard writes.
+///
+/// Each guard contributes to a process-wide stage total until it is dropped. The
+/// reported peak therefore includes concurrent PUTs, but excludes reader,
+/// allocator, and transport buffers; it is not a per-PUT or process-RSS limit.
+pub struct EcEncodePayloadStageGuard {
+    counter: &'static AtomicU64,
+    bytes: u64,
+    enabled: bool,
+    current_metric: EcEncodePeakMetric,
+}
+
+impl Drop for EcEncodePayloadStageGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let next = saturating_sub_atomic(self.counter, self.bytes);
+        match self.current_metric {
+            EcEncodePeakMetric::Producer => gauge_set_cached!("rustfs_ec_encode_producer_bytes_current", next as f64),
+            EcEncodePeakMetric::Queue => unreachable!("queue bytes use their own ownership guard"),
+            EcEncodePeakMetric::Writer => gauge_set_cached!("rustfs_ec_encode_writer_bytes_current", next as f64),
+        }
+    }
+}
+
+fn track_ec_encode_payload_stage(
+    bytes: usize,
+    counter: &'static AtomicU64,
+    peak: &'static AtomicU64,
+    metric: EcEncodePeakMetric,
+) -> EcEncodePayloadStageGuard {
+    let enabled = put_stage_metrics_enabled();
+    let bytes = bytes as u64;
+    if enabled {
+        let next = counter.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        match metric {
+            EcEncodePeakMetric::Producer => gauge_set_cached!("rustfs_ec_encode_producer_bytes_current", next as f64),
+            EcEncodePeakMetric::Queue => unreachable!("queue bytes use their own ownership guard"),
+            EcEncodePeakMetric::Writer => gauge_set_cached!("rustfs_ec_encode_writer_bytes_current", next as f64),
+        }
+        publish_ec_encode_peak(peak, metric, next);
+    }
+    EcEncodePayloadStageGuard {
+        counter,
+        bytes,
+        enabled,
+        current_metric: metric,
+    }
+}
+
+/// Track encoded producer payload bytes until queue hand-off completes.
+#[inline(always)]
+pub fn track_ec_encode_producer_bytes(bytes: usize) -> EcEncodePayloadStageGuard {
+    track_ec_encode_payload_stage(
+        bytes,
+        &EC_ENCODE_PRODUCER_BYTES_CURRENT,
+        &EC_ENCODE_PRODUCER_BYTES_PEAK,
+        EcEncodePeakMetric::Producer,
+    )
+}
+
+/// Track encoded payload bytes while shard writers own the batch.
+#[inline(always)]
+pub fn track_ec_encode_writer_bytes(bytes: usize) -> EcEncodePayloadStageGuard {
+    track_ec_encode_payload_stage(
+        bytes,
+        &EC_ENCODE_WRITER_BYTES_CURRENT,
+        &EC_ENCODE_WRITER_BYTES_PEAK,
+        EcEncodePeakMetric::Writer,
+    )
+}
+
+/// Return the process-lifetime high-water mark of encoded producer payload bytes.
+#[inline(always)]
+pub fn current_ec_encode_producer_bytes_peak() -> u64 {
+    EC_ENCODE_PRODUCER_BYTES_PEAK.load(Ordering::Relaxed)
+}
+
+/// Return the current process-wide encoded producer payload bytes.
+#[inline(always)]
+pub fn current_ec_encode_producer_bytes() -> u64 {
+    EC_ENCODE_PRODUCER_BYTES_CURRENT.load(Ordering::Relaxed)
+}
+
+/// Return the process-lifetime high-water mark of encoded queue payload bytes.
+#[inline(always)]
+pub fn current_ec_encode_queue_bytes_peak() -> u64 {
+    EC_ENCODE_QUEUE_BYTES_PEAK.load(Ordering::Relaxed)
+}
+
+/// Return the process-lifetime high-water mark of encoded writer payload bytes.
+#[inline(always)]
+pub fn current_ec_encode_writer_bytes_peak() -> u64 {
+    EC_ENCODE_WRITER_BYTES_PEAK.load(Ordering::Relaxed)
+}
+
+/// Return the current process-wide encoded writer payload bytes.
+#[inline(always)]
+pub fn current_ec_encode_writer_bytes() -> u64 {
+    EC_ENCODE_WRITER_BYTES_CURRENT.load(Ordering::Relaxed)
 }
 
 /// Track whole-object buffering on the GET path.
@@ -2381,7 +2543,9 @@ pub fn record_io_latency_p99(latency_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::sync::{Arc, Barrier, Mutex};
 
     // Serialize tests that mutate the process-global PUT_STAGE_METRICS_ENABLED flag.
     static METRICS_FLAG_LOCK: Mutex<()> = Mutex::new(());
@@ -2834,6 +2998,9 @@ mod tests {
 
     #[test]
     fn test_ec_encode_inflight_bytes_tracking() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(true);
+        let queue_peak_before = current_ec_encode_queue_bytes_peak();
         EC_ENCODE_INFLIGHT_BYTES.store(0, Ordering::Relaxed);
         add_ec_encode_inflight_bytes(1024);
         add_ec_encode_inflight_bytes(2048);
@@ -2841,6 +3008,104 @@ mod tests {
         remove_ec_encode_inflight_bytes(2048);
         remove_ec_encode_inflight_bytes(4096);
         assert_eq!(current_ec_encode_inflight_bytes(), 0);
+        assert!(
+            current_ec_encode_queue_bytes_peak() >= queue_peak_before.max(3072),
+            "queue peak must retain the largest observed queue occupancy"
+        );
+        set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_ec_encode_producer_and_writer_stage_guards_aggregate_and_settle() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(true);
+
+        let producer_bytes = 1024;
+        let producer_first = track_ec_encode_producer_bytes(producer_bytes);
+        let producer_second = track_ec_encode_producer_bytes(producer_bytes);
+        assert_eq!(current_ec_encode_producer_bytes(), 2048);
+        assert!(
+            current_ec_encode_producer_bytes_peak() >= 2048,
+            "producer peak must include simultaneous stage ownership"
+        );
+        drop((producer_first, producer_second));
+        assert_eq!(current_ec_encode_producer_bytes(), 0);
+
+        let writer_bytes = 2048;
+        let writer_first = track_ec_encode_writer_bytes(writer_bytes);
+        let writer_second = track_ec_encode_writer_bytes(writer_bytes);
+        assert_eq!(current_ec_encode_writer_bytes(), 4096);
+        assert!(
+            current_ec_encode_writer_bytes_peak() >= 4096,
+            "writer peak must include simultaneous stage ownership"
+        );
+        drop((writer_first, writer_second));
+        assert_eq!(current_ec_encode_writer_bytes(), 0);
+
+        set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_ec_encode_producer_peak_exports_the_high_water_mark() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(current_ec_encode_producer_bytes(), 0, "test must start without producer stage ownership");
+        let previous_peak = EC_ENCODE_PRODUCER_BYTES_PEAK.swap(0, Ordering::Relaxed);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(true);
+            let first = track_ec_encode_producer_bytes(1024);
+            let second = track_ec_encode_producer_bytes(2048);
+            drop((first, second));
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let exported_peak = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(composite, _, _, value)| {
+                (composite.kind() == MetricKind::Gauge && composite.key().name() == "rustfs_ec_encode_producer_bytes_peak")
+                    .then_some(value)
+            });
+        assert!(
+            matches!(exported_peak, Some(DebugValue::Gauge(value)) if value.0 == 3072.0),
+            "exported producer peak must retain the aggregate high-water mark"
+        );
+        EC_ENCODE_PRODUCER_BYTES_PEAK.fetch_max(previous_peak, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_ec_encode_peak_publish_does_not_regress_after_out_of_order_cas() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let peak = Arc::new(AtomicU64::new(0));
+        let exported = Arc::new(AtomicU64::new(0));
+        let first_ready = Arc::new(Barrier::new(2));
+        let release_first = Arc::new(Barrier::new(2));
+        let first_peak = Arc::clone(&peak);
+        let first_exported = Arc::clone(&exported);
+        let first_ready_for_thread = Arc::clone(&first_ready);
+        let release_first_for_thread = Arc::clone(&release_first);
+
+        let first = std::thread::spawn(move || {
+            publish_ec_encode_peak_with(
+                &first_peak,
+                10,
+                || {
+                    first_ready_for_thread.wait();
+                    release_first_for_thread.wait();
+                },
+                |value| first_exported.store(value as u64, Ordering::Relaxed),
+            );
+        });
+        first_ready.wait();
+        publish_ec_encode_peak_with(&peak, 20, || {}, |value| exported.store(value as u64, Ordering::Relaxed));
+        release_first.wait();
+        first.join().expect("first publisher should not panic");
+
+        assert_eq!(peak.load(Ordering::Relaxed), 20);
+        assert_eq!(exported.load(Ordering::Relaxed), 20, "late publisher must reload the high-water mark");
     }
 
     #[test]

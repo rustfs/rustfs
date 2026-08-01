@@ -241,6 +241,16 @@ impl InQueueStats {
         Self::default()
     }
 
+    pub fn add_current(&self, bytes: i64, count: i64) {
+        self.now_bytes.fetch_add(bytes.max(0), Ordering::Relaxed);
+        self.now_count.fetch_add(count.max(0), Ordering::Relaxed);
+    }
+
+    pub fn subtract_current(&self, bytes: i64, count: i64) {
+        saturating_atomic_sub(&self.now_bytes, bytes.max(0));
+        saturating_atomic_sub(&self.now_count, count.max(0));
+    }
+
     pub fn get_current_bytes(&self) -> i64 {
         self.now_bytes.load(Ordering::Relaxed)
     }
@@ -248,6 +258,14 @@ impl InQueueStats {
     pub fn get_current_count(&self) -> i64 {
         self.now_count.load(Ordering::Relaxed)
     }
+}
+
+fn saturating_atomic_sub(value: &AtomicI64, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(delta).max(0)));
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,6 +375,18 @@ pub struct QueueCache {
 impl QueueCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn inc(&mut self, bucket: &str, size: i64) {
+        let stats = self.bucket_stats.entry(bucket.to_string()).or_default();
+        stats.curr.add_current(size, 1);
+        self.sr_queue_stats.curr.add_current(size, 1);
+    }
+
+    pub fn dec(&mut self, bucket: &str, size: i64) {
+        let stats = self.bucket_stats.entry(bucket.to_string()).or_default();
+        stats.curr.subtract_current(size, 1);
+        self.sr_queue_stats.curr.subtract_current(size, 1);
     }
 
     pub fn update(&mut self) {
@@ -808,12 +838,10 @@ mod tests {
     #[test]
     fn in_queue_metric_observe_updates_rolling_stats() {
         let mut metric = InQueueMetric::default();
-        metric.curr.now_bytes.store(128, Ordering::Relaxed);
-        metric.curr.now_count.store(4, Ordering::Relaxed);
+        metric.curr.add_current(128, 4);
         metric.observe(Instant::now());
 
-        metric.curr.now_bytes.store(256, Ordering::Relaxed);
-        metric.curr.now_count.store(6, Ordering::Relaxed);
+        metric.curr.add_current(128, 2);
         metric.observe(Instant::now());
 
         assert_eq!(metric.curr.bytes, 256);
@@ -822,6 +850,21 @@ mod tests {
         assert_eq!(metric.max.count, 6);
         assert_eq!(metric.last_minute.bytes, 192);
         assert_eq!(metric.last_minute.count, 5);
+    }
+
+    #[test]
+    fn queue_cache_decrement_saturates_at_zero() {
+        let mut cache = QueueCache::new();
+        cache.inc("bucket", 128);
+        cache.dec("bucket", 512);
+        cache.dec("bucket", 1);
+
+        let bucket = cache.get_bucket_stats("bucket");
+        let site = cache.get_site_stats();
+        assert_eq!(bucket.curr.count, 0);
+        assert_eq!(bucket.curr.bytes, 0);
+        assert_eq!(site.curr.count, 0);
+        assert_eq!(site.curr.bytes, 0);
     }
 
     #[test]

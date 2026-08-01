@@ -382,7 +382,6 @@ struct ManualTransitionRunReport {
     skipped_delete_marker: u64,
     skipped_directory: u64,
     skipped_replication: u64,
-    skipped_already_transitioned: u64,
     skipped_already_in_flight: u64,
     skipped_queue_full: u64,
     skipped_queue_closed: u64,
@@ -406,41 +405,6 @@ fn assert_completed_or_in_flight_partial(state: &str, report: &ManualTransitionR
         "partial" if report.skipped_already_in_flight > 0 => {}
         _ => panic!("{context}: state={state}, report={report:#?}"),
     }
-}
-
-fn assert_conflict_winner_report(state: &str, report: &ManualTransitionRunReport, expected_objects: u64, context: &str) {
-    assert_completed_or_in_flight_partial(state, report, context);
-    if report.skipped_already_in_flight > 0 {
-        assert!(
-            report.scanned <= expected_objects,
-            "{context}: scanned more objects than the conflict scope contains: {report:#?}"
-        );
-        assert!(
-            report.eligible <= expected_objects,
-            "{context}: marked more objects eligible than the conflict scope contains: {report:#?}"
-        );
-        assert_eq!(
-            report.enqueued + report.skipped_already_in_flight,
-            report.eligible,
-            "{context}: partial in-flight accounting must cover every eligible object: {report:#?}"
-        );
-    } else {
-        assert_eq!(report.scanned, expected_objects, "{context}: {report:#?}");
-        assert_eq!(
-            report.eligible + report.skipped_already_transitioned,
-            expected_objects,
-            "{context}: {report:#?}"
-        );
-        assert_eq!(
-            report.enqueued + report.skipped_already_in_flight,
-            expected_objects,
-            "{context}: {report:#?}"
-        );
-    }
-    assert_eq!(
-        report.transition_completed, report.enqueued,
-        "{context}: winner must wait for all queued transitions: {report:#?}"
-    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -1276,8 +1240,15 @@ async fn test_manual_transition_async_scope_conflicts_report_active_job() -> Tes
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    hot.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_SCANNER_ENABLED", "false"),
+            ("RUSTFS_SCANNER_CYCLE", "3600"),
+            (MANUAL_TRANSITION_CANCEL_BARRIER_ENV, "1"),
+        ],
+    )
+    .await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -1347,20 +1318,21 @@ async fn test_manual_transition_async_scope_conflicts_report_active_job() -> Tes
     assert_eq!(conflict.cancel_endpoint, status_endpoint);
     assert!(!conflict.scope_key.is_empty());
 
+    manual_transition_job_cancel(&hot, cancel_endpoint).await?;
+
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, MANUAL_ASYNC_CONFLICT_TERMINAL_TIMEOUT).await?;
     assert_eq!(terminal.job_id, job_id);
+    assert_eq!(terminal.status, "cancelled", "terminal conflict winner response: {terminal:#?}");
     assert!(!terminal.report.dry_run);
     assert_eq!(terminal.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
     assert_eq!(terminal.report.prefix, accepted.report.prefix);
-    assert_conflict_winner_report(
-        &terminal.status,
-        &terminal.report,
-        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
-        "terminal conflict winner response",
+    assert!(terminal.report.cancelled, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(terminal.report.scanned, 0, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(terminal.report.enqueued, 0, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.transition_completed, 0,
+        "terminal conflict winner response: {terminal:#?}"
     );
-    assert_eq!(terminal.report.dry_run_eligible, 0, "terminal conflict winner response: {terminal:#?}");
-    assert_eq!(terminal.report.transition_failed, 0, "terminal conflict winner response: {terminal:#?}");
-    assert_eq!(terminal.report.tier_failure, 0, "terminal conflict winner response: {terminal:#?}");
     let after_remote_count = cold_tier_object_count(&cold_client).await?;
     assert!(after_remote_count >= before_remote_count);
     assert!(after_remote_count <= before_remote_count + MANUAL_ASYNC_CONFLICT_OBJECTS);

@@ -32,6 +32,7 @@ permissions:
 jobs:
   build-helm-package:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: |
       (github.event_name == 'workflow_dispatch' && !contains(github.event.inputs.version, '-preview')) ||
       (
@@ -49,16 +50,26 @@ jobs:
     steps:
       - name: Checkout helm chart repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
+      # Both inputs reach the shell through env rather than `${{ }}`
+      # interpolation. A git ref name may contain `$(...)` — anything without a
+      # space is a legal tag — and interpolation pastes it into the script
+      # verbatim, where bash would run it. Reading "$RAW_INPUT" instead makes it
+      # data.
       - name: Normalize release version
         id: version
+        env:
+          RAW_INPUT: ${{ github.event.inputs.version }}
+          RAW_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -eux
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW="${{ github.event.inputs.version }}"
+            RAW="$RAW_INPUT"
           else
-            RAW="${{ github.event.workflow_run.head_branch }}"
+            RAW="$RAW_BRANCH"
           fi
 
           case "$RAW" in
@@ -73,10 +84,13 @@ jobs:
           ./scripts/helm_chart_version.sh "$RAW_TAG"
 
       - name: Replace chart version and app version
+        env:
+          CHART_VERSION: ${{ steps.version.outputs.chart_version }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
         run: |
           set -eux
-          sed -i -E 's/^version:.*/version: "${{ steps.version.outputs.chart_version }}"/' helm/rustfs/Chart.yaml
-          sed -i -E 's/^appVersion:.*/appVersion: "${{ steps.version.outputs.app_version }}"/' helm/rustfs/Chart.yaml
+          sed -i -E "s/^version:.*/version: \"${CHART_VERSION}\"/" helm/rustfs/Chart.yaml
+          sed -i -E "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" helm/rustfs/Chart.yaml
 
       - name: Set up Helm
         uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
@@ -101,6 +115,7 @@ jobs:
 
   publish-helm-package:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [ build-helm-package ]
     if: needs.build-helm-package.result == 'success'
 
@@ -108,6 +123,8 @@ jobs:
       - name: Checkout helm package repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          # persist-credentials-exempt: this checkout's token IS the push credential —
+          # the job git-pushes to rustfs/helm below. Clearing it breaks chart publishing.
           repository: rustfs/helm
           token: ${{ secrets.RUSTFS_HELM_PACKAGE }}
 
@@ -123,11 +140,19 @@ jobs:
       - name: Generate index
         run: helm repo index . --url https://charts.rustfs.com
 
+      # app_version is derived from the triggering tag name, and this job holds
+      # the cross-repository push token with rustfs/helm already checked out —
+      # the worst place in the repo to paste an attacker-influenced string into
+      # a shell line. Passed through env so bash treats it as data.
       - name: Push helm package and index file
+        env:
+          GIT_USERNAME: ${{ secrets.USERNAME }}
+          GIT_EMAIL: ${{ secrets.EMAIL_ADDRESS }}
+          APP_VERSION: ${{ needs.build-helm-package.outputs.app_version }}
         run: |
           set -eux
-          git config --global user.name "${{ secrets.USERNAME }}"
-          git config --global user.email "${{ secrets.EMAIL_ADDRESS }}"
+          git config --global user.name "${GIT_USERNAME}"
+          git config --global user.email "${GIT_EMAIL}"
           git add .
-          git commit -m "Update rustfs helm package with ${{ needs.build-helm-package.outputs.app_version }}." || echo "No changes to commit"
+          git commit -m "Update rustfs helm package with ${APP_VERSION}." || echo "No changes to commit"
           git push origin main

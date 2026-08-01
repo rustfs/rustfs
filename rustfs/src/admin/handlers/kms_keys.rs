@@ -14,7 +14,8 @@
 
 //! KMS key management admin API handlers
 
-use crate::admin::auth::validate_admin_request;
+use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
+use crate::admin::auth::{validate_admin_request, validate_admin_request_with_kms_key};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
@@ -23,7 +24,7 @@ use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_kms::{KmsError, types::*};
+use rustfs_kms::{KmsAuditOperation, KmsError, types::*};
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -116,6 +117,29 @@ fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
         .find_map(|name| query_params.get(name).filter(|value| !value.is_empty()).cloned())
 }
 
+/// The `key_id` of a KMS admin request body, read without committing to the
+/// strict schema of the endpoint: the authorization gate needs the target key
+/// before the body is parsed for execution, and a body that fails the strict
+/// parse is rejected right after the gate anyway.
+#[derive(Deserialize)]
+struct KeyIdProbe {
+    #[serde(default)]
+    key_id: String,
+}
+
+/// Target key of an endpoint that accepts either a JSON body or a `keyId` query
+/// parameter, resolved exactly the way the endpoint resolves it for execution so
+/// the authorized key can never differ from the operated one. Returns `None`
+/// when the target cannot be determined, which authorizes unscoped and lets the
+/// request fail on its own parse error afterwards.
+pub(super) fn scoped_key_id(body: &[u8], uri: &hyper::Uri) -> Option<String> {
+    if body.is_empty() {
+        return extract_query_params(uri).get("keyId").cloned();
+    }
+
+    serde_json::from_slice::<KeyIdProbe>(body).ok().map(|probe| probe.key_id)
+}
+
 fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsServiceManager>> {
     current_kms_runtime_service_manager()
 }
@@ -192,15 +216,21 @@ impl Operation for CreateKeyHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_create_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_create_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAuditOperation::CreateKey,
+            None,
+        )?;
 
         let body = req
             .input
@@ -235,7 +265,7 @@ impl Operation for CreateKeyHandler {
             policy: None,
         };
 
-        match service.create_key(kms_request).await {
+        match service.create_key_with_context(kms_request, audit.context()).await {
             Ok(response) => {
                 let api_response = CreateKeyApiResponse {
                     key_id: response.key_id,
@@ -279,17 +309,25 @@ impl Operation for DescribeKeyHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_describe_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let requested_key_id = extract_key_id(&req.uri);
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
 
-        let Some(key_id) = extract_key_id(&req.uri) else {
+        audit.gate(
+            validate_admin_request_with_kms_key(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_describe_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                requested_key_id.as_deref().unwrap_or_default(),
+            )
+            .await,
+            KmsAuditOperation::DescribeKey,
+            requested_key_id.as_deref(),
+        )?;
+
+        let Some(key_id) = requested_key_id else {
             return Err(s3_error!(InvalidRequest, "missing required parameter: 'keyId'"));
         };
 
@@ -299,7 +337,7 @@ impl Operation for DescribeKeyHandler {
 
         let request = DescribeKeyRequest { key_id: key_id.clone() };
 
-        match service.describe_key(request).await {
+        match service.describe_key_with_context(request, audit.context()).await {
             Ok(response) => {
                 let api_response = DescribeKeyApiResponse {
                     key_metadata: response.key_metadata,
@@ -335,10 +373,12 @@ mod tests {
     use super::{
         CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, GenerateDataKeyApiRequest,
         extract_key_id, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
-        kms_list_keys_actions,
+        kms_list_keys_actions, scoped_key_id,
     };
     use http::Uri;
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+    use rustfs_policy::policy::{Args, Policy};
+    use std::collections::HashMap;
 
     fn assert_has_action(actions: &[Action], action: Action) {
         assert!(actions.contains(&action), "expected action list to contain {action:?}");
@@ -422,6 +462,248 @@ mod tests {
             assert!(err.to_string().contains("unknown field"));
         }
     }
+
+    #[test]
+    fn scoped_key_id_reads_the_body_first_and_falls_back_to_the_query() {
+        let uri: Uri = "/rustfs/admin/v3/kms/keys/delete?keyId=query-key"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(scoped_key_id(br#"{"key_id":"body-key"}"#, &uri).as_deref(), Some("body-key"));
+        assert_eq!(scoped_key_id(b"", &uri).as_deref(), Some("query-key"));
+
+        // The query aliases accepted by the legacy describe endpoint are not
+        // accepted here, because the handlers only execute on `keyId`.
+        let alias_uri: Uri = "/rustfs/admin/v3/kms/keys/delete?key-id=query-key"
+            .parse()
+            .expect("uri should parse");
+        assert_eq!(scoped_key_id(b"", &alias_uri), None);
+    }
+
+    /// A body the endpoint will reject leaves the request unscoped: the gate then
+    /// answers as it did before resource scoping and the request still fails on
+    /// its own parse error, so no key is operated on under that decision.
+    #[test]
+    fn scoped_key_id_is_absent_for_bodies_that_name_no_key() {
+        let uri: Uri = "/rustfs/admin/v3/kms/keys/delete".parse().expect("uri should parse");
+
+        assert_eq!(scoped_key_id(b"not json", &uri), None);
+        assert_eq!(scoped_key_id(br#"{"key_id":"" }"#, &uri).as_deref(), Some(""));
+        assert_eq!(scoped_key_id(b"{}", &uri).as_deref(), Some(""));
+        assert_eq!(scoped_key_id(b"", &uri), None);
+    }
+
+    /// Identity policy scoped to a single KMS key, or unscoped when `key_arn` is
+    /// `None` (the legacy action-only form that must keep matching every key).
+    fn kms_policy(key_arn: Option<&str>) -> Policy {
+        let resource = match key_arn {
+            Some(arn) => format!(r#","Resource":["{arn}"]"#),
+            None => String::new(),
+        };
+        let document = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["kms:*"]{resource}}}]}}"#);
+
+        Policy::parse_config(document.as_bytes()).expect("kms policy should parse")
+    }
+
+    async fn policy_allows(policy: &Policy, action: Action, key_id: &str, is_owner: bool) -> bool {
+        let groups = None;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        policy
+            .is_allowed(&Args {
+                account: "kms-operator",
+                groups: &groups,
+                action,
+                // The admin gate scopes KMS requests through `AdminResourceScope::kms_key`,
+                // which puts the requested key id in the object slot with an empty bucket.
+                bucket: "",
+                conditions: &conditions,
+                is_owner,
+                object: key_id,
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    }
+
+    fn describe_by_query(key_id: &str) -> String {
+        let uri: Uri = format!("/rustfs/admin/v3/kms/key/status?keyId={key_id}")
+            .parse()
+            .expect("uri should parse");
+        extract_key_id(&uri).unwrap_or_default()
+    }
+
+    fn describe_by_path(key_id: &str) -> String {
+        // `DescribeKmsKeyHandler` reads the router path parameter verbatim.
+        key_id.to_string()
+    }
+
+    fn generate_data_key_body(key_id: &str) -> String {
+        let body = format!(r#"{{"key_id":"{key_id}","key_spec":"Aes256"}}"#);
+        serde_json::from_str::<GenerateDataKeyApiRequest>(&body)
+            .expect("generate-data-key body should parse")
+            .key_id
+    }
+
+    fn key_id_body(key_id: &str) -> String {
+        let uri: Uri = "/rustfs/admin/v3/kms/keys".parse().expect("uri should parse");
+        scoped_key_id(format!(r#"{{"key_id":"{key_id}"}}"#).as_bytes(), &uri).unwrap_or_default()
+    }
+
+    fn key_id_query(key_id: &str) -> String {
+        let uri: Uri = format!("/rustfs/admin/v3/kms/keys?keyId={key_id}")
+            .parse()
+            .expect("uri should parse");
+        scoped_key_id(b"", &uri).unwrap_or_default()
+    }
+
+    /// Endpoint label, the action it gates on, and the resolution its handler
+    /// performs to obtain the key the gate is scoped to.
+    type SingleKeyEndpoint = (&'static str, Action, fn(&str) -> String);
+
+    /// Every KMS admin endpoint that acts on one key. Lifecycle endpoints share
+    /// `scoped_key_id` with the delete/cancel endpoints (see `kms_key_lifecycle`).
+    fn single_key_endpoints() -> Vec<SingleKeyEndpoint> {
+        vec![
+            (
+                "GET /v3/kms/key/status",
+                Action::KmsAction(KmsAction::DescribeKeyAction),
+                describe_by_query,
+            ),
+            (
+                "GET /v3/kms/keys/{key_id}",
+                Action::KmsAction(KmsAction::DescribeKeyAction),
+                describe_by_path,
+            ),
+            (
+                "POST /v3/kms/generate-data-key",
+                Action::KmsAction(KmsAction::GenerateDataKeyAction),
+                generate_data_key_body,
+            ),
+            ("DELETE /v3/kms/keys/delete", Action::KmsAction(KmsAction::DeleteKeyAction), key_id_body),
+            (
+                "DELETE /v3/kms/keys/delete?keyId=",
+                Action::KmsAction(KmsAction::DeleteKeyAction),
+                key_id_query,
+            ),
+            (
+                "POST /v3/kms/keys/cancel-deletion",
+                Action::KmsAction(KmsAction::DeleteKeyAction),
+                key_id_body,
+            ),
+            ("POST /v3/kms/keys/enable", Action::KmsAction(KmsAction::EnableKeyAction), key_id_body),
+            ("POST /v3/kms/keys/disable", Action::KmsAction(KmsAction::DisableKeyAction), key_id_body),
+            ("POST /v3/kms/keys/rotate", Action::KmsAction(KmsAction::RotateKeyAction), key_id_body),
+        ]
+    }
+
+    /// A policy limited to `key/A` must not authorize any single-key endpoint
+    /// against another key (rustfs/backlog#1582).
+    #[tokio::test]
+    async fn single_key_endpoints_reject_a_key_outside_the_policy_scope() {
+        let policy = kms_policy(Some("arn:aws:kms:::key/key-a"));
+
+        for (endpoint, action, resolve_key_id) in single_key_endpoints() {
+            assert!(
+                policy_allows(&policy, action, &resolve_key_id("key-a"), false).await,
+                "{endpoint} must stay allowed on the key the policy names"
+            );
+            assert!(
+                !policy_allows(&policy, action, &resolve_key_id("key-b"), false).await,
+                "{endpoint} must be denied on a key outside the policy scope"
+            );
+        }
+    }
+
+    /// Compatibility pin: a KMS statement without resources keeps matching every
+    /// key, and the owner short-circuit is unaffected by scoping.
+    #[tokio::test]
+    async fn unscoped_policies_and_owner_credentials_keep_matching_every_key() {
+        let unscoped = kms_policy(None);
+        let scoped = kms_policy(Some("arn:aws:kms:::key/key-a"));
+
+        for (endpoint, action, resolve_key_id) in single_key_endpoints() {
+            for key in ["key-a", "key-b"] {
+                assert!(
+                    policy_allows(&unscoped, action, &resolve_key_id(key), false).await,
+                    "{endpoint} must stay allowed on {key} for a resource-less KMS statement"
+                );
+                assert!(
+                    policy_allows(&scoped, action, &resolve_key_id(key), true).await,
+                    "{endpoint} must stay allowed on {key} for an owner credential"
+                );
+            }
+        }
+    }
+
+    /// The key the handler resolves also reaches Deny statements, so an explicit
+    /// Deny on one key survives an unscoped Allow.
+    #[tokio::test]
+    async fn explicit_deny_on_one_key_overrides_an_unscoped_allow() {
+        let document = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:*"]},
+            {"Effect":"Deny","Action":["kms:*"],"Resource":["arn:aws:kms:::key/key-b"]}
+        ]}"#;
+        let policy = Policy::parse_config(document.as_bytes()).expect("kms policy should parse");
+
+        for (endpoint, action, resolve_key_id) in single_key_endpoints() {
+            assert!(
+                policy_allows(&policy, action, &resolve_key_id("key-a"), false).await,
+                "{endpoint} must stay allowed on a key the Deny does not name"
+            );
+            assert!(
+                !policy_allows(&policy, action, &resolve_key_id("key-b"), false).await,
+                "{endpoint} must be denied on the key the Deny names"
+            );
+        }
+    }
+
+    /// The single-key handlers must reach the gate through the KMS-scoped entry
+    /// point; the endpoints that have no target key must not (passing an empty
+    /// scope there would be a no-op, but the unscoped call documents intent).
+    #[test]
+    fn single_key_handlers_authorize_through_the_kms_scoped_gate() {
+        let src = include_str!("kms_keys.rs");
+
+        for handler in [
+            "DescribeKeyHandler",
+            "GenerateDataKeyHandler",
+            "DeleteKmsKeyHandler",
+            "CancelKmsKeyDeletionHandler",
+            "DescribeKmsKeyHandler",
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("validate_admin_request_with_kms_key("),
+                "{handler} must scope its authorization to the requested key"
+            );
+        }
+
+        for handler in [
+            "CreateKeyHandler",
+            "ListKeysHandler",
+            "CreateKmsKeyHandler",
+            "ListKmsKeysHandler",
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                !block.contains("validate_admin_request_with_kms_key("),
+                "{handler} has no target key and must not claim a KMS resource scope"
+            );
+        }
+    }
+
+    fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
+        let marker = format!("impl Operation for {handler}");
+        let block = src.split_once(&marker).expect("handler impl should exist").1;
+        let end = ["\n/// ", "\n#[derive(", "\n#[cfg(test)]", "\npub struct "]
+            .into_iter()
+            .filter_map(|item| block.find(item))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
 }
 
 /// List KMS keys (legacy endpoint)
@@ -437,15 +719,21 @@ impl Operation for ListKeysHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_list_keys_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_list_keys_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAuditOperation::ListKeys,
+            None,
+        )?;
 
         let query_params = extract_query_params(&req.uri);
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
@@ -462,7 +750,7 @@ impl Operation for ListKeysHandler {
             usage_filter: None,
         };
 
-        match service.list_keys(request).await {
+        match service.list_keys_with_context(request, audit.context()).await {
             Ok(response) => {
                 let api_response = ListKeysApiResponse {
                     keys: response.keys,
@@ -507,36 +795,56 @@ impl Operation for GenerateDataKeyHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_generate_data_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
-
-        let body = req
+        // The body names the key this endpoint derives a data key from, so it has
+        // to be read before the gate runs. Input failures stay deferred until
+        // after the gate so an unauthorized caller still sees AccessDenied.
+        let parsed = req
             .input
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
-            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))
+            .and_then(|body| {
+                serde_json::from_slice::<GenerateDataKeyApiRequest>(&body)
+                    .map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
+            });
 
-        let request: GenerateDataKeyApiRequest =
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate_admin(
+            validate_admin_request_with_kms_key(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_generate_data_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                parsed.as_ref().map(|request| request.key_id.as_str()).unwrap_or_default(),
+            )
+            .await,
+            KmsAdminOperation::GenerateDataKey,
+            parsed.as_ref().ok().map(|request| request.key_id.as_str()),
+        )?;
+
+        let request = parsed?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
+        let key_id = request.key_id.clone();
         let kms_request = GenerateDataKeyRequest {
             key_id: request.key_id,
             key_spec: request.key_spec,
             encryption_context: request.encryption_context.unwrap_or_default(),
         };
 
-        match service.generate_data_key(kms_request).await {
+        // Audited here rather than in the KMS layer: data-key derivation goes
+        // through the encryption service, which has no context-aware entry
+        // point, so this is the only place that knows who asked.
+        let result = service.generate_data_key(kms_request).await;
+        audit.finish(KmsAdminOperation::GenerateDataKey, Some(&key_id), result.as_ref().err());
+
+        match result {
             Ok(response) => {
                 let api_response = GenerateDataKeyApiResponse {
                     key_id: response.key_id,
@@ -581,15 +889,21 @@ impl Operation for CreateKmsKeyHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_create_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_create_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAuditOperation::CreateKey,
+            None,
+        )?;
 
         let body = req
             .input
@@ -648,7 +962,7 @@ impl Operation for CreateKmsKeyHandler {
             policy: None,
         };
 
-        match manager.create_key(kms_request).await {
+        match manager.create_key_with_context(kms_request, audit.context()).await {
             Ok(kms_response) => {
                 info!(
                     event = EVENT_ADMIN_KMS_KEYS_STATE,
@@ -709,6 +1023,9 @@ pub struct DeleteKmsKeyRequest {
     pub key_id: String,
     pub pending_window_in_days: Option<u32>,
     pub force_immediate: Option<bool>,
+    /// Echo of `key_id`, required by the service gate before it will destroy
+    /// key material immediately. Absent for an ordinary scheduled deletion.
+    pub confirm_key_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -732,21 +1049,29 @@ impl Operation for DeleteKmsKeyHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_delete_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        // Read the body before the gate so the request can be scoped to the key it
+        // targets; the read failure is surfaced afterwards to keep AccessDenied
+        // ahead of input errors for callers that are not authorized at all.
+        let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+        let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
 
-        let body = req
-            .input
-            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
-            .await
-            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+        audit.gate(
+            validate_admin_request_with_kms_key(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_delete_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                scoped.as_deref().unwrap_or_default(),
+            )
+            .await,
+            KmsAuditOperation::ScheduleKeyDeletion,
+            scoped.as_deref(),
+        )?;
+
+        let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let request: DeleteKmsKeyRequest = if body.is_empty() {
             let query_params = extract_query_params(&req.uri);
@@ -767,11 +1092,13 @@ impl Operation for DeleteKmsKeyHandler {
             // Extract pending_window_in_days and force_immediate from query parameters
             let pending_window_in_days = query_params.get("pending_window_in_days").and_then(|s| s.parse::<u32>().ok());
             let force_immediate = query_params.get("force_immediate").and_then(|s| s.parse::<bool>().ok());
+            let confirm_key_id = query_params.get("confirm_key_id").map(|s| s.to_string());
 
             DeleteKmsKeyRequest {
                 key_id: key_id.clone(),
                 pending_window_in_days,
                 force_immediate,
+                confirm_key_id,
             }
         } else {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
@@ -809,9 +1136,10 @@ impl Operation for DeleteKmsKeyHandler {
             key_id: request.key_id.clone(),
             pending_window_in_days: request.pending_window_in_days,
             force_immediate: request.force_immediate,
+            confirm_key_id: request.confirm_key_id.clone(),
         };
 
-        match manager.delete_key(kms_request).await {
+        match manager.delete_key_with_context(kms_request, audit.context()).await {
             Ok(kms_response) => {
                 info!(
                     event = EVENT_ADMIN_KMS_KEYS_STATE,
@@ -906,21 +1234,28 @@ impl Operation for CancelKmsKeyDeletionHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_delete_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        // Same ordering as the delete endpoint: the target key is resolved before
+        // the gate, the read failure only after it.
+        let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await;
+        let scoped = body.as_ref().ok().and_then(|body| scoped_key_id(body, &req.uri));
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
 
-        let body = req
-            .input
-            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
-            .await
-            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+        audit.gate(
+            validate_admin_request_with_kms_key(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_delete_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                scoped.as_deref().unwrap_or_default(),
+            )
+            .await,
+            KmsAuditOperation::CancelKeyDeletion,
+            scoped.as_deref(),
+        )?;
+
+        let body = body.map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let request: CancelKmsKeyDeletionRequest = if body.is_empty() {
             let query_params = extract_query_params(&req.uri);
@@ -974,7 +1309,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             key_id: request.key_id.clone(),
         };
 
-        match manager.cancel_key_deletion(kms_request).await {
+        match manager.cancel_key_deletion_with_context(kms_request, audit.context()).await {
             Ok(kms_response) => {
                 info!(
                     event = EVENT_ADMIN_KMS_KEYS_STATE,
@@ -1052,15 +1387,21 @@ impl Operation for ListKmsKeysHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_list_keys_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_list_keys_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAuditOperation::ListKeys,
+            None,
+        )?;
 
         let query_params = extract_query_params(&req.uri);
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
@@ -1103,7 +1444,7 @@ impl Operation for ListKmsKeysHandler {
             usage_filter: None,
         };
 
-        match manager.list_keys(kms_request).await {
+        match manager.list_keys_with_context(kms_request, audit.context()).await {
             Ok(kms_response) => {
                 info!(
                     event = EVENT_ADMIN_KMS_KEYS_STATE,
@@ -1180,15 +1521,22 @@ impl Operation for DescribeKmsKeyHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_describe_key_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate(
+            validate_admin_request_with_kms_key(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_describe_key_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                params.get("key_id").unwrap_or_default(),
+            )
+            .await,
+            KmsAuditOperation::DescribeKey,
+            params.get("key_id"),
+        )?;
 
         let Some(key_id) = params.get("key_id") else {
             let response = DescribeKmsKeyResponse {
@@ -1233,7 +1581,7 @@ impl Operation for DescribeKmsKeyHandler {
             key_id: key_id.to_string(),
         };
 
-        match manager.describe_key(kms_request).await {
+        match manager.describe_key_with_context(kms_request, audit.context()).await {
             Ok(kms_response) => {
                 info!(
                     event = EVENT_ADMIN_KMS_KEYS_STATE,

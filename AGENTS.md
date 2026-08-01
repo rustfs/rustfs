@@ -21,6 +21,22 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
 - A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification that survives Adversarial Validation (below).
 
+## Worktree and Disk Hygiene
+
+- Unless the requester explicitly says otherwise, treat every new implementation task as isolated work: fetch the latest `origin/main`, confirm the requested change is not already present there, and create a dedicated feature branch and worktree from that exact upstream commit before editing. Do not implement new work directly in the primary checkout or reuse a worktree from another task.
+- Check available disk space before creating the worktree or starting dependency downloads, builds, tests, coverage, or other artifact-heavy commands. For long-running or artifact-heavy work, re-check disk usage at natural phase boundaries and before broad validation; if remaining space may not safely accommodate the next command, stop and reclaim task-owned artifacts before continuing.
+- Keep cleanup scoped and safe: remove generated build/test/coverage artifacts and temporary files created by the task when they are no longer needed, and never delete another task's worktree or uncommitted files. Prefer shared dependency caches where supported instead of duplicating large artifacts across worktrees.
+- At handoff, report the disk-space checks, cleanup performed, and any retained worktree or artifacts with the reason they are still needed.
+
+## PR Lifecycle Monitoring
+
+- Creating or updating a PR is not the terminal state. Unless the requester explicitly limits the task to PR creation, monitor the PR through its terminal state: merged, closed, or explicitly handed off because progress requires user or maintainer action.
+- While the task is active, monitor CI/check runs, review decisions and unresolved threads, mergeability and conflicts, and unexpected head/base changes. Prefer event-driven or bounded waits provided by the current environment over frequent polling; report only state changes, actionable failures, or meaningful prolonged delays.
+- Investigate every failing check and review comment before changing code. Fix failures attributable to the task, run the verification required for the new diff, push the update, respond to or resolve the corresponding review threads, and resume monitoring. Do not weaken checks, dismiss valid feedback, or retry flaky failures merely to obtain a green result.
+- Treat opening, green CI, approval, and mergeability as intermediate states. Never merge without the required reviewer approval or explicit authority. If progress depends on credentials, infrastructure, a maintainer decision, or another external action, report the exact blocker and the evidence already collected.
+- If the current execution environment cannot remain active until the next PR event, use a supported automation, monitor, or thread wakeup when available and within scope. Otherwise leave an explicit handoff containing the PR, current state, next event to observe, and pending cleanup; do not imply that background monitoring exists when none is scheduled.
+- After observing a merge, verify the commits are preserved on the upstream base, ensure the worktree is clean, remove the dedicated worktree, prune stale worktree metadata, and delete the local task branch when it is no longer in use. For a closed or abandoned PR, preserve any unmerged work unless deletion was explicitly authorized. Do not delete remote branches unless explicitly requested or repository automation owns that cleanup.
+
 ## Autonomy and Approval Boundaries
 
 - Inquiry tasks (answer, explain, review, diagnose, plan): report findings; do not change files unless a fix is explicitly requested.

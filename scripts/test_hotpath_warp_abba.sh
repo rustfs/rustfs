@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNNER="${SCRIPT_DIR}/run_hotpath_warp_abba.sh"
+TMP_DIR="$(mktemp -d)"
+OUT_DIR="${TMP_DIR}/abba"
+TRACE_FILE="${TMP_DIR}/abba-trace.log"
+
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --out-dir "$OUT_DIR" \
+  --dry-run >"$TRACE_FILE" 2>&1
+
+awk -F',' '
+  NR == 1 {
+    if ($1 != "sync_label" || $6 != "leg" || $7 != "phase" || $10 != "bucket" || $11 != "dataset_setup") exit 1
+    next
+  }
+  {
+    key = $1 SUBSEP $3
+    seen[key]++
+    leg[key, seen[key]] = $6
+    phase[key, seen[key]] = $7
+    bucket[key, seen[key]] = $10
+  }
+  END {
+    for (key in seen) {
+      if (seen[key] != 4) exit 1
+      if (leg[key, 1] != "A1" || leg[key, 2] != "B1" || leg[key, 3] != "B2" || leg[key, 4] != "A2") exit 1
+      if (phase[key, 1] != "baseline" || phase[key, 2] != "candidate" || phase[key, 3] != "candidate" || phase[key, 4] != "baseline") exit 1
+      for (slot = 1; slot <= 4; slot++) {
+        if (length(bucket[key, slot]) > 63 || bucket[key, slot] !~ /^rustfs-abba-[a-z0-9-]+$/ || bucket[key, slot] in all_buckets) exit 1
+        all_buckets[bucket[key, slot]] = 1
+      }
+      cells++
+    }
+    exit cells == 12 ? 0 : 1
+  }
+' "$OUT_DIR/abba_schedule.csv"
+
+rg -qx 'schedule=ABBA' "$OUT_DIR/manifest.env"
+rg -qx 'rounds=3' "$OUT_DIR/manifest.env"
+rg -qx 'baseline_revision=baseline-test' "$OUT_DIR/manifest.env"
+rg -qx 'candidate_revision=candidate-test' "$OUT_DIR/manifest.env"
+rg -qx 'external_isolation=local-per-cell-disks' "$OUT_DIR/manifest.env"
+rg -qx 'bucket_isolation=per-leg' "$OUT_DIR/manifest.env"
+rg -qx 'dataset_setup=get-and-mixed-via-warp-put' "$OUT_DIR/manifest.env"
+[[ "$(rg -c -- '--extra-args --noclear' "$TRACE_FILE")" == "64" ]]
+! rg -q -- 'rustfs-bench' "$TRACE_FILE"
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --out-dir "${TMP_DIR}/missing-revisions" >/dev/null 2>&1; then
+  echo "expected formal mode to reject unknown binary revisions" >&2
+  exit 1
+fi
+
+mkdir -p "${TMP_DIR}/data/reused/put-4kib-A1-sync-true"
+printf '%s\n' sentinel >"${TMP_DIR}/data/reused/put-4kib-A1-sync-true/sentinel"
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --data-root "${TMP_DIR}/data" \
+  --out-dir "${TMP_DIR}/reused" >/dev/null 2>&1; then
+  echo "expected local mode to reject a reused run namespace" >&2
+  exit 1
+fi
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --endpoint 127.0.0.1:9000 \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --out-dir "${TMP_DIR}/external" \
+  --dry-run >/dev/null 2>&1; then
+  echo "expected formal external mode to require a deploy hook" >&2
+  exit 1
+fi
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --endpoint 127.0.0.1:9000 \
+  --deploy-hook ':' \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --out-dir "${TMP_DIR}/missing-deploy-evidence" >/dev/null 2>&1; then
+  echo "expected a formal external deploy hook to write evidence" >&2
+  exit 1
+fi
+
+echo "hotpath warp ABBA tests passed"

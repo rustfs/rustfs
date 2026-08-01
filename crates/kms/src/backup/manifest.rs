@@ -306,6 +306,141 @@ impl LocalKdfDescriptor {
     }
 }
 
+/// Transit engine reference recorded in a Vault-backed bundle.
+///
+/// Transit keys are non-exportable, so a bundle can only ever name the key and
+/// the version window its content depends on. Restore compares these values
+/// against the Transit key the operator's native Vault restore produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultTransitReference {
+    /// Transit engine mount path.
+    pub mount_path: String,
+    /// Transit key name.
+    pub key_name: String,
+    /// Lowest Transit key version the bundle's content still needs. A target
+    /// whose `min_decryption_version` sits above this can no longer decrypt
+    /// the oldest state in the bundle.
+    pub required_min_version: u32,
+    /// Latest Transit key version at snapshot time. A target whose newest
+    /// version is below this was restored to a point before the bundle.
+    pub current_version: u32,
+    /// Operator-recorded immutable reference to the native Vault/HSM snapshot
+    /// protecting this key. RustFS neither produces nor consumes that
+    /// snapshot; the reference exists so restore evidence can name it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_snapshot_reference: Option<String>,
+}
+
+/// KV generation of one key's record at snapshot time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultKvRecordReference {
+    /// Stable key id the record belongs to.
+    pub key_id: String,
+    /// KV2 secret version holding the record when the snapshot was taken.
+    /// Restore compares the target's current version against it: a lower
+    /// value means the target's Vault was restored to a point before the
+    /// bundle, a higher value means the target moved ahead of it.
+    pub kv_version: u64,
+}
+
+/// Immutable references to the external Vault state a bundle depends on.
+///
+/// A Vault-backed bundle never carries the cryptographic root: Transit keys
+/// cannot be exported and KV2 records live in Vault's own storage. What the
+/// bundle can own is a precise description of *which* external state it was
+/// captured against, so a restore refuses to proceed when the operator's
+/// native Vault restore landed somewhere else. Credentials are structurally
+/// absent — no token, AppRole secret id, or TLS material is representable in
+/// this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultExternalReferences {
+    /// Opaque identity of the Vault cluster the snapshot was taken from.
+    pub cluster_id: String,
+    /// Vault Enterprise namespace, when the deployment uses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// KV v2 mount holding the RustFS records.
+    pub kv_mount: String,
+    /// Path prefix under `kv_mount` holding the RustFS records.
+    pub kv_path_prefix: String,
+    /// Transit engine reference; present exactly when the bundle's material
+    /// is protected by a Transit key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit: Option<VaultTransitReference>,
+    /// Per-key KV generation observed at snapshot time, one entry per key the
+    /// bundle carries a record for.
+    pub kv_records: Vec<VaultKvRecordReference>,
+}
+
+impl VaultExternalReferences {
+    fn validate(&self, backend: BackupBackendKind, protection: AtRestProtection) -> Result<(), BackupError> {
+        require_non_empty("external_references.cluster_id", &self.cluster_id)?;
+        require_non_empty("external_references.kv_mount", &self.kv_mount)?;
+        require_non_empty("external_references.kv_path_prefix", &self.kv_path_prefix)?;
+        if self.namespace.as_deref() == Some("") {
+            return Err(BackupError::corrupted("external Vault namespace must not be empty when present"));
+        }
+
+        // The Transit reference is required exactly where the cryptographic
+        // root lives in Transit; a storage-only KV2 bundle that claims one
+        // would misdescribe its own trust root.
+        let transit_required = matches!(
+            (backend, protection),
+            (BackupBackendKind::VaultTransit, _) | (BackupBackendKind::VaultKv2, AtRestProtection::TransitWrapped)
+        );
+        match (&self.transit, transit_required) {
+            (None, true) => {
+                return Err(BackupError::corrupted(format!(
+                    "({backend:?}, {protection:?}) bundles must reference the Transit key protecting them"
+                )));
+            }
+            (Some(_), false) => {
+                return Err(BackupError::corrupted(format!(
+                    "({backend:?}, {protection:?}) bundles have no Transit trust root to reference"
+                )));
+            }
+            (Some(transit), true) => {
+                require_non_empty("external_references.transit.mount_path", &transit.mount_path)?;
+                require_non_empty("external_references.transit.key_name", &transit.key_name)?;
+                if transit.required_min_version == 0 {
+                    return Err(BackupError::corrupted("Transit reference must require at least key version 1"));
+                }
+                if transit.current_version < transit.required_min_version {
+                    return Err(BackupError::corrupted(format!(
+                        "Transit reference declares current version {} below the required minimum {}",
+                        transit.current_version, transit.required_min_version
+                    )));
+                }
+                if transit.native_snapshot_reference.as_deref() == Some("") {
+                    return Err(BackupError::corrupted("Transit native snapshot reference must not be empty when present"));
+                }
+            }
+            (None, false) => {}
+        }
+
+        let mut seen = BTreeSet::new();
+        for record in &self.kv_records {
+            require_non_empty("external_references.kv_records[].key_id", &record.key_id)?;
+            if record.kv_version == 0 {
+                return Err(BackupError::corrupted(format!(
+                    "KV generation for key '{}' must be at least 1",
+                    record.key_id
+                )));
+            }
+            if !seen.insert(record.key_id.as_str()) {
+                return Err(BackupError::corrupted(format!(
+                    "KV reference for key '{}' appears more than once",
+                    record.key_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Completeness marker of a bundle.
 ///
 /// A producer writes `in-progress` state (or no manifest at all) until the
@@ -394,6 +529,10 @@ pub struct BackupManifest {
     /// Local backend section; required exactly when `backend` is `Local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_kdf: Option<LocalKdfDescriptor>,
+    /// External Vault references; required exactly when `backend` is a Vault
+    /// backend. Never carries credentials — see [`VaultExternalReferences`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_references: Option<VaultExternalReferences>,
     /// Reserved for the per-key version/envelope inventory defined by the
     /// backlog#1565 contract. May not carry data in format version 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,6 +711,7 @@ impl BackupManifest {
         }
         self.validate_responsibility()?;
         self.validate_local_kdf()?;
+        self.validate_external_references()?;
         self.validate_artifacts()?;
         Ok(())
     }
@@ -598,6 +738,19 @@ impl BackupManifest {
             (BackupBackendKind::Local, Some(descriptor)) => descriptor.validate(),
             (_, Some(_)) => Err(BackupError::corrupted("local_kdf descriptor is only valid for the Local backend")),
             (_, None) => Ok(()),
+        }
+    }
+
+    fn validate_external_references(&self) -> Result<(), BackupError> {
+        let vault_backend = matches!(self.backend, BackupBackendKind::VaultKv2 | BackupBackendKind::VaultTransit);
+        match (&self.external_references, vault_backend) {
+            (None, true) => Err(BackupError::corrupted("Vault backend manifest must carry external Vault references")),
+            (Some(_), false) => Err(BackupError::corrupted(format!(
+                "external Vault references are not valid for backend {:?}",
+                self.backend
+            ))),
+            (Some(references), true) => references.validate(self.backend, self.at_rest_protection),
+            (None, false) => Ok(()),
         }
     }
 
@@ -865,6 +1018,7 @@ mod tests {
                 vec![AtRestProtection::EncryptedMasterKey],
                 Some("verifier-opaque-1".to_string()),
             )),
+            external_references: None,
             key_versions: None,
             capability_discovery: None,
             completeness: CompletenessState::InProgress,
@@ -1270,5 +1424,165 @@ mod tests {
         let decoded = BackupManifest::decode(&bytes).expect("decoding should succeed");
         assert_eq!(decoded, sealed);
         assert_eq!(decoded.responsibility, BackupResponsibility::ReferenceOnly);
+    }
+
+    fn transit_references() -> VaultExternalReferences {
+        VaultExternalReferences {
+            cluster_id: "vault-cluster-a".to_string(),
+            namespace: Some("tenant-a".to_string()),
+            kv_mount: "secret".to_string(),
+            kv_path_prefix: "rustfs/kms/transit-metadata".to_string(),
+            transit: Some(VaultTransitReference {
+                mount_path: "transit".to_string(),
+                key_name: "rustfs-master".to_string(),
+                required_min_version: 2,
+                current_version: 5,
+                native_snapshot_reference: Some("s3://dr/vault/2026-08-01.snap".to_string()),
+            }),
+            kv_records: vec![VaultKvRecordReference {
+                key_id: "object-key".to_string(),
+                kv_version: 4,
+            }],
+        }
+    }
+
+    fn transit_manifest_unsealed() -> BackupManifest {
+        BackupManifest {
+            backend: BackupBackendKind::VaultTransit,
+            at_rest_protection: AtRestProtection::ExternalNonExportable,
+            responsibility: BackupResponsibility::MetadataPlusExternalRoot,
+            artifacts: vec![artifact(ArtifactKind::KeyMetadata, "vault/records/object-key.json.enc")],
+            local_kdf: None,
+            external_references: Some(transit_references()),
+            ..local_manifest_unsealed()
+        }
+    }
+
+    #[test]
+    fn vault_bundle_round_trips_with_external_references() {
+        let sealed = seal(transit_manifest_unsealed());
+        let bytes = sealed.encode().expect("encoding should succeed");
+        let decoded = BackupManifest::decode(&bytes).expect("decoding should succeed");
+        assert_eq!(decoded, sealed);
+    }
+
+    #[test]
+    fn vault_backend_requires_external_references() {
+        let manifest = BackupManifest {
+            external_references: None,
+            ..transit_manifest_unsealed()
+        };
+        expect_corrupted(
+            BackupManifest::decode(&serde_json::to_vec(&seal(manifest)).expect("serialize")),
+            "must carry external Vault references",
+        );
+    }
+
+    #[test]
+    fn non_vault_backend_rejects_external_references() {
+        let manifest = BackupManifest {
+            external_references: Some(transit_references()),
+            ..local_manifest_unsealed()
+        };
+        expect_corrupted(
+            BackupManifest::decode(&serde_json::to_vec(&seal(manifest)).expect("serialize")),
+            "not valid for backend",
+        );
+    }
+
+    /// One way to contradict an otherwise valid set of Vault references.
+    type ReferenceContradiction = Box<dyn Fn(&mut VaultExternalReferences)>;
+
+    #[test]
+    fn external_reference_contradictions_fail_closed() {
+        let cases: [(&str, ReferenceContradiction); 7] = [
+            ("cluster_id", Box::new(|refs| refs.cluster_id.clear())),
+            ("kv_mount", Box::new(|refs| refs.kv_mount.clear())),
+            ("namespace must not be empty", Box::new(|refs| refs.namespace = Some(String::new()))),
+            (
+                "must reference the Transit key",
+                Box::new(|refs: &mut VaultExternalReferences| refs.transit = None),
+            ),
+            (
+                "at least key version 1",
+                Box::new(|refs: &mut VaultExternalReferences| {
+                    if let Some(transit) = refs.transit.as_mut() {
+                        transit.required_min_version = 0;
+                    }
+                }),
+            ),
+            (
+                "below the required minimum",
+                Box::new(|refs: &mut VaultExternalReferences| {
+                    if let Some(transit) = refs.transit.as_mut() {
+                        transit.current_version = 1;
+                    }
+                }),
+            ),
+            (
+                "appears more than once",
+                Box::new(|refs: &mut VaultExternalReferences| {
+                    let first = refs.kv_records[0].clone();
+                    refs.kv_records.push(first);
+                }),
+            ),
+        ];
+        for (needle, mutate) in cases {
+            let mut references = transit_references();
+            mutate(&mut references);
+            let manifest = BackupManifest {
+                external_references: Some(references),
+                ..transit_manifest_unsealed()
+            };
+            expect_corrupted(BackupManifest::decode(&serde_json::to_vec(&seal(manifest)).expect("serialize")), needle);
+        }
+    }
+
+    /// The reference schema is the only place a Vault coordinate reaches a
+    /// bundle, so its field set is pinned: a credential-carrying field could
+    /// only appear by editing this assertion.
+    #[test]
+    fn external_reference_field_set_is_frozen() {
+        let value = serde_json::to_value(transit_references()).expect("serialize");
+        let mut top: Vec<&str> = value.as_object().expect("object").keys().map(String::as_str).collect();
+        top.sort_unstable();
+        assert_eq!(
+            top,
+            [
+                "cluster_id",
+                "kv_mount",
+                "kv_path_prefix",
+                "kv_records",
+                "namespace",
+                "transit"
+            ]
+        );
+
+        let mut transit: Vec<&str> = value["transit"]
+            .as_object()
+            .expect("transit object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        transit.sort_unstable();
+        assert_eq!(
+            transit,
+            [
+                "current_version",
+                "key_name",
+                "mount_path",
+                "native_snapshot_reference",
+                "required_min_version"
+            ]
+        );
+
+        let mut record: Vec<&str> = value["kv_records"][0]
+            .as_object()
+            .expect("record object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        record.sort_unstable();
+        assert_eq!(record, ["key_id", "kv_version"]);
     }
 }

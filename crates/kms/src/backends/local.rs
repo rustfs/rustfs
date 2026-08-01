@@ -14,7 +14,10 @@
 
 //! Local file-based KMS backend implementation
 
-use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits};
+use crate::backends::{
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits,
+    ensure_tag_keys_are_mutable,
+};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -1294,6 +1297,32 @@ impl LocalKmsClient {
         Ok(())
     }
 
+    /// Read-modify-write of a key's mutable metadata under the per-key write
+    /// lock, carrying the existing key material over untouched.
+    ///
+    /// `mutate` reports whether it changed anything; an unchanged record is
+    /// never rewritten, so a repeated no-op update neither rewrites the key
+    /// file nor risks a failed commit on an unrelated call.
+    async fn update_key_metadata<F>(&self, key_id: &str, mutate: F) -> Result<()>
+    where
+        F: FnOnce(&mut MasterKeyInfo) -> Result<bool>,
+    {
+        let _write_guard = self.lock_key_for_write(key_id).await;
+        let mut master_key = self.load_master_key(key_id).await?;
+        if !mutate(&mut master_key)? {
+            return Ok(());
+        }
+
+        // Preserve the existing key material (see enable_key): a metadata edit
+        // must never regenerate the master key, or every DEK wrapped by it
+        // becomes undecryptable.
+        let key_material = self.get_key_material(key_id).await?;
+        self.save_master_key(&master_key, &key_material).await?;
+
+        debug!(key_id, "Local KMS key metadata updated");
+        Ok(())
+    }
+
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
     #[cfg(test)]
     pub(crate) async fn schedule_key_deletion(
@@ -1386,7 +1415,8 @@ impl LocalKmsBackend {
             crate::config::BackendConfig::Local(local_config) => local_config.clone(),
             crate::config::BackendConfig::VaultKv2(_)
             | crate::config::BackendConfig::VaultTransit(_)
-            | crate::config::BackendConfig::Static(_) => {
+            | crate::config::BackendConfig::Static(_)
+            | crate::config::BackendConfig::Aws(_) => {
                 return Err(KmsError::configuration_error("Expected Local backend configuration"));
             }
         };
@@ -1411,12 +1441,15 @@ impl KmsBackend for LocalKmsBackend {
             // Generate key material
             let key_material = generate_key_material(algorithm)?;
 
-            let master_key = MasterKeyInfo::new_with_description(
+            let mut master_key = MasterKeyInfo::new_with_description(
                 key_id.clone(),
                 algorithm.to_string(),
                 Some("local-kms".to_string()),
                 request.description.clone(),
             );
+            // Persist the caller's tags: the response below reports them, and
+            // describe_key reads them back out of this record.
+            master_key.metadata = request.tags.clone();
 
             // Save to disk
             self.client.save_new_master_key(&master_key, &key_material).await?;
@@ -1584,9 +1617,15 @@ impl KmsBackend for LocalKmsBackend {
             // Schedule for deletion (default 30 days)
             ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
@@ -1684,6 +1723,44 @@ impl KmsBackend for LocalKmsBackend {
         self.client.disable_key(key_id, None).await
     }
 
+    async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.client
+            .update_key_metadata(key_id, |master_key| {
+                if master_key.description.as_deref() == description {
+                    return Ok(false);
+                }
+                master_key.description = description.map(str::to_string);
+                Ok(true)
+            })
+            .await
+    }
+
+    async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        ensure_tag_keys_are_mutable(tags.keys().map(String::as_str))?;
+        self.client
+            .update_key_metadata(key_id, |master_key| {
+                let mut changed = false;
+                for (tag_key, value) in tags {
+                    changed |= master_key.metadata.insert(tag_key.clone(), value.clone()).as_ref() != Some(value);
+                }
+                Ok(changed)
+            })
+            .await
+    }
+
+    async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        ensure_tag_keys_are_mutable(tag_keys.iter().map(String::as_str))?;
+        self.client
+            .update_key_metadata(key_id, |master_key| {
+                let mut changed = false;
+                for tag_key in tag_keys {
+                    changed |= master_key.metadata.remove(tag_key).is_some();
+                }
+                Ok(changed)
+            })
+            .await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
@@ -1696,6 +1773,7 @@ impl KmsBackend for LocalKmsBackend {
             .with_enable_disable(true)
             .with_schedule_deletion(true)
             .with_physical_delete(true)
+            .with_update_key_metadata(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
@@ -2606,11 +2684,47 @@ mod tests {
                 key_id: "durable-key".to_string(),
                 pending_window_in_days: None,
                 force_immediate: Some(true),
+                confirm_key_id: None,
             })
             .await
             .expect("delete key");
         assert!(!key_path.exists(), "immediate delete must remove the key file");
         assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "delete must fsync the key directory");
+    }
+
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn delete_key_refuses_a_window_outside_the_supported_range() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "window-bounds-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+        let backend = LocalKmsBackend { client };
+
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+        }
+
+        let state = backend
+            .describe_key(DescribeKeyRequest {
+                key_id: key_id.to_string(),
+            })
+            .await
+            .expect("describe should succeed")
+            .key_metadata
+            .key_state;
+        assert_eq!(state, KeyState::Enabled, "a refused window must not schedule the key");
     }
 
     #[tokio::test]

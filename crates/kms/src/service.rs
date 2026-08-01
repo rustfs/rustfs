@@ -14,6 +14,10 @@
 
 //! Object encryption service for S3-compatible encryption
 
+use crate::api_types::{
+    TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
+};
+use crate::cache::KmsCacheStats;
 use crate::encryption::ciphers::{create_cipher, generate_iv};
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
@@ -112,6 +116,23 @@ impl ObjectEncryptionService {
         self.kms_manager.create_key(request).await
     }
 
+    /// Create a new master key on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - CreateKeyRequest with key parameters
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// CreateKeyResponse with created key details
+    ///
+    pub async fn create_key_with_context(
+        &self,
+        request: CreateKeyRequest,
+        context: &OperationContext,
+    ) -> Result<CreateKeyResponse> {
+        self.kms_manager.create_key_with_context(request, context).await
+    }
+
     /// Describe a master key (delegates to KMS manager)
     ///
     /// # Arguments
@@ -124,6 +145,23 @@ impl ObjectEncryptionService {
         self.kms_manager.describe_key(request).await
     }
 
+    /// Describe a master key on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - DescribeKeyRequest with key ID
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// DescribeKeyResponse with key metadata
+    ///
+    pub async fn describe_key_with_context(
+        &self,
+        request: DescribeKeyRequest,
+        context: &OperationContext,
+    ) -> Result<DescribeKeyResponse> {
+        self.kms_manager.describe_key_with_context(request, context).await
+    }
+
     /// List master keys (delegates to KMS manager)
     ///
     /// # Arguments
@@ -134,6 +172,77 @@ impl ObjectEncryptionService {
     ///
     pub async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse> {
         self.kms_manager.list_keys(request).await
+    }
+
+    /// List master keys on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - ListKeysRequest with listing parameters
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// ListKeysResponse with list of keys
+    ///
+    pub async fn list_keys_with_context(&self, request: ListKeysRequest, context: &OperationContext) -> Result<ListKeysResponse> {
+        self.kms_manager.list_keys_with_context(request, context).await
+    }
+
+    /// Replace a master key's description (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - UpdateKeyDescriptionRequest with key ID and the new
+    ///   description; an empty description clears the stored value
+    ///
+    /// # Returns
+    /// UpdateKeyDescriptionResponse acknowledging the update
+    ///
+    pub async fn update_key_description(&self, request: UpdateKeyDescriptionRequest) -> Result<UpdateKeyDescriptionResponse> {
+        let description = (!request.description.is_empty()).then_some(request.description.as_str());
+        self.kms_manager.update_key_description(&request.key_id, description).await?;
+
+        Ok(UpdateKeyDescriptionResponse {
+            success: true,
+            message: "key description updated".to_string(),
+            key_id: request.key_id,
+        })
+    }
+
+    /// Add or overwrite master key tags (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - TagKeyRequest with key ID and the tags to set; tags
+    ///   outside the request are left untouched
+    ///
+    /// # Returns
+    /// TagKeyResponse acknowledging the update
+    ///
+    pub async fn tag_key(&self, request: TagKeyRequest) -> Result<TagKeyResponse> {
+        self.kms_manager.tag_key(&request.key_id, &request.tags).await?;
+
+        Ok(TagKeyResponse {
+            success: true,
+            message: "key tags updated".to_string(),
+            key_id: request.key_id,
+        })
+    }
+
+    /// Remove master key tags (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - UntagKeyRequest with key ID and the tag keys to remove;
+    ///   tag keys that are not set are ignored, so the call is idempotent
+    ///
+    /// # Returns
+    /// UntagKeyResponse acknowledging the removal
+    ///
+    pub async fn untag_key(&self, request: UntagKeyRequest) -> Result<UntagKeyResponse> {
+        self.kms_manager.untag_key(&request.key_id, &request.tag_keys).await?;
+
+        Ok(UntagKeyResponse {
+            success: true,
+            message: "key tags removed".to_string(),
+            key_id: request.key_id,
+        })
     }
 
     /// Generate a data encryption key (delegates to KMS manager)
@@ -160,9 +269,9 @@ impl ObjectEncryptionService {
     /// Get cache statistics
     ///
     /// # Returns
-    /// Option with (hits, misses) if caching is enabled
+    /// A [`KmsCacheStats`] snapshot if caching is enabled, `None` otherwise
     ///
-    pub async fn cache_stats(&self) -> Option<(u64, u64)> {
+    pub async fn cache_stats(&self) -> Option<KmsCacheStats> {
         self.kms_manager.cache_stats().await
     }
 
@@ -916,6 +1025,128 @@ mod tests {
                 .validate_encryption_context(&actual_context, &invalid_expected)
                 .is_err()
         );
+    }
+
+    async fn describe(service: &ObjectEncryptionService, key_id: &str) -> KeyMetadata {
+        service
+            .describe_key(DescribeKeyRequest {
+                key_id: key_id.to_string(),
+            })
+            .await
+            .expect("describe should succeed")
+            .key_metadata
+    }
+
+    async fn create_metadata_test_key(service: &ObjectEncryptionService, key_id: &str) {
+        service
+            .create_key(CreateKeyRequest {
+                key_name: Some(key_id.to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: Some("original".to_string()),
+                policy: None,
+                tags: HashMap::from([
+                    ("name".to_string(), key_id.to_string()),
+                    ("team".to_string(), "storage".to_string()),
+                ]),
+                origin: None,
+            })
+            .await
+            .expect("test key should be created");
+    }
+
+    #[tokio::test]
+    async fn key_metadata_updates_are_visible_to_describe() {
+        let (service, _temp_dir) = create_test_service().await;
+        create_metadata_test_key(&service, "metadata-key").await;
+
+        service
+            .update_key_description(UpdateKeyDescriptionRequest {
+                key_id: "metadata-key".to_string(),
+                description: "updated".to_string(),
+            })
+            .await
+            .expect("description update should succeed");
+        service
+            .tag_key(TagKeyRequest {
+                key_id: "metadata-key".to_string(),
+                tags: HashMap::from([
+                    ("team".to_string(), "platform".to_string()),
+                    ("env".to_string(), "prod".to_string()),
+                ]),
+            })
+            .await
+            .expect("tagging should succeed");
+
+        // Reading through the manager's metadata cache must observe the
+        // updates, not the snapshot cached when the key was created.
+        let metadata = describe(&service, "metadata-key").await;
+        assert_eq!(metadata.description.as_deref(), Some("updated"));
+        assert_eq!(metadata.tags.get("team").map(String::as_str), Some("platform"));
+        assert_eq!(metadata.tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            metadata.tags.get("name").map(String::as_str),
+            Some("metadata-key"),
+            "tags set at creation must survive a later tag update"
+        );
+
+        // Untagging is idempotent: removing an absent tag is a no-op, not an
+        // error, so a retried request stays safe.
+        for attempt in 1..=2 {
+            service
+                .untag_key(UntagKeyRequest {
+                    key_id: "metadata-key".to_string(),
+                    tag_keys: vec!["env".to_string()],
+                })
+                .await
+                .unwrap_or_else(|error| panic!("untag attempt {attempt} should succeed: {error:?}"));
+        }
+        let metadata = describe(&service, "metadata-key").await;
+        assert!(!metadata.tags.contains_key("env"), "untagged tag must be gone: {:?}", metadata.tags);
+        assert_eq!(
+            metadata.tags.get("team").map(String::as_str),
+            Some("platform"),
+            "untagging must not touch other tags"
+        );
+
+        // An empty description clears the stored value.
+        service
+            .update_key_description(UpdateKeyDescriptionRequest {
+                key_id: "metadata-key".to_string(),
+                description: String::new(),
+            })
+            .await
+            .expect("clearing the description should succeed");
+        assert_eq!(describe(&service, "metadata-key").await.description, None);
+    }
+
+    #[tokio::test]
+    async fn identity_tag_is_not_writable_through_metadata_updates() {
+        let (service, _temp_dir) = create_test_service().await;
+        create_metadata_test_key(&service, "identity-key").await;
+
+        let rewrite = service
+            .tag_key(TagKeyRequest {
+                key_id: "identity-key".to_string(),
+                tags: HashMap::from([("name".to_string(), "other-key".to_string())]),
+            })
+            .await
+            .expect_err("rewriting the identity tag must be rejected");
+        assert!(matches!(rewrite, KmsError::InvalidOperation { .. }), "got {rewrite:?}");
+
+        let removal = service
+            .untag_key(UntagKeyRequest {
+                key_id: "identity-key".to_string(),
+                tag_keys: vec!["team".to_string(), "name".to_string()],
+            })
+            .await
+            .expect_err("removing the identity tag must be rejected");
+        assert!(matches!(removal, KmsError::InvalidOperation { .. }), "got {removal:?}");
+
+        // Both rejections are pre-write: the record is untouched, including
+        // the ordinary tag that shared the rejected untag request.
+        let metadata = describe(&service, "identity-key").await;
+        assert_eq!(metadata.tags.get("name").map(String::as_str), Some("identity-key"));
+        assert_eq!(metadata.tags.get("team").map(String::as_str), Some("storage"));
     }
 
     #[tokio::test]

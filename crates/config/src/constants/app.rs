@@ -230,6 +230,19 @@ pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
 /// Default value: false
 pub const DEFAULT_KMS_ENABLE: bool = false;
 
+/// Environment variable enabling per-key KMS authorization on the SSE-KMS data path.
+///
+/// When enabled, an SSE-KMS write additionally requires `kms:GenerateDataKey` and an
+/// SSE-KMS read additionally requires `kms:Decrypt` on the resolved key, evaluated as
+/// the requesting identity. SSE-S3 and SSE-C are unaffected.
+pub const ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY: &str = "RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY";
+
+/// Default per-key KMS authorization mode for the SSE-KMS data path.
+///
+/// Off for now so deployments whose identity policies only grant s3 actions keep
+/// working; the default flips to on in a later release.
+pub const DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY: bool = false;
+
 /// Environment variable for server KMS backend.
 pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
 

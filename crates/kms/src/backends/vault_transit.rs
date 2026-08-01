@@ -18,7 +18,10 @@ use crate::backends::vault_credentials::{
     CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
     token_source_for,
 };
-use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits};
+use crate::backends::{
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits,
+    ensure_tag_keys_are_mutable,
+};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -56,7 +59,14 @@ const METADATA_CAS_ATTEMPTS: usize = 3;
 /// TTL bound on cached metadata records. This caps how long one node can keep
 /// acting on lifecycle state another node has since changed (disable,
 /// schedule-deletion): the divergence window is one TTL instead of "until
-/// process restart". Matches the manager-level `KmsCache` TTL.
+/// process restart".
+///
+/// Deliberately fixed rather than derived from `CacheConfig`: this cache gates
+/// cryptographic operations through `ensure_key_state_allows`, so its staleness
+/// window must not follow a knob an operator turns to tune the manager-level
+/// describe cache. It happens to equal `config::DEFAULT_CACHE_TTL` today, but
+/// that is a coincidence rather than a contract, and binding the two would let
+/// a later change to the operator-facing default silently widen this window.
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Capacity bound on the metadata cache so an unbounded key namespace cannot
@@ -908,6 +918,46 @@ impl VaultTransitKmsClient {
         .map(|_| ())
     }
 
+    /// Replace the key's description; `None` clears it.
+    ///
+    /// Metadata edits carry no state gate: they neither use nor invalidate key
+    /// material, so they stay available for whatever lifecycle state the key
+    /// is in.
+    pub(crate) async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.mutate_key_metadata(key_id, |metadata| {
+            metadata.description = description.map(str::to_string);
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Add or overwrite tags, leaving every other tag untouched.
+    pub(crate) async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        ensure_tag_keys_are_mutable(tags.keys().map(String::as_str))?;
+        self.mutate_key_metadata(key_id, |metadata| {
+            metadata
+                .tags
+                .extend(tags.iter().map(|(key, value)| (key.clone(), value.clone())));
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Remove tags; tags that are not set are ignored.
+    pub(crate) async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        ensure_tag_keys_are_mutable(tag_keys.iter().map(String::as_str))?;
+        self.mutate_key_metadata(key_id, |metadata| {
+            for tag_key in tag_keys {
+                metadata.tags.remove(tag_key);
+            }
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
     #[cfg(test)]
     pub(crate) async fn schedule_key_deletion(
@@ -1012,7 +1062,9 @@ impl VaultTransitKmsBackend {
                 metadata_key_prefix: vault_config.key_path_prefix.clone(),
                 tls: vault_config.tls.clone(),
             },
-            crate::config::BackendConfig::Local(_) | crate::config::BackendConfig::Static(_) => {
+            crate::config::BackendConfig::Local(_)
+            | crate::config::BackendConfig::Static(_)
+            | crate::config::BackendConfig::Aws(_) => {
                 return Err(KmsError::configuration_error("Expected Vault Transit backend configuration"));
             }
         };
@@ -1174,9 +1226,15 @@ impl KmsBackend for VaultTransitKmsBackend {
         } else {
             ensure_key_state_permits(&key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30"));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let scheduled = Zoned::now() + Duration::from_secs(days as u64 * 86400);
@@ -1235,6 +1293,18 @@ impl KmsBackend for VaultTransitKmsBackend {
         self.client.rotate_key(key_id, None).await.map(|_| ())
     }
 
+    async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.client.update_key_description(key_id, description).await
+    }
+
+    async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        self.client.tag_key(key_id, tags).await
+    }
+
+    async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        self.client.untag_key(key_id, tag_keys).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
@@ -1249,6 +1319,7 @@ impl KmsBackend for VaultTransitKmsBackend {
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(true)
+            .with_update_key_metadata(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
@@ -1759,6 +1830,48 @@ mod tests {
         let requests = vault.requests();
         assert_eq!(requests.len(), 7, "two versioned read+write cycles plus one rotate attempt: {requests:?}");
         assert_eq!(requests[6], "POST /v1/transit/keys/wired-key/rotate", "{requests:?}");
+    }
+
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn wired_backend_delete_refuses_a_window_outside_the_supported_range() {
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+            let vault = ScriptedVault::serve(vec![
+                // The state gate reads the transit key, then its metadata record.
+                ScriptedResponse::ok(transit_key_read_data("wired-key")),
+                ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ])
+            .await;
+            let config = KmsConfig::vault_transit(
+                url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+                "scripted-token".to_string(),
+            )
+            .with_insecure_development_defaults();
+            let backend = VaultTransitKmsBackend::new(config)
+                .await
+                .expect("vault transit backend should build");
+
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: "wired-key".to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+
+            let requests = vault.requests();
+            assert!(
+                !requests.iter().any(|line| line.starts_with("POST ")),
+                "a refused window must not write anything: {requests:?}"
+            );
+        }
     }
 
     /// KV2 secret-metadata read payload (`kv2::read_metadata`) pinning the

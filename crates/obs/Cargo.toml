@@ -146,6 +146,7 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time", "macros"] }
 tokio-util = { workspace = true, features = ["io", "compat"] }
+url.workspace = true
 dial9-tokio-telemetry = { workspace = true, optional = true }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
@@ -162,3 +163,4 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 temp-env = { workspace = true }
+log = "0.4"

@@ -251,6 +251,10 @@ pub(crate) mod startup {
         pub(crate) use crate::storage::storage_api::ECStore;
     }
 
+    pub(crate) mod sse {
+        pub(crate) use crate::storage::storage_api::sse_consumer::log_sse_kms_key_policy_mode;
+    }
+
     pub(crate) mod notification {
         pub(crate) use crate::storage::storage_api::{EndpointServerPools, Result, new_global_notification_sys};
 

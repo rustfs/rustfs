@@ -2,7 +2,7 @@
 
 RustFS ships several KMS backends. They differ not only in deployment effort but in **where master key material lives and who can read it**. Pick a backend based on the confidentiality boundary you need, not on the name alone.
 
-For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md).
+For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md). For what may be claimed about the cryptographic implementations themselves, see [Cryptographic compliance positioning](kms-cryptographic-compliance.md).
 
 ## Backend comparison
 
@@ -12,6 +12,7 @@ For how the Vault backends authenticate (static token, AppRole, Vault Agent toke
 | Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | No state persisted by RustFS | Rejected (read-only backend) | Simple deployments with an external secret manager |
 | Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Versioned retention (immutable per-version records + current pointer) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
+| AWS KMS | `AWS` (alias `AwsKms`) | Key material never leaves AWS KMS; RustFS mirrors no key state | AWS KMS (cryptographic isolation) + IAM | Delegated to AWS | On-demand `RotateKeyOnDemand`; prior backing keys stay usable for decryption | Deployments already rooted in AWS IAM that want AWS as the cryptographic root — read [AWS KMS: deviations from the shared backend contract](#aws-kms-deviations-from-the-shared-backend-contract) first |
 
 ## Vault KV2: what the backend does and does not do
 
@@ -44,7 +45,7 @@ path "secret/metadata/rustfs/kms/keys/*" {
 Notes:
 
 - The trailing wildcards also cover the per-version material records that rotation creates under `.../keys/{key_id}/versions/{N}`; no extra policy paths are needed.
-- `delete` on the metadata path is required for permanent key deletion (`force_immediate`); drop it if you never hard-delete keys.
+- `delete` on the metadata path is required for permanent key deletion (`force_immediate`); drop it if you never hard-delete keys. RustFS refuses `force_immediate` unless the server sets `RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION=true`, so leaving that gate off keeps the capability unreachable no matter what the Vault policy allows.
 - Do not attach `sudo`, wildcard mounts, or Transit paths to this policy; the KV2 backend does not use them.
 - Auditing KV reads on the key prefix is strongly recommended: every read event is a potential master-key disclosure.
 
@@ -62,18 +63,108 @@ Decryption loads exactly the version recorded in the envelope and fails closed w
 
 - Every version record that any stored DEK envelope references must remain readable. Until an object rewrap/migration capability exists, assume **every** version of a rotated key is referenced: destroying a version record permanently orphans all objects whose DEKs it wrapped.
 - Version records are ordinary KV v2 secrets under the key subtree. Never run `kv metadata delete` or `kv destroy` against `{prefix}/{key_id}/versions/*`, and do not apply `delete-version-after` or retention tooling to that subtree. RustFS-managed retention does not rely on KV2's own secret versioning (each version record has a single KV revision), so KV `max-versions` settings do not protect or endanger history — but metadata deletion always removes a record entirely.
-- Permanent key deletion through RustFS (`force_immediate` after `PendingDeletion`) purges the key's version records together with the key record; that is the only supported way to remove them.
+- Permanent key deletion through RustFS (`force_immediate` after `PendingDeletion`) purges the key's version records together with the key record; that is the only supported way to remove them. It is refused by default: the server must set `RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION=true`, and the request must echo the key id back as `confirm_key_id`. Leave the gate off unless you are actively destroying keys, and turn it off again afterwards — the pending-deletion window plus `CancelKeyDeletion` is the only recovery path for objects encrypted under the key.
 - For Vault Transit, retention is governed by the Transit key's `min_decryption_version`: never raise it above the oldest version that may still protect live ciphertext.
 
 ### Upgrade before first rotation (hard constraint)
 
 Do not rotate any key until **every** RustFS node in the cluster runs a build that understands the `master_key_version` envelope field. Older binaries ignore the field and always decrypt with the current material: harmless while nothing has been rotated, but after a rotation they will fail to decrypt every object wrapped by an earlier key version. Complete the rolling upgrade of the entire cluster first, then rotate.
 
+This is the sharpest instance of a broader class of constraints; the rest are collected in [Mixed-version clusters during a rolling upgrade](#mixed-version-clusters-during-a-rolling-upgrade).
+
+## Mixed-version clusters during a rolling upgrade
+
+During a rolling upgrade the cluster runs two RustFS builds at once. That window matters more for KMS than for most subsystems, because KMS state is shared three ways: **Vault** holds the key records and Transit metadata, **cluster storage** holds the persisted KMS configuration, and **each node's process memory** holds caches and the live backend instance. Nodes on different builds agree on the first, may disagree on the third, and — for configuration — can disagree for as long as the operator leaves them running.
+
+This section states only what is true of the current implementation. It is written for the KV2 and Transit backends; the Local backend is unsupported for multi-node deployments regardless of version (see the [deployment support matrix](#deployment-support-matrix)).
+
+### Persisted formats are backward compatible in both directions
+
+Nothing in this list requires a coordinated format cutover. The compatibility is deliberate and is covered by decode tests.
+
+- **DEK envelopes.** `DataKeyEnvelope::master_key_version` is optional and omitted when absent, so envelopes written by non-rotating backends stay byte-identical to the historical seven-field JSON shape. An upgraded node reading a pre-versioning envelope resolves `None` to the key's recorded baseline version, or — for a key that was never rotated, and so has no baseline — to the current version, which is exactly the pre-versioning behavior.
+- **KV2 key records.** `baseline_version` is read with a serde default, so records written by older builds deserialize unchanged, and `None` correctly means "never rotated".
+- **Transit metadata records.** Metadata persisted in KV v2 by either build decodes on the other.
+
+The one-way hazard is the rotation constraint above: an older binary reading a *new* envelope silently ignores the version field and decrypts with the current material.
+
+### Guarantees that hold only once every node is upgraded
+
+These are properties of the upgraded code, so a single node left behind removes them for the whole cluster.
+
+- **Check-and-set lifecycle writes.** Upgraded builds write every KV2 lifecycle mutation — create, enable, disable, tag metadata, schedule deletion, cancel deletion — as a versioned read followed by a check-and-set write, retrying on conflict by re-reading and re-validating the state gate (rustfs/rustfs#5518). Transit metadata writes got the same treatment (rustfs/rustfs#5520). Builds older than those write blind. A blind write from an old node can overwrite a check-and-set commit from an upgraded node without any conflict being reported, which is precisely the lost update the change was made to eliminate.
+- **`baseline_version` survives a write-back.** The KV2 key record does not deny unknown fields, so an old build reads a new record without error — and drops `baseline_version` when it writes that record back for any reason. A key that loses its baseline resolves pre-versioning envelopes to the current version again, which after a rotation means the wrong master key material. Any lifecycle operation issued to an old node is enough to trigger this.
+- **Version-record awareness.** Rotation stores each historical version under `{prefix}/{key_id}/versions/{N}` as a create-only record (check-and-set of 0), so two nodes racing the same version number produce exactly one creator; the loser adopts the persisted, never-current material or fails without touching the current pointer. Old builds have no concept of that sub-path: they never read or write it, and their key listing reports the KV2 directory entry (`my-key/`) as though it were a key, because the directory filter only exists in upgraded builds.
+
+### Windows in which nodes can legitimately disagree
+
+Even with every node on the same build, some state is process-local. These windows are bounded by design, except the last one.
+
+| What can diverge | Bound | Mechanism |
+| --- | --- | --- |
+| Transit key lifecycle state used by the `encrypt` and `generate_data_key` gates | ≤ 300 s (`METADATA_CACHE_TTL`) | Each node caches Transit metadata in process, TTL- and capacity-bounded, with targeted invalidation when a data-path call reports the key is gone server-side. A disable or schedule-deletion performed on one node is enforced on the others within one TTL at the latest, sooner if they hit that signal. |
+| `describe_key` output | ≤ 300 s | The manager-level key metadata cache. This is a reporting cache; the KV2 state gates do not read it. |
+| KV2 key lifecycle state | None | The KV2 backend re-reads the key record from Vault for every lifecycle and data-key operation, so a committed disable is effective on every upgraded node immediately. |
+| Active KMS configuration | Until the remaining nodes are restarted | See below. |
+
+Builds older than rustfs/rustfs#5520 held the Transit metadata cache with no TTL and no capacity bound. On such a node the divergence window is not 300 seconds but "until the process restarts": it can keep encrypting under a key that another node disabled, indefinitely.
+
+### Configuration is persisted cluster-wide but applied per node
+
+`POST /rustfs/admin/v3/kms/reconfigure` currently does two things: it switches the KMS service **on the node that handled the request**, and it persists the new configuration to cluster storage at `config/kms_config.json`. It does not notify peers. Every other node keeps running the configuration it started with until it is restarted, at which point it loads the persisted configuration during startup.
+
+The practical consequences today:
+
+- The configuration-split window has no upper bound other than the operator restarting the remaining nodes. Convergence is a restart, not a timeout.
+- During the window both configurations are live. If the reconfiguration changed backends, or changed the Vault mount or key prefix, different nodes write new key material to different places, and a key created through one node is invisible to the others.
+- `kms status` reflects the node that answered the request, so a single successful status response is not evidence that the cluster is consistent. Query every node.
+
+Treat `reconfigure` as the first step of a cluster-wide operation, not as the operation itself.
+
+### Recommended rolling upgrade order
+
+Follow the node-at-a-time procedure in the [multi-node restart runbook](rolling-restart.md); this adds the KMS-specific sequencing around it.
+
+1. **Freeze KMS administrative traffic** for the duration: no key creation, enable, disable, tagging, schedule-deletion, cancel-deletion, rotation, or reconfiguration. Object read and write traffic continues normally.
+2. **Upgrade one node at a time**, waiting for each to report ready before starting the next.
+3. **Verify no node is left behind** before unfreezing. A single old node is enough to reintroduce blind writes and to strip `baseline_version` on its next lifecycle write.
+4. **Resume administrative traffic.**
+5. **Only then perform the first rotation of any key.** Once the whole cluster understands `master_key_version`, rotation is safe; before that it is not.
+6. **If the KMS configuration was changed at any point**, restart the nodes that did not handle the request so they reload the persisted configuration, and confirm each one reports the intended backend.
+
+### Do not do these during a mixed-version window
+
+- **Rotate any key.** This is the hard constraint stated above; a rotation is unrecoverable for objects an old node must read.
+- **Issue any KV2 lifecycle write to an old node.** Its blind write can clobber a concurrent check-and-set commit and will drop `baseline_version` from the record.
+- **Create the same key ID from two nodes.** The create path is create-only on upgraded builds, but an old node's blind write does not honor that: the later writer's material wins and every DEK already wrapped with the earlier material becomes permanently unwrappable.
+- **Assume a disable or schedule-deletion took effect cluster-wide.** Old Transit nodes cache lifecycle state without expiry; confirm per node, or restart the old nodes, before treating a key as no longer in use.
+- **Reconfigure the KMS backend and consider it done.** The change applies to one node and is persisted; the rest need a restart.
+- **Delete or prune version records** under `{prefix}/{key_id}/versions/*` for any reason. This is never safe, mixed-version or not; see [Retention and destruction preconditions](#retention-and-destruction-preconditions).
+
 ## Choosing between Vault KV2 and Vault Transit
 
 Use **Vault Transit** (`VaultTransit`) when key material must be cryptographically isolated from anyone holding storage-level read access: Transit keeps key-encryption keys inside Vault and only ever returns ciphertext, and supports server-side key versioning/rotation.
 
 Use **Vault KV2** only when you accept that the Vault ACL on the key path *is* the confidentiality boundary and you want the operational simplicity of a single KV mount.
+
+## AWS KMS: deviations from the shared backend contract
+
+Select it with `RUSTFS_KMS_BACKEND=aws`. Credentials and region resolution are delegated entirely to the standard `aws-config` provider chain (environment, shared profile, container/IMDS role), so RustFS never stores, persists, or redacts AWS credential material of its own. Only two non-credential settings are read: `RUSTFS_KMS_AWS_REGION` and `RUSTFS_KMS_AWS_ENDPOINT_URL`. A plaintext (`http://`) endpoint override would expose every KMS request including plaintext data keys, so it is refused unless the development opt-in is set.
+
+AWS owns key state, backing-key rotation, and the deletion window, and this backend mirrors none of it locally. That makes four behaviours differ from every RustFS-managed backend. Verify each against your operational assumptions before switching:
+
+| Behaviour | RustFS-managed backends | AWS KMS backend |
+| --- | --- | --- |
+| Decryption with a `Disabled` or `PendingDeletion` key | Kept working, so disabling a key never breaks reads of objects already encrypted under it | **Refused by AWS.** Objects encrypted under a key that is later disabled become unreadable until it is re-enabled |
+| Key deletion | Physical deletion available | **No physical delete.** `ScheduleKeyDeletion` is the only removal path; AWS destroys the material when the 7-30 day window elapses. RustFS never destroys AWS-held material, and `force_immediate` is refused |
+| Cancelling a scheduled deletion | Key returns to `Enabled` | Key is left **`Disabled`**; enable it explicitly to make it usable again |
+| Creating a key under a caller-chosen name | The requested name becomes the key id | **Refused.** AWS assigns identifiers and this backend does not manage aliases, so a named create would produce a key unreachable by that name |
+
+Two consequences follow from that last row: **SSE-S3 key auto-creation and the synthetic KMS probe are unavailable on this backend**, because both address a key by a name they choose. Pre-create keys in AWS and reference them by AWS key id or ARN.
+
+Key versions are opaque. AWS addresses backing keys internally and picks the right one to decrypt with, so RustFS reports `key_version` as 1 and cannot enumerate versions. Rotation uses `RotateKeyOnDemand`, which retains prior backing keys for decryption; AWS's separate automatic yearly rotation is neither enabled nor reported on by RustFS.
+
+The AWS backend is not configurable through the KMS admin API — use the environment variables above at startup.
 
 ## Local backend durability and deployment support matrix
 
