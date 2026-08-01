@@ -17,18 +17,17 @@ use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     current_action_credentials, current_app_context, current_object_store_handle_for_context, current_server_config_for_context,
-    publish_server_config,
 };
 use crate::admin::service::config::{
-    CONFIG_WORKER_RELOAD_FAILURE_STATE, EVENT_CONFIG_WORKER_RELOAD_FAILED, FULL_CONFIG_WORKER_SUBSYSTEMS, LOG_COMPONENT_ADMIN,
-    LOG_SUBSYSTEM_CONFIG, PreparedRuntimeConfig, is_dynamic_config_subsystem, preflight_dynamic_config_reload,
-    prepare_server_config, reload_dynamic_config_runtime_state, reload_runtime_config_snapshot, signal_config_snapshot_reload,
-    signal_config_snapshot_reload_checked, signal_dynamic_config_reload_checked,
+    FULL_CONFIG_WORKER_SUBSYSTEMS, is_dynamic_config_subsystem, preflight_dynamic_config_reload, prepare_server_config,
+    publish_latest_runtime_config_snapshot, reload_dynamic_config_runtime_state, reload_runtime_config_snapshot,
+    signal_config_snapshot_reload, signal_config_snapshot_reload_checked, signal_dynamic_config_reload_checked,
 };
 use crate::admin::storage_api::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
 use crate::admin::storage_api::config::{
-    AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, read_admin_config,
-    read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_config, save_admin_server_config_snapshot,
+    AdminServerConfigSaveResult, AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config,
+    read_admin_config, read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_config,
+    save_admin_server_config_snapshot,
 };
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
@@ -766,7 +765,10 @@ async fn load_server_config_snapshot_from_store() -> S3Result<AdminServerConfigS
         .map_err(Into::into)
 }
 
-async fn save_server_config_to_store(config: &ServerConfig, snapshot: &AdminServerConfigSnapshot) -> S3Result<bool> {
+async fn save_server_config_to_store(
+    config: &ServerConfig,
+    snapshot: &AdminServerConfigSnapshot,
+) -> S3Result<AdminServerConfigSaveResult> {
     let store = object_store()?;
     save_admin_server_config_snapshot(store, config, snapshot)
         .await
@@ -987,8 +989,8 @@ fn decode_config_history_snapshot(data: &[u8]) -> S3Result<ServerConfig> {
     Ok(config)
 }
 
-fn validate_restore_rollback_generation(current: &ServerConfig, restored: &ServerConfig) -> S3Result<()> {
-    if current == restored {
+fn validate_restore_rollback_generation(current: Option<Uuid>, committed: Option<Uuid>) -> S3Result<()> {
+    if current.is_some() && current == committed {
         Ok(())
     } else {
         Err(s3_error!(
@@ -1004,12 +1006,12 @@ async fn save_server_config_history_snapshot(config: &ServerConfig) -> S3Result<
     save_server_config_history(&sealed).await
 }
 
-async fn cleanup_failed_config_history_snapshot(restore_id: &str) {
+async fn cleanup_config_history_snapshot(restore_id: &str) {
     if let Err(err) = delete_server_config_history(restore_id).await {
         warn!(
             restore_id,
             error = %err,
-            "Failed to remove config history snapshot for an uncommitted mutation"
+            "Failed to remove config history snapshot"
         );
     }
 }
@@ -1843,23 +1845,6 @@ async fn reject_lost_config_transaction<T>(snapshot: AdminServerConfigSnapshot, 
     ))
 }
 
-fn publish_prepared_config_snapshots(config: ServerConfig, prepared: PreparedRuntimeConfig) -> S3Result<()> {
-    prepared.publish_storage_class()?;
-    publish_server_config(config);
-    Ok(())
-}
-
-/// Re-apply local mutable worker families after a full-config replacement.
-/// Peers receive one full-snapshot signal after this returns; signaling each
-/// family here as well would recreate audit/scanner targets twice per peer.
-fn publish_notify_config_intent(
-    config: &ServerConfig,
-    sub_system: Option<&str>,
-) -> Option<rustfs_notify::NotificationLifecycleTransition> {
-    (sub_system.is_none() || sub_system.is_some_and(|sub_system| NOTIFY_SUB_SYSTEMS.contains(&sub_system)))
-        .then(|| rustfs_notify::ensure_live_events().publish_config(config.clone()))
-}
-
 fn config_preflight_subsystems(sub_system: Option<&str>) -> Vec<&str> {
     if let Some(sub_system) = sub_system {
         return is_dynamic_config_subsystem(sub_system)
@@ -1884,78 +1869,26 @@ async fn preflight_config_intent(sub_system: Option<&str>) -> S3Result<()> {
     Ok(())
 }
 
-async fn wait_notify_config_intent(transition: Option<rustfs_notify::NotificationLifecycleTransition>) -> S3Result<bool> {
-    let Some(transition) = transition else {
-        return Ok(false);
-    };
-    transition.wait().await.map_err(|err| {
-        warn!(error = %err, "Failed to apply local notification config");
-        s3_error!(InternalError, "failed to apply notification config")
-    })?;
-    Ok(true)
-}
-
-async fn reload_non_notify_dynamic_subsystems() -> Vec<String> {
-    let mut failures = Vec::new();
-    for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
-        if NOTIFY_SUB_SYSTEMS.contains(&sub_system) {
-            continue;
-        }
-        if reload_dynamic_config_runtime_state(sub_system).await.is_err() {
-            failures.push(format!("local {sub_system}"));
-            warn!(
-                event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_CONFIG,
-                config_subsystem = sub_system,
-                state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
-                reason = "apply_failed",
-                "Published server config but failed to reload a local worker subsystem"
-            );
-        }
-    }
-    failures
-}
-
-fn finish_config_reconciliation(errors: Vec<String>) -> S3Result<()> {
+fn finish_config_reconciliation(errors: Vec<String>, persisted: bool) -> S3Result<()> {
     if errors.is_empty() {
         Ok(())
-    } else {
+    } else if persisted {
         Err(s3_error!(
             InternalError,
             "server config persisted but runtime convergence failed: {}",
             errors.join("; ")
         ))
+    } else {
+        Err(s3_error!(
+            InternalError,
+            "server config was unchanged but runtime convergence failed: {}",
+            errors.join("; ")
+        ))
     }
 }
 
-async fn reconcile_targeted_config(
-    sub_system: Option<String>,
-    storage_class_applied: bool,
-    notify_transition: Option<rustfs_notify::NotificationLifecycleTransition>,
-) -> S3Result<bool> {
-    let mut errors = Vec::new();
-    let notify_applied = notify_transition.is_some();
-    if let Err(err) = wait_notify_config_intent(notify_transition).await {
-        warn!(error = %err, "Local notification config failed to converge");
-        errors.push("local notify".to_string());
-    }
-
-    let config_applied = if notify_applied {
-        if let Some(sub_system) = sub_system.as_deref()
-            && let Err(err) = signal_dynamic_config_reload_checked(sub_system).await
-        {
-            warn!(config_subsystem = sub_system, error = %err, "Peer config reload failed");
-            errors.push(format!("peer {sub_system}"));
-        }
-        true
-    } else if storage_class_applied {
-        if let Err(err) = signal_dynamic_config_reload_checked(STORAGE_CLASS_SUB_SYS).await {
-            warn!(error = %err, "Peer storage-class reload failed");
-            errors.push(format!("peer {STORAGE_CLASS_SUB_SYS}"));
-        }
-        true
-    } else if let Some(sub_system) = sub_system.as_deref()
+async fn reconcile_targeted_config(sub_system: Option<String>, persisted: bool, mut errors: Vec<String>) -> S3Result<bool> {
+    let config_applied = if let Some(sub_system) = sub_system.as_deref()
         && is_dynamic_config_subsystem(sub_system)
     {
         let config_applied = match reload_dynamic_config_runtime_state(sub_system).await {
@@ -1979,21 +1912,19 @@ async fn reconcile_targeted_config(
         false
     };
 
-    finish_config_reconciliation(errors)?;
+    finish_config_reconciliation(errors, persisted)?;
     Ok(config_applied)
 }
 
-async fn reconcile_full_config(notify_transition: Option<rustfs_notify::NotificationLifecycleTransition>) -> S3Result<()> {
-    let mut errors = Vec::new();
-    if let Err(err) = wait_notify_config_intent(notify_transition).await {
-        warn!(error = %err, "Local notification config failed to converge");
+async fn reconcile_full_config(persisted: bool, mut errors: Vec<String>) -> S3Result<()> {
+    if let Err(err) = reload_dynamic_config_runtime_state(NOTIFY_WEBHOOK_SUB_SYS).await {
+        warn!(error = %err, "Local notification config failed to converge from durable config");
         errors.push("local notify".to_string());
     }
     if let Err(err) = signal_dynamic_config_reload_checked(STORAGE_CLASS_SUB_SYS).await {
         warn!(error = %err, "Peer storage-class reload failed");
         errors.push(format!("peer {STORAGE_CLASS_SUB_SYS}"));
     }
-    errors.extend(reload_non_notify_dynamic_subsystems().await);
     if let Err(err) = signal_dynamic_config_reload_checked(NOTIFY_WEBHOOK_SUB_SYS).await {
         warn!(error = %err, "Peer notification config reload failed");
         errors.push("peer notify".to_string());
@@ -2002,91 +1933,82 @@ async fn reconcile_full_config(notify_transition: Option<rustfs_notify::Notifica
         warn!(error = %err, "Peer config snapshot reload failed");
         errors.push("peer config snapshot".to_string());
     }
-    finish_config_reconciliation(errors)
+    finish_config_reconciliation(errors, persisted)
 }
 
 struct PersistedConfigTransaction {
     previous_config: ServerConfig,
     history_restore_id: Option<String>,
-    storage_class_applied: bool,
-    notify_transition: Option<rustfs_notify::NotificationLifecycleTransition>,
+    persisted: bool,
+    committed_generation: Option<Uuid>,
 }
 
 async fn persist_server_config_transaction(
     config: ServerConfig,
-    prepared: PreparedRuntimeConfig,
     snapshot: AdminServerConfigSnapshot,
-    sub_system: Option<&str>,
 ) -> S3Result<PersistedConfigTransaction> {
     snapshot.ensure_lock_held().map_err(ApiError::from).map_err(S3Error::from)?;
     let previous_config = snapshot.config.clone();
     let history_restore_id = save_server_config_history_snapshot(&previous_config).await?;
     if snapshot.is_lock_lost() {
-        cleanup_failed_config_history_snapshot(&history_restore_id).await;
+        cleanup_config_history_snapshot(&history_restore_id).await;
         return reject_lost_config_transaction(snapshot, "before persistence").await;
     }
 
-    let persisted = match save_server_config_to_store(&config, &snapshot).await {
-        Ok(persisted) => persisted,
+    let save_result = match save_server_config_to_store(&config, &snapshot).await {
+        Ok(result) => result,
         Err(err) => {
-            cleanup_failed_config_history_snapshot(&history_restore_id).await;
+            cleanup_config_history_snapshot(&history_restore_id).await;
             return Err(err);
         }
     };
+    let persisted = save_result.persisted();
+    let committed_generation = save_result.generation();
     let history_restore_id = if persisted {
         Some(history_restore_id)
     } else {
-        cleanup_failed_config_history_snapshot(&history_restore_id).await;
+        cleanup_config_history_snapshot(&history_restore_id).await;
         None
     };
-    if snapshot.is_lock_lost() {
-        return reject_lost_config_transaction(snapshot, "after persistence").await;
-    }
-
-    let storage_class_applied = sub_system.is_none_or(|value| value == STORAGE_CLASS_SUB_SYS);
-    if storage_class_applied {
-        if let Err(err) = publish_prepared_config_snapshots(config.clone(), prepared) {
-            return Err(match history_restore_id.as_deref() {
-                Some(restore_id) => s3_error!(
-                    InternalError,
-                    "config persisted but runtime publish failed; recovery snapshot restoreId={}: {}",
-                    restore_id,
-                    err
-                ),
-                None => err,
-            });
-        }
-    } else {
-        publish_server_config(config.clone());
-    }
-    let notify_transition = publish_notify_config_intent(&config, sub_system);
-    if snapshot.is_lock_lost() {
-        return reject_lost_config_transaction(snapshot, "while publishing runtime snapshots").await;
-    }
-
     drop(snapshot);
     Ok(PersistedConfigTransaction {
         previous_config,
         history_restore_id,
-        storage_class_applied,
-        notify_transition,
+        persisted,
+        committed_generation,
     })
+}
+
+async fn reconcile_committed_config(sub_system: Option<String>, persisted: bool) -> S3Result<bool> {
+    let mut errors = Vec::new();
+    let publication_result = match sub_system.as_deref() {
+        Some(sub_system) => publish_latest_runtime_config_snapshot(sub_system).await,
+        None => reload_runtime_config_snapshot().await,
+    };
+    if let Err(err) = publication_result {
+        warn!(error = %err, "Failed to publish the latest durable server config");
+        errors.push("local config snapshot".to_string());
+    }
+
+    if sub_system.is_none() {
+        reconcile_full_config(persisted, errors).await?;
+        return Ok(false);
+    }
+
+    reconcile_targeted_config(sub_system, persisted, errors).await
 }
 
 async fn commit_server_config_transaction(
     config: ServerConfig,
-    prepared: PreparedRuntimeConfig,
     snapshot: AdminServerConfigSnapshot,
     sub_system: Option<String>,
 ) -> S3Result<bool> {
-    let transaction = persist_server_config_transaction(config, prepared, snapshot, sub_system.as_deref()).await?;
-
-    if sub_system.is_none() {
-        reconcile_full_config(transaction.notify_transition).await?;
-        return Ok(false);
+    let transaction = persist_server_config_transaction(config, snapshot).await?;
+    let result = reconcile_committed_config(sub_system, transaction.persisted).await;
+    match (result, transaction.history_restore_id.as_deref()) {
+        (Err(err), Some(restore_id)) => Err(s3_error!(InternalError, "{}; recovery snapshot restoreId={}", err, restore_id)),
+        (result, _) => result,
     }
-
-    reconcile_targeted_config(sub_system, transaction.storage_class_applied, transaction.notify_transition).await
 }
 
 pub struct GetConfigKVHandler {}
@@ -2127,8 +2049,8 @@ impl Operation for SetConfigKVHandler {
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = snapshot.config.clone();
             apply_set_directives(&mut config, &directives)?;
-            let prepared = prepare_server_config(&config, sub_system.as_deref()).await?;
-            commit_server_config_transaction(config, prepared, snapshot, sub_system).await
+            prepare_server_config(&config, sub_system.as_deref()).await?;
+            commit_server_config_transaction(config, snapshot, sub_system).await
         })
         .await?;
 
@@ -2155,8 +2077,8 @@ impl Operation for DelConfigKVHandler {
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = snapshot.config.clone();
             apply_delete_directives(&mut config, &directives);
-            let prepared = prepare_server_config(&config, sub_system.as_deref()).await?;
-            commit_server_config_transaction(config, prepared, snapshot, sub_system).await
+            prepare_server_config(&config, sub_system.as_deref()).await?;
+            commit_server_config_transaction(config, snapshot, sub_system).await
         })
         .await?;
 
@@ -2239,15 +2161,19 @@ impl Operation for RestoreConfigHistoryKVHandler {
         supervise_admin_mutation("config mutation", async move {
             preflight_config_intent(None).await?;
             let snapshot = load_server_config_snapshot_from_store().await?;
-            let prepared = prepare_server_config(&config, None).await?;
-            let restored_config = config.clone();
-            let transaction = persist_server_config_transaction(config, prepared, snapshot, None).await?;
-            let Err(restore_error) = reconcile_full_config(transaction.notify_transition).await else {
+            prepare_server_config(&config, None).await?;
+            let transaction = persist_server_config_transaction(config, snapshot).await?;
+            let Err(restore_error) = reconcile_committed_config(None, transaction.persisted).await else {
                 return Ok(());
             };
 
+            if !transaction.persisted {
+                return Err(restore_error);
+            }
+
             let previous_config = transaction.previous_config;
             let recovery_restore_id = transaction.history_restore_id;
+            let committed_generation = transaction.committed_generation;
             let recovery_reference = recovery_restore_id.as_deref().unwrap_or("not-created");
             let rollback_snapshot = match load_server_config_snapshot_from_store().await {
                 Ok(snapshot) => snapshot,
@@ -2261,7 +2187,9 @@ impl Operation for RestoreConfigHistoryKVHandler {
                     ));
                 }
             };
-            if let Err(rollback_error) = validate_restore_rollback_generation(&rollback_snapshot.config, &restored_config) {
+            if let Err(rollback_error) =
+                validate_restore_rollback_generation(rollback_snapshot.generation(), committed_generation)
+            {
                 return Err(s3_error!(
                     InternalError,
                     "config restore failed: {}; automatic rollback failed: {}; recovery snapshot restoreId={}",
@@ -2271,12 +2199,20 @@ impl Operation for RestoreConfigHistoryKVHandler {
                 ));
             }
 
-            let rollback_prepared = prepare_server_config(&previous_config, None).await?;
-            rollback_snapshot
+            if let Err(rollback_error) = prepare_server_config(&previous_config, None).await {
+                return Err(s3_error!(
+                    InternalError,
+                    "config restore failed: {}; automatic rollback failed: {}; recovery snapshot restoreId={}",
+                    restore_error,
+                    rollback_error,
+                    recovery_reference
+                ));
+            }
+            if let Err(rollback_error) = rollback_snapshot
                 .ensure_lock_held()
                 .map_err(ApiError::from)
-                .map_err(S3Error::from)?;
-            if let Err(rollback_error) = save_server_config_to_store(&previous_config, &rollback_snapshot).await {
+                .map_err(S3Error::from)
+            {
                 return Err(s3_error!(
                     InternalError,
                     "config restore failed: {}; automatic rollback failed: {}; recovery snapshot restoreId={}",
@@ -2285,10 +2221,9 @@ impl Operation for RestoreConfigHistoryKVHandler {
                     recovery_reference
                 ));
             }
-            if rollback_snapshot.is_lock_lost() {
-                if let Err(rollback_error) =
-                    reject_lost_config_transaction::<()>(rollback_snapshot, "after restore rollback persistence").await
-                {
+            let rollback_persisted = match save_server_config_to_store(&previous_config, &rollback_snapshot).await {
+                Ok(result) => result.persisted(),
+                Err(rollback_error) => {
                     return Err(s3_error!(
                         InternalError,
                         "config restore failed: {}; automatic rollback failed: {}; recovery snapshot restoreId={}",
@@ -2297,46 +2232,20 @@ impl Operation for RestoreConfigHistoryKVHandler {
                         recovery_reference
                     ));
                 }
-                return Err(s3_error!(InternalError, "restore rollback lock-loss handling returned unexpectedly"));
-            }
-
-            if let Err(rollback_error) = publish_prepared_config_snapshots(previous_config.clone(), rollback_prepared) {
-                return Err(s3_error!(
-                    InternalError,
-                    "config restore failed: {}; automatic rollback publish failed: {}; recovery snapshot restoreId={}",
-                    restore_error,
-                    rollback_error,
-                    recovery_reference
-                ));
-            }
-            let rollback_transition = publish_notify_config_intent(&previous_config, None);
-            if rollback_snapshot.is_lock_lost() {
-                if let Err(rollback_error) =
-                    reject_lost_config_transaction::<()>(rollback_snapshot, "while publishing restore rollback").await
-                {
-                    return Err(s3_error!(
-                        InternalError,
-                        "config restore failed: {}; automatic rollback failed: {}; recovery snapshot restoreId={}",
-                        restore_error,
-                        rollback_error,
-                        recovery_reference
-                    ));
-                }
-                return Err(s3_error!(InternalError, "restore rollback lock-loss handling returned unexpectedly"));
-            }
+            };
             drop(rollback_snapshot);
 
-            if let Err(rollback_error) = reconcile_full_config(rollback_transition).await {
+            if let Err(rollback_error) = reconcile_committed_config(None, rollback_persisted).await {
                 return Err(s3_error!(
                     InternalError,
-                    "config restore failed: {}; persisted rollback did not converge: {}; recovery snapshot restoreId={}",
+                    "config restore failed: {}; automatic rollback convergence failed: {}; recovery snapshot restoreId={}",
                     restore_error,
                     rollback_error,
                     recovery_reference
                 ));
             }
-            if let Some(recovery_restore_id) = recovery_restore_id.as_deref() {
-                cleanup_failed_config_history_snapshot(recovery_restore_id).await;
+            if rollback_persisted && let Some(recovery_restore_id) = recovery_restore_id.as_deref() {
+                cleanup_config_history_snapshot(recovery_restore_id).await;
             }
             Err(s3_error!(InternalError, "config restore failed and was rolled back: {}", restore_error))
         })
@@ -2377,8 +2286,8 @@ impl Operation for SetConfigHandler {
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = ServerConfig::new();
             apply_set_directives(&mut config, &directives)?;
-            let prepared = prepare_server_config(&config, None).await?;
-            commit_server_config_transaction(config, prepared, snapshot, None).await?;
+            prepare_server_config(&config, None).await?;
+            commit_server_config_transaction(config, snapshot, None).await?;
             Ok(())
         })
         .await?;
@@ -2405,6 +2314,23 @@ mod tests {
                 rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
                 SCANNER_SUB_SYS
             ]
+        );
+    }
+
+    #[test]
+    fn reconciliation_error_reports_whether_config_was_persisted() {
+        let persisted = finish_config_reconciliation(vec!["local config snapshot".to_string()], true)
+            .expect_err("committed config convergence failure must be reported");
+        let unchanged = finish_config_reconciliation(vec!["local config snapshot".to_string()], false)
+            .expect_err("unchanged config convergence failure must be reported");
+
+        assert_eq!(
+            persisted.message(),
+            Some("server config persisted but runtime convergence failed: local config snapshot")
+        );
+        assert_eq!(
+            unchanged.message(),
+            Some("server config was unchanged but runtime convergence failed: local config snapshot")
         );
     }
 
@@ -3191,21 +3117,30 @@ notify_webhook:secondary endpoint="https://secondary.example" auth_token="second
     }
 
     #[test]
-    fn restore_rollback_generation_rejects_concurrent_config_change() {
-        crate::admin::storage_api::config::init_admin_config_defaults();
-        let restored = ServerConfig::new();
-        let mut concurrent = restored.clone();
-        apply_set_directives(
-            &mut concurrent,
-            &parse_config_directives(r#"identity_openid client_id="concurrent-client""#, false).expect("parse concurrent"),
-        )
-        .expect("apply concurrent");
+    fn restore_rollback_generation_accepts_committed_write_identity() {
+        let committed = Uuid::from_u128(1);
+        validate_restore_rollback_generation(Some(committed), Some(committed)).expect("matching committed generation");
+    }
 
-        validate_restore_rollback_generation(&restored, &restored).expect("unchanged restore generation");
-        let error = validate_restore_rollback_generation(&concurrent, &restored)
-            .expect_err("concurrent change must fence automatic rollback");
+    #[test]
+    fn restore_rollback_generation_rejects_aba_with_matching_config_content() {
+        let error = validate_restore_rollback_generation(Some(Uuid::from_u128(2)), Some(Uuid::from_u128(1)))
+            .expect_err("a later generation must fence automatic rollback even when config content matches");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert!(error.to_string().contains("concurrent configuration change"));
+    }
+
+    #[test]
+    fn restore_rollback_generation_rejects_missing_write_identity() {
+        for (current, committed) in [
+            (None, Some(Uuid::from_u128(1))),
+            (Some(Uuid::from_u128(1)), None),
+            (None, None),
+        ] {
+            let error = validate_restore_rollback_generation(current, committed)
+                .expect_err("missing generation metadata must fence automatic rollback");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        }
     }
 
     #[test]
