@@ -17,7 +17,10 @@ use super::ecfs::FS;
 use super::{
     PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
 };
-use crate::auth::{check_key_valid_with_context, get_condition_values_with_query_and_client_info, get_session_token};
+use crate::auth::{
+    check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
+    get_session_token,
+};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
@@ -296,6 +299,19 @@ fn authorization_conditions<T>(
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
     merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
     Ok(conditions)
+}
+
+/// Condition values for an authorization decision that is not scoped to a bucket or object.
+///
+/// Lives here rather than at the call site because this module already owns the request
+/// plumbing every such decision needs: the verified client address and `ReqInfo`. The KMS
+/// grammar has no bucket/object/tag conditions, so none of the S3 merges apply.
+pub(crate) fn resource_free_condition_values<T>(
+    req: &S3Request<T>,
+    cred: &rustfs_credentials::Credentials,
+) -> HashMap<String, Vec<String>> {
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    get_condition_values_with_client_info(&req.headers, cred, None, None, remote_addr, req.extensions.get::<ClientInfo>())
 }
 
 fn auth_fs() -> &'static FS {
