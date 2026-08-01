@@ -10,5 +10,6 @@ expression: capabilities_snapshot(backend.capabilities())
   "physical_delete": false,
   "rotate": true,
   "schedule_deletion": true,
+  "update_key_metadata": false,
   "versioning": true
 }
