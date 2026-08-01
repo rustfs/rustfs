@@ -80,6 +80,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       # cargo-deny compiles nothing, so the full setup composite (apt packages,
       # protoc, flatc, nextest, rustfmt/clippy) was pure overhead here. It does
@@ -119,6 +121,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Report unpinned GitHub Actions
         run: ./scripts/security/check_workflow_pins.sh --enforce
@@ -128,6 +132,9 @@ jobs:
 
       - name: Check every job declares a timeout
         run: ./scripts/security/check_job_timeouts.sh
+
+      - name: Check checkouts clear their credentials
+        run: ./scripts/security/check_persist_credentials.sh
 
       - name: Check preview release workflow policy
         run: ./scripts/security/check_preview_release_workflow.sh
@@ -143,6 +150,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
@@ -174,6 +183,8 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:

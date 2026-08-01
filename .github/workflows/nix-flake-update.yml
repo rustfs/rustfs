@@ -40,6 +40,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        # persist-credentials-exempt: update-flake-lock pushes the branch and opens
+        # the PR. It passes FLAKE_UPDATE_TOKEN to create-pull-request itself rather
+        # than reusing .git/config, but that is unverified — exempt until a
+        # workflow_dispatch run confirms it (rustfs/backlog#1602).
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@629b284231c2a82554b724e357e47fc6020833c8 # v3

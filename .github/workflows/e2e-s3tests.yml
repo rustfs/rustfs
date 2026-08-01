@@ -142,6 +142,8 @@ jobs:
       TEST_MODE: ${{ matrix.test-mode }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       # Provision Python explicitly rather than trusting the runner image to
       # ship a working pip (ci-1: a bare python3 without pip is what broke the
@@ -361,6 +363,8 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:

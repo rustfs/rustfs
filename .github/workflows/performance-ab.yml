@@ -99,6 +99,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -148,6 +150,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0 # baseline is built from origin/main
 
       - name: Setup Rust environment
@@ -394,6 +397,8 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
