@@ -117,6 +117,7 @@ const REPLICATION_FAILED_EVENT: &str = "s3:Replication:OperationFailedReplicatio
 const REPLICATION_EVENT_MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const OTLP_METRICS_BODY_LIMIT: u64 = 4 * 1024 * 1024;
 const BUCKET_LABEL: &str = "bucket";
+const TOTAL_FAILED_COUNT_METRIC: &str = "rustfs_bucket_replication_total_failed_count";
 const CURRENT_BACKLOG_COUNT_METRIC: &str = "rustfs_bucket_replication_current_backlog_count";
 const CURRENT_BACKLOG_BYTES_METRIC: &str = "rustfs_bucket_replication_current_backlog_bytes";
 const MRF_PENDING_COUNT_METRIC: &str = "rustfs_bucket_replication_mrf_pending_count";
@@ -262,6 +263,7 @@ fn record_backlog_metrics(export: &ExportMetricsServiceRequest, values: &mut BTr
 
 fn record_backlog_metric(metric: &Metric, values: &mut BTreeMap<String, BTreeMap<String, (u64, f64)>>) {
     if ![
+        TOTAL_FAILED_COUNT_METRIC,
         CURRENT_BACKLOG_COUNT_METRIC,
         CURRENT_BACKLOG_BYTES_METRIC,
         MRF_PENDING_COUNT_METRIC,
@@ -3917,7 +3919,8 @@ async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
 /// loopback target keeps replication workers occupied long enough for the metrics
 /// runtime to publish non-zero bucket backlog gauges; after the real target
 /// returns, replication must converge and the exported current/MRF pending gauges
-/// must settle back to zero.
+/// must settle back to zero even though the historical failed counter remains
+/// non-zero.
 #[tokio::test]
 #[serial]
 async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -> TestResult {
@@ -4003,6 +4006,14 @@ async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -
         current_bytes >= current_backlog,
         "backlog bytes should be at least the object count while queued; count={current_backlog}, bytes={current_bytes}"
     );
+    let failed_count = collector
+        .wait_for_bucket_metric(
+            TOTAL_FAILED_COUNT_METRIC,
+            source_bucket,
+            |value| value >= 1.0,
+            "record at least one failed replication attempt during outage",
+        )
+        .await?;
 
     slow_target.stop().await;
     target_env.restart_server_preserving_data(vec![], &[]).await?;
@@ -4018,6 +4029,11 @@ async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -
             .wait_for_bucket_metric(metric, source_bucket, |value| value == 0.0, "settle back to zero after recovery")
             .await?;
     }
+    let final_failed_count = collector.bucket_metric_value(TOTAL_FAILED_COUNT_METRIC, source_bucket).await;
+    assert!(
+        final_failed_count >= failed_count,
+        "historical failed counter should remain non-zero after recovery while current backlog is zero; before={failed_count}, after={final_failed_count}"
+    );
 
     let target_state = list_replication_state(&target_client, target_bucket).await?;
     for key in ["before-outage.txt"].into_iter().chain(outage_keys) {
