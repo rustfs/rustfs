@@ -1490,9 +1490,12 @@ mod tests {
         );
     }
 
+    /// One way to contradict an otherwise valid set of Vault references.
+    type ReferenceContradiction = Box<dyn Fn(&mut VaultExternalReferences)>;
+
     #[test]
     fn external_reference_contradictions_fail_closed() {
-        let cases: [(&str, Box<dyn Fn(&mut VaultExternalReferences)>); 7] = [
+        let cases: [(&str, ReferenceContradiction); 7] = [
             ("cluster_id", Box::new(|refs| refs.cluster_id.clear())),
             ("kv_mount", Box::new(|refs| refs.kv_mount.clear())),
             ("namespace must not be empty", Box::new(|refs| refs.namespace = Some(String::new()))),

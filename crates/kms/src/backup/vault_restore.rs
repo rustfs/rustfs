@@ -1400,6 +1400,9 @@ mod tests {
     const KEY_ID: &str = "object-key";
     const KV_GENERATION: u64 = 4;
 
+    /// One way a restore target can drift from the bundle's coordinates.
+    type TargetDrift = fn(&mut VaultRestoreTarget);
+
     fn test_kek() -> BackupKek {
         BackupKek::new("backup-kek-test", 1, [0x42; 32]).expect("kek")
     }
@@ -1777,7 +1780,7 @@ mod tests {
         // Each of these leaves the Transit mount agreeing with the bundle, so
         // only the ordering of the checks — coordinates first, network second
         // — can keep the Transit read from going out.
-        let drifts: [(&str, fn(&mut VaultRestoreTarget)); 4] = [
+        let drifts: [(&str, TargetDrift); 4] = [
             ("vault cluster identity", |target| target.cluster_id = "vault-cluster-b".to_string()),
             ("vault namespace", |target| target.namespace = Some("tenant-b".to_string())),
             ("vault kv mount", |target| target.kv_mount = "other-kv".to_string()),
@@ -1901,7 +1904,7 @@ mod tests {
                 format!("GET /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{KEY_ID}"),
                 marker_path.clone(),
                 record_path.clone(),
-                marker_path.clone(),
+                marker_path,
                 format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
             ],
             "the trust root is verified first, the marker brackets every write, \
