@@ -103,7 +103,7 @@ where
     /// or `out` is larger than one shard. On error `out`'s contents are
     /// unspecified but never contain bytes that failed the hash check — the copy
     /// happens only after verification.
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "BitrotReader")]
     pub async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let want = out.len();
         self.begin_read(want)?;
@@ -303,7 +303,7 @@ where
 
     /// Write a (hash+data) block. Returns the number of data bytes written.
     /// Returns an error if called after a short write or if data exceeds shard_size.
-    #[hotpath::measure(label = "BitrotWriter::write")]
+    #[hotpath::measure(label = "BitrotWriter::write", impl_type = "BitrotWriter")]
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
