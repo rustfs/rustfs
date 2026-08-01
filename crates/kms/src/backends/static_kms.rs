@@ -19,7 +19,10 @@
 //!
 //! ## Ciphertext format
 //!
-//! encrypted_data(plaintext_len+16) || nonce (12 bytes)
+//! A JSON-serialized `DataKeyEnvelope` carrying the AES-256-GCM ciphertext, the
+//! 12-byte nonce and the authenticated encryption context. This is a
+//! RustFS-internal format; it is not interchangeable with MinIO's KMS
+//! ciphertext (see the note on `StaticConfig`).
 
 use crate::backends::{BackendCapabilities, KmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
