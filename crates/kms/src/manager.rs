@@ -448,6 +448,15 @@ impl KmsManager {
     pub(crate) fn backend(&self) -> Arc<dyn KmsBackend> {
         self.backend.clone()
     }
+
+    /// The running client a full-material backup can be exported from, or
+    /// `None` for backends whose cryptographic root lives outside RustFS.
+    ///
+    /// See [`KmsBackend::local_backup_client`] for why the export must use the
+    /// running client rather than a freshly opened one.
+    pub fn local_backup_client(&self) -> Option<&crate::backends::local::LocalKmsClient> {
+        self.backend.local_backup_client()
+    }
 }
 
 #[cfg(test)]

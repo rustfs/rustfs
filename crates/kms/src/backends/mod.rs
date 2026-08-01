@@ -241,6 +241,19 @@ pub trait KmsBackend: Send + Sync {
     async fn remove_expired_key(&self, _key_id: &str, _now: &Zoned) -> Result<ExpiredKeyRemoval> {
         Err(KmsError::unsupported_capability("backend without deletion support", "remove_expired_key"))
     }
+
+    /// The running client to export a full-material backup bundle from.
+    ///
+    /// Only the Local backend owns key material RustFS is allowed to export in
+    /// full (see [`crate::backup::BackupResponsibility`]); every other backend
+    /// keeps its cryptographic root outside RustFS and returns `None` here.
+    ///
+    /// The export must run against the *running* client so that its fence
+    /// actually blocks concurrent create/delete work — a second client opened
+    /// on the same key directory would fence nothing.
+    fn local_backup_client(&self) -> Option<&local::LocalKmsClient> {
+        None
+    }
 }
 
 /// Outcome of [`KmsBackend::remove_expired_key`].
