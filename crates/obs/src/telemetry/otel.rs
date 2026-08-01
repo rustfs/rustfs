@@ -68,7 +68,7 @@ use std::{fs, io::IsTerminal, time::Duration};
 use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
 
 const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_io_get_object_request_duration_seconds",
@@ -93,7 +93,7 @@ const REDACTED_PROFILING_ENDPOINT: &str = "[redacted]";
     feature = "pyroscope",
     any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 ))]
-fn log_profiler_failure(result: &'static str, error_kind: &'static str, _endpoint: &str) {
+fn log_profiler_failure(result: &'static str, error_kind: &'static str) {
     warn!(
         backend = "pyroscope",
         endpoint = REDACTED_PROFILING_ENDPOINT,
@@ -178,9 +178,7 @@ pub(super) fn init_observability_http(
         logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
-        otel_bridge = logger_provider
-            .as_ref()
-            .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(pyroscope_log_filter()));
+        otel_bridge = logger_provider.as_ref().map(OpenTelemetryTracingBridge::new);
 
         // No separate formatting layer is added here; when OTLP logging is
         // active, the OpenTelemetry bridge is the authoritative sink for
@@ -553,7 +551,7 @@ pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     };
 
     if url::Url::parse(endpoint).is_err() {
-        log_profiler_failure("profiling_endpoint_invalid", "invalid_endpoint", endpoint);
+        log_profiler_failure("profiling_endpoint_invalid", "invalid_endpoint");
         return None;
     }
 
@@ -569,7 +567,7 @@ pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     {
         Ok(agent) => agent,
         Err(_) => {
-            log_profiler_failure("profiling_agent_build_failed", "build", endpoint);
+            log_profiler_failure("profiling_agent_build_failed", "build");
             return None;
         }
     };
@@ -577,7 +575,7 @@ pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     match agent.start() {
         Ok(agent) => Some(agent),
         Err(_) => {
-            log_profiler_failure("profiling_agent_start_failed", "start", endpoint);
+            log_profiler_failure("profiling_agent_start_failed", "start");
             None
         }
     }
