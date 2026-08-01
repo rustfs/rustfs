@@ -62,8 +62,8 @@ pub mod vault_restore;
 
 pub use capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
 pub use drill::{
-    DRILL_EVIDENCE_FORMAT_VERSION, DrillBundleEvidence, DrillDataset, DrillDisaster, DrillEvidence, DrillPhase,
-    DrillPhaseTiming, DrillRecoveryEvidence, DrillRequest, DrillRpoEvidence, DrillVerdict, EnvelopeProbe, run_local_drill,
+    DRILL_EVIDENCE_FORMAT_VERSION, DrillBundleEvidence, DrillDataset, DrillDisaster, DrillEvidence, DrillPhase, DrillPhaseTiming,
+    DrillRecoveryEvidence, DrillRequest, DrillRpoEvidence, DrillVerdict, EnvelopeProbe, run_local_drill,
 };
 pub use dry_run::{
     ExternalDependencyMismatch, RestoreBlocker, RestoreBlockerCode, RestoreConflict, RestoreConflictKind, RestoreDryRunReport,

@@ -799,13 +799,7 @@ async fn probe_object(service: &ObjectEncryptionService, object: &SealedObject) 
     };
 
     let decrypted = service
-        .decrypt_object(
-            DRILL_BUCKET,
-            &object.object_key,
-            object.ciphertext.clone(),
-            &object.metadata,
-            None,
-        )
+        .decrypt_object(DRILL_BUCKET, &object.object_key, object.ciphertext.clone(), &object.metadata, None)
         .await;
     let mut reader = match decrypted {
         Ok(reader) => reader,
@@ -938,7 +932,11 @@ async fn tree_digest(root: &Path) -> Result<ContentDigest> {
                 .modified()?
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_nanos());
-            let relative = path.strip_prefix(&root).unwrap_or(path.as_path()).to_string_lossy().into_owned();
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .into_owned();
             let content = std::fs::read(&path)?;
             lines.push(format!(
                 "{relative}\u{1f}{}\u{1f}{modified}\u{1f}{}",
@@ -1035,7 +1033,11 @@ mod tests {
 
     /// Open the restored directory and ask it to reproduce one object.
     async fn probe_after_restore(config: &KmsConfig, object: &SealedObject) -> EnvelopeProbe {
-        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("restored backend must open"));
+        let backend = Arc::new(
+            LocalKmsBackend::new(config.clone())
+                .await
+                .expect("restored backend must open"),
+        );
         let service = ObjectEncryptionService::new(KmsManager::new(backend, config.clone()));
         probe_object(&service, object).await
     }
@@ -1222,10 +1224,7 @@ mod tests {
         assert_eq!(marker["backup_id"], serde_json::json!(manifest.backup_id));
         assert_eq!(marker["manifest_digest"]["hex"], serde_json::json!(manifest.manifest_digest.hex));
         let files: Vec<String> = serde_json::from_value(marker["files"].clone()).expect("marker file list");
-        assert_eq!(
-            files,
-            vec![LOCAL_KMS_MASTER_KEY_SALT_FILE.to_string(), format!("{}.key", sealed.key_id)]
-        );
+        assert_eq!(files, vec![LOCAL_KMS_MASTER_KEY_SALT_FILE.to_string(), format!("{}.key", sealed.key_id)]);
 
         // A directory mid-cutover must not serve requests.
         let error = LocalKmsBackend::new(target_config.clone())
@@ -1234,7 +1233,9 @@ mod tests {
             .expect("startup must fail closed mid-cutover");
         assert!(error.to_string().contains("unfinished restore"), "got {error}");
 
-        let report = restore_local_backup(&test_kek(), &restore_request).await.expect("roll forward");
+        let report = restore_local_backup(&test_kek(), &restore_request)
+            .await
+            .expect("roll forward");
         assert!(report.resumed, "re-running the same bundle must roll the cutover forward");
         assert!(!target.join(LOCAL_RESTORE_COMMIT_MARKER_FILE).exists());
         assert!(probe_after_restore(&target_config, &sealed).await.verified);
@@ -1386,12 +1387,9 @@ mod tests {
             },
         };
         let sealed = manifest.seal().expect("seal manifest");
-        fs::write(
-            bundle.join(LOCAL_BUNDLE_MANIFEST_FILE),
-            sealed.encode().expect("encode manifest"),
-        )
-        .await
-        .expect("write manifest");
+        fs::write(bundle.join(LOCAL_BUNDLE_MANIFEST_FILE), sealed.encode().expect("encode manifest"))
+            .await
+            .expect("write manifest");
         bundle
     }
 
