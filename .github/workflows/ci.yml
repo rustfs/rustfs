@@ -216,9 +216,39 @@ jobs:
 
       - name: Run nextest tests
         env:
-          # Three concurrent workspace test links saturate the self-hosted
-          # runner's overlay I/O and can wedge Cargo until the 75m timeout.
-          CARGO_BUILD_JOBS: "2"
+          # #5394 mitigation, now under a measured experiment (backlog#1601).
+          #
+          # 2 was chosen when three concurrent workspace test links were believed
+          # to saturate the runner's overlay I/O and wedge Cargo until the 75m
+          # timeout. cgroup v2 readings from the sampler show the pod actually
+          # has 14 CPUs and 28GB (peak use 2.1GB), so 2 throttles compilation to
+          # a seventh of what is available and memory was never the constraint —
+          # the label name "sm-standard-4" had led everyone, including the
+          # original mitigation, to assume 4 cores.
+          #
+          # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
+          # merge path is untouched while the experiment runs.
+          #
+          # Dispatch is included because push alone cannot supply the samples:
+          # this workflow cancels superseded runs on main, and only 4 of the last
+          # 20 push-triggered Test and Lint jobs reached a terminal state — at
+          # that rate ten samples would take roughly fifty merges. The
+          # concurrency group is scoped by event_name, so a dispatched run has
+          # its own group and is not cancelled by merge traffic, which makes the
+          # sample collectable on demand rather than by waiting.
+          #
+          # Baseline over 17 samples at 2:
+          # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2
+          # criterion is that ratio dropping at least 10% (below ~1.76) with no
+          # 75m timeout and no run showing three consecutive samples of
+          # rustc/collect2/rust-lld in D state. If it does not, the conclusion is
+          # "this limit is not the bottleneck" — fix it back at 2 and record the
+          # experiment, which is a result, not a failure.
+          #
+          # Must stay step-level: rust-cache hashes CARGO/CC/CFLAGS/CXX/CMAKE/RUST
+          # prefixed variables from process.env into the cache key, so promoting
+          # this to job level would rotate every key on this lane.
+          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
         run: |
           mkdir -p artifacts/test-and-lint
           ./scripts/ci/resource_sampler.sh start nextest

@@ -74,7 +74,7 @@ pub const LOCAL_BUNDLE_MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIR: &str = "artifacts";
 const KEYS_DIR: &str = "artifacts/keys";
 const SALT_ARTIFACT_PATH: &str = "artifacts/master-key.salt.enc";
-const AEAD_NONCE_LEN: usize = 12;
+pub(crate) const AEAD_NONCE_LEN: usize = 12;
 /// Domain-separation context for the artifact AAD binding.
 const BUNDLE_AAD_CONTEXT: &str = "rustfs-kms-local-backup:v1";
 /// Domain-separation context for the master-key verifier.
@@ -118,7 +118,7 @@ impl BackupKek {
         }
     }
 
-    fn cipher(&self) -> Aes256Gcm {
+    pub(crate) fn cipher(&self) -> Aes256Gcm {
         Aes256Gcm::new(&Key::<Aes256Gcm>::from(*self.key))
     }
 }
@@ -227,11 +227,14 @@ pub async fn export_local_backup(
     Ok(manifest)
 }
 
-/// Read and fully validate the manifest of a local bundle directory.
+/// Read and fully validate the manifest of a bundle directory, whatever
+/// backend produced it.
 ///
 /// A directory without a manifest is an interrupted export: the manifest is
-/// written last, so its absence means the bundle never sealed.
-pub async fn read_local_bundle_manifest(bundle_dir: &Path) -> Result<BackupManifest> {
+/// written last, so its absence means the bundle never sealed. The manifest
+/// file name and framing are bundle-wide, not Local-specific, so consumers of
+/// other backends' bundles read them through here too.
+pub async fn read_bundle_manifest(bundle_dir: &Path) -> Result<BackupManifest> {
     let manifest_path = bundle_dir.join(LOCAL_BUNDLE_MANIFEST_FILE);
     let bytes = match fs::read(&manifest_path).await {
         Ok(bytes) => bytes,
@@ -240,7 +243,12 @@ pub async fn read_local_bundle_manifest(bundle_dir: &Path) -> Result<BackupManif
         }
         Err(error) => return Err(error.into()),
     };
-    let manifest = BackupManifest::decode(&bytes)?;
+    Ok(BackupManifest::decode(&bytes)?)
+}
+
+/// Read and fully validate the manifest of a *local* bundle directory.
+pub async fn read_local_bundle_manifest(bundle_dir: &Path) -> Result<BackupManifest> {
+    let manifest = read_bundle_manifest(bundle_dir).await?;
     if manifest.backend != BackupBackendKind::Local {
         return Err(
             BackupError::corrupted(format!("bundle manifest declares backend {:?}, expected Local", manifest.backend)).into(),
@@ -424,6 +432,7 @@ async fn build_and_write_bundle(
         backup_kek: kek.descriptor(),
         artifacts,
         local_kdf: Some(local_kdf_descriptor(snapshot, master_key_verifier)),
+        external_references: None,
         key_versions: None,
         capability_discovery: None,
         completeness: CompletenessState::InProgress,
@@ -502,7 +511,7 @@ async fn encrypt_and_write_artifact(
 
 /// AAD binding an artifact to its bundle identity and path. A JSON tuple
 /// gives unambiguous field boundaries without a hand-rolled framing format.
-fn artifact_aad(backup_id: &str, snapshot_generation: u64, artifact_path: &str) -> Vec<u8> {
+pub(crate) fn artifact_aad(backup_id: &str, snapshot_generation: u64, artifact_path: &str) -> Vec<u8> {
     serde_json::to_vec(&(BUNDLE_AAD_CONTEXT, backup_id, snapshot_generation, artifact_path))
         .expect("AAD tuple of strings and integers always serializes")
 }
