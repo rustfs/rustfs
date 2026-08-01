@@ -32,7 +32,14 @@ doctest = false
 name = "la-dump-anchors"
 path = "src/bin/la_dump_anchors.rs"
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 regex = { workspace = true }

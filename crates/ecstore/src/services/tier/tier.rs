@@ -72,6 +72,7 @@ use crate::{
     cluster::rpc::peer_rest_client::{PeerRestClient, PeerTierMutationState},
     config::com::{CONFIG_PREFIX, read_config, read_config_with_metadata},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
+    layout::endpoints::EndpointServerPools,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
     set_disk::get_lock_acquire_timeout,
@@ -236,6 +237,7 @@ struct TierPublishTransition {
 
 struct PreparedTierDriver {
     tier_name: String,
+    tier_config: TierConfig,
     config_fingerprint: TierDriverFingerprint,
     backend_identity: TierDestinationId,
     exact_get_delete: bool,
@@ -903,14 +905,17 @@ async fn remote_tier_mutation_peers() -> io::Result<Vec<Arc<dyn TierMutationPeer
     let Some(endpoints) = runtime_sources::endpoint_pools() else {
         return Err(tier_mutation_replay_error("cluster endpoint topology is not initialized"));
     };
-    let remote_host_count = endpoints.hosts_sorted().iter().flatten().count();
-    let (peers, _) = PeerRestClient::new_clients(endpoints).await;
+    remote_tier_mutation_peers_from_topology(endpoints).await
+}
+
+async fn remote_tier_mutation_peers_from_topology(endpoints: EndpointServerPools) -> io::Result<Vec<Arc<dyn TierMutationPeer>>> {
+    let (peers, _, remote_topology_hosts) = PeerRestClient::new_clients_with_topology(endpoints).await;
     let peers = peers
         .into_iter()
         .flatten()
         .map(|peer| Arc::new(peer) as Arc<dyn TierMutationPeer>)
         .collect::<Vec<_>>();
-    ensure_complete_tier_mutation_commit_peer_set(peers.len(), remote_host_count)?;
+    ensure_complete_tier_mutation_commit_peer_set(peers.len(), remote_topology_hosts.len())?;
     Ok(peers)
 }
 
@@ -1342,6 +1347,7 @@ fn tier_exact_get_delete(config: &TierConfig) -> bool {
 
 struct TierDriverGeneration {
     tier_name: Arc<str>,
+    tier_config: TierConfig,
     generation: DriverRevision,
     // Process-local only: this may reflect credential changes and must never be persisted or logged.
     config_fingerprint: TierDriverFingerprint,
@@ -1349,6 +1355,9 @@ struct TierDriverGeneration {
     backend_identity: TierDestinationId,
     exact_get_delete: bool,
     driver: SharedWarmBackend,
+    reconciler: tokio::sync::OnceCell<
+        Option<Arc<dyn crate::services::tier::warm_backend::TransitionCandidateReconciler + Send + Sync + 'static>>,
+    >,
     accepting: AtomicBool,
     active_leases: AtomicUsize,
     drained: tokio::sync::Notify,
@@ -1471,6 +1480,35 @@ impl TierOperationLease {
 
     pub(crate) fn backend_identity(&self) -> TierDestinationId {
         self.inner.backend_identity
+    }
+
+    pub(crate) async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        transaction_id: uuid::Uuid,
+    ) -> io::Result<TransitionCandidateProbe> {
+        let Some(reconciler) = self
+            .inner
+            .reconciler
+            .get_or_try_init(|| async {
+                crate::services::tier::warm_backend::new_transition_candidate_reconciler(&self.inner.tier_config)
+                    .await
+                    .map(|reconciler| reconciler.map(Arc::from))
+            })
+            .await
+            .map_err(|err| io::Error::other(err.message))?
+        else {
+            return self.inner.driver.probe_transition_candidate(object).await;
+        };
+        reconciler
+            .probe_transition_candidate_for(
+                object,
+                crate::services::tier::warm_backend::TransitionCandidateIdentity {
+                    transaction_id,
+                    destination_id: self.backend_identity(),
+                },
+            )
+            .await
     }
 
     pub(crate) fn validate_remote_version_id(&self, remote_version_id: &str) -> io::Result<()> {
@@ -2833,6 +2871,7 @@ impl TierConfigMgr {
                     let exact_get_delete = tier_exact_get_delete(config);
                     Some(PreparedTierDriver {
                         tier_name: tier_name.to_string(),
+                        tier_config: config.clone(),
                         config_fingerprint,
                         backend_identity,
                         exact_get_delete,
@@ -2861,11 +2900,13 @@ impl TierConfigMgr {
             })?;
             let entry = Arc::new(TierDriverGeneration {
                 tier_name: Arc::from(prepared.tier_name.as_str()),
+                tier_config: prepared.tier_config.clone(),
                 generation,
                 config_fingerprint: prepared.config_fingerprint,
                 backend_identity: prepared.backend_identity,
                 exact_get_delete: prepared.exact_get_delete,
                 driver: prepared.driver.clone(),
+                reconciler: tokio::sync::OnceCell::new(),
                 accepting: AtomicBool::new(true),
                 active_leases: AtomicUsize::new(0),
                 drained: tokio::sync::Notify::new(),
@@ -3609,11 +3650,13 @@ impl TierConfigMgr {
         let driver: SharedWarmBackend = Arc::from(driver);
         let entry = Arc::new(TierDriverGeneration {
             tier_name: Arc::from(tier_name),
+            tier_config: config.clone(),
             generation,
             config_fingerprint,
             backend_identity,
             exact_get_delete,
             driver: driver.clone(),
+            reconciler: tokio::sync::OnceCell::new(),
             accepting: AtomicBool::new(true),
             active_leases: AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
@@ -4268,6 +4311,34 @@ fn tier_config_not_initialized_error(operation: &str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{
+        endpoint::Endpoint,
+        endpoints::{Endpoints, PoolEndpoints, SetupType},
+    };
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = runtime_sources::current_setup_type().await;
+            runtime_sources::set_setup_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    runtime_sources::set_setup_type(previous).await;
+                });
+            });
+        }
+    }
 
     fn build_s3_tier(name: &str) -> TierConfig {
         TierConfig {
@@ -6313,6 +6384,42 @@ mod tests {
         ensure_complete_tier_mutation_commit_peer_set(2, 2).expect("two remote hosts should require two peers");
         let err = ensure_complete_tier_mutation_commit_peer_set(1, 2).expect_err("missing one expected peer must fail closed");
         assert!(err.to_string().contains("without peer commit clients"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn tier_mutation_peer_composition_preserves_unresolved_topology_slots() {
+        let mut endpoints = Vec::new();
+        for disk_index in 0..4 {
+            let mut endpoint = Endpoint::try_from(format!("http://rustfs-{disk_index}.invalid:9000/data{disk_index}").as_str())
+                .expect("unresolved topology endpoint should parse without DNS");
+            endpoint.is_local = disk_index == 0;
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+        let topology = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "unresolved-tier-mutation-topology".to_string(),
+            platform: "test".to_string(),
+        }]);
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let peers = remote_tier_mutation_peers_from_topology(topology)
+            .await
+            .expect("every unresolved remote topology slot should retain a tier mutation client");
+        assert_eq!(
+            peers.iter().map(|peer| peer.peer_label()).collect::<Vec<_>>(),
+            vec![
+                "http://rustfs-1.invalid:9000".to_string(),
+                "http://rustfs-2.invalid:9000".to_string(),
+                "http://rustfs-3.invalid:9000".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -9274,7 +9381,8 @@ mod tests {
             version_id: "v1".to_string(),
             tier_name: "COLD-A".to_string(),
             backend_identity: Some(current_identity),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         };
         journal_store
             .insert_config_object(

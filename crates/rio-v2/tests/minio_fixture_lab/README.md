@@ -137,7 +137,7 @@ tests read):
 ./capture_via_docker.sh
 
 RUSTFS_MINIO_STATIC_KMS_KEY_B64=IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= \
-  cargo test -p rustfs-ecstore --features rio-v2 --test minio_generated_read_test -- --ignored
+  cargo test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored
 ```
 
 This is exactly what the nightly `minio-interop` GitHub Actions workflow runs

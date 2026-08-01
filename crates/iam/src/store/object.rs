@@ -22,7 +22,7 @@ use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
     keyring,
-    manager::{extract_jwt_claims, extract_jwt_claims_allow_missing_exp, get_default_policyes},
+    manager::{extract_jwt_claims, extract_jwt_claims_allow_missing_exp, get_default_policies},
     root_credentials,
 };
 use futures::future::join_all;
@@ -469,6 +469,7 @@ impl ObjectStore {
         });
     }
 
+    #[hotpath::measure]
     async fn list_all_iamconfig_items(&self) -> Result<HashMap<String, Vec<String>>> {
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
@@ -508,6 +509,7 @@ impl ObjectStore {
         Ok(res)
     }
 
+    #[hotpath::measure]
     async fn load_policy_doc_concurrent(&self, names: &[String], mode: LoadMode) -> Result<Vec<PolicyDoc>> {
         let mut futures = Vec::with_capacity(names.len());
 
@@ -1127,7 +1129,7 @@ impl Store for ObjectStore {
         let cache_snapshot = cache.snapshot();
         let listed_config_items = self.list_all_iamconfig_items().await?;
 
-        let mut policy_docs_cache = CacheEntity::new(get_default_policyes());
+        let mut policy_docs_cache = CacheEntity::new(get_default_policies());
 
         if let Some(policies_list) = listed_config_items.get(POLICIES_LIST_KEY) {
             // Load in fixed-size chunks so each policy is fetched exactly once.

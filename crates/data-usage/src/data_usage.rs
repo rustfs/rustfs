@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
-    path::Path,
     time::{Duration, SystemTime},
 };
 
@@ -334,7 +332,7 @@ impl<'de> Deserialize<'de> for SizeHistogram {
 impl SizeHistogram {
     pub fn add(&mut self, size: u64) {
         let intervals = [
-            (0, 1024),                                  // LESS_THAN_1024_B
+            (0, 1024 - 1),                              // LESS_THAN_1024_B
             (1024, 64 * 1024 - 1),                      // BETWEEN_1024_B_AND_64_KB
             (64 * 1024, 256 * 1024 - 1),                // BETWEEN_64_KB_AND_256_KB
             (256 * 1024, 512 * 1024 - 1),               // BETWEEN_256_KB_AND_512_KB
@@ -362,7 +360,7 @@ impl SizeHistogram {
         // the sub-ranges in [1 KiB, 512 KiB).
         const ONE_MIB: u64 = 1024 * 1024;
         let intervals = [
-            (0, 1024),                          // LESS_THAN_1024_B
+            (0, 1024 - 1),                      // LESS_THAN_1024_B
             (1024, 64 * 1024 - 1),              // BETWEEN_1024_B_AND_64_KB
             (64 * 1024, 256 * 1024 - 1),        // BETWEEN_64_KB_AND_256_KB
             (256 * 1024, 512 * 1024 - 1),       // BETWEEN_256_KB_AND_512_KB
@@ -506,8 +504,35 @@ pub struct ReplicationStats {
 }
 
 impl ReplicationStats {
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            pending_size,
+            replicated_size,
+            failed_size,
+            failed_count,
+            pending_count,
+            missed_threshold_size,
+            after_threshold_size,
+            missed_threshold_count,
+            after_threshold_count,
+            replicated_count,
+        } = self;
+
+        *pending_size == 0
+            && *replicated_size == 0
+            && *failed_size == 0
+            && *failed_count == 0
+            && *pending_count == 0
+            && *missed_threshold_size == 0
+            && *after_threshold_size == 0
+            && *missed_threshold_count == 0
+            && *after_threshold_count == 0
+            && *replicated_count == 0
+    }
+
+    #[deprecated(note = "use is_empty instead")]
     pub fn empty(&self) -> bool {
-        self.replicated_size == 0 && self.failed_size == 0 && self.failed_count == 0
+        self.is_empty()
     }
 }
 
@@ -520,16 +545,19 @@ pub struct ReplicationAllStats {
 }
 
 impl ReplicationAllStats {
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            replica_size,
+            replica_count,
+            targets,
+        } = self;
+
+        *replica_size == 0 && *replica_count == 0 && targets.values().all(ReplicationStats::is_empty)
+    }
+
+    #[deprecated(note = "use is_empty instead")]
     pub fn empty(&self) -> bool {
-        if self.replica_size != 0 && self.replica_count != 0 {
-            return false;
-        }
-        for v in self.targets.values() {
-            if !v.empty() {
-                return false;
-            }
-        }
-        true
+        self.is_empty()
     }
 }
 
@@ -783,7 +811,7 @@ impl DataUsageCache {
                     return Some(root);
                 }
                 let mut flat = self.flatten(&root);
-                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
+                if flat.replication_stats.as_ref().is_some_and(ReplicationAllStats::is_empty) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -1080,9 +1108,39 @@ fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String
     }
 }
 
-/// Hash a path for data usage caching
+fn clean_data_usage_path(data: &str) -> String {
+    let rooted = data.starts_with('/');
+    let mut parts = Vec::new();
+
+    for part in data.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !rooted {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let clean = parts.join("/");
+    match (rooted, clean.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{clean}"),
+        (false, true) => ".".to_string(),
+        (false, false) => clean,
+    }
+}
+
+/// Hash a slash-separated path for data usage caching.
+///
+/// Cache identifiers are persisted and exchanged across nodes, so their
+/// normalization must not depend on the host operating system.
 pub fn hash_path(data: &str) -> DataUsageHash {
-    DataUsageHash(Path::new(&data).clean().to_string_lossy().to_string())
+    DataUsageHash(clean_data_usage_path(data))
 }
 
 impl DataUsageInfo {
@@ -1468,6 +1526,23 @@ mod tests {
     }
 
     #[test]
+    fn hash_path_uses_portable_slash_semantics() {
+        for (input, expected) in [
+            ("", "."),
+            (".", "."),
+            ("/", "/"),
+            ("//bucket///prefix/", "/bucket/prefix"),
+            ("bucket/./prefix//object", "bucket/prefix/object"),
+            ("bucket/a/../b", "bucket/b"),
+            ("../bucket/..", ".."),
+            ("/../../bucket", "/bucket"),
+            ("bucket\\prefix/object", "bucket\\prefix/object"),
+        ] {
+            assert_eq!(hash_path(input).key(), expected, "unexpected portable cache key for {input:?}");
+        }
+    }
+
+    #[test]
     fn completeness_marker_is_additive_for_legacy_named_readers() {
         let current = DataUsageInfo {
             last_update: Some(SystemTime::UNIX_EPOCH),
@@ -1572,6 +1647,49 @@ mod tests {
     }
 
     #[test]
+    fn test_size_histogram_classifies_adjacent_boundaries_once() {
+        let cases = [
+            (1023, 0),
+            (1024, 1),
+            (64 * 1024 - 1, 1),
+            (64 * 1024, 2),
+            (256 * 1024 - 1, 2),
+            (256 * 1024, 3),
+            (512 * 1024 - 1, 3),
+            (512 * 1024, 4),
+            (1024 * 1024 - 1, 4),
+            (1024 * 1024, 6),
+            (10 * 1024 * 1024 - 1, 6),
+            (10 * 1024 * 1024, 7),
+            (64 * 1024 * 1024 - 1, 7),
+            (64 * 1024 * 1024, 8),
+            (128 * 1024 * 1024 - 1, 8),
+            (128 * 1024 * 1024, 9),
+            (512 * 1024 * 1024 - 1, 9),
+            (512 * 1024 * 1024, 10),
+        ];
+
+        for (size, expected_bucket) in cases {
+            let mut hist = SizeHistogram::default();
+            hist.add(size);
+
+            assert_eq!(hist.0.iter().sum::<u64>(), 1, "size {size} must have exactly one physical bucket");
+            assert_eq!(hist.0[expected_bucket], 1, "size {size} must select the expected bucket");
+        }
+    }
+
+    #[test]
+    fn test_size_histogram_1024_bytes_contributes_to_compat_rollup() {
+        let mut hist = SizeHistogram::default();
+        hist.add(1024);
+
+        let map = hist.to_map();
+        assert_eq!(map["LESS_THAN_1024_B"], 0);
+        assert_eq!(map["BETWEEN_1024_B_AND_64_KB"], 1);
+        assert_eq!(map["BETWEEN_1024B_AND_1_MB"], 1);
+    }
+
+    #[test]
     fn test_size_histogram_compat_rollup_saturates_on_corrupt_counts() {
         let mut hist = SizeHistogram::default();
         hist.0[1] = u64::MAX;
@@ -1580,6 +1698,126 @@ mod tests {
         let map = hist.to_map();
 
         assert_eq!(map["BETWEEN_1024B_AND_1_MB"], u64::MAX);
+    }
+
+    #[test]
+    fn replication_stats_empty_checks_every_field() {
+        type SetField = fn(&mut ReplicationStats);
+
+        let cases: [(&str, SetField); 10] = [
+            ("pending_size", |stats| stats.pending_size = 1),
+            ("replicated_size", |stats| stats.replicated_size = 1),
+            ("failed_size", |stats| stats.failed_size = 1),
+            ("failed_count", |stats| stats.failed_count = 1),
+            ("pending_count", |stats| stats.pending_count = 1),
+            ("missed_threshold_size", |stats| stats.missed_threshold_size = 1),
+            ("after_threshold_size", |stats| stats.after_threshold_size = 1),
+            ("missed_threshold_count", |stats| stats.missed_threshold_count = 1),
+            ("after_threshold_count", |stats| stats.after_threshold_count = 1),
+            ("replicated_count", |stats| stats.replicated_count = 1),
+        ];
+
+        assert!(ReplicationStats::default().is_empty());
+        for (field, set_nonzero) in cases {
+            let mut stats = ReplicationStats::default();
+            set_nonzero(&mut stats);
+            assert!(!stats.is_empty(), "{field} must make replication stats non-empty");
+        }
+    }
+
+    #[test]
+    fn replication_all_stats_empty_checks_aggregate_fields_independently() {
+        let cases = [
+            (
+                "replica_size",
+                ReplicationAllStats {
+                    replica_size: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "replica_count",
+                ReplicationAllStats {
+                    replica_count: 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        assert!(ReplicationAllStats::default().is_empty());
+        for (field, stats) in cases {
+            assert!(!stats.is_empty(), "{field} must make aggregate replication stats non-empty");
+        }
+
+        let empty_targets = ReplicationAllStats {
+            targets: HashMap::from([("arn:test:empty".to_string(), ReplicationStats::default())]),
+            ..Default::default()
+        };
+        assert!(empty_targets.is_empty(), "all-empty targets must keep aggregate stats empty");
+
+        let stats = ReplicationAllStats {
+            targets: HashMap::from([
+                ("arn:test:empty".to_string(), ReplicationStats::default()),
+                (
+                    "arn:test:non-empty".to_string(),
+                    ReplicationStats {
+                        pending_count: 1,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert!(!stats.is_empty(), "a non-empty target must make aggregate replication stats non-empty");
+    }
+
+    #[test]
+    fn size_recursive_prunes_empty_and_preserves_pending_replication_stats() {
+        let root = hash_path("bucket");
+        let child = hash_path("bucket/child");
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats::default()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            cache
+                .size_recursive("bucket")
+                .expect("bucket usage should flatten")
+                .replication_stats
+                .is_none()
+        );
+
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                replication_stats: Some(ReplicationAllStats {
+                    targets: HashMap::from([(
+                        "arn:test:pending".to_string(),
+                        ReplicationStats {
+                            pending_count: 1,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let flattened = cache.size_recursive("bucket").expect("bucket usage should flatten");
+        let replication = flattened
+            .replication_stats
+            .expect("pending-only replication stats must survive pruning");
+
+        assert_eq!(replication.targets["arn:test:pending"].pending_count, 1);
     }
 
     #[test]

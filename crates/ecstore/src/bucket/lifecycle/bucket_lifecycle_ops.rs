@@ -554,6 +554,7 @@ async fn delete_free_version_remote_object(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
 ) -> Result<(), std::io::Error> {
+    let version_id_exact = validate_transition_remote_version(oi)?;
     let identity = tier_destination_id_from_metadata(&oi.user_defined)?
         .ok_or_else(|| std::io::Error::other("tier free-version has no durable backend identity"))?;
     delete_object_from_remote_tier_idempotent_with_manager_and_identity(
@@ -562,7 +563,7 @@ async fn delete_free_version_remote_object(
         &oi.transitioned_object.tier,
         identity,
         tier_config_mgr,
-        false,
+        version_id_exact,
     )
     .await?;
     Ok(())
@@ -4201,6 +4202,23 @@ pub async fn get_transitioned_object_reader(
     get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr).await
 }
 
+fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::Error> {
+    let version = oi.transitioned_object.version_id.as_str();
+    match oi.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object version state is unknown",
+        )),
+        rustfs_filemeta::TransitionVersionState::KnownDisabled if version.is_empty() => Ok(false),
+        rustfs_filemeta::TransitionVersionState::SuspendedNull if version == "null" => Ok(true),
+        rustfs_filemeta::TransitionVersionState::Exact if !version.is_empty() && version != "null" => Ok(true),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object version state conflicts with its version ID",
+        )),
+    }
+}
+
 pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     bucket: &str,
     object: &str,
@@ -4210,6 +4228,7 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     opts: &ObjectOptions,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
 ) -> Result<GetObjectReader, std::io::Error> {
+    validate_transition_remote_version(oi)?;
     let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
     let lease = match expected_identity {
         Some(identity) => {
@@ -5506,6 +5525,7 @@ mod tests {
                 tier: tier.clone(),
                 ..Default::default()
             },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
             ..Default::default()
         };
 
@@ -5569,6 +5589,7 @@ mod tests {
                 tier,
                 ..Default::default()
             },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
             ..Default::default()
         };
 
@@ -5589,6 +5610,70 @@ mod tests {
 
         assert!(err.to_string().contains("requires an unversioned remote object"));
         assert_eq!(backend.get_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_unknown_version_state_before_backend_io() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: String::new(),
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier,
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            ..Default::default()
+        };
+
+        let err = match get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown remote version state must fail before backend IO"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.get_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_rejects_unknown_version_state_before_backend_io() {
+        let manager = TierConfigMgr::new();
+        let backend = register_mock_tier(&manager, "WARM").await;
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "legacy-version".to_string(),
+                tier: "WARM".to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            ..Default::default()
+        };
+
+        let err = super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect_err("unknown remote version state must fail before backend IO");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
@@ -5640,6 +5725,7 @@ mod tests {
         oi.transitioned_object.tier = "WARM".to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
         let local_delete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let legacy_err = delete_free_version_remote_object_then(&oi, &manager, {
@@ -5650,7 +5736,8 @@ mod tests {
         })
         .await
         .expect_err("legacy free-version without identity must be retained");
-        assert!(legacy_err.to_string().contains("no durable backend identity"));
+        assert_eq!(legacy_err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(old_backend.remove_count().await, 0);
         assert_eq!(local_delete_calls.load(Ordering::Relaxed), 0);
 
         let mut invalid_metadata = HashMap::new();
@@ -5781,6 +5868,7 @@ mod tests {
         oi.transitioned_object.tier = "WARM".to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
 
         let err = match get_transitioned_object_reader_with_tier_manager(
             "bucket",
@@ -5796,7 +5884,12 @@ mod tests {
             Ok(_) => panic!("identity-bound GET must reject a same-name tier rebind"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("identity no longer matches"));
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let admin_err = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::client::admin_handler_utils::AdminError>())
+            .expect("identity mismatch should retain the typed tier error");
+        assert_eq!(admin_err.code, crate::services::tier::tier::ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(new_backend.get_count().await, 0);
 
         oi.user_defined = Arc::new(HashMap::new());
@@ -5902,7 +5995,8 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([1; 32]),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         };
 
         let err = state
@@ -6013,7 +6107,8 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([1; 32]),
-            version_id_exact: false,
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
         };
 
         state
@@ -8879,7 +8974,7 @@ mod tests {
         .await
         .expect("first worker result should persist");
         assert_eq!(first.state, ManualTransitionJobState::Running);
-        assert_eq!(first.report.transition_completed, 1);
+        assert_eq!(first.report.transition_completed, 0);
         assert_eq!(first.report.transition_failed, 0);
 
         let duplicate = record_manual_transition_worker_result(
@@ -8892,11 +8987,11 @@ mod tests {
         .await
         .expect("duplicate worker result should be idempotent");
         assert_eq!(duplicate.state, ManualTransitionJobState::Running);
-        assert_eq!(duplicate.report.transition_completed, 1);
+        assert_eq!(duplicate.report.transition_completed, 0);
         assert_eq!(duplicate.report.transition_failed, 0);
 
         let second_key = manual_transition_worker_result_task_key(&bucket, "logs/b", None);
-        let final_record = record_manual_transition_worker_result(
+        let pending_record = record_manual_transition_worker_result(
             ecstore.clone(),
             job_id,
             &second_key,
@@ -8905,7 +9000,14 @@ mod tests {
         )
         .await
         .expect("second distinct worker result should persist");
+        assert_eq!(pending_record.state, ManualTransitionJobState::Running);
+        assert_eq!(pending_record.report.transition_completed, 0);
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record =
+            reconcile_manual_transition_worker_results(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+                .await
+                .expect("worker result journal should reconcile");
         assert_eq!(final_record.state, ManualTransitionJobState::Partial);
         assert_eq!(final_record.report.transition_completed, 1);
         assert_eq!(final_record.report.transition_failed, 1);
@@ -8940,7 +9042,7 @@ mod tests {
             .expect("worker result job record should save");
 
         let task_key = manual_transition_worker_result_task_key(&bucket, "logs/fail", None);
-        let final_record = record_manual_transition_worker_result_with_reason(
+        let pending_record = record_manual_transition_worker_result_with_reason(
             ecstore.clone(),
             job_id,
             &task_key,
@@ -8950,7 +9052,12 @@ mod tests {
         )
         .await
         .expect("worker result with failure reason should persist");
+        assert!(pending_record.report.tier_failure_by_reason.is_empty());
+        assert_eq!(pending_record.report.transition_failed, 0);
 
+        let final_record = reconcile_manual_transition_worker_results(ecstore, job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("worker failure reason should reconcile");
         assert_eq!(
             final_record
                 .report
@@ -10081,6 +10188,87 @@ mod tests {
         (backend, identity_hex)
     }
 
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_replay_rejects_unknown_version_state_before_backend_io() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let (backend, _) = register_recovery_mock_tier(&ecstore).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("mock tier lease should be available")
+            .backend_identity();
+        let je = Jentry {
+            obj_name: "remote/object".to_string(),
+            version_id: "legacy-version".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: Some(identity),
+            version_id_exact: false,
+            version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+        };
+
+        let err = crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
+            .await
+            .expect_err("unknown journal state must fail before backend IO");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_replay_deletes_confirmed_exact_provider_token() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let (backend, _) = register_recovery_mock_tier(&ecstore).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("mock tier lease should be available");
+        let identity = lease.backend_identity();
+        backend
+            .set_put_remote_version(Some("provider-version-token".to_string()))
+            .await;
+        lease
+            .put(
+                "remote/object",
+                crate::client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
+                9,
+            )
+            .await
+            .expect("confirmed remote candidate should be seeded");
+        backend.set_remove_failure(true);
+        backend.set_reject_non_empty_remote_versions(true);
+        let je = Jentry {
+            obj_name: "remote/object".to_string(),
+            version_id: "provider-version-token".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: Some(identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+        };
+
+        crate::set_disk::cleanup_rejected_transition_upload_durably(
+            &lease,
+            &je.obj_name,
+            &je.version_id,
+            true,
+            Some(ecstore.clone()),
+        )
+        .await
+        .expect("failed immediate cleanup should remain durable in the journal");
+        assert!(backend.contains(&je.obj_name).await);
+
+        backend.set_remove_failure(false);
+        crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
+            .await
+            .expect("identity-bound exact journal must retry confirmed candidate cleanup");
+
+        assert!(!backend.contains(&je.obj_name).await);
+        assert_eq!(backend.exact_remove_count(), 2);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![("remote/object".to_string(), "provider-version-token".to_string())]
+        );
+    }
+
     async fn seed_recoverable_free_version(
         disk_paths: &[PathBuf],
         bucket: &str,
@@ -10100,6 +10288,7 @@ mod tests {
                 identity,
             );
         }
+        let transition_version_id = Uuid::new_v4();
         let mut metadata = FileMeta::new();
         metadata
             .add_version(FileInfo {
@@ -10108,7 +10297,9 @@ mod tests {
                 version_id: Some(object_version_id),
                 transition_status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
                 transitioned_objname: format!("remote/{bucket}/{object}"),
-                transition_version_id: Some(Uuid::new_v4()),
+                transition_version_id: Some(transition_version_id),
+                transition_version: Some(transition_version_id.to_string()),
+                transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
                 transition_tier: "WARM".to_string(),
                 mod_time: Some(OffsetDateTime::now_utc()),
                 metadata: transitioned_metadata,
@@ -11127,23 +11318,25 @@ mod tests {
 
         // Distinct payloads with distinct sizes: a mixed-generation reassembly
         // would produce bytes matching none of them (or fail the read outright).
-        let candidates: Vec<Vec<u8>> = (0..3)
+        let candidates: Vec<Vec<u8>> = (0..2)
             .map(|g| {
                 let len = 4096 + g * 512;
                 vec![b'a' + g as u8; len]
             })
             .collect();
 
-        let commit_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
-        let start = Arc::new(tokio::sync::Barrier::new(candidates.len() + 1));
+        let commit_barrier = MultipartCommitBarrier::install_for_arrivals(
+            &bucket,
+            object,
+            MultipartCommitPause::PutPartBeforeLockAcquire,
+            candidates.len(),
+        );
         let mut tasks = tokio::task::JoinSet::new();
         for payload in candidates.iter().cloned() {
             let store = ecstore.clone();
             let bucket = bucket.clone();
             let upload_id = upload.upload_id.clone();
-            let start = Arc::clone(&start);
             tasks.spawn(async move {
-                start.wait().await;
                 let mut data = PutObjReader::from_vec(payload.clone());
                 store
                     .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
@@ -11151,11 +11344,10 @@ mod tests {
                     .map(|info| (info, payload))
             });
         }
-        start.wait().await;
 
-        // The first writer holds the uploadId commit lock while the other
-        // resends reach the same critical section. Releasing it proves the
-        // handoff without depending on saturated CI disk latency.
+        // Both writers finish streaming before racing for the uploadId commit
+        // lock. Two generations are sufficient to exercise the mixed-shard
+        // hazard, while each waiter sits behind at most one cross-disk rename.
         commit_barrier.wait_until_paused().await;
         commit_barrier.release();
 

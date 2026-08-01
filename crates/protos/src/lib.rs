@@ -171,6 +171,7 @@ pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SI
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
 pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
@@ -195,6 +196,49 @@ pub fn heal_control_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
 
 pub fn is_heal_control_capability_probe(command: &[u8]) -> bool {
     command.len() == HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + 16 && command.starts_with(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn remote_version_state_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
+    command.len() == REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn encode_remote_version_state_capability(
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let topology_member = topology_member.as_bytes();
+    let mut result = Vec::with_capacity(8 + topology_member.len() + process_epoch.len());
+    result.extend_from_slice(&u64::try_from(topology_member.len())?.to_be_bytes());
+    result.extend_from_slice(topology_member);
+    result.extend_from_slice(process_epoch);
+    Ok(result)
+}
+
+pub fn decode_remote_version_state_capability(result: &[u8]) -> Result<(&str, &[u8; 16]), &'static str> {
+    let member_len = result
+        .get(..8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or("remote version state capability is truncated")?;
+    let member_len = usize::try_from(member_len).map_err(|_| "remote version state member length cannot be represented")?;
+    let member_end = 8_usize
+        .checked_add(member_len)
+        .ok_or("remote version state member length overflow")?;
+    let topology_member = std::str::from_utf8(result.get(8..member_end).ok_or("remote version state member is truncated")?)
+        .map_err(|_| "remote version state member is not UTF-8")?;
+    let process_epoch = result
+        .get(member_end..)
+        .and_then(|value| value.try_into().ok())
+        .ok_or("remote version state process epoch has an invalid length")?;
+    Ok((topology_member, process_epoch))
 }
 
 /// Builds the stable byte representation authenticated for a heal-control request.
@@ -447,8 +491,21 @@ impl CanonicalBodyBuilder {
         self.push_bytes(field.as_bytes())
     }
 
+    fn push_optional_str(&mut self, field: Option<&str>) -> Result<(), std::num::TryFromIntError> {
+        self.body.push(u8::from(field.is_some()));
+        self.push_str(field.unwrap_or_default())
+    }
+
     fn push_bool(&mut self, field: bool) {
         self.body.push(u8::from(field));
+    }
+
+    fn push_u32(&mut self, field: u32) {
+        self.body.extend_from_slice(&field.to_be_bytes());
+    }
+
+    fn push_u64(&mut self, field: u64) {
+        self.body.extend_from_slice(&field.to_be_bytes());
     }
 
     fn push_count(&mut self, count: usize) -> Result<(), std::num::TryFromIntError> {
@@ -460,6 +517,211 @@ impl CanonicalBodyBuilder {
         self.body
     }
 }
+
+pub const PEER_RESTSIGNAL: &str = "signal";
+pub const PEER_RESTSUB_SYS: &str = "sub-sys";
+pub const PEER_RESTDRY_RUN: &str = "dry-run";
+
+/// A stable semantic body for a side-effecting unary RPC.
+///
+/// Implementations deliberately enumerate handler-consumed fields instead of re-encoding the
+/// protobuf message, whose unknown fields and map order are not a mixed-version contract.
+pub trait CanonicalMutationBody {
+    fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError>;
+}
+
+macro_rules! impl_canonical_mutation_body {
+    ($request:ty, $domain:expr, |$value:ident, $body:ident| $fields:block) => {
+        impl CanonicalMutationBody for $request {
+            fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+                let $value = self;
+                let mut $body = CanonicalBodyBuilder::new($domain);
+                $fields
+                Ok($body.finish())
+            }
+        }
+    };
+    ($request:ty, $domain:expr) => {
+        impl CanonicalMutationBody for $request {
+            fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+                Ok(CanonicalBodyBuilder::new($domain).finish())
+            }
+        }
+    };
+}
+
+impl_canonical_mutation_body!(
+    proto_gen::node_service::SignalServiceRequest,
+    b"rustfs-signal-service-request-v1\0",
+    |request, body| {
+        let vars = request.vars.as_ref().map(|vars| &vars.value);
+        body.push_optional_str(vars.and_then(|vars| vars.get(PEER_RESTSIGNAL).map(String::as_str)))?;
+        body.push_optional_str(vars.and_then(|vars| vars.get(PEER_RESTSUB_SYS).map(String::as_str)))?;
+        body.push_optional_str(vars.and_then(|vars| vars.get(PEER_RESTDRY_RUN).map(String::as_str)))?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::HealBucketRequest,
+    b"rustfs-heal-bucket-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_str(&request.options)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::MakeBucketRequest,
+    b"rustfs-make-bucket-request-v1\0",
+    |request, body| {
+        body.push_str(&request.name)?;
+        body.push_str(&request.options)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteBucketRequest,
+    b"rustfs-delete-bucket-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_str(&request.options)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::GenerallyLockRequest,
+    b"rustfs-lock-request-v1\0",
+    |request, body| {
+        body.push_str(&request.args)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::BatchGenerallyLockRequest,
+    b"rustfs-lock-batch-request-v1\0",
+    |request, body| {
+        body.push_count(request.args.len())?;
+        for arg in &request.args {
+            body.push_str(arg)?;
+        }
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadBucketMetadataRequest,
+    b"rustfs-load-bucket-metadata-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_bool(request.scanner_maintenance_change);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteBucketMetadataRequest,
+    b"rustfs-delete-bucket-metadata-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeletePolicyRequest,
+    b"rustfs-delete-policy-request-v1\0",
+    |request, body| {
+        body.push_str(&request.policy_name)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadPolicyRequest,
+    b"rustfs-load-policy-request-v1\0",
+    |request, body| {
+        body.push_str(&request.policy_name)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadPolicyMappingRequest,
+    b"rustfs-load-policy-mapping-request-v1\0",
+    |request, body| {
+        body.push_str(&request.user_or_group)?;
+        body.push_u64(request.user_type);
+        body.push_bool(request.is_group);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteUserRequest,
+    b"rustfs-delete-user-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteServiceAccountRequest,
+    b"rustfs-delete-service-account-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadUserRequest,
+    b"rustfs-load-user-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+        body.push_bool(request.temp);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadServiceAccountRequest,
+    b"rustfs-load-service-account-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadGroupRequest,
+    b"rustfs-load-group-request-v1\0",
+    |request, body| {
+        body.push_str(&request.group)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::ReloadSiteReplicationConfigRequest,
+    b"rustfs-reload-site-replication-config-request-v1\0"
+);
+impl_canonical_mutation_body!(proto_gen::node_service::ReloadPoolMetaRequest, b"rustfs-reload-pool-meta-request-v1\0");
+impl_canonical_mutation_body!(
+    proto_gen::node_service::StopRebalanceRequest,
+    b"rustfs-stop-rebalance-request-v1\0",
+    |request, body| {
+        body.push_str(&request.expected_rebalance_id)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadRebalanceMetaRequest,
+    b"rustfs-load-rebalance-meta-request-v1\0",
+    |request, body| {
+        body.push_bool(request.start_rebalance);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::StartDecommissionRequest,
+    b"rustfs-start-decommission-request-v1\0",
+    |request, body| {
+        body.push_count(request.pool_indices.len())?;
+        for pool_index in &request.pool_indices {
+            body.push_u32(*pool_index);
+        }
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::CancelDecommissionRequest,
+    b"rustfs-cancel-decommission-request-v1\0",
+    |request, body| {
+        body.push_u32(request.pool_index);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::ClearDecommissionRequest,
+    b"rustfs-clear-decommission-request-v1\0",
+    |request, body| {
+        body.push_u32(request.pool_index);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadTransitionTierConfigRequest,
+    b"rustfs-load-transition-tier-config-request-v1\0"
+);
 
 // Canonical request bodies for the mutating NodeService disk RPCs (backlog#1327 body-digest
 // binding). Each covers every semantic wire field — including both the msgpack `_bin` payload and
@@ -575,6 +837,40 @@ pub fn canonical_delete_paths_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_snapshot_lease_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_u64(request.ttl_ms);
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_renew_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseRenewRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-renew-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.token)?;
+    body.push_u64(request.ttl_ms);
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_release_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-release-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.token)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_rename_file_request_body(
     request: &proto_gen::node_service::RenameFileRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -662,7 +958,8 @@ mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
         DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
         MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        SettlePartTransactionRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
 
@@ -1021,6 +1318,58 @@ mod disk_mutation_canonical_tests {
     }
 
     #[test]
+    fn snapshot_lease_canonical_bodies_bind_every_field() {
+        let acquire = SnapshotLeaseRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            ttl_ms: 60_000,
+        };
+        let mut acquire_bodies = vec![canonical_snapshot_lease_request_body(&acquire).unwrap()];
+        for mutate in [
+            |r: &mut SnapshotLeaseRequest| r.disk = "d2".into(),
+            |r: &mut SnapshotLeaseRequest| r.volume = "v2".into(),
+            |r: &mut SnapshotLeaseRequest| r.path = "p2".into(),
+            |r: &mut SnapshotLeaseRequest| r.ttl_ms = 60_001,
+        ] {
+            let mut request = acquire.clone();
+            mutate(&mut request);
+            acquire_bodies.push(canonical_snapshot_lease_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&acquire_bodies);
+
+        let renew = SnapshotLeaseRenewRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+            ttl_ms: 60_000,
+        };
+        let mut changed_token = renew.clone();
+        changed_token.token = vec![2; 16].into();
+        let mut changed_ttl = renew.clone();
+        changed_ttl.ttl_ms += 1;
+        assert_all_distinct(&[
+            canonical_snapshot_lease_renew_request_body(&renew).unwrap(),
+            canonical_snapshot_lease_renew_request_body(&changed_token).unwrap(),
+            canonical_snapshot_lease_renew_request_body(&changed_ttl).unwrap(),
+        ]);
+
+        let release = SnapshotLeaseReleaseRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+        };
+        let mut changed_release = release.clone();
+        changed_release.token = vec![2; 16].into();
+        assert_ne!(
+            canonical_snapshot_lease_release_request_body(&release).unwrap(),
+            canonical_snapshot_lease_release_request_body(&changed_release).unwrap()
+        );
+    }
+
+    #[test]
     fn disk_mutation_canonical_domains_are_distinct_per_message() {
         // The same field values must never authenticate one RPC's request as another's.
         let rename_file = RenameFileRequest {
@@ -1042,6 +1391,154 @@ mod disk_mutation_canonical_tests {
             canonical_rename_file_request_body(&rename_file).unwrap(),
             canonical_rename_part_request_body(&rename_part).unwrap(),
         );
+    }
+}
+
+#[cfg(test)]
+mod non_disk_mutation_canonical_tests {
+    use super::*;
+    use proto_gen::node_service::*;
+    use std::collections::HashMap;
+
+    macro_rules! assert_fields_bound {
+        ($request:ty, {$($field:ident: $value:expr),+ $(,)?}) => {{
+            let baseline = <$request>::default();
+            let expected = baseline.canonical_body().expect("baseline canonical body should encode");
+            $(
+                let mut variant = baseline.clone();
+                variant.$field = $value;
+                assert_ne!(
+                    expected,
+                    variant.canonical_body().expect("variant canonical body should encode"),
+                    concat!(stringify!($request), " omitted field ", stringify!($field)),
+                );
+            )+
+        }};
+    }
+
+    fn signal_request(signal: Option<&str>, sub_system: Option<&str>, dry_run: Option<&str>) -> SignalServiceRequest {
+        let mut value = HashMap::new();
+        if let Some(signal) = signal {
+            value.insert(PEER_RESTSIGNAL.to_string(), signal.to_string());
+        }
+        if let Some(sub_system) = sub_system {
+            value.insert(PEER_RESTSUB_SYS.to_string(), sub_system.to_string());
+        }
+        if let Some(dry_run) = dry_run {
+            value.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
+        }
+        SignalServiceRequest {
+            vars: Some(Mss { value }),
+        }
+    }
+
+    #[test]
+    fn signal_service_canonical_body_is_versioned_and_binds_every_semantic_field() {
+        let request = signal_request(Some("2"), Some("scanner"), Some("false"));
+        let baseline = request.canonical_body().expect("small signal request should encode");
+        assert!(baseline.starts_with(b"rustfs-signal-service-request-v1\0"));
+
+        for variant in [
+            signal_request(Some("1"), Some("scanner"), Some("false")),
+            signal_request(Some("2"), Some("heal"), Some("false")),
+            signal_request(Some("2"), Some("scanner"), Some("true")),
+            signal_request(None, Some("scanner"), Some("false")),
+            signal_request(Some("2"), None, Some("false")),
+            signal_request(Some("2"), Some("scanner"), None),
+        ] {
+            assert_ne!(baseline, variant.canonical_body().expect("small signal request should encode"));
+        }
+
+        let mut ignored_field = request;
+        ignored_field
+            .vars
+            .as_mut()
+            .expect("signal vars should exist")
+            .value
+            .insert("future-field".to_string(), "ignored".to_string());
+        assert_eq!(
+            baseline,
+            ignored_field
+                .canonical_body()
+                .expect("unknown signal field should not affect the semantic body"),
+        );
+    }
+
+    #[test]
+    fn signal_service_canonical_body_distinguishes_missing_and_empty_fields() {
+        assert_ne!(
+            signal_request(None, Some("scanner"), Some("false"))
+                .canonical_body()
+                .expect("missing signal should encode"),
+            signal_request(Some(""), Some("scanner"), Some("false"))
+                .canonical_body()
+                .expect("empty signal should encode"),
+        );
+    }
+
+    #[test]
+    fn bucket_and_lock_canonical_bodies_bind_every_semantic_field() {
+        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
+        assert_fields_bound!(BatchGenerallyLockRequest, { args: vec!["first".into(), "second".into()] });
+
+        let first = BatchGenerallyLockRequest {
+            args: vec!["first".into(), "second".into()],
+        };
+        let reversed = BatchGenerallyLockRequest {
+            args: vec!["second".into(), "first".into()],
+        };
+        assert_ne!(first.canonical_body().unwrap(), reversed.canonical_body().unwrap());
+    }
+
+    #[test]
+    fn metadata_and_iam_canonical_bodies_bind_every_semantic_field() {
+        assert_fields_bound!(LoadBucketMetadataRequest, {
+            bucket: "bucket".into(),
+            scanner_maintenance_change: true,
+        });
+        assert_fields_bound!(DeleteBucketMetadataRequest, { bucket: "bucket".into() });
+        assert_fields_bound!(DeletePolicyRequest, { policy_name: "policy".into() });
+        assert_fields_bound!(LoadPolicyRequest, { policy_name: "policy".into() });
+        assert_fields_bound!(LoadPolicyMappingRequest, {
+            user_or_group: "user".into(),
+            user_type: 1,
+            is_group: true,
+        });
+        assert_fields_bound!(DeleteUserRequest, { access_key: "user".into() });
+        assert_fields_bound!(DeleteServiceAccountRequest, { access_key: "service".into() });
+        assert_fields_bound!(LoadUserRequest, { access_key: "user".into(), temp: true });
+        assert_fields_bound!(LoadServiceAccountRequest, { access_key: "service".into() });
+        assert_fields_bound!(LoadGroupRequest, { group: "group".into() });
+    }
+
+    #[test]
+    fn control_plane_canonical_bodies_bind_every_semantic_field() {
+        assert_fields_bound!(StopRebalanceRequest, { expected_rebalance_id: "rebalance".into() });
+        assert_fields_bound!(LoadRebalanceMetaRequest, { start_rebalance: true });
+        assert_fields_bound!(StartDecommissionRequest, { pool_indices: vec![1, 2] });
+        assert_fields_bound!(CancelDecommissionRequest, { pool_index: 1 });
+        assert_fields_bound!(ClearDecommissionRequest, { pool_index: 1 });
+
+        let first = StartDecommissionRequest {
+            pool_indices: vec![1, 2],
+        };
+        let reversed = StartDecommissionRequest {
+            pool_indices: vec![2, 1],
+        };
+        assert_ne!(first.canonical_body().unwrap(), reversed.canonical_body().unwrap());
+
+        let empty_domains = [
+            ReloadSiteReplicationConfigRequest::default().canonical_body().unwrap(),
+            ReloadPoolMetaRequest::default().canonical_body().unwrap(),
+            LoadTransitionTierConfigRequest::default().canonical_body().unwrap(),
+        ];
+        assert!(empty_domains.iter().all(|body| !body.is_empty()));
+        assert_ne!(empty_domains[0], empty_domains[1]);
+        assert_ne!(empty_domains[0], empty_domains[2]);
+        assert_ne!(empty_domains[1], empty_domains[2]);
     }
 }
 
@@ -1203,10 +1700,12 @@ mod scanner_activity_tests {
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
-        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, canonical_heal_control_capability_ack,
-        canonical_heal_control_request_body, canonical_heal_control_response_body, heal_control_capability_probe,
+        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
+        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
+        decode_remote_version_state_capability, encode_remote_version_state_capability, heal_control_capability_probe,
         heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
-        internode_rpc_timeout, is_heal_control_capability_probe, normalize_internode_rpc_timeout,
+        internode_rpc_timeout, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
+        normalize_internode_rpc_timeout, remote_version_state_capability_probe,
     };
     use crate::heal_control;
     use std::time::Duration;
@@ -1261,6 +1760,29 @@ mod heal_control_tests {
         );
         assert!(is_heal_control_capability_probe(&probe));
         assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn remote_version_state_capability_probe_requires_exact_nonce() {
+        let probe = remote_version_state_capability_probe(&[7; 16]);
+        assert!(is_remote_version_state_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn remote_version_state_capability_binds_member_and_process_epoch() {
+        let encoded =
+            encode_remote_version_state_capability("node-a:9000", &[7; 16]).expect("small capability response should encode");
+        assert_eq!(
+            decode_remote_version_state_capability(&encoded).expect("capability response should decode"),
+            ("node-a:9000", &[7; 16])
+        );
+        assert!(decode_remote_version_state_capability(&encoded[..encoded.len() - 1]).is_err());
+
+        let mut invalid_utf8 =
+            encode_remote_version_state_capability("node-a", &[7; 16]).expect("small capability response should encode");
+        invalid_utf8[8] = 0xff;
+        assert!(decode_remote_version_state_capability(&invalid_utf8).is_err());
     }
 
     #[test]

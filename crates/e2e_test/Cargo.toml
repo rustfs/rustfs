@@ -25,10 +25,58 @@ workspace = true
 
 [features]
 default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/reqwest-0-13",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-data-usage/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-filemeta/hotpath",
+    "rustfs-lock/hotpath",
+    "rustfs-madmin/hotpath",
+    "rustfs-protos/hotpath",
+    "rustfs-rio/hotpath",
+    "rustfs-signer/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-data-usage/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-filemeta/hotpath-alloc",
+    "rustfs-lock/hotpath-alloc",
+    "rustfs-madmin/hotpath-alloc",
+    "rustfs-protos/hotpath-alloc",
+    "rustfs-rio/hotpath-alloc",
+    "rustfs-signer/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-data-usage/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-filemeta/hotpath-cpu",
+    "rustfs-lock/hotpath-cpu",
+    "rustfs-madmin/hotpath-cpu",
+    "rustfs-protos/hotpath-cpu",
+    "rustfs-rio/hotpath-cpu",
+    "rustfs-signer/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
 ftps = []
 sftp = []
 
 [dependencies]
+hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-credentials.workspace = true
 rustfs-ecstore.workspace = true
@@ -70,7 +118,8 @@ walkdir.workspace = true
 base64 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
-md5 = { workspace = true }
+hex = { workspace = true }
+md-5 = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true
 sha2 = { workspace = true }

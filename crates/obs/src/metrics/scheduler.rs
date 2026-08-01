@@ -92,6 +92,7 @@ use crate::metrics::schema::notification_target::{
     NOTIFICATION_TARGET_FAILED_MESSAGES_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD,
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
 };
+use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
     collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
@@ -100,6 +101,7 @@ use crate::metrics::stats_collector::{
     collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_metric_stats,
     collect_system_cpu_and_memory_stats_with,
 };
+use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
 use crate::telemetry::retire_metric_series;
 use futures_util::FutureExt;
 use rustfs_audit::audit_target_metrics;
@@ -1509,7 +1511,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let labels = current_process_metric_labels();
+        let process_attribute_labels = current_process_attribute_labels();
         let mut host_system = System::new_all();
         let mut host_networks = Networks::new();
         let mut process_sampler = ProcessSampler::new();
@@ -1560,6 +1562,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         }
 
                         if now >= next_system_run {
+                            let labels = current_process_metric_labels(&process_attribute_labels);
                             #[cfg(feature = "gpu")]
                             let mut metrics =
                                 collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
@@ -1686,22 +1689,31 @@ fn advance_deadline(deadline: &mut Instant, interval: Duration, now: Instant) {
     }
 }
 
-fn current_process_metric_labels() -> Vec<(&'static str, Cow<'static, str>)> {
+fn current_process_attribute_labels() -> Vec<(&'static str, Cow<'static, str>)> {
     match collect_process_attributes() {
         Ok(attrs) => vec![
-            ("process_pid", Cow::Owned(attrs.pid.to_string())),
-            ("process_executable_name", Cow::Owned(attrs.executable_name)),
+            (PROCESS_PID_LABEL, Cow::Owned(attrs.pid.to_string())),
+            (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Owned(attrs.executable_name)),
         ],
-        Err(err) => fallback_process_metric_labels(err),
+        Err(err) => fallback_process_attribute_labels(err),
     }
 }
 
-fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
+fn fallback_process_attribute_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "process_metric_labels", result = "collect_failed", error = %err, "metrics runtime state changed");
     vec![
-        ("process_pid", Cow::Owned(std::process::id().to_string())),
-        ("process_executable_name", Cow::Borrowed("unknown")),
+        (PROCESS_PID_LABEL, Cow::Owned(std::process::id().to_string())),
+        (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Borrowed("unknown")),
     ]
+}
+
+fn current_process_metric_labels(
+    process_attribute_labels: &[(&'static str, Cow<'static, str>)],
+) -> Vec<(&'static str, Cow<'static, str>)> {
+    let mut labels = Vec::with_capacity(process_attribute_labels.len() + 1);
+    labels.push((SERVER_LABEL, Cow::Owned(current_local_node_identity())));
+    labels.extend(process_attribute_labels.iter().map(|(key, value)| (*key, value.clone())));
+    labels
 }
 
 fn collect_system_monitoring_metrics(

@@ -72,6 +72,24 @@ pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{QuotaError, StorageError};
 }
 
+pub(crate) mod kms {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
+        }
+    }
+
+    pub(crate) use crate::storage::storage_api::{ECStore, StorageError};
+
+    /// Bucket SSE configuration for the KMS deletion reference gate;
+    /// `Err(StorageError::ConfigNotFound)` when the bucket has none.
+    pub(crate) async fn get_bucket_sse_config(bucket: &str) -> Result<s3s::dto::ServerSideEncryptionConfiguration, StorageError> {
+        crate::storage::storage_api::ecstore_bucket::metadata_sys::get_sse_config(bucket)
+            .await
+            .map(|(config, _)| config)
+    }
+}
+
 pub(crate) mod protocols {
     pub(crate) mod client {
         pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
@@ -97,7 +115,8 @@ pub(crate) mod server {
 
     pub(crate) mod http {
         pub(crate) use crate::storage::storage_api::{
-            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
+            tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -124,9 +143,7 @@ pub(crate) mod server {
         }
 
         pub(crate) mod request_context {
-            pub(crate) use crate::storage::storage_api::request_context_consumer::{
-                RequestContext, extract_request_id_from_headers,
-            };
+            pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         }
 
         pub(crate) mod rpc {
@@ -149,7 +166,7 @@ pub(crate) mod server {
 
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
-                RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
+                RequestContext, extract_request_id_from_headers, spawn_traced,
             };
         }
     }

@@ -2478,7 +2478,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
     };
 
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let _transaction_guard = metadata_sys::acquire_bucket_targets_transaction_lock(bucket)
+    let _transaction_guard = metadata_sys::acquire_bucket_metadata_transaction_lock(bucket)
         .await
         .map_err(ApiError::from)?;
     let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
@@ -2655,6 +2655,10 @@ fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
+fn server_context_not_ready_error() -> S3Error {
+    s3_error!(ServiceUnavailable, "server context is not ready")
+}
+
 fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
     if method != Method::GET {
         return false;
@@ -2704,17 +2708,15 @@ impl<T: Operation> S3Router<T> {
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
         let path = Self::make_route_str(method, path);
+        #[cfg(test)]
+        let registered_path = path.clone();
 
         // warn!("set uri {}", &path);
 
-        #[cfg(test)]
-        {
-            self.router.insert(path.clone(), operation).map_err(std::io::Error::other)?;
-            self.registered_routes.push(path);
-        }
-
-        #[cfg(not(test))]
         self.router.insert(path, operation).map_err(std::io::Error::other)?;
+
+        #[cfg(test)]
+        self.registered_routes.push(registered_path);
 
         Ok(())
     }
@@ -2783,6 +2785,9 @@ where
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
+            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
+                return Err(server_context_not_ready_error());
+            }
         }
         if parse_replication_extension_request(&req.method, &req.uri).is_some()
             || parse_misc_extension_request(&req.method, &req.uri).is_some()
@@ -2836,6 +2841,9 @@ where
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
+            if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
+                return Err(server_context_not_ready_error());
+            }
         }
         if let Some(ext_req) = parse_replication_extension_request(&req.method, &req.uri) {
             return handle_replication_extension_request(&mut req, &ext_req).await;

@@ -274,9 +274,20 @@ async fn data_usage_endpoint_treats_legacy_partial_stats_as_unknown_until_covere
     let before_endpoint = live_bucket_usage_computations();
     let unknown = DefaultAdminUsecase::query_data_usage_info_with_store(ecstore.clone())
         .await
-        .expect_err("an uncovered snapshot must be reported as temporarily unavailable");
+        .expect("an uncovered snapshot must be reported as unknown without failing the endpoint");
 
-    assert_eq!(unknown.code, s3s::S3ErrorCode::ServiceUnavailable);
+    assert!(unknown.last_update.is_none());
+    assert!(!unknown.usage_snapshot_complete);
+    assert_eq!(unknown.buckets_count, 0);
+    assert_eq!(unknown.objects_total_count, 0);
+    assert_eq!(unknown.objects_total_size, 0);
+    assert!(unknown.buckets_usage.is_empty());
+    assert!(unknown.bucket_sizes.is_empty());
+    assert!(unknown.total_capacity > 0);
+    assert_eq!(
+        unknown.total_used_capacity,
+        unknown.total_capacity.saturating_sub(unknown.total_free_capacity)
+    );
     assert_eq!(
         live_bucket_usage_computations(),
         before_endpoint,

@@ -19,6 +19,7 @@
 #![allow(clippy::all)]
 
 use std::collections::HashMap;
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -44,6 +45,19 @@ const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
+
+fn parse_generation(remote_version: &str) -> Result<Option<i64>, Error> {
+    if remote_version.is_empty() {
+        return Ok(None);
+    }
+    let generation = remote_version
+        .parse::<i64>()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "GCS remote version is not a valid generation"))?;
+    if generation <= 0 {
+        return Err(Error::new(ErrorKind::InvalidData, "GCS remote version generation must be positive"));
+    }
+    Ok(Some(generation))
+}
 
 pub struct WarmBackendGCS {
     pub client: Arc<Storage>,
@@ -105,6 +119,10 @@ impl WarmBackendGCS {
 
 #[async_trait::async_trait]
 impl WarmBackend for WarmBackendGCS {
+    fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
+        parse_generation(remote_version_id).map(|_| ())
+    }
+
     async fn put_with_meta(
         &self,
         object: &str,
@@ -135,6 +153,9 @@ impl WarmBackend for WarmBackendGCS {
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         let mut req = self.client.read_object(&self.bucket, &self.get_dest(object));
+        if let Some(generation) = parse_generation(rv)? {
+            req = req.set_generation(generation);
+        }
 
         // Honor the requested byte range so Range GETs on tiered objects return the exact
         // interval instead of the whole object (matches the s3/s3sdk/rustfs warm backends).
@@ -164,13 +185,15 @@ impl WarmBackend for WarmBackendGCS {
         // gRPC v2 DeleteObject requires the bucket in resource-name form. Without this the
         // deleted tiered object was never removed from GCS (empty impl returned Ok), leaking
         // remote data forever.
-        self.control
+        let mut req = self
+            .control
             .delete_object()
             .set_bucket(format!("projects/_/buckets/{}", self.bucket))
-            .set_object(self.get_dest(object))
-            .send()
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .set_object(self.get_dest(object));
+        if let Some(generation) = parse_generation(rv)? {
+            req = req.set_generation(generation);
+        }
+        req.send().await.map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -188,6 +211,30 @@ impl WarmBackend for WarmBackendGCS {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(!resp.objects.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_generation;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn generation_parser_preserves_exact_numeric_versions() {
+        assert_eq!(parse_generation("").expect("empty generation means no version condition"), None);
+        assert_eq!(parse_generation("1").expect("minimum generation should parse"), Some(1));
+        assert_eq!(
+            parse_generation(&i64::MAX.to_string()).expect("maximum generation should parse"),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn generation_parser_rejects_unknown_or_non_positive_versions() {
+        for value in ["unknown", "1.0", "-1", "0", "9223372036854775808"] {
+            let err = parse_generation(value).expect_err("unknown generation must fail closed");
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "{value}");
+        }
     }
 }
 

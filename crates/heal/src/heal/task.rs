@@ -584,6 +584,7 @@ impl HealTask {
     }
 
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
+    #[hotpath::measure]
     pub async fn execute(&self) -> Result<()> {
         // update status and timestamps atomically to avoid race conditions
         let now = SystemTime::now();
@@ -759,6 +760,7 @@ impl HealTask {
 
     // specific heal implementation method
     #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
+    #[hotpath::measure]
     async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
         debug!(
             target: "rustfs::heal::task",
@@ -1404,6 +1406,7 @@ impl HealTask {
         self.heal_bucket_objects(bucket, prefix).await
     }
 
+    #[hotpath::measure]
     async fn heal_bucket_objects(&self, bucket: &str, prefix: &str) -> Result<()> {
         let mut continuation_token: Option<String> = None;
         let mut scanned = 0u64;

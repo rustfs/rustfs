@@ -103,7 +103,7 @@ where
     /// or `out` is larger than one shard. On error `out`'s contents are
     /// unspecified but never contain bytes that failed the hash check — the copy
     /// happens only after verification.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[hotpath::measure]
     pub async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let want = out.len();
         self.begin_read(want)?;
@@ -303,7 +303,7 @@ where
 
     /// Write a (hash+data) block. Returns the number of data bytes written.
     /// Returns an error if called after a short write or if data exceeds shard_size.
-    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "BitrotWriter::write"))]
+    #[hotpath::measure(label = "BitrotWriter::write")]
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -455,7 +455,7 @@ pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorith
 /// stores those as whole-file bitrot with no interleaved hash, so the size guard
 /// on the next line would reject a genuinely healthy part. Reading legacy V1
 /// whole-file-bitrot objects would need a separate verification path.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     mut r: R,
     want_size: usize,

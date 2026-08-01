@@ -72,4 +72,10 @@ pub enum Error {
 
     #[error("invalid resource, type: '{0}', pattern: '{1}'")]
     InvalidResource(String, String),
+
+    #[error("KMS resources require a statement whose actions are all KMS actions")]
+    KmsResourceWithNonKmsAction,
+
+    #[error("bucket policies do not support KMS actions or resources")]
+    KmsUnsupportedInBucketPolicy,
 }

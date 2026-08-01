@@ -26,6 +26,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{Compression, write::GzEncoder};
 use http::HeaderValue;
 use http::header::{CONTENT_TYPE, HOST};
+use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
@@ -50,7 +51,15 @@ fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
 }
 
 fn sse_customer_key_md5_base64(key: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(md5::compute(key).0)
+    let mut hasher = Md5::new();
+    hasher.update(key.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+fn md5_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hex::encode(hasher.finalize())
 }
 
 /// Env var consumed by the local SSE-S3 DEK provider when KMS is not configured.
@@ -5664,7 +5673,7 @@ async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box
     client.create_bucket().bucket(bucket).send().await?;
 
     let archive = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
-    let expected_etag = format!("\"{:x}\"", md5::compute(&archive));
+    let expected_etag = format!("\"{}\"", md5_hex(&archive));
 
     let response = client
         .put_object()

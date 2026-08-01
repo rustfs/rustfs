@@ -79,10 +79,40 @@ fn kms_service_control_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::ServiceControlAction)]
 }
 
-fn normalize_configure_request_auth(
+fn normalize_configure_request_secrets(
     request: &mut ConfigureKmsRequest,
     existing_config: Option<&KmsConfig>,
 ) -> Result<(), String> {
+    if existing_config.is_some_and(|config| matches!(&config.backend_config, rustfs_kms::BackendConfig::Local(_)))
+        && !matches!(request, ConfigureKmsRequest::Local(_))
+    {
+        return Err("Changing from the Local KMS backend is not supported".to_string());
+    }
+
+    if let ConfigureKmsRequest::Local(request) = request
+        && let Some(KmsConfig {
+            backend_config: rustfs_kms::BackendConfig::Local(existing),
+            allow_insecure_dev_defaults,
+            ..
+        }) = existing_config
+    {
+        if request.key_dir != existing.key_dir {
+            return Err("Changing the Local KMS key directory is not supported".to_string());
+        }
+        match request.file_permissions {
+            Some(permissions) if Some(permissions) != existing.file_permissions => {
+                return Err("Changing Local KMS file permissions is not supported".to_string());
+            }
+            None => request.file_permissions = existing.file_permissions,
+            Some(_) => {}
+        }
+        if request.master_key.as_deref().is_some_and(|master_key| !master_key.is_empty()) {
+            return Err("Changing the Local KMS master key is not supported".to_string());
+        }
+        request.master_key.clone_from(&existing.master_key);
+        request.allow_insecure_dev_defaults = Some(*allow_insecure_dev_defaults);
+    }
+
     let needs_existing_auth = match request {
         ConfigureKmsRequest::VaultKv2(req) => token_is_blank(&req.auth_method),
         ConfigureKmsRequest::VaultTransit(req) => token_is_blank(&req.auth_method),
@@ -350,9 +380,9 @@ impl Operation for ConfigureKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-        let existing_config = service_manager.get_redacted_config().await;
+        let existing_config = service_manager.get_config().await;
 
-        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+        if let Err(e) = normalize_configure_request_secrets(&mut configure_request, existing_config.as_ref()) {
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
         }
 
@@ -363,36 +393,27 @@ impl Operation for ConfigureKmsHandler {
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
 
-        // Configure the service
-        let (success, message, status) = match service_manager.configure(kms_config.clone()).await {
+        let persisted_config = kms_config.clone();
+        let (success, message, status) = match service_manager
+            .configure_with_persistence(kms_config, || async move {
+                save_kms_config(&persisted_config)
+                    .await
+                    .map_err(|error| rustfs_kms::KmsError::backend_error(format!("Failed to persist KMS configuration: {error}")))
+            })
+            .await
+        {
             Ok(()) => {
-                // Persist the configuration to cluster storage
-                if let Err(e) = save_kms_config(&kms_config).await {
-                    let error_msg = format!("KMS configured in memory but failed to persist: {e}");
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "configure",
-                        state = "persist_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    let status = service_manager.get_status().await;
-                    (false, error_msg, status)
-                } else {
-                    let status = service_manager.get_status().await;
-                    info!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "configure",
-                        state = "configured",
-                        status = ?status,
-                        "admin kms dynamic state"
-                    );
-                    (true, "KMS configured successfully".to_string(), status)
-                }
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "configure",
+                    state = "configured",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS configured successfully".to_string(), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
@@ -499,125 +520,61 @@ impl Operation for StartKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-
-        // Check if already running and force flag
-        let current_status = service_manager.get_status().await;
-        if matches!(current_status, KmsServiceStatus::Running) && !start_request.force.unwrap_or(false) {
-            warn!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_KMS,
-                event = "kms_service_state",
-                operation = "start",
-                state = "already_running",
-                "admin kms dynamic state"
-            );
-            let response = StartKmsResponse {
-                success: false,
-                message: "KMS service is already running. Use force=true to restart.".to_string(),
-                status: current_status,
-            };
-            let json_response = match serde_json::to_string(&response) {
-                Ok(json) => json,
-                Err(e) => {
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = EVENT_ADMIN_KMS_DYNAMIC_STATE,
-                        operation = "start",
-                        result = "response_serialize_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from("Serialization error".to_string()),
-                    )));
-                }
-            };
-            return Ok(S3Response::new((StatusCode::OK, Body::from(json_response))));
-        }
-
-        // Start the service (or restart if force=true)
-        let (success, message, status) =
-            if start_request.force.unwrap_or(false) && matches!(current_status, KmsServiceStatus::Running) {
-                // Force restart
-                match service_manager.stop().await {
-                    Ok(()) => match service_manager.start().await {
-                        Ok(()) => {
-                            let status = service_manager.get_status().await;
-                            info!(
-                                component = LOG_COMPONENT_ADMIN,
-                                subsystem = LOG_SUBSYSTEM_KMS,
-                                event = "kms_service_state",
-                                operation = "restart",
-                                state = "running",
-                                status = ?status,
-                                "admin kms dynamic state"
-                            );
-                            (true, "KMS service restarted successfully".to_string(), status)
-                        }
-                        Err(e) => {
-                            let error_msg = format!("Failed to restart KMS service: {e}");
-                            error!(
-                                component = LOG_COMPONENT_ADMIN,
-                                subsystem = LOG_SUBSYSTEM_KMS,
-                                event = "kms_service_state",
-                                operation = "restart",
-                                state = "start_failed",
-                                error = %e,
-                                "admin kms dynamic state"
-                            );
-                            let status = service_manager.get_status().await;
-                            (false, error_msg, status)
-                        }
-                    },
-                    Err(e) => {
-                        let error_msg = format!("Failed to stop KMS service for restart: {e}");
-                        error!(
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_KMS,
-                            event = "kms_service_state",
-                            operation = "restart",
-                            state = "stop_failed",
-                            error = %e,
-                            "admin kms dynamic state"
-                        );
-                        let status = service_manager.get_status().await;
-                        (false, error_msg, status)
-                    }
-                }
-            } else {
-                // Normal start
-                match service_manager.start().await {
-                    Ok(()) => {
-                        let status = service_manager.get_status().await;
-                        info!(
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_KMS,
-                            event = "kms_service_state",
-                            operation = "start",
-                            state = "running",
-                            status = ?status,
-                            "admin kms dynamic state"
-                        );
-                        (true, "KMS service started successfully".to_string(), status)
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Failed to start KMS service: {e}");
-                        error!(
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_KMS,
-                            event = "kms_service_state",
-                            operation = "start",
-                            state = "start_failed",
-                            error = %e,
-                            "admin kms dynamic state"
-                        );
-                        let status = service_manager.get_status().await;
-                        (false, error_msg, status)
-                    }
-                }
-            };
+        let force = start_request.force.unwrap_or(false);
+        let (success, message, status) = match service_manager.start_or_restart(force).await {
+            Ok(rustfs_kms::KmsStartOutcome::Started) => {
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "start",
+                    state = "running",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS service started successfully".to_string(), status)
+            }
+            Ok(rustfs_kms::KmsStartOutcome::Restarted) => {
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "restart",
+                    state = "running",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS service restarted successfully".to_string(), status)
+            }
+            Ok(rustfs_kms::KmsStartOutcome::AlreadyRunning) => {
+                let status = service_manager.get_status().await;
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "start",
+                    state = "already_running",
+                    "admin kms dynamic state"
+                );
+                (false, "KMS service is already running. Use force=true to restart.".to_string(), status)
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to start or restart KMS service: {e}");
+                error!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "start",
+                    state = "start_failed",
+                    error = %e,
+                    "admin kms dynamic state"
+                );
+                let status = service_manager.get_status().await;
+                (false, error_msg, status)
+            }
+        };
 
         let response = StartKmsResponse {
             success,
@@ -774,8 +731,7 @@ impl Operation for GetKmsStatusHandler {
 
         let service_manager = kms_service_manager_from_context();
 
-        let status = service_manager.get_status().await;
-        let config = service_manager.get_redacted_config().await;
+        let (status, config) = service_manager.get_redacted_state().await;
 
         // Get backend type and health status
         let backend_type = config.as_ref().map(|c| c.backend.clone());
@@ -895,9 +851,9 @@ impl Operation for ReconfigureKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-        let existing_config = service_manager.get_redacted_config().await;
+        let existing_config = service_manager.get_config().await;
 
-        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+        if let Err(e) = normalize_configure_request_secrets(&mut configure_request, existing_config.as_ref()) {
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
         }
 
@@ -908,36 +864,27 @@ impl Operation for ReconfigureKmsHandler {
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
 
-        // Reconfigure the service (stops, reconfigures, and starts)
-        let (success, message, status) = match service_manager.reconfigure(kms_config.clone()).await {
+        let persisted_config = kms_config.clone();
+        let (success, message, status) = match service_manager
+            .reconfigure_with_persistence(kms_config, || async move {
+                save_kms_config(&persisted_config)
+                    .await
+                    .map_err(|error| rustfs_kms::KmsError::backend_error(format!("Failed to persist KMS configuration: {error}")))
+            })
+            .await
+        {
             Ok(()) => {
-                // Persist the configuration to cluster storage
-                if let Err(e) = save_kms_config(&kms_config).await {
-                    let error_msg = format!("KMS reconfigured in memory but failed to persist: {e}");
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "reconfigure",
-                        state = "persist_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    let status = service_manager.get_status().await;
-                    (false, error_msg, status)
-                } else {
-                    let status = service_manager.get_status().await;
-                    info!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_service_state",
-                        operation = "reconfigure",
-                        state = "reconfigured",
-                        status = ?status,
-                        "admin kms dynamic state"
-                    );
-                    (true, "KMS reconfigured and restarted successfully".to_string(), status)
-                }
+                let status = service_manager.get_status().await;
+                info!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_service_state",
+                    operation = "reconfigure",
+                    state = "reconfigured",
+                    status = ?status,
+                    "admin kms dynamic state"
+                );
+                (true, "KMS reconfigured and restarted successfully".to_string(), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");
@@ -986,8 +933,12 @@ impl Operation for ReconfigureKmsHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_persisted_kms_config, ensure_kms_config_persistable, kms_configure_actions, kms_service_control_actions};
+    use super::{
+        decode_persisted_kms_config, ensure_kms_config_persistable, kms_configure_actions, kms_service_control_actions,
+        normalize_configure_request_secrets,
+    };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn assert_has_action(actions: &[Action], action: Action) {
@@ -1083,5 +1034,141 @@ mod tests {
         );
 
         assert!(ensure_kms_config_persistable(&config).is_err());
+    }
+
+    #[test]
+    fn local_reconfigure_preserves_hidden_master_key_for_same_directory() {
+        let key_dir = PathBuf::from("/var/lib/rustfs/kms");
+        let mut existing = rustfs_kms::KmsConfig::local(key_dir.clone());
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+
+        let mut request = rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+            key_dir,
+            master_key: None,
+            file_permissions: Some(0o600),
+            default_key_id: Some("experience-key".to_string()),
+            timeout_seconds: Some(30),
+            retry_attempts: Some(3),
+            enable_cache: Some(true),
+            max_cached_keys: Some(1000),
+            cache_ttl_seconds: Some(3600),
+            allow_insecure_dev_defaults: Some(false),
+        });
+
+        normalize_configure_request_secrets(&mut request, Some(&existing)).expect("normalize local request");
+        let rustfs_kms::ConfigureKmsRequest::Local(request) = request else {
+            panic!("request must remain local");
+        };
+        assert_eq!(request.master_key.as_deref(), Some("stored-master-key"));
+    }
+
+    #[test]
+    fn local_reconfigure_preserves_unspecified_legacy_file_permissions() {
+        let key_dir = PathBuf::from("/var/lib/rustfs/kms");
+        let mut existing = rustfs_kms::KmsConfig::local(key_dir.clone());
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+        existing_local.file_permissions = None;
+
+        let mut request = rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+            key_dir,
+            master_key: None,
+            file_permissions: None,
+            default_key_id: Some("experience-key".to_string()),
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: Some(false),
+        });
+
+        normalize_configure_request_secrets(&mut request, Some(&existing)).expect("normalize legacy local request");
+        let rustfs_kms::ConfigureKmsRequest::Local(request) = request else {
+            panic!("request must remain local");
+        };
+        assert!(request.file_permissions.is_none());
+    }
+
+    #[test]
+    fn local_reconfigure_does_not_reuse_master_key_for_different_directory() {
+        let mut existing = rustfs_kms::KmsConfig::local(PathBuf::from("/var/lib/rustfs/kms"));
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+
+        let mut request = rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+            key_dir: PathBuf::from("/var/lib/rustfs/other-kms"),
+            master_key: None,
+            file_permissions: Some(0o600),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: Some(false),
+        });
+
+        let error = normalize_configure_request_secrets(&mut request, Some(&existing))
+            .expect_err("changing the local key directory must be rejected");
+        assert_eq!(error, "Changing the Local KMS key directory is not supported");
+    }
+
+    #[test]
+    fn local_reconfigure_rejects_file_permission_and_master_key_changes() {
+        let key_dir = PathBuf::from("/var/lib/rustfs/kms");
+        let mut existing = rustfs_kms::KmsConfig::local(key_dir.clone());
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+        existing_local.file_permissions = Some(0o600);
+
+        let request = |master_key, file_permissions| {
+            rustfs_kms::ConfigureKmsRequest::Local(rustfs_kms::ConfigureLocalKmsRequest {
+                key_dir: key_dir.clone(),
+                master_key,
+                file_permissions,
+                default_key_id: None,
+                timeout_seconds: None,
+                retry_attempts: None,
+                enable_cache: None,
+                max_cached_keys: None,
+                cache_ttl_seconds: None,
+                allow_insecure_dev_defaults: Some(false),
+            })
+        };
+
+        let mut permissions_change = request(None, Some(0o666));
+        let permissions_error = normalize_configure_request_secrets(&mut permissions_change, Some(&existing))
+            .expect_err("changing file permissions must be rejected");
+        assert_eq!(permissions_error, "Changing Local KMS file permissions is not supported");
+
+        let mut master_key_change = request(Some("replacement-master-key".to_string()), Some(0o600));
+        let master_key_error = normalize_configure_request_secrets(&mut master_key_change, Some(&existing))
+            .expect_err("changing the master key must be rejected");
+        assert_eq!(master_key_error, "Changing the Local KMS master key is not supported");
+
+        let mut backend_change = rustfs_kms::ConfigureKmsRequest::Static(rustfs_kms::ConfigureStaticKmsRequest {
+            key_id: "static-key".to_string(),
+            secret_key: "not-used-by-normalization".to_string(),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
+        });
+        let backend_error = normalize_configure_request_secrets(&mut backend_change, Some(&existing))
+            .expect_err("changing from the local backend must be rejected");
+        assert_eq!(backend_error, "Changing from the Local KMS backend is not supported");
     }
 }

@@ -25,7 +25,17 @@ keywords = ["checksum-calculation", "verification", "integrity", "authenticity",
 categories = ["web-programming", "development-tools", "network-programming"]
 documentation = "https://docs.rs/rustfs-checksums/latest/rustfs_checksum/"
 
+[lints]
+workspace = true
+
+[features]
+default = []
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 crc-fast = { workspace = true }
 http = { workspace = true }

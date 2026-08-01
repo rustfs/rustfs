@@ -156,6 +156,9 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
     let bound_addr = http_server.bound_addr;
     let cancel_token = CancellationToken::new();
 
+    #[cfg(feature = "e2e-test-hooks")]
+    crate::embedded::wait_for_embedded_startup_hook(bound_addr.port()).await;
+
     let storage_runtime = match init_embedded_startup_storage_runtime(
         listen_context.server_addr,
         &endpoint_pools,

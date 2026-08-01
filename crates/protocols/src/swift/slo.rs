@@ -21,6 +21,7 @@
 use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
+use md5::{Digest as Md5Digest, Md5};
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use serde::{Deserialize, Serialize};
@@ -81,9 +82,9 @@ impl SLOManifest {
             etag_concat.push_str(etag);
         }
 
-        // Calculate MD5 hash
-        let hash = md5::compute(etag_concat.as_bytes());
-        format!("\"{:x}-{}\"", hash, self.segments.len())
+        let mut hasher = Md5::new();
+        hasher.update(etag_concat.as_bytes());
+        format!("\"{}-{}\"", hex::encode(hasher.finalize()), self.segments.len())
     }
 
     /// Validate manifest against actual segments

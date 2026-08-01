@@ -26,7 +26,51 @@ documentation = "https://docs.rs/rustfs-heal/latest/rustfs_heal/"
 keywords = ["RustFS", "heal", "erasure-coding", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 
+[lints]
+workspace = true
+
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "rustfs-common/hotpath",
+    "rustfs-concurrency/hotpath",
+    "rustfs-config/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-madmin/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-utils/hotpath",
+    "rustfs-test-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-concurrency/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-madmin/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+    "rustfs-test-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-concurrency/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-madmin/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+    "rustfs-test-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-config = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-ecstore = { workspace = true }
@@ -53,7 +97,7 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
 http = { workspace = true }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 
 [lib]

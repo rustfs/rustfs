@@ -29,11 +29,11 @@ use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
 use rustfs_utils::XHost;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -47,6 +47,9 @@ const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
 const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
+const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -91,6 +94,180 @@ lazy_static! {
     pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<Arc<NotificationSys>> = OnceLock::new();
 }
 
+#[derive(Clone)]
+struct RemoteVersionStateFleetProof {
+    topology_fingerprint: String,
+    peer_epochs: Arc<BTreeMap<String, Uuid>>,
+    expires_at: Instant,
+}
+
+impl RemoteVersionStateFleetProof {
+    fn token(&self) -> RemoteVersionStateFleetProofToken {
+        RemoteVersionStateFleetProofToken {
+            topology_fingerprint: self.topology_fingerprint.clone(),
+            peer_epochs: self.peer_epochs.clone(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RemoteVersionStateFleetProofToken {
+    topology_fingerprint: String,
+    peer_epochs: Arc<BTreeMap<String, Uuid>>,
+}
+
+#[derive(Default)]
+struct RemoteVersionStateFleetProofState {
+    proof: Option<RemoteVersionStateFleetProof>,
+    topology_conflict: bool,
+}
+
+static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<RemoteVersionStateFleetProofState>> = OnceLock::new();
+static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
+
+fn remote_version_state_fleet_proof_slot() -> &'static std::sync::RwLock<RemoteVersionStateFleetProofState> {
+    REMOTE_VERSION_STATE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(RemoteVersionStateFleetProofState::default()))
+}
+
+fn replace_remote_version_state_fleet_proof(proof: Option<RemoteVersionStateFleetProof>) {
+    replace_remote_version_state_fleet_proof_in(remote_version_state_fleet_proof_slot(), proof);
+}
+
+fn replace_remote_version_state_fleet_proof_in(
+    slot: &std::sync::RwLock<RemoteVersionStateFleetProofState>,
+    proof: Option<RemoteVersionStateFleetProof>,
+) {
+    slot.write().unwrap_or_else(std::sync::PoisonError::into_inner).proof = proof;
+}
+
+fn publish_remote_version_state_probe_result(
+    slot: &std::sync::RwLock<RemoteVersionStateFleetProofState>,
+    topology_fingerprint: &str,
+    result: Result<BTreeMap<String, Uuid>>,
+    observed_at: Instant,
+) -> Option<Error> {
+    match result {
+        Ok(peer_epochs) => {
+            let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let peer_epochs = state
+                .proof
+                .as_ref()
+                .filter(|proof| proof.topology_fingerprint == topology_fingerprint && proof.peer_epochs.as_ref() == &peer_epochs)
+                .map(|proof| Arc::clone(&proof.peer_epochs))
+                .unwrap_or_else(|| Arc::new(peer_epochs));
+            state.proof = Some(RemoteVersionStateFleetProof {
+                topology_fingerprint: topology_fingerprint.to_string(),
+                peer_epochs,
+                expires_at: observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
+            });
+            None
+        }
+        Err(err) => {
+            replace_remote_version_state_fleet_proof_in(slot, None);
+            Some(err)
+        }
+    }
+}
+
+pub(crate) fn acquire_remote_version_state_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = remote_version_state_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    acquire_remote_version_state_fleet_proof_from(&state, expected_topology, Instant::now())
+}
+
+fn acquire_remote_version_state_fleet_proof_from(
+    state: &RemoteVersionStateFleetProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<RemoteVersionStateFleetProofToken> {
+    if state.topology_conflict || !remote_version_state_fleet_proof_valid_at(state.proof.as_ref(), expected_topology, now) {
+        return None;
+    }
+    state.proof.as_ref().map(RemoteVersionStateFleetProof::token)
+}
+
+pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStateFleetProofToken) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    let state = remote_version_state_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.topology_conflict {
+        return false;
+    }
+    state.proof.as_ref().is_some_and(|current| {
+        current.topology_fingerprint == *expected_topology
+            && current.topology_fingerprint == proof.topology_fingerprint
+            && Arc::ptr_eq(&current.peer_epochs, &proof.peer_epochs)
+            && Instant::now() < current.expires_at
+    })
+}
+
+fn remote_version_state_fleet_proof_valid_at(
+    proof: Option<&RemoteVersionStateFleetProof>,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof.is_some_and(|proof| proof.topology_fingerprint == expected_topology && now < proof.expires_at)
+}
+
+fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, peer: String, epoch: Uuid) -> Result<()> {
+    if epoch.is_nil() || peer_epochs.values().any(|existing| *existing == epoch) || peer_epochs.insert(peer, epoch).is_some() {
+        return Err(Error::other("remote version state capability peer identity is invalid"));
+    }
+    Ok(())
+}
+
+pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
+    if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.clone()).is_err() {
+        if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() != Some(&topology_fingerprint) {
+            let mut state = remote_version_state_fleet_proof_slot()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.topology_conflict = true;
+            state.proof = None;
+        }
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            let result = match get_global_notification_sys() {
+                Some(notification_sys) => {
+                    match timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::other("remote version state fleet capability probe timed out")),
+                    }
+                }
+                None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
+            };
+            let topology_conflict = remote_version_state_fleet_proof_slot()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .topology_conflict;
+            if topology_conflict {
+                replace_remote_version_state_fleet_proof(None);
+            } else if let Some(err) = publish_remote_version_state_probe_result(
+                remote_version_state_fleet_proof_slot(),
+                &topology_fingerprint,
+                result,
+                Instant::now(),
+            ) {
+                debug!(error = %err, "remote version state fleet capability probe failed closed");
+            }
+            sleep(REMOTE_VERSION_STATE_PROBE_INTERVAL).await;
+        }
+    });
+}
+
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
     let _ = GLOBAL_NOTIFICATION_SYS
         .set(Arc::new(NotificationSys::new(eps).await))
@@ -115,7 +292,17 @@ pub struct NotificationSys {
 
 impl NotificationSys {
     pub async fn new(eps: EndpointServerPools) -> Self {
+        let expected_remote_hosts = eps
+            .peer_grid_host_slots_sorted()
+            .into_iter()
+            .filter_map(|(peer, _, is_local)| (!is_local).then_some(peer))
+            .collect::<Vec<_>>();
         let (peer_clients, all_peer_clients, peer_topology_hosts) = PeerRestClient::new_clients_with_topology(eps).await;
+        let peer_topology_hosts = if peer_topology_hosts.is_empty() {
+            expected_remote_hosts
+        } else {
+            peer_topology_hosts
+        };
         let peer_admin_caches = (0..peer_clients.len()).map(|_| Mutex::new(PeerAdminCache::new())).collect();
         Self {
             peer_clients,
@@ -124,6 +311,24 @@ impl NotificationSys {
             peer_admin_caches,
             tier_config_reload_workers: Default::default(),
         }
+    }
+
+    async fn probe_remote_version_state_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("remote version state capability fleet membership is incomplete"));
+        }
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("remote version state capability peer is unreachable"))?;
+            client.probe_remote_version_state(topology_fingerprint.to_string()).await
+        });
+        let mut peer_epochs = BTreeMap::new();
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        Ok(peer_epochs)
     }
 }
 
@@ -1344,8 +1549,11 @@ async fn run_tier_config_reload_worker<F, Fut>(
                 }
                 TierConfigReloadFinish::Pending => retry_attempt = 0,
             },
-            TierConfigReloadOutcome::Terminal(_) => match sys.finish_tier_config_reload_worker(&host) {
+            TierConfigReloadOutcome::Terminal(err) => match sys.finish_tier_config_reload_worker(&host) {
                 TierConfigReloadFinish::Completed => {
+                    // This peer keeps the previous tier configuration for good, so record
+                    // why. Dropping the error here hides the only evidence of a divergent
+                    // node behind an outcome label that cannot be acted on.
                     warn!(
                         event = EVENT_NOTIFICATION_PEER_PROPAGATION,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1353,6 +1561,7 @@ async fn run_tier_config_reload_worker<F, Fut>(
                         action = "reload_transition_tier_config",
                         host,
                         outcome = "terminal",
+                        error = ?err,
                         "tier configuration reload stopped after a terminal outcome"
                     );
                     return;
@@ -1835,15 +2044,10 @@ fn synthesized_disks(host: &str, endpoints: &EndpointServerPools, state: ItemSta
 /// Whether `peer_host` refers to the same node as an endpoint whose
 /// `host_port()` is `ep_host_port`.
 ///
-/// `PeerRestClient::host` is an `XHost`, which resolves names to an address on
-/// construction (`hosts_sorted` -> `XHost::try_from` -> `to_socket_addrs`), so
-/// `peer_host` is the resolved `IP:port`. An endpoint's `host_port()`, however,
-/// is `url.host():port` — still the raw `hostname:port` on hostname-based
-/// deployments. A plain string compare therefore misses on hostname clusters,
-/// leaving the synthesized/degraded drive list empty and `unknownDisks` at 0
-/// (rustfs/rustfs#4607 follow-up). Compare directly first (fast path / IP
-/// deployments), then canonicalize the endpoint side through the same `XHost`
-/// resolution and compare again.
+/// Current topology clients preserve the endpoint `hostname:port`, so the
+/// direct comparison is the normal path. The resolution fallback keeps
+/// compatibility with older or manually constructed clients whose `XHost`
+/// contains a resolved `IP:port` (rustfs/rustfs#4607 follow-up).
 fn endpoint_host_matches(peer_host: &str, ep_host_port: &str) -> bool {
     if peer_host == ep_host_port {
         return true;
@@ -1885,6 +2089,183 @@ fn aggregate_scanner_dirty_usage_acknowledgement_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_version_state_fleet_proof_rejects_stale_or_mismatched_membership() {
+        let now = Instant::now();
+        let mut peer_epochs = BTreeMap::new();
+        peer_epochs.insert("peer-a".to_string(), Uuid::new_v4());
+        let proof = RemoteVersionStateFleetProof {
+            topology_fingerprint: "topology-a".to_string(),
+            peer_epochs: Arc::new(peer_epochs),
+            expires_at: now + Duration::from_secs(1),
+        };
+
+        assert!(remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-a", now));
+        assert!(!remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-b", now));
+        assert!(!remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-a", proof.expires_at));
+        assert!(!remote_version_state_fleet_proof_valid_at(None, "topology-a", now));
+    }
+
+    #[test]
+    fn remote_version_state_fleet_proof_rejects_nil_process_epoch() {
+        let mut peer_epochs = BTreeMap::new();
+
+        assert!(insert_remote_version_state_peer(&mut peer_epochs, "peer-a".to_string(), Uuid::nil()).is_err());
+        assert!(peer_epochs.is_empty());
+    }
+
+    #[test]
+    fn remote_version_state_fleet_proof_accepts_single_node_membership() {
+        let now = Instant::now();
+        let proof = RemoteVersionStateFleetProof {
+            topology_fingerprint: "topology-a".to_string(),
+            peer_epochs: Arc::new(BTreeMap::new()),
+            expires_at: now + Duration::from_secs(1),
+        };
+
+        assert!(remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-a", now));
+    }
+
+    #[test]
+    fn remote_version_state_fleet_proof_token_changes_with_process_epoch() {
+        let now = Instant::now();
+        let proof = RemoteVersionStateFleetProof {
+            topology_fingerprint: "topology-a".to_string(),
+            peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
+            expires_at: now + Duration::from_secs(1),
+        };
+        let captured = proof.token();
+        let restarted = RemoteVersionStateFleetProof {
+            topology_fingerprint: proof.topology_fingerprint.clone(),
+            peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
+            expires_at: proof.expires_at,
+        };
+
+        assert!(captured != restarted.token());
+    }
+
+    #[test]
+    fn remote_version_state_fleet_proof_renewal_preserves_only_same_epoch_token() {
+        let slot = std::sync::RwLock::new(RemoteVersionStateFleetProofState::default());
+        let now = Instant::now();
+        let epoch = Uuid::new_v4();
+        let peers = BTreeMap::from([("peer-a".to_string(), epoch)]);
+        assert!(publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peers.clone()), now).is_none());
+        let original = slot
+            .read()
+            .expect("proof slot should not poison")
+            .proof
+            .as_ref()
+            .expect("successful probe should publish proof")
+            .token();
+
+        assert!(
+            publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peers), now + Duration::from_millis(1)).is_none()
+        );
+        let renewed = slot
+            .read()
+            .expect("proof slot should not poison")
+            .proof
+            .as_ref()
+            .expect("renewal should retain proof")
+            .token();
+        assert!(Arc::ptr_eq(&original.peer_epochs, &renewed.peer_epochs));
+
+        let restarted = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(
+            publish_remote_version_state_probe_result(&slot, "topology-a", Ok(restarted), now + Duration::from_millis(2))
+                .is_none()
+        );
+        let replaced = slot
+            .read()
+            .expect("proof slot should not poison")
+            .proof
+            .as_ref()
+            .expect("restarted peer should publish a new proof")
+            .token();
+        assert!(!Arc::ptr_eq(&original.peer_epochs, &replaced.peer_epochs));
+    }
+
+    #[test]
+    fn remote_version_state_fleet_proof_conflict_revokes_atomic_snapshot() {
+        let now = Instant::now();
+        let mut state = RemoteVersionStateFleetProofState {
+            proof: Some(RemoteVersionStateFleetProof {
+                topology_fingerprint: "topology-a".to_string(),
+                peer_epochs: Arc::new(BTreeMap::new()),
+                expires_at: now + Duration::from_secs(1),
+            }),
+            topology_conflict: false,
+        };
+        assert!(acquire_remote_version_state_fleet_proof_from(&state, "topology-a", now).is_some());
+
+        state.topology_conflict = true;
+        assert!(acquire_remote_version_state_fleet_proof_from(&state, "topology-a", now).is_none());
+    }
+
+    #[test]
+    fn remote_version_state_fleet_probe_rejects_duplicate_member_or_process_epoch() {
+        let epoch = Uuid::new_v4();
+        let mut peer_epochs = BTreeMap::new();
+        insert_remote_version_state_peer(&mut peer_epochs, "node-a:9000".to_string(), epoch)
+            .expect("first member should be admitted");
+        assert!(insert_remote_version_state_peer(&mut peer_epochs, "node-b:9000".to_string(), epoch).is_err());
+        assert!(insert_remote_version_state_peer(&mut peer_epochs, "node-a:9000".to_string(), Uuid::new_v4()).is_err());
+        assert!(insert_remote_version_state_peer(&mut peer_epochs, "node-c:9000".to_string(), Uuid::nil()).is_err());
+    }
+
+    #[test]
+    fn remote_version_state_fleet_probe_failure_revokes_previous_proof() {
+        let slot = std::sync::RwLock::new(RemoteVersionStateFleetProofState::default());
+        let now = Instant::now();
+        let peer_epochs = BTreeMap::from([("node-a:9000".to_string(), Uuid::new_v4())]);
+        assert!(publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peer_epochs), now).is_none());
+        assert!(slot.read().expect("proof slot should not poison").proof.is_some());
+
+        assert!(
+            publish_remote_version_state_probe_result(&slot, "topology-a", Err(Error::other("peer unavailable")), now,).is_some()
+        );
+        assert!(slot.read().expect("proof slot should not poison").proof.is_none());
+
+        let peer_epochs = BTreeMap::from([("node-a:9000".to_string(), Uuid::new_v4())]);
+        assert!(publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peer_epochs), now).is_none());
+        assert!(slot.read().expect("proof slot should not poison").proof.is_some());
+    }
+
+    #[tokio::test]
+    async fn remote_version_state_fleet_probe_rejects_unreachable_member() {
+        let notification_sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["peer-a".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+
+        let err = notification_sys
+            .probe_remote_version_state_fleet("topology-a")
+            .await
+            .expect_err("an unreachable configured member must fail the fleet proof");
+        assert!(err.to_string().contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn remote_version_state_fleet_probe_rejects_missing_member_slot() {
+        let notification_sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["peer-a".to_string()],
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+
+        let err = notification_sys
+            .probe_remote_version_state_fleet("topology-a")
+            .await
+            .expect_err("a missing configured member slot must fail the fleet proof");
+        assert!(err.to_string().contains("incomplete"));
+    }
 
     fn build_props(endpoint: &str) -> ServerProperties {
         ServerProperties {

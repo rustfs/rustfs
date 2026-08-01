@@ -72,7 +72,7 @@ use super::storage_api::object_usecase::error::{
     is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use super::storage_api::object_usecase::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
 use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
@@ -116,7 +116,7 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
-use md5::Context as Md5Context;
+use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
@@ -130,9 +130,7 @@ use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_targets::{
-    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-};
+use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
@@ -763,7 +761,7 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object, existing.transition_version_state)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
         tier_sweeper::transitioned_delete_journal_entry(
@@ -771,6 +769,7 @@ async fn enqueue_transitioned_delete_cleanup(
             opts.versioned,
             opts.version_suspended,
             &existing.transitioned_object,
+            existing.transition_version_state,
         )
     };
     let Some(mut je) = je else {
@@ -800,7 +799,7 @@ pin_project! {
     struct ExtractArchiveEtagReader<R> {
         #[pin]
         inner: R,
-        md5: Md5Context,
+        md5: Md5,
         finished: bool,
         etag: Arc<Mutex<Option<String>>>,
     }
@@ -1853,7 +1852,7 @@ impl<R> ExtractArchiveEtagReader<R> {
     fn new(inner: R, etag: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             inner,
-            md5: Md5Context::new(),
+            md5: Md5::new(),
             finished: false,
             etag,
         }
@@ -1869,11 +1868,11 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
             Poll::Ready(Ok(())) => {
                 let filled = &buf.filled()[before..];
                 if !filled.is_empty() {
-                    this.md5.consume(filled);
+                    this.md5.update(filled);
                 } else if !*this.finished {
                     *this.finished = true;
                     if let Ok(mut etag) = this.etag.lock() {
-                        *etag = Some(format!("{:x}", this.md5.clone().finalize()));
+                        *etag = Some(hex_simd::encode_to_string(this.md5.clone().finalize(), hex_simd::AsciiCase::Lower));
                     }
                 }
                 Poll::Ready(Ok(()))
@@ -6073,19 +6072,6 @@ impl DefaultObjectUsecase {
                 ));
             }
         };
-        let has_replacement_metadata = metadata.is_some()
-            || cache_control.is_some()
-            || content_disposition.is_some()
-            || content_encoding.is_some()
-            || content_language.is_some()
-            || content_type.is_some()
-            || expires.is_some();
-        if has_replacement_metadata && !replaces_metadata {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                "Replacement metadata requires the REPLACE metadata directive".to_string(),
-            ));
-        }
         let replacement_metadata = if replaces_metadata {
             validate_archive_content_encoding(&key, content_type.as_deref(), content_encoding.as_deref())?;
             let mut replacement_metadata = metadata.unwrap_or_default();
@@ -6539,6 +6525,7 @@ impl DefaultObjectUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects).suppress_event();
+        let request_context = helper.request_context_or_from_request(&req);
         let (bucket, delete) = {
             let bucket = req.input.bucket.clone();
             let delete = req.input.delete.clone();
@@ -6947,10 +6934,12 @@ impl DefaultObjectUsecase {
 
         let req_headers = req.headers.clone();
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let req_params = rustfs_targets::extract_params_header(&req_headers);
+        let resp_elements =
+            build_event_resp_elements(&S3Response::new(DeleteObjectsOutput::default()), &request_context.request_id);
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
         let notify_bucket = bucket.clone();
-        spawn_background_with_context(request_context, async move {
+        spawn_background_with_context(Some(request_context), async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
@@ -6965,8 +6954,8 @@ impl DefaultObjectUsecase {
                         }),
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                    .req_params(extract_params_header(&req_headers))
-                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .req_params(req_params.clone())
+                    .resp_elements(resp_elements.clone())
                     .host(get_request_host(&req_headers))
                     .user_agent(get_request_user_agent(&req_headers))
                     .build();
@@ -7782,7 +7771,12 @@ impl DefaultObjectUsecase {
         let bucket_clone = bucket.clone();
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
-        let version_id_clone = obj_info_.version_id.map(|v| v.to_string());
+        let version_id_clone = obj_info_
+            .version_id
+            .map(|v| v.to_string())
+            .or_else(|| (opts.versioned || opts.version_suspended).then(|| Uuid::nil().to_string()));
+        let versioned = opts.versioned;
+        let version_suspended = opts.version_suspended;
         let mut restore_operation_metadata = HashMap::new();
         if let Some(id) = restore_operation_id {
             insert_str(&mut restore_operation_metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
@@ -7796,6 +7790,8 @@ impl DefaultObjectUsecase {
                     ..Default::default()
                 },
                 version_id: version_id_clone,
+                versioned,
+                version_suspended,
                 user_defined: restore_operation_metadata,
                 ..Default::default()
             };
@@ -7841,6 +7837,7 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
+        let request_context = helper.request_context_or_from_request(&req);
         let auth_method = req.method.clone();
         let auth_uri = req.uri.clone();
         let auth_headers = req.headers.clone();
@@ -8017,7 +8014,7 @@ impl DefaultObjectUsecase {
         };
 
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let req_params = extract_params_header(&req.headers);
+        let req_params = rustfs_targets::extract_params_header(&req.headers);
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
@@ -8246,7 +8243,7 @@ impl DefaultObjectUsecase {
                 bucket_name: bucket.clone(),
                 object: convert_ecstore_object_info(obj_info.clone()),
                 req_params: req_params.clone(),
-                resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
+                resp_elements: build_event_resp_elements(&S3Response::new(output.clone()), &request_context.request_id),
                 version_id: version_id.clone(),
                 host: host.clone(),
                 port,
@@ -8254,8 +8251,7 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
+            spawn_background_with_context(Some(request_context.clone()), async move {
                 notify.notify(event_args).await;
             });
         }
@@ -9683,7 +9679,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn transitioned_delete_cleanup_persists_identity_bound_and_legacy_journals() {
+    async fn transitioned_delete_cleanup_persists_known_state_and_rejects_unknown_state() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         if current_app_context().is_none() {
             crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
@@ -9703,8 +9699,9 @@ mod tests {
         current.transitioned_object.tier = "WARM".to_string();
         current.transitioned_object.name = "remote/identity-bound".to_string();
         current.transitioned_object.version_id = "remote-version".to_string();
+        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
 
-        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>| {
+        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>, version_id_exact: bool| {
             use sha2::{Digest, Sha256};
 
             let mut hasher = Sha256::new();
@@ -9717,6 +9714,10 @@ mod tests {
                 hasher.update([0]);
                 hasher.update(backend_identity);
             }
+            if version_id_exact {
+                hasher.update([0]);
+                hasher.update(b"exact-version-id");
+            }
             format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
         };
 
@@ -9726,7 +9727,7 @@ mod tests {
         let mut identity_bound = store
             .get_object_reader(
                 ".rustfs.sys",
-                &journal_name("remote/identity-bound", Some(identity)),
+                &journal_name("remote/identity-bound", Some(identity), true),
                 None,
                 http::HeaderMap::new(),
                 &ObjectOptions::default(),
@@ -9739,11 +9740,14 @@ mod tests {
             .expect("identity-bound journal body should be readable");
         let identity_bound: serde_json::Value =
             serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
-        assert_eq!(identity_bound["version"], serde_json::json!(2));
+        assert_eq!(identity_bound["version"], serde_json::json!(4));
         assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
+        assert_eq!(identity_bound["version_id_exact"], serde_json::json!(true));
+        assert_eq!(identity_bound["version_state"], serde_json::json!("exact"));
 
         current.user_defined = Arc::new(HashMap::new());
         current.transitioned_object.name = "remote/legacy".to_string();
+        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
         enqueue_transitioned_delete_cleanup(
             store.clone(),
             "bucket",
@@ -9755,24 +9759,31 @@ mod tests {
             Some(&current),
         )
         .await
-        .expect("legacy force-delete cleanup should persist a fail-closed v1 journal");
-        let mut legacy = store
+        .expect("unknown force-delete cleanup should fail closed without a journal");
+        let legacy_err = match store
             .get_object_reader(
                 ".rustfs.sys",
-                &journal_name("remote/legacy", None),
+                &journal_name("remote/legacy", None, false),
                 None,
                 http::HeaderMap::new(),
                 &ObjectOptions::default(),
             )
             .await
-            .expect("legacy journal should be readable");
-        let mut legacy_data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut legacy.stream, &mut legacy_data)
-            .await
-            .expect("legacy journal body should be readable");
-        let legacy: serde_json::Value = serde_json::from_slice(&legacy_data).expect("legacy journal should decode as JSON");
-        assert_eq!(legacy["version"], serde_json::json!(1));
-        assert_eq!(legacy["backend_identity"], serde_json::Value::Null);
+        {
+            Ok(_) => panic!("unknown remote version state must not persist a delete journal"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                &legacy_err,
+                StorageError::FileNotFound
+                    | StorageError::ObjectNotFound(_, _)
+                    | StorageError::FileVersionNotFound
+                    | StorageError::VersionNotFound(_, _, _)
+                    | StorageError::VolumeNotFound
+            ),
+            "unknown remote version state must leave no journal, got {legacy_err:?}"
+        );
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {

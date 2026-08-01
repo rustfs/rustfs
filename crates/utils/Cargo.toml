@@ -25,6 +25,7 @@ keywords = ["utilities", "hashing", "compression", "network", "rustfs"]
 categories = ["web-programming", "development-tools", "cryptography"]
 
 [dependencies]
+hotpath.workspace = true
 base64-simd = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
@@ -58,10 +59,15 @@ url = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 temp-env = { workspace = true }
 proptest = "1"
+
+[[bench]]
+name = "hash_hotpath_benchmark"
+harness = false
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem"] }
@@ -71,6 +77,9 @@ workspace = true
 
 [features]
 default = ["ip"]  # features that are enabled by default
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "hotpath/futures", "hotpath/reqwest-0-13"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:hyper", "dep:tokio"]  # network features with DNS resolver
 egress = ["ip", "dep:reqwest", "dep:tokio", "dep:url"]

@@ -46,16 +46,6 @@ lazy_static! {
         m.insert("x-amz-replication-status".to_string(), true);
         m
     };
-    static ref SSE_HEADERS: HashMap<String, bool> = {
-        let mut m = HashMap::new();
-        m.insert("x-amz-server-side-encryption".to_string(), true);
-        m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), true);
-        m.insert("x-amz-server-side-encryption-context".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-key".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), true);
-        m
-    };
 }
 
 pub fn is_standard_query_value(qs_key: &str) -> bool {
@@ -70,16 +60,12 @@ pub fn is_standard_header(header_key: &str) -> bool {
     *SUPPORTED_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
 }
 
-pub fn is_sse_header(header_key: &str) -> bool {
-    *SSE_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
-}
-
 pub fn is_amz_header(header_key: &str) -> bool {
     let key = header_key.to_lowercase();
     key.starts_with("x-amz-meta-")
         || key.starts_with("x-amz-grant-")
         || key == "x-amz-acl"
-        || is_sse_header(header_key)
+        || rustfs_utils::http::is_sse_header(header_key)
         || key.starts_with("x-amz-checksum-")
 }
 

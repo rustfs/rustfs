@@ -29,6 +29,7 @@ use crate::client::{
     api_remove::{RemoveObjectOptions, RemoveObjectResult},
     api_s3_datatypes::ListVersionsResult,
     credentials::{Credentials, SignatureType, Static, Value},
+    provider_versions::validate_remote_version_id,
     transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
@@ -36,7 +37,10 @@ use crate::error::ErrorResponse;
 use crate::error::error_resp_to_object_err;
 use crate::services::tier::{
     tier_config::TierS3,
-    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{
+        TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
+        build_transition_put_options,
+    },
 };
 use http::HeaderMap;
 use rustfs_utils::egress::validate_outbound_url;
@@ -189,44 +193,188 @@ impl WarmBackendS3 {
         remote_bucket_versioning_from_status(config.status.as_ref().map(|status| status.as_str()))
     }
 
-    async fn list_transition_candidate_versions(&self, object: &str) -> Result<ListVersionsResult, std::io::Error> {
+    async fn probe_transition_candidate_versions(
+        &self,
+        object: &str,
+        bucket_versioning: RemoteBucketVersioning,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let remote_object = self.get_dest(object);
         let mut opts = ListObjectsOptions::default();
-        opts.set("prefix", &self.get_dest(object));
-        opts.set("max-keys", "2");
-        self.client.list_object_versions_query(&self.bucket, &opts, "", "", "").await
+        opts.set("prefix", &remote_object);
+        opts.set("max-keys", "1000");
+
+        let mut key_marker = String::new();
+        let mut version_id_marker = String::new();
+        let mut candidates = TransitionCandidateVersions::default();
+        loop {
+            let versions = self
+                .client
+                .list_object_versions_query(&self.bucket, &opts, &key_marker, &version_id_marker, "")
+                .await?;
+            candidates.extend(&remote_object, &versions);
+            if candidates.is_ambiguous() {
+                return Ok(TransitionCandidateProbe::Ambiguous);
+            }
+            if !versions.is_truncated {
+                return classify_transition_candidates(candidates, bucket_versioning);
+            }
+
+            advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
+        }
+    }
+
+    async fn probe_transition_candidate_identity(
+        &self,
+        object: &str,
+        identity: TransitionCandidateIdentity,
+        bucket_versioning: RemoteBucketVersioning,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let remote_object = self.get_dest(object);
+        let mut opts = ListObjectsOptions::default();
+        opts.set("prefix", &remote_object);
+        opts.set("max-keys", "1000");
+        let mut key_marker = String::new();
+        let mut version_id_marker = String::new();
+        let mut matched_version = None;
+        let mut saw_unproven_candidate = false;
+
+        loop {
+            let versions = self
+                .client
+                .list_object_versions_query(&self.bucket, &opts, &key_marker, &version_id_marker, "")
+                .await?;
+            for version in versions.versions.iter().filter(|version| version.key == remote_object) {
+                let mut stat_opts = GetObjectOptions::default();
+                stat_opts.version_id.clone_from(&version.version_id);
+                let info = self.client.stat_object(&self.bucket, &remote_object, &stat_opts).await?;
+                let mut metadata = info.user_metadata;
+                for (name, value) in &info.metadata {
+                    if (name
+                        .as_str()
+                        .starts_with(rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX)
+                        || name
+                            .as_str()
+                            .starts_with(rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX))
+                        && let Ok(value) = value.to_str()
+                    {
+                        metadata.insert(name.as_str().to_string(), value.to_string());
+                    }
+                }
+                if transition_candidate_metadata_matches(&metadata, identity)? {
+                    if matched_version.is_some() {
+                        return Ok(TransitionCandidateProbe::Ambiguous);
+                    }
+                    matched_version = Some(version.version_id.clone());
+                } else {
+                    saw_unproven_candidate = true;
+                }
+            }
+            if !versions.is_truncated {
+                if matched_version.is_none() && saw_unproven_candidate {
+                    return Ok(TransitionCandidateProbe::Unsupported);
+                }
+                let candidates = TransitionCandidateVersions {
+                    version_id: matched_version,
+                    ambiguous: false,
+                };
+                return classify_transition_candidates(candidates, bucket_versioning);
+            }
+            advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
+        }
     }
 }
 
-fn classify_transition_candidate_versions(
-    remote_object: &str,
-    bucket_versioning: RemoteBucketVersioning,
-    versions: &ListVersionsResult,
-) -> TransitionCandidateProbe {
-    if versions.is_truncated {
-        return TransitionCandidateProbe::Ambiguous;
-    }
-
-    if versions.delete_markers.iter().any(|marker| marker.key == remote_object) {
-        return TransitionCandidateProbe::Ambiguous;
-    }
-
-    let mut exact_versions = versions.versions.iter().filter(|version| version.key == remote_object);
-    let Some(version) = exact_versions.next() else {
-        return TransitionCandidateProbe::Missing;
+fn transition_candidate_metadata_matches(
+    metadata: &HashMap<String, String>,
+    identity: TransitionCandidateIdentity,
+) -> Result<bool, std::io::Error> {
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITION_TRANSACTION_ID, contains_key_str, get_consistent_str,
     };
-    if exact_versions.next().is_some() {
-        return TransitionCandidateProbe::Ambiguous;
+
+    let transaction_id = get_consistent_str(metadata, SUFFIX_TRANSITION_TRANSACTION_ID);
+    let destination_id = get_consistent_str(metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID);
+    if transaction_id.is_none() || destination_id.is_none() {
+        if contains_key_str(metadata, SUFFIX_TRANSITION_TRANSACTION_ID)
+            || contains_key_str(metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transition candidate identity metadata is empty or conflicting",
+            ));
+        }
+        return Ok(false);
+    }
+    let expected_transaction_id = identity.transaction_id.to_string();
+    let expected_destination_id = rustfs_utils::crypto::hex(identity.destination_id);
+    Ok(transaction_id == Some(expected_transaction_id.as_str()) && destination_id == Some(expected_destination_id.as_str()))
+}
+
+fn classify_transition_candidates(
+    candidates: TransitionCandidateVersions,
+    bucket_versioning: RemoteBucketVersioning,
+) -> Result<TransitionCandidateProbe, std::io::Error> {
+    let probe = candidates.classify(bucket_versioning);
+    if let TransitionCandidateProbe::VersionedPresent(version_id) = &probe {
+        validate_remote_version_id(version_id)?;
+    }
+    Ok(probe)
+}
+
+fn advance_version_markers(
+    key_marker: &mut String,
+    version_id_marker: &mut String,
+    versions: &ListVersionsResult,
+) -> Result<(), std::io::Error> {
+    let next_markers = (&versions.next_key_marker, &versions.next_version_id_marker);
+    if next_markers == (&*key_marker, &*version_id_marker) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ListObjectVersions pagination markers did not advance",
+        ));
+    }
+    key_marker.clone_from(&versions.next_key_marker);
+    version_id_marker.clone_from(&versions.next_version_id_marker);
+    Ok(())
+}
+
+#[derive(Default)]
+struct TransitionCandidateVersions {
+    version_id: Option<String>,
+    ambiguous: bool,
+}
+
+impl TransitionCandidateVersions {
+    fn extend(&mut self, remote_object: &str, versions: &ListVersionsResult) {
+        for version in versions.versions.iter().filter(|version| version.key == remote_object) {
+            if self.version_id.is_some() {
+                self.ambiguous = true;
+                return;
+            }
+            self.version_id = Some(version.version_id.clone());
+        }
     }
 
-    match bucket_versioning {
-        RemoteBucketVersioning::Disabled => TransitionCandidateProbe::UnversionedPresent,
-        RemoteBucketVersioning::Suspended if version.version_id == "null" => {
-            TransitionCandidateProbe::VersionedPresent(version.version_id.clone())
+    fn is_ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+
+    fn classify(self, bucket_versioning: RemoteBucketVersioning) -> TransitionCandidateProbe {
+        if self.ambiguous {
+            return TransitionCandidateProbe::Ambiguous;
         }
-        RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if !version.version_id.is_empty() => {
-            TransitionCandidateProbe::VersionedPresent(version.version_id.clone())
+        let Some(version_id) = self.version_id else {
+            return TransitionCandidateProbe::Missing;
+        };
+
+        match bucket_versioning {
+            RemoteBucketVersioning::Disabled => TransitionCandidateProbe::UnversionedPresent,
+            RemoteBucketVersioning::Suspended if version_id == "null" => TransitionCandidateProbe::VersionedPresent(version_id),
+            RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if !version_id.is_empty() => {
+                TransitionCandidateProbe::VersionedPresent(version_id)
+            }
+            RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled => TransitionCandidateProbe::Ambiguous,
         }
-        RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled => TransitionCandidateProbe::Ambiguous,
     }
 }
 
@@ -275,72 +423,161 @@ mod tests {
         }
     }
 
+    fn classify_pages(bucket_versioning: RemoteBucketVersioning, pages: &[ListVersionsResult]) -> TransitionCandidateProbe {
+        let mut candidates = TransitionCandidateVersions::default();
+        for page in pages {
+            candidates.extend("archive/object", page);
+        }
+        candidates.classify(bucket_versioning)
+    }
+
+    fn candidate_identity() -> TransitionCandidateIdentity {
+        TransitionCandidateIdentity {
+            transaction_id: uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            destination_id: [0x5a; 32],
+        }
+    }
+
+    fn candidate_metadata(identity: TransitionCandidateIdentity) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            identity.transaction_id.to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity.destination_id),
+        );
+        metadata
+    }
+
+    #[test]
+    fn transition_candidate_identity_requires_exact_compatible_metadata() {
+        let identity = candidate_identity();
+        let metadata = candidate_metadata(identity);
+        assert!(transition_candidate_metadata_matches(&metadata, identity).unwrap());
+
+        let mut adjacent = metadata;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut adjacent,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+                .unwrap()
+                .to_string(),
+        );
+        assert!(!transition_candidate_metadata_matches(&adjacent, identity).unwrap());
+
+        assert!(!transition_candidate_metadata_matches(&HashMap::new(), identity).unwrap());
+    }
+
+    #[test]
+    fn transition_candidate_identity_rejects_conflicting_compatibility_keys() {
+        let identity = candidate_identity();
+        let mut metadata = candidate_metadata(identity);
+        metadata.insert(
+            rustfs_utils::http::metadata_compat::internal_key_rustfs(
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID,
+            ),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        assert!(transition_candidate_metadata_matches(&metadata, identity).is_err());
+    }
+
     #[test]
     fn transition_candidate_probe_classifier_is_fail_closed() {
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Disabled,
-                &list_versions(&[], &[], false),
-            ),
+            classify_pages(RemoteBucketVersioning::Disabled, &[list_versions(&[], &[], false)],),
             TransitionCandidateProbe::Missing
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Disabled,
-                &list_versions(&[("archive/object", "")], &[], false),
-            ),
+            classify_pages(RemoteBucketVersioning::Disabled, &[list_versions(&[("archive/object", "")], &[], false)],),
             TransitionCandidateProbe::UnversionedPresent
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a")], &[], false),
+                &[list_versions(&[("archive/object", "version-a")], &[], false)],
             ),
             TransitionCandidateProbe::VersionedPresent("version-a".to_string())
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Suspended,
-                &list_versions(&[("archive/object", "null")], &[], false),
+                &[list_versions(&[("archive/object", "null")], &[], false)],
             ),
             TransitionCandidateProbe::VersionedPresent("null".to_string())
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "")], &[], false),
-            ),
+            classify_pages(RemoteBucketVersioning::Enabled, &[list_versions(&[("archive/object", "")], &[], false)],),
             TransitionCandidateProbe::Ambiguous
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a"), ("archive/object", "version-b")], &[], false),
+                &[list_versions(
+                    &[("archive/object", "version-a"), ("archive/object", "version-b")],
+                    &[],
+                    false,
+                )],
             ),
             TransitionCandidateProbe::Ambiguous
+        );
+    }
+
+    #[test]
+    fn transition_candidate_probe_reconciles_all_pages_and_ignores_delete_markers() {
+        assert_eq!(
+            classify_pages(
+                RemoteBucketVersioning::Enabled,
+                &[
+                    list_versions(&[], &[("archive/object", "marker-a")], true),
+                    list_versions(&[("archive/object", "version-a"), ("archive/object-adjacent", "unrelated"),], &[], false,),
+                ],
+            ),
+            TransitionCandidateProbe::VersionedPresent("version-a".to_string())
         );
         assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
+            classify_pages(
                 RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a")], &[("archive/object", "marker-a")], false),
+                &[
+                    list_versions(&[("archive/object", "version-a")], &[], true),
+                    list_versions(&[("archive/object", "version-b")], &[], false),
+                ],
             ),
             TransitionCandidateProbe::Ambiguous
         );
-        assert_eq!(
-            classify_transition_candidate_versions(
-                "archive/object",
-                RemoteBucketVersioning::Enabled,
-                &list_versions(&[("archive/object", "version-a")], &[], true),
-            ),
-            TransitionCandidateProbe::Ambiguous
-        );
+    }
+
+    #[test]
+    fn transition_candidate_pagination_advances_both_markers() {
+        let mut key_marker = "old-key".to_string();
+        let mut version_id_marker = "old-version".to_string();
+        let page = ListVersionsResult {
+            next_key_marker: "next-key".to_string(),
+            next_version_id_marker: "next-version".to_string(),
+            ..Default::default()
+        };
+
+        advance_version_markers(&mut key_marker, &mut version_id_marker, &page)
+            .expect("new ListObjectVersions markers should advance pagination");
+        assert_eq!(key_marker, "next-key");
+        assert_eq!(version_id_marker, "next-version");
+
+        let err = advance_version_markers(&mut key_marker, &mut version_id_marker, &page)
+            .expect_err("repeated ListObjectVersions markers must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn transition_candidate_probe_rejects_untrusted_version_ids() {
+        let mut candidates = TransitionCandidateVersions::default();
+        candidates.extend("archive/object", &list_versions(&[("archive/object", "version\ninjection")], &[], false));
+
+        let err = classify_transition_candidates(candidates, RemoteBucketVersioning::Enabled)
+            .expect_err("control characters in listed version IDs must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -397,12 +634,7 @@ impl WarmBackend for WarmBackendS3 {
 
     async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
         let bucket_versioning = self.remote_bucket_versioning().await?;
-        let versions = self.list_transition_candidate_versions(object).await?;
-        Ok(classify_transition_candidate_versions(
-            &self.get_dest(object),
-            bucket_versioning,
-            &versions,
-        ))
+        self.probe_transition_candidate_versions(object, bucket_versioning).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
@@ -412,5 +644,18 @@ impl WarmBackend for WarmBackendS3 {
             .await?;
 
         Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)
+    }
+}
+
+#[async_trait::async_trait]
+impl TransitionCandidateReconciler for WarmBackendS3 {
+    async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        identity: TransitionCandidateIdentity,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let bucket_versioning = self.remote_bucket_versioning().await?;
+        self.probe_transition_candidate_identity(object, identity, bucket_versioning)
+            .await
     }
 }

@@ -20,12 +20,19 @@ use crate::manager::KmsManager;
 use crate::types::*;
 use base64::Engine;
 use jiff::Zoned;
+use md5::{Digest as Md5Digest, Md5};
 use rand::random;
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::debug;
 use zeroize::Zeroize;
+
+fn md5_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hex::encode(hasher.finalize())
+}
 
 /// Data key for object encryption
 /// SECURITY: This struct automatically zeros sensitive key material when dropped
@@ -175,6 +182,15 @@ impl ObjectEncryptionService {
     ///
     pub async fn health_check(&self) -> Result<bool> {
         self.kms_manager.health_check().await
+    }
+
+    /// Report the capabilities of the configured backend
+    ///
+    /// # Returns
+    /// The capability matrix advertised by the active KMS backend
+    ///
+    pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
+        self.kms_manager.backend_capabilities()
     }
 
     /// Create a data encryption key for object encryption
@@ -486,8 +502,7 @@ impl ObjectEncryptionService {
 
         // Validate key MD5 if provided
         if let Some(expected_md5) = customer_key_md5 {
-            let actual_md5 = md5::compute(customer_key);
-            let actual_md5_hex = format!("{actual_md5:x}");
+            let actual_md5_hex = md5_hex(customer_key);
             if actual_md5_hex != expected_md5.to_lowercase() {
                 return Err(KmsError::validation_error("Customer key MD5 mismatch"));
             }

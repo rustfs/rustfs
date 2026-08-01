@@ -14,15 +14,31 @@
 
 #![allow(dead_code)]
 
+use crate::node_identity::SERVER_LABEL;
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
+
+pub const PROCESS_PID_LABEL: &str = "process_pid";
+pub const PROCESS_EXECUTABLE_NAME_LABEL: &str = "process_executable_name";
+pub const DIRECTION_LABEL: &str = "direction";
+pub const STATUS_LABEL: &str = "status";
+
+const PROCESS_LABELS: &[&str] = &[SERVER_LABEL];
+const PROCESS_WITH_ATTRIBUTES_LABELS: &[&str] = &[SERVER_LABEL, PROCESS_PID_LABEL, PROCESS_EXECUTABLE_NAME_LABEL];
+const PROCESS_DISK_IO_LABELS: &[&str] = &[
+    DIRECTION_LABEL,
+    SERVER_LABEL,
+    PROCESS_PID_LABEL,
+    PROCESS_EXECUTABLE_NAME_LABEL,
+];
+const PROCESS_STATUS_LABELS: &[&str] = &[SERVER_LABEL, STATUS_LABEL];
 
 /// Number of current READ locks on this peer
 pub static PROCESS_LOCKS_READ_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ProcessLocksReadTotal,
         "Number of current READ locks on this peer",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -32,7 +48,7 @@ pub static PROCESS_LOCKS_WRITE_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::
     new_gauge_md(
         MetricName::ProcessLocksWriteTotal,
         "Number of current WRITE locks on this peer",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -42,7 +58,7 @@ pub static PROCESS_CPU_TOTAL_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::
     new_counter_md(
         MetricName::ProcessCPUTotalSeconds,
         "Total user and system CPU time spent in seconds",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -52,7 +68,7 @@ pub static PROCESS_GO_ROUTINE_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::n
     new_gauge_md(
         MetricName::ProcessGoRoutineTotal,
         "Total number of go routines running",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -62,7 +78,7 @@ pub static PROCESS_IO_RCHAR_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_counter_md(
         MetricName::ProcessIORCharBytes,
         "Total bytes read by the process from the underlying storage system including cache, /proc/[pid]/io rchar",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -72,7 +88,7 @@ pub static PROCESS_IO_READ_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(
     new_counter_md(
         MetricName::ProcessIOReadBytes,
         "Total bytes read by the process from the underlying storage system, /proc/[pid]/io read_bytes",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -82,7 +98,7 @@ pub static PROCESS_IO_WCHAR_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_counter_md(
         MetricName::ProcessIOWCharBytes,
         "Total bytes written by the process to the underlying storage system including page cache, /proc/[pid]/io wchar",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -92,7 +108,7 @@ pub static PROCESS_IO_WRITE_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_counter_md(
         MetricName::ProcessIOWriteBytes,
         "Total bytes written by the process to the underlying storage system, /proc/[pid]/io write_bytes",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -102,7 +118,7 @@ pub static PROCESS_START_TIME_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock:
     new_gauge_md(
         MetricName::ProcessStartTimeSeconds,
         "Start time for RustFS process in seconds since Unix epoch",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -112,7 +128,7 @@ pub static PROCESS_UPTIME_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_gauge_md(
         MetricName::ProcessUptimeSeconds,
         "Uptime for RustFS process in seconds",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -122,7 +138,7 @@ pub static PROCESS_FILE_DESCRIPTOR_LIMIT_TOTAL_MD: LazyLock<MetricDescriptor> = 
     new_gauge_md(
         MetricName::ProcessFileDescriptorLimitTotal,
         "Limit on total number of open file descriptors for the RustFS Server process",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -132,7 +148,7 @@ pub static PROCESS_FILE_DESCRIPTOR_OPEN_TOTAL_MD: LazyLock<MetricDescriptor> = L
     new_gauge_md(
         MetricName::ProcessFileDescriptorOpenTotal,
         "Total number of open file descriptors by the RustFS Server process",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -142,7 +158,7 @@ pub static PROCESS_SYSCALL_READ_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock:
     new_counter_md(
         MetricName::ProcessSyscallReadTotal,
         "Total read SysCalls to the kernel. /proc/[pid]/io syscr",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -152,7 +168,7 @@ pub static PROCESS_SYSCALL_WRITE_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock
     new_counter_md(
         MetricName::ProcessSyscallWriteTotal,
         "Total write SysCalls to the kernel. /proc/[pid]/io syscw",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -162,7 +178,7 @@ pub static PROCESS_RESIDENT_MEMORY_BYTES_MD: LazyLock<MetricDescriptor> = LazyLo
     new_gauge_md(
         MetricName::ProcessResidentMemoryBytes,
         "Resident memory size in bytes",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -172,7 +188,7 @@ pub static PROCESS_VIRTUAL_MEMORY_BYTES_MD: LazyLock<MetricDescriptor> = LazyLoc
     new_gauge_md(
         MetricName::ProcessVirtualMemoryBytes,
         "Virtual memory size in bytes",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -182,7 +198,7 @@ pub static PROCESS_VIRTUAL_MEMORY_MAX_BYTES_MD: LazyLock<MetricDescriptor> = Laz
     new_gauge_md(
         MetricName::ProcessVirtualMemoryMaxBytes,
         "Maximum virtual memory size in bytes",
-        &[],
+        PROCESS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -196,7 +212,7 @@ pub static PROCESS_CPU_USAGE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ProcessCPUUsage,
         "The percentage of CPU in use by the process",
-        &[],
+        PROCESS_WITH_ATTRIBUTES_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -206,7 +222,7 @@ pub static PROCESS_CPU_UTILIZATION_MD: LazyLock<MetricDescriptor> = LazyLock::ne
     new_gauge_md(
         MetricName::ProcessCPUUtilization,
         "The amount of CPU in use by the process (considering multiple cores)",
-        &[],
+        PROCESS_WITH_ATTRIBUTES_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -216,7 +232,7 @@ pub static PROCESS_DISK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ProcessDiskIO,
         "Disk bytes transferred by the process",
-        &[],
+        PROCESS_DISK_IO_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });
@@ -226,7 +242,7 @@ pub static PROCESS_STATUS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ProcessStatus,
         "Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)",
-        &[],
+        PROCESS_STATUS_LABELS,
         subsystems::SYSTEM_PROCESS,
     )
 });

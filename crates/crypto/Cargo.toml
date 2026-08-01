@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-crypto/latest/rustfs_crypto/"
 workspace = true
 
 [dependencies]
+hotpath.workspace = true
 aes-gcm = { workspace = true, optional = true, features = ["rand_core"] }
 argon2 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
@@ -49,6 +50,9 @@ time = { workspace = true, features = ["parsing", "formatting", "macros", "serde
 
 [features]
 default = ["crypto", "fips"]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 fips = []
 crypto = [
     "dep:aes-gcm",

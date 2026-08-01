@@ -203,6 +203,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111",
         ),
         admin_route_sample(
+            Method::GET,
+            "/v3/ilm/transition/reconcile/{transaction_id}",
+            "/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/ilm/transition/reconcile/{transaction_id}",
+            "/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
             Method::DELETE,
             "/v3/ilm/transition/jobs/{job_id}",
             "/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111",
@@ -330,6 +340,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/kms/keys/cancel-deletion"),
         admin_route(Method::GET, "/v3/kms/keys"),
         admin_route_sample(Method::GET, "/v3/kms/keys/{key_id}", "/v3/kms/keys/test-key"),
+        admin_route(Method::POST, "/v3/kms/keys/enable"),
+        admin_route(Method::POST, "/v3/kms/keys/disable"),
+        admin_route(Method::POST, "/v3/kms/keys/rotate"),
         admin_route(Method::GET, "/v3/oidc/providers"),
         admin_route_sample(Method::GET, "/v3/oidc/authorize/{provider_id}", "/v3/oidc/authorize/default"),
         admin_route_sample(Method::GET, "/v3/oidc/callback/{provider_id}", "/v3/oidc/callback/default"),
@@ -855,6 +868,16 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::DELETE,
         &admin_path("/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &admin_path("/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111"),
     );
 
     assert_route(&router, Method::GET, &table_catalog_path("/config"));

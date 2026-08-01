@@ -15,6 +15,7 @@
 use crate::runtime_sources::current_region;
 use crate::server::ShutdownHandle;
 use crate::server::runtime_sources::current_notify_interface;
+use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
@@ -23,11 +24,14 @@ use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
-use rustfs_targets::arn::{ARN, TargetIDError};
+use rustfs_notify::NotificationError;
+use rustfs_s3_types::EventName;
+use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
 use rustfs_utils::get_env_usize;
 use s3s::s3_error;
 use std::env;
 use std::io::Error;
+use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 const LOG_COMPONENT_INIT: &str = "init";
@@ -40,6 +44,8 @@ const LOG_SUBSYSTEM_AUTOTUNER: &str = "autotuner";
 const LOG_SUBSYSTEM_PROTOCOL: &str = "protocol";
 const EVENT_PROTOCOL_RUNTIME_STATE: &str = "protocol_runtime_state";
 const EVENT_PROTOCOL_SERVER_STATE: &str = "protocol_server_state";
+
+type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
 
 #[instrument]
 pub fn print_server_info() {
@@ -151,6 +157,57 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
 }
 
+fn notification_config_to_event_rules(
+    cfg: &s3s::dto::NotificationConfiguration,
+) -> Result<Vec<NotificationEventRule>, TargetIDError> {
+    let mut event_rules = Vec::new();
+    process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)?;
+    process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)?;
+    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)?;
+    Ok(event_rules)
+}
+
+async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
+    let has_notification_config = get_bucket_notification_config(bucket)
+        .await
+        .map_err(|err| NotificationError::StorageNotAvailable(format!("load bucket notification config for {bucket}: {err}")))?;
+
+    match has_notification_config {
+        Some(cfg) => {
+            info!(
+                target: "rustfs::init",
+                event = "notification_config_loaded",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                queue_configuration_count = cfg.queue_configurations.as_ref().map_or(0, Vec::len),
+                topic_configuration_count = cfg.topic_configurations.as_ref().map_or(0, Vec::len),
+                lambda_configuration_count = cfg.lambda_function_configurations.as_ref().map_or(0, Vec::len),
+                "Loaded bucket notification configuration"
+            );
+
+            let event_rules =
+                notification_config_to_event_rules(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
+            current_notify_interface()
+                .add_event_specific_rules(bucket, region, &event_rules)
+                .await?;
+            Ok(true)
+        }
+        None => {
+            info!(
+                target: "rustfs::init",
+                event = "notification_config_missing",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                "Bucket notification configuration not found"
+            );
+            current_notify_interface().clear_bucket_notification_rules(bucket).await?;
+            Ok(false)
+        }
+    }
+}
+
 /// Add existing bucket notification configurations to the global notifier system.
 /// This function retrieves notification configurations for each bucket
 /// and registers the corresponding event rules with the notifier system.
@@ -159,11 +216,52 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
+    let region = notification_region();
+    for bucket in buckets.iter() {
+        if let Err(err) = apply_bucket_notification_configuration(bucket, region.as_str()).await {
+            let err = s3_error!(InternalError, "Failed to add rules: {err}");
+            error!(
+                target: "rustfs::init",
+                event = "notification_rules_registration_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                region,
+                error = ?err,
+                "Failed to register bucket notification rules"
+            );
+        }
+    }
+}
+
+pub(crate) async fn reconcile_persisted_bucket_notification_configurations(
+    store: Arc<rustfs_notify::NotifyStore>,
+) -> Result<usize, NotificationError> {
+    let bucket_infos = store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| NotificationError::StorageNotAvailable(format!("list buckets for notification reconciliation: {err}")))?;
+    let region = notification_region();
+    let mut configured_bucket_count = 0;
+
+    for bucket in bucket_infos {
+        if apply_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
+            configured_bucket_count += 1;
+        }
+    }
+
+    Ok(configured_bucket_count)
+}
+
+fn notification_region() -> String {
     let global_region = current_region();
-    let region = global_region
+    global_region
         .as_ref()
         .filter(|r| !r.as_str().is_empty())
-        .map(|r| r.as_str())
+        .map(|r| r.to_string())
         .unwrap_or_else(|| {
             warn!(
                 target: "rustfs::init",
@@ -173,107 +271,8 @@ pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
                 fallback_region = RUSTFS_REGION,
                 "Notification configuration falling back to default region"
             );
-            RUSTFS_REGION
-        });
-    for bucket in buckets.iter() {
-        let has_notification_config = get_bucket_notification_config(bucket).await.unwrap_or_else(|err| {
-            warn!(
-                target: "rustfs::init",
-                event = "notification_config_load_failed",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                bucket = %bucket,
-                error = ?err,
-                "Failed to load bucket notification configuration"
-            );
-            None
-        });
-
-        match has_notification_config {
-            Some(cfg) => {
-                info!(
-                    target: "rustfs::init",
-                    event = "notification_config_loaded",
-                    component = LOG_COMPONENT_INIT,
-                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                    bucket = %bucket,
-                    queue_configuration_count = cfg.queue_configurations.as_ref().map_or(0, Vec::len),
-                    topic_configuration_count = cfg.topic_configurations.as_ref().map_or(0, Vec::len),
-                    lambda_configuration_count = cfg.lambda_function_configurations.as_ref().map_or(0, Vec::len),
-                    "Loaded bucket notification configuration"
-                );
-
-                let mut event_rules = Vec::new();
-                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)
-                {
-                    error!(
-                        target: "rustfs::init",
-                        event = "notification_config_parse_failed",
-                        component = LOG_COMPONENT_INIT,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        bucket = %bucket,
-                        config_type = "queue",
-                        error = ?e,
-                        "Failed to parse bucket notification configuration"
-                    );
-                }
-                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)
-                {
-                    error!(
-                        target: "rustfs::init",
-                        event = "notification_config_parse_failed",
-                        component = LOG_COMPONENT_INIT,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        bucket = %bucket,
-                        config_type = "topic",
-                        error = ?e,
-                        "Failed to parse bucket notification configuration"
-                    );
-                }
-                if let Err(e) =
-                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)
-                {
-                    error!(
-                        target: "rustfs::init",
-                        event = "notification_config_parse_failed",
-                        component = LOG_COMPONENT_INIT,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        bucket = %bucket,
-                        config_type = "lambda",
-                        error = ?e,
-                        "Failed to parse bucket notification configuration"
-                    );
-                }
-
-                if let Err(e) = current_notify_interface()
-                    .add_event_specific_rules(bucket, region, &event_rules)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
-                {
-                    error!(
-                        target: "rustfs::init",
-                        event = "notification_rules_registration_failed",
-                        component = LOG_COMPONENT_INIT,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        bucket = %bucket,
-                        region,
-                        error = ?e,
-                        "Failed to register bucket notification rules"
-                    );
-                }
-            }
-            None => {
-                info!(
-                    target: "rustfs::init",
-                    event = "notification_config_missing",
-                    component = LOG_COMPONENT_INIT,
-                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                    bucket = %bucket,
-                    "Bucket notification configuration not found"
-                );
-            }
-        }
-    }
+            RUSTFS_REGION.to_string()
+        })
 }
 
 /// Build KMS configuration for local backend
@@ -468,6 +467,13 @@ async fn configure_and_start_kms(
 pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
+
+    // A key referenced by any bucket's encryption configuration must never be
+    // deleted. Register the gate before the service can start so every
+    // deletion-worker spawn observes it; the gate fails closed while the
+    // object store is not ready.
+    service_manager
+        .set_deletion_reference_checker(std::sync::Arc::new(crate::kms_deletion_gate::BucketEncryptionReferenceChecker));
 
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
@@ -1354,9 +1360,13 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_buffer_profile_config;
+    use super::{notification_config_to_event_rules, resolve_buffer_profile_config};
     use crate::config::{BufferConfig, WorkloadProfile};
     use rustfs_config::KI_B;
+    use rustfs_s3_types::EventName;
+    use s3s::dto::{
+        FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter,
+    };
 
     #[test]
     fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
@@ -1385,5 +1395,62 @@ mod tests {
         let resolved = resolve_buffer_profile_config(invalid.clone(), invalid);
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn notification_config_to_event_rules_preserves_target_and_filters() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                events: vec!["s3:ObjectCreated:Put".to_string().into()],
+                queue_arn: "arn:rustfs:sqs:us-east-1:rustfs_to_activemq:mqtt".to_string(),
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from_static(FilterRuleName::PREFIX)),
+                                value: Some("uploads/".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from_static(FilterRuleName::SUFFIX)),
+                                value: Some(".json".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+                id: Some("primary".to_string()),
+            }]),
+            topic_configurations: None,
+            lambda_function_configurations: None,
+            event_bridge_configuration: None,
+        };
+
+        let rules = notification_config_to_event_rules(&cfg).expect("valid notification config should map to event rules");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, vec![EventName::ObjectCreatedPut]);
+        assert_eq!(rules[0].1, "uploads/");
+        assert_eq!(rules[0].2, ".json");
+        assert_eq!(rules[0].3.len(), 1);
+        assert_eq!(rules[0].3[0].id, "rustfs_to_activemq");
+        assert_eq!(rules[0].3[0].name, "mqtt");
+    }
+
+    #[test]
+    fn notification_config_to_event_rules_rejects_invalid_arn() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                events: vec!["s3:ObjectCreated:Put".to_string().into()],
+                queue_arn: "arn:aws:sqs:us-east-1:rustfs_to_activemq:mqtt".to_string(),
+                filter: None,
+                id: None,
+            }]),
+            topic_configurations: None,
+            lambda_function_configurations: None,
+            event_bridge_configuration: None,
+        };
+
+        let err = notification_config_to_event_rules(&cfg).expect_err("invalid ARN partition must fail");
+
+        assert!(err.to_string().contains("Invalid ARN"), "unexpected error: {err}");
     }
 }

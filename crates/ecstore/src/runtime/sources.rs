@@ -27,7 +27,7 @@ use crate::{
     bucket::replication::{DynReplicationPool, ReplicationStats},
     config::{get_global_storage_class, get_global_storage_class_snapshot, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
-    error::Result,
+    error::{Error, Result},
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
@@ -46,7 +46,6 @@ use crate::{
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
 use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
@@ -103,10 +102,6 @@ pub(crate) fn workload_admission_snapshot_provider() -> Option<WorkloadSnapshotP
 
 pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_error: &'static str) {
     global_internode_metrics().record_erasure_write_quorum_failure(stage, dominant_error);
-}
-
-pub(crate) async fn object_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    get_global_encryption_service().await
 }
 
 pub fn object_store_handle() -> Option<Arc<ECStore>> {
@@ -205,10 +200,6 @@ pub(crate) fn boot_uptime_secs() -> u64 {
 
 pub(crate) async fn ensure_boot_time() {
     GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
-}
-
-pub(crate) async fn scanner_init_time() -> Option<chrono::DateTime<chrono::Utc>> {
-    rustfs_common::get_global_init_time().await
 }
 
 pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
@@ -421,19 +412,66 @@ pub(crate) async fn clear_local_disk_id_map_for_test() {
     local_disk_id_map_handle().write().await.clear();
 }
 
-pub(crate) async fn record_local_disk_id(instance_ctx: &Arc<InstanceContext>, disk_id: Uuid, endpoint: String) {
-    instance_ctx.local_disk_id_map().write().await.insert(disk_id, endpoint);
-}
-
 pub(crate) async fn replace_local_disk_id(previous: Option<Uuid>, current: Option<Uuid>, endpoint: String) {
     let id_map = local_disk_id_map_handle();
     let mut disk_id_map = id_map.write().await;
-    if let Some(previous_id) = previous {
+    if let Some(previous_id) = previous
+        && disk_id_map
+            .get(&previous_id)
+            .is_some_and(|registered_endpoint| registered_endpoint == &endpoint)
+    {
         disk_id_map.remove(&previous_id);
     }
     if let Some(current_id) = current {
         disk_id_map.insert(current_id, endpoint);
     }
+}
+
+pub(crate) async fn reconcile_local_disk_ids(
+    instance_ctx: &InstanceContext,
+    pool_endpoints: &[String],
+    selected: &[(Uuid, String)],
+) {
+    let pool_endpoints = pool_endpoints.iter().map(String::as_str).collect::<HashSet<_>>();
+    let disk_id_map = instance_ctx.local_disk_id_map();
+    let mut disk_ids = disk_id_map.write().await;
+    disk_ids.retain(|_, registered_endpoint| !pool_endpoints.contains(registered_endpoint.as_str()));
+    disk_ids.extend(selected.iter().cloned());
+}
+
+pub(crate) async fn quarantine_local_disks(instance_ctx: &InstanceContext, endpoints: &[Endpoint]) -> Result<()> {
+    let slots = endpoints
+        .iter()
+        .map(|endpoint| {
+            Ok((
+                usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
+                usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
+                usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let local_disk_map = instance_ctx.local_disk_map();
+    let mut local_disks = local_disk_map.write().await;
+    for endpoint in endpoints {
+        local_disks.insert(endpoint.to_string(), None);
+    }
+    drop(local_disks);
+
+    let set_drives = instance_ctx.local_disk_set_drives();
+    let mut local_set_drives = set_drives.write().await;
+    if local_set_drives.is_empty() {
+        return Ok(());
+    }
+    for (pool_idx, set_idx, disk_idx) in slots {
+        let disk = local_set_drives
+            .get_mut(pool_idx)
+            .and_then(|sets| sets.get_mut(set_idx))
+            .and_then(|disks| disks.get_mut(disk_idx))
+            .ok_or(Error::CorruptedFormat)?;
+        *disk = None;
+    }
+    Ok(())
 }
 
 pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disks: Vec<DiskStore>) {
@@ -562,10 +600,14 @@ pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LockRegistry, local_node_name, set_local_node_name};
+    use super::{
+        LockRegistry, clear_local_disk_id_map_for_test, local_disk_path_by_id, local_node_name, reconcile_local_disk_ids,
+        replace_local_disk_id, set_local_node_name,
+    };
     use crate::disk::endpoint::Endpoint;
     use rustfs_lock::{LocalClient, LockClient};
     use std::{collections::HashMap, sync::Arc};
+    use uuid::Uuid;
 
     fn url_endpoint(raw: &str) -> Endpoint {
         Endpoint {
@@ -610,5 +652,79 @@ mod tests {
         set_local_node_name(previous).await;
 
         assert_eq!(observed, next);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn clearing_a_stale_disk_id_does_not_remove_another_endpoint() {
+        clear_local_disk_id_map_for_test().await;
+        let disk_id = Uuid::new_v4();
+        replace_local_disk_id(None, Some(disk_id), "endpoint-a".to_string()).await;
+
+        replace_local_disk_id(Some(disk_id), None, "endpoint-b".to_string()).await;
+
+        assert_eq!(local_disk_path_by_id(&disk_id).await, Some("endpoint-a".to_string()));
+        clear_local_disk_id_map_for_test().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconciling_pool_disk_ids_preserves_other_endpoints() {
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let process_ctx = crate::runtime::global::current_ctx();
+        let bootstrap_ctx = crate::runtime::instance::bootstrap_ctx();
+        let retained_id = Uuid::new_v4();
+        let removed_id = Uuid::new_v4();
+        let selected_id = Uuid::new_v4();
+        let process_sentinel = Uuid::new_v4();
+        let bootstrap_sentinel = Uuid::new_v4();
+        instance_ctx.local_disk_id_map().write().await.extend([
+            (retained_id, "endpoint-a".to_string()),
+            (removed_id, "endpoint-b".to_string()),
+        ]);
+        process_ctx
+            .local_disk_id_map()
+            .write()
+            .await
+            .insert(process_sentinel, "endpoint-b".to_string());
+        bootstrap_ctx
+            .local_disk_id_map()
+            .write()
+            .await
+            .insert(bootstrap_sentinel, "endpoint-b".to_string());
+
+        reconcile_local_disk_ids(
+            &instance_ctx,
+            &["endpoint-b".to_string(), "endpoint-c".to_string()],
+            &[(selected_id, "endpoint-c".to_string())],
+        )
+        .await;
+
+        let disk_ids = instance_ctx.local_disk_id_map();
+        let disk_ids = disk_ids.read().await;
+        assert_eq!(disk_ids.get(&retained_id).map(String::as_str), Some("endpoint-a"));
+        assert_eq!(disk_ids.get(&removed_id), None);
+        assert_eq!(disk_ids.get(&selected_id).map(String::as_str), Some("endpoint-c"));
+        drop(disk_ids);
+        assert_eq!(
+            process_ctx
+                .local_disk_id_map()
+                .read()
+                .await
+                .get(&process_sentinel)
+                .map(String::as_str),
+            Some("endpoint-b")
+        );
+        assert_eq!(
+            bootstrap_ctx
+                .local_disk_id_map()
+                .read()
+                .await
+                .get(&bootstrap_sentinel)
+                .map(String::as_str),
+            Some("endpoint-b")
+        );
+        process_ctx.local_disk_id_map().write().await.remove(&process_sentinel);
+        bootstrap_ctx.local_disk_id_map().write().await.remove(&bootstrap_sentinel);
     }
 }

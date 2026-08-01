@@ -27,7 +27,14 @@ categories = ["data-structures"]
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "rustfs-s3-types/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-s3-types/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-s3-types/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-s3-types = { workspace = true }
 
 [lib]

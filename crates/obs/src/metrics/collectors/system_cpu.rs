@@ -25,11 +25,14 @@
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::system_cpu::*;
 use crate::metrics::schema::system_process::{PROCESS_CPU_USAGE_MD, PROCESS_CPU_UTILIZATION_MD};
+use crate::node_identity::SERVER_LABEL;
 use std::borrow::Cow;
 
 /// System CPU statistics.
 #[derive(Debug, Clone, Default)]
 pub struct CpuStats {
+    /// Stable local node identity for labeling node-local CPU metrics
+    pub server: String,
     /// Average CPU idle time (percentage, 0-100)
     pub avg_idle: f64,
     /// CPU load average over 1 minute
@@ -56,11 +59,16 @@ pub struct ProcessCpuStats {
 /// Uses the metric descriptors from `metrics_type::system_cpu` module.
 /// Returns a vector of Prometheus metrics for CPU statistics.
 pub fn collect_cpu_metrics(stats: &CpuStats) -> Vec<PrometheusMetric> {
+    let server_label = stats.server.as_str();
     vec![
-        PrometheusMetric::from_descriptor(&SYS_CPU_AVG_IDLE_MD, stats.avg_idle),
-        PrometheusMetric::from_descriptor(&SYS_CPU_LOAD_MD, stats.load_avg),
-        PrometheusMetric::from_descriptor(&SYS_CPU_LOAD_PERC_MD, stats.load_avg_perc),
-        PrometheusMetric::from_descriptor(&SYS_CPU_USAGE_PERC_MD, stats.usage_perc),
+        PrometheusMetric::from_descriptor(&SYS_CPU_AVG_IDLE_MD, stats.avg_idle)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&SYS_CPU_LOAD_MD, stats.load_avg)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&SYS_CPU_LOAD_PERC_MD, stats.load_avg_perc)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&SYS_CPU_USAGE_PERC_MD, stats.usage_perc)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
     ]
 }
 
@@ -91,10 +99,12 @@ pub fn collect_process_cpu_metrics(
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 
     #[test]
     fn test_collect_cpu_metrics() {
         let stats = CpuStats {
+            server: "node1:9000".to_string(),
             avg_idle: 75.5,
             load_avg: 1.5,
             load_avg_perc: 37.5,
@@ -108,6 +118,11 @@ mod tests {
 
         // Verify that metric names are properly generated from descriptors
         assert!(metrics.iter().all(|m| m.name.starts_with("rustfs_system_cpu_")));
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"))
+        );
     }
 
     #[test]
@@ -118,13 +133,16 @@ mod tests {
         assert_eq!(metrics.len(), 4);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
-            assert!(metric.labels.is_empty());
+            assert_eq!(metric.labels.len(), 1);
+            assert_eq!(metric.labels[0].0, SERVER_LABEL);
+            assert!(metric.labels[0].1.is_empty());
         }
     }
 
     #[test]
     fn system_cpu_metrics_export_total_usage_under_honest_name() {
         let stats = CpuStats {
+            server: "node1:9000".to_string(),
             avg_idle: 40.0,
             load_avg: 1.0,
             load_avg_perc: 25.0,
@@ -171,8 +189,9 @@ mod tests {
         };
 
         let labels = vec![
-            ("process_pid", Cow::Borrowed("12345")),
-            ("process_executable_name", Cow::Borrowed("rustfs")),
+            (SERVER_LABEL, Cow::Borrowed("node1:9000")),
+            (PROCESS_PID_LABEL, Cow::Borrowed("12345")),
+            (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Borrowed("rustfs")),
         ];
 
         let metrics = collect_process_cpu_metrics(&stats, Some(&labels));
@@ -180,7 +199,8 @@ mod tests {
 
         // All metrics should have the labels
         for metric in &metrics {
-            assert_eq!(metric.labels.len(), 2);
+            assert_eq!(metric.labels.len(), 3);
+            assert!(metric.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"));
         }
     }
 }

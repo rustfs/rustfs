@@ -25,8 +25,60 @@ description = "Protocol implementations for RustFS (FTPS, SFTP, etc.)"
 keywords = ["ftp", "sftp", "protocol", "storage", "rustfs"]
 categories = ["network-programming", "filesystem"]
 
+[lints]
+workspace = true
+
 [features]
 default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-ecstore?/hotpath",
+    "rustfs-iam/hotpath",
+    "rustfs-keystone?/hotpath",
+    "rustfs-policy/hotpath",
+    "rustfs-rio?/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-tls-runtime?/hotpath",
+    "rustfs-trusted-proxies?/hotpath",
+    "rustfs-utils/hotpath",
+    "rustfs-test-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-ecstore?/hotpath-alloc",
+    "rustfs-iam/hotpath-alloc",
+    "rustfs-keystone?/hotpath-alloc",
+    "rustfs-policy/hotpath-alloc",
+    "rustfs-rio?/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-tls-runtime?/hotpath-alloc",
+    "rustfs-trusted-proxies?/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+    "rustfs-test-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-ecstore?/hotpath-cpu",
+    "rustfs-iam/hotpath-cpu",
+    "rustfs-keystone?/hotpath-cpu",
+    "rustfs-policy/hotpath-cpu",
+    "rustfs-rio?/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-tls-runtime?/hotpath-cpu",
+    "rustfs-trusted-proxies?/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+    "rustfs-test-utils/hotpath-cpu",
+]
 ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime", "dep:subtle"]
 swift = [
     "dep:rustfs-keystone",
@@ -44,7 +96,7 @@ swift = [
     "dep:tokio-util",
     "dep:serde",
     "dep:urlencoding",
-    "dep:md5",
+    "dep:md-5",
     "dep:quick-xml",
     "dep:hmac",
     "dep:sha1",
@@ -59,6 +111,7 @@ webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util",
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
+hotpath.workspace = true
 # Core RustFS dependencies
 rustfs-iam = { workspace = true }
 rustfs-credentials = { workspace = true }
@@ -108,7 +161,7 @@ http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
-md5 = { workspace = true, optional = true }
+md-5 = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
@@ -134,6 +187,7 @@ socket2 = { workspace = true, optional = true, features = ["all"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
+rustfs-test-utils = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 tokio = { workspace = true, features = ["test-util", "macros", "fs"] }
 

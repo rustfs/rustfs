@@ -33,6 +33,7 @@ use crate::metrics::{
     obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_replication_site_stats_snapshot,
     obs_resolve_object_store_handle,
 };
+use crate::node_identity::current_local_node_identity;
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
@@ -262,11 +263,11 @@ async fn obs_site_replication_stats() -> ReplicationStats {
 }
 
 fn current_scanner_cycle_age_seconds(
-    current_cycle: u64,
+    current_cycle_active: bool,
     current_started: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
 ) -> u64 {
-    if current_cycle == 0 {
+    if !current_cycle_active {
         0
     } else {
         now.signed_duration_since(current_started).num_seconds().max(0) as u64
@@ -539,12 +540,13 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
     disk_stats
 }
 
-fn build_system_cpu_stats(system: &System) -> CpuStats {
+fn build_system_cpu_stats(system: &System, server: &str) -> CpuStats {
     let cpu_usage = system.global_cpu_usage() as f64;
     let cpu_count = system.cpus().len().max(1) as f64;
     let load_avg = System::load_average().one;
 
     CpuStats {
+        server: server.to_string(),
         avg_idle: (100.0 - cpu_usage).max(0.0),
         load_avg,
         load_avg_perc: (load_avg / cpu_count) * 100.0,
@@ -552,11 +554,12 @@ fn build_system_cpu_stats(system: &System) -> CpuStats {
     }
 }
 
-fn build_system_memory_stats(system: &System) -> MemoryStats {
+fn build_system_memory_stats(system: &System, server: &str) -> MemoryStats {
     let total = system.total_memory();
     let used = system.used_memory();
 
     MemoryStats {
+        server: server.to_string(),
         total,
         used,
         used_perc: if total > 0 {
@@ -582,7 +585,8 @@ pub fn collect_system_cpu_and_memory_stats() -> (CpuStats, MemoryStats) {
 pub fn collect_system_cpu_and_memory_stats_with(system: &mut System) -> (CpuStats, MemoryStats) {
     system.refresh_cpu_all();
     system.refresh_memory();
-    (build_system_cpu_stats(system), build_system_memory_stats(system))
+    let server = current_local_node_identity();
+    (build_system_cpu_stats(system, &server), build_system_memory_stats(system, &server))
 }
 
 /// Collect system CPU statistics from the current host.
@@ -692,6 +696,7 @@ fn process_metric_bundle_from_snapshots(
     resource_snapshot: ProcessResourceSnapshot,
     process_snapshot: ProcessSystemSnapshot,
 ) -> ProcessMetricBundle {
+    let server = current_local_node_identity();
     let status = match process_snapshot.status {
         ProcessStatusSnapshot::Running => ProcessStatusType::Running,
         ProcessStatusSnapshot::Sleeping => ProcessStatusType::Sleeping,
@@ -700,11 +705,13 @@ fn process_metric_bundle_from_snapshots(
     };
 
     let resource_stats = ResourceStats {
+        server: server.clone(),
         cpu_percent: resource_snapshot.cpu_percent,
         memory_bytes: resource_snapshot.memory_bytes,
         uptime_seconds: resource_snapshot.uptime_seconds,
     };
     let process_stats = ProcessStats {
+        server,
         locks_read_total: process_snapshot.locks_read_total,
         locks_write_total: process_snapshot.locks_write_total,
         cpu_total_seconds: process_snapshot.cpu_total_seconds,
@@ -770,6 +777,7 @@ pub fn collect_host_network_stats_with(networks: &Networks) -> HostNetworkStats 
     }
 
     HostNetworkStats {
+        server: current_local_node_identity(),
         total_received,
         total_transmitted,
         per_interface,
@@ -794,6 +802,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
     let snapshot = global_internode_metrics().snapshot();
 
     Some(NetworkStats {
+        server: current_local_node_identity(),
         internode_errors_total: snapshot.errors_total,
         internode_dial_errors_total: snapshot.dial_errors_total,
         internode_dial_avg_time_nanos: snapshot.dial_avg_time_nanos,
@@ -1090,7 +1099,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
     let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
     let active_paths = metrics.active_scan_paths as u64;
-    let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle, metrics.current_started, now);
+    let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle_active, metrics.current_started, now);
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
     let current_cycle_age = current_cycle_age_seconds as f64;
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
@@ -1307,6 +1316,27 @@ mod tests {
         assert!(cluster_config_stats_from_backend_parities(Some(1), Some(overflow)).is_none());
     }
 
+    #[tokio::test]
+    async fn node_local_resource_stats_use_stable_local_node_identity() {
+        let _guard = crate::node_identity::local_node_identity_test_guard().await;
+        let previous = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("node1:9000").await;
+
+        let mut system = System::new_all();
+        let (cpu, memory) = collect_system_cpu_and_memory_stats_with(&mut system);
+        let host_network = collect_host_network_stats_with(&Networks::new());
+        let process_bundle =
+            process_metric_bundle_from_snapshots(ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default());
+
+        assert_eq!(cpu.server, "node1:9000");
+        assert_eq!(memory.server, "node1:9000");
+        assert_eq!(host_network.server, "node1:9000");
+        assert_eq!(process_bundle.resource.server, "node1:9000");
+        assert_eq!(process_bundle.process.server, "node1:9000");
+
+        rustfs_common::set_global_local_node_name(&previous).await;
+    }
+
     #[test]
     fn erasure_set_stats_skip_unknown_backend_layout() {
         let storage_info = storage_info_with_one_online_disk();
@@ -1464,21 +1494,21 @@ mod tests {
     fn current_scanner_cycle_age_seconds_returns_zero_when_idle() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(0, now - chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(false, now - chrono::Duration::seconds(30), now), 0);
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_clamps_future_start() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(4, now + chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now + chrono::Duration::seconds(30), now), 0);
     }
 
     #[test]
-    fn current_scanner_cycle_age_seconds_reports_active_elapsed_time() {
+    fn current_scanner_cycle_age_seconds_reports_active_first_cycle_elapsed_time() {
         let now = Utc::now();
 
-        assert_eq!(current_scanner_cycle_age_seconds(4, now - chrono::Duration::seconds(45), now), 45);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now - chrono::Duration::seconds(45), now), 45);
     }
 
     #[test]

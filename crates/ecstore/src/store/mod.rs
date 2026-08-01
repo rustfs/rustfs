@@ -141,6 +141,7 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
 const MAX_UPLOADS_LIST: usize = 10000;
 
 mod bucket;
+pub(crate) use bucket::await_bucket_namespace_operation;
 mod heal;
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
@@ -427,11 +428,11 @@ impl ECStore {
 }
 
 lazy_static! {
-    static ref enableObjcetLockConfig: ObjectLockConfiguration = ObjectLockConfiguration {
+    static ref ENABLED_OBJECT_LOCK_CONFIG: ObjectLockConfiguration = ObjectLockConfiguration {
         object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
         ..Default::default()
     };
-    static ref enableVersioningConfig: VersioningConfiguration = VersioningConfiguration {
+    static ref ENABLED_VERSIONING_CONFIG: VersioningConfiguration = VersioningConfiguration {
         status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
         ..Default::default()
     };
@@ -988,7 +989,7 @@ mod tests {
 
         init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
 
-        let (disks, errs) = init_disks(
+        let (mut disks, errs) = init_disks(
             &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
             &DiskOption {
                 cleanup: true,
@@ -998,7 +999,7 @@ mod tests {
         .await;
 
         assert!(errs.iter().all(|err| err.is_none()), "disk init should succeed: {errs:?}");
-        connect_load_init_formats(true, &disks, 1, 4, None)
+        connect_load_init_formats(true, &mut disks, 1, 4, None)
             .await
             .expect("initialize format metadata");
 

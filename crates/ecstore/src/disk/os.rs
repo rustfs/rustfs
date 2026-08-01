@@ -25,7 +25,7 @@ use std::{
     sync::{Arc, LazyLock, Weak},
 };
 use tokio::fs;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit};
 use tracing::warn;
 
 /// Check path length according to OS limits.
@@ -123,6 +123,8 @@ const TEST_GLOBAL_FILE_SYNCS: usize = 64;
 
 static FILE_SYNC_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(global_file_sync_limit()));
 static DISK_FILE_SYNC_LIMITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn default_global_file_sync_limit(cpu_count: usize, max_blocking_threads: usize) -> usize {
     let cpu_scaled = cpu_count
@@ -155,6 +157,24 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
     let limiter = Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS));
     limiters.insert(root.to_path_buf(), Arc::downgrade(&limiter));
     limiter
+}
+
+/// Serialize a bucket's local metadata commits with physical bucket removal.
+///
+/// The key includes the canonical disk root, so independently reconnected
+/// [`LocalDisk`](super::local::LocalDisk) instances share the same lock while
+/// disconnected disks do not keep the registry alive.
+pub(crate) fn disk_volume_mutation_lock(root: &Path, volume: &str) -> Arc<RwLock<()>> {
+    let key = root.join(volume);
+    let mut locks = DISK_VOLUME_MUTATION_LOCKS.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(RwLock::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 /// Always acquire the per-disk permit before the process-wide permit. Keeping
@@ -572,15 +592,14 @@ async fn reliable_rename_inner(
     base_dir: impl AsRef<Path>,
     warn_on_missing_source: bool,
 ) -> io::Result<()> {
-    if let Some(parent) = dst_file_path.as_ref().parent()
-        && !file_exists(parent)
-    {
-        reliable_mkdir_all(parent, base_dir.as_ref()).await?;
-    }
+    let parent_guard = match dst_file_path.as_ref().parent() {
+        Some(parent) => Some(mkdir_all_below_existing_base(parent, base_dir.as_ref()).await?),
+        None => None,
+    };
 
     let mut i = 0;
     loop {
-        if let Err(e) = super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
+        if let Err(e) = rename_into_existing_parent(src_file_path.as_ref(), dst_file_path.as_ref(), parent_guard.as_ref()) {
             if should_retry_rename(&e, i) {
                 i += 1;
                 continue;
@@ -595,6 +614,159 @@ async fn reliable_rename_inner(
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn rename_into_existing_parent(
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    parent_guard: Option<&ExistingBaseDirectoryGuard>,
+) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, open, renameat};
+
+    let Some(parent_guard) = parent_guard else {
+        return super::fs::rename_std(src_file_path, dst_file_path);
+    };
+    let src_parent = src_file_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a parent directory"))?;
+    let src_name = src_file_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a file name"))?;
+    let dst_name = dst_file_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a file name"))?;
+    let src_parent = open(
+        src_parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let dst_parent = parent_guard
+        .last()
+        .ok_or_else(|| io::Error::other("rename destination parent guard is empty"))?;
+
+    renameat(&src_parent, src_name, dst_parent, dst_name).map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn rename_into_existing_parent(
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    _parent_guard: Option<&ExistingBaseDirectoryGuard>,
+) -> io::Result<()> {
+    super::fs::rename_std(src_file_path, dst_file_path)
+}
+
+async fn mkdir_all_below_existing_base(dir_path: &Path, base_dir: &Path) -> io::Result<ExistingBaseDirectoryGuard> {
+    let dir_path = dir_path.to_path_buf();
+    let base_dir = base_dir.to_path_buf();
+
+    tokio::task::spawn_blocking(move || mkdir_all_below_existing_base_std(&dir_path, &base_dir)).await?
+}
+
+#[cfg(windows)]
+pub(crate) type ExistingBaseDirectoryGuard = Vec<winapi_util::Handle>;
+
+#[cfg(unix)]
+pub(crate) type ExistingBaseDirectoryGuard = Vec<std::os::fd::OwnedFd>;
+
+#[cfg(all(not(unix), not(windows)))]
+pub(crate) type ExistingBaseDirectoryGuard = ();
+
+#[cfg(windows)]
+fn lock_windows_directory(path: &Path) -> io::Result<winapi_util::Handle> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let handle = winapi_util::Handle::from_file(file);
+    let info = winapi_util::file::information(&handle)?;
+    if info.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0
+        || info.file_attributes() & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(io::Error::from(io::ErrorKind::NotADirectory));
+    }
+    Ok(handle)
+}
+
+pub(crate) fn mkdir_all_below_existing_base_std(dir_path: &Path, base_dir: &Path) -> io::Result<ExistingBaseDirectoryGuard> {
+    let relative = dir_path
+        .strip_prefix(base_dir)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory"))?;
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_) | Component::CurDir) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rename destination contains an invalid path component",
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+        use rustix::io::Errno;
+
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let mut parents = vec![open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?];
+
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            let parent = parents
+                .last()
+                .expect("base directory guard should contain the base directory");
+            match mkdirat(parent, component, mode) {
+                Ok(()) => {}
+                Err(Errno::EXIST) => {}
+                Err(err) => return Err(err.into()),
+            }
+            parents.push(openat(parent, component, flags, Mode::empty()).map_err(io::Error::from)?);
+        }
+
+        Ok(parents)
+    }
+
+    #[cfg(windows)]
+    {
+        let mut handles = vec![lock_windows_directory(base_dir)?];
+        let mut current = base_dir.to_path_buf();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            current.push(component);
+            match std::fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+            handles.push(lock_windows_directory(&current)?);
+        }
+
+        Ok(handles)
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = relative;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe recursive directory creation is unavailable on this platform",
+        ))
+    }
 }
 
 fn warn_reliable_rename_failure(src_file_path: &Path, dst_file_path: &Path, base_dir: &Path, err: &io::Error) {
@@ -727,6 +899,20 @@ mod tests {
         Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS))
     }
 
+    #[tokio::test]
+    async fn disk_volume_mutation_lock_is_shared_per_root_and_volume() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let first = disk_volume_mutation_lock(temp_dir.path(), "bucket");
+        let second = disk_volume_mutation_lock(temp_dir.path(), "bucket");
+        let other = disk_volume_mutation_lock(temp_dir.path(), "other-bucket");
+
+        assert!(Arc::ptr_eq(&first, &second), "reconnected disks must share a bucket mutation lock");
+        assert!(!Arc::ptr_eq(&first, &other), "different buckets must not serialize each other");
+
+        let _write_guard = first.write().await;
+        assert!(second.try_read().is_err(), "a bucket delete lock must exclude local commits");
+    }
+
     #[derive(Clone, Default)]
     struct CapturedLogs {
         buffer: Arc<Mutex<Vec<u8>>>,
@@ -771,9 +957,26 @@ mod tests {
         }
     }
 
+    /// Holds a `warn_capture()` capture alive: the thread-local subscriber, plus
+    /// the pin that keeps tracing's process-global callsite-interest cache from
+    /// being decided by some other test's thread.
+    struct WarnCaptureGuard {
+        _subscriber: tracing::subscriber::DefaultGuard,
+        _callsite_pin: tracing::Dispatch,
+    }
+
     /// Capture WARN-level output on the current thread; tokio tests here run on
     /// the current-thread runtime, so the guard covers the whole test body.
-    fn warn_capture() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    ///
+    /// The callsite pin matters because `warn_reliable_rename_failure` is a
+    /// single production callsite shared with tests that call `rename_all`
+    /// *without* installing a subscriber — `rename_all_missing_source_returns_file_not_found`
+    /// is one. Whichever thread reaches it first fixes its `Interest`
+    /// process-wide, so without the pin that sibling can cache
+    /// `Interest::never()` and the WARN never fires here at all, leaving the
+    /// "must keep the WARN" assertions staring at empty output. See
+    /// [`crate::test_tracing::pin_callsite_interest_for_test`].
+    fn warn_capture() -> (CapturedLogs, WarnCaptureGuard) {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::WARN)
@@ -781,7 +984,10 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = WarnCaptureGuard {
+            _subscriber: tracing::subscriber::set_default(subscriber),
+            _callsite_pin: crate::test_tracing::pin_callsite_interest_for_test(),
+        };
         (logs, guard)
     }
 
@@ -966,6 +1172,112 @@ mod tests {
 
         assert!(!src.exists());
         assert_eq!(std::fs::read(dst.join("nested").join("part.1")).expect("read moved part"), b"payload");
+    }
+
+    #[tokio::test]
+    async fn rename_all_does_not_recreate_missing_base_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        std::fs::create_dir(&base).expect("create destination base");
+        let src = temp_dir.path().join("staged-object");
+        std::fs::write(&src, b"payload").expect("write staged object");
+        let dst = base.join("object").join("xl.meta");
+        std::fs::remove_dir(&base).expect("delete destination base before commit");
+
+        let err = rename_all(&src, &dst, &base)
+            .await
+            .expect_err("rename must not recreate a deleted destination base");
+
+        assert!(matches!(err, DiskError::FileNotFound));
+        assert!(src.exists(), "failed commit must preserve the staged source");
+        assert!(!base.exists(), "failed commit must not recreate the deleted bucket");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_rejects_a_replaced_base_with_an_existing_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir(&base).expect("create destination base");
+        std::fs::create_dir_all(outside.join("object")).expect("create outside destination parent");
+        let src = temp_dir.path().join("staged-object");
+        std::fs::write(&src, b"payload").expect("write staged object");
+        let dst = base.join("object").join("xl.meta");
+
+        std::fs::remove_dir(&base).expect("remove destination base before replacement");
+        symlink(&outside, &base).expect("replace destination base with a symlink");
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect_err("rename must reject an existing destination parent below a replaced base");
+
+        assert!(src.exists(), "rejected rename must preserve the staged source");
+        assert!(
+            !outside.join("object/xl.meta").exists(),
+            "rename must not publish through the replacement symlink"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_parent_guard_blocks_base_and_intermediate_replacement() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        std::fs::create_dir(&base).expect("create destination base");
+        let parent = base.join("object").join("nested");
+        let guard = mkdir_all_below_existing_base_std(&parent, &base).expect("create and lock destination parents");
+
+        std::fs::rename(&base, temp_dir.path().join("replacement-base"))
+            .expect_err("the locked base must not be replaceable before commit");
+        std::fs::rename(base.join("object"), base.join("replacement-object"))
+            .expect_err("a locked intermediate directory must not be replaceable before commit");
+
+        drop(guard);
+        std::fs::rename(base.join("object"), base.join("replacement-object"))
+            .expect("replacement should succeed after the commit guard is released");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_parent_creation_rejects_symlinked_base() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        let base = temp_dir.path().join("bucket");
+        symlink(&outside, &base).expect("create symlinked base");
+
+        mkdir_all_below_existing_base(&base.join("object"), &base)
+            .await
+            .expect_err("symlinked base must be rejected");
+
+        assert!(!outside.join("object").exists(), "parent creation must remain confined to the base");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_parent_creation_rejects_symlink_below_base() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir(&base).expect("create destination base");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        symlink(&outside, base.join("linked")).expect("create symlink below base");
+
+        mkdir_all_below_existing_base(&base.join("linked/object"), &base)
+            .await
+            .expect_err("symlink below base must be rejected");
+
+        assert!(
+            !outside.join("object").exists(),
+            "parent creation must not follow a symlink outside the base"
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,17 @@ description = "Shared concurrency contract types for RustFS - workload admission
 keywords = ["rustfs", "concurrency", "admission", "backpressure", "workers"]
 categories = ["concurrency", "filesystem"]
 
+[lints]
+workspace = true
+
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-io-core/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-io-core/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-io-core/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 # Internal crates
 rustfs-io-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

@@ -12,23 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+use std::alloc::{GlobalAlloc, Layout};
+
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+#[derive(Default)]
+struct DefaultMiMalloc;
+
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+// SAFETY: allocation and deallocation are forwarded unchanged to MiMalloc, so
+// MiMalloc's GlobalAlloc guarantees apply to every returned pointer and layout.
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for DefaultMiMalloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds GlobalAlloc's contract for layout.
+        unsafe { mimalloc::MiMalloc.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+}
+
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+#[global_allocator]
+static GLOBAL: hotpath::CountingAllocator<DefaultMiMalloc> = hotpath::CountingAllocator::new();
+
+#[cfg(not(all(feature = "hotpath", feature = "hotpath-alloc")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    // Wall-time profiling guard for `--features hotpath` builds. The guard
-    // lives for the whole process; dropping it on normal exit (SIGINT/SIGTERM
-    // unwind back through run_process) prints the timing report.
-    //
-    // hotpath's alloc mode is intentionally NOT wired up: hotpath 0.21.x
-    // panics when a MeasurementGuardSync drops on a different thread than it
-    // was created on (TLS index mismatch, alloc/core.rs:151), which tokio's
-    // work-stealing runtime does constantly. See rustfs/backlog#935.
-    #[cfg(feature = "hotpath")]
-    let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main")
-        .percentiles(&[50.0, 95.0, 99.0])
-        .functions_limit(0)
-        .build();
+    let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
 
     rustfs::startup_entrypoint::run_process();
+}
+
+#[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc"))]
+mod tests {
+    #[test]
+    #[allow(unsafe_code)]
+    fn hotpath_allocator_uses_mimalloc() {
+        let allocation = Box::new([0_u8; 64]);
+
+        // SAFETY: the live Box pointer is valid to inspect for heap ownership.
+        assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(allocation.as_ptr().cast()) });
+    }
 }

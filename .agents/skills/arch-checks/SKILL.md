@@ -10,9 +10,15 @@ never weaken a check to get green.
 
 ## `check_layer_dependencies.sh` — layer DAG in `rustfs/src`
 
-Enforces `interface (admin, storage/ecfs, storage/s3_api) → app → infra`; no
-upward imports. Known legacy violations live in
+Enforces `composition (server, startup/init) → interface (admin,
+storage/ecfs, storage/s3_api) → app → infra`; no upward imports. Server source
+files are composition roots, while imports of their exported HTTP contracts
+are classified as interface dependencies. Known legacy violations live in
 `scripts/layer-dependency-baseline.txt`.
+
+Dedicated `*_test.rs` and `tests/` modules are outside this production guard.
+Inline `#[cfg(test)]` imports remain checked under their source file's layer;
+move architecture-crossing test scaffolding into a dedicated test module.
 
 - **New violation**: restructure your change so the dependency points
   downward (move the shared type/function to the lower layer).

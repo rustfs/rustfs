@@ -27,7 +27,7 @@ use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
 use std::future::Future;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -36,6 +36,7 @@ const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MultipartCommitPause {
+    PutPartBeforeLockAcquire,
     PutPartBeforeLockLost,
     PutPartAfterRename,
     BeforeLockLost,
@@ -47,9 +48,10 @@ struct MultipartCommitBarrierState {
     bucket: String,
     object: String,
     pause: MultipartCommitPause,
-    armed: AtomicBool,
+    expected_arrivals: usize,
+    arrivals: AtomicUsize,
     arrived: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
 }
 
 #[cfg(test)]
@@ -64,13 +66,24 @@ static MULTIPART_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc
 #[cfg(test)]
 impl MultipartCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
+        Self::install_for_arrivals(bucket, object, pause, 1)
+    }
+
+    pub(crate) fn install_for_arrivals(
+        bucket: &str,
+        object: &str,
+        pause: MultipartCommitPause,
+        expected_arrivals: usize,
+    ) -> Self {
+        assert!(expected_arrivals > 0, "multipart commit barrier must wait for at least one arrival");
         let state = Arc::new(MultipartCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
             pause,
-            armed: AtomicBool::new(true),
+            expected_arrivals,
+            arrivals: AtomicUsize::new(0),
             arrived: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
         });
         let mut slot = MULTIPART_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -83,20 +96,28 @@ impl MultipartCommitBarrier {
     }
 
     pub(crate) async fn wait_until_paused(&self) {
-        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
-            .await
-            .expect("multipart completion should reach the deterministic commit barrier");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let arrived = self.state.arrived.notified();
+                if self.state.arrivals.load(Ordering::Acquire) >= self.state.expected_arrivals {
+                    return;
+                }
+                arrived.await;
+            }
+        })
+        .await
+        .expect("multipart completion should reach the deterministic commit barrier");
     }
 
     pub(crate) fn release(&self) {
-        self.state.release.notify_one();
+        self.state.release.add_permits(self.state.expected_arrivals);
     }
 }
 
 #[cfg(test)]
 impl Drop for MultipartCommitBarrier {
     fn drop(&mut self) {
-        self.state.release.notify_one();
+        self.release();
         let mut slot = MULTIPART_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
@@ -117,10 +138,20 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
         .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
         .cloned();
     if let Some(barrier) = barrier
-        && barrier.armed.swap(false, Ordering::AcqRel)
+        && let Ok(previous) = barrier.arrivals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < barrier.expected_arrivals).then_some(current + 1)
+        })
     {
-        barrier.arrived.notify_one();
-        barrier.release.notified().await;
+        let arrival = previous + 1;
+        if arrival == barrier.expected_arrivals {
+            barrier.arrived.notify_one();
+        }
+        barrier
+            .release
+            .acquire()
+            .await
+            .expect("multipart commit barrier should remain open")
+            .forget();
     }
 }
 
@@ -693,6 +724,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
 
+            #[cfg(test)]
+            pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockAcquire).await;
             // Serialize only the commit (rename_part), not the whole upload. Each
             // concurrent stream writes to its own unique temp dir (see `tmp_part`
             // above), so the encode/stream phase never conflicts and must stay
@@ -3346,85 +3379,98 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn complete_holds_object_then_upload_lock_through_commit() {
-        temp_env::async_with_vars([(crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
-            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
-            let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
-            let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
-            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
-            let bucket = "multipart-layout-lock-order-bucket";
-            let object = "object";
-            make_bucket_on_all(&disk_stores, bucket).await;
-            let create_opts = ObjectOptions {
-                user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]),
-                ..Default::default()
-            };
-            let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x43; 4096], &create_opts).await;
-            let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
-            let upload_resource = rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path);
-            let object_resource = rustfs_lock::ObjectKey::new(bucket, object);
-            signaling.set_target(upload_resource.clone());
-            signaling.clear_observed();
-            let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
-            let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
+        temp_env::async_with_vars(
+            [
+                (crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60")),
+            ],
+            async {
+                let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+                let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+                let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+                let bucket = "multipart-layout-lock-order-bucket";
+                let object = "object";
+                make_bucket_on_all(&disk_stores, bucket).await;
+                let create_opts = ObjectOptions {
+                    user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]),
+                    ..Default::default()
+                };
+                let (upload_id, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, object, &[0x43; 4096], &create_opts).await;
+                let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+                let upload_resource = rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path);
+                let object_resource = rustfs_lock::ObjectKey::new(bucket, object);
+                signaling.set_target(upload_resource.clone());
+                signaling.clear_observed();
+                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
 
-            let complete_store = set_disks.clone();
-            let complete_upload_id = upload_id.clone();
-            let complete = tokio::spawn(async move {
-                complete_store
-                    .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
+                let complete_store = set_disks.clone();
+                let complete_upload_id = upload_id.clone();
+                let complete = tokio::spawn(async move {
+                    complete_store
+                        .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
+                        .await
+                });
+                barrier.wait_until_paused().await;
+
+                let observed = signaling.observed();
+                let object_position = observed
+                    .iter()
+                    .position(|resource| resource == &object_resource)
+                    .expect("completion should acquire the object lock");
+                let upload_position = observed
+                    .iter()
+                    .position(|resource| resource == &upload_resource)
+                    .expect("completion should acquire the upload lock");
+                assert!(object_position < upload_position, "completion must acquire object before upload");
+
+                let abort_store = set_disks.clone();
+                let abort_upload_id = upload_id.clone();
+                let abort = tokio::spawn(async move {
+                    abort_store
+                        .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
+                        .await
+                });
+                signaling.wait_for_attempts(2).await;
+                tokio::task::yield_now().await;
+                assert!(!abort.is_finished(), "abort must wait until completion releases the upload lock");
+
+                let list_store = set_disks.clone();
+                let list_upload_id = upload_id.clone();
+                let list = tokio::spawn(async move {
+                    list_store
+                        .list_object_parts(bucket, object, &list_upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+                        .await
+                });
+                signaling.wait_for_attempts(3).await;
+                tokio::task::yield_now().await;
+                assert!(!list.is_finished(), "ListParts must wait until completion releases the upload lock");
+
+                barrier.release();
+                complete
                     .await
-            });
-            barrier.wait_until_paused().await;
-
-            let observed = signaling.observed();
-            let object_position = observed
-                .iter()
-                .position(|resource| resource == &object_resource)
-                .expect("completion should acquire the object lock");
-            let upload_position = observed
-                .iter()
-                .position(|resource| resource == &upload_resource)
-                .expect("completion should acquire the upload lock");
-            assert!(object_position < upload_position, "completion must acquire object before upload");
-
-            let abort_store = set_disks.clone();
-            let abort_upload_id = upload_id.clone();
-            let abort = tokio::spawn(async move {
-                abort_store
-                    .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
+                    .expect("completion task should not panic")
+                    .expect("completion should commit after the barrier is released");
+                let abort_err = abort
                     .await
-            });
-            signaling.wait_for_attempts(2).await;
-            tokio::task::yield_now().await;
-            assert!(!abort.is_finished(), "abort must wait until completion releases the upload lock");
-
-            let list_store = set_disks.clone();
-            let list_upload_id = upload_id.clone();
-            let list = tokio::spawn(async move {
-                list_store
-                    .list_object_parts(bucket, object, &list_upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+                    .expect("abort task should not panic")
+                    .expect_err("the committed upload should no longer exist when abort acquires the lock");
+                assert!(
+                    matches!(abort_err, StorageError::InvalidUploadID(..)),
+                    "abort should return InvalidUploadID after completion, got {abort_err:?}"
+                );
+                let list_err = list
                     .await
-            });
-            signaling.wait_for_attempts(3).await;
-            tokio::task::yield_now().await;
-            assert!(!list.is_finished(), "ListParts must wait until completion releases the upload lock");
-
-            barrier.release();
-            complete
-                .await
-                .expect("completion task should not panic")
-                .expect("completion should commit after the barrier is released");
-            let abort_err = abort
-                .await
-                .expect("abort task should not panic")
-                .expect_err("the committed upload should no longer exist when abort acquires the lock");
-            assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
-            let list_err = list
-                .await
-                .expect("ListParts task should not panic")
-                .expect_err("the committed upload should no longer exist when ListParts acquires the lock");
-            assert!(matches!(list_err, StorageError::InvalidUploadID(..)));
-        })
+                    .expect("ListParts task should not panic")
+                    .expect_err("the committed upload should no longer exist when ListParts acquires the lock");
+                assert!(
+                    matches!(list_err, StorageError::InvalidUploadID(..)),
+                    "ListParts should return InvalidUploadID after completion, got {list_err:?}"
+                );
+            },
+        )
         .await;
     }
 

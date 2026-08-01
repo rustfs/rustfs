@@ -67,6 +67,14 @@ pub mod bucket {
             };
         }
 
+        pub mod transition_transaction {
+            pub use crate::bucket::lifecycle::transition_transaction::{
+                TransitionOperatorDeleteResult, TransitionOperatorError, TransitionOperatorProbe, TransitionOperatorStatus,
+                delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
+                inspect_transition_transaction_for_operator,
+            };
+        }
+
         pub mod evaluator {
             pub use crate::bucket::lifecycle::evaluator::Evaluator;
         }
@@ -122,13 +130,13 @@ pub mod bucket {
 
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataSys, acquire_bucket_targets_transaction_lock, delete, get, get_accelerate_config, get_bucket_policy,
+            BucketMetadataSys, acquire_bucket_metadata_transaction_lock, delete, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
-            init_bucket_metadata_sys, list_bucket_targets, remove_bucket_metadata, set_bucket_metadata, update,
-            update_bucket_targets_under_transaction_lock,
+            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
+            update, update_bucket_targets_under_transaction_lock, update_config_with, update_under_transaction_lock,
         };
     }
 
@@ -259,12 +267,13 @@ pub mod config {
     pub mod com {
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
-            ServerConfigCorruptError, ServerConfigSnapshot, delete_config, is_server_config_corrupt_error, lookup_configs,
-            read_config, read_config_no_lock, read_config_with_metadata, read_config_without_migrate,
-            read_config_without_migrate_no_lock, read_existing_server_config_no_lock, read_server_config_snapshot, save_config,
-            save_config_no_lock, save_config_with_opts, save_server_config, save_server_config_no_lock,
-            save_server_config_snapshot, server_config_path, try_migrate_server_config, with_config_object_read_lock,
-            with_config_object_write_lock, with_server_config_read_lock, with_server_config_write_lock,
+            ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config,
+            is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
+            read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
+            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_server_config,
+            save_server_config_no_lock, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+            server_config_path, try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock,
+            with_server_config_read_lock, with_server_config_write_lock,
         };
     }
 
@@ -305,7 +314,8 @@ pub mod disk {
         CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
         FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
         PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk, validate_batch_read_version_item_count,
+        STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
+        validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -376,15 +386,18 @@ pub mod metrics {
 pub mod notification {
     pub use crate::services::notification_sys::{
         NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
 }
 
 pub mod object {
     pub use crate::object_api::{
-        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource,
-        GetObjectReader, ObjectInfo, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader, StreamConsumer,
-        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
-        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
+        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, ObjectEncryptionResolver, ObjectInfo,
+        ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode,
+        ReadEncryptionRequest, StreamConsumer, get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook,
+        register_get_object_body_cache_hook, register_object_mutation_hook, unregister_get_object_body_cache_hook,
+        unregister_object_mutation_hook,
     };
     pub use crate::store::PreparedGetObjectReader;
 }
@@ -406,13 +419,15 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::{
-        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, S3PeerSys,
-        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerPeerActivity,
-        TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
-        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
-        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature,
-        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
-        verify_tonic_rpc_signature,
+        AuthenticatedChannel, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
+        PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing,
+        ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers, gen_tonic_replay_scope_headers,
+        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
+        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
+        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 

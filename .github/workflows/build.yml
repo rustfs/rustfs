@@ -107,13 +107,21 @@ jobs:
 
           # Determine build type based on trigger
           if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
-            # Tag push - release or prerelease
+            # Tag push - preview, release, or prerelease
             should_build=true
             tag_name="${GITHUB_REF#refs/tags/}"
             version="${tag_name}"
 
-            # Check if this is a prerelease
-            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
+            # Preview tags publish a GitHub prerelease for validation, but
+            # must not update any latest channel.
+            if [[ "$tag_name" =~ -preview\.[0-9]+$ ]]; then
+              build_type="preview"
+              is_prerelease=true
+              echo "🔍 Preview build detected: $tag_name"
+            elif [[ "$tag_name" == *"-preview"* ]]; then
+              echo "❌ Invalid preview tag: $tag_name (expected suffix: -preview.<number>)" >&2
+              exit 1
+            elif [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
               build_type="prerelease"
               is_prerelease=true
               echo "🚀 Prerelease build detected: $tag_name"
@@ -714,6 +722,10 @@ jobs:
           echo ""
 
           case "$BUILD_TYPE" in
+            "preview")
+              echo "🔍 Preview artifacts are published in a GitHub prerelease"
+              echo "⏭️  Preview releases do not update latest channels"
+              ;;
             "development")
               echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
               echo "⚠️  This is a development build - not suitable for production use"
@@ -732,7 +744,9 @@ jobs:
 
           echo ""
           echo "🐳 Docker Images:"
-          if [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
+          if [[ "$BUILD_TYPE" == "preview" ]]; then
+            echo "⏭️  Preview tags do not publish Docker images"
+          elif [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
           elif [[ "$BUILD_STATUS" == "success" ]]; then
             echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
@@ -740,11 +754,11 @@ jobs:
             echo "❌ Docker image build will be skipped due to build failure"
           fi
 
-  # Create GitHub Release (only for tag pushes)
+  # Create GitHub Release for every valid release tag, including previews
   create-release:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -767,9 +781,12 @@ jobs:
           VERSION="${{ needs.build-check.outputs.version }}"
           IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          TARGET_COMMITISH=$(git rev-parse --verify "refs/tags/${TAG}^{commit}")
 
           # Determine release type for title
-          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
+          if [[ "$BUILD_TYPE" == "preview" ]]; then
+            RELEASE_TYPE="preview"
+          elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             if [[ "$TAG" == *"alpha"* ]]; then
               RELEASE_TYPE="alpha"
             elif [[ "$TAG" == *"beta"* ]]; then
@@ -783,54 +800,24 @@ jobs:
             RELEASE_TYPE="release"
           fi
 
-          # Check if release already exists
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
-            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
-            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          # Create release title
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            TITLE="RustFS $VERSION (${RELEASE_TYPE})"
           else
-            # Get release notes from tag message
-            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
-            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
-              if [[ "$IS_PRERELEASE" == "true" ]]; then
-                RELEASE_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
-              else
-                RELEASE_NOTES="Release ${VERSION}"
-              fi
-            fi
-
-            # Create release title
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              TITLE="RustFS $VERSION (${RELEASE_TYPE})"
-            else
-              TITLE="RustFS $VERSION"
-            fi
-
-            # Create the release
-            PRERELEASE_FLAG=""
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              PRERELEASE_FLAG="--prerelease"
-            fi
-
-            gh release create "$TAG" \
-              --title "$TITLE" \
-              --notes "$RELEASE_NOTES" \
-              $PRERELEASE_FLAG \
-              --draft
-
-            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
-            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+            TITLE="RustFS $VERSION"
           fi
 
-          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
-          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
-          echo "Created release: $RELEASE_URL"
+          ./scripts/release/create_or_update_release.sh \
+            "$TAG" \
+            "$TARGET_COMMITISH" \
+            "$TITLE" \
+            "$IS_PRERELEASE"
 
   # Prepare and upload release assets
   upload-release-assets:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -920,8 +907,8 @@ jobs:
   # the pointed-to version is a prerelease.
   update-latest-version:
     name: Update Latest Version
-    needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ build-check, publish-release ]
+    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
@@ -980,51 +967,33 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - name: Update release notes and publish
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
-          VERSION="${{ needs.build-check.outputs.version }}"
-          IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          RELEASE_ID="${{ needs.create-release.outputs.release_id }}"
 
-          # Determine release type
-          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
-            if [[ "$TAG" == *"alpha"* ]]; then
-              RELEASE_TYPE="alpha"
-            elif [[ "$TAG" == *"beta"* ]]; then
-              RELEASE_TYPE="beta"
-            elif [[ "$TAG" == *"rc"* ]]; then
-              RELEASE_TYPE="rc"
-            else
-              RELEASE_TYPE="prerelease"
-            fi
+          # Publish the release and correct its channel state on retries.
+          # Only a stable final release may become GitHub Latest.
+          if [[ "$BUILD_TYPE" == "release" ]]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -F draft=false \
+              -F prerelease=false \
+              -f make_latest=true >/dev/null
           else
-            RELEASE_TYPE="release"
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -F draft=false \
+              -F prerelease=true \
+              -f make_latest=false >/dev/null
           fi
-
-          # Get original release notes from tag
-          ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
-          if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
-            if [[ "$IS_PRERELEASE" == "true" ]]; then
-              ORIGINAL_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
-            else
-              ORIGINAL_NOTES="Release ${VERSION}"
-            fi
-          fi
-
-          # Publish the release (remove draft status)
-          gh release edit "$TAG" --draft=false
 
           echo "🎉 Released $TAG successfully!"
           echo "📄 Release URL: ${{ needs.create-release.outputs.release_url }}"

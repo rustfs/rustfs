@@ -379,9 +379,7 @@ where
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        let prefix_with_slash = prefix
-            .clone()
-            .map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
+        let prefix_with_slash = prefix.clone().map(|p| if p.ends_with('/') { p } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
             .bucket(bucket)

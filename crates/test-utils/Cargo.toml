@@ -25,7 +25,32 @@ keywords = ["testing", "storage", "rustfs", "Minio"]
 categories = ["development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-test-utils/latest/rustfs_test_utils/"
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "rustfs-ecstore/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-data-usage/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-data-usage/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-data-usage/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }

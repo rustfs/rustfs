@@ -718,12 +718,18 @@ pub enum KmsAction {
     GenerateDataKeyAction,
     #[strum(serialize = "kms:DeleteKey")]
     DeleteKeyAction,
+    #[strum(serialize = "kms:EnableKey")]
+    EnableKeyAction,
+    #[strum(serialize = "kms:DisableKey")]
+    DisableKeyAction,
     #[strum(serialize = "kms:RotateKey")]
     RotateKeyAction,
     #[strum(serialize = "kms:ListKeys")]
     ListKeysAction,
     #[strum(serialize = "kms:DescribeKey")]
     DescribeKeyAction,
+    #[strum(serialize = "kms:Decrypt")]
+    DecryptAction,
 }
 
 #[cfg(test)]
@@ -755,9 +761,12 @@ mod tests {
             ("kms:ClearCache", KmsAction::ClearCacheAction),
             ("kms:GenerateDataKey", KmsAction::GenerateDataKeyAction),
             ("kms:DeleteKey", KmsAction::DeleteKeyAction),
+            ("kms:EnableKey", KmsAction::EnableKeyAction),
+            ("kms:DisableKey", KmsAction::DisableKeyAction),
             ("kms:RotateKey", KmsAction::RotateKeyAction),
             ("kms:ListKeys", KmsAction::ListKeysAction),
             ("kms:DescribeKey", KmsAction::DescribeKeyAction),
+            ("kms:Decrypt", KmsAction::DecryptAction),
         ] {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));

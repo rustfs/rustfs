@@ -58,8 +58,11 @@ const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
 const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
 const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
 const KMS_DESCRIBE_KEY: AdminActionRef = AdminActionRef::new("kms:DescribeKey");
+const KMS_DISABLE_KEY: AdminActionRef = AdminActionRef::new("kms:DisableKey");
+const KMS_ENABLE_KEY: AdminActionRef = AdminActionRef::new("kms:EnableKey");
 const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
 const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
@@ -434,6 +437,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}",
+        LIST_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v3/audit/target/list",
         GET_BUCKET_TARGET,
         RouteRiskLevel::Sensitive,
@@ -765,6 +780,14 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/enable", KMS_ENABLE_KEY, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/disable",
+        KMS_DISABLE_KEY,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rotate", KMS_ROTATE_KEY, RouteRiskLevel::High),
     public(
         HttpMethod::Get,
         "/rustfs/admin/v3/oidc/providers",
@@ -1825,13 +1848,17 @@ mod tests {
     }
 
     #[test]
-    fn route_policy_requires_set_tier_for_manual_transition_routes() {
+    fn route_policy_uses_tier_actions_for_transition_routes() {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
         assert_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", SET_TIER);
         assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SERVER_INFO);
         assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
         assert_not_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
     }
 
     #[test]

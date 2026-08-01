@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::disk::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint, Error,
-    FileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint,
+    Error, FileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result,
+    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     health_state::{
         RuntimeDriveHealthState, classify_drive_recovery, get_drive_returning_probe_interval,
         get_drive_returning_success_threshold, get_drive_suspect_failure_threshold, record_drive_offline_duration,
@@ -1049,6 +1049,10 @@ impl LocalDiskWrapper {
         Ok(())
     }
 
+    pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) {
+        *self.disk_id.write().await = id;
+    }
+
     /// Get the current disk ID
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
@@ -1347,6 +1351,38 @@ impl DiskAPI for LocalDiskWrapper {
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         self.track_disk_health(|| async { self.disk.delete_paths(volume, paths).await }, get_max_timeout_duration())
             .await
+    }
+
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
+        self.track_disk_health(
+            || async { self.disk.acquire_snapshot_lease(volume, path).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
+        self.track_disk_health(
+            || async { self.disk.release_snapshot_lease(volume, path, token).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        self.track_disk_health(
+            || async { self.disk.renew_snapshot_lease(volume, path, token).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        self.track_disk_health(
+            || async { self.disk.delete_data_dir(volume, path, opts).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {

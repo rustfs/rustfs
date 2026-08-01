@@ -556,7 +556,7 @@ where
         Ok(now)
     }
 
-    pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+    pub async fn list_policies(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
         let mut m = HashMap::new();
 
         self.api.load_policy_docs(&mut m).await?;
@@ -586,6 +586,15 @@ where
             .collect();
 
         Ok(filtered)
+    }
+
+    /// Backward-compatible misspelling retained until the next breaking release.
+    #[deprecated(
+        since = "1.0.0",
+        note = "use list_policies instead; this alias will be removed in the next breaking release"
+    )]
+    pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+        self.list_policies(bucket_name).await
     }
 
     pub async fn merge_policies(&self, name: &str) -> (String, Policy) {
@@ -2184,7 +2193,7 @@ where
     }
 }
 
-pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
+pub fn get_default_policies() -> HashMap<String, PolicyDoc> {
     let default_policies = &DEFAULT_POLICIES;
     default_policies
         .iter()
@@ -2199,6 +2208,15 @@ pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
             )
         })
         .collect()
+}
+
+/// Backward-compatible misspelling retained until the next breaking release.
+#[deprecated(
+    since = "1.0.0",
+    note = "use get_default_policies instead; this alias will be removed in the next breaking release"
+)]
+pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
+    get_default_policies()
 }
 
 fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
@@ -2900,7 +2918,7 @@ mod tests {
 
     #[test]
     fn test_get_default_policies() {
-        let policies = get_default_policyes();
+        let policies = get_default_policies();
 
         // Should contain some default policies
         assert!(!policies.is_empty());
@@ -2911,6 +2929,12 @@ mod tests {
             // PolicyDoc.version is i64, not String
             assert!(policy_doc.version >= 0);
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_get_default_policyes_matches_current_api() {
+        assert_eq!(get_default_policyes().len(), get_default_policies().len());
     }
 
     #[test]

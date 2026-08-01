@@ -1646,40 +1646,14 @@ pub async fn record_manual_transition_worker_result_with_reason(
     job_id: Uuid,
     task_key: &str,
     result: ManualTransitionWorkerResult,
-    queue_snapshot: ManualTransitionQueueSnapshot,
+    _queue_snapshot: ManualTransitionQueueSnapshot,
     failure_reason: Option<ManualTransitionWorkerFailureReason>,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
     let result_record = ManualTransitionWorkerResultRecord::new_with_reason(job_id, task_key, result, failure_reason);
     if !save_manual_transition_worker_result_if_absent(api.clone(), &result_record).await? {
         return load_manual_transition_job_record(api, job_id).await;
     }
-
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        if record.is_terminal() {
-            return Ok(record);
-        }
-        record.record_worker_result_with_reason(result, queue_snapshot, failure_reason);
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                if record.is_terminal() {
-                    delete_manual_transition_scope_admission_if_current(
-                        api.clone(),
-                        &record.scope_key,
-                        record.job_id,
-                        record.lease_id,
-                    )
-                    .await?;
-                } else {
-                    renew_manual_transition_scope_admission_from_job(api, &record).await?;
-                }
-                return Ok(record);
-            }
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Err(Error::PreconditionFailed)
+    load_manual_transition_job_record(api, job_id).await
 }
 
 pub async fn renew_manual_transition_job_lease(
