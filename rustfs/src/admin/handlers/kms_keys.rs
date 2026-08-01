@@ -595,6 +595,13 @@ mod tests {
             ("POST /v3/kms/keys/enable", Action::KmsAction(KmsAction::EnableKeyAction), key_id_body),
             ("POST /v3/kms/keys/disable", Action::KmsAction(KmsAction::DisableKeyAction), key_id_body),
             ("POST /v3/kms/keys/rotate", Action::KmsAction(KmsAction::RotateKeyAction), key_id_body),
+            (
+                "POST /v3/kms/keys/update-description",
+                Action::KmsAction(KmsAction::UpdateKeyDescriptionAction),
+                key_id_body,
+            ),
+            ("POST /v3/kms/keys/tag", Action::KmsAction(KmsAction::TagResourceAction), key_id_body),
+            ("POST /v3/kms/keys/untag", Action::KmsAction(KmsAction::UntagResourceAction), key_id_body),
         ]
     }
 

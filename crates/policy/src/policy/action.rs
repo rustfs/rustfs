@@ -724,6 +724,12 @@ pub enum KmsAction {
     DisableKeyAction,
     #[strum(serialize = "kms:RotateKey")]
     RotateKeyAction,
+    #[strum(serialize = "kms:UpdateKeyDescription")]
+    UpdateKeyDescriptionAction,
+    #[strum(serialize = "kms:TagResource")]
+    TagResourceAction,
+    #[strum(serialize = "kms:UntagResource")]
+    UntagResourceAction,
     #[strum(serialize = "kms:ListKeys")]
     ListKeysAction,
     #[strum(serialize = "kms:DescribeKey")]
@@ -771,6 +777,9 @@ mod tests {
             ("kms:EnableKey", KmsAction::EnableKeyAction),
             ("kms:DisableKey", KmsAction::DisableKeyAction),
             ("kms:RotateKey", KmsAction::RotateKeyAction),
+            ("kms:UpdateKeyDescription", KmsAction::UpdateKeyDescriptionAction),
+            ("kms:TagResource", KmsAction::TagResourceAction),
+            ("kms:UntagResource", KmsAction::UntagResourceAction),
             ("kms:ListKeys", KmsAction::ListKeysAction),
             ("kms:DescribeKey", KmsAction::DescribeKeyAction),
             ("kms:Decrypt", KmsAction::DecryptAction),
