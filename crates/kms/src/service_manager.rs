@@ -749,6 +749,42 @@ mod tests {
         KmsConfig::static_kms(key_id.to_string(), BASE64_STANDARD.encode([fill; 32]))
     }
 
+    /// End-to-end wiring check for the AWS backend: an admin configure request
+    /// must select it, build a real client, and pass the startup health check.
+    ///
+    /// `RUSTFS_KMS_AWS_REGION` names the region; the credential chain supplies
+    /// the rest. No key is created, so this test is not billable on its own.
+    #[tokio::test]
+    #[ignore] // Requires real AWS credentials
+    async fn aws_backend_configure_and_start_end_to_end() {
+        let region = std::env::var("RUSTFS_KMS_AWS_REGION").expect("RUSTFS_KMS_AWS_REGION must name the test region");
+        let config = crate::api_types::ConfigureAwsKmsRequest {
+            region,
+            endpoint_url: None,
+            default_key_id: std::env::var("RUSTFS_KMS_DEFAULT_KEY_ID").ok(),
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
+        }
+        .to_kms_config();
+
+        let manager = KmsServiceManager::new();
+        manager.configure(config).await.expect("configure the AWS backend");
+        manager.start().await.expect("start the AWS backend");
+
+        assert_eq!(manager.get_status().await, KmsServiceStatus::Running);
+        let capabilities = manager
+            .get_manager()
+            .await
+            .expect("a running service exposes its manager")
+            .backend_capabilities();
+        assert!(capabilities.schedule_deletion);
+        assert!(!capabilities.physical_delete);
+    }
+
     #[tokio::test]
     async fn configure_rejects_insecure_development_defaults_before_state_update() {
         let manager = KmsServiceManager::new();
