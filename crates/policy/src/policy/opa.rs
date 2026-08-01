@@ -446,7 +446,8 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept local test request");
             let mut request = [0_u8; 1024];
-            stream.read(&mut request).expect("read local test request");
+            let read = stream.read(&mut request).expect("read local test request");
+            assert!(read > 0, "local test client must send an HTTP request");
             stream
                 .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .expect("write local test response");
@@ -485,14 +486,15 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept local test request");
             let mut request = [0_u8; 1024];
-            stream.read(&mut request).expect("read local test request");
+            let read = stream.read(&mut request).expect("read local test request");
+            assert!(read > 0, "local test client must send an HTTP request");
             stream
                 .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .expect("write local test response");
         });
         let endpoint = format!("http://opa-user:opa-token@127.0.0.1:{port}/private/allow?access_token=query-secret");
         let plugin = AuthZPlugin::new(Args {
-            url: endpoint.to_string(),
+            url: endpoint,
             auth_token: "authorization-secret".to_string(),
         });
         let groups = None;
