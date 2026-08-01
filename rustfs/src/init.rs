@@ -478,6 +478,12 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     service_manager
         .set_deletion_reference_checker(std::sync::Arc::new(crate::kms_deletion_gate::BucketEncryptionReferenceChecker));
 
+    // Route KMS management records into the server's audit pipeline. Installed
+    // before the service can start so every service version built afterwards
+    // carries it; with no audit target configured the records are dropped and
+    // KMS operations are unaffected.
+    service_manager.set_audit_sink(std::sync::Arc::new(crate::admin::handlers::kms_audit::KmsAdminAuditSink));
+
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
         info!(

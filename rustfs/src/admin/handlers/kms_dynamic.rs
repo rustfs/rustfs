@@ -14,6 +14,7 @@
 
 //! KMS dynamic configuration admin API handlers
 
+use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
@@ -531,15 +532,21 @@ impl Operation for ConfigureKmsHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_configure_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate_admin(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_configure_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAdminOperation::Configure,
+            None,
+        )?;
 
         let body = req
             .input
@@ -615,6 +622,7 @@ impl Operation for ConfigureKmsHandler {
                 );
                 let unconverged = broadcast_kms_config_reload().await;
                 let (success, message) = local_success_with_peer_report("KMS configured successfully", &unconverged);
+                audit.finish(KmsAdminOperation::Configure, None, None);
                 (success, message, status)
             }
             Err(e) => {
@@ -628,6 +636,7 @@ impl Operation for ConfigureKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Configure, None, Some(&e));
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
@@ -675,15 +684,21 @@ impl Operation for StartKmsHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_service_control_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate_admin(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_service_control_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAdminOperation::Start,
+            None,
+        )?;
 
         let body = req
             .input
@@ -735,6 +750,7 @@ impl Operation for StartKmsHandler {
                     status = ?status,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Start, None, None);
                 (true, "KMS service started successfully".to_string(), status)
             }
             Ok(rustfs_kms::KmsStartOutcome::Restarted) => {
@@ -748,6 +764,7 @@ impl Operation for StartKmsHandler {
                     status = ?status,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Start, None, None);
                 (true, "KMS service restarted successfully".to_string(), status)
             }
             Ok(rustfs_kms::KmsStartOutcome::AlreadyRunning) => {
@@ -760,6 +777,9 @@ impl Operation for StartKmsHandler {
                     state = "already_running",
                     "admin kms dynamic state"
                 );
+                // A refusal, not an outage: recorded as a failed attempt so the
+                // trail shows the request without inventing a KMS error for it.
+                audit.finish_with_class(KmsAdminOperation::Start, Some("invalid_operation"));
                 (false, "KMS service is already running. Use force=true to restart.".to_string(), status)
             }
             Err(e) => {
@@ -773,6 +793,7 @@ impl Operation for StartKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Start, None, Some(&e));
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
@@ -820,15 +841,21 @@ impl Operation for StopKmsHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_service_control_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate_admin(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_service_control_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAdminOperation::Stop,
+            None,
+        )?;
 
         info!(
             component = LOG_COMPONENT_ADMIN,
@@ -853,6 +880,7 @@ impl Operation for StopKmsHandler {
                     status = ?status,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Stop, None, None);
                 (true, "KMS service stopped successfully".to_string(), status)
             }
             Err(e) => {
@@ -866,6 +894,7 @@ impl Operation for StopKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Stop, None, Some(&e));
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
@@ -1004,15 +1033,21 @@ impl Operation for ReconfigureKmsHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_configure_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+
+        audit.gate_admin(
+            validate_admin_request(
+                &req.headers,
+                &cred,
+                owner,
+                false,
+                kms_configure_actions(),
+                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            )
+            .await,
+            KmsAdminOperation::Reconfigure,
+            None,
+        )?;
 
         let body = req
             .input
@@ -1089,6 +1124,7 @@ impl Operation for ReconfigureKmsHandler {
                 let unconverged = broadcast_kms_config_reload().await;
                 let (success, message) =
                     local_success_with_peer_report("KMS reconfigured and restarted successfully", &unconverged);
+                audit.finish(KmsAdminOperation::Reconfigure, None, None);
                 (success, message, status)
             }
             Err(e) => {
@@ -1102,6 +1138,7 @@ impl Operation for ReconfigureKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
+                audit.finish(KmsAdminOperation::Reconfigure, None, Some(&e));
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
             }
