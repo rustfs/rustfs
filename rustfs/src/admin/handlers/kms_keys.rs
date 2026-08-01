@@ -1023,6 +1023,9 @@ pub struct DeleteKmsKeyRequest {
     pub key_id: String,
     pub pending_window_in_days: Option<u32>,
     pub force_immediate: Option<bool>,
+    /// Echo of `key_id`, required by the service gate before it will destroy
+    /// key material immediately. Absent for an ordinary scheduled deletion.
+    pub confirm_key_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1089,11 +1092,13 @@ impl Operation for DeleteKmsKeyHandler {
             // Extract pending_window_in_days and force_immediate from query parameters
             let pending_window_in_days = query_params.get("pending_window_in_days").and_then(|s| s.parse::<u32>().ok());
             let force_immediate = query_params.get("force_immediate").and_then(|s| s.parse::<bool>().ok());
+            let confirm_key_id = query_params.get("confirm_key_id").map(|s| s.to_string());
 
             DeleteKmsKeyRequest {
                 key_id: key_id.clone(),
                 pending_window_in_days,
                 force_immediate,
+                confirm_key_id,
             }
         } else {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
@@ -1131,9 +1136,7 @@ impl Operation for DeleteKmsKeyHandler {
             key_id: request.key_id.clone(),
             pending_window_in_days: request.pending_window_in_days,
             force_immediate: request.force_immediate,
-            // The endpoint does not accept a confirmation yet, so an immediate
-            // deletion asked for here is always refused by the service gate.
-            confirm_key_id: None,
+            confirm_key_id: request.confirm_key_id.clone(),
         };
 
         match manager.delete_key_with_context(kms_request, audit.context()).await {

@@ -460,8 +460,7 @@ async fn test_vault_kms_key_crud(
         secret_key,
     )
     .await
-    .err()
-    .expect("Immediate KMS key deletion must be refused on a default server");
+    .expect_err("Immediate KMS key deletion must be refused on a default server");
     info!("✅ Force Delete: correctly refused for key {}: {}", key_id, force_delete_error);
 
     // The refused request must leave the key exactly as it was: still present,
