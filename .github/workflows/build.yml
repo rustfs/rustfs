@@ -83,6 +83,7 @@ jobs:
   build-check:
     name: Build Strategy Check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
@@ -164,6 +165,7 @@ jobs:
     name: Prepare Platform Matrix
     needs: build-check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       selected: ${{ steps.select.outputs.selected }}
@@ -171,10 +173,14 @@ jobs:
       - name: Select target platforms
         id: select
         shell: bash
+        env:
+          # via env, not interpolation: a dispatch input is free-form text and
+          # would otherwise be pasted into the script for bash to evaluate.
+          RAW_PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}
         run: |
           set -euo pipefail
 
-          selected="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}"
+          selected="$RAW_PLATFORMS"
           selected="$(echo "${selected}" | tr -d '[:space:]')"
           if [[ -z "${selected}" ]]; then
             selected="all"
@@ -710,9 +716,14 @@ jobs:
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Build completion summary
         shell: bash
+        env:
+          # dispatch input via env: free-form text must not be pasted into the
+          # script for bash to evaluate.
+          INPUT_BUILD_DOCKER: ${{ github.event.inputs.build_docker }}
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
           VERSION="${{ needs.build-check.outputs.version }}"
@@ -754,7 +765,7 @@ jobs:
           echo "🐳 Docker Images:"
           if [[ "$BUILD_TYPE" == "preview" ]]; then
             echo "⏭️  Preview tags do not publish Docker images"
-          elif [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
+          elif [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
           elif [[ "$BUILD_STATUS" == "success" ]]; then
             echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
@@ -768,6 +779,7 @@ jobs:
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     outputs:
@@ -827,6 +839,7 @@ jobs:
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       actions: read
@@ -918,6 +931,7 @@ jobs:
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Update latest.json
         env:
@@ -977,6 +991,7 @@ jobs:
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:

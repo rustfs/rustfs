@@ -85,6 +85,7 @@ jobs:
        github.event.workflow_run.head_branch != 'main' &&
        !contains(github.event.workflow_run.head_branch, '-preview'))
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       should_push: ${{ steps.check.outputs.should_push }}
@@ -102,6 +103,12 @@ jobs:
 
       - name: Check build conditions
         id: check
+        env:
+          # dispatch inputs via env, not `${{ }}` interpolation: they are
+          # free-form strings and would otherwise be evaluated by bash.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUSH_IMAGES: ${{ github.event.inputs.push_images }}
+          INPUT_FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
         run: |
           should_build=false
           should_push=false
@@ -202,9 +209,9 @@ jobs:
 
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Manual trigger
-            input_version="${{ github.event.inputs.version }}"
+            input_version="$INPUT_VERSION"
             version="${input_version}"
-            should_push="${{ github.event.inputs.push_images }}"
+            should_push="$INPUT_PUSH_IMAGES"
             should_build=true
 
             # Get short SHA
@@ -212,7 +219,7 @@ jobs:
 
             echo "🎯 Manual Docker build triggered:"
             echo "   📋 Requested version: $input_version"
-            echo "   🔧 Force rebuild: ${{ github.event.inputs.force_rebuild }}"
+            echo "   🔧 Force rebuild: $INPUT_FORCE_REBUILD"
             echo "   🚀 Push images: $should_push"
 
             case "$input_version" in
@@ -439,6 +446,7 @@ jobs:
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
@@ -493,6 +501,7 @@ jobs:
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Docker build completion summary
         run: |
