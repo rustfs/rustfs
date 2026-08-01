@@ -24,7 +24,7 @@ use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_kms::{KmsAuditOperation, KmsError, types::*};
+use rustfs_kms::{KeyImpactReport, KmsAuditOperation, KmsError, types::*};
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -1135,6 +1135,17 @@ pub struct DeleteKmsKeyResponse {
     pub message: String,
     pub key_id: String,
     pub deletion_date: Option<String>,
+    /// Configuration that still points at the key when the request was
+    /// handled. A scheduled deletion succeeds regardless — it destroys
+    /// nothing and stays cancellable — but the deletion worker will refuse to
+    /// destroy the material while any of these references remain, so an
+    /// operator has to be able to see them at the moment they schedule it
+    /// rather than only in a server-side log once the window has run out.
+    ///
+    /// `None` when the request never got far enough to identify a key or
+    /// reach the KMS service. See [`KeyImpactReport`] for what an empty
+    /// reference list does and does not mean.
+    pub impact: Option<KeyImpactReport>,
 }
 
 const IMMEDIATE_DELETION_QUERY_RETIRED: &str = "immediate deletion is no longer accepted as a query parameter; send it as a JSON body with force_immediate and confirm_key_id set to the key id";
@@ -1640,6 +1651,10 @@ pub struct DescribeKmsKeyResponse {
     pub success: bool,
     pub message: String,
     pub key_metadata: Option<KeyMetadata>,
+    /// Configuration that currently points at the key, so the blast radius of
+    /// a deletion can be read off without scheduling one first. `None` when
+    /// the key could not be described at all.
+    pub impact: Option<KeyImpactReport>,
 }
 
 /// Describe a KMS key

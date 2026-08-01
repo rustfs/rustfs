@@ -1308,6 +1308,155 @@ mod tests {
         assert!(matches!(error, KmsError::KeyNotFound { .. }), "expected KeyNotFound, got {error:?}");
     }
 
+    /// Reference checker whose answer is fixed, standing in for the server's
+    /// bucket-configuration gate.
+    struct StaticReferences(Vec<String>);
+
+    #[async_trait]
+    impl DeletionReferenceChecker for StaticReferences {
+        async fn references(&self, _key_id: &str) -> Vec<String> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_is_refused_while_configuration_references_the_key() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(vec!["bucket:sse-bucket".to_string()]))));
+        let key_id = create_named_key(&manager, "referenced-force-delete").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        // Server opt-in granted and the confirmation exact: the reference is
+        // the only thing left to refuse this.
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("immediate deletion must be refused while configuration references the key");
+
+        match error {
+            KmsError::KeyStillReferenced { key_id: refused, references } => {
+                assert_eq!(refused, key_id);
+                assert_eq!(references, vec!["bucket:sse-bucket".to_string()], "the caller must learn what refused it");
+            }
+            other => panic!("expected KeyStillReferenced, got {other:?}"),
+        }
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_of_the_service_default_key_is_refused() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let mut config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        config.allow_immediate_deletion = true;
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
+        let key_id = KmsManager::new(backend.clone(), config.clone())
+            .create_key(CreateKeyRequest {
+                key_name: Some("default-key-force-delete".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create key")
+            .key_id;
+
+        config.default_key_id = Some(key_id.clone());
+        let manager = KmsManager::new(backend, config);
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("the service default key must not be destroyed out from under the deployment");
+        assert!(
+            matches!(error, KmsError::KeyStillReferenced { .. }),
+            "expected KeyStillReferenced, got {error:?}"
+        );
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    /// A checker that reports nothing must not become a shortcut around the
+    /// gates that were already there: it is not a clearance, only the absence
+    /// of one more objection.
+    #[tokio::test]
+    async fn an_empty_reference_set_grants_no_deletion_on_its_own() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
+        let key_id = create_named_key(&manager, "unreferenced-force-delete").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        // Server opt-in withheld, then confirmation missing: both still refuse.
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an unreferenced key still needs the server-side opt-in");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "expected InvalidOperation, got {error:?}");
+
+        let allowed = deletion_manager(&temp_dir, true)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
+        let error = allowed
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an unreferenced key still needs the key-id confirmation");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "expected InvalidOperation, got {error:?}");
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    /// Scheduling stays a schedule: it destroys nothing, stays cancellable,
+    /// and is re-checked against the same references by the deletion worker
+    /// before any material goes away. Turning references into an up-front
+    /// refusal here would let one unreadable bucket block routine operations.
+    #[tokio::test]
+    async fn scheduled_deletion_is_unaffected_by_references() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(vec!["bucket:sse-bucket".to_string()]))));
+        let key_id = create_named_key(&manager, "referenced-schedule").await;
+
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("a scheduled deletion must still be accepted while configuration references the key");
+
+        let state = manager
+            .describe_key(DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect("a scheduled key must still be describable")
+            .key_metadata
+            .key_state;
+        assert_eq!(state, KeyState::PendingDeletion);
+    }
+
     #[tokio::test]
     async fn pending_window_outside_the_supported_range_is_refused() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
