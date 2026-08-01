@@ -126,6 +126,82 @@ pub(crate) fn ensure_tag_keys_are_mutable<'a>(tag_keys: impl IntoIterator<Item =
     Ok(())
 }
 
+/// Page size used when a [`ListKeysRequest`] does not ask for one.
+pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = 100;
+
+/// One page of a key set the backend has to slice itself.
+pub(crate) struct KeyPage<'a, T> {
+    /// The identifiers this page covers, in listing order.
+    pub(crate) items: &'a [T],
+    /// Where the next page resumes; `None` when this page is the last one.
+    pub(crate) next_marker: Option<String>,
+    /// Whether keys remain beyond this page.
+    pub(crate) truncated: bool,
+}
+
+/// Cut the page `request` asks for out of `sorted`.
+///
+/// `sorted` must be ordered by the identifier `key_id_of` returns, and the
+/// marker is an *exclusive lower bound* on that identifier rather than an index
+/// into the sequence. That is what makes paging survive concurrent mutation:
+/// the next page resumes at the first identifier greater than the marker, so a
+/// key added or removed elsewhere in the ordering — including the marker key
+/// itself, which the deletion sweep routinely destroys — cannot make the
+/// listing skip keys or restart from the beginning.
+///
+/// A `limit` of zero is honoured as written: the caller asked for no keys and
+/// gets an empty, non-truncated page (see [`list_keys_page_size`]).
+///
+/// Filters are applied by the caller to `items` after this slice, so a filtered
+/// page can be shorter than `limit` — and even empty — while more keys remain.
+/// Callers must page until `truncated` is false rather than until a page comes
+/// back short.
+pub(crate) fn paginate_keys<'a, T>(sorted: &'a [T], request: &ListKeysRequest, key_id_of: impl Fn(&T) -> &str) -> KeyPage<'a, T> {
+    let Some(limit) = list_keys_page_size(request.limit) else {
+        return KeyPage {
+            items: &[],
+            next_marker: None,
+            truncated: false,
+        };
+    };
+
+    let start = match request.marker.as_deref() {
+        Some(marker) => sorted.partition_point(|item| key_id_of(item) <= marker),
+        None => 0,
+    };
+    // `partition_point` never exceeds the length, so both bounds stay in range
+    // however large `limit` is.
+    let end = start.saturating_add(limit).min(sorted.len());
+    let items = &sorted[start..end];
+    let truncated = end < sorted.len();
+
+    KeyPage {
+        items,
+        // Resuming from the last identifier on the page, not from an index,
+        // keeps the cursor meaningful after the key it names disappears.
+        next_marker: if truncated {
+            items.last().map(|item| key_id_of(item).to_string())
+        } else {
+            None
+        },
+        truncated,
+    }
+}
+
+/// Resolve the page size of a [`ListKeysRequest`]; `None` means the caller
+/// asked for no keys at all.
+///
+/// `Some(0)` is a well-formed request for an empty page — the reading rustfs
+/// already gives `max-keys=0` on the S3 listing path — not a malformed one and
+/// not an omitted value. Rounding it up to a default would hand back a full
+/// page of keys to a caller that explicitly asked for none.
+pub(crate) fn list_keys_page_size(limit: Option<u32>) -> Option<usize> {
+    match limit.unwrap_or(DEFAULT_LIST_KEYS_PAGE_SIZE) {
+        0 => None,
+        size => Some(size as usize),
+    }
+}
+
 /// Simplified KMS backend interface for manager
 #[async_trait]
 pub trait KmsBackend: Send + Sync {
