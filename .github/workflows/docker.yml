@@ -340,32 +340,28 @@ jobs:
           CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
           VARIANT_SUFFIX="${{ matrix.suffix }}"
 
-          # Convert version format for Dockerfile compatibility
+          # Convert version format for Dockerfile compatibility. The former
+          # DOCKER_CHANNEL was "release" down every branch and was passed as a
+          # build-arg no Dockerfile declares, so it is gone.
           case "$VERSION" in
             "latest")
-              # For stable latest, use RELEASE=latest + release CHANNEL
               DOCKER_RELEASE="latest"
-              DOCKER_CHANNEL="release"
               ;;
             v*)
               # For versioned releases (v1.0.0), remove 'v' prefix for Dockerfile
               DOCKER_RELEASE="${VERSION#v}"
-              DOCKER_CHANNEL="release"
               ;;
             *)
               # For other versions, pass as-is
               DOCKER_RELEASE="${VERSION}"
-              DOCKER_CHANNEL="release"
               ;;
           esac
 
           echo "docker_release=$DOCKER_RELEASE" >> "$GITHUB_OUTPUT"
-          echo "docker_channel=$DOCKER_CHANNEL" >> "$GITHUB_OUTPUT"
 
           echo "🐳 Docker build parameters:"
           echo "  - Original version: $VERSION"
           echo "  - Docker RELEASE: $DOCKER_RELEASE"
-          echo "  - Docker CHANNEL: $DOCKER_CHANNEL"
 
           # Generate tags based on build type
           # Only support release and prerelease builds (no development builds)
@@ -419,18 +415,24 @@ jobs:
           push: ${{ needs.build-check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=docker-${{ matrix.variant }}
-          cache-to: |
-            type=gha,mode=max,scope=docker-${{ matrix.variant }}
+          # No layer cache. This build compiles nothing — it downloads a
+          # release zip and runs apk/apt — so the cache could only save the
+          # minute or two those take, while creating a correctness problem: with
+          # RELEASE=latest the binary URL is resolved by curl *inside* a RUN
+          # layer, and the layer key does not include what that resolved to. A
+          # rebuild at the same RELEASE value (dispatch with version=latest, or
+          # a re-run of the same version) would hit the old layer and ship the
+          # previous release's binary. mode=max also consumed the same 10GB
+          # Actions cache quota the Rust lanes are fighting over.
+          #
+          # Only RELEASE is passed: it is the sole build-arg the Dockerfiles
+          # declare besides TARGETARCH. BUILDTIME, VERSION, BUILD_TYPE, REVISION
+          # and CHANNEL were never read by any stage (and BUILDTIME's $(date ...)
+          # was a literal here, not a shell substitution). BUILD_DATE and VCS_REF
+          # are declared by the Dockerfiles but deliberately left unset —
+          # supplying them would change the published image labels.
           build-args: |
-            BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-            VERSION=${{ needs.build-check.outputs.version }}
-            BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
-            REVISION=${{ github.sha }}
             RELEASE=${{ steps.meta.outputs.docker_release }}
-            CHANNEL=${{ steps.meta.outputs.docker_channel }}
-            BUILDKIT_INLINE_CACHE=1
           provenance: true
           sbom: true
           # Add retry mechanism by splitting the build process

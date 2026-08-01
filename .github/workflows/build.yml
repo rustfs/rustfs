@@ -265,7 +265,6 @@ jobs:
           rust-version: stable
           target: ${{ matrix.target }}
           cache-shared-key: build-${{ matrix.target }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           # main only. A cache saved on refs/tags/X is scoped to that tag: no
           # other tag, no main run and no PR can restore it, so every release
           # cycle wrote up to 12 entries of 1-2GB (preview tag plus final tag,
@@ -276,6 +275,7 @@ jobs:
           # finds that tag's own warm cache and falls back to main's.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-cross-tools: ${{ matrix.cross }}
+          install-test-tools: 'false'
 
       - name: Download static console assets
         shell: bash
