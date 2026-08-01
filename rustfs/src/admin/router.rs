@@ -2708,17 +2708,15 @@ impl<T: Operation> S3Router<T> {
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
         let path = Self::make_route_str(method, path);
+        #[cfg(test)]
+        let registered_path = path.clone();
 
         // warn!("set uri {}", &path);
 
-        #[cfg(test)]
-        {
-            self.router.insert(path.clone(), operation).map_err(std::io::Error::other)?;
-            self.registered_routes.push(path);
-        }
-
-        #[cfg(not(test))]
         self.router.insert(path, operation).map_err(std::io::Error::other)?;
+
+        #[cfg(test)]
+        self.registered_routes.push(registered_path);
 
         Ok(())
     }

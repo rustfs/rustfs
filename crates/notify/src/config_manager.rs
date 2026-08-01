@@ -19,7 +19,7 @@ use crate::{
     resolve_notify_object_store_handle,
     rule_engine::NotifyRuleEngine,
     runtime_facade::NotifyRuntimeFacade,
-    with_notify_server_config_read_lock, with_notify_server_config_write_lock,
+    with_notify_server_config_read_lock,
 };
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
@@ -41,12 +41,32 @@ enum NotifyConfigStoreError {
     StorageNotAvailable,
     Read(String),
     Save(String),
+    Converge { persisted: bool, error: String },
+}
+
+fn notification_convergence_error(persisted: bool, error: impl std::fmt::Display) -> NotificationError {
+    let durable_state = if persisted { "persisted" } else { "unchanged" };
+    NotificationError::Configuration(format!(
+        "configuration was {durable_state} but notification runtime convergence failed: {error}"
+    ))
+}
+
+async fn supervise_config_update<T>(
+    mutation: impl std::future::Future<Output = Result<T, NotifyConfigStoreError>> + Send + 'static,
+) -> Result<T, NotifyConfigStoreError>
+where
+    T: Send + 'static,
+{
+    tokio::spawn(mutation).await.map_err(|error| {
+        let outcome = if error.is_cancelled() { "cancelled" } else { "panicked" };
+        NotifyConfigStoreError::Lock(format!("notify config update task {outcome}"))
+    })?
 }
 
 async fn update_server_config<F>(
-    modifier: F,
+    mut modifier: F,
     lifecycle: NotifyLifecycleCoordinator,
-) -> Result<Option<crate::lifecycle::NotificationLifecycleTransition>, NotifyConfigStoreError>
+) -> Result<Option<(crate::lifecycle::NotificationLifecycleTransition, bool)>, NotifyConfigStoreError>
 where
     F: FnMut(&mut Config) -> bool + Send + 'static,
 {
@@ -54,51 +74,31 @@ where
         return Err(NotifyConfigStoreError::StorageNotAvailable);
     };
 
-    let store_for_read = store.clone();
-    let store_for_save = store.clone();
-    with_notify_server_config_write_lock(store, move || {
-        read_modify_write(
-            modifier,
-            move || async move {
-                crate::read_notify_server_config_without_migrate_no_lock(store_for_read)
-                    .await
-                    .map_err(NotifyConfigStoreError::Read)
-            },
-            move |config| async move {
-                crate::save_notify_server_config_no_lock(store_for_save, &config)
-                    .await
-                    .map_err(NotifyConfigStoreError::Save)
-            },
-            move |config| lifecycle.update_config(config),
-        )
+    supervise_config_update(async move {
+        let snapshot = crate::read_notify_server_config_snapshot(store.clone())
+            .await
+            .map_err(NotifyConfigStoreError::Read)?;
+        let mut config = snapshot.config.clone();
+        if !modifier(&mut config) {
+            return Ok(None);
+        }
+
+        let persisted = crate::save_notify_server_config_snapshot(store.clone(), &config, &snapshot)
+            .await
+            .map_err(NotifyConfigStoreError::Save)?;
+        drop(snapshot);
+
+        let read_store = store.clone();
+        with_notify_server_config_read_lock(store, move || async move {
+            let latest = crate::read_existing_notify_server_config_no_lock(read_store)
+                .await
+                .map_err(|error| NotifyConfigStoreError::Converge { persisted, error })?;
+            Ok::<_, NotifyConfigStoreError>(Some((lifecycle.update_config(latest), persisted)))
+        })
+        .await
+        .map_err(|error| NotifyConfigStoreError::Converge { persisted, error })?
     })
     .await
-    .map_err(NotifyConfigStoreError::Lock)?
-}
-
-async fn read_modify_write<F, R, RFut, S, SFut, P, T>(
-    mut modifier: F,
-    read: R,
-    save: S,
-    publish: P,
-) -> Result<Option<T>, NotifyConfigStoreError>
-where
-    F: FnMut(&mut Config) -> bool,
-    R: FnOnce() -> RFut,
-    RFut: std::future::Future<Output = Result<Config, NotifyConfigStoreError>>,
-    S: FnOnce(Config) -> SFut,
-    SFut: std::future::Future<Output = Result<(), NotifyConfigStoreError>>,
-    P: FnOnce(Config) -> T,
-{
-    let mut new_config = read().await?;
-
-    if !modifier(&mut new_config) {
-        return Ok(None);
-    }
-
-    save(new_config.clone()).await?;
-
-    Ok(Some(publish(new_config)))
 }
 
 pub(crate) fn notify_configuration_hint() -> String {
@@ -345,16 +345,18 @@ impl NotifyConfigManager {
         if self.lifecycle.state() == NotificationRuntimeState::Terminated {
             return Err(NotificationError::Initialization("Notification runtime has terminated".to_string()));
         }
-        let Some(transition) = update_server_config(modifier, self.lifecycle.clone())
-            .await
-            .map_err(|err| match err {
-                NotifyConfigStoreError::Lock(err) => NotificationError::StorageNotAvailable(err),
-                NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
-                    "Failed to save target configuration: server storage not initialized".to_string(),
-                ),
-                NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
-                NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
-            })?
+        let Some((transition, persisted)) =
+            update_server_config(modifier, self.lifecycle.clone())
+                .await
+                .map_err(|err| match err {
+                    NotifyConfigStoreError::Lock(err) => NotificationError::StorageNotAvailable(err),
+                    NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
+                        "Failed to save target configuration: server storage not initialized".to_string(),
+                    ),
+                    NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
+                    NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
+                    NotifyConfigStoreError::Converge { persisted, error } => notification_convergence_error(persisted, error),
+                })?
         else {
             debug!(
                 event = EVENT_NOTIFY_CONFIG_UPDATE,
@@ -367,23 +369,53 @@ impl NotifyConfigManager {
             return Ok(());
         };
 
+        let result = if persisted { "updated" } else { "unchanged" };
         info!(
             event = EVENT_NOTIFY_CONFIG_UPDATE,
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_CONFIG,
             action = "reload_if_changed",
-            result = "updated",
+            result,
             "notify config update"
         );
-        transition.wait().await
+        transition
+            .wait()
+            .await
+            .map_err(|err| notification_convergence_error(persisted, err))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NotifyConfigManager, NotifyConfigStoreError, read_modify_write, runtime_target_id_for_subsystem};
+    use super::{
+        NotifyConfigManager, NotifyConfigStoreError, notification_convergence_error, runtime_target_id_for_subsystem,
+        supervise_config_update,
+    };
     use crate::rules::RulesMap;
     use crate::{NotificationError, NotificationRuntimeState};
+
+    #[tokio::test]
+    async fn supervised_config_update_survives_waiter_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            supervise_config_update(async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let _ = completed_tx.send(());
+                Ok::<_, NotifyConfigStoreError>(())
+            })
+            .await
+        });
+
+        started_rx.await.expect("config update should start");
+        waiter.abort();
+        release_tx.send(()).expect("config update should be released");
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(30), completed_rx).await;
+        assert!(matches!(completed, Ok(Ok(()))), "detached config update should complete");
+    }
     use crate::{
         integration::NotificationMetrics, notifier::EventNotifier, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
         runtime_facade::NotifyRuntimeFacade,
@@ -392,14 +424,11 @@ mod tests {
         NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_SUB_SYS,
         NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
     };
-    use rustfs_config::server_config::{Config, KVS};
+    use rustfs_config::server_config::Config;
     use rustfs_s3_types::EventName;
     use rustfs_targets::ReplayWorkerManager;
     use rustfs_targets::arn::TargetID;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::Arc;
     use tokio::sync::{RwLock, Semaphore};
 
     fn build_manager() -> NotifyConfigManager {
@@ -463,38 +492,6 @@ mod tests {
         assert!(matches!(manager.lifecycle().state(), NotificationRuntimeState::TargetsEnabled { .. }));
     }
 
-    #[tokio::test]
-    async fn read_modify_write_publishes_only_after_save() {
-        let saved = Arc::new(AtomicBool::new(false));
-        let saved_by_writer = saved.clone();
-        let observed_by_publisher = saved.clone();
-
-        read_modify_write(
-            |config| {
-                config
-                    .0
-                    .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
-                    .or_default()
-                    .insert("primary".to_string(), KVS::default());
-                true
-            },
-            || async { Ok::<_, NotifyConfigStoreError>(Config::default()) },
-            move |_config| async move {
-                saved_by_writer.store(true, Ordering::Release);
-                Ok::<_, NotifyConfigStoreError>(())
-            },
-            move |_config| {
-                assert!(
-                    observed_by_publisher.load(Ordering::Acquire),
-                    "publication must observe the completed save"
-                );
-            },
-        )
-        .await
-        .expect("read-modify-write should succeed")
-        .expect("changed config should publish");
-    }
-
     #[test]
     fn runtime_target_id_for_subsystem_maps_notify_webhook_to_runtime_type() {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_WEBHOOK_SUB_SYS, "Primary");
@@ -549,5 +546,17 @@ mod tests {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_POSTGRES_SUB_SYS, "AuditTrail");
         assert_eq!(target_id.id, "audittrail");
         assert_eq!(target_id.name, "postgres");
+    }
+
+    #[test]
+    fn convergence_error_reports_durable_write_state() {
+        for (persisted, expected) in [(true, "configuration was persisted"), (false, "configuration was unchanged")] {
+            let error = notification_convergence_error(persisted, "injected failure");
+            let NotificationError::Configuration(message) = error else {
+                panic!("convergence error should be a configuration error");
+            };
+            assert!(message.contains(expected), "unexpected convergence error: {message}");
+            assert!(message.contains("injected failure"));
+        }
     }
 }

@@ -522,6 +522,7 @@ fn snapshot_from_delivery(target_id: TargetID, delivery: TargetDeliverySnapshot)
     }
 }
 
+#[hotpath::measure]
 pub async fn init_target_and_optionally_start_replay<E, F, G>(
     target: Box<dyn Target<E> + Send + Sync>,
     on_replay_start: F,
@@ -557,6 +558,7 @@ where
     Some((shared, cancel))
 }
 
+#[hotpath::measure]
 pub(crate) async fn prepare_target<E>(
     target: Box<dyn Target<E> + Send + Sync>,
     cancellation: Option<&CancellationToken>,
@@ -598,6 +600,7 @@ where
 
 type ActivatedTarget<E> = (SharedTarget<E>, Option<(mpsc::Sender<()>, JoinHandle<()>)>);
 
+#[hotpath::measure]
 pub async fn activate_targets_with_replay<E, F, Fut>(
     targets: Vec<Box<dyn Target<E> + Send + Sync>>,
     mut activate_one: F,
@@ -670,6 +673,7 @@ fn seed_interval_start(now: tokio::time::Instant, interval: Duration) -> tokio::
     now.checked_sub(interval).unwrap_or(now)
 }
 
+#[hotpath::measure]
 async fn stream_replay_worker<E>(
     store: &mut (dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
     target: SharedTarget<E>,
@@ -805,6 +809,7 @@ async fn stream_replay_worker<E>(
 /// Returns `true` if a cancel signal was observed while processing (e.g. during
 /// retry backoff), so the caller can stop promptly instead of continuing to
 /// drain a store that a replacement worker may already own.
+#[hotpath::measure]
 async fn process_replay_batch<E>(
     store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
     batch_keys: &mut Vec<Key>,

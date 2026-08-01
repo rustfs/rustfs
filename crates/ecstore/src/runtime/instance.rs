@@ -46,6 +46,7 @@ use crate::bucket::metadata_sys::BucketMetadataSys;
 use crate::bucket::replication::{DynReplicationPool, ReplicationStats};
 use crate::disk::DiskStore;
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
+use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
@@ -159,6 +160,8 @@ pub struct InstanceContext {
     /// workers (scanner/heal/tier/lifecycle) without touching another instance.
     /// Replaces the process-global cancel-token static.
     background_cancel_token: OnceLock<CancellationToken>,
+    /// Resolves object-encryption material at the application boundary.
+    object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     #[cfg(test)]
@@ -197,6 +200,7 @@ impl InstanceContext {
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
+            object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -207,6 +211,19 @@ impl InstanceContext {
     /// This instance's namespace lock manager.
     pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
         self.lock_manager.clone()
+    }
+
+    /// Install the application-owned object-encryption resolver once.
+    pub fn set_object_encryption_resolver(
+        &self,
+        resolver: Arc<dyn ObjectEncryptionResolver>,
+    ) -> Result<(), Arc<dyn ObjectEncryptionResolver>> {
+        self.object_encryption_resolver.set(resolver)
+    }
+
+    /// Return the configured object-encryption resolver, if startup installed one.
+    pub fn object_encryption_resolver(&self) -> Option<&dyn ObjectEncryptionResolver> {
+        self.object_encryption_resolver.get().map(Arc::as_ref)
     }
 
     /// Set this instance's S3 region.

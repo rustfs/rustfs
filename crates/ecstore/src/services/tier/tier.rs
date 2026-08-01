@@ -72,6 +72,7 @@ use crate::{
     cluster::rpc::peer_rest_client::{PeerRestClient, PeerTierMutationState},
     config::com::{CONFIG_PREFIX, read_config, read_config_with_metadata},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
+    layout::endpoints::EndpointServerPools,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
     set_disk::get_lock_acquire_timeout,
@@ -904,14 +905,17 @@ async fn remote_tier_mutation_peers() -> io::Result<Vec<Arc<dyn TierMutationPeer
     let Some(endpoints) = runtime_sources::endpoint_pools() else {
         return Err(tier_mutation_replay_error("cluster endpoint topology is not initialized"));
     };
-    let remote_host_count = endpoints.hosts_sorted().iter().flatten().count();
-    let (peers, _) = PeerRestClient::new_clients(endpoints).await;
+    remote_tier_mutation_peers_from_topology(endpoints).await
+}
+
+async fn remote_tier_mutation_peers_from_topology(endpoints: EndpointServerPools) -> io::Result<Vec<Arc<dyn TierMutationPeer>>> {
+    let (peers, _, remote_topology_hosts) = PeerRestClient::new_clients_with_topology(endpoints).await;
     let peers = peers
         .into_iter()
         .flatten()
         .map(|peer| Arc::new(peer) as Arc<dyn TierMutationPeer>)
         .collect::<Vec<_>>();
-    ensure_complete_tier_mutation_commit_peer_set(peers.len(), remote_host_count)?;
+    ensure_complete_tier_mutation_commit_peer_set(peers.len(), remote_topology_hosts.len())?;
     Ok(peers)
 }
 
@@ -4307,6 +4311,34 @@ fn tier_config_not_initialized_error(operation: &str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{
+        endpoint::Endpoint,
+        endpoints::{Endpoints, PoolEndpoints, SetupType},
+    };
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = runtime_sources::current_setup_type().await;
+            runtime_sources::set_setup_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    runtime_sources::set_setup_type(previous).await;
+                });
+            });
+        }
+    }
 
     fn build_s3_tier(name: &str) -> TierConfig {
         TierConfig {
@@ -6352,6 +6384,42 @@ mod tests {
         ensure_complete_tier_mutation_commit_peer_set(2, 2).expect("two remote hosts should require two peers");
         let err = ensure_complete_tier_mutation_commit_peer_set(1, 2).expect_err("missing one expected peer must fail closed");
         assert!(err.to_string().contains("without peer commit clients"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn tier_mutation_peer_composition_preserves_unresolved_topology_slots() {
+        let mut endpoints = Vec::new();
+        for disk_index in 0..4 {
+            let mut endpoint = Endpoint::try_from(format!("http://rustfs-{disk_index}.invalid:9000/data{disk_index}").as_str())
+                .expect("unresolved topology endpoint should parse without DNS");
+            endpoint.is_local = disk_index == 0;
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+        let topology = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "unresolved-tier-mutation-topology".to_string(),
+            platform: "test".to_string(),
+        }]);
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let peers = remote_tier_mutation_peers_from_topology(topology)
+            .await
+            .expect("every unresolved remote topology slot should retain a tier mutation client");
+        assert_eq!(
+            peers.iter().map(|peer| peer.peer_label()).collect::<Vec<_>>(),
+            vec![
+                "http://rustfs-1.invalid:9000".to_string(),
+                "http://rustfs-2.invalid:9000".to_string(),
+                "http://rustfs-3.invalid:9000".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

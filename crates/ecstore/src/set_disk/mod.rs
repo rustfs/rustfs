@@ -110,7 +110,10 @@ use crate::{
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     // event::name::EventName,
     services::event_notification::{EventArgs, send_event},
-    store::init_format::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
+    store::init_format::{
+        formats_match_reference_slots, get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all,
+        save_format_file,
+    },
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -144,15 +147,17 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, current_dirty_generation, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
+#[cfg(test)]
+use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
 use rustfs_utils::http::{
-    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, contains_key_str,
-    get_header_map, get_str, insert_str, is_encryption_metadata_key, remove_header_map,
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_RESTORE_OPERATION_ID, contains_key_str, get_header_map, get_str, insert_str, is_object_encryption_marker,
+    remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -667,10 +672,7 @@ pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, S
 }
 
 fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
-    metadata.keys().any(|key| is_encryption_metadata_key(key))
-        || metadata.contains_key(SSEC_ALGORITHM_HEADER)
-        || metadata.contains_key(SSEC_KEY_HEADER)
-        || metadata.contains_key(SSEC_KEY_MD5_HEADER)
+    metadata.keys().any(|key| is_object_encryption_marker(key))
 }
 
 /// Per-set memoized capacity dirty scope.
@@ -4712,6 +4714,7 @@ mod tests {
     use crate::layout::endpoints::SetupType;
     use crate::object_api::BLOCK_SIZE_V2;
     use crate::object_api::ObjectInfo;
+    use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         namespace::NamespaceLocking as _, object::ObjectIO as _, object::ObjectOperations as _,
@@ -5849,23 +5852,27 @@ mod tests {
             crate::disk::DataDirDeleteStatus::Deleted
         );
         release_slow_candidate.notify_one();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            disk2
-                .delete_data_dir(
-                    bucket,
-                    data_dir,
-                    DeleteOptions {
-                        recursive: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("a token acquired after the deadline must be released"),
-            crate::disk::DataDirDeleteStatus::Deleted
-        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match disk2
+                    .delete_data_dir(
+                        bucket,
+                        data_dir,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("a token acquired after the deadline must be released")
+                {
+                    crate::disk::DataDirDeleteStatus::Deleted => return,
+                    crate::disk::DataDirDeleteStatus::Deferred => tokio::time::sleep(Duration::from_millis(1)).await,
+                }
+            }
+        })
+        .await
+        .expect("late snapshot lease cleanup must finish within the bounded wait");
     }
 
     #[tokio::test(start_paused = true)]
@@ -9559,6 +9566,15 @@ mod tests {
         make_local_bucket_test_set_disks_with_drive_count(2).await
     }
 
+    fn assert_exclusive_object_lock_held(set_disks: &SetDisks, bucket: &str, object: &str) {
+        let lock = set_disks
+            .local_lock_manager_for_test()
+            .get_lock_info(&ObjectKey::new(bucket, object))
+            .expect("object lock should be visible while rename is paused");
+        assert!(matches!(lock.mode, rustfs_lock::LockMode::Exclusive));
+        assert_eq!(lock.owner.as_ref(), set_disks.locker_owner.as_str());
+    }
+
     async fn make_local_bucket_test_set_disks_with_drive_count(drive_count: usize) -> Arc<SetDisks> {
         let format = FormatV3::new(1, drive_count);
         let mut endpoints = Vec::new();
@@ -9593,7 +9609,9 @@ mod tests {
             disks.push(Some(disk));
         }
 
-        let set_disks = SetDisks::new(
+        let instance_ctx = Arc::new(InstanceContext::new());
+        instance_ctx.update_erasure_type(SetupType::Erasure).await;
+        let set_disks = SetDisks::new_with_instance_ctx(
             "test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
             drive_count,
@@ -9603,6 +9621,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            instance_ctx,
         )
         .await;
         set_disks.set_test_storage_class_config(
@@ -10254,6 +10273,216 @@ mod tests {
                 .await,
             Some(StorageError::ObjectNotFound(_, _))
         ));
+    }
+
+    #[tokio::test]
+    async fn conditional_replace_holds_object_lock_through_rename() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-conditional-replace-fence";
+        let object = "config/conditional-replace.json";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut initial_reader = PutObjReader::from_vec(b"initial config".to_vec());
+        let initial = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial config should be written");
+        let initial_etag = initial.etag.expect("initial config should have an ETag");
+
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let writer_store = set_disks.clone();
+        let expected_etag = initial_etag.clone();
+        let writer = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"replacement config".to_vec());
+            writer_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        preserve_etag: Some("replacement-etag".to_string()),
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_match: Some(expected_etag),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("conditional replace should reach the rename barrier");
+        assert_exclusive_object_lock_held(&set_disks, bucket, object);
+        barrier.release();
+        writer
+            .await
+            .expect("conditional writer task should finish")
+            .expect("matching conditional replace should commit");
+        assert!(
+            set_disks
+                .local_lock_manager_for_test()
+                .get_lock_info(&ObjectKey::new(bucket, object))
+                .is_none(),
+            "conditional replace should release the object lock after commit"
+        );
+        let contender = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("contender namespace lock should be created");
+        let contender_guard = contender
+            .get_write_lock(std::time::Duration::from_secs(30))
+            .await
+            .expect("contender should acquire after conditional replace commits");
+        drop(contender_guard);
+
+        let mut stale_reader = PutObjReader::from_vec(b"stale config".to_vec());
+        let err = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut stale_reader,
+                &ObjectOptions {
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_match: Some(initial_etag),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the old ETag must fail after the fenced replacement commits");
+        assert_eq!(err, StorageError::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn repeated_body_write_keeps_etag_but_changes_data_dir_generation() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-write-generation";
+        let object = "config/write-generation.json";
+        let body = b"identical config body".to_vec();
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut first_reader = PutObjReader::from_vec(body.clone());
+        let first = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut first_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first config body should be written");
+        let mut second_reader = PutObjReader::from_vec(body);
+        let second = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut second_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("identical config body should be rewritten");
+
+        assert_eq!(first.etag, second.etag, "content ETag should expose the ABA collision");
+        assert_ne!(first.data_dir, second.data_dir, "each committed body write needs a unique generation");
+        assert!(first.data_dir.is_some() && second.data_dir.is_some());
+    }
+
+    #[tokio::test]
+    async fn conditional_create_holds_object_lock_through_rename() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-conditional-create-fence";
+        let object = "config/conditional-create.json";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let writer_store = set_disks.clone();
+        let writer = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"created config".to_vec());
+            writer_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("conditional create should reach the rename barrier");
+        assert_exclusive_object_lock_held(&set_disks, bucket, object);
+        barrier.release();
+        writer
+            .await
+            .expect("conditional writer task should finish")
+            .expect("first conditional create should commit");
+        assert!(
+            set_disks
+                .local_lock_manager_for_test()
+                .get_lock_info(&ObjectKey::new(bucket, object))
+                .is_none(),
+            "conditional create should release the object lock after commit"
+        );
+        let contender = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("contender namespace lock should be created");
+        let contender_guard = contender
+            .get_write_lock(std::time::Duration::from_secs(30))
+            .await
+            .expect("contender should acquire after conditional create commits");
+        drop(contender_guard);
+
+        let mut duplicate_reader = PutObjReader::from_vec(b"duplicate config".to_vec());
+        let err = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut duplicate_reader,
+                &ObjectOptions {
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a second create-only write must not replace the committed config");
+        assert_eq!(err, StorageError::PreconditionFailed);
     }
 
     #[tokio::test]

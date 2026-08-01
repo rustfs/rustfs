@@ -131,6 +131,10 @@ pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 /// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
+/// Environment variable identifying this server's host in distributed endpoint
+/// lists without relying on DNS locality discovery.
+pub const ENV_LOCAL_ENDPOINT_HOST: &str = "RUSTFS_LOCAL_ENDPOINT_HOST";
+
 /// Environment variable to explicitly bypass local physical disk independence checks.
 pub const ENV_UNSAFE_BYPASS_DISK_CHECK: &str = "RUSTFS_UNSAFE_BYPASS_DISK_CHECK";
 

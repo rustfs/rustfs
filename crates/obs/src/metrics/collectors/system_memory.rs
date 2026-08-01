@@ -25,11 +25,14 @@
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::system_memory::*;
 use crate::metrics::schema::system_process::{PROCESS_RESIDENT_MEMORY_BYTES_MD, PROCESS_VIRTUAL_MEMORY_BYTES_MD};
+use crate::node_identity::SERVER_LABEL;
 use std::borrow::Cow;
 
 /// System memory statistics.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStats {
+    /// Stable local node identity for labeling node-local memory metrics
+    pub server: String,
     /// Total memory in bytes
     pub total: u64,
     /// Used memory in bytes
@@ -64,15 +67,24 @@ pub struct ProcessMemoryStats {
 /// Uses the metric descriptors from `metrics_type::system_memory` module.
 /// Returns a vector of Prometheus metrics for memory statistics.
 pub fn collect_memory_metrics(stats: &MemoryStats) -> Vec<PrometheusMetric> {
+    let server_label = stats.server.as_str();
     vec![
-        PrometheusMetric::from_descriptor(&MEM_TOTAL_MD, stats.total as f64),
-        PrometheusMetric::from_descriptor(&MEM_USED_MD, stats.used as f64),
-        PrometheusMetric::from_descriptor(&MEM_USED_PERC_MD, stats.used_perc),
-        PrometheusMetric::from_descriptor(&MEM_FREE_MD, stats.free as f64),
-        PrometheusMetric::from_descriptor(&MEM_BUFFERS_MD, stats.buffers as f64),
-        PrometheusMetric::from_descriptor(&MEM_CACHE_MD, stats.cache as f64),
-        PrometheusMetric::from_descriptor(&MEM_SHARED_MD, stats.shared as f64),
-        PrometheusMetric::from_descriptor(&MEM_AVAILABLE_MD, stats.available as f64),
+        PrometheusMetric::from_descriptor(&MEM_TOTAL_MD, stats.total as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_USED_MD, stats.used as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_USED_PERC_MD, stats.used_perc)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_FREE_MD, stats.free as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_BUFFERS_MD, stats.buffers as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_CACHE_MD, stats.cache as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_SHARED_MD, stats.shared as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&MEM_AVAILABLE_MD, stats.available as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
     ]
 }
 
@@ -104,10 +116,12 @@ pub fn collect_process_memory_metrics(
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 
     #[test]
     fn test_collect_memory_metrics() {
         let stats = MemoryStats {
+            server: "node1:9000".to_string(),
             total: 16 * 1024 * 1024 * 1024, // 16 GB
             used: 8 * 1024 * 1024 * 1024,   // 8 GB
             used_perc: 50.0,
@@ -123,6 +137,11 @@ mod tests {
 
         assert_eq!(metrics.len(), 8);
         assert!(metrics.iter().all(|m| m.name.starts_with("rustfs_system_memory_")));
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"))
+        );
     }
 
     #[test]
@@ -133,7 +152,9 @@ mod tests {
         assert_eq!(metrics.len(), 8);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
-            assert!(metric.labels.is_empty());
+            assert_eq!(metric.labels.len(), 1);
+            assert_eq!(metric.labels[0].0, SERVER_LABEL);
+            assert!(metric.labels[0].1.is_empty());
         }
     }
 
@@ -157,13 +178,18 @@ mod tests {
             virtual_mem: 1024 * 1024 * 1024,
         };
 
-        let labels = vec![("process_pid", Cow::Borrowed("12345"))];
+        let labels = vec![
+            (SERVER_LABEL, Cow::Borrowed("node1:9000")),
+            (PROCESS_PID_LABEL, Cow::Borrowed("12345")),
+            (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Borrowed("rustfs")),
+        ];
 
         let metrics = collect_process_memory_metrics(&stats, Some(&labels));
         assert_eq!(metrics.len(), 2);
 
         for metric in &metrics {
-            assert_eq!(metric.labels.len(), 1);
+            assert_eq!(metric.labels.len(), 3);
+            assert!(metric.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"));
         }
     }
 }

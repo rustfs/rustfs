@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum FormatMetaVersion {
     #[serde(rename = "1")]
     V1,
@@ -27,7 +27,7 @@ pub enum FormatMetaVersion {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum FormatBackend {
     #[serde(rename = "xl")]
     Erasure,
@@ -64,7 +64,7 @@ pub struct FormatErasureV3 {
     pub distribution_algo: DistributionAlgoVersion,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum FormatErasureVersion {
     #[serde(rename = "1")]
     V1,
@@ -77,7 +77,7 @@ pub enum FormatErasureVersion {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum DistributionAlgoVersion {
     #[serde(rename = "CRCMOD")]
     V1,
@@ -120,6 +120,15 @@ pub struct FormatV3 {
     #[serde(skip)]
     pub disk_info: Option<DiskInfo>,
 }
+
+pub(crate) type SharedFormatIdentity<'a> = (
+    &'a FormatMetaVersion,
+    &'a FormatBackend,
+    &'a Uuid,
+    &'a FormatErasureVersion,
+    &'a [Vec<Uuid>],
+    &'a DistributionAlgoVersion,
+);
 
 impl TryFrom<&[u8]> for FormatV3 {
     type Error = JsonError;
@@ -198,52 +207,24 @@ impl FormatV3 {
     }
 
     pub fn check_other(&self, other: &FormatV3) -> Result<()> {
-        let mut tmp = other.clone();
-        let this = tmp.erasure.this;
-        tmp.erasure.this = Uuid::nil();
-
-        if self.erasure.sets.len() != other.erasure.sets.len() {
-            return Err(Error::other(format!(
-                "Expected number of sets {}, got {}",
-                self.erasure.sets.len(),
-                other.erasure.sets.len()
-            )));
+        if self.shared_identity() != other.shared_identity() {
+            return Err(Error::other("storage formats do not match"));
         }
 
-        for i in 0..self.erasure.sets.len() {
-            if self.erasure.sets[i].len() != other.erasure.sets[i].len() {
-                return Err(Error::other(format!(
-                    "Each set should be of same size, expected {}, got {}",
-                    self.erasure.sets[i].len(),
-                    other.erasure.sets[i].len()
-                )));
-            }
+        self.find_disk_index_by_disk_id(other.erasure.this).map(|_| ())
+    }
 
-            for j in 0..self.erasure.sets[i].len() {
-                if self.erasure.sets[i][j] != other.erasure.sets[i][j] {
-                    return Err(Error::other(format!(
-                        "UUID on positions {}:{} do not match with, expected {:?} got {:?}: (%w)",
-                        i,
-                        j,
-                        self.erasure.sets[i][j].to_string(),
-                        other.erasure.sets[i][j].to_string(),
-                    )));
-                }
-            }
-        }
-
-        for i in 0..tmp.erasure.sets.len() {
-            for j in 0..tmp.erasure.sets[i].len() {
-                if this == tmp.erasure.sets[i][j] {
-                    return Ok(());
-                }
-            }
-        }
-
-        Err(Error::other(format!(
-            "DriveID {:?} not found in any drive sets {:?}",
-            this, other.erasure.sets
-        )))
+    /// Fields that must agree across every disk in one erasure format,
+    /// excluding the disk-specific `this` UUID and runtime-only `disk_info`.
+    pub(crate) fn shared_identity(&self) -> SharedFormatIdentity<'_> {
+        (
+            &self.version,
+            &self.format,
+            &self.id,
+            &self.erasure.version,
+            &self.erasure.sets,
+            &self.erasure.distribution_algo,
+        )
     }
 }
 
@@ -435,6 +416,30 @@ mod test {
 
         let result = format1.check_other(&format2);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_other_rejects_shared_identity_mismatches() {
+        type FormatMutation = (&'static str, fn(&mut FormatV3));
+
+        let format = FormatV3::new(1, 2);
+        let mutations: [FormatMutation; 5] = [
+            ("meta version", |other| other.version = FormatMetaVersion::Unknown),
+            ("backend", |other| other.format = FormatBackend::ErasureSingle),
+            ("deployment id", |other| other.id = Uuid::new_v4()),
+            ("erasure version", |other| other.erasure.version = FormatErasureVersion::V2),
+            ("distribution algorithm", |other| {
+                other.erasure.distribution_algo = DistributionAlgoVersion::V2
+            }),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut other = format.clone();
+            other.erasure.this = format.erasure.sets[0][0];
+            mutate(&mut other);
+
+            assert!(format.check_other(&other).is_err(), "{field} mismatch must be rejected");
+        }
     }
 
     #[test]

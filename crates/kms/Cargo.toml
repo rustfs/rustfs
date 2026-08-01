@@ -28,6 +28,7 @@ categories = ["cryptography", "web-programming", "authentication"]
 workspace = true
 
 [dependencies]
+hotpath.workspace = true
 # Core dependencies
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
@@ -37,6 +38,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# Operation metrics emitted by the retry policy engine (crate::policy).
+metrics = { workspace = true }
 
 # Cryptography
 aes-gcm = { workspace = true, features = ["rand_core"] }
@@ -65,11 +68,34 @@ rustfs-security-governance = { workspace = true }
 # HTTP client for Vault
 reqwest = { workspace = true }
 vaultrs = { workspace = true }
+# vaultrs surfaces transport-level failures as wrapped rustify errors; the
+# operation policy needs the concrete type to classify them for retry decisions.
+rustify = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
+# Debugging recorder for asserting emitted metrics in tests.
+metrics-util = { version = "0.20", features = ["debugging"] }
 insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
+# "net" backs the scripted loopback Vault used by the policy wiring tests.
+tokio = { workspace = true, features = ["net", "test-util"] }
 
 [features]
 default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/reqwest-0-13",
+    "rustfs-security-governance/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-security-governance/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-security-governance/hotpath-cpu", "rustfs-utils/hotpath-cpu"]

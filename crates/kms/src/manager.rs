@@ -66,16 +66,19 @@ impl KmsManager {
     }
 
     /// Encrypt data with a master key
+    #[hotpath::measure]
     pub async fn encrypt(&self, request: EncryptRequest) -> Result<EncryptResponse> {
         self.backend.encrypt(request).await
     }
 
     /// Decrypt data with a master key
+    #[hotpath::measure]
     pub async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         self.backend.decrypt(request).await
     }
 
     /// Generate a data encryption key
+    #[hotpath::measure]
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
         self.backend.generate_data_key(request).await
     }
@@ -155,9 +158,50 @@ impl KmsManager {
         Ok(response)
     }
 
+    /// Enable a disabled key
+    pub async fn enable_key(&self, key_id: &str) -> Result<()> {
+        self.backend.enable_key(key_id).await?;
+        self.invalidate_cached_metadata(key_id).await;
+        Ok(())
+    }
+
+    /// Disable a key; existing data remains decryptable
+    pub async fn disable_key(&self, key_id: &str) -> Result<()> {
+        self.backend.disable_key(key_id).await?;
+        self.invalidate_cached_metadata(key_id).await;
+        Ok(())
+    }
+
+    /// Rotate a key to a new version
+    pub async fn rotate_key(&self, key_id: &str) -> Result<()> {
+        self.backend.rotate_key(key_id).await?;
+        self.invalidate_cached_metadata(key_id).await;
+        Ok(())
+    }
+
+    /// Drop cached metadata after a state mutation so the next describe
+    /// observes backend truth instead of the pre-mutation snapshot.
+    async fn invalidate_cached_metadata(&self, key_id: &str) {
+        if self.enable_cache {
+            let mut cache = self.cache.write().await;
+            cache.remove_key_metadata(key_id).await;
+        }
+    }
+
     /// Perform health check on the KMS backend
     pub async fn health_check(&self) -> Result<bool> {
         self.backend.health_check().await
+    }
+
+    /// Report the capabilities of the configured backend
+    pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
+        self.backend.capabilities()
+    }
+
+    /// Direct handle to the configured backend, bypassing the metadata cache.
+    /// Used by background maintenance that must observe fresh state.
+    pub(crate) fn backend(&self) -> Arc<dyn KmsBackend> {
+        self.backend.clone()
     }
 }
 
@@ -217,6 +261,52 @@ mod tests {
         // Test health check
         let health = manager.health_check().await.expect("Health check failed");
         assert!(health);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_round_trip_invalidates_cached_metadata() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
+        let manager = KmsManager::new(backend, config);
+
+        let key_id = manager
+            .create_key(CreateKeyRequest {
+                key_name: Some("lifecycle-round-trip".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create key")
+            .key_id;
+
+        let describe = |key_id: String| {
+            let manager = manager.clone();
+            async move {
+                manager
+                    .describe_key(DescribeKeyRequest { key_id })
+                    .await
+                    .expect("describe should succeed")
+                    .key_metadata
+                    .key_state
+            }
+        };
+
+        // Warm the metadata cache, then flip states; each describe must see
+        // the post-mutation state, proving the cache entry was dropped.
+        assert_eq!(describe(key_id.clone()).await, KeyState::Enabled);
+        manager.disable_key(&key_id).await.expect("disable should succeed");
+        assert_eq!(describe(key_id.clone()).await, KeyState::Disabled);
+        manager.enable_key(&key_id).await.expect("enable should succeed");
+        assert_eq!(describe(key_id.clone()).await, KeyState::Enabled);
+
+        // The local backend does not retain version history, so rotation is
+        // reported as a capability gap rather than a missing key.
+        let error = manager.rotate_key(&key_id).await.expect_err("local rotate must be rejected");
+        assert!(
+            matches!(error, crate::error::KmsError::UnsupportedCapability { .. }),
+            "expected UnsupportedCapability, got {error:?}"
+        );
     }
 
     #[tokio::test]

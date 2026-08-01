@@ -579,8 +579,26 @@ pub struct BucketMetadataSys {
     /// Serializes metadata-map commits and their derived cache updates for one
     /// bucket. Namespace locks, when present, are acquired before this lock.
     metadata_publish_locks: Arc<MetadataPublishLockRegistry>,
+    /// Deduplicates concurrent lazy loads of one bucket's metadata, so N
+    /// simultaneous cache misses issue a single disk read instead of N.
+    ///
+    /// This is the `singleflight` that upstream applies to its own lazy
+    /// `GetConfig`. Without it the namespace *read* lock the load holds is no
+    /// help: read locks are shared, so it excludes concurrent config writers
+    /// but not concurrent readers, and every caller still pays a full
+    /// erasure-set metadata fanout. A separate registry from
+    /// `metadata_publish_locks`, reusing the same per-bucket lock machinery.
+    ///
+    /// Lock order: this lock, then the namespace lock, then the publish lock,
+    /// then the metadata map. It is only ever taken as the first of those, so
+    /// it cannot invert against a path that already holds one of the others.
+    lazy_load_locks: Arc<MetadataPublishLockRegistry>,
     #[cfg(test)]
     lazy_load_lock_probe: std::sync::atomic::AtomicBool,
+    /// Counts disk loads taken by the lazy `get_config` path, so a test can
+    /// prove concurrent misses collapse into one.
+    #[cfg(test)]
+    lazy_disk_loads: std::sync::atomic::AtomicUsize,
     /// Buckets recently observed to have no persisted metadata. Serving the
     /// fabricated default from here (instead of re-reading disk) keeps the
     /// per-request cost of repeated lookups for such names bounded — without
@@ -599,8 +617,13 @@ impl BucketMetadataSys {
             metadata_publish_locks: Arc::new(MetadataPublishLockRegistry {
                 locks: StdMutex::new(HashMap::new()),
             }),
+            lazy_load_locks: Arc::new(MetadataPublishLockRegistry {
+                locks: StdMutex::new(HashMap::new()),
+            }),
             #[cfg(test)]
             lazy_load_lock_probe: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            lazy_disk_loads: std::sync::atomic::AtomicUsize::new(0),
             absent_metadata: moka::future::Cache::builder()
                 .max_capacity(ABSENT_BUCKET_METADATA_MAX_ENTRIES)
                 .time_to_live(ABSENT_BUCKET_METADATA_TTL)
@@ -615,16 +638,22 @@ impl BucketMetadataSys {
     }
 
     fn metadata_publish_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
-        let mut locks = self
-            .metadata_publish_locks
-            .locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::bucket_lock_in(&self.metadata_publish_locks, bucket)
+    }
+
+    /// Per-bucket gate for the lazy `get_config` disk load. See
+    /// [`Self::lazy_load_locks`].
+    fn lazy_load_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
+        Self::bucket_lock_in(&self.lazy_load_locks, bucket)
+    }
+
+    fn bucket_lock_in(registry: &Arc<MetadataPublishLockRegistry>, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
+        let mut locks = registry.locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         locks.get(bucket).and_then(Weak::upgrade).unwrap_or_else(|| {
             let lock = Arc::new_cyclic(|lock| {
                 Mutex::new(MetadataPublishLockState {
                     bucket: bucket.to_string(),
-                    registry: Arc::downgrade(&self.metadata_publish_locks),
+                    registry: Arc::downgrade(registry),
                     lock: lock.clone(),
                 })
             });
@@ -1079,6 +1108,27 @@ impl BucketMetadataSys {
                 return Ok((Arc::new(bm), true));
             }
 
+            // Collapse concurrent misses for this bucket into one disk load.
+            // Taken before the namespace lock — see `lazy_load_locks` for the
+            // ordering rule.
+            let load_lock = self.lazy_load_lock(bucket);
+            let _load_guard = load_lock.lock_owned().await;
+
+            // Re-check both caches: whoever held the gate before us may have
+            // already answered this exact question, and repeating the fanout
+            // is the whole cost this gate exists to avoid.
+            if let Some(bm) = self.metadata_map.read().await.get(bucket).cloned() {
+                return Ok((bm, true));
+            }
+            if self.absent_metadata.get(bucket).await.is_some() {
+                let mut bm = BucketMetadata::new(bucket);
+                bm.default_timestamps();
+                return Ok((Arc::new(bm), true));
+            }
+
+            #[cfg(test)]
+            self.lazy_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             let lock = self.api.new_ns_lock(bucket, bucket).await?;
             let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
             #[cfg(test)]
@@ -1430,6 +1480,43 @@ mod tests {
     use crate::bucket::target::{BucketTarget, BucketTargetType, Credentials};
     use serial_test::serial;
     use tokio::time::timeout;
+
+    /// Concurrent cache misses for one bucket must collapse into a single disk
+    /// load.
+    ///
+    /// The namespace read lock the lazy path already holds does not provide
+    /// this: read locks are shared, so it excludes concurrent config writers
+    /// but not concurrent readers. Without the dedup gate every caller pays its
+    /// own namespace-lock acquisition plus a full erasure-set metadata fanout —
+    /// and the paths that reach `get_config` are per-request, so the multiplier
+    /// is request concurrency.
+    #[tokio::test]
+    async fn concurrent_lazy_loads_of_one_bucket_issue_a_single_disk_read() {
+        use std::sync::atomic::Ordering;
+
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(BucketMetadataSys::new(ecstore));
+
+        // A name with no persisted metadata: every caller misses the map, and
+        // the absent-cache entry does not exist until the first load records it.
+        let bucket = "singleflight-bucket";
+        let waiters = 8;
+
+        let results = futures::future::join_all((0..waiters).map(|_| {
+            let sys = Arc::clone(&sys);
+            async move { sys.get_config(bucket).await.map(|(bm, _)| bm.name.clone()) }
+        }))
+        .await;
+
+        for result in results {
+            assert_eq!(result.expect("every caller must get an answer"), bucket);
+        }
+        assert_eq!(
+            sys.lazy_disk_loads.load(Ordering::Relaxed),
+            1,
+            "concurrent misses for one bucket must share a single disk load"
+        );
+    }
 
     /// Pins the fail-closed caching contract of the lazy `get_config` path
     /// and the refresh no-replace rule: fabricated defaults are returned but

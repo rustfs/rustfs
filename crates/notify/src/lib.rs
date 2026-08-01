@@ -57,7 +57,6 @@ pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
 pub use storage_api::NotifyStore;
 pub(crate) use storage_api::crate_boundary::{
-    read_existing_notify_server_config_no_lock, read_notify_server_config_without_migrate_no_lock,
-    resolve_notify_object_store_handle, save_notify_server_config_no_lock, with_notify_server_config_read_lock,
-    with_notify_server_config_write_lock,
+    read_existing_notify_server_config_no_lock, read_notify_server_config_snapshot, resolve_notify_object_store_handle,
+    save_notify_server_config_snapshot, with_notify_server_config_read_lock,
 };

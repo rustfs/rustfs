@@ -95,6 +95,7 @@ impl KeystoneClient {
     }
 
     /// Validate a Keystone token
+    #[hotpath::measure]
     pub async fn validate_token(&self, token: &str) -> Result<KeystoneToken> {
         match self.version {
             KeystoneVersion::V3 => self.validate_token_v3(token).await,
@@ -238,6 +239,7 @@ impl KeystoneClient {
     }
 
     /// Get EC2 credentials for a user
+    #[hotpath::measure]
     pub async fn get_ec2_credentials(&self, user_id: &str, project_id: Option<&str>) -> Result<Vec<EC2Credential>> {
         let admin_token = self.get_admin_token().await?;
 

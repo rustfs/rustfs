@@ -90,6 +90,53 @@ pub enum KmsError {
     /// Encryption context mismatch
     #[error("Encryption context mismatch: {message}")]
     ContextMismatch { message: String },
+
+    /// Backend operation exceeded its per-attempt timeout or total deadline
+    #[error("Operation timed out: {message}")]
+    OperationTimedOut { message: String },
+
+    /// Backend operation aborted by cancellation or shutdown
+    #[error("Operation cancelled: {message}")]
+    OperationCancelled { message: String },
+
+    // New variants must be appended below (never inserted above) so that
+    // concurrent additions rebase without conflicts.
+    /// Persisted key material is absent from an otherwise readable key record
+    #[error(
+        "Key material missing for key {key_id}: the stored record has no key material; restore it from backup or repair the key explicitly"
+    )]
+    MaterialMissing { key_id: String },
+
+    /// Persisted key material exists but cannot be decoded
+    #[error("Key material corrupt for key {key_id}: {message}")]
+    MaterialCorrupt { key_id: String, message: String },
+
+    /// Persisted key material failed authenticated decryption
+    #[error(
+        "Key material authentication failed for key {key_id}: the stored material cannot be decrypted with the configured master key"
+    )]
+    MaterialAuthenticationFailed { key_id: String },
+
+    /// Persisted key record uses a format version unknown to this build
+    #[error("Unsupported key format version {version:?} for key {key_id}")]
+    UnsupportedFormatVersion { key_id: String, version: String },
+
+    /// Requested master key version has no persisted material for the key
+    #[error("Key version {version} not found for key {key_id}")]
+    KeyVersionNotFound { key_id: String, version: u32 },
+
+    /// Backup/restore bundle contract violation; see [`crate::backup::BackupError`]
+    #[error(transparent)]
+    Backup(#[from] crate::backup::BackupError),
+
+    /// Operation is not supported by the active KMS backend
+    #[error("Operation '{operation}' is not supported by KMS backend '{backend}'")]
+    UnsupportedCapability { backend: String, operation: String },
+
+    /// Backend credentials expired or could not be refreshed in time; requests
+    /// fail closed instead of being sent with credentials that may lapse mid-flight
+    #[error("KMS credentials unavailable: {message}")]
+    CredentialsUnavailable { message: String },
 }
 
 impl KmsError {
@@ -186,6 +233,63 @@ impl KmsError {
     /// Create an encryption context mismatch error
     pub fn context_mismatch<S: Into<String>>(message: S) -> Self {
         Self::ContextMismatch { message: message.into() }
+    }
+
+    /// Create an operation timed out error
+    pub fn operation_timed_out<S: Into<String>>(message: S) -> Self {
+        Self::OperationTimedOut { message: message.into() }
+    }
+
+    /// Create an operation cancelled error
+    pub fn operation_cancelled<S: Into<String>>(message: S) -> Self {
+        Self::OperationCancelled { message: message.into() }
+    }
+
+    /// Create a material missing error
+    pub fn material_missing<S: Into<String>>(key_id: S) -> Self {
+        Self::MaterialMissing { key_id: key_id.into() }
+    }
+
+    /// Create a material corrupt error
+    pub fn material_corrupt<S1: Into<String>, S2: Into<String>>(key_id: S1, message: S2) -> Self {
+        Self::MaterialCorrupt {
+            key_id: key_id.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Create a material authentication failed error
+    pub fn material_authentication_failed<S: Into<String>>(key_id: S) -> Self {
+        Self::MaterialAuthenticationFailed { key_id: key_id.into() }
+    }
+
+    /// Create an unsupported format version error
+    pub fn unsupported_format_version<S1: Into<String>, S2: Into<String>>(key_id: S1, version: S2) -> Self {
+        Self::UnsupportedFormatVersion {
+            key_id: key_id.into(),
+            version: version.into(),
+        }
+    }
+
+    /// Create a key version not found error
+    pub fn key_version_not_found<S: Into<String>>(key_id: S, version: u32) -> Self {
+        Self::KeyVersionNotFound {
+            key_id: key_id.into(),
+            version,
+        }
+    }
+
+    /// Create an unsupported capability error
+    pub fn unsupported_capability<S1: Into<String>, S2: Into<String>>(backend: S1, operation: S2) -> Self {
+        Self::UnsupportedCapability {
+            backend: backend.into(),
+            operation: operation.into(),
+        }
+    }
+
+    /// Create a credentials unavailable error
+    pub fn credentials_unavailable<S: Into<String>>(message: S) -> Self {
+        Self::CredentialsUnavailable { message: message.into() }
     }
 }
 

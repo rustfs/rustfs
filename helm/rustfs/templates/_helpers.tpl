@@ -322,21 +322,23 @@ Render RUSTFS_SERVER_DOMAINS
 {{- join "," $domains -}}
 {{- end -}}
 
-{{/* Render probe command for liveness and readiness
+{{/* Render an mTLS probe command
 */}}
 
 {{- define "rustfs.probeCommand" -}}
-{{- $endpoint_port := .Values.service.endpoint.port | default 9000 -}}
-{{- $console_port := .Values.service.console.port | default 9001 -}}
+{{- $root := .root -}}
+{{- $endpointPath := .endpointPath -}}
+{{- $endpoint_port := $root.Values.service.endpoint.port | default 9000 -}}
+{{- $console_port := $root.Values.service.console.port | default 9001 -}}
 {{- $args := "-skf" -}}
 
-{{- if and .Values.mtls.enabled -}}
-  {{- $args = printf "%s --cert %s --key %s" $args .Values.mtls.clientCertPath .Values.mtls.clientKeyPath -}}
+{{- if and $root.Values.mtls.enabled -}}
+  {{- $args = printf "%s --cert %s --key %s" $args $root.Values.mtls.clientCertPath $root.Values.mtls.clientKeyPath -}}
 {{- end -}}
 - /bin/sh
 - -c
 - |
-  curl {{ $args }} https://127.0.0.1:{{ $endpoint_port }}/health/ready && \
+  curl {{ $args }} https://127.0.0.1:{{ $endpoint_port }}{{ $endpointPath }} && \
   curl {{ $args }} https://127.0.0.1:{{ $console_port }}/rustfs/console/health
 {{- end -}}
 
@@ -350,7 +352,7 @@ livenessProbe:
   {{- if .Values.mtls.enabled }}
   exec:
     command:
-{{ include "rustfs.probeCommand" . | nindent 6 }}
+{{ include "rustfs.probeCommand" (dict "root" . "endpointPath" "/health") | nindent 6 }}
   {{- else }}
   httpGet:
     path: /health
@@ -369,7 +371,7 @@ readinessProbe:
   {{- if .Values.mtls.enabled }}
   exec:
     command:
-{{ include "rustfs.probeCommand" . | nindent 6 }}
+{{ include "rustfs.probeCommand" (dict "root" . "endpointPath" "/health/ready") | nindent 6 }}
   {{- else }}
   httpGet:
     path: /health/ready

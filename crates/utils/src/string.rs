@@ -360,7 +360,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         Some(caps) => caps,
         None => {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
+                "Invalid ellipsis format. Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     };
@@ -399,7 +399,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(CLOSE_BRACES)
         {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
+                "Invalid ellipsis format. Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     }
@@ -936,6 +936,15 @@ mod tests {
     fn test_find_ellipses_patterns_error_mentions_hex_ranges() {
         let err = find_ellipses_patterns("{1..64}").unwrap_err();
         assert!(err.to_string().contains("decimal or hexadecimal"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn test_find_ellipses_patterns_leftover_brace_error_does_not_echo_input() {
+        let err = find_ellipses_patterns("http://:brace-secret@server/{1...2}}").unwrap_err();
+        assert!(
+            !err.to_string().contains("brace-secret"),
+            "ellipsis error leaked endpoint credentials: {err}"
+        );
     }
 
     #[test]

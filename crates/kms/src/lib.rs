@@ -20,7 +20,7 @@
 //!
 //! ## Features
 //!
-//! - **Multiple Backends**: Local file storage, Vault KV2+Transit, and Vault Transit (optional)
+//! - **Multiple Backends**: Local file storage, Vault KV2 (plain KV storage), and Vault Transit (optional)
 //! - **Object Encryption**: Transparent S3-compatible object encryption
 //! - **Streaming Encryption**: Memory-efficient encryption for large files
 //! - **Key Management**: Full lifecycle management of encryption keys
@@ -66,11 +66,14 @@
 // Core modules
 pub mod api_types;
 pub mod backends;
+pub mod backup;
 mod cache;
 pub mod config;
+pub mod deletion_worker;
 mod encryption;
 mod error;
 pub mod manager;
+mod policy;
 pub mod service;
 pub mod service_manager;
 mod time_serde;
@@ -84,12 +87,13 @@ pub use api_types::{
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
+pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{
-    KmsServiceManager, KmsServiceStatus, get_global_encryption_service, get_global_kms_service_manager,
+    KmsServiceManager, KmsServiceStatus, KmsStartOutcome, get_global_encryption_service, get_global_kms_service_manager,
     init_global_kms_service_manager,
 };
 pub use types::*;

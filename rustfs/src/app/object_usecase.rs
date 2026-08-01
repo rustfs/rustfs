@@ -6072,19 +6072,6 @@ impl DefaultObjectUsecase {
                 ));
             }
         };
-        let has_replacement_metadata = metadata.is_some()
-            || cache_control.is_some()
-            || content_disposition.is_some()
-            || content_encoding.is_some()
-            || content_language.is_some()
-            || content_type.is_some()
-            || expires.is_some();
-        if has_replacement_metadata && !replaces_metadata {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                "Replacement metadata requires the REPLACE metadata directive".to_string(),
-            ));
-        }
         let replacement_metadata = if replaces_metadata {
             validate_archive_content_encoding(&key, content_type.as_deref(), content_encoding.as_deref())?;
             let mut replacement_metadata = metadata.unwrap_or_default();

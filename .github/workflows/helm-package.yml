@@ -33,11 +33,12 @@ jobs:
   build-helm-package:
     runs-on: ubuntu-latest
     if: |
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && !contains(github.event.inputs.version, '-preview')) ||
       (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
-        contains(github.event.workflow_run.head_branch, '.')
+        contains(github.event.workflow_run.head_branch, '.') &&
+        !contains(github.event.workflow_run.head_branch, '-preview')
       )
 
     outputs:

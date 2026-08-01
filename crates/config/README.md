@@ -66,6 +66,10 @@ Current guidance:
 
 - `RUSTFS_BROWSER_REDIRECT_URL` sets the externally reachable browser origin used for OIDC callback, console success redirect, and logout fallback URLs. Configure it to the public scheme and authority without a path, for example `https://console.example.com`. In load-balancer deployments, keep OIDC authorize and callback requests on the same backend node because the in-flight OIDC `state` is local to the RustFS node.
 
+## Distributed endpoint locality
+
+- `RUSTFS_LOCAL_ENDPOINT_HOST` identifies this server's host in a distributed `RUSTFS_VOLUMES` topology without resolving every peer during startup. Set it to exactly one host, without a scheme, port, or path. It is accepted only for orchestrated URL topologies and must match at least one endpoint on the RustFS server port; invalid or unmatched values fail startup. Leave it unset to retain DNS-based locality discovery.
+
 ## Scanner environment aliases
 
 - `RUSTFS_SCANNER_SPEED` (canonical, also accepts `MINIO_SCANNER_SPEED`)

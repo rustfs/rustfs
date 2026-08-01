@@ -23,10 +23,13 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::system_network::*;
+use crate::node_identity::SERVER_LABEL;
 
 /// Network statistics for internode communication.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkStats {
+    /// Stable local node identity for labeling node-local internode metrics
+    pub server: String,
     /// Total number of failed internode calls
     pub internode_errors_total: u64,
     /// Total number of TCP dial timeouts and errors
@@ -44,12 +47,18 @@ pub struct NetworkStats {
 /// Uses the metric descriptors from `metrics_type::system_network` module.
 /// Returns a vector of Prometheus metrics for network statistics.
 pub fn collect_network_metrics(stats: &NetworkStats) -> Vec<PrometheusMetric> {
+    let server_label = stats.server.as_str();
     vec![
-        PrometheusMetric::from_descriptor(&INTERNODE_ERRORS_TOTAL_MD, stats.internode_errors_total as f64),
-        PrometheusMetric::from_descriptor(&INTERNODE_DIAL_ERRORS_TOTAL_MD, stats.internode_dial_errors_total as f64),
-        PrometheusMetric::from_descriptor(&INTERNODE_DIAL_AVG_TIME_NANOS_MD, stats.internode_dial_avg_time_nanos as f64),
-        PrometheusMetric::from_descriptor(&INTERNODE_SENT_BYTES_TOTAL_MD, stats.internode_sent_bytes_total as f64),
-        PrometheusMetric::from_descriptor(&INTERNODE_RECV_BYTES_TOTAL_MD, stats.internode_recv_bytes_total as f64),
+        PrometheusMetric::from_descriptor(&INTERNODE_ERRORS_TOTAL_MD, stats.internode_errors_total as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&INTERNODE_DIAL_ERRORS_TOTAL_MD, stats.internode_dial_errors_total as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&INTERNODE_DIAL_AVG_TIME_NANOS_MD, stats.internode_dial_avg_time_nanos as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&INTERNODE_SENT_BYTES_TOTAL_MD, stats.internode_sent_bytes_total as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        PrometheusMetric::from_descriptor(&INTERNODE_RECV_BYTES_TOTAL_MD, stats.internode_recv_bytes_total as f64)
+            .with_label_owned(SERVER_LABEL, server_label.to_string()),
     ]
 }
 
@@ -61,6 +70,7 @@ mod tests {
     #[test]
     fn test_collect_network_metrics() {
         let stats = NetworkStats {
+            server: "node1:9000".to_string(),
             internode_errors_total: 10,
             internode_dial_errors_total: 5,
             internode_dial_avg_time_nanos: 1_500_000,      // 1.5ms
@@ -73,6 +83,11 @@ mod tests {
 
         assert_eq!(metrics.len(), 5);
         assert!(metrics.iter().all(|m| m.name.contains("internode")));
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.labels.iter().any(|(k, v)| *k == SERVER_LABEL && v == "node1:9000"))
+        );
     }
 
     #[test]
@@ -83,7 +98,9 @@ mod tests {
         assert_eq!(metrics.len(), 5);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
-            assert!(metric.labels.is_empty());
+            assert_eq!(metric.labels.len(), 1);
+            assert_eq!(metric.labels[0].0, SERVER_LABEL);
+            assert!(metric.labels[0].1.is_empty());
         }
     }
 }
