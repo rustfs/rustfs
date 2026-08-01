@@ -553,9 +553,15 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     drop(lrg_workers);
 
                     // Queue to MRF if worker is busy.
-                    let admission =
-                        queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "large_object")
-                            .await;
+                    let admission = queue_mrf_save_admission(
+                        &self.mrf_save_tx,
+                        ri.to_mrf_entry(),
+                        &ri.bucket,
+                        &ri.name,
+                        "large_object",
+                        Some(self.stats.as_ref()),
+                    )
+                    .await;
 
                     if let Some(resize) = resize {
                         self.resize_lrg_workers(resize.new_count, resize.existing_count).await;
@@ -581,7 +587,15 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
 
         // Queue to MRF if all workers are busy.
-        let admission = queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "object").await;
+        let admission = queue_mrf_save_admission(
+            &self.mrf_save_tx,
+            ri.to_mrf_entry(),
+            &ri.bucket,
+            &ri.name,
+            "object",
+            Some(self.stats.as_ref()),
+        )
+        .await;
 
         // Try to scale up workers based on priority
         self.apply_queue_backpressure("object", true, "Replication queue is backpressured")
@@ -612,6 +626,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             &doi.bucket,
             &doi.delete_object.object_name,
             "delete",
+            Some(self.stats.as_ref()),
         )
         .await;
 
@@ -623,7 +638,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        let _ = queue_mrf_save_admission(&self.mrf_save_tx, entry, "", "", "mrf_worker").await;
+        let _ = queue_mrf_save_admission(&self.mrf_save_tx, entry, "", "", "mrf_worker", Some(self.stats.as_ref())).await;
     }
 
     /// Starts the MRF processor — one-shot at startup.
@@ -809,6 +824,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return;
         };
         let storage = self.storage.clone();
+        let stats = self.stats.clone();
 
         let handle = tokio::spawn(async move {
             // The on-disk MRF file is a restart-recovery backstop: entries are
@@ -834,6 +850,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     entry = rx.recv() => match entry {
                         Some(e) => {
                             if pending.len() >= MRF_PENDING_CAP {
+                                dec_mrf_entries(stats.as_ref(), std::slice::from_ref(&e));
                                 if !capped {
                                     capped = true;
                                     warn!(
@@ -852,20 +869,22 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             // set, not the absolute length, so a large backlog is
                             // not rewritten on every single add).
                             if pending.len() - flushed_len >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
+                                dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                                 flushed_len = pending.len();
                                 dirty = false;
                             }
                         }
                         None => {
                             // Channel closed (pool shutting down) — final flush.
-                            if dirty {
-                                flush_mrf_to_disk(&pending, &storage).await;
+                            if dirty && flush_mrf_to_disk(&pending, &storage).await {
+                                dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             }
                             break;
                         }
                     },
                     _ = interval.tick() => {
                         if dirty && flush_mrf_to_disk(&pending, &storage).await {
+                            dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             flushed_len = pending.len();
                             dirty = false;
                         }
@@ -1308,8 +1327,15 @@ async fn queue_mrf_save_admission(
     bucket: &str,
     object: &str,
     queue_type: &'static str,
+    stats: Option<&ReplicationStats>,
 ) -> ReplicationQueueAdmission {
+    let entry_bucket = entry.bucket.clone();
+    let entry_size = entry.size;
+    let entry_is_delete = matches!(entry.op, MrfOpKind::Delete);
     if tx.send(entry).await.is_ok() {
+        if let Some(stats) = stats {
+            stats.inc_q(&entry_bucket, entry_size, entry_is_delete, ReplicationType::Heal);
+        }
         return ReplicationQueueAdmission::Queued;
     }
 
@@ -1323,6 +1349,12 @@ async fn queue_mrf_save_admission(
         "MRF save channel unavailable — replication failure entry could not be persisted for retry"
     );
     ReplicationQueueAdmission::Missed
+}
+
+fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
+    for entry in entries {
+        stats.dec_q(&entry.bucket, entry.size, matches!(entry.op, MrfOpKind::Delete), ReplicationType::Heal);
+    }
 }
 
 /// Encodes `entries` and overwrites the MRF persistence file.
@@ -2399,7 +2431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_replica_task_rolls_back_runtime_backlog_when_worker_queue_is_full() {
+    async fn queue_replica_task_counts_mrf_pending_backlog_when_worker_queue_is_full() {
         let shared = empty_resync_shared_state();
         let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared))).await;
         let (tx, _rx) = mpsc::channel(1);
@@ -2425,8 +2457,8 @@ mod tests {
 
         assert_eq!(admission, ReplicationQueueAdmission::Queued);
         let queued = pool.stats.get_latest_replication_stats("runtime-backlog").await;
-        assert_eq!(queued.replication_stats.q_stat.curr.count, 0);
-        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 0);
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 2048);
     }
 
     #[test]
@@ -2470,7 +2502,7 @@ mod tests {
 
         tx.try_send(first).expect("first MRF entry should fill the test channel");
 
-        let admission = queue_mrf_save_admission(&tx, second, "bucket", "second", "test");
+        let admission = queue_mrf_save_admission(&tx, second, "bucket", "second", "test", None);
         tokio::pin!(admission);
 
         assert!(

@@ -21,10 +21,11 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats,
-    ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats,
-    DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats,
-    ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
+    BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats,
+    BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats,
+    CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats,
+    IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats,
+    ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -223,11 +224,6 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
             resync_failed_count: stats.resync_failed_count,
             resync_canceled_count: stats.resync_canceled_count,
             resync_duration_ms: stats.resync_duration_ms,
-            current_backlog_count: stats.current_backlog_count,
-            current_backlog_bytes: stats.current_backlog_bytes,
-            durable_mrf_available: stats.durable_mrf_available,
-            durable_mrf_backlog_count: stats.durable_mrf_backlog_count,
-            durable_mrf_backlog_bytes: stats.durable_mrf_backlog_bytes,
             targets: stats
                 .targets
                 .into_iter()
@@ -240,6 +236,78 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
                 .collect(),
         })
         .collect()
+}
+
+async fn obs_bucket_replication_backlog_stats() -> Vec<BucketReplicationBacklogStats> {
+    obs_bucket_replication_stats_snapshot()
+        .await
+        .into_iter()
+        .map(|stats| BucketReplicationBacklogStats {
+            bucket: stats.bucket,
+            current_backlog_count: stats.current_backlog_count,
+            current_backlog_bytes: stats.current_backlog_bytes,
+            durable_mrf_available: stats.durable_mrf_available,
+            durable_mrf_backlog_count: stats.durable_mrf_backlog_count,
+            durable_mrf_backlog_bytes: stats.durable_mrf_backlog_bytes,
+        })
+        .collect()
+}
+
+async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, Vec<BucketReplicationBacklogStats>) {
+    let snapshots = obs_bucket_replication_stats_snapshot().await;
+    let mut detail_stats = Vec::with_capacity(snapshots.len());
+    let mut backlog_stats = Vec::with_capacity(snapshots.len());
+
+    for stats in snapshots {
+        backlog_stats.push(BucketReplicationBacklogStats {
+            bucket: stats.bucket.clone(),
+            current_backlog_count: stats.current_backlog_count,
+            current_backlog_bytes: stats.current_backlog_bytes,
+            durable_mrf_available: stats.durable_mrf_available,
+            durable_mrf_backlog_count: stats.durable_mrf_backlog_count,
+            durable_mrf_backlog_bytes: stats.durable_mrf_backlog_bytes,
+        });
+        detail_stats.push(BucketReplicationStats {
+            bucket: stats.bucket,
+            total_failed_bytes: stats.total_failed_bytes,
+            total_failed_count: stats.total_failed_count,
+            last_min_failed_bytes: stats.last_min_failed_bytes,
+            last_min_failed_count: stats.last_min_failed_count,
+            last_hour_failed_bytes: stats.last_hour_failed_bytes,
+            last_hour_failed_count: stats.last_hour_failed_count,
+            sent_bytes: stats.sent_bytes,
+            sent_count: stats.sent_count,
+            proxied_get_requests_total: stats.proxied_get_requests_total,
+            proxied_get_requests_failures: stats.proxied_get_requests_failures,
+            proxied_head_requests_total: stats.proxied_head_requests_total,
+            proxied_head_requests_failures: stats.proxied_head_requests_failures,
+            proxied_put_requests_total: stats.proxied_put_requests_total,
+            proxied_put_requests_failures: stats.proxied_put_requests_failures,
+            proxied_put_tagging_requests_total: stats.proxied_put_tagging_requests_total,
+            proxied_put_tagging_requests_failures: stats.proxied_put_tagging_requests_failures,
+            proxied_get_tagging_requests_total: stats.proxied_get_tagging_requests_total,
+            proxied_get_tagging_requests_failures: stats.proxied_get_tagging_requests_failures,
+            proxied_delete_tagging_requests_total: stats.proxied_delete_tagging_requests_total,
+            proxied_delete_tagging_requests_failures: stats.proxied_delete_tagging_requests_failures,
+            resync_started_count: stats.resync_started_count,
+            resync_completed_count: stats.resync_completed_count,
+            resync_failed_count: stats.resync_failed_count,
+            resync_canceled_count: stats.resync_canceled_count,
+            resync_duration_ms: stats.resync_duration_ms,
+            targets: stats
+                .targets
+                .into_iter()
+                .map(|target| BucketReplicationTargetStats {
+                    target_arn: target.target_arn,
+                    bandwidth_limit_bytes_per_sec: target.bandwidth_limit_bytes_per_sec,
+                    current_bandwidth_bytes_per_sec: target.current_bandwidth_bytes_per_sec,
+                    latency_ms: target.latency_ms,
+                })
+                .collect(),
+        });
+    }
+
+    (detail_stats, backlog_stats)
 }
 
 async fn obs_site_replication_stats() -> ReplicationStats {
@@ -532,6 +600,15 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
 /// Collect bucket and target level replication stats from the global replication runtime.
 pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
     obs_bucket_replication_detail_stats().await
+}
+
+pub(crate) async fn collect_bucket_replication_backlog_stats() -> Vec<BucketReplicationBacklogStats> {
+    obs_bucket_replication_backlog_stats().await
+}
+
+pub(crate) async fn collect_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, Vec<BucketReplicationBacklogStats>)
+{
+    obs_bucket_replication_stats_bundle().await
 }
 
 /// Collect site-level replication stats from the global replication runtime.

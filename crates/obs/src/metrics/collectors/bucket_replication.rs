@@ -33,7 +33,8 @@ use crate::metrics::schema::bucket_replication::{
 };
 use std::borrow::Cow;
 
-const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 30;
+const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 25;
+const BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET: usize = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct BucketReplicationTargetStats {
@@ -79,12 +80,17 @@ pub struct BucketReplicationStats {
     pub resync_failed_count: u64,
     pub resync_canceled_count: u64,
     pub resync_duration_ms: u64,
-    pub current_backlog_count: u64,
-    pub current_backlog_bytes: u64,
-    pub durable_mrf_available: bool,
-    pub durable_mrf_backlog_count: u64,
-    pub durable_mrf_backlog_bytes: u64,
     pub targets: Vec<BucketReplicationTargetStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BucketReplicationBacklogStats {
+    pub(crate) bucket: String,
+    pub(crate) current_backlog_count: u64,
+    pub(crate) current_backlog_bytes: u64,
+    pub(crate) durable_mrf_available: bool,
+    pub(crate) durable_mrf_backlog_count: u64,
+    pub(crate) durable_mrf_backlog_bytes: u64,
 }
 
 pub fn collect_bucket_replication_bandwidth_metrics(stats: &[BucketReplicationBandwidthStats]) -> Vec<PrometheusMetric> {
@@ -256,6 +262,30 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
             PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD, stat.resync_duration_ms as f64)
                 .with_label(BUCKET_L, bucket_label.clone()),
         );
+        for target in &stat.targets {
+            let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
+                    .with_label(RANGE_L, Cow::Borrowed("all"))
+                    .with_label(TARGET_ARN_L, target_label),
+            );
+        }
+    }
+
+    metrics
+}
+
+pub(crate) fn collect_bucket_replication_backlog_metrics(stats: &[BucketReplicationBacklogStats]) -> Vec<PrometheusMetric> {
+    if stats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut metrics = Vec::with_capacity(stats.len() * BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET);
+    for stat in stats {
+        let bucket_label: Cow<'static, str> = Cow::Owned(stat.bucket.clone());
+
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, stat.current_backlog_count as f64)
                 .with_label(BUCKET_L, bucket_label.clone()),
@@ -277,19 +307,8 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD, stat.durable_mrf_backlog_bytes as f64)
-                .with_label(BUCKET_L, bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label),
         );
-
-        for target in &stat.targets {
-            let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
-            metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
-                    .with_label(RANGE_L, Cow::Borrowed("all"))
-                    .with_label(TARGET_ARN_L, target_label),
-            );
-        }
     }
 
     metrics
@@ -328,11 +347,6 @@ mod tests {
             resync_failed_count: 1,
             resync_canceled_count: 0,
             resync_duration_ms: 1500,
-            current_backlog_count: 3,
-            current_backlog_bytes: 4096,
-            durable_mrf_available: true,
-            durable_mrf_backlog_count: 2,
-            durable_mrf_backlog_bytes: 2048,
             targets: vec![BucketReplicationTargetStats {
                 target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
                 bandwidth_limit_bytes_per_sec: 2048,
@@ -342,7 +356,7 @@ mod tests {
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 31);
+        assert_eq!(metrics.len(), 26);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
@@ -402,6 +416,21 @@ mod tests {
                 && metric.value == 1500.0
                 && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         }));
+    }
+
+    #[test]
+    fn test_collect_bucket_replication_backlog_metrics() {
+        let stats = vec![BucketReplicationBacklogStats {
+            bucket: "b1".to_string(),
+            current_backlog_count: 3,
+            current_backlog_bytes: 4096,
+            durable_mrf_available: true,
+            durable_mrf_backlog_count: 2,
+            durable_mrf_backlog_bytes: 2048,
+        }];
+
+        let metrics = collect_bucket_replication_backlog_metrics(&stats);
+        assert_eq!(metrics.len(), 5);
 
         let backlog_count_name = BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
@@ -448,21 +477,16 @@ mod tests {
 
     #[test]
     fn backlog_metrics_are_bucket_scoped_without_target_labels() {
-        let stats = vec![BucketReplicationStats {
+        let stats = vec![BucketReplicationBacklogStats {
             bucket: "scope-bucket".to_string(),
             current_backlog_count: 5,
             current_backlog_bytes: 8192,
             durable_mrf_available: true,
             durable_mrf_backlog_count: 2,
             durable_mrf_backlog_bytes: 4096,
-            targets: vec![BucketReplicationTargetStats {
-                target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
         }];
 
-        let metrics = collect_bucket_replication_metrics(&stats);
+        let metrics = collect_bucket_replication_backlog_metrics(&stats);
         let backlog_names = [
             BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name(),
             BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD.get_full_metric_name(),
