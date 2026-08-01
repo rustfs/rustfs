@@ -154,10 +154,7 @@ impl KeyImpactReport {
     /// [`ReferenceCompleteness::Unavailable`] here rather than at the call
     /// site, so no producer can report a partially read source as `Exact`.
     pub fn push_reference(&mut self, reference: KeyReference) {
-        if matches!(
-            reference.kind,
-            KeyReferenceKind::UnreadableSource | KeyReferenceKind::UnreadableResource
-        ) {
+        if matches!(reference.kind, KeyReferenceKind::UnreadableSource | KeyReferenceKind::UnreadableResource) {
             self.completeness = ReferenceCompleteness::Unavailable;
         }
         self.references.push(reference);
@@ -276,7 +273,12 @@ mod tests {
 
         for report in [KeyImpactReport::configuration_layer("kms-key-1"), referenced] {
             let json = serde_json::to_value(&report).expect("serialization should succeed");
-            let mut fields: Vec<&str> = json.as_object().expect("report is a JSON object").keys().map(String::as_str).collect();
+            let mut fields: Vec<&str> = json
+                .as_object()
+                .expect("report is a JSON object")
+                .keys()
+                .map(String::as_str)
+                .collect();
             fields.sort_unstable();
 
             assert_eq!(fields, vec!["completeness", "coverage", "key_id", "references"]);

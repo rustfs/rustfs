@@ -1341,7 +1341,10 @@ mod tests {
             .expect_err("immediate deletion must be refused while configuration references the key");
 
         match error {
-            KmsError::KeyStillReferenced { key_id: refused, references } => {
+            KmsError::KeyStillReferenced {
+                key_id: refused,
+                references,
+            } => {
                 assert_eq!(refused, key_id);
                 assert_eq!(references, vec!["bucket:sse-bucket".to_string()], "the caller must learn what refused it");
             }
@@ -1410,7 +1413,10 @@ mod tests {
             })
             .await
             .expect_err("an unreferenced key still needs the server-side opt-in");
-        assert!(matches!(error, KmsError::InvalidOperation { .. }), "expected InvalidOperation, got {error:?}");
+        assert!(
+            matches!(error, KmsError::InvalidOperation { .. }),
+            "expected InvalidOperation, got {error:?}"
+        );
 
         let allowed = deletion_manager(&temp_dir, true)
             .await
@@ -1423,9 +1429,39 @@ mod tests {
             })
             .await
             .expect_err("an unreferenced key still needs the key-id confirmation");
-        assert!(matches!(error, KmsError::InvalidOperation { .. }), "expected InvalidOperation, got {error:?}");
+        assert!(
+            matches!(error, KmsError::InvalidOperation { .. }),
+            "expected InvalidOperation, got {error:?}"
+        );
 
         assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    /// The refusal is the only thing the checker adds: a fully authorized
+    /// immediate deletion of a key nothing points at still goes through.
+    #[tokio::test]
+    async fn immediate_deletion_still_succeeds_when_nothing_references_the_key() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
+        let key_id = create_named_key(&manager, "unreferenced-confirmed-force-delete").await;
+
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("a confirmed immediate deletion must still be allowed when nothing references the key");
+
+        let error = manager
+            .describe_key(DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect_err("an immediately deleted key must be gone");
+        assert!(matches!(error, KmsError::KeyNotFound { .. }), "expected KeyNotFound, got {error:?}");
     }
 
     /// Scheduling stays a schedule: it destroys nothing, stays cancellable,

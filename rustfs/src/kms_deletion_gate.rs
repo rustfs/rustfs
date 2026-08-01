@@ -85,7 +85,9 @@ async fn collect_key_impact(key_id: &str, default_key_id: Option<&str>, store: O
     // racing server startup, before the object store is published.
     let Some(store) = store else {
         warn!(key_id, "KMS deletion reference check: object store not ready; blocking removal");
-        report.push_reference(unreadable_source("object store is not ready, so bucket encryption configuration could not be read"));
+        report.push_reference(unreadable_source(
+            "object store is not ready, so bucket encryption configuration could not be read",
+        ));
         return report;
     };
     let buckets = match store.list_bucket(&BucketOptions::default()).await {
@@ -205,15 +207,17 @@ mod tests {
 
     #[test]
     fn unreadable_config_blocks_deletion() {
-        let reference =
-            bucket_reference("broken", Err(StorageError::FaultyDisk), "kms-key-1").expect("an unreadable bucket must be reported");
+        let reference = bucket_reference("broken", Err(StorageError::FaultyDisk), "kms-key-1")
+            .expect("an unreadable bucket must be reported");
         assert_eq!(reference.kind, KeyReferenceKind::UnreadableResource);
         assert_eq!(reference.id, "broken");
     }
 
     /// The deletion worker's gate is the only thing standing between an
     /// expired key and destroyed material; reshaping the collection it reads
-    /// must not change a single identifier it receives.
+    /// must not change a single identifier it receives. The report is the
+    /// second reading of that same collection, so it must never look clear
+    /// where the gate objects.
     #[test]
     fn worker_reference_identifiers_are_unchanged() {
         let cases = [
@@ -225,12 +229,19 @@ mod tests {
                 bucket_reference("broken", Err(StorageError::FaultyDisk), "kms-key-1"),
                 "bucket:broken:encryption-config-unreadable",
             ),
-            (Some(unreadable_source("object store is not ready")), "bucket-encryption-config:unavailable"),
+            (
+                Some(unreadable_source("object store is not ready")),
+                "bucket-encryption-config:unavailable",
+            ),
         ];
 
         for (reference, expected) in cases {
             let reference = reference.expect("case must produce a reference");
             assert_eq!(blocking_reference(&reference), expected);
+
+            let mut report = KeyImpactReport::configuration_layer("kms-key-1");
+            report.push_reference(reference);
+            assert!(report.blocks_destruction(), "{expected} must read as blocking in the report too");
         }
     }
 

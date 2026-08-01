@@ -831,7 +831,10 @@ mod tests {
         };
 
         let json = serde_json::to_value(&response).expect("response should serialize");
-        assert_eq!(json["success"], true, "an outstanding reference must not change the outcome of a schedule");
+        assert_eq!(
+            json["success"], true,
+            "an outstanding reference must not change the outcome of a schedule"
+        );
         assert_eq!(json["impact"]["references"][0]["kind"], "bucket-default-encryption");
         assert_eq!(json["impact"]["references"][0]["id"], "sse-bucket");
     }
@@ -853,8 +856,7 @@ mod tests {
         assert_eq!(json["impact"]["completeness"], "exact");
         assert_eq!(json["impact"]["coverage"]["scanned"][0], "bucket-default-encryption");
         assert_eq!(
-            json["impact"]["coverage"]["not_scanned"][0],
-            "object-envelopes",
+            json["impact"]["coverage"]["not_scanned"][0], "object-envelopes",
             "an empty reference list is only honest next to the scopes it did not read"
         );
 
