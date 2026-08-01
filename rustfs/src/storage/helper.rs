@@ -15,6 +15,7 @@
 use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::RequestContext;
+use crate::storage::sse::KmsRequestAuditScope;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use hashbrown::HashMap;
 use http::StatusCode;
@@ -94,6 +95,9 @@ pub struct EnabledOperationHelper {
     event_builder: Option<EventArgsBuilder>,
     start_time: std::time::Instant,
     request_context: RequestContext,
+    /// Open for the lifetime of the audit entry so the SSE data path can summarise
+    /// its KMS work onto it. `None` when this request is not audited.
+    kms_audit: Option<KmsRequestAuditScope>,
 }
 
 impl OperationHelper {
@@ -220,6 +224,8 @@ impl OperationHelper {
             None
         };
 
+        let kms_audit = audit_enabled.then(|| KmsRequestAuditScope::register(&request_id));
+
         Self::Enabled(Box::new(EnabledOperationHelper {
             audit_enabled,
             notify_enabled,
@@ -228,6 +234,7 @@ impl OperationHelper {
             event_builder,
             start_time: request_context.start_time,
             request_context,
+            kms_audit,
         }))
     }
 
@@ -326,14 +333,20 @@ impl OperationHelper {
             }
 
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
-            if state.request_context.trace_id.is_some() || state.request_context.span_id.is_some() {
-                let mut tags = HashMap::new();
-                if let Some(ref tid) = state.request_context.trace_id {
-                    tags.insert("traceId".to_string(), Value::String(tid.clone()));
-                }
-                if let Some(ref sid) = state.request_context.span_id {
-                    tags.insert("spanId".to_string(), Value::String(sid.clone()));
-                }
+            let mut tags = HashMap::new();
+            if let Some(ref tid) = state.request_context.trace_id {
+                tags.insert("traceId".to_string(), Value::String(tid.clone()));
+            }
+            if let Some(ref sid) = state.request_context.span_id {
+                tags.insert("spanId".to_string(), Value::String(sid.clone()));
+            }
+            // Summarise the KMS work the SSE data path did for this request, so the
+            // KMS outcome inherits this entry's principal and request ID instead of
+            // needing an event of its own.
+            if let Some(scope) = state.kms_audit.as_ref() {
+                tags.extend(scope.audit_tags().into_iter().map(|(key, value)| (key.to_string(), value)));
+            }
+            if !tags.is_empty() {
                 final_builder = final_builder.tags(tags);
             }
 
@@ -415,6 +428,7 @@ mod tests {
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
     use crate::storage::access::ReqInfo;
     use crate::storage::request_context::RequestContext;
+    use base64::Engine as _;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use rustfs_credentials::Credentials;
@@ -424,7 +438,7 @@ mod tests {
     use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput};
     use s3s::{S3Request, S3Response};
     use std::sync::{Arc, Mutex};
-    use temp_env::with_vars;
+    use temp_env::{async_with_vars, with_vars};
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
         S3Request {
@@ -681,6 +695,137 @@ mod tests {
                 assert_eq!(helper.request_context_or_from_request(&req).request_id, "server-request-id");
             },
         );
+    }
+
+    /// SSE-KMS object metadata whose IV is missing, so unwrapping fails inside the
+    /// SSE layer without depending on a KMS service being reachable from a unit test.
+    fn unreadable_sse_kms_metadata() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            ("x-rustfs-encryption-key-id".to_string(), "finance-key".to_string()),
+            (
+                "x-rustfs-encryption-key".to_string(),
+                base64::engine::general_purpose::STANDARD.encode([7u8; 48]),
+            ),
+            ("x-rustfs-encryption-algorithm".to_string(), "aws:kms".to_string()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn operation_helper_attaches_the_sse_kms_summary_to_the_audit_entry() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            async {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("finance".to_string())
+                    .key("ledger.csv".to_string())
+                    .build()
+                    .unwrap();
+                let mut req = build_request(input, Method::GET, Uri::from_static("/finance/ledger.csv"));
+                req.extensions.insert(RequestContext {
+                    request_id: "kms-tagged-request".to_string(),
+                    x_amz_request_id: "kms-tagged-request".to_string(),
+                    trace_id: None,
+                    span_id: None,
+                    start_time: std::time::Instant::now(),
+                });
+                req.extensions.insert(ReqInfo {
+                    cred: Some(Credentials {
+                        access_key: "analyst".to_string(),
+                        ..Default::default()
+                    }),
+                    bucket: Some("finance".to_string()),
+                    object: Some("ledger.csv".to_string()),
+                    ..Default::default()
+                });
+
+                let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+
+                // Drive the real data path: the principal built from this request is
+                // what carries the audit slot into the SSE code.
+                let metadata = unreadable_sse_kms_metadata();
+                let principal =
+                    crate::storage::sse::SseKmsPrincipal::from_request(&req).expect("authenticated request has a principal");
+                crate::storage::sse::sse_decryption(crate::storage::sse::DecryptionRequest {
+                    bucket: "finance",
+                    key: "ledger.csv",
+                    metadata: &metadata,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    principal: Some(&principal),
+                })
+                .await
+                .expect_err("metadata without an IV cannot be unwrapped");
+
+                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let mut helper = helper.complete(&result);
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                let tags = entry.tags.expect("a request that used KMS must carry its summary");
+
+                assert_eq!(tags.get("sseType").and_then(|value| value.as_str()), Some("SSE-KMS"));
+                assert_eq!(tags.get("kmsKeyId").and_then(|value| value.as_str()), Some("finance-key"));
+                assert_eq!(tags.get("kmsOutcome").and_then(|value| value.as_str()), Some("failure"));
+                assert!(tags.contains_key("kmsErrorClass"), "a failed KMS interaction must be classified");
+
+                let rendered = serde_json::to_string(&tags).expect("audit tags serialize");
+                assert!(
+                    !rendered.contains(&base64::engine::general_purpose::STANDARD.encode([7u8; 48])),
+                    "the audit entry must not carry the wrapped data key: {rendered}"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn operation_helper_omits_kms_tags_for_requests_that_used_no_sse() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            async {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("finance".to_string())
+                    .key("plain.txt".to_string())
+                    .build()
+                    .unwrap();
+                let mut req = build_request(input, Method::GET, Uri::from_static("/finance/plain.txt"));
+                req.extensions.insert(RequestContext {
+                    request_id: "plain-request".to_string(),
+                    x_amz_request_id: "plain-request".to_string(),
+                    trace_id: None,
+                    span_id: None,
+                    start_time: std::time::Instant::now(),
+                });
+
+                let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                let mut helper =
+                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let entry = state.audit_builder.take().expect("audit builder should exist").build();
+
+                assert!(
+                    entry.tags.is_none_or(|tags| tags.keys().all(|key| !key.starts_with("kms"))),
+                    "a request that never reached KMS must not be tagged as if it had"
+                );
+            },
+        )
+        .await;
     }
 
     #[test]
