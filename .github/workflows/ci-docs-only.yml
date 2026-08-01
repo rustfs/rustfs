@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Companion to ci.yml for the required "Test and Lint" and "Quick Checks"
-# status checks.
+# Companion to ci.yml for required status checks.
 #
-# ci.yml skips docs-only pull requests via paths-ignore, but the branch
-# ruleset requires checks named "Test and Lint" and "Quick Checks" — without
-# this workflow a docs-only PR would wait on those checks forever. This
-# workflow triggers on exactly the paths ci.yml ignores and reports success
-# under the same job names. Mixed PRs trigger both workflows and the real
-# checks still gate: a required check with any failing run blocks the merge.
+# ci.yml skips docs-only pull requests via paths-ignore, but the branch ruleset
+# requires a check named "Test and Lint" — without this workflow a docs-only PR
+# would wait on it forever. This workflow triggers on exactly the paths ci.yml
+# ignores and reports success under the same job name. Mixed PRs trigger both
+# workflows and the real check still gates: a required check with any failing
+# run blocks the merge.
 # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/defining-the-mergeability-of-pull-requests/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+#
+# "Quick Checks" is mirrored here ahead of the ruleset change that will make it
+# required too (rustfs/backlog#1599). It is not required yet, so today this job
+# is inert; adding it first is what lets that ruleset change land without
+# stranding docs-only PRs on a check nobody reports.
 #
 # Keep the paths list below in sync with the pull_request paths-ignore list
 # in ci.yml, and keep the quick-checks steps below byte-identical to the
-# quick-checks job in ci.yml (see the comment on that job).
+# quick-checks job in ci.yml.
 
 name: Continuous Integration (docs only)
 
