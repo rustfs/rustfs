@@ -19,7 +19,7 @@ use crate::diagnostics::get::{
     GET_STAGE_READER_MMAP_PATH_RESOLVE, GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS,
     GET_STAGE_READER_OPEN_STREAM, GET_STAGE_READER_STREAM_FIRST_READ, record_get_stage_duration_if_enabled,
 };
-use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, MmapCopyStageMetrics, error::DiskError};
+use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, FileWriter, MmapCopyStageMetrics, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_config::{
@@ -35,6 +35,11 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::debug;
+
+#[cfg(test)]
+tokio::task_local! {
+    static FORCE_MMAP_COPY_FAILURE_FOR_TEST: ();
+}
 
 /// A shard source for the bitrot reader.
 ///
@@ -360,10 +365,21 @@ async fn open_disk_reader(
             mmap_copy_stage: GET_STAGE_READER_MMAP_COPY_BUFFER,
             direct_read_copy_stage: GET_STAGE_READER_MMAP_DIRECT_READ_COPY,
         });
-        match disk
-            .read_file_mmap_copy_with_metrics(bucket, path, offset, length, mmap_metrics)
-            .await
-        {
+        let mmap_result = {
+            #[cfg(test)]
+            if FORCE_MMAP_COPY_FAILURE_FOR_TEST.try_with(|_| ()).is_ok() {
+                Err(DiskError::other("forced mmap-copy failure for test"))
+            } else {
+                disk.read_file_mmap_copy_with_metrics(bucket, path, offset, length, mmap_metrics)
+                    .await
+            }
+            #[cfg(not(test))]
+            {
+                disk.read_file_mmap_copy_with_metrics(bucket, path, offset, length, mmap_metrics)
+                    .await
+            }
+        };
+        match mmap_result {
             Ok(bytes) => {
                 let duration_ms = zero_copy_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -398,7 +414,10 @@ async fn open_disk_reader(
                 }
 
                 return match stream_result {
-                    Ok(reader) => Ok(wrap_first_read_metrics(reader, metrics_path)),
+                    Ok(reader) => Ok(wrap_first_read_metrics(
+                        instrument_raw_shard_reader(reader, disk.is_local()),
+                        metrics_path,
+                    )),
                     Err(_) => Err(err),
                 };
             }
@@ -406,7 +425,7 @@ async fn open_disk_reader(
     }
 
     let stream_start = stage_metrics_enabled.then(Instant::now);
-    let reader = disk.read_file_stream(bucket, path, offset, length).await?;
+    let reader = instrument_raw_shard_reader(disk.read_file_stream(bucket, path, offset, length).await?, disk.is_local());
     if let Some(metrics_path) = metrics_path {
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_OPEN_STREAM, stream_start);
     }
@@ -425,6 +444,47 @@ fn wrap_first_read_metrics(reader: FileReader, metrics_path: Option<&'static str
     }
 
     ShardReader::Stream(reader)
+}
+
+// The labels are deliberately fixed: object keys, disk paths, and remote hosts
+// are all high-cardinality or sensitive and belong nowhere in a profiling report.
+#[cfg(feature = "hotpath")]
+const RAW_SHARD_READ_LOCAL_LABEL: &str = "EC raw shard read local";
+#[cfg(feature = "hotpath")]
+const RAW_SHARD_READ_REMOTE_LABEL: &str = "EC raw shard read remote";
+#[cfg(feature = "hotpath")]
+const RAW_SHARD_WRITE_LOCAL_LABEL: &str = "EC raw shard write local";
+#[cfg(feature = "hotpath")]
+const RAW_SHARD_WRITE_REMOTE_LABEL: &str = "EC raw shard write remote";
+
+#[cfg(feature = "hotpath")]
+fn instrument_raw_shard_reader(reader: FileReader, is_local: bool) -> FileReader {
+    // `io!` aggregates by call site, so the local and remote branches must remain distinct.
+    if is_local {
+        Box::new(hotpath::io!(reader, label = RAW_SHARD_READ_LOCAL_LABEL))
+    } else {
+        Box::new(hotpath::io!(reader, label = RAW_SHARD_READ_REMOTE_LABEL))
+    }
+}
+
+#[cfg(not(feature = "hotpath"))]
+fn instrument_raw_shard_reader(reader: FileReader, _is_local: bool) -> FileReader {
+    reader
+}
+
+#[cfg(feature = "hotpath")]
+fn instrument_raw_shard_writer(writer: FileWriter, is_local: bool) -> FileWriter {
+    // `io!` aggregates by call site, so the local and remote branches must remain distinct.
+    if is_local {
+        Box::new(hotpath::io!(writer, label = RAW_SHARD_WRITE_LOCAL_LABEL))
+    } else {
+        Box::new(hotpath::io!(writer, label = RAW_SHARD_WRITE_REMOTE_LABEL))
+    }
+}
+
+#[cfg(not(feature = "hotpath"))]
+fn instrument_raw_shard_writer(writer: FileWriter, _is_local: bool) -> FileWriter {
+    writer
 }
 
 fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksum_algo: HashAlgorithm) -> (usize, usize) {
@@ -685,7 +745,7 @@ pub async fn create_bitrot_writer(
             0
         };
 
-        let file = disk.create_file("", volume, path, length).await?;
+        let file = instrument_raw_shard_writer(disk.create_file("", volume, path, length).await?, disk.is_local());
         CustomWriter::new_tokio_writer(file)
     } else {
         return Err(DiskError::DiskNotFound);
@@ -697,6 +757,173 @@ pub async fn create_bitrot_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::cluster::rpc::RemoteDisk;
+    use crate::cluster::rpc::internode_data_transport::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
+    };
+    use crate::disk::{Disk, DiskOption, error::Result};
+
+    #[derive(Debug, Clone, Default)]
+    struct TestRemoteDataTransport {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl TestRemoteDataTransport {
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes
+                .lock()
+                .expect("test remote transport bytes lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestRemoteWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncWrite for TestRemoteWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.bytes
+                .lock()
+                .expect("test remote transport bytes lock should not be poisoned")
+                .extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for TestRemoteDataTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            Ok(Box::new(Cursor::new(self.bytes())))
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            Ok(Box::new(TestRemoteWriter {
+                bytes: Arc::clone(&self.bytes),
+            }))
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir must not be used by the raw shard I/O test")
+        }
+
+        fn name(&self) -> &'static str {
+            "bitrot-test-remote"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    async fn local_test_disk() -> (DiskStore, tempfile::TempDir) {
+        use crate::disk::endpoint::Endpoint;
+        use crate::disk::{DiskOption, new_disk};
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("local disk should be created");
+
+        (disk, dir)
+    }
+
+    async fn remote_test_disk() -> (DiskStore, TestRemoteDataTransport) {
+        use crate::disk::endpoint::Endpoint;
+
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-node:9000/data/rustfs0").expect("test remote endpoint should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let transport = TestRemoteDataTransport::default();
+        let remote = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(transport.clone()),
+        )
+        .await
+        .expect("test remote disk should be created");
+
+        (Arc::new(Disk::Remote(Box::new(remote))), transport)
+    }
+
+    async fn round_trip_disk_bitrot(disk: &DiskStore, bucket: &str, path: &str, payload: &[u8], shard_size: usize) -> Vec<u8> {
+        disk.make_volume(bucket).await.expect("volume should be created");
+        let mut writer = create_bitrot_writer(
+            false,
+            Some(disk),
+            bucket,
+            path,
+            i64::try_from(payload.len()).expect("test payload length should fit i64"),
+            shard_size,
+            HashAlgorithm::None,
+        )
+        .await
+        .expect("disk bitrot writer should open the raw shard file");
+        for chunk in payload.chunks(shard_size) {
+            writer
+                .write(chunk)
+                .await
+                .expect("disk bitrot writer should preserve each shard block");
+        }
+        writer.shutdown().await.expect("disk bitrot writer should close cleanly");
+
+        let mut reader = create_bitrot_reader(
+            None,
+            Some(disk),
+            bucket,
+            path,
+            0,
+            payload.len(),
+            shard_size,
+            HashAlgorithm::None,
+            false,
+            false,
+        )
+        .await
+        .expect("disk bitrot reader should open the raw shard file")
+        .expect("disk bitrot reader should exist");
+        let mut actual = Vec::with_capacity(payload.len());
+        while actual.len() < payload.len() {
+            let remaining = payload.len() - actual.len();
+            let mut chunk = vec![0; remaining.min(shard_size)];
+            let read = reader
+                .read(&mut chunk)
+                .await
+                .expect("disk bitrot reader should return the complete shard body");
+            assert!(read > 0, "disk bitrot reader must not end before the expected shard body is complete");
+            actual.extend_from_slice(&chunk[..read]);
+        }
+
+        actual
+    }
 
     #[test]
     fn object_mmap_read_enabled_accepts_legacy_zero_copy_alias() {
@@ -724,6 +951,165 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hotpath")]
+    #[test]
+    fn raw_shard_io_wrappers_report_fixed_labels_and_preserve_bytes() {
+        const CHILD_ENV: &str = "RUSTFS_HOTPATH_RAW_SHARD_IO_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test executable path should be available"))
+                .arg("--exact")
+                .arg("io_support::bitrot::tests::raw_shard_io_wrappers_report_fixed_labels_and_preserve_bytes")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("isolated HotPath I/O test process should start");
+            assert!(status.success(), "isolated HotPath I/O test process should pass");
+            return;
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should be created")
+            .block_on(raw_shard_io_wrappers_report_fixed_labels_and_preserve_bytes_in_isolated_process());
+    }
+
+    #[cfg(feature = "hotpath")]
+    async fn raw_shard_io_wrappers_report_fixed_labels_and_preserve_bytes_in_isolated_process() {
+        use hotpath::{Format, HotpathGuardBuilder, Section};
+        use tokio::io::AsyncReadExt;
+
+        let report_dir = tempfile::tempdir().expect("report tempdir should be created");
+        let report_path = report_dir.path().join("hotpath-io.json");
+        let guard = HotpathGuardBuilder::new("raw_shard_io_test")
+            .format(Format::Json)
+            .output_path(&report_path)
+            .sections(vec![Section::Io])
+            .build();
+
+        let (disk, _dir) = local_test_disk().await;
+        let bucket = "test-bucket";
+        let path = "obj/hotpath-part.1";
+        let payload = b"local shard bytes";
+        let shard_size = 4;
+        let local_read = round_trip_disk_bitrot(&disk, bucket, path, payload, shard_size).await;
+        assert_eq!(local_read, payload, "local raw shard I/O instrumentation must not alter stored bytes");
+
+        let fallback_path = "obj/hotpath-mmap-fallback-part.1";
+        let fallback_payload = b"mmap fallback shard bytes";
+        disk.write_all("test-bucket", fallback_path, Bytes::from_static(fallback_payload))
+            .await
+            .expect("fallback shard file should be written");
+        let mut fallback_reader = FORCE_MMAP_COPY_FAILURE_FOR_TEST
+            .scope((), open_disk_reader(&disk, bucket, fallback_path, 0, fallback_payload.len(), true, None))
+            .await
+            .expect("mmap-copy failure should fall back to a raw shard stream");
+        assert!(
+            matches!(fallback_reader, ShardReader::Stream(_)),
+            "forced mmap-copy failure must use the streaming fallback"
+        );
+        let mut fallback_read = Vec::new();
+        fallback_reader
+            .read_to_end(&mut fallback_read)
+            .await
+            .expect("mmap-copy fallback stream should preserve bytes");
+        assert_eq!(fallback_read, fallback_payload);
+
+        let (remote_disk, remote_transport) = remote_test_disk().await;
+        let remote_payload = b"remote shard bytes";
+        let mut remote_writer = create_bitrot_writer(
+            false,
+            Some(&remote_disk),
+            bucket,
+            "obj/hotpath-remote-part.1",
+            i64::try_from(remote_payload.len()).expect("remote payload length should fit i64"),
+            shard_size,
+            HashAlgorithm::None,
+        )
+        .await
+        .expect("remote bitrot writer should use the production raw writer path");
+        for chunk in remote_payload.chunks(shard_size) {
+            remote_writer
+                .write(chunk)
+                .await
+                .expect("remote bitrot writer should preserve bytes");
+        }
+        remote_writer
+            .shutdown()
+            .await
+            .expect("remote bitrot writer should close cleanly");
+        assert_eq!(remote_transport.bytes(), remote_payload);
+
+        let mut reader = create_bitrot_reader(
+            None,
+            Some(&remote_disk),
+            bucket,
+            "obj/hotpath-remote-part.1",
+            0,
+            remote_payload.len(),
+            shard_size,
+            HashAlgorithm::None,
+            false,
+            true,
+        )
+        .await
+        .expect("remote bitrot reader should use the production raw reader path")
+        .expect("remote bitrot reader should exist");
+        let mut remote_read = Vec::with_capacity(remote_payload.len());
+        while remote_read.len() < remote_payload.len() {
+            let remaining = remote_payload.len() - remote_read.len();
+            let mut chunk = vec![0; remaining.min(shard_size)];
+            let read = reader
+                .read(&mut chunk)
+                .await
+                .expect("remote bitrot reader should preserve bytes");
+            assert!(read > 0, "remote bitrot reader must not end before the expected shard body is complete");
+            remote_read.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(remote_read, remote_payload);
+
+        drop(guard);
+        let report = std::fs::read_to_string(&report_path).expect("HotPath I/O report should be written");
+        let report: serde_json::Value = serde_json::from_str(&report).expect("HotPath I/O report should be valid JSON");
+        let entries = report["io"]["data"]
+            .as_array()
+            .expect("HotPath I/O report should include data rows");
+        let io_bytes = |label: &str, direction: &str| {
+            let byte_count: u64 = entries
+                .iter()
+                .filter(|entry| entry["label"].as_str().is_some_and(|entry_label| entry_label == label))
+                .filter_map(|entry| entry[direction]["bytes"].as_u64())
+                .sum();
+            assert!(byte_count > 0, "report must include fixed label {label}");
+            byte_count
+        };
+        let payload_len = u64::try_from(payload.len()).expect("test payload length should fit u64");
+        assert_eq!(
+            io_bytes(RAW_SHARD_READ_LOCAL_LABEL, "read"),
+            payload_len + u64::try_from(fallback_payload.len()).expect("fallback payload length should fit u64")
+        );
+        assert_eq!(io_bytes(RAW_SHARD_WRITE_LOCAL_LABEL, "write"), payload_len);
+        assert_eq!(
+            io_bytes(RAW_SHARD_READ_REMOTE_LABEL, "read"),
+            u64::try_from(remote_payload.len()).expect("remote payload length should fit u64")
+        );
+        assert_eq!(
+            io_bytes(RAW_SHARD_WRITE_REMOTE_LABEL, "write"),
+            u64::try_from(remote_payload.len()).expect("remote payload length should fit u64")
+        );
+        for label in [
+            RAW_SHARD_READ_LOCAL_LABEL,
+            RAW_SHARD_READ_REMOTE_LABEL,
+            RAW_SHARD_WRITE_LOCAL_LABEL,
+            RAW_SHARD_WRITE_REMOTE_LABEL,
+        ] {
+            assert!(
+                !label.contains(['/', ':', '?', '@']),
+                "raw shard I/O labels must not carry a path, host, query, or credential delimiter: {label}"
+            );
+        }
+    }
+
     #[test]
     fn object_mmap_read_max_length_defaults_and_env_override() {
         temp_env::with_var(ENV_OBJECT_MMAP_READ_MAX_LENGTH, None::<&str>, || {
@@ -741,25 +1127,9 @@ mod tests {
     // be materialized in memory by the mmap-copy path; over-cap reads stream.
     #[tokio::test]
     async fn open_disk_reader_streams_when_length_exceeds_mmap_cap() {
-        use crate::disk::endpoint::Endpoint;
-        use crate::disk::{DiskOption, new_disk};
         use tokio::io::AsyncReadExt;
 
-        let dir = tempfile::tempdir().expect("tempdir should be created");
-        let mut endpoint =
-            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(0);
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .expect("local disk should be created");
+        let (disk, _dir) = local_test_disk().await;
 
         let payload = vec![7u8; 4096];
         disk.make_volume("test-bucket").await.expect("volume should be created");
@@ -812,6 +1182,17 @@ mod tests {
             );
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn disk_bitrot_reader_and_writer_preserve_full_shard_body() {
+        let (disk, _dir) = local_test_disk().await;
+        let bucket = "test-bucket";
+        let path = "obj/wrapped-part.1";
+        let payload = b"wrapped shard body";
+        let actual = round_trip_disk_bitrot(&disk, bucket, path, payload, 4).await;
+
+        assert_eq!(actual, payload, "raw shard I/O instrumentation must not alter stored bytes");
     }
 
     #[tokio::test]
