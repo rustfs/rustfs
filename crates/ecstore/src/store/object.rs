@@ -815,7 +815,7 @@ impl ECStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_get_object_reader(
         &self,
         bucket: &str,
@@ -849,7 +849,7 @@ impl ECStore {
     }
 
     #[instrument(level = "debug", skip(self, data))]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_put_object(
         &self,
         bucket: &str,

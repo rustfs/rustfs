@@ -23,8 +23,8 @@ use super::replication_stats_boundary::{
 };
 use super::runtime_boundary as runtime_sources;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
@@ -143,7 +143,7 @@ pub struct ReplicationStats {
     // Active worker statistics
     pub workers: Arc<Mutex<ActiveWorkerStat>>,
     // Queue statistics cache
-    pub q_cache: Arc<Mutex<QueueCache>>,
+    pub q_cache: Arc<StdMutex<QueueCache>>,
     // Proxy statistics cache
     pub p_cache: Arc<Mutex<ProxyStatsCache>>,
     // MRF backlog statistics (simplified)
@@ -158,7 +158,7 @@ impl ReplicationStats {
         Self {
             sr_stats: Arc::new(SRStats::new()),
             workers: Arc::new(Mutex::new(ActiveWorkerStat::new())),
-            q_cache: Arc::new(Mutex::new(QueueCache::new())),
+            q_cache: Arc::new(StdMutex::new(QueueCache::new())),
             p_cache: Arc::new(Mutex::new(ProxyStatsCache::new())),
             mrf_stats: HashMap::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -198,8 +198,9 @@ impl ReplicationStats {
             let mut interval = interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let mut cache = q_cache_clone.lock().await;
-                cache.update();
+                if let Ok(mut cache) = q_cache_clone.lock() {
+                    cache.update();
+                }
             }
         });
     }
@@ -391,12 +392,13 @@ impl ReplicationStats {
         drop(cache);
 
         {
-            let q_cache = self.q_cache.lock().await;
-            for (bucket, queue_stats) in &q_cache.bucket_stats {
-                let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
-                bucket_stats.q_stat = queue_stats.snapshot();
-                bucket_stats.mark_node_local_provider_available();
-                bucket_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+            if let Ok(q_cache) = self.q_cache.lock() {
+                for (bucket, queue_stats) in &q_cache.bucket_stats {
+                    let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+                    bucket_stats.q_stat = queue_stats.snapshot();
+                    bucket_stats.mark_node_local_provider_available();
+                    bucket_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+                }
             }
         }
 
@@ -429,8 +431,11 @@ impl ReplicationStats {
         let boot_time = SystemTime::UNIX_EPOCH; // simplified implementation
         let uptime = SystemTime::now().duration_since(boot_time).unwrap_or_default().as_secs() as i64;
 
-        let q_cache = self.q_cache.lock().await;
-        let queued = q_cache.get_site_stats();
+        let queued = self
+            .q_cache
+            .lock()
+            .map(|q_cache| q_cache.get_site_stats())
+            .unwrap_or_default();
 
         let p_cache = self.p_cache.lock().await;
         let proxied = p_cache.get_site_stats();
@@ -633,8 +638,9 @@ impl ReplicationStats {
         drop(cache);
 
         {
-            let q_cache = self.q_cache.lock().await;
-            if let Some(queue_stats) = q_cache.bucket_stats.get(bucket) {
+            if let Ok(q_cache) = self.q_cache.lock()
+                && let Some(queue_stats) = q_cache.bucket_stats.get(bucket)
+            {
                 replication_stats.q_stat = queue_stats.snapshot();
             }
         }
@@ -665,31 +671,17 @@ impl ReplicationStats {
     }
 
     /// Increase queue statistics
-    pub async fn inc_q(&self, bucket: &str, size: i64, _is_delete_repl: bool, _op_type: ReplicationType) {
-        let mut q_cache = self.q_cache.lock().await;
-        let stats = q_cache
-            .bucket_stats
-            .entry(bucket.to_string())
-            .or_insert_with(InQueueMetric::default);
-        stats.curr.now_bytes.fetch_add(size, Ordering::Relaxed);
-        stats.curr.now_count.fetch_add(1, Ordering::Relaxed);
-
-        q_cache.sr_queue_stats.curr.now_bytes.fetch_add(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.curr.now_count.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_q(&self, bucket: &str, size: i64, _is_delete_repl: bool, _op_type: ReplicationType) {
+        if let Ok(mut q_cache) = self.q_cache.lock() {
+            q_cache.inc(bucket, size);
+        }
     }
 
     /// Decrease queue statistics
-    pub async fn dec_q(&self, bucket: &str, size: i64, _is_del_marker: bool, _op_type: ReplicationType) {
-        let mut q_cache = self.q_cache.lock().await;
-        let stats = q_cache
-            .bucket_stats
-            .entry(bucket.to_string())
-            .or_insert_with(InQueueMetric::default);
-        stats.curr.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        stats.curr.now_count.fetch_sub(1, Ordering::Relaxed);
-
-        q_cache.sr_queue_stats.curr.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.curr.now_count.fetch_sub(1, Ordering::Relaxed);
+    pub fn dec_q(&self, bucket: &str, size: i64, _is_del_marker: bool, _op_type: ReplicationType) {
+        if let Ok(mut q_cache) = self.q_cache.lock() {
+            q_cache.dec(bucket, size);
+        }
     }
 
     /// Increase proxy metrics
@@ -801,14 +793,14 @@ mod tests {
     async fn latest_stats_include_queue_until_drained() {
         let stats = ReplicationStats::new();
 
-        stats.inc_q("queued-bucket", 4096, false, ReplicationType::Object).await;
+        stats.inc_q("queued-bucket", 4096, false, ReplicationType::Object);
         let queued = stats.get_latest_replication_stats("queued-bucket").await;
         assert!(queued.replication_stats.provider_available);
         assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
         assert_eq!(queued.replication_stats.q_stat.curr.bytes, 4096);
         assert_eq!(queued.replication_stats.queue_scope, ReplicationMetricScope::NodeLocal);
 
-        stats.dec_q("queued-bucket", 4096, false, ReplicationType::Object).await;
+        stats.dec_q("queued-bucket", 4096, false, ReplicationType::Object);
         let drained = stats.get_latest_replication_stats("queued-bucket").await;
         assert_eq!(drained.replication_stats.q_stat.curr.count, 0);
         assert_eq!(drained.replication_stats.q_stat.curr.bytes, 0);
@@ -911,7 +903,7 @@ mod tests {
         for _ in 0..32 {
             let stats = Arc::clone(&stats);
             tasks.push(tokio::spawn(async move {
-                stats.inc_q("concurrent-bucket", 7, false, ReplicationType::Object).await;
+                stats.inc_q("concurrent-bucket", 7, false, ReplicationType::Object);
             }));
         }
         for task in tasks {
