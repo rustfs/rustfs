@@ -1507,6 +1507,10 @@ async fn build_sse_replication_pair(
             ("RUSTFS_KMS_KEY_DIR", source_kms_key_dir.as_str()),
             ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
             ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+            // Per-key KMS authorization is on so this contract is pinned in the
+            // configuration replication will eventually ship with: the replication
+            // worker carries no request identity and must stay exempt.
+            ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ]);
     }
     source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
@@ -1519,6 +1523,7 @@ async fn build_sse_replication_pair(
             ("RUSTFS_KMS_KEY_DIR", target_kms_key_dir.as_str()),
             ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
             ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+            ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ]);
     }
     target_env
