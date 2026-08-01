@@ -137,6 +137,13 @@ pub enum KmsError {
     /// fail closed instead of being sent with credentials that may lapse mid-flight
     #[error("KMS credentials unavailable: {message}")]
     CredentialsUnavailable { message: String },
+
+    /// Key has master key version records but no baseline version, so envelopes
+    /// written before versioned rotation can no longer be resolved
+    #[error(
+        "Baseline version lost for key {key_id}: master key version records exist (oldest {oldest_version}) but the key record carries no baseline version, so data keys written before versioned rotation can no longer be resolved to the master key version that wrapped them. A node older than versioned rotation rewrote the key record and dropped the field. Finish upgrading every node, restore baseline_version to {oldest_version} on the key record, then retry"
+    )]
+    BaselineVersionLost { key_id: String, oldest_version: u32 },
 }
 
 impl KmsError {
@@ -290,6 +297,18 @@ impl KmsError {
     /// Create a credentials unavailable error
     pub fn credentials_unavailable<S: Into<String>>(message: S) -> Self {
         Self::CredentialsUnavailable { message: message.into() }
+    }
+
+    /// Create a baseline version lost error
+    ///
+    /// `oldest_version` is the lowest master key version that still has a
+    /// material record; it is exactly the baseline that was dropped, because
+    /// version records start at the baseline the first rotation froze.
+    pub fn baseline_version_lost<S: Into<String>>(key_id: S, oldest_version: u32) -> Self {
+        Self::BaselineVersionLost {
+            key_id: key_id.into(),
+            oldest_version,
+        }
     }
 }
 

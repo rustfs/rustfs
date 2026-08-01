@@ -155,6 +155,7 @@ pub fn error_class(error: &KmsError) -> &'static str {
         KmsError::Backup(_) => "backup",
         KmsError::UnsupportedCapability { .. } => "unsupported_capability",
         KmsError::CredentialsUnavailable { .. } => "credentials_unavailable",
+        KmsError::BaselineVersionLost { .. } => "baseline_version_lost",
     }
 }
 
