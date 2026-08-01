@@ -440,6 +440,14 @@ impl DrillRequest {
         // The drill re-opens the backend after the restore to prove the
         // material on disk decrypts; a warm cache would prove nothing.
         config.enable_cache = false;
+        // The rehearsal deployment is throwaway by construction: it is created
+        // inside the drill workspace, destroyed by the drill, and never
+        // registered as a server's KMS. The production-hygiene guard on where
+        // a key directory may live therefore does not apply to it — a drill
+        // workspace under the temp directory is the normal case, not a
+        // misconfiguration. The one guard that still matters, a non-empty
+        // at-rest master key, is enforced by `DrillRequest::validate`.
+        config.allow_insecure_dev_defaults = true;
         config
     }
 }
@@ -973,4 +981,481 @@ fn walk_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn elapsed_millis(from: &Zoned, to: &Zoned) -> u64 {
     let nanos = to.timestamp().as_nanosecond() - from.timestamp().as_nanosecond();
     u64::try_from(nanos / 1_000_000).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::local::durable_file::{CommitStep, failpoint};
+    use crate::backends::local::is_orphan_commit_temp_name;
+    use crate::backup::capability::{AtRestProtection, BackupResponsibility};
+    use crate::backup::local_export::{AEAD_NONCE_LEN, LOCAL_BUNDLE_MANIFEST_FILE, artifact_aad};
+    use crate::backup::local_restore::abort_local_restore;
+    use crate::backup::manifest::{
+        AeadAlgorithm, ArtifactDescriptor, ArtifactKind, BackupManifest, CompletenessState, DigestAlgorithm,
+        VaultExternalReferences, VaultKvRecordReference, VaultTransitReference,
+    };
+    use crate::backup::vault_restore::{
+        VAULT_RECORD_ARTIFACT_DIR, VAULT_RECORD_ARTIFACT_SUFFIX, VaultRestoreClient, VaultRestoreRequest, VaultRestoreTarget,
+        dry_run_vault_restore,
+    };
+    use crate::config::VaultAuthMethod;
+    use aes_gcm::{
+        Nonce,
+        aead::{Aead, Payload},
+    };
+    use tempfile::TempDir;
+
+    /// Deliberately distinctive so the evidence assertion below cannot pass by
+    /// accident.
+    const DRILL_MASTER_KEY: &str = "drill-master-key-never-in-evidence";
+    const DEPLOYMENT: &str = "deployment-drill";
+
+    fn test_kek() -> BackupKek {
+        BackupKek::new("backup-kek-drill", 1, [0x37; 32]).expect("kek")
+    }
+
+    fn drill_request(workspace: &Path, disaster: DrillDisaster) -> DrillRequest {
+        DrillRequest {
+            drill_id: "drill-0001".to_string(),
+            workspace: workspace.to_path_buf(),
+            deployment_identity: DEPLOYMENT.to_string(),
+            rustfs_version: "1.0.0-test".to_string(),
+            snapshot_generation: 11,
+            dataset: DrillDataset {
+                keys: 2,
+                objects_per_key: 2,
+                object_bytes: 1024,
+            },
+            disaster,
+            master_key: DRILL_MASTER_KEY.to_string(),
+            file_permissions: Some(0o600),
+        }
+    }
+
+    /// Open the restored directory and ask it to reproduce one object.
+    async fn probe_after_restore(config: &KmsConfig, object: &SealedObject) -> EnvelopeProbe {
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("restored backend must open"));
+        let service = ObjectEncryptionService::new(KmsManager::new(backend, config.clone()));
+        probe_object(&service, object).await
+    }
+
+    /// Seed a deployment, seal one object, and export a bundle.
+    ///
+    /// The interrupted-cutover legs drive the restore themselves — they have
+    /// to crash it — so they cannot go through [`run_local_drill`], but they
+    /// use the same production path to produce the state they crash on.
+    async fn interrupted_cutover_fixture(work: &Path) -> (KmsConfig, LocalRestoreRequest, BackupManifest, SealedObject) {
+        let request = drill_request(work, DrillDisaster::KeyDirectoryLost);
+        let source_dir = work.join("source");
+        fs::create_dir_all(&source_dir).await.expect("source dir");
+        let source_config = request.local_config(source_dir);
+        let backend = Arc::new(LocalKmsBackend::new(source_config.clone()).await.expect("source backend"));
+        let service = ObjectEncryptionService::new(KmsManager::new(backend.clone(), source_config.clone()));
+
+        let key_id = request.key_id(0);
+        create_drill_key(&service, &key_id).await.expect("create key");
+        let sealed = seal_object(&service, &key_id, 0, 512).await.expect("seal object");
+
+        let bundle_dir = work.join("bundle");
+        let manifest = export_local_backup(
+            backend.local_backup_client().expect("local backup client"),
+            &test_kek(),
+            &LocalBackupExportRequest {
+                backup_id: request.drill_id.clone(),
+                deployment_identity: DEPLOYMENT.to_string(),
+                rustfs_version: request.rustfs_version.clone(),
+                snapshot_generation: request.snapshot_generation,
+                destination: bundle_dir.clone(),
+                sanitized_config: None,
+            },
+        )
+        .await
+        .expect("export");
+
+        let target = work.join("target");
+        let restore_request = LocalRestoreRequest {
+            bundle_dir,
+            target_key_dir: target.clone(),
+            target_deployment_identity: DEPLOYMENT.to_string(),
+            observed_generation: None,
+            master_key: Some(DRILL_MASTER_KEY.to_string()),
+            conflict_policy: RestoreConflictPolicy::RestoreIntoEmptyTarget,
+            file_permissions: Some(0o600),
+        };
+        (request.local_config(target), restore_request, manifest, sealed)
+    }
+
+    /// Crash a restore precisely at its commit point: arming the failpoint on
+    /// the marker path itself leaves the staging commits untouched, so what
+    /// survives is a fully staged restore with a published marker and no
+    /// cutover — the state a power loss produces between the two.
+    async fn crash_at_commit_point(restore_request: &LocalRestoreRequest) {
+        let marker_path = restore_request.target_key_dir.join(LOCAL_RESTORE_COMMIT_MARKER_FILE);
+        failpoint::arm(&marker_path, CommitStep::DirSynced);
+        let error = restore_local_backup(&test_kek(), restore_request)
+            .await
+            .expect_err("the armed commit point must simulate a crash");
+        failpoint::disarm(&marker_path);
+        assert!(error.to_string().contains("injected crash"), "got {error}");
+        assert!(marker_path.exists(), "the commit marker must be published before the crash");
+    }
+
+    #[tokio::test]
+    async fn every_local_disaster_recovers_and_replays_historical_object_deks() {
+        for disaster in [
+            DrillDisaster::KeyDirectoryLost,
+            DrillDisaster::MasterKeySaltLost,
+            DrillDisaster::KeyRecordCorrupted,
+        ] {
+            let work = TempDir::new().expect("work dir");
+            let request = drill_request(work.path(), disaster);
+            let evidence = run_local_drill(&test_kek(), &request)
+                .await
+                .unwrap_or_else(|error| panic!("{disaster:?}: drill failed to run: {error}"));
+
+            assert_eq!(evidence.verdict, DrillVerdict::Passed, "{disaster:?}: {:?}", evidence.findings);
+            assert!(evidence.findings.is_empty(), "{disaster:?}: {:?}", evidence.findings);
+
+            // The acceptance criterion: every object sealed before the
+            // disaster decrypts again.
+            assert_eq!(evidence.envelope_probes.len(), 4, "{disaster:?}");
+            assert!(evidence.envelope_probes.iter().all(|probe| probe.verified), "{disaster:?}");
+
+            // ... and the recovery point holds: work past the fence stays lost.
+            assert_eq!(evidence.rpo.post_snapshot_objects, 2, "{disaster:?}");
+            assert_eq!(evidence.rpo.post_snapshot_objects_recovered, 0, "{disaster:?}");
+            assert_eq!(evidence.rpo.post_snapshot_key_ids, vec![request.post_snapshot_key_id()], "{disaster:?}");
+
+            assert!(evidence.recovery.dry_run_zero_write, "{disaster:?}");
+            assert!(evidence.recovery.dry_run.restore_permitted(), "{disaster:?}");
+            let restore = evidence.recovery.restore.as_ref().expect("restore report");
+            assert_eq!(restore.restored_key_ids.len(), 2, "{disaster:?}: the post-fence key is not in the bundle");
+            assert!(restore.salt_restored, "{disaster:?}");
+            assert!(!restore.resumed, "{disaster:?}");
+            assert!(evidence.recovery.commit_marker_cleared, "{disaster:?}");
+            assert!(evidence.recovery.repeat_restore_refused, "{disaster:?}");
+            assert!(evidence.recovery.repeat_restore_left_target_unchanged, "{disaster:?}");
+
+            assert!(evidence.bundle.source_unchanged, "{disaster:?}");
+            assert_eq!(
+                evidence.bundle.manifest_digest, evidence.bundle.manifest_digest_after_recovery,
+                "{disaster:?}"
+            );
+            assert_eq!(evidence.bundle.snapshot_generation, request.snapshot_generation, "{disaster:?}");
+
+            assert!(!evidence.recovery.destroyed_files.is_empty(), "{disaster:?}");
+            assert_eq!(
+                evidence.timings.iter().map(|timing| timing.phase).collect::<Vec<_>>(),
+                vec![
+                    DrillPhase::Seed,
+                    DrillPhase::SealObjects,
+                    DrillPhase::Export,
+                    DrillPhase::PostSnapshotWrite,
+                    DrillPhase::Disaster,
+                    DrillPhase::Quarantine,
+                    DrillPhase::DryRun,
+                    DrillPhase::Restore,
+                    DrillPhase::Verify,
+                    DrillPhase::RepeatRestore,
+                ],
+                "{disaster:?}"
+            );
+        }
+    }
+
+    /// Whatever survives a disaster is preserved, never deleted: a restore
+    /// that turns out to be the wrong call has to stay reversible.
+    #[tokio::test]
+    async fn the_damaged_key_directory_is_preserved_for_rollback() {
+        let work = TempDir::new().expect("work dir");
+        let request = drill_request(work.path(), DrillDisaster::KeyRecordCorrupted);
+        let evidence = run_local_drill(&test_kek(), &request).await.expect("drill");
+
+        assert_eq!(evidence.recovery.destroyed_files, vec![format!("{}.key", request.key_id(0))]);
+        let quarantined = &evidence.recovery.quarantined_files;
+        assert!(quarantined.contains(&LOCAL_KMS_MASTER_KEY_SALT_FILE.to_string()), "got {quarantined:?}");
+        assert!(quarantined.contains(&format!("{}.key", request.key_id(1))), "got {quarantined:?}");
+        assert_eq!(
+            top_level_names(&evidence.recovery.quarantine_path).await.expect("quarantine"),
+            *quarantined,
+            "the quarantined directory must still hold exactly what was moved into it"
+        );
+    }
+
+    #[tokio::test]
+    async fn drill_evidence_is_archivable_and_names_no_secret() {
+        let work = TempDir::new().expect("work dir");
+        let request = drill_request(work.path(), DrillDisaster::KeyDirectoryLost);
+        let evidence = run_local_drill(&test_kek(), &request).await.expect("drill");
+
+        let encoded = evidence.encode().expect("evidence must serialize");
+        let text = String::from_utf8(encoded.clone()).expect("evidence is utf-8");
+        assert!(!text.contains(DRILL_MASTER_KEY), "the evidence must not carry the master key");
+        assert!(
+            !text.contains(&hex::encode([0x37u8; 32])),
+            "the evidence must not carry backup KEK material"
+        );
+
+        let decoded: DrillEvidence = serde_json::from_slice(&encoded).expect("evidence must round-trip");
+        assert_eq!(decoded.format_version, DRILL_EVIDENCE_FORMAT_VERSION);
+        assert_eq!(decoded.verdict, evidence.verdict);
+        assert_eq!(decoded.bundle, evidence.bundle);
+        assert_eq!(decoded.envelope_probes, evidence.envelope_probes);
+        assert_eq!(decoded.recovery.restore, evidence.recovery.restore);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_cutover_leaves_a_marker_bound_to_its_bundle_and_rolls_forward() {
+        let work = TempDir::new().expect("work dir");
+        let (target_config, restore_request, manifest, sealed) = interrupted_cutover_fixture(work.path()).await;
+        let target = restore_request.target_key_dir.clone();
+        crash_at_commit_point(&restore_request).await;
+
+        // The marker is read as the on-disk artifact an operator would find,
+        // not through the type that wrote it: it must name this exact bundle
+        // and exactly the files the cutover still owes.
+        let marker_bytes = fs::read(target.join(LOCAL_RESTORE_COMMIT_MARKER_FILE))
+            .await
+            .expect("commit marker");
+        let marker: serde_json::Value = serde_json::from_slice(&marker_bytes).expect("marker json");
+        assert_eq!(marker["backup_id"], serde_json::json!(manifest.backup_id));
+        assert_eq!(marker["manifest_digest"]["hex"], serde_json::json!(manifest.manifest_digest.hex));
+        let files: Vec<String> = serde_json::from_value(marker["files"].clone()).expect("marker file list");
+        assert_eq!(
+            files,
+            vec![LOCAL_KMS_MASTER_KEY_SALT_FILE.to_string(), format!("{}.key", sealed.key_id)]
+        );
+
+        // A directory mid-cutover must not serve requests.
+        let error = LocalKmsBackend::new(target_config.clone())
+            .await
+            .err()
+            .expect("startup must fail closed mid-cutover");
+        assert!(error.to_string().contains("unfinished restore"), "got {error}");
+
+        let report = restore_local_backup(&test_kek(), &restore_request).await.expect("roll forward");
+        assert!(report.resumed, "re-running the same bundle must roll the cutover forward");
+        assert!(!target.join(LOCAL_RESTORE_COMMIT_MARKER_FILE).exists());
+        assert!(probe_after_restore(&target_config, &sealed).await.verified);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_cutover_can_be_aborted_back_to_the_pre_restore_state() {
+        let work = TempDir::new().expect("work dir");
+        let (target_config, restore_request, _manifest, sealed) = interrupted_cutover_fixture(work.path()).await;
+        let target = restore_request.target_key_dir.clone();
+        crash_at_commit_point(&restore_request).await;
+
+        abort_local_restore(&target).await.expect("abort must succeed");
+        // Only the commit temp of the crashed marker write may survive: it was
+        // never published, carries no state, and is exactly what the backend's
+        // startup recovery and a fresh restore both classify as removable.
+        let leftovers = top_level_names(&target).await.expect("target names");
+        assert!(
+            leftovers.iter().all(|name| is_orphan_commit_temp_name(name)),
+            "abort must take back the marker, the staged state, and anything already published; left {leftovers:?}"
+        );
+
+        // The rolled-back target is a clean slate again, so the drill is
+        // repeatable rather than a one-shot.
+        let report = restore_local_backup(&test_kek(), &restore_request)
+            .await
+            .expect("a fresh restore after an abort must succeed");
+        assert!(!report.resumed);
+        assert!(probe_after_restore(&target_config, &sealed).await.verified);
+    }
+
+    #[tokio::test]
+    async fn a_drill_refuses_a_workspace_that_already_holds_a_rehearsal() {
+        let work = TempDir::new().expect("work dir");
+        let request = drill_request(work.path(), DrillDisaster::KeyDirectoryLost);
+        run_local_drill(&test_kek(), &request).await.expect("first drill");
+
+        let error = run_local_drill(&test_kek(), &request)
+            .await
+            .expect_err("a used workspace must be refused");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn drill_requests_are_validated_before_anything_is_created() {
+        let work = TempDir::new().expect("work dir");
+
+        let mut request = drill_request(work.path(), DrillDisaster::KeyDirectoryLost);
+        request.master_key = String::new();
+        assert!(run_local_drill(&test_kek(), &request).await.is_err());
+
+        let mut request = drill_request(work.path(), DrillDisaster::KeyDirectoryLost);
+        request.drill_id = "../escape".to_string();
+        assert!(run_local_drill(&test_kek(), &request).await.is_err());
+
+        let mut request = drill_request(work.path(), DrillDisaster::KeyDirectoryLost);
+        request.dataset.keys = MAX_DRILL_OBJECTS;
+        request.dataset.objects_per_key = 2;
+        assert!(run_local_drill(&test_kek(), &request).await.is_err());
+
+        assert!(
+            !work.path().join(LIVE_DIR).exists(),
+            "a rejected request must not have created a deployment"
+        );
+    }
+
+    #[test]
+    fn drill_payloads_are_deterministic_and_sized() {
+        for bytes in [1usize, 31, 32, 33, 4096] {
+            let payload = drill_payload("bucket/object", bytes);
+            assert_eq!(payload.len(), bytes);
+            assert_eq!(payload, drill_payload("bucket/object", bytes));
+        }
+        assert_ne!(drill_payload("a", 64), drill_payload("b", 64));
+    }
+
+    /// Seal a minimal Vault bundle: one KV metadata record plus the external
+    /// references that name the Transit trust root an operator has to restore
+    /// natively.
+    async fn vault_drill_bundle(dir: &Path, transit_key: &str, cluster_id: &str, kv_mount: &str, kv_prefix: &str) -> PathBuf {
+        const BACKUP_ID: &str = "drill-vault-0001";
+        const SNAPSHOT_GENERATION: u64 = 11;
+        let key_id = "drill-vault-key";
+        let bundle = dir.join("vault-bundle");
+        fs::create_dir_all(bundle.join(VAULT_RECORD_ARTIFACT_DIR))
+            .await
+            .expect("artifact dir");
+
+        let kek = test_kek();
+        let path = format!("{VAULT_RECORD_ARTIFACT_DIR}/{key_id}{VAULT_RECORD_ARTIFACT_SUFFIX}");
+        let plaintext = serde_json::to_vec(&serde_json::json!({ "key_state": "Enabled", "current_version": 1 })).expect("record");
+        let nonce = [0x21u8; AEAD_NONCE_LEN];
+        let ciphertext = kek
+            .cipher()
+            .encrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &artifact_aad(BACKUP_ID, SNAPSHOT_GENERATION, &path),
+                },
+            )
+            .expect("seal artifact");
+        let mut payload = nonce.to_vec();
+        payload.extend_from_slice(&ciphertext);
+        fs::write(bundle.join(&path), &payload).await.expect("write artifact");
+
+        let manifest = BackupManifest {
+            format_version: BackupManifest::FORMAT_VERSION,
+            backup_id: BACKUP_ID.to_string(),
+            created_at: "2026-08-01T00:00:00+00:00[UTC]".parse().expect("timestamp"),
+            rustfs_version: "1.0.0-test".to_string(),
+            deployment_identity: DEPLOYMENT.to_string(),
+            backend: BackupBackendKind::VaultTransit,
+            at_rest_protection: AtRestProtection::ExternalNonExportable,
+            responsibility: BackupResponsibility::MetadataPlusExternalRoot,
+            snapshot_generation: SNAPSHOT_GENERATION,
+            backup_kek: kek.descriptor(),
+            artifacts: vec![ArtifactDescriptor {
+                kind: ArtifactKind::KeyMetadata,
+                path,
+                len: payload.len() as u64,
+                aead_algorithm: AeadAlgorithm::Aes256Gcm,
+                encrypted_digest: ContentDigest::sha256_of(&payload),
+            }],
+            local_kdf: None,
+            external_references: Some(VaultExternalReferences {
+                cluster_id: cluster_id.to_string(),
+                namespace: None,
+                kv_mount: kv_mount.to_string(),
+                kv_path_prefix: kv_prefix.to_string(),
+                transit: Some(VaultTransitReference {
+                    mount_path: "transit".to_string(),
+                    key_name: transit_key.to_string(),
+                    required_min_version: 1,
+                    current_version: 1,
+                    native_snapshot_reference: None,
+                }),
+                kv_records: vec![VaultKvRecordReference {
+                    key_id: key_id.to_string(),
+                    kv_version: 1,
+                }],
+            }),
+            key_versions: None,
+            capability_discovery: None,
+            completeness: CompletenessState::InProgress,
+            manifest_digest: ContentDigest {
+                algorithm: DigestAlgorithm::Sha256,
+                hex: String::new(),
+            },
+        };
+        let sealed = manifest.seal().expect("seal manifest");
+        fs::write(
+            bundle.join(LOCAL_BUNDLE_MANIFEST_FILE),
+            sealed.encode().expect("encode manifest"),
+        )
+        .await
+        .expect("write manifest");
+        bundle
+    }
+
+    /// Vault leg of the drill matrix, against a real server.
+    ///
+    /// Transit keys are non-exportable, so a Vault bundle never carries the
+    /// cryptographic root: restoring it is a Vault-native operator step, and
+    /// what RustFS owes is a refusal to proceed until that step has actually
+    /// happened. This drills exactly that refusal — the bundle names a Transit
+    /// key the recovered Vault does not have, and the preflight must report it
+    /// instead of publishing anything.
+    ///
+    /// Prerequisites: a Vault with the transit engine enabled
+    /// (`vault server -dev`, then `vault secrets enable transit`). Address and
+    /// token come from `RUSTFS_KMS_VAULT_ADDR` (default
+    /// `http://127.0.0.1:8200`) and `RUSTFS_KMS_VAULT_TOKEN` (default `root`).
+    #[tokio::test]
+    #[ignore = "needs a Vault with the transit engine enabled; see RUSTFS_KMS_VAULT_ADDR"]
+    async fn a_vault_bundle_is_refused_until_its_transit_trust_root_is_restored() {
+        let address = std::env::var("RUSTFS_KMS_VAULT_ADDR").unwrap_or_else(|_| "http://127.0.0.1:8200".to_string());
+        let token = std::env::var("RUSTFS_KMS_VAULT_TOKEN").unwrap_or_else(|_| "root".to_string());
+        let cluster_id = "vault-drill-cluster";
+        let kv_mount = "secret";
+        let kv_prefix = "rustfs/kms/drill";
+        // A name no operator would have restored, so the trust root is
+        // provably absent whatever else the server holds.
+        let transit_key = format!("rustfs-kms-drill-absent-{}", uuid::Uuid::new_v4());
+
+        let work = TempDir::new().expect("work dir");
+        let bundle = vault_drill_bundle(work.path(), &transit_key, cluster_id, kv_mount, kv_prefix).await;
+
+        let target = VaultRestoreTarget {
+            address,
+            auth_method: VaultAuthMethod::Token { token },
+            namespace: None,
+            cluster_id: cluster_id.to_string(),
+            kv_mount: kv_mount.to_string(),
+            kv_path_prefix: kv_prefix.to_string(),
+            transit_mount: Some("transit".to_string()),
+        };
+        let client = VaultRestoreClient::connect(&target, &KmsConfig::default())
+            .await
+            .expect("vault restore client");
+        let report = dry_run_vault_restore(
+            &test_kek(),
+            &client,
+            &VaultRestoreRequest {
+                bundle_dir: bundle,
+                target,
+                target_deployment_identity: DEPLOYMENT.to_string(),
+                observed_generation: None,
+                conflict_policy: RestoreConflictPolicy::RestoreIntoEmptyTarget,
+            },
+        )
+        .await
+        .expect("preflight must produce a report, not an error");
+
+        assert!(!report.restore_permitted(), "got {report:?}");
+        assert!(
+            report
+                .external_mismatches
+                .iter()
+                .any(|mismatch| mismatch.observed.contains(&transit_key) || mismatch.expected.contains(&transit_key)),
+            "the missing Transit trust root must be named in the report: {report:?}"
+        );
+    }
 }
