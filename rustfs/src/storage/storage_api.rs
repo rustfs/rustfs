@@ -231,11 +231,11 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore,
-            ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-            ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-            StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata, validate_batch_read_version_item_count,
+            ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN,
+            PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
+            SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path,
+            collect_local_metrics, find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata,
+            reload_transition_tier_config, remove_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -493,11 +493,11 @@ pub(crate) mod ecstore_rio {
 
 pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
-        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
-        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
-        verify_tonic_rpc_signature_with_bootstrap,
+        KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
+        PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX,
+        normalize_tonic_rpc_audience, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
+        tonic_boot_epoch_response_headers, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -561,6 +561,7 @@ pub(crate) const OBJECT_LOCK_CONFIG: &str = ecstore_bucket::metadata::OBJECT_LOC
 pub(crate) const PEER_RESTDRY_RUN: &str = ecstore_rpc::PEER_RESTDRY_RUN;
 pub(crate) const PEER_RESTSIGNAL: &str = ecstore_rpc::PEER_RESTSIGNAL;
 pub(crate) const PEER_RESTSUB_SYS: &str = ecstore_rpc::PEER_RESTSUB_SYS;
+pub(crate) const KMS_SIGNAL_SUBSYSTEM: &str = ecstore_rpc::KMS_SIGNAL_SUBSYSTEM;
 pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNAL_REFRESH_CONFIG;
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
