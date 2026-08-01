@@ -974,11 +974,7 @@ pub(crate) fn log_sse_kms_key_policy_mode() {
 ///
 /// Scoping is limited to SSE-KMS, matching AWS: SSE-S3 wraps its data key with a
 /// server-owned key the caller never names, and SSE-C never reaches KMS at all.
-fn kms_authorization_subject<'a>(
-    enforced: bool,
-    principal: Option<&'a SseKmsPrincipal>,
-    sse_type: SSEType,
-) -> Option<&'a SseKmsPrincipal> {
+fn kms_authorization_subject(enforced: bool, principal: Option<&SseKmsPrincipal>, sse_type: SSEType) -> Option<&SseKmsPrincipal> {
     if !enforced || !matches!(sse_type, SSEType::SseKms) {
         return None;
     }
