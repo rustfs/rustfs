@@ -20,6 +20,7 @@ use crate::config::{BackendConfig, KmsConfig};
 use crate::deletion_worker::{DeletionReferenceChecker, DeletionWorker};
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
+use crate::probe::{ProbeHandle, ProbeStatus, spawn_probe_worker};
 use crate::service::ObjectEncryptionService;
 use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
@@ -120,12 +121,22 @@ struct ServiceVersion {
     /// Background deletion worker owned by this service version, if the
     /// backend supports deletion scheduling
     deletion_worker: Option<Arc<DeletionWorkerHandle>>,
+    /// Background synthetic probe owned by this service version, if the
+    /// backend can round-trip a data key and the probe is enabled
+    probe_worker: Option<Arc<ProbeHandle>>,
 }
 
 impl ServiceVersion {
-    fn shutdown_deletion_worker(&self) {
+    /// Stop the background workers this version owns.
+    ///
+    /// The credential renewal task is recycled separately because its shutdown
+    /// is asynchronous.
+    fn shutdown_background_workers(&self) {
         if let Some(worker) = &self.deletion_worker {
             worker.shutdown();
+        }
+        if let Some(probe) = &self.probe_worker {
+            probe.shutdown();
         }
     }
 }
@@ -379,7 +390,7 @@ impl KmsServiceManager {
         // Note: Existing Arc references will keep the service alive until operations complete
         let state = self.state.load_full();
         if let Some(current) = state.current_service.as_ref() {
-            current.shutdown_deletion_worker();
+            current.shutdown_background_workers();
         }
         self.state.store(Arc::new(RuntimeState {
             config: state.config.clone(),
@@ -514,6 +525,19 @@ impl KmsServiceManager {
         self.state.load().current_service.as_ref().map(|sv| sv.version)
     }
 
+    /// Latest synthetic probe snapshot of the running service version.
+    ///
+    /// `None` when KMS is not running, when the backend cannot round-trip a
+    /// data key, or when the probe is disabled. The read is lock-free and
+    /// performs no backend I/O, so a health endpoint can consult it without
+    /// turning an external KMS hiccup into probe pressure of its own; the
+    /// staleness and consecutive-failure thresholds belong to the caller.
+    pub fn probe_status(&self) -> Option<Arc<ProbeStatus>> {
+        let state = self.state.load();
+        let service_version = state.current_service.as_ref()?;
+        Some(service_version.probe_worker.as_ref()?.status())
+    }
+
     /// Health check for the KMS service
     pub async fn health_check(&self) -> Result<bool> {
         let checked_state = self.state.load_full();
@@ -596,6 +620,7 @@ impl KmsServiceManager {
             manager: kms_manager,
             credential_task,
             deletion_worker: None,
+            probe_worker: None,
         })
     }
 
@@ -609,9 +634,13 @@ impl KmsServiceManager {
 
     fn publish_running(&self, config: KmsConfig, mut service_version: ServiceVersion) {
         if let Some(previous) = self.state.load().current_service.as_ref() {
-            previous.shutdown_deletion_worker();
+            previous.shutdown_background_workers();
         }
         service_version.deletion_worker = self.spawn_deletion_worker(&config, &service_version);
+        // Started at publish time for the same reason as the deletion worker:
+        // a start or reconfigure candidate that never becomes current must not
+        // leak a running task or publish probe results nobody asked for.
+        service_version.probe_worker = spawn_probe_worker(service_version.manager.backend()).map(Arc::new);
         self.state.store(Arc::new(RuntimeState {
             config: Some(config),
             status: KmsServiceStatus::Running,
@@ -978,6 +1007,49 @@ mod tests {
                 .is_none(),
             "a backend without deletion scheduling must not run a worker"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_worker_follows_the_service_lifecycle() {
+        use tempfile::TempDir;
+
+        let key_dir = TempDir::new().expect("create local KMS directory");
+        let mut config = KmsConfig::local(key_dir.path().to_path_buf());
+        config.allow_insecure_dev_defaults = true;
+        let manager = KmsServiceManager::new();
+        manager.configure(config).await.expect("configure local KMS");
+        manager.start().await.expect("start local KMS");
+
+        let first_probe = manager
+            .state
+            .load()
+            .current_service
+            .as_ref()
+            .expect("running service")
+            .probe_worker
+            .clone()
+            .expect("a backend with a data key round trip must run a probe");
+        assert!(!first_probe.is_cancelled());
+        assert!(manager.probe_status().is_some(), "a running service must publish probe status");
+
+        // Replacing the service version replaces (and cancels) its probe.
+        manager.restart().await.expect("restart");
+        assert!(first_probe.is_cancelled(), "replaced version's probe must be cancelled");
+        let second_probe = manager
+            .state
+            .load()
+            .current_service
+            .as_ref()
+            .expect("running service")
+            .probe_worker
+            .clone()
+            .expect("restarted service must run a fresh probe");
+        assert!(!second_probe.is_cancelled());
+
+        // Stopping the service stops its probe and withdraws the snapshot.
+        manager.stop().await.expect("stop");
+        assert!(second_probe.is_cancelled(), "stop must cancel the probe worker");
+        assert!(manager.probe_status().is_none(), "a stopped service must publish no status");
     }
 
     #[tokio::test]
