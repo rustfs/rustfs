@@ -69,7 +69,9 @@ Decryption loads exactly the version recorded in the envelope and fails closed w
 
 ### Reading the `impact` section
 
-`DeleteKey` and `DescribeKey` responses carry an `impact` section listing the configuration that currently points at the key — the buckets whose default encryption names it, and whether it is the service default key — so the references that will refuse the destruction are visible when the deletion is scheduled rather than only in a server-side log once the window has run out.
+`DeleteKey` responses always carry an `impact` section listing the configuration that currently points at the key — the buckets whose default encryption names it, and whether it is the service default key — so the references that will refuse the destruction are visible when the deletion is scheduled rather than only in a server-side log once the window has run out.
+
+`DescribeKey` (`GET /rustfs/admin/v3/kms/keys/{key_id}`) can return the same section, but only when the request asks for it with `impact=true`. It is opt-in there because collecting it lists every bucket and `DescribeKey` is polled; without the parameter the endpoint does exactly the work it did before and returns no `impact` field at all. A value other than `true` or `false` is rejected with `400` rather than treated as `false`, so a typo can never answer a request for the section with a response that merely lacks one. **An absent section means "not collected", never "nothing references this key".**
 
 Read it for what it says and nothing more. `coverage.scanned` names the sources that were read; `coverage.not_scanned` names the ones that were not, which currently includes every object encrypted under the key. `completeness` is `exact` only over the scanned sources, and `unavailable` when a source could not be read at all — an unavailable report is not an empty one, and both an unreadable source and an outstanding reference will stop the sweep from destroying the material.
 

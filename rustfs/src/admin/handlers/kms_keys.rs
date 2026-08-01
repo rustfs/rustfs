@@ -374,8 +374,8 @@ mod tests {
     use super::{
         CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, DeleteKmsKeyResponse,
         DescribeKmsKeyResponse, GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id,
-        kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
-        kms_list_keys_actions, scoped_key_id,
+        key_impact_if_requested, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
+        kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
@@ -885,22 +885,81 @@ mod tests {
     fn handlers_report_the_key_impact_without_acting_on_it() {
         let src = include_str!("kms_keys.rs");
 
-        for handler in ["DeleteKmsKeyHandler", "DescribeKmsKeyHandler"] {
-            let block = operation_block(src, handler);
-            assert!(
-                block.contains("current_key_impact("),
-                "{handler} must report the configuration impact of the key it operates on"
-            );
-            for decision in [
-                "if impact",
+        // Deleting is the request whose consequences the caller cannot
+        // otherwise see, and it is not polled, so it always reports.
+        let delete = operation_block(src, "DeleteKmsKeyHandler");
+        assert!(
+            delete.contains("let impact = current_key_impact("),
+            "the delete path must report the configuration impact unconditionally"
+        );
+
+        // Describing is polled, so the same collection is opt-in there.
+        let describe = operation_block(src, "DescribeKmsKeyHandler");
+        assert!(
+            describe.contains("key_impact_if_requested(wants_impact,"),
+            "the describe path must collect the impact only when the request asked for it"
+        );
+        assert!(
+            !describe.contains("current_key_impact("),
+            "the describe path must not reach the collection except through the opt-in"
+        );
+
+        // Neither handler may read what the report says. Constructing it and
+        // handing it to the response is the whole of their business: a handler
+        // that inspected it would be treating "nothing found in the
+        // configuration layer" as "nothing uses this key", which it is not.
+        for (handler, block) in [("DeleteKmsKeyHandler", delete), ("DescribeKmsKeyHandler", describe)] {
+            for inspection in [
                 "impact.blocks_destruction",
-                "impact.references.is_empty",
-                "!impact",
+                "impact.references",
+                "impact.completeness",
+                "impact.coverage",
+                "impact.key_id",
                 "match impact",
             ] {
-                assert!(!block.contains(decision), "{handler} must not branch on the impact report (`{decision}`)");
+                assert!(!block.contains(inspection), "{handler} must not read the impact report (`{inspection}`)");
             }
         }
+    }
+
+    fn describe_uri(query: &str) -> Uri {
+        format!("/rustfs/admin/v3/kms/keys/key-a{query}")
+            .parse()
+            .expect("uri should parse")
+    }
+
+    #[test]
+    fn the_impact_section_is_opt_in_and_refuses_an_unreadable_opt_in() {
+        assert_eq!(
+            wants_key_impact(&describe_uri("")),
+            Ok(false),
+            "the default read path must not ask for it"
+        );
+        assert_eq!(wants_key_impact(&describe_uri("?impact=false")), Ok(false));
+        assert_eq!(wants_key_impact(&describe_uri("?impact=true")), Ok(true));
+
+        // A typo must not be read as "off": the caller asked for the section,
+        // and an absent section would be indistinguishable from an empty one.
+        for query in ["?impact=maybe", "?impact=1", "?impact=", "?impact=TRUE"] {
+            let error = wants_key_impact(&describe_uri(query)).expect_err("a malformed opt-in must be refused");
+            assert!(error.contains("expected 'true' or 'false'"), "unhelpful message for {query}: {error}");
+        }
+    }
+
+    /// A report can only come from the collection, so `None` is proof that the
+    /// default read path never reached the bucket listing behind it.
+    #[tokio::test]
+    async fn the_default_describe_path_never_collects_the_impact() {
+        assert!(key_impact_if_requested(false, "key-a", None).await.is_none());
+
+        let collected = key_impact_if_requested(true, "key-a", None)
+            .await
+            .expect("an opted-in describe must carry the section");
+        assert_eq!(collected.key_id, "key-a");
+        assert_eq!(
+            collected.coverage.not_scanned,
+            vec![ReferenceScope::ObjectEnvelopes, ReferenceScope::InProgressMultipartUploads]
+        );
     }
 
     fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
@@ -1778,9 +1837,41 @@ pub struct DescribeKmsKeyResponse {
     pub message: String,
     pub key_metadata: Option<KeyMetadata>,
     /// Configuration that currently points at the key, so the blast radius of
-    /// a deletion can be read off without scheduling one first. `None` when
-    /// the key could not be described at all.
+    /// a deletion can be read off without scheduling one first.
+    ///
+    /// Present only when the request asked for it with `impact=true`; `None`
+    /// otherwise, and whenever the key could not be described at all. Absent
+    /// therefore means "not collected", never "nothing references this key" —
+    /// see [`KeyImpactReport`] for what a collected one does and does not say.
     pub impact: Option<KeyImpactReport>,
+}
+
+/// Whether the caller asked for the configuration impact section.
+///
+/// Off unless asked for. Collecting the section lists every bucket, and this
+/// endpoint is polled, so the default read path must not carry that fan-out;
+/// the delete path reports unconditionally instead, because that is the
+/// request whose consequences the operator cannot otherwise see.
+///
+/// A value that is neither `true` nor `false` is refused rather than read as
+/// "off". Silently downgrading a typo would answer a request for the section
+/// with a response that has none, and an absent section must never be
+/// mistaken for one that found nothing.
+fn wants_key_impact(uri: &hyper::Uri) -> Result<bool, String> {
+    match extract_query_params(uri).get("impact") {
+        None => Ok(false),
+        Some(value) => value
+            .parse::<bool>()
+            .map_err(|_| format!("invalid value for 'impact': expected 'true' or 'false', got '{value}'")),
+    }
+}
+
+/// Configuration impact of the described key, collected only when requested.
+async fn key_impact_if_requested(requested: bool, key_id: &str, default_key_id: Option<&str>) -> Option<KeyImpactReport> {
+    if !requested {
+        return None;
+    }
+    Some(current_key_impact(key_id, default_key_id).await)
 }
 
 /// Describe a KMS key
@@ -1827,6 +1918,25 @@ impl Operation for DescribeKmsKeyHandler {
             return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
         };
 
+        // Validated before the key is looked up, so a malformed opt-in fails as
+        // the input error it is instead of riding along on the key's outcome.
+        let wants_impact = match wants_key_impact(&req.uri) {
+            Ok(wants_impact) => wants_impact,
+            Err(message) => {
+                let response = DescribeKmsKeyResponse {
+                    success: false,
+                    message,
+                    key_metadata: None,
+                    impact: None,
+                };
+                let data =
+                    serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
+                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+            }
+        };
+
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DescribeKmsKeyResponse {
                 success: false,
@@ -1870,15 +1980,16 @@ impl Operation for DescribeKmsKeyHandler {
                     state = "completed",
                     "admin kms keys state"
                 );
-                // Read-only: the same configuration-layer facts the delete
-                // path reports, so the blast radius of a deletion can be
+                // Read-only, and opt-in: the same configuration-layer facts the
+                // delete path reports, so the blast radius of a deletion can be
                 // inspected without scheduling one first.
-                let impact = current_key_impact(key_id, manager.get_default_key_id().map(String::as_str)).await;
+                let impact =
+                    key_impact_if_requested(wants_impact, key_id, manager.get_default_key_id().map(String::as_str)).await;
                 let response = DescribeKmsKeyResponse {
                     success: true,
                     message: "Key described successfully".to_string(),
                     key_metadata: Some(kms_response.key_metadata),
-                    impact: Some(impact),
+                    impact,
                 };
 
                 let data =
