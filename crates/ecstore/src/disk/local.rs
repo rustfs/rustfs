@@ -5078,7 +5078,7 @@ impl LocalDisk {
         Ok((buf, mtime))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
@@ -5121,7 +5121,7 @@ impl LocalDisk {
         Ok((data, modtime))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
         // TODO: timeout support
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;

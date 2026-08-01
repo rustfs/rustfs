@@ -199,7 +199,7 @@ impl SetDisks {
         );
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "SetDisks")]
     pub async fn read_version_optimized(
         &self,
         bucket: &str,
@@ -238,7 +238,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_fileinfo(
         &self,
         bucket: &str,
@@ -410,7 +410,7 @@ impl SetDisks {
         Ok((fi, parts_metadata, op_online_disks))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_info_and_quorum(
         &self,
         bucket: &str,
@@ -605,7 +605,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_with_fileinfo<W>(
         // &self,
         bucket: &str,
@@ -1140,7 +1140,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_decode_reader_with_fileinfo(
         bucket: &str,
         object: &str,
@@ -1296,7 +1296,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "SetDisks")]
     async fn build_codec_streaming_part_reader(
         bucket: &str,
         object: &str,

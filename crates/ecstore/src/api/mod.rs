@@ -172,6 +172,9 @@ pub mod bucket {
     }
 
     pub mod replication {
+        pub use crate::bucket::replication::replication_pool::{
+            DurableMrfBacklogSummary, DurableMrfBucketBacklog, durable_mrf_backlog_summary_snapshot,
+        };
         pub use crate::bucket::replication::{
             BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool,
             MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,

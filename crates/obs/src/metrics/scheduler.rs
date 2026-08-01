@@ -35,6 +35,7 @@ use crate::metrics::collectors::{
     ProcessMemoryStats,
     collect_audit_metrics,
     collect_bucket_metrics,
+    collect_bucket_replication_backlog_metrics,
     collect_bucket_replication_bandwidth_metrics,
     collect_bucket_replication_metrics,
     collect_bucket_usage_metrics,
@@ -94,7 +95,7 @@ use crate::metrics::schema::notification_target::{
 };
 use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
-    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
+    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_stats_bundle,
     collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
     collect_compression_cluster_stats, collect_disk_and_system_drive_stats, collect_erasure_set_stats,
     collect_host_network_stats, collect_iam_stats, collect_ilm_metric_stats, collect_internode_network_stats,
@@ -1348,8 +1349,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             // Phase-1 action: force zero for removed keys during tombstone cycles.
                             metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
 
-                            let bucket_replication = collect_bucket_replication_detail_stats().await;
+                            let (bucket_replication, bucket_replication_backlog) = collect_bucket_replication_stats_bundle().await;
                             metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
+                            metrics.extend(collect_bucket_replication_backlog_metrics(&bucket_replication_backlog));
                             let replication = collect_replication_stats().await;
                             metrics.extend(collect_replication_metrics(&replication));
                             report_metrics(&metrics);

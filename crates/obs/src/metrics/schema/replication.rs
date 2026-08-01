@@ -128,7 +128,7 @@ pub static REPLICATION_MAX_DATA_TRANSFER_RATE_MD: LazyLock<MetricDescriptor> = L
 pub static REPLICATION_RECENT_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ReplicationRecentBacklogCount,
-        "Total number of objects currently in replication backlog (failed plus queued)",
+        "Legacy replication backlog indicator: failed target objects plus objects currently queued on this node",
         &[],
         subsystems::REPLICATION,
     )

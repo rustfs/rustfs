@@ -18,7 +18,26 @@
 //! used across different logging backends (stdout, file, OpenTelemetry).
 
 use std::env;
-use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+use tracing::Metadata;
+use tracing_subscriber::{
+    EnvFilter,
+    filter::{FilterFn, LevelFilter, filter_fn},
+};
+
+/// Pyroscope emits raw reqwest errors from its background session manager.
+/// Those errors can include the configured endpoint, so they must never reach
+/// a RustFS logging sink even when an operator enables verbose dependency logs.
+pub(super) fn is_pyroscope_dependency_target(target: &str) -> bool {
+    target == "pyroscope" || target.starts_with("pyroscope::") || target.starts_with("Pyroscope::")
+}
+
+fn allows_non_pyroscope_dependency_event(metadata: &Metadata<'_>) -> bool {
+    !is_pyroscope_dependency_target(metadata.target())
+}
+
+pub(super) fn pyroscope_log_filter() -> FilterFn {
+    filter_fn(allows_non_pyroscope_dependency_event)
+}
 
 /// Build an `EnvFilter` from the given log level string.
 ///
