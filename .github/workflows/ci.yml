@@ -96,6 +96,10 @@ jobs:
 
   # Fast, compile-free checks that fail early so contributors get feedback in
   # ~1 minute instead of waiting for the full test job.
+  #
+  # These steps are mirrored byte-for-byte in ci-docs-only.yml so that a mixed
+  # PR, which reports two check runs named "Quick Checks", cannot get one red
+  # and one green. Edit both jobs together.
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
