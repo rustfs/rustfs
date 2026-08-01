@@ -24,6 +24,7 @@ use std::time::Duration;
 use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
+pub const ENV_KMS_ALLOW_IMMEDIATE_DELETION: &str = "RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
@@ -164,6 +165,24 @@ pub struct KmsConfig {
     /// Allow development-only insecure defaults such as plaintext local keys or HTTP Vault.
     #[serde(default)]
     pub allow_insecure_dev_defaults: bool,
+    /// Allow `DeleteKey` requests to skip the pending-deletion waiting window and
+    /// destroy key material right away.
+    ///
+    /// Off by default: an immediate deletion is unrecoverable and takes every
+    /// object encrypted under the key with it, so the waiting window (plus
+    /// `CancelKeyDeletion`) is the only recovery path. Operators who genuinely
+    /// need immediate deletion — throwaway test clusters, key material that was
+    /// never used — must turn it on through server configuration
+    /// ([`ENV_KMS_ALLOW_IMMEDIATE_DELETION`]); the request must still echo the
+    /// key id back for confirmation.
+    ///
+    /// Not part of the serialized configuration, and not settable through the
+    /// admin configure API. It is per-server operator state that has to be
+    /// re-stated to survive a restart: persisting it would carry one operator's
+    /// one-time enablement into the cluster-wide config that every node reloads,
+    /// long after the deletion it was turned on for.
+    #[serde(skip)]
+    pub allow_immediate_deletion: bool,
     /// Timeout for a single backend attempt.
     ///
     /// This bounds one outbound request, not the whole operation: the operation
@@ -187,6 +206,7 @@ impl Default for KmsConfig {
             default_key_id: None,
             backend_config: BackendConfig::default(),
             allow_insecure_dev_defaults: false,
+            allow_immediate_deletion: false,
             timeout: Duration::from_secs(30),
             retry_attempts: 3,
             enable_cache: true,
@@ -714,6 +734,12 @@ impl KmsConfig {
         self
     }
 
+    /// Explicitly allow deletions that bypass the pending-deletion waiting window.
+    pub fn with_immediate_deletion_allowed(mut self) -> Self {
+        self.allow_immediate_deletion = true;
+        self
+    }
+
     /// Set operation timeout
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -927,6 +953,7 @@ impl KmsConfig {
         config.enable_cache = get_env_bool("RUSTFS_KMS_ENABLE_CACHE", config.enable_cache);
         config.allow_insecure_dev_defaults =
             get_env_bool(ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS, config.allow_insecure_dev_defaults);
+        config.allow_immediate_deletion = get_env_bool(ENV_KMS_ALLOW_IMMEDIATE_DELETION, config.allow_immediate_deletion);
 
         // Backend-specific configuration
         match config.backend {
@@ -1040,6 +1067,15 @@ impl KmsConfig {
         config.validate()?;
         Ok(config)
     }
+}
+
+/// Read the immediate-deletion gate from the environment.
+///
+/// Callers that assemble a [`KmsConfig`] field by field instead of going
+/// through [`KmsConfig::from_env`] use this, so the gate keeps one name, one
+/// default, and one place to look it up.
+pub fn allow_immediate_deletion_from_env() -> bool {
+    get_env_bool(ENV_KMS_ALLOW_IMMEDIATE_DELETION, false)
 }
 
 fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
@@ -1800,6 +1836,38 @@ mod tests {
         assert_eq!(secret_id_file, None);
         assert_eq!(mount, DEFAULT_VAULT_APPROLE_MOUNT);
         assert_eq!(refresh_safety_window_secs, None);
+    }
+
+    /// The gate lives in server configuration only: it never rides along in a
+    /// serialized config, and a stored config that claims it must not be
+    /// believed. Otherwise one operator's one-time enablement would reach every
+    /// node that later reloads that config.
+    #[test]
+    fn immediate_deletion_gate_is_server_local_and_never_persisted() {
+        let persisted =
+            serde_json::to_value(KmsConfig::default().with_immediate_deletion_allowed()).expect("kms config should serialize");
+        assert!(
+            persisted.get("allow_immediate_deletion").is_none(),
+            "the gate must not be written into a persisted config: {persisted}"
+        );
+
+        let mut forged = persisted;
+        forged
+            .as_object_mut()
+            .expect("a persisted config must be a JSON object")
+            .insert("allow_immediate_deletion".to_string(), serde_json::json!(true));
+        let restored: KmsConfig = serde_json::from_value(forged).expect("an unknown gate field must not break loading");
+        assert!(!restored.allow_immediate_deletion, "a stored gate must fail closed");
+
+        with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, Some("true"))], || {
+            assert!(
+                allow_immediate_deletion_from_env(),
+                "the gate must be reachable from server configuration"
+            );
+        });
+        with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, None::<&str>)], || {
+            assert!(!allow_immediate_deletion_from_env());
+        });
     }
 
     #[test]

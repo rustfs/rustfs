@@ -1427,11 +1427,15 @@ impl KmsBackend for VaultKmsBackend {
             // Schedule for deletion (default 30 days)
             ensure_key_state_permits(key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(crate::error::KmsError::invalid_parameter(
-                    "pending_window_in_days must be between 7 and 30".to_string(),
-                ));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(crate::error::KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
@@ -2274,6 +2278,7 @@ mod tests {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: Some(false),
+                confirm_key_id: None,
             })
             .await
             .expect("schedule delete");
@@ -2777,6 +2782,7 @@ mod tests {
                 key_id: "wired-key".to_string(),
                 pending_window_in_days: Some(7),
                 force_immediate: Some(false),
+                confirm_key_id: None,
             })
             .await
             .expect("the schedule must retry past the lost race and commit");
@@ -2791,6 +2797,45 @@ mod tests {
             !committed["data"]["deletion_date"].is_null(),
             "the deadline must be persisted: {committed}"
         );
+    }
+
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn wired_schedule_deletion_refuses_a_window_outside_the_supported_range() {
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let vault = ScriptedVault::serve(vec![
+                // describe_key: key info plus stored metadata.
+                ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+                ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ])
+            .await;
+            let config = KmsConfig::vault(
+                url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+                "scripted-token".to_string(),
+            )
+            .with_insecure_development_defaults();
+            let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: "wired-key".to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+
+            let requests = vault.requests();
+            assert!(
+                !requests.iter().any(|line| line.starts_with("POST ")),
+                "a refused window must not write anything: {requests:?}"
+            );
+        }
     }
 
     /// Conflict semantics are re-read *and* re-gate: when the re-read after a
@@ -2825,6 +2870,7 @@ mod tests {
                 key_id: "wired-key".to_string(),
                 pending_window_in_days: Some(7),
                 force_immediate: Some(false),
+                confirm_key_id: None,
             })
             .await
             .expect_err("the retry must re-run the state gate against the fresh record");

@@ -192,6 +192,9 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 
 fn decode_persisted_kms_config(data: &[u8]) -> serde_json::Result<(KmsConfig, bool)> {
     let mut config: KmsConfig = serde_json::from_slice(data)?;
+    // The immediate-deletion gate is per-server operator state, never stored,
+    // so a config loaded from cluster storage still has to pick it up here.
+    config.allow_immediate_deletion = rustfs_kms::config::allow_immediate_deletion_from_env();
     let value: serde_json::Value = serde_json::from_slice(data)?;
     let is_missing_development_flag = value
         .as_object()
