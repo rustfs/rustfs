@@ -75,6 +75,7 @@ mod encryption;
 mod error;
 pub mod manager;
 mod policy;
+pub mod probe;
 pub mod service;
 pub mod service_manager;
 mod time_serde;
@@ -93,6 +94,7 @@ pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;
+pub use probe::{ProbeFailureKind, ProbeResult, ProbeStatus};
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{
     KmsServiceManager, KmsServiceStatus, KmsStartOutcome, get_global_encryption_service, get_global_kms_service_manager,
