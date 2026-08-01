@@ -364,6 +364,11 @@ impl SimpleQueryDispatcher {
                 {
                     file_format = file_format.with_delimiter(delimiter.as_bytes()[0]);
                 }
+                if let Some(delimiter) = csv.record_delimiter.as_ref()
+                    && delimiter.len() == 1
+                {
+                    file_format = file_format.with_terminator(Some(delimiter.as_bytes()[0]));
+                }
                 match csv.file_header_info.as_ref() {
                     Some(info) => {
                         if *info == *NONE {
@@ -729,6 +734,8 @@ mod tests {
             record_batch::RecordBatch,
         },
         common::DataFusionError,
+        execution::object_store::ObjectStoreUrl,
+        object_store::{ObjectStoreExt, path::Path},
         physical_plan::{RecordBatchStream, stream::RecordBatchStreamAdapter},
     };
     use futures::{StreamExt, stream};
@@ -1023,6 +1030,72 @@ mod tests {
         assert_eq!(dispatcher.query_admission.available_permits(), DEFAULT_MAX_CONCURRENT_QUERIES);
         assert_eq!(dispatcher.query_timeout, Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS));
         assert_eq!(dispatcher.memory_limit_bytes, DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn csv_query_uses_single_byte_record_delimiter() {
+        const ROW_COUNT: usize = 3;
+
+        let mut input = test_input();
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("test input should use CSV serialization");
+        csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+        csv.record_delimiter = Some("^".to_string());
+        let input = Arc::new(input);
+        let admission = Arc::new(Semaphore::new(1));
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let scheduler = Arc::new(LocalScheduler {});
+        let dispatcher = SimpleQueryDispatcherBuilder::default()
+            .with_input(Arc::clone(&input))
+            .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+            .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
+            .with_parser(Arc::new(DefaultParser::default()))
+            .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)))
+            .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+            .with_query_admission(Arc::clone(&admission))
+            .with_query_timeout(Duration::from_secs(300))
+            .build()
+            .expect("query dispatcher should build");
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+        let query_state_machine = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("query should acquire admission");
+        let store_url = ObjectStoreUrl::parse("s3://test-bucket").expect("test object store URL should be valid");
+        let store = query_state_machine
+            .session
+            .inner()
+            .runtime_env()
+            .object_store(&store_url)
+            .expect("test object store should be registered");
+        store
+            .put(&Path::from("test.csv"), b"value^".repeat(ROW_COUNT).into())
+            .await
+            .expect("CSV fixture should be stored");
+
+        let logical_plan = dispatcher
+            .build_logical_plan(Arc::clone(&query_state_machine))
+            .await
+            .expect("query should build a logical plan")
+            .expect("select query should produce a logical plan");
+        let output = dispatcher
+            .execute_logical_plan(logical_plan, query_state_machine)
+            .await
+            .expect("query should execute");
+        let mut stream = output
+            .into_record_batch_stream()
+            .expect("select query should return a record batch stream");
+        let mut row_count = 0;
+        while let Some(batch) = stream.next().await {
+            row_count += batch.expect("query batch should be valid").num_rows();
+        }
+
+        assert_eq!(row_count, ROW_COUNT);
+        assert_eq!(admission.available_permits(), 1);
     }
 
     #[tokio::test]

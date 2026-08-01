@@ -349,6 +349,19 @@ impl SessionCtxFactory {
         };
         let rt = RuntimeEnvBuilder::new().with_memory_limit(memory_limit_bytes, 1.0).build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
+        let config = if context
+            .input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .and_then(|csv| csv.record_delimiter.as_deref())
+            .is_some_and(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != b"\r\n")
+        {
+            config.with_repartition_file_scans(false)
+        } else {
+            config
+        };
         let memory_pool = Arc::clone(&rt.memory_pool);
         let df_session_state = SessionStateBuilder::new()
             .with_config(config)
@@ -530,6 +543,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_byte_csv_record_delimiter_disables_file_scan_repartition() {
+        let mut context = test_context();
+        Arc::get_mut(&mut context.input)
+            .expect("test context input should be uniquely owned")
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("test context should use CSV")
+            .record_delimiter = Some("aa".to_string());
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(4)
+            .create_session_ctx(&context)
+            .await
+            .expect("session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn crlf_record_delimiter_retains_file_scan_repartition() {
+        let mut context = test_context();
+        Arc::get_mut(&mut context.input)
+            .expect("test context input should be uniquely owned")
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("test context should use CSV")
+            .record_delimiter = Some("\r\n".to_string());
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(4)
+            .create_session_ctx(&context)
+            .await
+            .expect("session should be created");
+
+        assert_eq!(
+            session.inner().config().options().optimizer.repartition_file_scans,
+            SessionConfig::new().options().optimizer.repartition_file_scans
+        );
+    }
+
+    #[tokio::test]
     async fn session_factory_zero_target_partitions_uses_datafusion_default() {
         let factory = SessionCtxFactory::new(true);
         let session = factory
@@ -557,12 +613,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn session_factory_propagates_query_guard_to_ec_store() {
-        let temp_root = tempfile::tempdir().expect("create session test temp root");
-        let env = rustfs_test_utils::TestECStoreEnv::builder()
-            .base_dir(temp_root.path())
-            .init_bucket_metadata(false)
-            .build()
-            .await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
 
         let admission = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = Arc::clone(&admission)

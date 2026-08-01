@@ -84,6 +84,8 @@ pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
+const NORMALIZED_RECORD_DELIMITER: &[u8] = b"\r\n";
+const NORMALIZED_FIELD_DELIMITER: &[u8] = &[DEFAULT_DELIMITER];
 
 #[derive(Debug)]
 pub struct EcObjectStore {
@@ -227,6 +229,17 @@ impl EcObjectStore {
             .and_then(|csv| csv.record_delimiter.as_ref())
             .map(|delimiter| delimiter.as_bytes().to_vec())
             .unwrap_or_else(|| b"\n".to_vec())
+    }
+
+    fn record_delimiter_to_convert(&self) -> Option<Vec<u8>> {
+        self.input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .and_then(|csv| csv.record_delimiter.as_deref())
+            .filter(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != NORMALIZED_RECORD_DELIMITER)
+            .map(|delimiter| delimiter.as_bytes().to_vec())
     }
 
     fn csv_has_header(&self) -> bool {
@@ -382,7 +395,13 @@ fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
 }
 
 fn scan_range_read_start(scan_range: SelectScanRange, delimiter: &[u8]) -> u64 {
-    scan_range.start().saturating_sub(delimiter.len() as u64)
+    // MinIO initializes its delimiter transform after seeking to ScanRange.Start;
+    // overlapping delimiters must therefore start with the same local match state.
+    if delimiter.len() == 2 && delimiter[0] == delimiter[1] {
+        scan_range.start()
+    } else {
+        scan_range.start().saturating_sub(delimiter.len() as u64)
+    }
 }
 
 fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
@@ -481,6 +500,11 @@ impl ObjectStore for EcObjectStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let opts = self.object_options(&options);
+        let record_delimiter = if options.head {
+            None
+        } else {
+            self.record_delimiter_to_convert()
+        };
         let needs_scan_context = options.range.is_none() && !options.head && self.input.request.scan_range.is_some();
         let source_size = if needs_scan_context {
             Some(validated_object_size(self.object_info(&opts).await?.size)?)
@@ -518,13 +542,16 @@ impl ObjectStore for EcObjectStore {
             })?,
             None => 0..original_size,
         };
-
         let payload = if options.head {
             GetResultPayload::Stream(stream::empty().boxed())
         } else if options.range.is_some() {
-            let size = (result_range.end - result_range.start) as usize;
-            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size).boxed();
-            GetResultPayload::Stream(stream)
+            let size = usize::try_from(result_range.end - result_range.start).map_err(|err| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(err),
+            })?;
+            GetResultPayload::Stream(
+                bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size).boxed(),
+            )
         } else if self.is_json_document {
             // JSON DOCUMENT mode: gate on object size before doing any I/O.
             //
@@ -570,13 +597,21 @@ impl ObjectStore for EcObjectStore {
             } else {
                 stream
             };
-            GetResultPayload::Stream(convert_field_delimiter_stream(stream, self.need_convert.then(|| self.delimiter.clone())))
+            GetResultPayload::Stream(convert_csv_delimiter_stream(
+                stream,
+                record_delimiter,
+                self.need_convert.then(|| self.delimiter.clone()),
+            ))
         } else {
             let stream = bytes_stream(
                 ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
             );
-            GetResultPayload::Stream(convert_field_delimiter_stream(stream, self.need_convert.then(|| self.delimiter.clone())))
+            GetResultPayload::Stream(convert_csv_delimiter_stream(
+                stream,
+                record_delimiter,
+                self.need_convert.then(|| self.delimiter.clone()),
+            ))
         };
 
         let meta = ObjectMeta {
@@ -622,13 +657,15 @@ impl ObjectStore for EcObjectStore {
 
 struct DelimiterConverter {
     delimiter: Vec<u8>,
+    replacement: &'static [u8],
     carry: Vec<u8>,
 }
 
 impl DelimiterConverter {
-    fn new(delimiter: Vec<u8>) -> Self {
+    fn new(delimiter: Vec<u8>, replacement: &'static [u8]) -> Self {
         Self {
             delimiter,
+            replacement,
             carry: Vec::new(),
         }
     }
@@ -647,7 +684,7 @@ impl DelimiterConverter {
         let mut pos = 0;
         while pos < safe_end {
             if combined[pos..].starts_with(&self.delimiter) {
-                converted.push(DEFAULT_DELIMITER);
+                converted.extend_from_slice(self.replacement);
                 pos += self.delimiter.len();
             } else {
                 converted.push(combined[pos]);
@@ -663,13 +700,13 @@ impl DelimiterConverter {
         if self.delimiter.is_empty() {
             return std::mem::take(&mut self.carry);
         }
-        let converted = replace_symbol(&self.delimiter, &self.carry);
+        let converted = replace_symbol(&self.delimiter, self.replacement, &self.carry);
         self.carry.clear();
         converted
     }
 }
 
-fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
+fn replace_symbol(delimiter: &[u8], replacement: &[u8], slice: &[u8]) -> Vec<u8> {
     if delimiter.is_empty() {
         return slice.to_vec();
     }
@@ -678,7 +715,7 @@ fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < slice.len() {
         if slice[i..].starts_with(delimiter) {
-            result.push(DEFAULT_DELIMITER);
+            result.extend_from_slice(replacement);
             i += delimiter.len();
         } else {
             result.push(slice[i]);
@@ -688,15 +725,12 @@ fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
     result
 }
 
-fn convert_field_delimiter_stream<S>(stream: S, delimiter: Option<String>) -> BoxStream<'static, Result<Bytes>>
+fn convert_delimiter_stream<S>(stream: S, delimiter: Vec<u8>, replacement: &'static [u8]) -> BoxStream<'static, Result<Bytes>>
 where
     S: Stream<Item = Result<Bytes>> + Send + 'static,
 {
-    let Some(delimiter) = delimiter else {
-        return stream.boxed();
-    };
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
-        let mut converter = DelimiterConverter::new(delimiter.into_bytes());
+        let mut converter = DelimiterConverter::new(delimiter, replacement);
         pin_mut!(stream);
         while let Some(result) = stream.next().await {
             let bytes = result?;
@@ -712,6 +746,37 @@ where
         Ok(())
     })
     .boxed()
+}
+
+fn convert_record_delimiter_stream<S>(stream: S, delimiter: Vec<u8>) -> BoxStream<'static, Result<Bytes>>
+where
+    S: Stream<Item = Result<Bytes>> + Send + 'static,
+{
+    // DataFusion's CSV reader treats CRLF as a record terminator.
+    convert_delimiter_stream(stream, delimiter, NORMALIZED_RECORD_DELIMITER)
+}
+
+fn convert_field_delimiter_stream<S>(stream: S, delimiter: String) -> BoxStream<'static, Result<Bytes>>
+where
+    S: Stream<Item = Result<Bytes>> + Send + 'static,
+{
+    convert_delimiter_stream(stream, delimiter.into_bytes(), NORMALIZED_FIELD_DELIMITER)
+}
+
+fn convert_csv_delimiter_stream<S>(
+    stream: S,
+    record_delimiter: Option<Vec<u8>>,
+    field_delimiter: Option<String>,
+) -> BoxStream<'static, Result<Bytes>>
+where
+    S: Stream<Item = Result<Bytes>> + Send + 'static,
+{
+    match (record_delimiter, field_delimiter) {
+        (None, None) => stream.boxed(),
+        (Some(record), None) => convert_record_delimiter_stream(stream, record),
+        (None, Some(field)) => convert_field_delimiter_stream(stream, field),
+        (Some(record), Some(field)) => convert_field_delimiter_stream(convert_record_delimiter_stream(stream, record), field),
+    }
 }
 
 struct ScanRangeState<S> {
@@ -1186,11 +1251,11 @@ fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error 
 #[cfg(test)]
 mod test {
     use super::{
-        EcObjectStore, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SelectScanRange, bytes_stream,
-        convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson,
-        http_range_spec_from_get_range, json_document_ndjson_stream, json_document_ndjson_stream_with_parser, replace_symbol,
-        scan_range_from_bounds, scan_range_read_start, scan_range_stream, select_read_headers, validate_json_document_size,
-        validated_object_size,
+        EcObjectStore, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectScanRange,
+        bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
+        extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
+        json_document_ndjson_stream, json_document_ndjson_stream_with_parser, replace_symbol, scan_range_from_bounds,
+        scan_range_read_start, scan_range_stream, select_read_headers, validate_json_document_size, validated_object_size,
     };
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
@@ -1199,7 +1264,10 @@ mod test {
     use datafusion::{
         common::DataFusionError,
         execution::memory_pool::{GreedyMemoryPool, MemoryPool},
+        execution::{config::SessionConfig, context::SessionContext},
         object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
+        physical_plan::ExecutionPlanProperties,
+        prelude::CsvReadOptions,
     };
     use futures::{StreamExt, TryStreamExt, stream};
     use s3s::dto::{
@@ -1223,7 +1291,7 @@ mod test {
 
     #[test]
     fn test_replace() {
-        let result = replace_symbol(b"&&", b"dandan&&is&&best");
+        let result = replace_symbol(b"&&", b",", b"dandan&&is&&best");
         assert_eq!(result, b"dandan,is,best");
     }
 
@@ -1293,6 +1361,66 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_range_stream_converts_custom_delimiter_split_across_chunks() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2^")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"Y1,a^Y2,b^")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"Y3,c^Y")),
+        ]);
+        let stream = scan_range_stream(chunks, b"^Y".to_vec(), SelectScanRange::new(12, 14), true, 0, 22);
+        let mut stream = convert_record_delimiter_stream(stream, b"^Y".to_vec());
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.expect("custom-delimiter ScanRange chunk should be valid"));
+        }
+        assert_eq!(output, b"h1,h2\r\n2,b\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_record_delimiter_conversion_carries_partial_delimiter() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a,1^")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"Yb,2^Y")),
+        ]);
+        let output = convert_record_delimiter_stream(chunks, b"^Y".to_vec())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("convert record delimiter")
+            .concat();
+        assert_eq!(output, b"a,1\r\nb,2\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_record_delimiter_conversion_preserves_overlapping_match_order() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"aa")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a")),
+        ]);
+        let output = convert_record_delimiter_stream(chunks, b"aa".to_vec())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("convert overlapping record delimiter")
+            .concat();
+        assert_eq!(output, b"\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_record_and_field_delimiter_conversion_order() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"&1^")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"Yb&&2^Y")),
+        ]);
+        let output = convert_csv_delimiter_stream(chunks, Some(b"^Y".to_vec()), Some("&&".to_string()))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("convert record and field delimiters")
+            .concat();
+        assert_eq!(output, b"a,1\r\nb,2\r\n");
+    }
+
+    #[tokio::test]
     async fn test_scan_range_stream_rejects_early_eof() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n"))]);
         let mut output = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 7), false, 0, 8);
@@ -1318,6 +1446,33 @@ mod test {
         assert_eq!(scan_range_read_start(range, b"\n"), 9);
         assert_eq!(scan_range_read_start(range, b"\r\n"), 8);
         assert_eq!(scan_range_read_start(range, b"abcdef"), 4);
+        assert_eq!(scan_range_read_start(range, b"aa"), 10);
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_self_overlapping_delimiter_matches_minio_local_state() {
+        let raw = b"baaXaa";
+        let range = SelectScanRange::new(2, 3);
+        let read_start = scan_range_read_start(range, b"aa");
+        assert_eq!(read_start, 2);
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&raw[2..3])),
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&raw[3..4])),
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&raw[4..])),
+        ]);
+        let output = scan_range_stream(
+            chunks,
+            b"aa".to_vec(),
+            range,
+            false,
+            read_start,
+            u64::try_from(raw.len()).expect("fixture length should fit in u64"),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("scan range with self-overlapping delimiter")
+        .concat();
+        assert_eq!(output, b"aXaa");
     }
 
     #[test]
@@ -1388,7 +1543,7 @@ mod test {
     async fn test_scan_range_output_can_convert_field_delimiter() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"a&&1\nb&&2\n"))]);
         let stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 10), false, 0, 10);
-        let mut stream = convert_field_delimiter_stream(stream, Some("&&".to_string()));
+        let mut stream = convert_field_delimiter_stream(stream, "&&".to_string());
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1402,7 +1557,7 @@ mod test {
             Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
             Ok::<_, object_store::Error>(Bytes::from_static(b"&1\nb&&2\n")),
         ]);
-        let mut stream = convert_field_delimiter_stream(chunks, Some("&&".to_string()));
+        let mut stream = convert_field_delimiter_stream(chunks, "&&".to_string());
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1416,7 +1571,7 @@ mod test {
             Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
             Ok::<_, object_store::Error>(Bytes::from_static(b"&")),
         ]);
-        let mut stream = convert_field_delimiter_stream(chunks, Some("&&".to_string()));
+        let mut stream = convert_field_delimiter_stream(chunks, "&&".to_string());
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1426,12 +1581,111 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
+    async fn test_self_overlapping_record_delimiter_uses_single_full_file_partition() {
+        const TARGET_PARTITIONS: usize = 4;
+
+        let mut input_bytes = Vec::with_capacity(SELECT_DEFAULT_READ_BUFFER_SIZE + 8);
+        input_bytes.extend_from_slice(b"0,");
+        input_bytes.resize(SELECT_DEFAULT_READ_BUFFER_SIZE - 1, b'b');
+        input_bytes.extend_from_slice(b"aaaX,caa");
+        assert!(input_bytes.len() > 1024 * 1024);
+        assert_eq!(
+            &input_bytes[SELECT_DEFAULT_READ_BUFFER_SIZE - 1..SELECT_DEFAULT_READ_BUFFER_SIZE + 2],
+            b"aaa"
+        );
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        let bucket = "s3select-record-delimiter";
+        let object = "input.csv";
+        env.make_bucket(bucket, false).await;
+        let mut reader = SelectPutObjReader::from_vec(input_bytes);
+        env.ecstore
+            .put_object(bucket, object, &mut reader, &Default::default())
+            .await
+            .expect("put multi-byte record-delimited test object");
+
+        let input = Arc::new(SelectObjectContentInput {
+            bucket: bucket.to_string(),
+            expected_bucket_owner: None,
+            key: object.to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM s3object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput {
+                        record_delimiter: Some("aa".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        });
+        let store = Arc::new(EcObjectStore {
+            input,
+            need_convert: false,
+            delimiter: String::new(),
+            is_json_document: false,
+            json_sub_path: None,
+            memory_pool: Arc::new(GreedyMemoryPool::new(32 * 1024 * 1024)),
+            query_tracker: None,
+            store: Arc::clone(&env.ecstore),
+        });
+
+        let config = SessionConfig::new()
+            .with_repartition_file_scans(false)
+            .with_repartition_file_min_size(0)
+            .with_target_partitions(TARGET_PARTITIONS);
+        let context = SessionContext::new_with_config(config);
+        let store_url = url::Url::parse(&format!("s3://{bucket}")).expect("valid object store URL");
+        context.runtime_env().register_object_store(&store_url, store);
+        context
+            .register_csv("records", &format!("s3://{bucket}/{object}"), CsvReadOptions::new().has_header(false))
+            .await
+            .expect("register partitioned CSV");
+
+        let scan_plan = context
+            .sql("SELECT * FROM records")
+            .await
+            .expect("plan partitioned CSV")
+            .create_physical_plan()
+            .await
+            .expect("create partitioned CSV physical plan");
+        assert_eq!(scan_plan.output_partitioning().partition_count(), 1);
+
+        let batches = context
+            .sql("SELECT column_1 FROM records")
+            .await
+            .expect("plan exact-result query")
+            .collect()
+            .await
+            .expect("query self-overlapping record-delimited CSV");
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .expect("mixed first column should be Utf8");
+                column.iter().map(|value| value.map(str::to_string)).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some("0".to_string()), Some("aX".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
     async fn test_get_opts_validates_raw_length_before_delimiter_conversion() {
-        let temp_root = tempfile::tempdir().expect("create s3select test temp root");
-        let env = rustfs_test_utils::TestECStoreEnv::builder()
-            .base_dir(temp_root.path())
-            .build()
-            .await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
         let bucket = "s3select-multi-byte-delimiter";
         let object = "input.csv";
         let input_bytes = b"a&&1\n";
@@ -1475,7 +1729,7 @@ mod test {
             json_sub_path: None,
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
-            store: env.ecstore,
+            store: Arc::clone(&env.ecstore),
         };
 
         let result = store
