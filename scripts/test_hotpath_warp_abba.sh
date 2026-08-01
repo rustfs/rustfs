@@ -54,6 +54,9 @@ rg -qx 'rounds=3' "$OUT_DIR/manifest.env"
 rg -qx 'baseline_revision=baseline-test' "$OUT_DIR/manifest.env"
 rg -qx 'candidate_revision=candidate-test' "$OUT_DIR/manifest.env"
 rg -qx 'external_isolation=local-per-cell-disks' "$OUT_DIR/manifest.env"
+rg -qx 'evidence_mode=dry-run' "$OUT_DIR/manifest.env"
+rg -qx 'formal_evidence=false' "$OUT_DIR/manifest.env"
+rg -qx 'performance_conclusion=not_measured_dry_run' "$OUT_DIR/manifest.env"
 rg -qx 'bucket_isolation=per-leg' "$OUT_DIR/manifest.env"
 rg -qx 'dataset_setup=get-and-mixed-via-warp-put' "$OUT_DIR/manifest.env"
 [[ "$(rg -c -- '--extra-args --noclear' "$TRACE_FILE")" == "64" ]]
@@ -84,6 +87,43 @@ if "$RUNNER" \
   exit 1
 fi
 
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --endpoint 127.0.0.1:9000 \
+  --allow-unmanaged-external \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --out-dir "${TMP_DIR}/unmanaged-external-dry-run" \
+  --dry-run >"${TMP_DIR}/unmanaged-external-trace.log" 2>&1
+rg -qx 'external=true' "${TMP_DIR}/unmanaged-external-dry-run/manifest.env"
+rg -qx 'external_isolation=unmanaged' "${TMP_DIR}/unmanaged-external-dry-run/manifest.env"
+rg -qx 'evidence_mode=dry-run' "${TMP_DIR}/unmanaged-external-dry-run/manifest.env"
+rg -qx 'formal_evidence=false' "${TMP_DIR}/unmanaged-external-dry-run/manifest.env"
+rg -qx 'performance_conclusion=not_measured_dry_run' "${TMP_DIR}/unmanaged-external-dry-run/manifest.env"
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --endpoint 127.0.0.1:9 \
+  --allow-unmanaged-external \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --health-timeout 1 \
+  --out-dir "${TMP_DIR}/unmanaged-external-nonformal" >/dev/null 2>&1; then
+  echo "expected unmanaged external mode to fail readiness in this test" >&2
+  exit 1
+fi
+rg -qx 'external=true' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'external_isolation=unmanaged' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'evidence_mode=external-unmanaged-nonformal' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'formal_evidence=false' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+rg -qx 'performance_conclusion=not_formal_unmanaged_external' "${TMP_DIR}/unmanaged-external-nonformal/manifest.env"
+
 if "$RUNNER" \
   --baseline-bin /usr/bin/true \
   --candidate-bin /usr/bin/true \
@@ -109,5 +149,43 @@ if "$RUNNER" \
   echo "expected a formal external deploy hook to write evidence" >&2
   exit 1
 fi
+rg -qx 'external=true' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'external_isolation=deploy-hook-attested' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'evidence_mode=external-deploy-hook-attested' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'formal_evidence=true' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "${TMP_DIR}/missing-deploy-evidence/manifest.env"
+
+BAD_EVIDENCE_HOOK="${TMP_DIR}/bad-evidence-hook.sh"
+cat >"$BAD_EVIDENCE_HOOK" <<'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >"$HOTPATH_ABBA_DEPLOY_EVIDENCE_FILE" <<EOF
+leg=$HOTPATH_ABBA_LEG
+phase=$HOTPATH_ABBA_PHASE
+bucket=wrong-bucket
+binary_sha256=$HOTPATH_ABBA_BINARY_SHA256
+dataset_reset=true
+EOF
+HOOK
+chmod +x "$BAD_EVIDENCE_HOOK"
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --endpoint 127.0.0.1:9000 \
+  --deploy-hook "$BAD_EVIDENCE_HOOK" \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --out-dir "${TMP_DIR}/bad-deploy-evidence" >/dev/null 2>&1; then
+  echo "expected a formal external deploy hook with wrong evidence to fail" >&2
+  exit 1
+fi
+rg -qx 'external=true' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
+rg -qx 'external_isolation=deploy-hook-attested' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
+rg -qx 'evidence_mode=external-deploy-hook-attested' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
+rg -qx 'formal_evidence=true' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
+rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "${TMP_DIR}/bad-deploy-evidence/manifest.env"
 
 echo "hotpath warp ABBA tests passed"
