@@ -3209,6 +3209,21 @@ mod tests {
         assert!(!response.truncated);
     }
 
+    /// A zero limit means zero keys, and no cursor to loop on.
+    #[tokio::test]
+    async fn list_keys_with_zero_limit_returns_an_empty_page() {
+        let (client, _temp_dir) = create_test_client().await;
+        create_keys(&client, &["zero-limit-key".to_string()]).await;
+
+        let response = client
+            .list_keys(&page_request(0, None), None)
+            .await
+            .expect("a zero-limit list must succeed");
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+    }
+
     /// A limit past the end of the key set returns everything, once.
     #[tokio::test]
     async fn list_keys_limit_beyond_the_key_set_returns_one_complete_page() {

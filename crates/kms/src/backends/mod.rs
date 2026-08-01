@@ -202,6 +202,20 @@ pub(crate) fn list_keys_page_size(limit: Option<u32>) -> Option<usize> {
     }
 }
 
+/// The response to a request for zero keys.
+///
+/// `truncated` is false even when keys exist: a zero-length page carries no
+/// identifier to resume from, so claiming more results would hand back a cursor
+/// the caller can never advance and turn a `while truncated` loop into a
+/// non-terminating one.
+pub(crate) fn empty_key_page() -> ListKeysResponse {
+    ListKeysResponse {
+        keys: Vec::new(),
+        next_marker: None,
+        truncated: false,
+    }
+}
+
 /// Simplified KMS backend interface for manager
 #[async_trait]
 pub trait KmsBackend: Send + Sync {
@@ -621,5 +635,85 @@ mod tests {
             .expect("static backend should build");
 
         insta::assert_json_snapshot!("static_backend_capabilities", capabilities_snapshot(backend.capabilities()));
+    }
+
+    // -- Pagination boundaries ----------------------------------------------
+
+    fn key_ids(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("key-{index:02}")).collect()
+    }
+
+    fn page_request(limit: Option<u32>, marker: Option<&str>) -> ListKeysRequest {
+        ListKeysRequest {
+            limit,
+            marker: marker.map(str::to_string),
+            usage_filter: None,
+            status_filter: None,
+        }
+    }
+
+    fn page_of(keys: &[String], limit: Option<u32>, marker: Option<&str>) -> (Vec<String>, Option<String>, bool) {
+        let page = paginate_keys(keys, &page_request(limit, marker), String::as_str);
+        (page.items.to_vec(), page.next_marker, page.truncated)
+    }
+
+    /// Zero keys requested, zero keys returned — and no cursor, so a caller
+    /// looping on `truncated` terminates instead of asking forever. Slicing a
+    /// zero-length page out of a non-empty key set must not reach for the
+    /// element before the page either.
+    #[test]
+    fn zero_limit_returns_an_empty_untruncated_page() {
+        let keys = key_ids(3);
+        assert_eq!(page_of(&keys, Some(0), None), (Vec::new(), None, false));
+        assert_eq!(page_of(&keys, Some(0), Some("key-01")), (Vec::new(), None, false));
+        // Also at the ends of the key set, where a page has no predecessor.
+        assert_eq!(page_of(&[], Some(0), None), (Vec::new(), None, false));
+        assert_eq!(page_of(&keys, Some(0), Some("key-02")), (Vec::new(), None, false));
+
+        assert_eq!(list_keys_page_size(Some(0)), None);
+        assert_eq!(list_keys_page_size(None), Some(DEFAULT_LIST_KEYS_PAGE_SIZE as usize));
+        assert_eq!(list_keys_page_size(Some(7)), Some(7));
+    }
+
+    /// A limit past the end of the key set is not an overflow.
+    #[test]
+    fn oversized_limit_returns_the_whole_key_set_once() {
+        let keys = key_ids(3);
+        assert_eq!(page_of(&keys, Some(u32::MAX), None), (keys.clone(), None, false));
+        assert_eq!(page_of(&keys, Some(u32::MAX), Some("key-01")), (vec![keys[2].clone()], None, false));
+    }
+
+    /// The cursor is an identifier, so a marker naming a key that no longer
+    /// exists resumes after where it would have been instead of restarting.
+    #[test]
+    fn marker_for_a_removed_key_resumes_after_it() {
+        let keys = vec!["key-00".to_string(), "key-02".to_string()];
+        assert_eq!(page_of(&keys, Some(10), Some("key-01")), (vec!["key-02".to_string()], None, false));
+        // A marker past every key ends the listing rather than wrapping.
+        assert_eq!(page_of(&keys, Some(10), Some("key-99")), (Vec::new(), None, false));
+        // A marker before every key yields the whole set.
+        assert_eq!(page_of(&keys, Some(10), Some("key")), (keys.clone(), None, false));
+    }
+
+    /// Truncation flips exactly at the page boundary, and paging covers the
+    /// key set once end to end.
+    #[test]
+    fn pages_tile_the_key_set_exactly_at_the_limit_boundary() {
+        let keys = key_ids(4);
+        assert_eq!(page_of(&keys, Some(4), None), (keys.clone(), None, false));
+        assert_eq!(page_of(&keys, Some(3), None), (keys[..3].to_vec(), Some("key-02".to_string()), true));
+
+        let mut seen = Vec::new();
+        let mut marker = None;
+        loop {
+            let (items, next_marker, truncated) = page_of(&keys, Some(2), marker.as_deref());
+            seen.extend(items);
+            if !truncated {
+                assert!(next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(next_marker.expect("a truncated page must offer a cursor"));
+        }
+        assert_eq!(seen, keys, "paging must tile the key set exactly once");
     }
 }

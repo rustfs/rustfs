@@ -67,7 +67,7 @@ use aws_smithy_types::Blob;
 use jiff::Zoned;
 use tokio_util::sync::CancellationToken;
 
-use super::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend};
+use super::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
 use crate::error::{KmsError, Result};
 use crate::policy::{self, AttemptError, ErrorClass, OpClass, RetryPolicy, classify_status};
@@ -577,6 +577,13 @@ impl KmsBackend for AwsKmsBackend {
     /// and creation date every caller relies on costs one `DescribeKey` per
     /// listed key. The page size is bounded by the caller's `limit`.
     async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse> {
+        // AWS rejects a `Limit` of zero, and clamping it up to one would return
+        // a key to a caller that asked for none; the empty page is answered
+        // here instead.
+        if list_keys_page_size(request.limit).is_none() {
+            return Ok(empty_key_page());
+        }
+
         let limit = request
             .limit
             .map(|limit| i32::try_from(limit).unwrap_or(i32::MAX).clamp(1, 1000));
@@ -1111,6 +1118,26 @@ mod tests {
             .expect_err("a named create must be rejected");
         assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "unexpected error: {error:?}");
         assert_eq!(http_client.actual_requests().count(), 0, "no key may be created in AWS");
+    }
+
+    /// AWS rejects `Limit: 0` outright, so the request cannot be forwarded as
+    /// written; clamping it up to one would answer a caller that asked for no
+    /// keys with a key. The empty page is served locally instead.
+    #[tokio::test]
+    async fn zero_limit_list_returns_an_empty_page_without_calling_aws() {
+        let (http_client, backend) = scripted_backend(Vec::new());
+        let response = backend
+            .list_keys(ListKeysRequest {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .await
+            .expect("a zero-limit list must succeed");
+
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+        assert_eq!(http_client.actual_requests().count(), 0, "no request should reach AWS");
     }
 
     /// Signing keys are outside the envelope-encryption surface this backend

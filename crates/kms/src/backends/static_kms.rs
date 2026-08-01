@@ -21,7 +21,7 @@
 //!
 //! encrypted_data(plaintext_len+16) || nonce (12 bytes)
 
-use crate::backends::{BackendCapabilities, KmsBackend};
+use crate::backends::{BackendCapabilities, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
 use crate::encryption::DataKeyEnvelope;
 use crate::error::{KmsError, Result};
@@ -262,6 +262,12 @@ impl StaticKmsBackend {
 
     /// List the single configured key, honouring the pagination marker.
     pub(crate) fn list_configured_key(&self, request: &ListKeysRequest) -> Result<ListKeysResponse> {
+        // A caller asking for no keys gets none, even from a backend whose
+        // whole key set is one key.
+        if list_keys_page_size(request.limit).is_none() {
+            return Ok(empty_key_page());
+        }
+
         let key_info = KeyInfo {
             key_id: self.key_id.clone(),
             description: Some("Static single-key KMS backend".to_string()),
@@ -655,6 +661,23 @@ mod tests {
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.keys[0].key_id, key_id);
         assert!(!response.truncated);
+    }
+
+    /// A zero limit means zero keys, even for a backend whose whole key set is
+    /// a single configured key.
+    #[tokio::test]
+    async fn zero_limit_list_returns_an_empty_page() {
+        let (backend, _key_id, _key) = create_test_backend().await;
+
+        let response = backend
+            .list_configured_key(&ListKeysRequest {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .expect("a zero-limit list must succeed");
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
     }
 
     #[tokio::test]
