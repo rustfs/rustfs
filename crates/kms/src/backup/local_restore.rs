@@ -522,6 +522,7 @@ async fn decode_bundle(bundle_dir: &Path, kek: &BackupKek) -> Result<DecodedBund
 
     let mut records = Vec::new();
     let mut salt: Option<Zeroizing<Vec<u8>>> = None;
+    let mut config_seen = false;
     for artifact in &manifest.artifacts {
         match artifact.kind {
             ArtifactKind::KeyMaterial => {
@@ -542,6 +543,18 @@ async fn decode_bundle(bundle_dir: &Path, kek: &BackupKek) -> Result<DecodedBund
                     .into());
                 }
                 salt = Some(plaintext);
+            }
+            // Configuration is evidence, not restorable state: the artifact is
+            // verified so a tampered bundle still fails closed, but restore
+            // never writes a configuration into the target. Presenting the
+            // difference against the running configuration, and any decision to
+            // adopt it, belongs to the admin layer.
+            ArtifactKind::KmsConfig => {
+                if config_seen {
+                    return Err(BackupError::corrupted("bundle carries more than one KMS configuration artifact").into());
+                }
+                config_seen = true;
+                decrypt_bundle_artifact(bundle_dir, &manifest, artifact, kek).await?;
             }
             // No producer emits these for a Local bundle yet; restoring a
             // bundle that carries state this implementation cannot apply
@@ -1072,6 +1085,14 @@ mod tests {
     }
 
     async fn export_bundle(client: &LocalKmsClient, dir: &Path) -> (PathBuf, BackupManifest) {
+        export_bundle_with_config(client, dir, None).await
+    }
+
+    async fn export_bundle_with_config(
+        client: &LocalKmsClient,
+        dir: &Path,
+        sanitized_config: Option<Vec<u8>>,
+    ) -> (PathBuf, BackupManifest) {
         let destination = dir.join("bundle");
         let manifest = export_local_backup(
             client,
@@ -1082,6 +1103,7 @@ mod tests {
                 rustfs_version: "1.0.0-test".to_string(),
                 snapshot_generation: SNAPSHOT_GENERATION,
                 destination: destination.clone(),
+                sanitized_config,
             },
         )
         .await
@@ -1966,5 +1988,72 @@ mod tests {
             .await
             .expect("a pre-marker abort only removes staging");
         assert_eq!(top_level_names(staging_only.path()).await, Vec::<String>::new());
+    }
+
+    /// A bundle carrying the sanitized configuration artifact stays fully
+    /// restorable, and the configuration never becomes target state: restore
+    /// verifies it and moves on, leaving the decision to the admin layer.
+    #[tokio::test]
+    async fn a_config_artifact_is_verified_but_never_restored() {
+        let (client, _source_dir) = source_with_keys(Some(TEST_MASTER_KEY), &["alpha"]).await;
+        let bundle_parent = TempDir::new().expect("bundle parent");
+        let config_bytes = br#"{"backend":"local","note":"sanitized"}"#.to_vec();
+        let (bundle, manifest) = export_bundle_with_config(&client, bundle_parent.path(), Some(config_bytes.clone())).await;
+        drop(client);
+
+        assert!(
+            manifest
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == ArtifactKind::KmsConfig),
+            "the bundle must carry the configuration artifact"
+        );
+
+        let target = TempDir::new().expect("target");
+        let report = dry_run_local_restore(&test_kek(), &restore_request(&bundle, target.path()))
+            .await
+            .expect("dry-run should evaluate a bundle with a config artifact");
+        assert!(report.blockers.is_empty(), "unexpected blockers: {:?}", report.blockers);
+
+        let mut request = restore_request(&bundle, target.path());
+        request.conflict_policy = RestoreConflictPolicy::RestoreIntoEmptyTarget;
+        let report = restore_local_backup(&test_kek(), &request)
+            .await
+            .expect("restore should succeed");
+        assert_eq!(report.restored_key_ids, vec!["alpha".to_string()]);
+
+        // Only key material and the salt land in the target; the configuration
+        // is evidence that stays in the bundle.
+        let names = top_level_names(target.path()).await;
+        assert!(names.contains(&"alpha.key".to_string()), "{names:?}");
+        for name in &names {
+            assert!(
+                !name.contains("config"),
+                "restore must not write a configuration into the key directory: {names:?}"
+            );
+        }
+        let restored = std::fs::read(target.path().join("alpha.key")).expect("restored record");
+        assert_ne!(restored, config_bytes);
+
+        // A tampered config artifact must still fail the bundle closed.
+        let descriptor = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == ArtifactKind::KmsConfig)
+            .expect("config artifact");
+        let artifact_path = bundle.join(&descriptor.path);
+        let mut payload = std::fs::read(&artifact_path).expect("artifact bytes");
+        let last = payload.len() - 1;
+        payload[last] ^= 0xff;
+        std::fs::write(&artifact_path, &payload).expect("tamper artifact");
+
+        let fresh_target = TempDir::new().expect("target");
+        dry_run_local_restore(&test_kek(), &restore_request(&bundle, fresh_target.path()))
+            .await
+            .expect("dry-run reports rather than errors")
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == RestoreBlockerCode::BundleCorrupted)
+            .expect("a tampered config artifact must be reported as corruption");
     }
 }

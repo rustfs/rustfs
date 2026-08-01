@@ -54,6 +54,7 @@ const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction")
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
 const INSPECT_DATA: AdminActionRef = AdminActionRef::new("InspectDataAction");
+const KMS_BACKUP: AdminActionRef = AdminActionRef::new("kms:Backup");
 const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
 const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
 const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
@@ -62,8 +63,12 @@ const KMS_DISABLE_KEY: AdminActionRef = AdminActionRef::new("kms:DisableKey");
 const KMS_ENABLE_KEY: AdminActionRef = AdminActionRef::new("kms:EnableKey");
 const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
 const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_RESTORE: AdminActionRef = AdminActionRef::new("kms:Restore");
 const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
+const KMS_TAG_RESOURCE: AdminActionRef = AdminActionRef::new("kms:TagResource");
+const KMS_UNTAG_RESOURCE: AdminActionRef = AdminActionRef::new("kms:UntagResource");
+const KMS_UPDATE_KEY_DESCRIPTION: AdminActionRef = AdminActionRef::new("kms:UpdateKeyDescription");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
 const LIST_TIER: AdminActionRef = AdminActionRef::new("ListTierAction");
@@ -788,6 +793,31 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rotate", KMS_ROTATE_KEY, RouteRiskLevel::High),
+    // Backup and restore act on the material of every key at once, so they
+    // carry their own actions rather than reusing any per-key one.
+    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/backup", KMS_BACKUP, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/backup", KMS_BACKUP, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/restore/dry-run",
+        KMS_RESTORE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_RESTORE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort", KMS_RESTORE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/update-description",
+        KMS_UPDATE_KEY_DESCRIPTION,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag", KMS_TAG_RESOURCE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/untag",
+        KMS_UNTAG_RESOURCE,
+        RouteRiskLevel::High,
+    ),
     public(
         HttpMethod::Get,
         "/rustfs/admin/v3/oidc/providers",
@@ -1826,6 +1856,58 @@ mod tests {
         assert_action(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", KMS_DELETE_KEY);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion", KMS_DELETE_KEY);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}", KMS_DESCRIBE_KEY);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/backup", KMS_BACKUP);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/backup", KMS_BACKUP);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_RESTORE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/dry-run", KMS_RESTORE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort", KMS_RESTORE);
+        assert_action(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/kms/keys/update-description",
+            KMS_UPDATE_KEY_DESCRIPTION,
+        );
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag", KMS_TAG_RESOURCE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag", KMS_UNTAG_RESOURCE);
+
+        // Key metadata updates must not fall back to the service-configuration
+        // action: holding it would otherwise imply the right to relabel keys.
+        for path in [
+            "/rustfs/admin/v3/kms/keys/update-description",
+            "/rustfs/admin/v3/kms/keys/tag",
+            "/rustfs/admin/v3/kms/keys/untag",
+        ] {
+            assert_not_action(HttpMethod::Post, path, KMS_CONFIGURE);
+        }
+    }
+
+    /// Backup and restore expose the whole key inventory at once, so no other
+    /// KMS action may reach them: holding `kms:Configure` or a per-key action
+    /// must not be enough.
+    #[test]
+    fn route_policy_isolates_backup_and_restore_from_other_kms_actions() {
+        for (method, path) in [
+            (HttpMethod::Get, "/rustfs/admin/v3/kms/backup"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/backup"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/restore"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/restore/dry-run"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort"),
+        ] {
+            for action in [
+                SERVER_INFO,
+                KMS_CONFIGURE,
+                KMS_DESCRIBE_KEY,
+                KMS_LIST_KEYS,
+                KMS_SERVICE_CONTROL,
+                KMS_DELETE_KEY,
+            ] {
+                assert_not_action(method, path, action);
+            }
+        }
+
+        // Backup and restore are separate privileges: neither implies the
+        // other.
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/kms/backup", KMS_RESTORE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_BACKUP);
     }
 
     #[test]
@@ -1836,6 +1918,9 @@ mod tests {
             (HttpMethod::Post, "/rustfs/admin/v3/kms/configure"),
             (HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete"),
             (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/update-description"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag"),
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }

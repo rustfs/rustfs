@@ -322,9 +322,9 @@ mod tests {
     use crate::storage_api::ObjectToDelete;
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
     use s3s::dto::{
-        DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
-        ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
+        DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
+        ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
     };
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
@@ -433,7 +433,9 @@ mod tests {
             delete_marker_replication: Some(DeleteMarkerReplication {
                 status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
             }),
-            delete_replication: None,
+            delete_replication: Some(DeleteReplication {
+                status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+            }),
             destination: Destination {
                 bucket: arn.to_string(),
                 ..Default::default()
@@ -513,7 +515,7 @@ mod tests {
         };
 
         let state = delete_replication_state_from_config(&config, &source)
-            .expect("delete-marker version purge should honor delete-marker replication rules");
+            .expect("delete-marker version purge should honor delete replication rules");
         let pending = format!("{arn}=PENDING;");
 
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));

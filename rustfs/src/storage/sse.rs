@@ -74,7 +74,7 @@ use super::storage_api::ecstore_object::{
     EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
     ReadEncryptionMode, ReadEncryptionRequest,
 };
-use crate::storage::access::{ReqInfo, resource_free_condition_values};
+use crate::storage::access::{ReqInfo, request_context_from_req, resource_free_condition_values};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -105,8 +105,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "rio-v2")]
 use sha2::Sha256;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
@@ -800,6 +800,17 @@ pub enum SSEType {
     SseC,
 }
 
+impl SSEType {
+    /// Stable scheme name for audit consumers.
+    fn audit_label(self) -> &'static str {
+        match self {
+            SSEType::SseS3 => "SSE-S3",
+            SSEType::SseKms => "SSE-KMS",
+            SSEType::SseC => "SSE-C",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionKeyKind {
     Direct,
@@ -823,6 +834,10 @@ pub struct SseKmsPrincipal {
     is_owner: bool,
     claims: HashMap<String, Value>,
     conditions: HashMap<String, Vec<String>>,
+    /// Audit slot of the S3 request this principal was built for, when the request
+    /// is being audited. The principal is the only request-derived value that reaches
+    /// the managed-SSE code paths, so it doubles as the carrier for the slot.
+    request_audit: Option<Arc<KmsRequestAudit>>,
     /// Test-only decision overrides. Carried per principal rather than in a global slot so
     /// concurrent tests cannot observe each other's injection.
     #[cfg(test)]
@@ -845,6 +860,7 @@ impl SseKmsPrincipal {
             is_owner: req_info.is_owner,
             claims: cred.claims_or_empty().clone(),
             conditions: resource_free_condition_values(req, cred),
+            request_audit: request_context_from_req(req).and_then(|context| kms_request_audit(&context.request_id)),
             #[cfg(test)]
             test_hooks: None,
         })
@@ -858,8 +874,17 @@ impl SseKmsPrincipal {
             is_owner: false,
             claims: HashMap::new(),
             conditions: HashMap::new(),
+            request_audit: None,
             test_hooks: Some(TestAuthorizationHooks { enforced, authorizer }),
         }
+    }
+
+    /// Bind this principal to `audit` so managed-SSE operations performed for it are
+    /// summarised onto the request's S3 audit entry.
+    #[cfg(test)]
+    fn with_request_audit(mut self, audit: Arc<KmsRequestAudit>) -> Self {
+        self.request_audit = Some(audit);
+        self
     }
 }
 
@@ -1029,7 +1054,14 @@ pub async fn authorize_sse_kms_object_read(
         return Ok(());
     };
 
-    authorize_sse_kms_key(principal, sse_type, KmsAction::DecryptAction, &key_id).await
+    let result = authorize_sse_kms_key(principal, sse_type, KmsAction::DecryptAction, &key_id).await;
+    // Only a denial is recorded here: an allowed read goes on to unwrap the key,
+    // and that operation reports its own outcome.
+    if let Err(error) = &result {
+        record_managed_kms_outcome(principal, sse_type, Some(&key_id), Err(error));
+    }
+
+    result
 }
 
 /// Resolve the scheme and KMS key a stored managed-SSE object was wrapped with.
@@ -1052,6 +1084,234 @@ fn stored_managed_encryption_key(metadata: &HashMap<String, String>) -> Option<(
         .unwrap_or_else(|| "default".to_string());
 
     Some((sse_type, key_id))
+}
+
+// ============================================================================
+// Data-plane KMS audit attachment (SSE-S3 / SSE-KMS)
+// ============================================================================
+
+/// Tag keys carrying the KMS summary on an S3 audit entry.
+///
+/// Audit consumers key off these strings, so they are a wire contract: append
+/// new keys rather than renaming existing ones.
+const KMS_AUDIT_TAG_SSE_TYPE: &str = "sseType";
+const KMS_AUDIT_TAG_KEY_ID: &str = "kmsKeyId";
+const KMS_AUDIT_TAG_KEY_VERSION: &str = "kmsKeyVersion";
+const KMS_AUDIT_TAG_OUTCOME: &str = "kmsOutcome";
+const KMS_AUDIT_TAG_ERROR_CLASS: &str = "kmsErrorClass";
+
+/// Separator for the rare request that touched more than one key or scheme.
+const KMS_AUDIT_VALUE_SEPARATOR: &str = ",";
+
+/// What the data path did with KMS while serving one S3 request.
+///
+/// This rides on the request's existing S3 audit entry instead of becoming its
+/// own event: the entry already carries the principal, request ID and API, so
+/// attaching the KMS outcome costs no extra event volume and needs no second
+/// correlation key.
+///
+/// # Redaction
+///
+/// Only the fields below may ever be recorded. The S3 audit entry fans out to
+/// every configured target, several of which sit outside the KMS trust
+/// boundary, so nothing derived from a data key — plaintext, ciphertext,
+/// envelope, nonce — nor any caller-supplied encryption-context value belongs
+/// here. Key identifiers and scheme names are configuration, not secrets.
+#[derive(Debug, Default)]
+struct KmsRequestAuditState {
+    sse_types: BTreeSet<&'static str>,
+    key_ids: BTreeSet<String>,
+    key_versions: BTreeSet<u32>,
+    /// Set by the first failure. A request that failed any KMS interaction is
+    /// reported as failed even if others succeeded: a partially completed
+    /// envelope operation is not a success for an audit reader.
+    error_class: Option<&'static str>,
+    recorded: bool,
+}
+
+/// Shared accumulator for one request's KMS summary.
+///
+/// Written by the managed-SSE code paths through the request's principal, read
+/// once by the [`OperationHelper`](crate::storage::helper::OperationHelper) that
+/// owns the request's audit entry.
+#[derive(Debug, Default)]
+pub(crate) struct KmsRequestAudit(Mutex<KmsRequestAuditState>);
+
+impl KmsRequestAudit {
+    fn record(&self, sse_type: SSEType, key_id: Option<&str>, key_version: Option<u32>, error_class: Option<&'static str>) {
+        // A poisoned lock costs the audit entry its KMS tags; it must never cost
+        // the request its result.
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+
+        state.recorded = true;
+        state.sse_types.insert(sse_type.audit_label());
+        if let Some(key_id) = key_id.filter(|value| !value.is_empty()) {
+            state.key_ids.insert(key_id.to_string());
+        }
+        if let Some(key_version) = key_version {
+            state.key_versions.insert(key_version);
+        }
+        if state.error_class.is_none() {
+            state.error_class = error_class;
+        }
+    }
+
+    /// Render the summary as audit tags, or nothing when the request performed
+    /// no KMS work at all (SSE-C and unencrypted objects never reach KMS).
+    pub(crate) fn audit_tags(&self) -> Vec<(&'static str, Value)> {
+        let Ok(state) = self.0.lock() else {
+            return Vec::new();
+        };
+        if !state.recorded {
+            return Vec::new();
+        }
+
+        let mut tags = Vec::with_capacity(5);
+        tags.push((KMS_AUDIT_TAG_SSE_TYPE, join_audit_values(state.sse_types.iter().copied())));
+        if !state.key_ids.is_empty() {
+            tags.push((KMS_AUDIT_TAG_KEY_ID, join_audit_values(state.key_ids.iter().map(String::as_str))));
+        }
+        if !state.key_versions.is_empty() {
+            tags.push((
+                KMS_AUDIT_TAG_KEY_VERSION,
+                join_audit_values(state.key_versions.iter().map(u32::to_string)),
+            ));
+        }
+        let outcome = if state.error_class.is_some() { "failure" } else { "success" };
+        tags.push((KMS_AUDIT_TAG_OUTCOME, Value::String(outcome.to_string())));
+        if let Some(error_class) = state.error_class {
+            tags.push((KMS_AUDIT_TAG_ERROR_CLASS, Value::String(error_class.to_string())));
+        }
+
+        tags
+    }
+}
+
+/// Render a set of values as one tag value.
+///
+/// Always a string, including for the single-value case: a consumer that would
+/// have to branch on the JSON type of a tag is a consumer that will get it
+/// wrong for the request that happens to touch two keys.
+fn join_audit_values(values: impl Iterator<Item = impl AsRef<str>>) -> Value {
+    let joined = values.map(|value| value.as_ref().to_string()).collect::<Vec<_>>();
+    Value::String(joined.join(KMS_AUDIT_VALUE_SEPARATOR))
+}
+
+/// Slots of the requests currently being audited, keyed by canonical request ID.
+///
+/// Only a weak reference is held: the owning [`KmsRequestAuditScope`] decides the
+/// lifetime, so a scope that is somehow not dropped cannot keep a slot alive.
+static KMS_REQUEST_AUDITS: LazyLock<Mutex<HashMap<String, Weak<KmsRequestAudit>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Registration of one request's KMS audit slot, dropped with the request's
+/// audit entry.
+pub(crate) struct KmsRequestAuditScope {
+    request_id: String,
+    audit: Arc<KmsRequestAudit>,
+}
+
+impl KmsRequestAuditScope {
+    /// Open a slot for `request_id`, so managed-SSE operations served under it can
+    /// be summarised onto its audit entry.
+    pub(crate) fn register(request_id: &str) -> Self {
+        let audit = Arc::new(KmsRequestAudit::default());
+        if let Ok(mut registry) = KMS_REQUEST_AUDITS.lock() {
+            registry.insert(request_id.to_string(), Arc::downgrade(&audit));
+        }
+
+        Self {
+            request_id: request_id.to_string(),
+            audit,
+        }
+    }
+
+    /// Tags describing the KMS work recorded under this request.
+    pub(crate) fn audit_tags(&self) -> Vec<(&'static str, Value)> {
+        self.audit.audit_tags()
+    }
+}
+
+impl Drop for KmsRequestAuditScope {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = KMS_REQUEST_AUDITS.lock() {
+            registry.remove(&self.request_id);
+        }
+    }
+}
+
+/// Resolve the audit slot opened for `request_id`, if the request is being audited.
+fn kms_request_audit(request_id: &str) -> Option<Arc<KmsRequestAudit>> {
+    KMS_REQUEST_AUDITS.lock().ok()?.get(request_id)?.upgrade()
+}
+
+/// Failure classes for data-path failures that never reached a KMS backend.
+///
+/// Backend failures carry the classification defined by the KMS audit contract;
+/// everything else is classified at the S3 boundary it surfaced through.
+fn kms_data_plane_error_class(error: &ApiError) -> &'static str {
+    if let Some(failure) = error
+        .source
+        .as_ref()
+        .and_then(|source| source.downcast_ref::<KmsDataPlaneFailure>())
+    {
+        return failure.class;
+    }
+
+    match error.code {
+        S3ErrorCode::AccessDenied => "access_denied",
+        S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => "invalid_argument",
+        _ => "sse_internal",
+    }
+}
+
+/// Carries a KMS failure class across the conversion to an S3-facing error.
+///
+/// The class is decided while the `KmsError` is still typed; re-deriving it from
+/// a rendered message downstream would be guesswork.
+#[derive(Debug)]
+struct KmsDataPlaneFailure {
+    class: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for KmsDataPlaneFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => source.fmt(formatter),
+            None => formatter.write_str(self.class),
+        }
+    }
+}
+
+impl std::error::Error for KmsDataPlaneFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Record the outcome of one managed-SSE operation on the request's audit entry.
+///
+/// A `None` principal marks an internal caller — replication, lifecycle, heal —
+/// which has no S3 audit entry to attach to.
+fn record_managed_kms_outcome(
+    principal: Option<&SseKmsPrincipal>,
+    sse_type: SSEType,
+    key_id: Option<&str>,
+    result: Result<(), &ApiError>,
+) {
+    let Some(audit) = principal.and_then(|principal| principal.request_audit.as_ref()) else {
+        return;
+    };
+
+    // The KMS key version is not observable on the data path: neither the
+    // generated data key nor the stored envelope surfaces the master-key version
+    // that wrapped it. Recording a fabricated version would be worse than
+    // omitting the tag, so it stays absent until KMS reports it.
+    audit.record(sse_type, key_id, None, result.err().map(kms_data_plane_error_class));
 }
 
 pub(crate) struct SseObjectEncryptionResolver;
@@ -2016,6 +2276,48 @@ async fn apply_managed_encryption_material(
     content_size: i64,
     principal: Option<&SseKmsPrincipal>,
 ) -> Result<EncryptionMaterial, ApiError> {
+    let requested_sse_type = managed_sse_type(server_side_encryption.as_str());
+    let requested_key_id = kms_key_id.clone();
+    let result = apply_managed_encryption_material_inner(
+        bucket,
+        key,
+        server_side_encryption,
+        kms_key_id,
+        ssekms_context,
+        content_size,
+        principal,
+    )
+    .await;
+
+    match &result {
+        // The resolved key is only known on success: it may come from the request,
+        // the bucket default or the KMS service default. On failure the audit entry
+        // records what the caller asked for, which is what a reader needs to see.
+        Ok(material) => record_managed_kms_outcome(principal, material.sse_type, material.kms_key_id.as_deref(), Ok(())),
+        Err(error) => record_managed_kms_outcome(principal, requested_sse_type, requested_key_id.as_deref(), Err(error)),
+    }
+
+    result
+}
+
+/// Scheme a managed-SSE header names, defaulting to SSE-S3 the same way the
+/// encryption and decryption paths do.
+fn managed_sse_type(server_side_encryption: &str) -> SSEType {
+    match server_side_encryption {
+        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
+        _ => SSEType::SseS3,
+    }
+}
+
+async fn apply_managed_encryption_material_inner(
+    bucket: &str,
+    key: &str,
+    server_side_encryption: ServerSideEncryption,
+    kms_key_id: Option<SSEKMSKeyId>,
+    ssekms_context: Option<HashMap<String, String>>,
+    content_size: i64,
+    principal: Option<&SseKmsPrincipal>,
+) -> Result<EncryptionMaterial, ApiError> {
     if !is_managed_sse(&server_side_encryption) {
         return Err(ApiError::from(StorageError::other(format!(
             "Unsupported server-side encryption: {}",
@@ -2097,6 +2399,29 @@ async fn apply_managed_encryption_material(
 }
 
 async fn apply_managed_decryption_material(
+    bucket: &str,
+    key: &str,
+    metadata: &HashMap<String, String>,
+    principal: Option<&SseKmsPrincipal>,
+) -> Result<Option<DecryptionMaterial>, ApiError> {
+    let result = apply_managed_decryption_material_inner(bucket, key, metadata, principal).await;
+
+    match &result {
+        // `None` means the object carries no managed-SSE metadata — SSE-C and
+        // plaintext objects never reach KMS and must not appear in the summary.
+        Ok(None) => {}
+        Ok(Some(material)) => record_managed_kms_outcome(principal, material.sse_type, material.kms_key_id.as_deref(), Ok(())),
+        Err(error) => {
+            if let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) {
+                record_managed_kms_outcome(principal, sse_type, Some(&key_id), Err(error));
+            }
+        }
+    }
+
+    result
+}
+
+async fn apply_managed_decryption_material_inner(
     bucket: &str,
     key: &str,
     metadata: &HashMap<String, String>,
@@ -2332,7 +2657,13 @@ struct KmsSseDekProvider {
 }
 
 fn kms_operation_error(error: rustfs_kms::KmsError) -> ApiError {
-    ApiError::from(StorageError::other(error))
+    let class = rustfs_kms::audit::error_class(&error);
+    let mut api_error = ApiError::from(StorageError::other(error));
+    // Wrap rather than replace the source so the original chain stays intact for
+    // logging; the wrapper only adds the class the audit attachment needs.
+    let source = api_error.source.take();
+    api_error.source = Some(Box::new(KmsDataPlaneFailure { class, source }));
+    api_error
 }
 
 impl KmsSseDekProvider {
@@ -5711,5 +6042,193 @@ mod tests {
             .expect("SSE-S3 sources are not gated");
 
         assert!(authorizer.calls().is_empty());
+    }
+
+    // ========================================================================
+    // Data-plane KMS audit attachment
+    // ========================================================================
+
+    fn audited_principal(enforced: bool, allowed: bool) -> (SseKmsPrincipal, Arc<super::KmsRequestAudit>) {
+        let audit = Arc::new(super::KmsRequestAudit::default());
+        let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
+        let principal = SseKmsPrincipal::for_test("analyst", enforced, authorizer).with_request_audit(audit.clone());
+        (principal, audit)
+    }
+
+    fn audit_tag(tags: &[(&'static str, serde_json::Value)], key: &str) -> Option<String> {
+        tags.iter()
+            .find(|(candidate, _)| *candidate == key)
+            .and_then(|(_, value)| value.as_str().map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn sse_kms_write_and_read_summarise_key_id_and_outcome_for_the_audit_entry() {
+        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+        let _guard = lock_sse_test_state().await;
+
+        reset_sse_dek_provider();
+        let manager = configure_test_global_local_kms().await;
+        manager
+            .get_encryption_service()
+            .await
+            .expect("encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some("audit-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("kms test key should be created");
+        let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+        super::set_sse_dek_provider_for_test(Arc::new(provider));
+
+        let (write_principal, write_audit) = audited_principal(false, true);
+        let material = sse_encryption(EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("audit-key".to_string()),
+            ssekms_context: Some(HashMap::from([("tenant".to_string(), "acct-4711".to_string())])),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 128,
+            principal: Some(&write_principal),
+        })
+        .await
+        .expect("sse-kms encryption should succeed")
+        .expect("managed sse-kms material");
+
+        let write_tags = write_audit.audit_tags();
+        assert_eq!(audit_tag(&write_tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&write_tags, "kmsKeyId").as_deref(), Some("audit-key"));
+        assert_eq!(audit_tag(&write_tags, "kmsOutcome").as_deref(), Some("success"));
+        assert_eq!(audit_tag(&write_tags, "kmsErrorClass"), None, "a successful request has no error class");
+
+        // The audit entry reaches every configured target: no encoding of the data
+        // key, and no caller-supplied encryption-context value, may appear in it.
+        let rendered = format!("{write_tags:?}");
+        let encrypted_data_key = material.encrypted_data_key.clone().expect("managed sse wraps a data key");
+        for secret in [
+            BASE64_STANDARD.encode(&encrypted_data_key),
+            BASE64_STANDARD.encode(material.key_bytes),
+            format!("{:?}", material.key_bytes),
+            format!("{encrypted_data_key:?}"),
+            "acct-4711".to_string(),
+        ] {
+            assert!(!rendered.contains(&secret), "audit tags must not carry key material: {rendered}");
+        }
+
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+        let (read_principal, read_audit) = audited_principal(false, true);
+        sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&read_principal),
+        })
+        .await
+        .expect("sse-kms decryption should succeed")
+        .expect("managed sse-kms material");
+
+        let read_tags = read_audit.audit_tags();
+        assert_eq!(audit_tag(&read_tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&read_tags, "kmsKeyId").as_deref(), Some("audit-key"));
+        assert_eq!(audit_tag(&read_tags, "kmsOutcome").as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn sse_c_requests_produce_no_kms_audit_summary() {
+        let key = [0x21u8; 32];
+        let (principal, audit) = audited_principal(false, true);
+
+        sse_encryption(EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some(SSECustomerAlgorithm::from("AES256".to_string())),
+            sse_customer_key: Some(SSECustomerKey::from(BASE64_STANDARD.encode(key))),
+            sse_customer_key_md5: Some(SSECustomerKeyMD5::from(md5_base64(key))),
+            content_size: 128,
+            principal: Some(&principal),
+        })
+        .await
+        .expect("sse-c encryption should succeed")
+        .expect("sse-c material");
+
+        assert!(
+            audit.audit_tags().is_empty(),
+            "SSE-C keys never reach KMS, so the request has no KMS outcome to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_sse_kms_read_is_summarised_as_an_access_denied_failure() {
+        let (principal, audit) = audited_principal(true, false);
+
+        authorize_sse_kms_object_read(Some(&principal), &sse_kms_object_metadata())
+            .await
+            .expect_err("an unauthorized principal must not read the source key");
+
+        let tags = audit.audit_tags();
+        assert_eq!(audit_tag(&tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&tags, "kmsKeyId").as_deref(), Some("finance-key"));
+        assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("failure"));
+        assert_eq!(audit_tag(&tags, "kmsErrorClass").as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn kms_backend_failures_keep_the_kms_audit_error_class() {
+        assert_eq!(
+            super::kms_data_plane_error_class(&kms_operation_error(rustfs_kms::KmsError::key_not_found("finance-key"))),
+            "key_not_found"
+        );
+        assert_eq!(
+            super::kms_data_plane_error_class(&kms_operation_error(rustfs_kms::KmsError::access_denied("nope"))),
+            "access_denied"
+        );
+        // Failures raised by the SSE layer itself never saw a KmsError; they are
+        // classified by the boundary they surfaced through.
+        assert_eq!(
+            super::kms_data_plane_error_class(&ApiError {
+                code: S3ErrorCode::AccessDenied,
+                message: "Access Denied".to_string(),
+                source: None,
+            }),
+            "access_denied"
+        );
+        assert_eq!(
+            super::kms_data_plane_error_class(&ApiError::from(StorageError::other("no KMS key available"))),
+            "sse_internal"
+        );
+    }
+
+    #[test]
+    fn a_request_audit_slot_is_reachable_only_while_its_scope_lives() {
+        let scope = super::KmsRequestAuditScope::register("request-under-audit");
+        let slot = super::kms_request_audit("request-under-audit").expect("a registered request must resolve its slot");
+        slot.record(SSEType::SseKms, Some("finance-key"), None, None);
+        assert_eq!(audit_tag(&scope.audit_tags(), "kmsKeyId").as_deref(), Some("finance-key"));
+
+        drop(scope);
+        assert!(
+            super::kms_request_audit("request-under-audit").is_none(),
+            "the slot must not outlive the audit entry it belongs to"
+        );
+    }
+
+    #[test]
+    fn a_request_that_did_no_kms_work_reports_no_tags() {
+        let scope = super::KmsRequestAuditScope::register("quiet-request");
+        assert!(scope.audit_tags().is_empty());
     }
 }

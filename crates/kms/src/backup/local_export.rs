@@ -74,6 +74,7 @@ pub const LOCAL_BUNDLE_MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIR: &str = "artifacts";
 const KEYS_DIR: &str = "artifacts/keys";
 const SALT_ARTIFACT_PATH: &str = "artifacts/master-key.salt.enc";
+const CONFIG_ARTIFACT_PATH: &str = "artifacts/kms-config.json.enc";
 pub(crate) const AEAD_NONCE_LEN: usize = 12;
 /// Domain-separation context for the artifact AAD binding.
 const BUNDLE_AAD_CONTEXT: &str = "rustfs-kms-local-backup:v1";
@@ -141,6 +142,15 @@ pub struct LocalBackupExportRequest {
     pub snapshot_generation: u64,
     /// Bundle output directory; must not exist yet or must be empty.
     pub destination: PathBuf,
+    /// Serialized sanitized KMS configuration to seal into the bundle, if the
+    /// caller produced one.
+    ///
+    /// The persisted `KmsConfig` carries plaintext credentials (Vault token,
+    /// AppRole secret id, Local master key), so the sanitized projection is
+    /// owned by the admin layer and this module only seals the bytes it is
+    /// handed. The artifact is evidence for an operator decision: restore
+    /// verifies it opens but never applies a configuration.
+    pub sanitized_config: Option<Vec<u8>>,
 }
 
 impl LocalBackupExportRequest {
@@ -410,6 +420,10 @@ async fn build_and_write_bundle(
         let descriptor = encrypt_and_write_artifact(kek, request, ArtifactKind::MasterKeySalt, SALT_ARTIFACT_PATH, salt).await?;
         artifacts.push(descriptor);
     }
+    if let Some(config) = &request.sanitized_config {
+        let descriptor = encrypt_and_write_artifact(kek, request, ArtifactKind::KmsConfig, CONFIG_ARTIFACT_PATH, config).await?;
+        artifacts.push(descriptor);
+    }
 
     // Make the artifact directory entries durable before sealing: the sealed
     // manifest must never survive a crash that its artifacts did not.
@@ -673,6 +687,7 @@ mod tests {
             rustfs_version: "1.0.0-test".to_string(),
             snapshot_generation: 7,
             destination,
+            sanitized_config: None,
         }
     }
 
