@@ -21,6 +21,14 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
 - A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification that survives Adversarial Validation (below).
 
+## Worktree and Disk Hygiene
+
+- Unless the requester explicitly says otherwise, treat every new implementation task as isolated work: fetch the latest `origin/main`, confirm the requested change is not already present there, and create a dedicated feature branch and worktree from that exact upstream commit before editing. Do not implement new work directly in the primary checkout or reuse a worktree from another task.
+- Check available disk space before creating the worktree or starting dependency downloads, builds, tests, coverage, or other artifact-heavy commands. For long-running or artifact-heavy work, re-check disk usage at natural phase boundaries and before broad validation; if remaining space may not safely accommodate the next command, stop and reclaim task-owned artifacts before continuing.
+- Keep cleanup scoped and safe: remove generated build/test/coverage artifacts and temporary files created by the task when they are no longer needed, and never delete another task's worktree or uncommitted files. Prefer shared dependency caches where supported instead of duplicating large artifacts across worktrees.
+- Track the task through its terminal state. After observing that its PR has been merged or otherwise confirming the worktree is no longer needed, verify the worktree is clean and the branch's commits are preserved upstream, then remove the dedicated worktree and prune stale worktree metadata. Delete the local task branch only when it is safe and no longer in use; do not delete remote branches unless explicitly requested or repository automation owns that cleanup.
+- At handoff, report the disk-space check and cleanup performed. If cleanup must be deferred because the PR is still open, say what remains and perform it when the task later observes the merge.
+
 ## Autonomy and Approval Boundaries
 
 - Inquiry tasks (answer, explain, review, diagnose, plan): report findings; do not change files unless a fix is explicitly requested.
