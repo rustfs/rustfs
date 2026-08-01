@@ -96,6 +96,10 @@ jobs:
 
   # Fast, compile-free checks that fail early so contributors get feedback in
   # ~1 minute instead of waiting for the full test job.
+  #
+  # These steps are mirrored byte-for-byte in ci-docs-only.yml so that a mixed
+  # PR, which reports two check runs named "Quick Checks", cannot get one red
+  # and one green. Edit both jobs together.
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
@@ -140,13 +144,26 @@ jobs:
   test-and-lint:
     name: Test and Lint
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 90
+    # Both lines are required. Job-level `permissions` replaces the workflow
+    # block rather than merging with it, so declaring only `actions: write`
+    # would drop `contents: read` and break this job's checkout and the
+    # repo-token the setup action hands to setup-protoc.
+    permissions:
+      contents: read
+      actions: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # This job's token can cancel runs and delete Actions caches. Checkout
+          # otherwise writes it into .git/config, where a PR's own build.rs or
+          # proc-macro could read it back out.
+          persist-credentials: false
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -277,6 +294,48 @@ jobs:
       - name: Run rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh
 
+      # Early stop. Once this job has failed the PR cannot merge, so the sibling
+      # lanes are burning runners on a result nobody can act on: on run
+      # 30674613104 three lanes had already failed while Test and Lint and the
+      # rio-v2 variant kept going past 70 minutes.
+      #
+      # Only this job may cancel. The lanes that are NOT required checks
+      # (protocols, ILM, e2e, s3-tests) must never hold that power: a flake in
+      # one of them would turn the required "Test and Lint" into `cancelled`,
+      # which blocks the merge. Today a maintainer can merge with sftp red, and
+      # that has to stay true.
+      #
+      # These steps run last so the `if: always()` artifact upload above still
+      # captures logs and diagnostics before the run goes away.
+      - name: Annotate early-stop reason
+        if: failure() && github.event_name == 'pull_request'
+        run: |
+          echo "## CI early-stop" >> "$GITHUB_STEP_SUMMARY"
+          echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; cancelling run ${GITHUB_RUN_ID} to free runners." >> "$GITHUB_STEP_SUMMARY"
+          echo "Sibling jobs showing **cancelled** were stopped by this job, not by their own failure." >> "$GITHUB_STEP_SUMMARY"
+
+      # curl rather than `gh`: every existing `gh` call in this repo runs on
+      # ubuntu-latest, and the sm-standard-* images are custom and trimmed (they
+      # ship no C toolchain, see the e2e job below), so `gh` is not known to
+      # exist here.
+      #
+      # Fork PRs are excluded explicitly instead of relying on the error path:
+      # their GITHUB_TOKEN is forced read-only and job-level permissions cannot
+      # raise it, so the call would always 403. Skipping keeps their logs clean.
+      - name: Cancel run on failure (same-repo PR only)
+        if: >-
+          failure() && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel" || true
+
   # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
   # drive the object layer through process-global singletons (the GLOBAL_ENV
   # ECStore, the global tier-config manager, background-expiry workers) and bind
@@ -290,6 +349,7 @@ jobs:
   test-ilm-integration-serial:
     name: ILM Integration (serial)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 45
     env:
@@ -327,6 +387,7 @@ jobs:
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 60
     env:
@@ -354,10 +415,17 @@ jobs:
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 60
     strategy:
-      fail-fast: false
+      # On a PR, one failing protocol leg is enough to know the PR is not ready,
+      # so stop the sibling leg instead of paying another ~40 minutes for it.
+      # Everywhere else (main pushes, the merge queue, the weekly schedule) keep
+      # the full signal: there we want to know whether swift AND sftp are broken,
+      # not just whichever failed first. This is the only part of the early-stop
+      # work that also covers fork PRs, since it needs no token.
+      fail-fast: ${{ github.event_name == 'pull_request' }}
       matrix:
         features:
           - name: swift
@@ -389,6 +457,7 @@ jobs:
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
     env:
@@ -419,6 +488,7 @@ jobs:
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
     env:
@@ -455,6 +525,7 @@ jobs:
     # suite (measured 4m17s / 7m19s / 7m31s on runs 30678272341 / 30678117601 /
     # 30662728539) and kept the cancellation run in progress for minutes.
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
     # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
     # a container, applies no seccomp filter that would block io_uring_setup — so
     # the probe succeeds and the tests exercise the real UringBackend/FdCache/
