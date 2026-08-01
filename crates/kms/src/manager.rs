@@ -16,7 +16,7 @@
 
 use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::KmsBackend;
-use crate::cache::KmsCache;
+use crate::cache::{KmsCache, KmsCacheStats};
 use crate::config::KmsConfig;
 use crate::error::Result;
 use crate::types::{
@@ -205,8 +205,8 @@ impl KmsManager {
         result
     }
 
-    /// Get cache statistics
-    pub async fn cache_stats(&self) -> Option<(u64, u64)> {
+    /// Get cache statistics, or `None` when caching is disabled
+    pub async fn cache_stats(&self) -> Option<KmsCacheStats> {
         if self.enable_cache {
             let cache = self.cache.read().await;
             Some(cache.stats())
@@ -882,9 +882,12 @@ mod tests {
         let describe_response = manager.describe_key(describe_request).await.expect("Failed to describe key");
         assert_eq!(describe_response.key_metadata.key_id, create_response.key_id);
 
-        // Test cache stats
-        let stats = manager.cache_stats().await;
-        assert!(stats.is_some());
+        // Creating the key populated the cache, so the describe above was
+        // served from it rather than from the backend.
+        let stats = manager.cache_stats().await.expect("cache is enabled");
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 0);
 
         // Test health check
         let health = manager.health_check().await.expect("Health check failed");
