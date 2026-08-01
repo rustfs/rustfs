@@ -56,6 +56,10 @@
 //! the unit tests of [`crate::backup::local_export`] and
 //! [`crate::backup::local_restore`]. The drill exercises the operator-facing
 //! loop on top of them rather than restating them.
+//!
+//! The procedure this harness automates, how to read the evidence, and the
+//! Vault variant are documented in
+//! `docs/operations/kms-disaster-recovery-drill.md`.
 
 use crate::backends::local::{LOCAL_KMS_MASTER_KEY_SALT_FILE, LOCAL_RESTORE_COMMIT_MARKER_FILE, LocalKmsBackend};
 use crate::backends::{KmsBackend as KmsBackendTrait, local::validate_key_id};
