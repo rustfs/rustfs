@@ -162,13 +162,15 @@ jobs:
 
       - name: Decide exemption
         id: exempt
+        env:
+          INPUT_ALLOW_REGRESSION: ${{ github.event.inputs.allow_regression }}
         run: |
           allow="false"
           if [[ "${{ github.event_name }}" == "pull_request" ]] \
             && ${{ contains(github.event.pull_request.labels.*.name, 'perf-deliberate-tradeoff') }}; then
             allow="true"
           fi
-          if [[ "${{ github.event.inputs.allow_regression }}" == "true" ]]; then
+          if [[ "$INPUT_ALLOW_REGRESSION" == "true" ]]; then
             allow="true"
           fi
           echo "allow_regression=$allow" >> "$GITHUB_OUTPUT"
@@ -224,6 +226,8 @@ jobs:
 
       - name: Run warp A/B and gate
         id: ab
+        env:
+          INPUT_DURATION: ${{ github.event.inputs.duration }}
         run: |
           set -euo pipefail
           # Budget note: with perf-3's cached baseline the nightly does no source
@@ -234,7 +238,7 @@ jobs:
           # budget, which the rig's previous 60s health poll undershot (the first
           # two nightly failures). perf-6 recalibrates these once the noise study
           # lands.
-          duration="${{ github.event.inputs.duration || '12s' }}"
+          duration="${INPUT_DURATION:-12s}"
           baseline_sha="${{ steps.commits.outputs.baseline_sha }}"
           candidate_sha="${{ steps.commits.outputs.candidate_sha }}"
           baseline_hit="${{ steps.baseline_cache.outputs.cache-hit }}"
