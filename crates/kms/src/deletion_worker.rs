@@ -376,6 +376,7 @@ mod tests {
                 key_id: key_id.to_string(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await
             .expect("deletion should be scheduled");

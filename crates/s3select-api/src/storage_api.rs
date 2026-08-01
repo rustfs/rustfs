@@ -43,6 +43,13 @@ pub(crate) type SelectGetObjectReader = <SelectStore as storage_contracts::Objec
 pub(crate) type SelectObjectInfo = <SelectStore as storage_contracts::ObjectOperations>::ObjectInfo;
 pub(crate) type SelectObjectOptions = <SelectStore as storage_contracts::ObjectOperations>::ObjectOptions;
 
+#[cfg(test)]
+pub(crate) async fn select_test_ecstore_env() -> &'static rustfs_test_utils::TestECStoreEnv {
+    static ENV: tokio::sync::OnceCell<rustfs_test_utils::TestECStoreEnv> = tokio::sync::OnceCell::const_new();
+    ENV.get_or_init(|| async { rustfs_test_utils::TestECStoreEnv::builder().build().await })
+        .await
+}
+
 pub(crate) fn resolve_select_object_store_handle() -> Option<Arc<SelectStore>> {
     resolve_select_object_store_handle_from_backend()
 }

@@ -16,22 +16,27 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::bucket_replication::{
-    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_LAST_HR_FAILED_BYTES_MD,
-    BUCKET_REPL_LAST_HR_FAILED_COUNT_MD, BUCKET_REPL_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_LAST_MIN_FAILED_COUNT_MD,
-    BUCKET_REPL_LATENCY_MS_MD, BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_GET_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_GET_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD,
-    BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD, BUCKET_REPL_RESYNC_FAILED_TOTAL_MD,
-    BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD, BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD,
-    BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
+    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD,
+    BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
+    BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_LAST_HR_FAILED_BYTES_MD, BUCKET_REPL_LAST_HR_FAILED_COUNT_MD,
+    BUCKET_REPL_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_LATENCY_MS_MD,
+    BUCKET_REPL_MRF_DROPPED_COUNT_MD, BUCKET_REPL_MRF_FLUSH_FAILURES_MD, BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD,
+    BUCKET_REPL_MRF_MISSED_COUNT_MD, BUCKET_REPL_MRF_PENDING_BYTES_MD, BUCKET_REPL_MRF_PENDING_COUNT_MD,
+    BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_PROXIED_GET_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_GET_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD, BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD,
+    BUCKET_REPL_RESYNC_FAILED_TOTAL_MD, BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD,
+    BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L,
+    TARGET_ARN_L,
 };
 use std::borrow::Cow;
 
 const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 25;
+const BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET: usize = 11;
 
 #[derive(Debug, Clone, Default)]
 pub struct BucketReplicationTargetStats {
@@ -78,6 +83,22 @@ pub struct BucketReplicationStats {
     pub resync_canceled_count: u64,
     pub resync_duration_ms: u64,
     pub targets: Vec<BucketReplicationTargetStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BucketReplicationBacklogStats {
+    pub(crate) bucket: String,
+    pub(crate) current_backlog_count: u64,
+    pub(crate) current_backlog_bytes: u64,
+    pub(crate) durable_mrf_available: bool,
+    pub(crate) durable_mrf_backlog_count: u64,
+    pub(crate) durable_mrf_backlog_bytes: u64,
+    pub(crate) mrf_pending_count: u64,
+    pub(crate) mrf_pending_bytes: u64,
+    pub(crate) mrf_dropped_count: u64,
+    pub(crate) mrf_missed_count: u64,
+    pub(crate) mrf_flush_failures: u64,
+    pub(crate) mrf_last_flush_duration_millis: u64,
 }
 
 pub fn collect_bucket_replication_bandwidth_metrics(stats: &[BucketReplicationBandwidthStats]) -> Vec<PrometheusMetric> {
@@ -249,7 +270,6 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
             PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD, stat.resync_duration_ms as f64)
                 .with_label(BUCKET_L, bucket_label.clone()),
         );
-
         for target in &stat.targets {
             let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
             metrics.push(
@@ -260,6 +280,71 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
                     .with_label(TARGET_ARN_L, target_label),
             );
         }
+    }
+
+    metrics
+}
+
+pub(crate) fn collect_bucket_replication_backlog_metrics(stats: &[BucketReplicationBacklogStats]) -> Vec<PrometheusMetric> {
+    if stats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut metrics = Vec::with_capacity(stats.len() * BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET);
+    for stat in stats {
+        let bucket_label: Cow<'static, str> = Cow::Owned(stat.bucket.clone());
+
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, stat.current_backlog_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD, stat.current_backlog_bytes as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD,
+                if stat.durable_mrf_available { 1.0 } else { 0.0 },
+            )
+            .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, stat.durable_mrf_backlog_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD, stat.durable_mrf_backlog_bytes as f64)
+                .with_label(BUCKET_L, bucket_label),
+        );
+        let bucket_label: Cow<'static, str> = Cow::Owned(stat.bucket.clone());
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_MRF_PENDING_COUNT_MD, stat.mrf_pending_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_MRF_PENDING_BYTES_MD, stat.mrf_pending_bytes as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_MRF_DROPPED_COUNT_MD, stat.mrf_dropped_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_MRF_MISSED_COUNT_MD, stat.mrf_missed_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_MRF_FLUSH_FAILURES_MD, stat.mrf_flush_failures as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD,
+                stat.mrf_last_flush_duration_millis as f64,
+            )
+            .with_label(BUCKET_L, bucket_label),
+        );
     }
 
     metrics
@@ -370,10 +455,155 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_bucket_replication_backlog_metrics() {
+        let stats = vec![BucketReplicationBacklogStats {
+            bucket: "b1".to_string(),
+            current_backlog_count: 3,
+            current_backlog_bytes: 4096,
+            durable_mrf_available: true,
+            durable_mrf_backlog_count: 2,
+            durable_mrf_backlog_bytes: 2048,
+            mrf_pending_count: 1,
+            mrf_pending_bytes: 512,
+            mrf_dropped_count: 3,
+            mrf_missed_count: 4,
+            mrf_flush_failures: 5,
+            mrf_last_flush_duration_millis: 6,
+        }];
+
+        let metrics = collect_bucket_replication_backlog_metrics(&stats);
+        assert_eq!(metrics.len(), 11);
+
+        let backlog_count_name = BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == backlog_count_name
+                && metric.value == 3.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let backlog_bytes_name = BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == backlog_bytes_name
+                && metric.value == 4096.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let durable_available_name = BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == durable_available_name
+                && metric.value == 1.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let durable_count_name = BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == durable_count_name
+                && metric.value == 2.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let durable_bytes_name = BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == durable_bytes_name
+                && metric.value == 2048.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let pending_count_name = BUCKET_REPL_MRF_PENDING_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == pending_count_name
+                && metric.value == 1.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let pending_bytes_name = BUCKET_REPL_MRF_PENDING_BYTES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == pending_bytes_name
+                && metric.value == 512.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let dropped_count_name = BUCKET_REPL_MRF_DROPPED_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == dropped_count_name
+                && metric.value == 3.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let missed_count_name = BUCKET_REPL_MRF_MISSED_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == missed_count_name
+                && metric.value == 4.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let flush_failures_name = BUCKET_REPL_MRF_FLUSH_FAILURES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == flush_failures_name
+                && metric.value == 5.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let flush_duration_name = BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == flush_duration_name
+                && metric.value == 6.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+    }
+
+    #[test]
     fn test_collect_bucket_replication_metrics_empty() {
         let stats: Vec<BucketReplicationStats> = Vec::new();
         let metrics = collect_bucket_replication_metrics(&stats);
         assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn backlog_metrics_are_bucket_scoped_without_target_labels() {
+        let stats = vec![BucketReplicationBacklogStats {
+            bucket: "scope-bucket".to_string(),
+            current_backlog_count: 5,
+            current_backlog_bytes: 8192,
+            durable_mrf_available: true,
+            durable_mrf_backlog_count: 2,
+            durable_mrf_backlog_bytes: 4096,
+            mrf_pending_count: 1,
+            mrf_pending_bytes: 2,
+            mrf_dropped_count: 3,
+            mrf_missed_count: 4,
+            mrf_flush_failures: 5,
+            mrf_last_flush_duration_millis: 6,
+        }];
+
+        let metrics = collect_bucket_replication_backlog_metrics(&stats);
+        let backlog_names = [
+            BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_PENDING_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_PENDING_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_DROPPED_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_MISSED_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_FLUSH_FAILURES_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD.get_full_metric_name(),
+        ];
+
+        for name in backlog_names {
+            let metric = metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .expect("backlog metric should be emitted");
+            assert!(
+                metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == BUCKET_L && value == "scope-bucket")
+            );
+            assert!(!metric.labels.iter().any(|(key, _)| *key == TARGET_ARN_L));
+        }
     }
 
     #[test]

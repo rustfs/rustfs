@@ -173,7 +173,7 @@ tower-http = { version = "0.7.0" }
 # Serialization and Data Formats
 apache-avro = "0.21.0"
 bytes = { version = "1.12.1" }
-bytesize = "2.4.2"
+bytesize = "2.6.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
@@ -236,7 +236,7 @@ aws-smithy-types = { version = "1.6.1" }
 base64 = "0.23.0"
 base64-simd = "0.8.0"
 brotli = "8.0.4"
-clap = { version = "4.6.4" }
+clap = { version = "4.6.5" }
 const-str = { version = "1.1.0" }
 convert_case = "0.11.0"
 criterion = { version = "0.8" }
@@ -341,14 +341,15 @@ libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "10.0.1" }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.62.4" }
+russh = { version = "0.62.5" }
 russh-sftp = "2.3.0"
 
 # WebDAV
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "1cdadea43e9c5a0f054b65be21200ce580e4eb13" }
+libmimalloc-sys = { version = "0.1.49", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "1cdadea43e9c5a0f054b65be21200ce580e4eb13", features = ["extended"] }
 hotpath = { version = "0.22.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }

@@ -26,10 +26,8 @@
 # superseded runs (which is correct — nobody needs test results for a commit
 # that is already three merges behind) while the caches still get written.
 #
-# The group below deliberately does NOT cancel in progress. GitHub keeps at most
-# one running plus one pending run per group, so a burst of merges collapses
-# into "current run finishes, newest queued run follows" rather than a pile-up.
-# That also bounds this workflow to one self-hosted runner at a time.
+# The group below deliberately does NOT cancel in progress; see the comment on
+# it for how that bounds concurrency and why it is scoped by event.
 #
 # Each job below owns exactly one shared-key and is the only place that sets
 # cache-save-if to anything but 'false' for it; every lane in ci.yml reads.
@@ -77,8 +75,21 @@ on:
 permissions:
   contents: read
 
+# Scoped by event. A push run and a dispatch run do not compete: GitHub keeps
+# one running plus one pending per group, so with a single shared group a
+# manually dispatched run was displaced as pending by the next merge and
+# cancelled — observed three times in a row, which made the --timings gate in
+# rustfs/backlog#1601 effectively impossible to trigger while main was busy.
+#
+# Still no cancel-in-progress: a burst of merges collapses into "current run
+# finishes, newest queued run follows" rather than a pile-up, which is what
+# bounds this workflow to one self-hosted runner per event type.
+#
+# The two paths can now overlap and race to save the same key. That is benign:
+# the loser finds the key already present and skips, and both builds produce the
+# same artifacts from the same commit.
 concurrency:
-  group: cache-warm
+  group: cache-warm-${{ github.event_name }}
   cancel-in-progress: false
 
 env:
@@ -107,10 +118,6 @@ jobs:
           cache-save-if: 'true'
           install-build-packaging-tools: 'false'
 
-      # --all-targets covers the test binaries nextest builds, including
-      # e2e_test, which test-and-lint's own run excludes. The second build adds
-      # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
-      # and that no lint lane enables.
       # rustfs/backlog#1601 gate. sccache can only cache compilation units whose
       # --emit includes link, so it covers workspace rlibs and nothing else:
       # clippy is metadata-only, and the ~100 test binaries, the rustfs bin and
@@ -138,6 +145,10 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # --all-targets covers the test binaries nextest builds, including
+      # e2e_test, which test-and-lint's own run excludes. The second build adds
+      # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
+      # and that no lint lane enables.
       - name: Build ci-dev superset
         env:
           # Same limit ci.yml puts on its nextest step: this builds the same
@@ -147,6 +158,29 @@ jobs:
         run: |
           cargo build --workspace --all-targets
           cargo build -p rustfs --bins --features e2e-test-hooks
+
+      # Runs before rust-cache's post step, so these are the sizes it is about
+      # to archive. Reported so the cache-all-crates decision stays evidence-led:
+      # registry/src is what that flag prunes, registry/cache is what the pruned
+      # sources are re-unpacked from. See rustfs/backlog#1600.
+      - name: Report cache input sizes
+        if: always()
+        run: |
+          # tee, not a plain redirect: sent only to $GITHUB_STEP_SUMMARY these
+          # numbers are readable in the UI but absent from the job log, and the
+          # REST API exposes the log, not the summary — which made the figures
+          # unreachable for exactly the scripted comparison they exist for.
+          sizes="$(du -sh ~/.cargo/registry/src ~/.cargo/registry/cache \
+                          ~/.cargo/registry/index ~/.cargo/git target 2>/dev/null || true)"
+          echo "cache-input-sizes-begin"
+          printf '%s\n' "$sizes"
+          echo "cache-input-sizes-end"
+          {
+            echo "### Cache input sizes (ci-dev)"
+            echo '```'
+            printf '%s\n' "$sizes"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Readers: test-and-lint-rio-v2, build-rustfs-debug-binary-rio-v2.
   warm-ci-feat-rio:

@@ -691,7 +691,7 @@ impl<R> ParallelReader<R>
 where
     R: crate::erasure::coding::ShardSource,
 {
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "ParallelReader")]
     pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
         // On the reconstruction-verifying GET path, read every live shard reader
         // in lockstep so all readers advance one block per stripe and stay
@@ -1505,7 +1505,7 @@ where
 }
 
 impl Erasure {
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "Erasure")]
     pub async fn decode<W, R>(
         &self,
         writer: &mut W,

@@ -90,7 +90,13 @@ fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
                         }
                         Ok(_) => PolicyPluginState::Failed,
                         Err(e) => {
-                            error!("Error loading OPA configuration err:{}", e);
+                            error!(
+                                component = "iam",
+                                subsystem = "policy_plugin",
+                                result = "configuration_load_failed",
+                                error_kind = e.kind(),
+                                "OPA plugin configuration load failed"
+                            );
                             PolicyPluginState::Failed
                         }
                     };

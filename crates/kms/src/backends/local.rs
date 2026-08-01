@@ -1617,9 +1617,15 @@ impl KmsBackend for LocalKmsBackend {
             // Schedule for deletion (default 30 days)
             ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
@@ -2678,11 +2684,47 @@ mod tests {
                 key_id: "durable-key".to_string(),
                 pending_window_in_days: None,
                 force_immediate: Some(true),
+                confirm_key_id: None,
             })
             .await
             .expect("delete key");
         assert!(!key_path.exists(), "immediate delete must remove the key file");
         assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "delete must fsync the key directory");
+    }
+
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn delete_key_refuses_a_window_outside_the_supported_range() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_id = "window-bounds-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create key");
+        let backend = LocalKmsBackend { client };
+
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+        }
+
+        let state = backend
+            .describe_key(DescribeKeyRequest {
+                key_id: key_id.to_string(),
+            })
+            .await
+            .expect("describe should succeed")
+            .key_metadata
+            .key_state;
+        assert_eq!(state, KeyState::Enabled, "a refused window must not schedule the key");
     }
 
     #[tokio::test]

@@ -78,10 +78,16 @@ fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
 /// Extract the canonical `RequestContext` from a request, checking both
 /// the request extensions directly and the `ReqInfo.request_context` field.
 pub(crate) fn request_context_from_req<T>(req: &S3Request<T>) -> Option<RequestContext> {
-    req.extensions
+    request_context_from_extensions(&req.extensions)
+}
+
+/// Same lookup against the extensions alone, for callers that have already
+/// moved a field out of the request and can no longer borrow it whole.
+pub(crate) fn request_context_from_extensions(extensions: &http::Extensions) -> Option<RequestContext> {
+    extensions
         .get::<RequestContext>()
         .cloned()
-        .or_else(|| req.extensions.get::<ReqInfo>().and_then(|ri| ri.request_context.clone()))
+        .or_else(|| extensions.get::<ReqInfo>().and_then(|ri| ri.request_context.clone()))
 }
 
 #[derive(Clone, Debug)]

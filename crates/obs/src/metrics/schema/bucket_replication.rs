@@ -33,6 +33,17 @@ const RESYNC_COMPLETED_TOTAL: &str = "resync_completed_total";
 const RESYNC_FAILED_TOTAL: &str = "resync_failed_total";
 const RESYNC_CANCELED_TOTAL: &str = "resync_canceled_total";
 const RESYNC_DURATION_MS_TOTAL: &str = "resync_duration_ms_total";
+const CURRENT_BACKLOG_COUNT: &str = "current_backlog_count";
+const CURRENT_BACKLOG_BYTES: &str = "current_backlog_bytes";
+const DURABLE_MRF_AVAILABLE: &str = "durable_mrf_available";
+const DURABLE_MRF_BACKLOG_COUNT: &str = "durable_mrf_backlog_count";
+const DURABLE_MRF_BACKLOG_BYTES: &str = "durable_mrf_backlog_bytes";
+const MRF_PENDING_COUNT: &str = "mrf_pending_count";
+const MRF_PENDING_BYTES: &str = "mrf_pending_bytes";
+const MRF_DROPPED_COUNT: &str = "mrf_dropped_count";
+const MRF_MISSED_COUNT: &str = "mrf_missed_count";
+const MRF_FLUSH_FAILURES: &str = "mrf_flush_failures";
+const MRF_LAST_FLUSH_DURATION_MILLIS: &str = "mrf_last_flush_duration_millis";
 
 pub static BUCKET_REPL_LAST_HR_FAILED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
@@ -75,6 +86,105 @@ pub static BUCKET_REPL_LATENCY_MS_MD: LazyLock<MetricDescriptor> = LazyLock::new
         MetricName::LatencyMilliSec,
         "Replication latency on a bucket in milliseconds",
         &[BUCKET_L, OPERATION_L, RANGE_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(CURRENT_BACKLOG_BYTES),
+        "Current number of bytes admitted to the in-memory replication worker queues for a bucket",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(CURRENT_BACKLOG_COUNT),
+        "Current number of objects admitted to the in-memory replication worker queues for a bucket",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(DURABLE_MRF_AVAILABLE),
+        "Whether the durable MRF backlog snapshot is available for this bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(DURABLE_MRF_BACKLOG_COUNT),
+        "Current number of objects in the durable MRF backlog file for a bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(DURABLE_MRF_BACKLOG_BYTES),
+        "Current bytes in the durable MRF backlog file for a bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_MRF_PENDING_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(MRF_PENDING_COUNT),
+        "Current number of MRF entries waiting to be flushed to the durable recovery file for a bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_MRF_PENDING_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(MRF_PENDING_BYTES),
+        "Current bytes represented by MRF entries waiting to be flushed to the durable recovery file for a bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_MRF_DROPPED_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(MRF_DROPPED_COUNT),
+        "Total number of MRF entries dropped after the bounded pending backlog cap was reached for a bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_MRF_MISSED_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(MRF_MISSED_COUNT),
+        "Total number of MRF entries that could not be admitted to the save channel for a bucket on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_MRF_FLUSH_FAILURES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(MRF_FLUSH_FAILURES),
+        "Total number of durable MRF flush failures observed while a bucket had pending MRF entries on this node",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(MRF_LAST_FLUSH_DURATION_MILLIS),
+        "Duration in milliseconds of the last durable MRF flush that touched pending entries for a bucket on this node",
+        &[BUCKET_L],
         subsystems::BUCKET_REPLICATION,
     )
 });
