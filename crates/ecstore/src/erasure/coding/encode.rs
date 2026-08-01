@@ -163,8 +163,7 @@ fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }
 
-/// Owns an encoded queue entry's gauge contribution until ownership transfers
-/// to its receiver. Dropping a pending send or failed send compensates it.
+/// Owns an encoded queue entry's gauge contribution until its consumer takes it.
 struct QueuedInflightBytes {
     bytes: usize,
 }
@@ -175,57 +174,48 @@ impl QueuedInflightBytes {
         Self { bytes }
     }
 
-    fn hand_off(mut self) {
-        self.bytes = 0;
+    fn settle(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes != 0 {
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(bytes);
+        }
     }
 }
 
 impl Drop for QueuedInflightBytes {
     fn drop(&mut self) {
-        if self.bytes != 0 {
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes(self.bytes);
+        self.settle();
+    }
+}
+
+/// Couples an encoded block with its queue gauge contribution. Keeping the
+/// guard in the queue entry also covers Tokio sends that complete through a
+/// permit after the receiver has closed.
+struct InflightEntry<T> {
+    entry: T,
+    accounting: QueuedInflightBytes,
+}
+
+impl<T> InflightEntry<T> {
+    fn new(entry: T, bytes: usize) -> Self {
+        Self {
+            entry,
+            accounting: QueuedInflightBytes::new(bytes),
         }
     }
-}
 
-/// The receiver owns queue accounting after a successful send. On cancellation
-/// it closes first, so an in-flight producer send fails and compensates itself,
-/// then synchronously settles every already-buffered entry.
-struct InflightQueueReceiver<T> {
-    receiver: mpsc::Receiver<T>,
-    bytes: fn(&T) -> usize,
-}
-
-impl<T> InflightQueueReceiver<T> {
-    fn new(receiver: mpsc::Receiver<T>, bytes: fn(&T) -> usize) -> Self {
-        Self { receiver, bytes }
-    }
-
-    async fn recv(&mut self) -> Option<T> {
-        self.receiver.recv().await
-    }
-
-    async fn drain(&mut self) {
-        while let Some(entry) = self.recv().await {
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes((self.bytes)(&entry));
-        }
+    fn into_inner(mut self) -> T {
+        self.accounting.settle();
+        self.entry
     }
 }
 
-impl<T> Drop for InflightQueueReceiver<T> {
-    fn drop(&mut self) {
-        self.receiver.close();
-        while let Ok(entry) = self.receiver.try_recv() {
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes((self.bytes)(&entry));
-        }
-    }
-}
-
-async fn send_queued<T>(sender: &mpsc::Sender<T>, entry: T, bytes: usize) -> Result<(), mpsc::error::SendError<T>> {
-    let accounting = QueuedInflightBytes::new(bytes);
-    sender.send(entry).await?;
-    accounting.hand_off();
-    Ok(())
+async fn send_queued<T>(
+    sender: &mpsc::Sender<InflightEntry<T>>,
+    entry: T,
+    bytes: usize,
+) -> Result<(), mpsc::error::SendError<InflightEntry<T>>> {
+    sender.send(InflightEntry::new(entry, bytes)).await
 }
 
 fn queued_batch_bytes(batch: &[Vec<Bytes>]) -> usize {
@@ -628,8 +618,7 @@ impl Erasure {
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = erasure_encode_max_inflight_bytes();
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
-        let (tx, rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
-        let mut rx = InflightQueueReceiver::new(rx, |block| queued_block_bytes(block));
+        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<Bytes>>>(inflight_blocks);
 
         let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
@@ -719,11 +708,10 @@ impl Erasure {
                 break;
             };
             record_internal_stage_if_enabled("erasure_encode_recv_wait", recv_wait_stage_start);
+            let block = block.into_inner();
             if block.is_empty() {
                 break;
             }
-            let queued_bytes = queued_block_bytes(&block);
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
             let write_stage_start = stage_timer_if_enabled();
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
@@ -734,7 +722,7 @@ impl Erasure {
 
         if let Some(err) = write_err {
             task.abort_and_wait().await;
-            rx.drain().await;
+            drop(rx);
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
@@ -772,8 +760,7 @@ impl Erasure {
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
         let batch_blocks = encode_batch_block_count().min(inflight_blocks);
         let channel_capacity = inflight_blocks.div_ceil(batch_blocks).max(1);
-        let (tx, rx) = mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity);
-        let mut rx = InflightQueueReceiver::new(rx, |batch| queued_batch_bytes(batch));
+        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<Vec<Bytes>>>>(channel_capacity);
 
         let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
@@ -840,7 +827,7 @@ impl Erasure {
                 break;
             };
             record_internal_stage_if_enabled("erasure_encode_batched_recv_wait", recv_wait_stage_start);
-            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_batch_bytes(&batch));
+            let batch = batch.into_inner();
             let write_stage_start = stage_timer_if_enabled();
             for block in batch {
                 if let Err(err) = writers.write(block).await {
@@ -856,7 +843,7 @@ impl Erasure {
 
         if let Some(err) = write_err {
             task.abort_and_wait().await;
-            rx.drain().await;
+            drop(rx);
             let shutdown_stage_start = stage_timer_if_enabled();
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
@@ -1750,7 +1737,6 @@ mod tests {
     async fn queued_inflight_bytes_are_settled_on_all_queue_exit_paths() {
         let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
         let (tx, rx) = mpsc::channel(1);
-        let rx = InflightQueueReceiver::new(rx, |block: &Vec<Bytes>| queued_block_bytes(block));
         let queued = vec![Bytes::from_static(b"queued")];
         let queued_bytes = queued_block_bytes(&queued);
 
@@ -1796,22 +1782,49 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn queued_batch_drain_settles_all_buffered_blocks() {
+    async fn queued_batch_entry_settles_bytes_before_handoff() {
         let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
         let (tx, rx) = mpsc::channel(2);
-        let mut rx = InflightQueueReceiver::new(rx, |batch: &Vec<Vec<Bytes>>| queued_batch_bytes(batch));
+        let mut rx = rx;
         let batch = vec![vec![Bytes::from_static(b"queued")], vec![Bytes::from_static(b"batch")]];
         let batch_bytes = queued_batch_bytes(&batch);
 
         send_queued(&tx, batch, batch_bytes).await.expect("batch should be queued");
-        drop(tx);
-        rx.drain().await;
+        let batch = rx.recv().await.expect("queued batch should be received").into_inner();
+        assert_eq!(batch_bytes, queued_batch_bytes(&batch));
 
-        assert!(rx.recv().await.is_none(), "draining must consume every queued batch");
         assert_eq!(
             rustfs_io_metrics::current_ec_encode_inflight_bytes(),
             baseline,
-            "draining a batch queue must settle all contained block bytes"
+            "receiving a batch must settle all contained block bytes before shard writes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_entry_settles_when_a_closed_receiver_accepts_an_outstanding_permit() {
+        let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let (tx, mut rx) = mpsc::channel(1);
+        let permit = tx
+            .clone()
+            .reserve_owned()
+            .await
+            .expect("open receiver should reserve queue capacity");
+        rx.close();
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "an outstanding permit must leave the closed queue observably empty"
+        );
+
+        let block = vec![Bytes::from_static(b"late-permit")];
+        let block_bytes = queued_block_bytes(&block);
+        permit.send(InflightEntry::new(block, block_bytes));
+        drop(rx);
+
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            baseline,
+            "a queue entry sent through an outstanding permit must settle when Tokio drops it"
         );
     }
 

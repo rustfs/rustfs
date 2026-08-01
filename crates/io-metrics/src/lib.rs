@@ -2203,14 +2203,14 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
 #[inline(always)]
 pub fn add_ec_encode_inflight_bytes(bytes: usize) {
     let next = EC_ENCODE_INFLIGHT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
-    gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
+    gauge_set_cached!("rustfs_ec_encode_inflight_bytes_current", next as f64);
 }
 
 /// Remove encoded bytes from the tracked erasure encode in-flight gauge.
 #[inline(always)]
 pub fn remove_ec_encode_inflight_bytes(bytes: usize) {
     let next = saturating_sub_atomic(&EC_ENCODE_INFLIGHT_BYTES, bytes as u64);
-    gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
+    gauge_set_cached!("rustfs_ec_encode_inflight_bytes_current", next as f64);
 }
 
 /// Return the current tracked EC encode in-flight bytes.
