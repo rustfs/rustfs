@@ -81,7 +81,8 @@ use crate::metrics::schema::audit::{AUDIT_FAILED_MESSAGES_MD, AUDIT_TARGET_QUEUE
 use crate::metrics::schema::bucket_replication::{
     BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD,
     BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
-    BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD, BUCKET_REPL_MRF_FLUSH_FAILURES_MD,
+    BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD,
+    BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD, BUCKET_REPL_MRF_FLUSH_FAILURES_MD,
     BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD, BUCKET_REPL_MRF_MISSED_COUNT_MD, BUCKET_REPL_MRF_PENDING_BYTES_MD,
     BUCKET_REPL_MRF_PENDING_COUNT_MD, TARGET_ARN_L,
 };
@@ -633,6 +634,17 @@ fn repl_backlog_live_keys(stats: &[BucketReplicationBacklogStats]) -> HashSet<Bu
     stats.iter().map(|s| s.bucket.clone()).collect()
 }
 
+fn repl_backlog_target_live_keys(stats: &[BucketReplicationBacklogStats]) -> HashSet<ReplBwKey> {
+    stats
+        .iter()
+        .flat_map(|stat| {
+            stat.durable_mrf_targets
+                .iter()
+                .map(|target| (stat.bucket.clone(), target.target_arn.clone()))
+        })
+        .collect()
+}
+
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
     has_seen_valid_snapshot: &mut bool,
     prev_live_keys: &mut HashSet<T>,
@@ -1060,6 +1072,30 @@ fn collect_repl_backlog_zero_tombstone_metrics(zero_tombstones: &HashMap<BucketK
     collect_bucket_replication_backlog_metrics(&stats)
 }
 
+fn collect_repl_backlog_target_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 2);
+    for (bucket, target_arn) in zero_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label)
+                .with_label(TARGET_ARN_L, target_arn_label),
+        );
+    }
+
+    zero_metrics
+}
+
 fn retire_repl_bw_metric_series(bucket: &str, target_arn: &str) -> usize {
     let labels = [
         (BUCKET_L, Cow::Owned(bucket.to_string())),
@@ -1089,6 +1125,15 @@ fn retire_repl_backlog_metric_series(bucket: &str) -> usize {
     .sum()
 }
 
+fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> usize {
+    let labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(), &labels)
+}
+
 fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<ReplBwKey, u8>) -> Vec<ReplBwKey> {
     if !monitor_available {
         return Vec::new();
@@ -1099,6 +1144,17 @@ fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut
 
 fn expire_repl_backlog_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<BucketKey, u8>) -> Vec<BucketKey> {
     if !monitor_available {
+        return Vec::new();
+    }
+
+    expire_series_zero_tombstones(zero_tombstones)
+}
+
+fn expire_repl_backlog_target_zero_tombstones(
+    durable_mrf_available: bool,
+    zero_tombstones: &mut HashMap<ReplBwKey, u8>,
+) -> Vec<ReplBwKey> {
+    if !durable_mrf_available {
         return Vec::new();
     }
 
@@ -1399,6 +1455,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut prev_backlog_live_keys: HashSet<BucketKey> = HashSet::new();
         let mut backlog_zero_tombstones: HashMap<BucketKey, u8> = HashMap::new();
         let mut has_seen_valid_backlog_snapshot = false;
+        let mut prev_backlog_target_live_keys: HashSet<ReplBwKey> = HashSet::new();
+        let mut backlog_target_zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
+        let mut has_seen_valid_backlog_target_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1429,6 +1488,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
 
                             let (bucket_replication, bucket_replication_backlog) = collect_bucket_replication_stats_bundle().await;
+                            let durable_mrf_available = bucket_replication_backlog.iter().any(|stat| stat.durable_mrf_available);
                             update_repl_backlog_zero_tombstones(
                                 monitor_available,
                                 &mut has_seen_valid_backlog_snapshot,
@@ -1437,9 +1497,19 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 repl_backlog_live_keys(&bucket_replication_backlog),
                                 repl_bw_zero_tombstone_cycles,
                             );
+                            if durable_mrf_available {
+                                update_series_zero_tombstones(
+                                    &mut has_seen_valid_backlog_target_snapshot,
+                                    &mut prev_backlog_target_live_keys,
+                                    &mut backlog_target_zero_tombstones,
+                                    repl_backlog_target_live_keys(&bucket_replication_backlog),
+                                    repl_bw_zero_tombstone_cycles,
+                                );
+                            }
                             metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
                             metrics.extend(collect_bucket_replication_backlog_metrics(&bucket_replication_backlog));
                             metrics.extend(collect_repl_backlog_zero_tombstone_metrics(&backlog_zero_tombstones));
+                            metrics.extend(collect_repl_backlog_target_zero_tombstone_metrics(&backlog_target_zero_tombstones));
                             let replication = collect_replication_stats().await;
                             metrics.extend(collect_replication_metrics(&replication));
                             report_metrics(&metrics);
@@ -1450,6 +1520,12 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             }
                             for bucket in expire_repl_backlog_zero_tombstones(monitor_available, &mut backlog_zero_tombstones) {
                                 let _ = retire_repl_backlog_metric_series(&bucket);
+                            }
+                            for (bucket, target_arn) in expire_repl_backlog_target_zero_tombstones(
+                                durable_mrf_available,
+                                &mut backlog_target_zero_tombstones,
+                            ) {
+                                let _ = retire_repl_backlog_target_metric_series(&bucket, &target_arn);
                             }
                         },
                     ).await;
@@ -2257,6 +2333,67 @@ mod tests {
 
         assert!(zero_tombstones.is_empty());
         assert_eq!(prev_live_keys, bucket_keys(&["photos"]));
+    }
+
+    #[test]
+    fn repl_backlog_target_tombstones_zero_removed_targets_then_expire() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let key = repl_bw_key("photos", "arn:rustfs:replication:target-a");
+
+        update_series_zero_tombstones(
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]),
+            2,
+        );
+        assert!(has_seen_valid_snapshot);
+        assert_eq!(prev_live_keys, repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]));
+        assert!(zero_tombstones.is_empty());
+
+        update_series_zero_tombstones(&mut has_seen_valid_snapshot, &mut prev_live_keys, &mut zero_tombstones, HashSet::new(), 2);
+        assert_eq!(zero_tombstones.get(&key), Some(&2));
+
+        let metrics = collect_repl_backlog_target_zero_tombstone_metrics(&zero_tombstones);
+        assert_eq!(metrics.len(), 2);
+        let expected_names = HashSet::from([
+            BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(),
+        ]);
+        let mut actual_names = HashSet::new();
+        for metric in metrics {
+            actual_names.insert(metric.name.to_string());
+            assert_eq!(metric.value, 0.0);
+            let labels = metric
+                .labels
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(labels.get(BUCKET_L).map(String::as_str), Some("photos"));
+            assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
+        }
+        assert_eq!(actual_names, expected_names);
+
+        let expired = expire_repl_backlog_target_zero_tombstones(true, &mut zero_tombstones);
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get(&key), Some(&1));
+
+        let expired = expire_repl_backlog_target_zero_tombstones(true, &mut zero_tombstones);
+        assert_eq!(expired, vec![key]);
+        assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn repl_backlog_target_tombstones_do_not_advance_when_durable_mrf_unavailable() {
+        let key = repl_bw_key("videos", "arn:rustfs:replication:target-b");
+        let mut zero_tombstones = HashMap::from([(key.clone(), 1)]);
+
+        let expired = expire_repl_backlog_target_zero_tombstones(false, &mut zero_tombstones);
+
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get(&key), Some(&1));
     }
 
     #[test]

@@ -42,7 +42,9 @@ pub mod system_process;
 
 pub use audit::{AuditTargetStats, collect_audit_metrics};
 pub use bucket::{BucketStats, collect_bucket_metrics};
-pub(crate) use bucket_replication::{BucketReplicationBacklogStats, collect_bucket_replication_backlog_metrics};
+pub(crate) use bucket_replication::{
+    BucketReplicationBacklogStats, BucketReplicationTargetBacklogStats, collect_bucket_replication_backlog_metrics,
+};
 pub use bucket_replication::{
     BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats,
     collect_bucket_replication_bandwidth_metrics, collect_bucket_replication_metrics,

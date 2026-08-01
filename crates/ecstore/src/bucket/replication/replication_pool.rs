@@ -87,9 +87,23 @@ pub struct DurableMrfBucketBacklog {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurableMrfTargetBacklog {
+    pub bucket: String,
+    pub target_arn: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DurableMrfBacklogSummary {
     pub available: bool,
     pub buckets: Vec<DurableMrfBucketBacklog>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DurableMrfBacklogSnapshot {
+    summary: DurableMrfBacklogSummary,
+    targets: Vec<DurableMrfTargetBacklog>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -110,6 +124,8 @@ pub struct MrfBacklogObservabilitySummary {
 
 static DURABLE_MRF_BACKLOG_SUMMARY: LazyLock<StdRwLock<DurableMrfBacklogSummary>> =
     LazyLock::new(|| StdRwLock::new(DurableMrfBacklogSummary::default()));
+static DURABLE_MRF_TARGET_BACKLOG: LazyLock<StdRwLock<Vec<DurableMrfTargetBacklog>>> =
+    LazyLock::new(|| StdRwLock::new(Vec::new()));
 static MRF_BACKLOG_OBSERVABILITY: LazyLock<StdRwLock<MrfBacklogObservabilityTracker>> =
     LazyLock::new(|| StdRwLock::new(MrfBacklogObservabilityTracker::default()));
 
@@ -117,13 +133,15 @@ static MRF_BACKLOG_OBSERVABILITY: LazyLock<StdRwLock<MrfBacklogObservabilityTrac
 struct DurableMrfBacklogTracker {
     available: bool,
     buckets: HashMap<String, DurableMrfBucketBacklog>,
+    targets: HashMap<(String, String), DurableMrfTargetBacklog>,
 }
 
 impl DurableMrfBacklogTracker {
-    fn add_entry(&mut self, bucket_name: String, entry_size: i64) {
-        let Ok(size) = u64::try_from(entry_size) else {
+    fn add_entry(&mut self, entry: &MrfReplicateEntry) {
+        let Ok(size) = u64::try_from(entry.size) else {
             self.available = false;
             self.buckets.clear();
+            self.targets.clear();
             return;
         };
 
@@ -131,6 +149,7 @@ impl DurableMrfBacklogTracker {
             return;
         }
 
+        let bucket_name = entry.bucket.clone();
         let bucket = match self.buckets.entry(bucket_name) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -143,16 +162,39 @@ impl DurableMrfBacklogTracker {
         };
         bucket.count = bucket.count.saturating_add(1);
         bucket.bytes = bucket.bytes.saturating_add(size);
+
+        for target_arn in &entry.target_arns {
+            if target_arn.is_empty() {
+                continue;
+            }
+            let key = (entry.bucket.clone(), target_arn.clone());
+            let target = match self.targets.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let (bucket, target_arn) = entry.key().clone();
+                    entry.insert(DurableMrfTargetBacklog {
+                        bucket,
+                        target_arn,
+                        ..Default::default()
+                    })
+                }
+            };
+            target.count = target.count.saturating_add(1);
+            target.bytes = target.bytes.saturating_add(size);
+        }
     }
 
-    fn into_summary(self) -> DurableMrfBacklogSummary {
+    fn into_snapshot(self) -> DurableMrfBacklogSnapshot {
         if !self.available {
-            return DurableMrfBacklogSummary::default();
+            return DurableMrfBacklogSnapshot::default();
         }
 
-        DurableMrfBacklogSummary {
-            available: true,
-            buckets: self.buckets.into_values().collect(),
+        DurableMrfBacklogSnapshot {
+            summary: DurableMrfBacklogSummary {
+                available: true,
+                buckets: self.buckets.into_values().collect(),
+            },
+            targets: self.targets.into_values().collect(),
         }
     }
 }
@@ -218,7 +260,21 @@ impl MrfBacklogObservabilityTracker {
     }
 }
 
-fn durable_mrf_backlog_summary_from_sizes<I>(entries: I) -> DurableMrfBacklogSummary
+fn durable_mrf_backlog_summary_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a MrfReplicateEntry>,
+) -> DurableMrfBacklogSnapshot {
+    let mut tracker = DurableMrfBacklogTracker {
+        available: true,
+        ..Default::default()
+    };
+    for entry in entries {
+        tracker.add_entry(entry);
+    }
+    tracker.into_snapshot()
+}
+
+#[cfg(test)]
+fn durable_mrf_backlog_summary_from_sizes<I>(entries: I) -> DurableMrfBacklogSnapshot
 where
     I: IntoIterator<Item = (String, i64)>,
 {
@@ -227,20 +283,49 @@ where
         ..Default::default()
     };
     for (bucket_name, entry_size) in entries {
-        tracker.add_entry(bucket_name, entry_size);
+        tracker.add_entry(&MrfReplicateEntry {
+            bucket: bucket_name,
+            object: String::new(),
+            version_id: None,
+            retry_count: 0,
+            size: entry_size,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: Vec::new(),
+        });
     }
-    tracker.into_summary()
+    tracker.into_snapshot()
+}
+
+fn set_durable_mrf_backlog_snapshot(snapshot: DurableMrfBacklogSnapshot) {
+    match DURABLE_MRF_BACKLOG_SUMMARY.write() {
+        Ok(mut guard) => *guard = snapshot.summary,
+        Err(poisoned) => *poisoned.into_inner() = snapshot.summary,
+    }
+    match DURABLE_MRF_TARGET_BACKLOG.write() {
+        Ok(mut guard) => *guard = snapshot.targets,
+        Err(poisoned) => *poisoned.into_inner() = snapshot.targets,
+    }
 }
 
 fn set_durable_mrf_backlog_summary(summary: DurableMrfBacklogSummary) {
-    match DURABLE_MRF_BACKLOG_SUMMARY.write() {
-        Ok(mut guard) => *guard = summary,
-        Err(poisoned) => *poisoned.into_inner() = summary,
-    }
+    set_durable_mrf_backlog_snapshot(DurableMrfBacklogSnapshot {
+        summary,
+        targets: Vec::new(),
+    });
 }
 
 pub fn durable_mrf_backlog_summary_snapshot() -> DurableMrfBacklogSummary {
     match DURABLE_MRF_BACKLOG_SUMMARY.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+pub fn durable_mrf_target_backlog_snapshot() -> Vec<DurableMrfTargetBacklog> {
+    match DURABLE_MRF_TARGET_BACKLOG.read() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
@@ -827,9 +912,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     return;
                 }
             };
-            set_durable_mrf_backlog_summary(durable_mrf_backlog_summary_from_sizes(
-                entries.iter().map(|entry| (entry.bucket.clone(), entry.size)),
-            ));
+            set_durable_mrf_backlog_snapshot(durable_mrf_backlog_summary_from_entries(&entries));
 
             let total = entries.len();
             let mut queued_count = 0usize;
@@ -1018,7 +1101,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 }
                                 continue;
                             }
-                            durable_tracker.add_entry(e.bucket.clone(), e.size);
+                            durable_tracker.add_entry(&e);
                             observe_mrf_pending(&e);
                             pending.push(e);
                             dirty = true;
@@ -1029,7 +1112,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             if pending.len() - flushed_len >= 1000
                                 && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
                             {
-                                set_durable_mrf_backlog_summary(durable_tracker.clone().into_summary());
+                                set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                                 observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
                                 dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                                 flushed_len = pending.len();
@@ -1039,7 +1122,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         None => {
                             // Channel closed (pool shutting down) — final flush.
                             if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
-                                set_durable_mrf_backlog_summary(durable_tracker.clone().into_summary());
+                                set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                                 observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
                                 dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             }
@@ -1048,7 +1131,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     },
                     _ = interval.tick() => {
                         if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
-                            set_durable_mrf_backlog_summary(durable_tracker.clone().into_summary());
+                            set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                             observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
                             dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             flushed_len = pending.len();
@@ -2745,6 +2828,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -2794,6 +2878,7 @@ mod tests {
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
+                target_arns: Vec::new(),
             },
             "test",
         )
@@ -2824,6 +2909,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
         observe_mrf_pending(&entry);
 
@@ -2873,6 +2959,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -2984,6 +3071,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -3017,6 +3105,7 @@ mod tests {
             delete_marker_version_id: Some(dm_vid),
             delete_marker: true,
             delete_marker_mtime: Some(mtime_nanos),
+            target_arns: Vec::new(),
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -3050,6 +3139,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
 
         let encoded = encode_mrf_file(&[entry]).expect("encode");
@@ -3078,6 +3168,7 @@ mod tests {
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
+                target_arns: Vec::new(),
             },
             MrfReplicateEntry {
                 bucket: "b".to_string(),
@@ -3089,6 +3180,7 @@ mod tests {
                 delete_marker_version_id: Some(del_dm_vid),
                 delete_marker: true,
                 delete_marker_mtime: None,
+                target_arns: Vec::new(),
             },
         ];
 
@@ -3118,6 +3210,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
 
@@ -3132,6 +3225,7 @@ mod tests {
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
 
@@ -3147,6 +3241,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
     }
@@ -3196,6 +3291,7 @@ mod tests {
         // The "deleteMarkerMtime" key was absent in old files — #[serde(default)] must fill in
         // None so replay falls back to the current time (backlog#867 backward compatibility).
         assert_eq!(entry.delete_marker_mtime, None, "missing deleteMarkerMtime key must default to None");
+        assert!(entry.target_arns.is_empty(), "old MRF entries must not be attributed to a target");
     }
 
     #[test]
@@ -3210,6 +3306,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         }];
         let encoded = encode_mrf_file(&entries).expect("durable MRF backlog should encode");
 
@@ -3226,9 +3323,10 @@ mod tests {
 
     #[test]
     fn durable_mrf_summary_aggregates_entries_by_bucket_for_obs() {
-        let summary =
+        let snapshot =
             durable_mrf_backlog_summary_from_sizes([("b1".to_string(), 1024), ("b1".to_string(), 512), ("b2".to_string(), 0)]);
 
+        let summary = snapshot.summary;
         assert!(summary.available);
         let buckets = summary
             .buckets
@@ -3239,13 +3337,82 @@ mod tests {
         assert_eq!(buckets["b1"].bytes, 1536);
         assert_eq!(buckets["b2"].count, 1);
         assert_eq!(buckets["b2"].bytes, 0);
+        assert!(snapshot.targets.is_empty());
+    }
+
+    #[test]
+    fn durable_mrf_summary_aggregates_target_backlog_without_attributing_legacy_entries() {
+        let entries = vec![
+            MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "object-a".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 1024,
+                op: MrfOpKind::Object,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
+            },
+            MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "object-b".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 512,
+                op: MrfOpKind::Object,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: vec!["arn:target-a".to_string()],
+            },
+            MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "legacy-object".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 256,
+                op: MrfOpKind::Object,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: Vec::new(),
+            },
+        ];
+
+        let snapshot = durable_mrf_backlog_summary_from_entries(&entries);
+
+        let summary = snapshot.summary;
+        assert!(summary.available);
+        let buckets = summary
+            .buckets
+            .into_iter()
+            .map(|bucket| (bucket.bucket.clone(), bucket))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(buckets["b1"].count, 3);
+        assert_eq!(buckets["b1"].bytes, 1792);
+
+        let targets = snapshot
+            .targets
+            .into_iter()
+            .map(|target| ((target.bucket.clone(), target.target_arn.clone()), target))
+            .collect::<HashMap<_, _>>();
+        let target_a = &targets[&("b1".to_string(), "arn:target-a".to_string())];
+        assert_eq!(target_a.count, 2);
+        assert_eq!(target_a.bytes, 1536);
+        let target_b = &targets[&("b1".to_string(), "arn:target-b".to_string())];
+        assert_eq!(target_b.count, 1);
+        assert_eq!(target_b.bytes, 1024);
     }
 
     #[test]
     fn durable_mrf_summary_marks_invalid_sizes_unavailable() {
         let invalid = durable_mrf_backlog_summary_from_sizes([("bucket".to_string(), -1)]);
-        assert!(!invalid.available);
-        assert!(invalid.buckets.is_empty());
+        let summary = invalid.summary;
+        assert!(!summary.available);
+        assert!(summary.buckets.is_empty());
+        assert!(invalid.targets.is_empty());
     }
 
     #[test]
@@ -3264,6 +3431,7 @@ mod tests {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
         }])
         .expect("invalid persisted entry should still encode for boundary testing");
         let invalid = durable_mrf_backlog_from_read(Ok(negative));

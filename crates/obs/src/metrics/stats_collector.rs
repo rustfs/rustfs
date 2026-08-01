@@ -21,11 +21,11 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats,
-    BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats,
-    CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats,
-    IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats,
-    ScannerStats,
+    BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetBacklogStats,
+    BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
+    ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, ErasureSetStats,
+    HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats,
+    ResourceStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -212,6 +212,15 @@ async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, 
             mrf_missed_count: stats.mrf_missed_count,
             mrf_flush_failures: stats.mrf_flush_failures,
             mrf_last_flush_duration_millis: stats.mrf_last_flush_duration_millis,
+            durable_mrf_targets: stats
+                .durable_mrf_targets
+                .iter()
+                .map(|target| BucketReplicationTargetBacklogStats {
+                    target_arn: target.target_arn.clone(),
+                    durable_mrf_backlog_count: target.durable_mrf_backlog_count,
+                    durable_mrf_backlog_bytes: target.durable_mrf_backlog_bytes,
+                })
+                .collect(),
         });
         detail_stats.push(bucket_replication_detail_from_snapshot(stats));
     }

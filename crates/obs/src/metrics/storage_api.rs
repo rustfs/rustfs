@@ -18,8 +18,8 @@ use std::time::Duration;
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
 use rustfs_ecstore::api::bucket::replication::{
-    DurableMrfBucketBacklog, MrfBucketBacklogObservability, durable_mrf_backlog_summary_snapshot, get_global_replication_stats,
-    mrf_backlog_observability_snapshot,
+    DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBucketBacklogObservability, durable_mrf_backlog_summary_snapshot,
+    durable_mrf_target_backlog_snapshot, get_global_replication_stats, mrf_backlog_observability_snapshot,
 };
 pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
@@ -42,6 +42,13 @@ pub(crate) struct ObsBucketReplicationTargetStatsSnapshot {
     pub(crate) bandwidth_limit_bytes_per_sec: u64,
     pub(crate) current_bandwidth_bytes_per_sec: f64,
     pub(crate) latency_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ObsBucketReplicationTargetBacklogSnapshot {
+    pub(crate) target_arn: String,
+    pub(crate) durable_mrf_backlog_count: u64,
+    pub(crate) durable_mrf_backlog_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +91,7 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
     pub(crate) mrf_flush_failures: u64,
     pub(crate) mrf_last_flush_duration_millis: u64,
     pub(crate) targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
+    pub(crate) durable_mrf_targets: Vec<ObsBucketReplicationTargetBacklogSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -159,6 +167,7 @@ fn bucket_replication_stats_snapshot_from_parts(
     proxy: ObsBucketReplicationProxySnapshot,
     durable_mrf_available: bool,
     durable_bucket: DurableMrfBucketBacklog,
+    durable_targets: Vec<DurableMrfTargetBacklog>,
     mrf_observability: MrfBucketBacklogObservability,
 ) -> ObsBucketReplicationStatsSnapshot {
     ObsBucketReplicationStatsSnapshot {
@@ -200,6 +209,14 @@ fn bucket_replication_stats_snapshot_from_parts(
         mrf_flush_failures: mrf_observability.flush_failure_count,
         mrf_last_flush_duration_millis: mrf_observability.last_flush_duration_millis,
         targets: runtime.targets,
+        durable_mrf_targets: durable_targets
+            .into_iter()
+            .map(|target| ObsBucketReplicationTargetBacklogSnapshot {
+                target_arn: target.target_arn,
+                durable_mrf_backlog_count: target.count,
+                durable_mrf_backlog_bytes: target.bytes,
+            })
+            .collect(),
     }
 }
 
@@ -222,6 +239,18 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
         .into_iter()
         .map(|bucket| (bucket.bucket.clone(), bucket))
         .collect::<HashMap<String, DurableMrfBucketBacklog>>();
+    let mut durable_targets_by_bucket: HashMap<String, Vec<DurableMrfTargetBacklog>> = HashMap::new();
+    let durable_mrf_targets = if replication_storage_available && durable_mrf_available {
+        durable_mrf_target_backlog_snapshot()
+    } else {
+        Vec::new()
+    };
+    for target in durable_mrf_targets {
+        durable_targets_by_bucket
+            .entry(target.bucket.clone())
+            .or_default()
+            .push(target);
+    }
     let mrf_observability = if replication_storage_available {
         mrf_backlog_observability_snapshot()
     } else {
@@ -327,6 +356,7 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             runtime.current_backlog_bytes = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes);
         }
         let durable_bucket = durable_buckets.get(&bucket).cloned().unwrap_or_default();
+        let durable_targets = durable_targets_by_bucket.remove(&bucket).unwrap_or_default();
         let mrf_observability = mrf_observability_buckets.get(&bucket).cloned().unwrap_or_default();
         buckets.push(bucket_replication_stats_snapshot_from_parts(
             bucket,
@@ -334,6 +364,7 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             proxy,
             durable_mrf_available,
             durable_bucket,
+            durable_targets,
             mrf_observability,
         ));
     }
@@ -432,6 +463,12 @@ mod tests {
                 count: 5,
                 bytes: 8192,
             },
+            vec![DurableMrfTargetBacklog {
+                bucket: "runtime-bucket".to_string(),
+                target_arn: "arn:rustfs:replication:target-a".to_string(),
+                count: 2,
+                bytes: 4096,
+            }],
             MrfBucketBacklogObservability {
                 bucket: "runtime-bucket".to_string(),
                 pending_count: 1,
@@ -449,6 +486,10 @@ mod tests {
         assert!(snapshot.durable_mrf_available);
         assert_eq!(snapshot.durable_mrf_backlog_count, 5);
         assert_eq!(snapshot.durable_mrf_backlog_bytes, 8192);
+        assert_eq!(snapshot.durable_mrf_targets.len(), 1);
+        assert_eq!(snapshot.durable_mrf_targets[0].target_arn, "arn:rustfs:replication:target-a");
+        assert_eq!(snapshot.durable_mrf_targets[0].durable_mrf_backlog_count, 2);
+        assert_eq!(snapshot.durable_mrf_targets[0].durable_mrf_backlog_bytes, 4096);
         assert_eq!(snapshot.mrf_pending_count, 1);
         assert_eq!(snapshot.mrf_pending_bytes, 512);
         assert_eq!(snapshot.mrf_dropped_count, 2);
@@ -472,6 +513,7 @@ mod tests {
                 count: 11,
                 bytes: 2048,
             },
+            Vec::new(),
             MrfBucketBacklogObservability::default(),
         );
 
@@ -490,6 +532,7 @@ mod tests {
             ObsBucketReplicationProxySnapshot::default(),
             true,
             DurableMrfBucketBacklog::default(),
+            Vec::new(),
             MrfBucketBacklogObservability {
                 bucket: "mrf-observability-only".to_string(),
                 pending_count: 13,
@@ -527,6 +570,7 @@ mod tests {
             ObsBucketReplicationProxySnapshot::default(),
             false,
             DurableMrfBucketBacklog::default(),
+            Vec::new(),
             MrfBucketBacklogObservability::default(),
         );
 
