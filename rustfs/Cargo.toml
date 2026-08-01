@@ -330,7 +330,7 @@ mimalloc = { workspace = true }
 libsystemd.workspace = true
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-libmimalloc-sys = { version = "0.1.49", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "1cdadea43e9c5a0f054b65be21200ce580e4eb13", features = ["extended"] }
+libmimalloc-sys.workspace = true
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }

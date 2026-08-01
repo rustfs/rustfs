@@ -20,7 +20,7 @@ use std::alloc::{GlobalAlloc, Layout};
 struct MiMallocAllocator;
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
-// SAFETY: allocation and deallocation are forwarded unchanged to MiMalloc, so
+// SAFETY: allocation operations are forwarded unchanged to MiMalloc, so
 // MiMalloc's GlobalAlloc guarantees apply to every returned pointer and layout.
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for MiMallocAllocator {
@@ -63,10 +63,44 @@ fn main() {
 mod tests {
     #[test]
     #[allow(unsafe_code)]
-    fn hotpath_allocator_uses_mimalloc() {
-        let allocation = Box::new([0_u8; 64]);
+    fn hotpath_allocation_workload_uses_mimalloc() {
+        let _guard = hotpath::MeasurementGuardSync::new("rustfs::tests::hotpath_allocation_workload_uses_mimalloc", false, false);
+        let mut allocation = Vec::with_capacity(64);
+        allocation.extend_from_slice(&[7_u8; 64]);
 
-        // SAFETY: the live Box pointer is valid to inspect for heap ownership.
+        assert_eq!(allocation.len(), 64);
+        // SAFETY: the live Vec pointer is valid to inspect for heap ownership.
         assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(allocation.as_ptr().cast()) });
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn mimalloc_allocator_forwards_extended_global_alloc_operations() {
+        use std::alloc::{GlobalAlloc, Layout};
+
+        let layout = Layout::from_size_align(32, 8).expect("valid test allocation layout");
+        let grown_layout = Layout::from_size_align(64, 8).expect("valid grown test allocation layout");
+        let allocator = super::MiMallocAllocator;
+
+        // SAFETY: The pointer is checked for null before use and later released
+        // through the same allocator with the corresponding layout.
+        let ptr = unsafe { allocator.alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(ptr.cast()) });
+        assert!(unsafe { std::slice::from_raw_parts(ptr, 32).iter().all(|byte| *byte == 0) });
+
+        // SAFETY: `ptr` was allocated by `allocator` with `layout`; on failure
+        // the original allocation remains valid and is released below.
+        let grown_ptr = unsafe { allocator.realloc(ptr, layout, 64) };
+        if grown_ptr.is_null() {
+            // SAFETY: `ptr` is still valid when realloc returns null.
+            unsafe { allocator.dealloc(ptr, layout) };
+            panic!("mimalloc realloc failed in allocator smoke test");
+        }
+
+        assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(grown_ptr.cast()) });
+        // SAFETY: `grown_ptr` was reallocated by `allocator` and is released
+        // with the matching grown layout.
+        unsafe { allocator.dealloc(grown_ptr, grown_layout) };
     }
 }
