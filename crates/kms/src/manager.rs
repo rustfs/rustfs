@@ -24,6 +24,7 @@ use crate::types::{
     DeleteKeyRequest, DeleteKeyResponse, DescribeKeyRequest, DescribeKeyResponse, EncryptRequest, EncryptResponse,
     GenerateDataKeyRequest, GenerateDataKeyResponse, ListKeysRequest, ListKeysResponse, OperationContext,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -346,6 +347,27 @@ impl KmsManager {
         }
         self.audit(KmsAuditOperation::RotateKey, context, Some(key_id), started, &result);
         result
+    }
+
+    /// Replace a key's description; `None` clears it
+    pub async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.backend.update_key_description(key_id, description).await?;
+        self.invalidate_cached_metadata(key_id).await;
+        Ok(())
+    }
+
+    /// Add or overwrite key tags, leaving every other tag untouched
+    pub async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        self.backend.tag_key(key_id, tags).await?;
+        self.invalidate_cached_metadata(key_id).await;
+        Ok(())
+    }
+
+    /// Remove key tags; tags that are not set are ignored
+    pub async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        self.backend.untag_key(key_id, tag_keys).await?;
+        self.invalidate_cached_metadata(key_id).await;
+        Ok(())
     }
 
     /// Drop cached metadata after a state mutation so the next describe

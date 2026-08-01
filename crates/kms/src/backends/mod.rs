@@ -19,6 +19,7 @@ use crate::types::*;
 use async_trait::async_trait;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[cfg(test)]
 mod contract_tests;
@@ -98,6 +99,32 @@ pub(crate) fn ensure_key_status_permits(key_id: &str, status: &KeyStatus, operat
     ensure_key_state_permits(key_id, &state, operation)
 }
 
+/// Tag key that carries the key's identity rather than user metadata.
+///
+/// The key-creation path lifts `name` out of the caller's tag map and uses it
+/// as the key id, so a key's `name` tag and its id are the same string.
+/// Rewriting or dropping it after creation would leave the key addressable
+/// under an id its own metadata no longer states. Metadata updates therefore
+/// reject it; only creation may set it.
+pub const RESERVED_KEY_NAME_TAG: &str = "name";
+
+/// Reject a metadata update that would rewrite or remove
+/// [`RESERVED_KEY_NAME_TAG`].
+///
+/// Enforced by every backend that implements tag updates, so no call path —
+/// including a direct [`KmsBackend`] user that bypasses the manager — can
+/// detach a key from its identity.
+pub(crate) fn ensure_tag_keys_are_mutable<'a>(tag_keys: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    for tag_key in tag_keys {
+        if tag_key == RESERVED_KEY_NAME_TAG {
+            return Err(KmsError::invalid_parameter(format!(
+                "Tag '{RESERVED_KEY_NAME_TAG}' identifies the key and cannot be updated or removed"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Simplified KMS backend interface for manager
 #[async_trait]
 pub trait KmsBackend: Send + Sync {
@@ -151,6 +178,38 @@ pub trait KmsBackend: Send + Sync {
     /// default rejects the operation.
     async fn rotate_key(&self, _key_id: &str) -> Result<()> {
         Err(KmsError::unsupported_capability("backend without rotation support", "rotate_key"))
+    }
+
+    /// Replace a key's free-form description; `None` clears it.
+    ///
+    /// Backends that advertise [`BackendCapabilities::update_key_metadata`]
+    /// must override this method; the default rejects the operation.
+    async fn update_key_description(&self, _key_id: &str, _description: Option<&str>) -> Result<()> {
+        Err(KmsError::unsupported_capability(
+            "backend without key metadata updates",
+            "update_key_description",
+        ))
+    }
+
+    /// Add or overwrite the given tags, leaving every other tag untouched.
+    ///
+    /// Implementations must run [`ensure_tag_keys_are_mutable`] before
+    /// persisting anything. Backends that advertise
+    /// [`BackendCapabilities::update_key_metadata`] must override this method;
+    /// the default rejects the operation.
+    async fn tag_key(&self, _key_id: &str, _tags: &HashMap<String, String>) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without key metadata updates", "tag_key"))
+    }
+
+    /// Remove the given tags.
+    ///
+    /// Tags that are not set are ignored, so repeating the call is a no-op
+    /// rather than an error. Implementations must run
+    /// [`ensure_tag_keys_are_mutable`] before persisting anything. Backends
+    /// that advertise [`BackendCapabilities::update_key_metadata`] must
+    /// override this method; the default rejects the operation.
+    async fn untag_key(&self, _key_id: &str, _tag_keys: &[String]) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without key metadata updates", "untag_key"))
     }
 
     /// Health check
@@ -222,6 +281,8 @@ pub struct BackendCapabilities {
     pub versioning: bool,
     /// Irreversible physical deletion of key material
     pub physical_delete: bool,
+    /// Updating a key's description and tags after creation
+    pub update_key_metadata: bool,
 }
 
 impl BackendCapabilities {
@@ -238,6 +299,7 @@ impl BackendCapabilities {
             schedule_deletion: false,
             versioning: false,
             physical_delete: false,
+            update_key_metadata: false,
         }
     }
 
@@ -286,6 +348,12 @@ impl BackendCapabilities {
     /// Set whether physical deletion of key material is supported
     pub const fn with_physical_delete(mut self, physical_delete: bool) -> Self {
         self.physical_delete = physical_delete;
+        self
+    }
+
+    /// Set whether description and tag updates are supported
+    pub const fn with_update_key_metadata(mut self, update_key_metadata: bool) -> Self {
+        self.update_key_metadata = update_key_metadata;
         self
     }
 }
@@ -366,6 +434,7 @@ mod tests {
         assert!(!capabilities.schedule_deletion);
         assert!(!capabilities.versioning);
         assert!(!capabilities.physical_delete);
+        assert!(!capabilities.update_key_metadata);
     }
 
     #[tokio::test]
@@ -374,6 +443,12 @@ mod tests {
             ("enable_key", MinimalBackend.enable_key("any-key").await),
             ("disable_key", MinimalBackend.disable_key("any-key").await),
             ("rotate_key", MinimalBackend.rotate_key("any-key").await),
+            (
+                "update_key_description",
+                MinimalBackend.update_key_description("any-key", Some("new")).await,
+            ),
+            ("tag_key", MinimalBackend.tag_key("any-key", &HashMap::new()).await),
+            ("untag_key", MinimalBackend.untag_key("any-key", &[]).await),
         ] {
             let error = result.expect_err("backends must opt in to lifecycle operations by overriding them");
             assert!(
@@ -393,6 +468,20 @@ mod tests {
             matches!(error, KmsError::UnsupportedCapability { .. }),
             "expected UnsupportedCapability, got {error:?}"
         );
+    }
+
+    #[test]
+    fn identity_tag_is_rejected_by_metadata_updates() {
+        let error = ensure_tag_keys_are_mutable([RESERVED_KEY_NAME_TAG])
+            .expect_err("the identity tag must not be writable through a metadata update");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains(RESERVED_KEY_NAME_TAG)),
+            "expected a typed rejection naming the tag, got {error:?}"
+        );
+
+        // Ordinary tags — including ones that merely contain the reserved name
+        // — stay writable.
+        ensure_tag_keys_are_mutable(["team", "nickname", "Name"]).expect("ordinary tags must remain writable");
     }
 
     #[tokio::test]
