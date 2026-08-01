@@ -126,6 +126,96 @@ pub(crate) fn ensure_tag_keys_are_mutable<'a>(tag_keys: impl IntoIterator<Item =
     Ok(())
 }
 
+/// Page size used when a [`ListKeysRequest`] does not ask for one.
+pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = 100;
+
+/// One page of a key set the backend has to slice itself.
+pub(crate) struct KeyPage<'a, T> {
+    /// The identifiers this page covers, in listing order.
+    pub(crate) items: &'a [T],
+    /// Where the next page resumes; `None` when this page is the last one.
+    pub(crate) next_marker: Option<String>,
+    /// Whether keys remain beyond this page.
+    pub(crate) truncated: bool,
+}
+
+/// Cut the page `request` asks for out of `sorted`.
+///
+/// `sorted` must be ordered by the identifier `key_id_of` returns, and the
+/// marker is an *exclusive lower bound* on that identifier rather than an index
+/// into the sequence. That is what makes paging survive concurrent mutation:
+/// the next page resumes at the first identifier greater than the marker, so a
+/// key added or removed elsewhere in the ordering — including the marker key
+/// itself, which the deletion sweep routinely destroys — cannot make the
+/// listing skip keys or restart from the beginning.
+///
+/// A `limit` of zero is honoured as written: the caller asked for no keys and
+/// gets an empty, non-truncated page (see [`list_keys_page_size`]).
+///
+/// Filters are applied by the caller to `items` after this slice, so a filtered
+/// page can be shorter than `limit` — and even empty — while more keys remain.
+/// Callers must page until `truncated` is false rather than until a page comes
+/// back short.
+pub(crate) fn paginate_keys<'a, T>(sorted: &'a [T], request: &ListKeysRequest, key_id_of: impl Fn(&T) -> &str) -> KeyPage<'a, T> {
+    let Some(limit) = list_keys_page_size(request.limit) else {
+        return KeyPage {
+            items: &[],
+            next_marker: None,
+            truncated: false,
+        };
+    };
+
+    let start = match request.marker.as_deref() {
+        Some(marker) => sorted.partition_point(|item| key_id_of(item) <= marker),
+        None => 0,
+    };
+    // `partition_point` never exceeds the length, so both bounds stay in range
+    // however large `limit` is.
+    let end = start.saturating_add(limit).min(sorted.len());
+    let items = &sorted[start..end];
+    let truncated = end < sorted.len();
+
+    KeyPage {
+        items,
+        // Resuming from the last identifier on the page, not from an index,
+        // keeps the cursor meaningful after the key it names disappears.
+        next_marker: if truncated {
+            items.last().map(|item| key_id_of(item).to_string())
+        } else {
+            None
+        },
+        truncated,
+    }
+}
+
+/// Resolve the page size of a [`ListKeysRequest`]; `None` means the caller
+/// asked for no keys at all.
+///
+/// `Some(0)` is a well-formed request for an empty page — the reading rustfs
+/// already gives `max-keys=0` on the S3 listing path — not a malformed one and
+/// not an omitted value. Rounding it up to a default would hand back a full
+/// page of keys to a caller that explicitly asked for none.
+pub(crate) fn list_keys_page_size(limit: Option<u32>) -> Option<usize> {
+    match limit.unwrap_or(DEFAULT_LIST_KEYS_PAGE_SIZE) {
+        0 => None,
+        size => Some(size as usize),
+    }
+}
+
+/// The response to a request for zero keys.
+///
+/// `truncated` is false even when keys exist: a zero-length page carries no
+/// identifier to resume from, so claiming more results would hand back a cursor
+/// the caller can never advance and turn a `while truncated` loop into a
+/// non-terminating one.
+pub(crate) fn empty_key_page() -> ListKeysResponse {
+    ListKeysResponse {
+        keys: Vec::new(),
+        next_marker: None,
+        truncated: false,
+    }
+}
+
 /// Simplified KMS backend interface for manager
 #[async_trait]
 pub trait KmsBackend: Send + Sync {
@@ -545,5 +635,85 @@ mod tests {
             .expect("static backend should build");
 
         insta::assert_json_snapshot!("static_backend_capabilities", capabilities_snapshot(backend.capabilities()));
+    }
+
+    // -- Pagination boundaries ----------------------------------------------
+
+    fn key_ids(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("key-{index:02}")).collect()
+    }
+
+    fn page_request(limit: Option<u32>, marker: Option<&str>) -> ListKeysRequest {
+        ListKeysRequest {
+            limit,
+            marker: marker.map(str::to_string),
+            usage_filter: None,
+            status_filter: None,
+        }
+    }
+
+    fn page_of(keys: &[String], limit: Option<u32>, marker: Option<&str>) -> (Vec<String>, Option<String>, bool) {
+        let page = paginate_keys(keys, &page_request(limit, marker), String::as_str);
+        (page.items.to_vec(), page.next_marker, page.truncated)
+    }
+
+    /// Zero keys requested, zero keys returned — and no cursor, so a caller
+    /// looping on `truncated` terminates instead of asking forever. Slicing a
+    /// zero-length page out of a non-empty key set must not reach for the
+    /// element before the page either.
+    #[test]
+    fn zero_limit_returns_an_empty_untruncated_page() {
+        let keys = key_ids(3);
+        assert_eq!(page_of(&keys, Some(0), None), (Vec::new(), None, false));
+        assert_eq!(page_of(&keys, Some(0), Some("key-01")), (Vec::new(), None, false));
+        // Also at the ends of the key set, where a page has no predecessor.
+        assert_eq!(page_of(&[], Some(0), None), (Vec::new(), None, false));
+        assert_eq!(page_of(&keys, Some(0), Some("key-02")), (Vec::new(), None, false));
+
+        assert_eq!(list_keys_page_size(Some(0)), None);
+        assert_eq!(list_keys_page_size(None), Some(DEFAULT_LIST_KEYS_PAGE_SIZE as usize));
+        assert_eq!(list_keys_page_size(Some(7)), Some(7));
+    }
+
+    /// A limit past the end of the key set is not an overflow.
+    #[test]
+    fn oversized_limit_returns_the_whole_key_set_once() {
+        let keys = key_ids(3);
+        assert_eq!(page_of(&keys, Some(u32::MAX), None), (keys.clone(), None, false));
+        assert_eq!(page_of(&keys, Some(u32::MAX), Some("key-01")), (vec![keys[2].clone()], None, false));
+    }
+
+    /// The cursor is an identifier, so a marker naming a key that no longer
+    /// exists resumes after where it would have been instead of restarting.
+    #[test]
+    fn marker_for_a_removed_key_resumes_after_it() {
+        let keys = vec!["key-00".to_string(), "key-02".to_string()];
+        assert_eq!(page_of(&keys, Some(10), Some("key-01")), (vec!["key-02".to_string()], None, false));
+        // A marker past every key ends the listing rather than wrapping.
+        assert_eq!(page_of(&keys, Some(10), Some("key-99")), (Vec::new(), None, false));
+        // A marker before every key yields the whole set.
+        assert_eq!(page_of(&keys, Some(10), Some("key")), (keys.clone(), None, false));
+    }
+
+    /// Truncation flips exactly at the page boundary, and paging covers the
+    /// key set once end to end.
+    #[test]
+    fn pages_tile_the_key_set_exactly_at_the_limit_boundary() {
+        let keys = key_ids(4);
+        assert_eq!(page_of(&keys, Some(4), None), (keys.clone(), None, false));
+        assert_eq!(page_of(&keys, Some(3), None), (keys[..3].to_vec(), Some("key-02".to_string()), true));
+
+        let mut seen = Vec::new();
+        let mut marker = None;
+        loop {
+            let (items, next_marker, truncated) = page_of(&keys, Some(2), marker.as_deref());
+            seen.extend(items);
+            if !truncated {
+                assert!(next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(next_marker.expect("a truncated page must offer a cursor"));
+        }
+        assert_eq!(seen, keys, "paging must tile the key set exactly once");
     }
 }

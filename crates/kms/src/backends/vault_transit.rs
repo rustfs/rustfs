@@ -19,8 +19,8 @@ use crate::backends::vault_credentials::{
     token_source_for,
 };
 use crate::backends::{
-    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits,
-    ensure_tag_keys_are_mutable,
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, empty_key_page, ensure_key_state_permits,
+    ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
 };
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
@@ -852,7 +852,12 @@ impl VaultTransitKmsClient {
         request: &ListKeysRequest,
         _context: Option<&OperationContext>,
     ) -> Result<ListKeysResponse> {
-        let all_keys = self
+        // A caller asking for no keys is answered without reaching Vault.
+        if list_keys_page_size(request.limit).is_none() {
+            return Ok(empty_key_page());
+        }
+
+        let mut all_keys = self
             .run("vault_transit_list_keys", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
                 key::list(&vault.client, &self.config.mount_path).await.map_err(|e| {
@@ -861,36 +866,27 @@ impl VaultTransitKmsClient {
             })
             .await?
             .keys;
+        // Vault's own LIST ordering is not part of its contract, so the sort is
+        // what makes the marker a stable cursor across calls.
+        all_keys.sort_unstable();
+        let page = paginate_keys(&all_keys, request, String::as_str);
 
-        let mut filtered = Vec::new();
-        for key_id in all_keys {
-            let key_info = self.key_info(&key_id).await?;
+        // Reading metadata only for the page keeps a list bounded by the
+        // requested limit instead of by the size of the transit mount.
+        let mut keys = Vec::with_capacity(page.items.len());
+        for key_id in page.items {
+            let key_info = self.key_info(key_id).await?;
             let usage_matches = request.usage_filter.as_ref().is_none_or(|usage| usage == &key_info.usage);
             let status_matches = request.status_filter.as_ref().is_none_or(|status| status == &key_info.status);
             if usage_matches && status_matches {
-                filtered.push(key_info);
+                keys.push(key_info);
             }
         }
 
-        let start_idx = request
-            .marker
-            .as_ref()
-            .and_then(|marker| filtered.iter().position(|info| &info.key_id == marker))
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let limit = request.limit.unwrap_or(100) as usize;
-        let end_idx = std::cmp::min(start_idx + limit, filtered.len());
-        let keys = filtered[start_idx..end_idx].to_vec();
-        let next_marker = if end_idx < filtered.len() {
-            Some(filtered[end_idx - 1].key_id.clone())
-        } else {
-            None
-        };
-
         Ok(ListKeysResponse {
             keys,
-            next_marker,
-            truncated: end_idx < filtered.len(),
+            next_marker: page.next_marker,
+            truncated: page.truncated,
         })
     }
 
@@ -1451,6 +1447,35 @@ mod tests {
             imported: Some(false),
         };
         serde_json::to_value(&response).expect("serialize transit key read response")
+    }
+
+    /// A caller asking for no keys gets an empty page, and the page arithmetic
+    /// never reaches for the element before an empty page. The scripted key
+    /// listing stays unused: a request for zero keys has nothing to ask Vault.
+    #[tokio::test]
+    async fn zero_limit_list_returns_an_empty_page_without_calling_vault() {
+        let (vault, client) =
+            scripted_client(vec![ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a", "key-b"] }))]).await;
+
+        let response = client
+            .list_keys(
+                &ListKeysRequest {
+                    limit: Some(0),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("a zero-limit list must succeed");
+
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+        assert!(
+            vault.requests().is_empty(),
+            "a request for no keys must not reach Vault: {:?}",
+            vault.requests()
+        );
     }
 
     #[tokio::test]

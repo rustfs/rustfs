@@ -36,6 +36,11 @@ use tracing::{debug, info, warn};
 /// How often the worker looks for expired pending deletions.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Keys requested per `ListKeys` call while sweeping. The sweep follows
+/// `truncated`/`next_marker` until the key set is exhausted, so this bounds the
+/// working set of one call, not how many keys a sweep can reach.
+const SWEEP_PAGE_SIZE: u32 = 100;
+
 // ---------------------------------------------------------------------------
 // Metrics
 //
@@ -240,7 +245,7 @@ impl DeletionWorker {
         let mut marker: Option<String> = None;
         let listed_everything = loop {
             let request = ListKeysRequest {
-                limit: Some(100),
+                limit: Some(SWEEP_PAGE_SIZE),
                 marker: marker.clone(),
                 usage_filter: None,
                 status_filter: None,
@@ -270,6 +275,13 @@ impl DeletionWorker {
                 break true;
             }
             match response.next_marker {
+                // A backend that hands back the cursor it was just given cannot
+                // advance. Following it would re-list the same page forever, so
+                // the sweep stops and reports the key set as partially seen.
+                Some(ref next_marker) if marker.as_ref() == Some(next_marker) => {
+                    warn!(marker = %next_marker, "KMS deletion sweep listing did not advance");
+                    break false;
+                }
                 Some(next_marker) => marker = Some(next_marker),
                 // Truncated without a marker: the rest of the key set is out
                 // of reach, so the census is incomplete.
@@ -424,6 +436,41 @@ mod tests {
         // Re-running the sweep after the removal is a no-op.
         let report = worker.sweep(&after_window()).await;
         assert_eq!(report, SweepReport::default());
+    }
+
+    /// Schedule `count` keys for deletion and report their identifiers.
+    async fn schedule_keys(backend: &LocalKmsBackend, count: usize) -> Vec<String> {
+        let mut key_ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let key_id = create_key(backend, &format!("expiring-{index:04}")).await;
+            schedule(backend, &key_id).await;
+            key_ids.push(key_id);
+        }
+        key_ids
+    }
+
+    /// A deployment with more keys than fit in one listing page must still have
+    /// every expired key destroyed: the sweep has to follow the cursor instead
+    /// of stopping at the first page.
+    #[tokio::test]
+    async fn sweep_removes_expired_keys_beyond_the_first_page() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let backend = local_backend(&temp_dir).await;
+        let total = SWEEP_PAGE_SIZE as usize + 5;
+        let key_ids = schedule_keys(&backend, total).await;
+
+        let report = worker(backend.clone()).sweep(&after_window()).await;
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            report.removed.len(),
+            total,
+            "every expired key must be swept, not just the ones on the first page"
+        );
+        // The keys sorting last are the ones a first-page-only sweep leaves
+        // behind for good.
+        for key_id in key_ids.iter().rev().take(5) {
+            assert_key_gone(&backend, key_id).await;
+        }
     }
 
     #[tokio::test]
@@ -756,5 +803,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The census counts the whole key set, not the first page of it. A sweep
+    /// that stops after one page would publish a gauge that understates every
+    /// large deployment by exactly the keys it never listed.
+    #[test]
+    fn lifecycle_gauges_count_keys_beyond_the_first_page() {
+        let total = SWEEP_PAGE_SIZE as usize + 5;
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async move {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let backend = local_backend(&temp_dir).await;
+                schedule_keys(&backend, total).await;
+
+                // Well inside the seven-day window: every key is observed as
+                // pending rather than removed.
+                let report = worker(backend.clone()).sweep(&Zoned::now()).await;
+                assert_eq!(report.skipped, total, "every scheduled key must be inspected");
+                assert!(report.removed.is_empty());
+            })
+        });
+
+        assert_eq!(gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS), Some(total as f64));
     }
 }

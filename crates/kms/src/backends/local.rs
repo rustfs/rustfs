@@ -16,7 +16,7 @@
 
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits,
-    ensure_tag_keys_are_mutable,
+    ensure_tag_keys_are_mutable, paginate_keys,
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
@@ -1214,6 +1214,32 @@ impl LocalKmsClient {
         Ok(master_key.into())
     }
 
+    /// Every key identifier in the key directory, sorted.
+    ///
+    /// `read_dir` order is arbitrary and may differ between calls over the same
+    /// directory, so it cannot carry a pagination cursor. Sorting gives the key
+    /// set a stable total order that a marker can point into.
+    async fn sorted_key_ids(&self) -> Result<Vec<String>> {
+        let mut key_ids = Vec::new();
+        let mut entries = fs::read_dir(&self.config.key_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "key")
+                && let Some(key_id) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                key_ids.push(key_id.to_string());
+            }
+        }
+        key_ids.sort_unstable();
+        Ok(key_ids)
+    }
+
+    /// One page of the key set, ordered by key identifier.
+    ///
+    /// Paging is real here rather than a first-page-only approximation:
+    /// callers that must see every key — the deletion sweep above all, which
+    /// only destroys expired material for keys it actually lists — depend on
+    /// `truncated` and `next_marker` to reach past the first page.
     pub(crate) async fn list_keys(
         &self,
         request: &ListKeysRequest,
@@ -1221,44 +1247,43 @@ impl LocalKmsClient {
     ) -> Result<ListKeysResponse> {
         debug!("Listing keys");
 
-        let mut keys = Vec::new();
-        let limit = request.limit.unwrap_or(100) as usize;
-        let mut count = 0;
+        let key_ids = self.sorted_key_ids().await?;
+        let page = paginate_keys(&key_ids, request, String::as_str);
 
-        let mut entries = fs::read_dir(&self.config.key_dir).await?;
+        // Only the page is read from disk, so the cost of a list stays bounded
+        // by the requested limit rather than by the size of the key set.
+        let mut keys = Vec::with_capacity(page.items.len());
+        for key_id in page.items {
+            // A key that vanished or cannot be decoded is dropped from the page
+            // instead of failing it: concurrent removal is normal, and the
+            // cursor is derived from the identifier list, so the listing still
+            // advances past it.
+            let key_info = match self.describe_key(key_id, None).await {
+                Ok(key_info) => key_info,
+                Err(error) => {
+                    debug!(key_id, %error, "skipping unreadable key while listing");
+                    continue;
+                }
+            };
 
-        while let Some(entry) = entries.next_entry().await? {
-            if count >= limit {
-                break;
-            }
-
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "key")
-                && let Some(stem) = path.file_stem()
-                && let Some(key_id) = stem.to_str()
-                && let Ok(key_info) = self.describe_key(key_id, None).await
+            if let Some(ref status_filter) = request.status_filter
+                && &key_info.status != status_filter
             {
-                // Apply filters
-                if let Some(ref status_filter) = request.status_filter
-                    && &key_info.status != status_filter
-                {
-                    continue;
-                }
-                if let Some(ref usage_filter) = request.usage_filter
-                    && &key_info.usage != usage_filter
-                {
-                    continue;
-                }
-
-                keys.push(key_info);
-                count += 1;
+                continue;
             }
+            if let Some(ref usage_filter) = request.usage_filter
+                && &key_info.usage != usage_filter
+            {
+                continue;
+            }
+
+            keys.push(key_info);
         }
 
         Ok(ListKeysResponse {
             keys,
-            next_marker: None, // Simple implementation without pagination
-            truncated: false,
+            next_marker: page.next_marker,
+            truncated: page.truncated,
         })
     }
 
@@ -3086,5 +3111,132 @@ mod tests {
             .await
             .expect("repeat removal");
         assert_eq!(outcome, crate::backends::ExpiredKeyRemoval::Removed);
+    }
+
+    // -- Listing and pagination ---------------------------------------------
+
+    fn page_request(limit: u32, marker: Option<&str>) -> ListKeysRequest {
+        ListKeysRequest {
+            limit: Some(limit),
+            marker: marker.map(str::to_string),
+            usage_filter: None,
+            status_filter: None,
+        }
+    }
+
+    async fn create_keys(client: &LocalKmsClient, key_ids: &[String]) {
+        for key_id in key_ids {
+            client
+                .create_key(key_id, "AES_256", None)
+                .await
+                .expect("key should be created");
+        }
+    }
+
+    /// Paging must reach every key exactly once. A backend that reports the
+    /// first page as the whole key set strands everything behind it — the
+    /// deletion sweep would never destroy expired material past page one.
+    #[tokio::test]
+    async fn list_keys_pages_through_the_whole_key_set() {
+        let (client, _temp_dir) = create_test_client().await;
+        let expected: Vec<String> = (0..7).map(|index| format!("page-key-{index:02}")).collect();
+        create_keys(&client, &expected).await;
+
+        let mut seen = Vec::new();
+        let mut marker: Option<String> = None;
+        // Bounded so a listing that cannot advance fails the assertion below
+        // instead of hanging the test run.
+        for _ in 0..expected.len() + 1 {
+            let response = client
+                .list_keys(&page_request(3, marker.as_deref()), None)
+                .await
+                .expect("list should succeed");
+            assert!(response.keys.len() <= 3, "a page must not exceed the requested limit");
+            seen.extend(response.keys.iter().map(|key| key.key_id.clone()));
+            if !response.truncated {
+                assert!(response.next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(response.next_marker.expect("a truncated page must offer a cursor"));
+        }
+
+        assert_eq!(seen, expected, "paging must visit every key exactly once, in identifier order");
+    }
+
+    /// Exact-limit boundary: a page that ends on the last key is complete.
+    #[tokio::test]
+    async fn list_keys_page_ending_on_the_last_key_is_not_truncated() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = (0..3).map(|index| format!("exact-key-{index}")).collect();
+        create_keys(&client, &key_ids).await;
+
+        let response = client
+            .list_keys(&page_request(3, None), None)
+            .await
+            .expect("list should succeed");
+        assert_eq!(response.keys.len(), 3);
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+
+        // One key short of the set, the same listing is truncated.
+        let response = client
+            .list_keys(&page_request(2, None), None)
+            .await
+            .expect("list should succeed");
+        assert!(response.truncated);
+        assert_eq!(response.next_marker.as_deref(), Some("exact-key-1"));
+    }
+
+    /// The cursor is an identifier, not an index, so it keeps working after the
+    /// key it names is destroyed — which is exactly what the deletion sweep
+    /// does to the keys it retires between pages.
+    #[tokio::test]
+    async fn list_keys_resumes_after_a_deleted_marker_key() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = ["marker-a", "marker-b", "marker-c"].iter().map(|id| id.to_string()).collect();
+        create_keys(&client, &key_ids).await;
+
+        fs::remove_file(client.master_key_path("marker-b").expect("key path"))
+            .await
+            .expect("key file should be removable");
+
+        let response = client
+            .list_keys(&page_request(10, Some("marker-b")), None)
+            .await
+            .expect("list should succeed");
+        let listed: Vec<&str> = response.keys.iter().map(|key| key.key_id.as_str()).collect();
+        assert_eq!(listed, vec!["marker-c"], "a vanished marker must not restart the listing");
+        assert!(!response.truncated);
+    }
+
+    /// A zero limit means zero keys, and no cursor to loop on.
+    #[tokio::test]
+    async fn list_keys_with_zero_limit_returns_an_empty_page() {
+        let (client, _temp_dir) = create_test_client().await;
+        create_keys(&client, &["zero-limit-key".to_string()]).await;
+
+        let response = client
+            .list_keys(&page_request(0, None), None)
+            .await
+            .expect("a zero-limit list must succeed");
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+    }
+
+    /// A limit past the end of the key set returns everything, once.
+    #[tokio::test]
+    async fn list_keys_limit_beyond_the_key_set_returns_one_complete_page() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = (0..3).map(|index| format!("huge-limit-key-{index}")).collect();
+        create_keys(&client, &key_ids).await;
+
+        let response = client
+            .list_keys(&page_request(u32::MAX, None), None)
+            .await
+            .expect("list should succeed");
+        assert_eq!(response.keys.len(), 3);
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
     }
 }
