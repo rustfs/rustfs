@@ -1,10 +1,14 @@
 # KMS observability runbook
 
-This runbook covers the KMS backend operation metrics, the Grafana dashboard that visualizes them, and the response procedure for each Prometheus alert shipped in `.docker/observability/prometheus-rules/rustfs-kms-alerts.yml`. It is the `runbook_url` target for those alerts. For what each KMS backend protects and how Vault authentication behaves, see the [KMS backend security properties](kms-backend-security.md) and the [Vault KMS authentication runbook](vault-kms-authentication.md).
+This runbook covers the KMS metrics, the Grafana dashboard that visualizes them, and the response procedure for each Prometheus alert shipped in `.docker/observability/prometheus-rules/rustfs-kms-alerts.yml`. It is the `runbook_url` target for those alerts. For what each KMS backend protects and how Vault authentication behaves, see the [KMS backend security properties](kms-backend-security.md) and the [Vault KMS authentication runbook](vault-kms-authentication.md).
 
 ## Metric reference
 
-All four metrics are emitted at the single operation-policy choke point (`crates/kms/src/policy.rs`) that every instrumented KMS backend call flows through. Label values are exclusively static enum strings — key identifiers, key material, ciphertext, paths, and tokens never appear in metric labels, and any change that would add such a label is a regression.
+Across every family below, label values are exclusively static enum strings — key identifiers, key material, ciphertext, paths, and tokens never appear in metric labels, and any change that would add such a label is a regression.
+
+### Backend operation metrics
+
+All four are emitted at the single operation-policy choke point (`crates/kms/src/policy.rs`) that every instrumented KMS backend call flows through.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -20,15 +24,71 @@ Label values:
 - `error_class`: `retryable_conn` (connection-level failure: dial, TLS, broken connection), `retryable_status` (retryable backend status, e.g. Vault 5xx or a sealed Vault's 503), `attempt_timeout` (the per-attempt timeout cut the attempt off; retried like a connection failure because the server may still have processed the request), `fatal` (non-retryable: authentication, permissions, malformed request, missing key or version).
 - `operation`: static per-call-site names, e.g. `vault_kv2_read_key_version`, `vault_kv2_cas_write_key`, `vault_transit_encrypt`, `vault_transit_decrypt`, `vault_login`, `vault_token_renew`.
 
-Export path: the `metrics` facade feeds the OTel recorder in `crates/obs`, which exports over OTLP to the collector scraped by Prometheus. Histograms therefore appear in Prometheus as `_bucket`/`_sum`/`_count` series. These metrics do not carry the RustFS `server` label used by the node observability dashboard — distinguish nodes through your scrape topology (`job`/`instance` or promoted OTel resource attributes such as `service_instance_id`).
+Instrumentation boundary: the Local and Static backends do not flow through the choke point and emit no operation metrics; bringing them under the same instrumentation is tracked separately (rustfs/backlog#1569). Absence of these four series on a cluster using those backends is expected, not an outage. The families below sit above the backend layer and are emitted regardless.
 
-Instrumentation boundary: the Local and Static backends do not flow through the choke point and emit no operation metrics; bringing them under the same instrumentation is tracked separately (rustfs/backlog#1569). Absence of KMS series on a cluster using those backends is expected, not an outage.
+### Key metadata cache metrics
+
+Emitted by the manager-level key metadata cache (`crates/kms/src/cache.rs`), which every backend shares. Publication is gated by the cache's `enable_metrics` setting (on by default); the counters behind the admin status API are maintained either way, so turning the metrics off does not blind `kms service-status`.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `rustfs_kms_metadata_cache_lookups_total` | counter | `result` | Key metadata lookups, by `hit` or `miss` |
+| `rustfs_kms_metadata_cache_evictions_total` | counter | `cause` | Entries dropped from the cache, by removal cause |
+| `rustfs_kms_metadata_cache_entries` | gauge | — | Entries the cache currently holds |
+
+`cause` is `expired` (TTL), `size` (capacity), `explicit` (invalidated by a key lifecycle operation), or `replaced` (overwritten by a newer value). Only `expired` and `size` are true evictions — a sustained `explicit`/`replaced` rate is lifecycle traffic, not cache pressure.
+
+The entry gauge is republished from every write path and from lookups that miss, because TTL expiry drops entries without any write taking place; a cache that goes completely idle can therefore hold a stale value until the next lookup. Note also that this cache only serves key metadata reads such as `describe_key` — encrypt, decrypt and data key generation never consult it, so a low hit ratio is not a data-path problem.
+
+### Key lifecycle metrics
+
+Published by the background deletion worker (`crates/kms/src/deletion_worker.rs`) at the end of each sweep, derived from the pages the sweep already walks, so observing the lifecycle costs no extra backend call. The worker only runs on backends whose capabilities include `schedule_deletion`, so a deployment on a backend without it emits none of these.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `rustfs_kms_pending_deletion_keys` | gauge | — | Keys scheduled for deletion whose deadline has not passed |
+| `rustfs_kms_deletion_tombstone_keys` | gauge | — | Keys left tombstoned by an interrupted removal, still awaiting the sweep |
+| `rustfs_kms_oldest_key_rotation_age_seconds` | gauge | — | Seconds since the least recently rotated usable key was rotated, counting from creation for keys never rotated; `0` when there are none |
+| `rustfs_kms_deletion_sweep_keys_total` | counter | `outcome` | Keys the sweep acted on, by outcome |
+
+`outcome` is `removed`, `blocked` (live configuration — the default key, or a reference reported by the injected checker — still points at the key, so the sweep refuses to remove it), `skipped` (pending but not yet due, or the state changed between inspection and removal), or `failed` (the removal attempt failed and is retried next sweep). Every series is emitted at zero from the first sweep on, so a `rate()` over it is defined immediately.
+
+The three gauges are republished only by a sweep that saw the whole key set; a sweep that could not finish listing leaves the previous, complete values standing rather than understating them. Keys already on their way out are excluded from the rotation-age gauge, so it does not stay pinned high by a key that will never be rotated again.
+
+### Vault credential metrics
+
+Published by the Vault credential provider (`crates/kms/src/backends/vault_credentials.rs`), so they exist only on Vault-backed backends. Both are label-less: there is exactly one credential generation to describe, and the Vault address, mount, auth path and token are all off limits as label values.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `rustfs_kms_vault_token_ttl_seconds` | gauge | — | Seconds left before the active Vault token expires; `0` once it has |
+| `rustfs_kms_vault_credentials_fail_closed` | gauge | — | `1` while the provider refuses to hand out its token because it is inside the fail-closed safety window, `0` otherwise |
+
+The renewal loop republishes both on a 10-second cadence while it waits, generating no extra Vault traffic, so a scrape landing between refresh cycles never reads a TTL frozen at the last refresh. `rustfs_kms_vault_credentials_fail_closed` at `1` is the metric form of the fail-closed window described in the [Vault KMS authentication runbook](vault-kms-authentication.md): while it is set, Vault-backed operations fail rather than run on a credential that may already be invalid.
+
+### Synthetic probe metrics
+
+Published by the background probe worker (`crates/kms/src/probe.rs`), which generates a data key under a reserved probe key, decrypts it, and compares the material. It runs every `RUSTFS_KMS_PROBE_INTERVAL_SECS` seconds (default 60, raised to a floor of 5, `0` disables the probe entirely), and the status it publishes is what KMS readiness reads.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `rustfs_kms_probe_rounds_total` | counter | `result` | Probe rounds completed, by `success`, `failure` or `unsupported` |
+| `rustfs_kms_probe_failures_total` | counter | `failure_kind` | Failed rounds, by the round-trip stage that failed |
+| `rustfs_kms_probe_duration_seconds` | histogram | `result` | Wall-clock duration of one probe round |
+| `rustfs_kms_probe_last_success_timestamp_seconds` | gauge | — | Unix timestamp of the most recent successful round |
+| `rustfs_kms_probe_consecutive_failures` | gauge | — | Rounds that have failed since the last success |
+
+`failure_kind` is `key_provisioning` (the probe key could not be described or created), `generate`, `decrypt`, or `mismatch` — the last means both calls answered but the material did not survive the round trip, which is as serious as an outage and is reported as loudly.
+
+`unsupported` means the backend cannot host the probe key. It is deliberately counted as its own result and never as a failure, and the worker stops after recording it, so failure-counter alerts stay silent on such deployments; the AWS KMS backend is the case in practice, because it refuses a caller-named create. Note also that `rustfs_kms_probe_last_success_timestamp_seconds` only ever moves forward on a success, so while the probe fails its age keeps growing — alert on that age, not on the presence of a failure counter.
+
+Export path: the `metrics` facade feeds the OTel recorder in `crates/obs`, which exports over OTLP to the collector scraped by Prometheus. Histograms therefore appear in Prometheus as `_bucket`/`_sum`/`_count` series. None of these metrics carry the RustFS `server` label used by the node observability dashboard — distinguish nodes through your scrape topology (`job`/`instance` or promoted OTel resource attributes such as `service_instance_id`).
 
 ## Dashboard
 
 Import `deploy/observability/grafana/rustfs-kms-observability.json` into Grafana and select a Prometheus data source that scrapes RustFS metrics. The dashboard has two variables: `datasource` (Prometheus data source) and `operation` (multi-select over the `operation` label). In the docker-compose observability stack (`.docker/observability/`), dashboards are provisioned from a directory (`grafana/provisioning/dashboards/dashboard.yml` points at `/etc/grafana/dashboards`), so no per-file registration is needed there.
 
-The dashboard's "Planned Panels (TODO)" text panel lists metric families designed under rustfs/backlog#1584 but not yet landed (key-cache effectiveness, lifecycle gauges, token TTL, synthetic probe). Do not add panels or alerts for those names until the emitting code is merged; keep that panel and the [Coverage gaps](#coverage-gaps-and-planned-metrics) section below in sync as they land.
+The shipped dashboard covers the backend operation metrics only. Its "Planned Panels (TODO)" text panel still describes the cache, lifecycle, Vault credential and probe families as not landed — that panel is stale: the emitting code is merged and the metric names, types and label values are in [Metric reference](#metric-reference) above. Until real panels replace it, query those families ad hoc; nothing in the shipped dashboard or alert rules reads them. See [Coverage gaps](#coverage-gaps).
 
 ## Alert rules
 
@@ -45,7 +105,7 @@ Meaning: attempts are failing with `error_class="fatal"` — failures the policy
 Investigation:
 
 1. Break the rate down by operation: `sum by (operation) (rate(rustfs_kms_backend_attempt_failures_total{error_class="fatal"}[5m]))`.
-2. If the failing operations are `vault_login` or `vault_token_renew` (`op_class="auth"`), the Vault credentials are invalid or expired. Follow the [Vault KMS authentication runbook](vault-kms-authentication.md) — note that credential refresh is fail-closed, so a broken credential eventually takes down all Vault-backed operations, not just auth. Look for the `Vault token renewal failed; falling back to a fresh login` and `Vault credential refresh failed; retrying until the credentials recover` warnings in the RustFS logs.
+2. If the failing operations are `vault_login` or `vault_token_renew` (`op_class="auth"`), the Vault credentials are invalid or expired. Follow the [Vault KMS authentication runbook](vault-kms-authentication.md) — note that credential refresh is fail-closed, so a broken credential eventually takes down all Vault-backed operations, not just auth. Look for the `Vault token renewal failed; falling back to a fresh login` and `Vault credential refresh failed; retrying until the credentials recover` warnings in the RustFS logs; `rustfs_kms_vault_credentials_fail_closed` at `1`, or `rustfs_kms_vault_token_ttl_seconds` at or near `0`, confirms that state without reading logs.
 3. If the failing operations are `vault_kv2_*` or `vault_transit_*`, check for Vault permission denials: compare the token's policy against the minimal policy in [KMS backend security properties](kms-backend-security.md) (a policy that drifted or was re-scoped produces 403s that classify as fatal), and check the Vault audit log for the corresponding denied requests.
 4. A fatal `KeyVersionNotFound` on decrypt-path operations means a DEK envelope references a key version whose record is missing. Decryption deliberately fails closed with no fallback — see the rotation retention preconditions in [KMS backend security properties](kms-backend-security.md) and verify nobody destroyed version records under the key subtree.
 5. Confirm blast radius with the outcome view: `sum by (operation) (rate(rustfs_kms_backend_operations_total{outcome="fatal"}[5m]))`.
@@ -112,16 +172,15 @@ Related signals: the "Backend Operation Rate by Outcome" panel; retry-backoff wa
 
 Every numeric threshold in `rustfs-kms-alerts.yml` (5% error ratio, 2s p99, 0.5/s attempt failures, 0.05/s budget exhaustion) is a conservative default chosen without a production baseline, biased toward not paging on healthy-but-busy systems. Before relying on these alerts for paging: run the workload in staging for at least a week, record the steady-state values of the expressions above, then tighten thresholds to sit clearly above observed peaks. Once a stable baseline exists, consider converting `KmsBackendAttemptFailureSpike` to a baseline-relative form (`offset 1d` ratio, see `.docker/observability/prometheus-rules/rustfs-get-optimization-alerts.yaml` for the pattern). Formal SLO targets for KMS operations are deliberately out of scope until that baseline exists (rustfs/backlog#1584).
 
-## Coverage gaps and planned metrics
+## Coverage gaps
 
-The following families are designed under rustfs/backlog#1584 but land in separate changes; they are intentionally absent from the dashboard and alert rules, and referencing their names before the emitting code merges would produce permanently-empty panels and never-firing alerts:
+The four metric families designed under rustfs/backlog#1584 — key-cache effectiveness, key lifecycle, Vault credentials, synthetic probe — have all landed and are documented in [Metric reference](#metric-reference). What is still missing:
 
-- Key-cache effectiveness: hit/miss counters, entry gauge, eviction counter (replacing the former hardcoded-zero miss statistic).
-- Key lifecycle: pending-deletion/tombstone gauges from the deletion-worker sweep and an aggregate rotation-age gauge.
-- Vault credentials: token TTL remaining and fail-closed state gauges (today only the log warnings quoted above exist).
-- Synthetic backend probe: probe outcome and failure-class metrics feeding the readiness cache.
+- **No dashboard panels and no alert rules for those four families.** They are emitted but neither visualized nor alerted on, so they surface only in ad-hoc queries. Building against them is safe now: the names and label values above are what the code emits.
+- **The Local and Static backends emit no operation metrics**, because they do not flow through the operation-policy choke point; bringing them under the same instrumentation is tracked separately (rustfs/backlog#1569). Their cache metrics are emitted normally.
+- **No formal SLO targets**, deliberately, until a production baseline exists — see [Threshold calibration](#threshold-calibration).
 
-When one of these lands, add its panels, extend the alert rules, replace the corresponding TODO bullet in the dashboard's "Planned Panels" text panel, and update this section.
+When a panel or alert rule for one of the landed families is added, replace the corresponding TODO bullet in the dashboard's "Planned Panels" text panel and update this section.
 
 ## Related documents
 
