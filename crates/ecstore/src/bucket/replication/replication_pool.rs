@@ -53,6 +53,7 @@ use std::sync::LazyLock;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
@@ -91,20 +92,46 @@ pub struct DurableMrfBacklogSummary {
     pub buckets: Vec<DurableMrfBucketBacklog>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MrfBucketBacklogObservability {
+    pub bucket: String,
+    pub pending_count: u64,
+    pub pending_bytes: u64,
+    pub dropped_count: u64,
+    pub missed_count: u64,
+    pub flush_failure_count: u64,
+    pub last_flush_duration_millis: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MrfBacklogObservabilitySummary {
+    pub buckets: Vec<MrfBucketBacklogObservability>,
+}
+
 static DURABLE_MRF_BACKLOG_SUMMARY: LazyLock<StdRwLock<DurableMrfBacklogSummary>> =
     LazyLock::new(|| StdRwLock::new(DurableMrfBacklogSummary::default()));
+static MRF_BACKLOG_OBSERVABILITY: LazyLock<StdRwLock<MrfBacklogObservabilityTracker>> =
+    LazyLock::new(|| StdRwLock::new(MrfBacklogObservabilityTracker::default()));
 
-fn durable_mrf_backlog_summary_from_sizes<I>(entries: I) -> DurableMrfBacklogSummary
-where
-    I: IntoIterator<Item = (String, i64)>,
-{
-    let mut buckets = HashMap::<String, DurableMrfBucketBacklog>::new();
-    for (bucket_name, entry_size) in entries {
+#[derive(Debug, Clone, Default)]
+struct DurableMrfBacklogTracker {
+    available: bool,
+    buckets: HashMap<String, DurableMrfBucketBacklog>,
+}
+
+impl DurableMrfBacklogTracker {
+    fn add_entry(&mut self, bucket_name: String, entry_size: i64) {
         let Ok(size) = u64::try_from(entry_size) else {
-            return DurableMrfBacklogSummary::default();
+            self.available = false;
+            self.buckets.clear();
+            return;
         };
 
-        let bucket = match buckets.entry(bucket_name) {
+        if !self.available {
+            return;
+        }
+
+        let bucket = match self.buckets.entry(bucket_name) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let bucket = entry.key().clone();
@@ -118,10 +145,91 @@ where
         bucket.bytes = bucket.bytes.saturating_add(size);
     }
 
-    DurableMrfBacklogSummary {
-        available: true,
-        buckets: buckets.into_values().collect(),
+    fn into_summary(self) -> DurableMrfBacklogSummary {
+        if !self.available {
+            return DurableMrfBacklogSummary::default();
+        }
+
+        DurableMrfBacklogSummary {
+            available: true,
+            buckets: self.buckets.into_values().collect(),
+        }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MrfBacklogObservabilityTracker {
+    buckets: HashMap<String, MrfBucketBacklogObservability>,
+}
+
+impl MrfBacklogObservabilityTracker {
+    fn bucket_mut(&mut self, bucket_name: &str) -> &mut MrfBucketBacklogObservability {
+        match self.buckets.entry(bucket_name.to_string()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(MrfBucketBacklogObservability {
+                bucket: bucket_name.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn add_pending(&mut self, entry: &MrfReplicateEntry) {
+        let Ok(size) = u64::try_from(entry.size) else {
+            return;
+        };
+        let bucket = self.bucket_mut(&entry.bucket);
+        bucket.pending_count = bucket.pending_count.saturating_add(1);
+        bucket.pending_bytes = bucket.pending_bytes.saturating_add(size);
+    }
+
+    fn flush_pending_entries<'a>(&mut self, entries: impl IntoIterator<Item = &'a MrfReplicateEntry>, duration_millis: u64) {
+        for entry in entries {
+            let Ok(size) = u64::try_from(entry.size) else {
+                continue;
+            };
+            let bucket = self.bucket_mut(&entry.bucket);
+            bucket.pending_count = bucket.pending_count.saturating_sub(1);
+            bucket.pending_bytes = bucket.pending_bytes.saturating_sub(size);
+            bucket.last_flush_duration_millis = duration_millis;
+        }
+    }
+
+    fn record_drop(&mut self, entry: &MrfReplicateEntry) {
+        let bucket = self.bucket_mut(&entry.bucket);
+        bucket.dropped_count = bucket.dropped_count.saturating_add(1);
+    }
+
+    fn record_missed(&mut self, bucket_name: &str) {
+        let bucket = self.bucket_mut(bucket_name);
+        bucket.missed_count = bucket.missed_count.saturating_add(1);
+    }
+
+    fn record_flush_failure(&mut self, duration_millis: u64) {
+        for bucket in self.buckets.values_mut().filter(|bucket| bucket.pending_count > 0) {
+            bucket.flush_failure_count = bucket.flush_failure_count.saturating_add(1);
+            bucket.last_flush_duration_millis = duration_millis;
+        }
+    }
+
+    fn snapshot(&self) -> MrfBacklogObservabilitySummary {
+        MrfBacklogObservabilitySummary {
+            buckets: self.buckets.values().cloned().collect(),
+        }
+    }
+}
+
+fn durable_mrf_backlog_summary_from_sizes<I>(entries: I) -> DurableMrfBacklogSummary
+where
+    I: IntoIterator<Item = (String, i64)>,
+{
+    let mut tracker = DurableMrfBacklogTracker {
+        available: true,
+        ..Default::default()
+    };
+    for (bucket_name, entry_size) in entries {
+        tracker.add_entry(bucket_name, entry_size);
+    }
+    tracker.into_summary()
 }
 
 fn set_durable_mrf_backlog_summary(summary: DurableMrfBacklogSummary) {
@@ -136,6 +244,40 @@ pub fn durable_mrf_backlog_summary_snapshot() -> DurableMrfBacklogSummary {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
+}
+
+pub fn mrf_backlog_observability_snapshot() -> MrfBacklogObservabilitySummary {
+    match MRF_BACKLOG_OBSERVABILITY.read() {
+        Ok(guard) => guard.snapshot(),
+        Err(poisoned) => poisoned.into_inner().snapshot(),
+    }
+}
+
+fn update_mrf_backlog_observability(mut update: impl FnMut(&mut MrfBacklogObservabilityTracker)) {
+    match MRF_BACKLOG_OBSERVABILITY.write() {
+        Ok(mut guard) => update(&mut guard),
+        Err(poisoned) => update(&mut poisoned.into_inner()),
+    }
+}
+
+fn observe_mrf_pending(entry: &MrfReplicateEntry) {
+    update_mrf_backlog_observability(|tracker| tracker.add_pending(entry));
+}
+
+fn observe_mrf_pending_flushed(entries: &[MrfReplicateEntry], duration_millis: u64) {
+    update_mrf_backlog_observability(|tracker| tracker.flush_pending_entries(entries, duration_millis));
+}
+
+fn observe_mrf_drop(entry: &MrfReplicateEntry) {
+    update_mrf_backlog_observability(|tracker| tracker.record_drop(entry));
+}
+
+fn observe_mrf_missed(bucket: &str) {
+    update_mrf_backlog_observability(|tracker| tracker.record_missed(bucket));
+}
+
+fn observe_mrf_flush_failure(duration_millis: u64) {
+    update_mrf_backlog_observability(|tracker| tracker.record_flush_failure(duration_millis));
 }
 
 fn durable_mrf_backlog_from_read(result: Result<Vec<u8>, EcstoreError>) -> DurableMrfBacklog {
@@ -302,26 +444,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
-                    active_counter.fetch_add(1, Ordering::SeqCst);
-
-                    match operation {
-                        ReplicationOperation::Object(obj_info) => {
-                            let bucket = obj_info.bucket.clone();
-                            let size = obj_info.size;
-                            let delete_marker = obj_info.delete_marker;
-                            let op_type = obj_info.op_type;
-                            replicate_object(*obj_info, storage.clone()).await;
-                            stats.dec_q(&bucket, size, delete_marker, op_type);
-                        }
-                        ReplicationOperation::Delete(del_info) => {
-                            let bucket = del_info.bucket.clone();
-                            let op_type = del_info.op_type;
-                            replicate_delete(*del_info, storage.clone()).await;
-                            stats.dec_q(&bucket, 0, true, op_type);
-                        }
-                    }
-
-                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let _active = ActiveWorkerGuard::new(active_counter.clone());
+                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
                 }
             });
 
@@ -379,30 +503,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
-                    active_counter.fetch_add(1, Ordering::SeqCst);
-
-                    match operation {
-                        ReplicationOperation::Object(obj_info) => {
-                            let bucket = obj_info.bucket.clone();
-                            let size = obj_info.size;
-                            let delete_marker = obj_info.delete_marker;
-                            let op_type = obj_info.op_type;
-                            // Perform actual replication (placeholder)
-                            replicate_object(*obj_info, storage.clone()).await;
-
-                            stats.dec_q(&bucket, size, delete_marker, op_type);
-                        }
-                        ReplicationOperation::Delete(del_info) => {
-                            let bucket = del_info.bucket.clone();
-                            let op_type = del_info.op_type;
-                            // Perform actual delete replication (placeholder)
-                            replicate_delete(*del_info, storage.clone()).await;
-
-                            stats.dec_q(&bucket, 0, true, op_type);
-                        }
-                    }
-
-                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let _active = ActiveWorkerGuard::new(active_counter.clone());
+                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
                 }
             });
 
@@ -448,24 +550,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     let operation = { mrf_rx.lock().await.recv().await };
                     let Some(operation) = operation else { break };
 
-                    active_counter.fetch_add(1, Ordering::SeqCst);
-                    match operation {
-                        ReplicationOperation::Object(obj_info) => {
-                            let bucket = obj_info.bucket.clone();
-                            let size = obj_info.size;
-                            let delete_marker = obj_info.delete_marker;
-                            let op_type = obj_info.op_type;
-                            replicate_object(*obj_info, storage.clone()).await;
-                            stats.dec_q(&bucket, size, delete_marker, op_type);
-                        }
-                        ReplicationOperation::Delete(del_info) => {
-                            let bucket = del_info.bucket.clone();
-                            let op_type = del_info.op_type;
-                            replicate_delete(*del_info, storage.clone()).await;
-                            stats.dec_q(&bucket, 0, true, op_type);
-                        }
-                    }
-                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let _active = ActiveWorkerGuard::new(active_counter.clone());
+                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
                 }
             });
             self.task_handles.lock().await.push(handle);
@@ -902,6 +988,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             // sustained failure storm can't grow it without limit.
             const MRF_PENDING_CAP: usize = 200_000;
             let mut pending: Vec<MrfReplicateEntry> = Vec::new();
+            let mut durable_tracker = DurableMrfBacklogTracker {
+                available: true,
+                ..Default::default()
+            };
             let mut flushed_len = 0usize;
             let mut dirty = false;
             let mut capped = false;
@@ -915,6 +1005,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     entry = rx.recv() => match entry {
                         Some(e) => {
                             if pending.len() >= MRF_PENDING_CAP {
+                                observe_mrf_drop(&e);
                                 dec_mrf_entries(stats.as_ref(), std::slice::from_ref(&e));
                                 if !capped {
                                     capped = true;
@@ -927,16 +1018,19 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 }
                                 continue;
                             }
+                            durable_tracker.add_entry(e.bucket.clone(), e.size);
+                            observe_mrf_pending(&e);
                             pending.push(e);
                             dirty = true;
                             // Flush eagerly once enough new entries have accumulated
                             // since the last write (measured against the flushed
                             // set, not the absolute length, so a large backlog is
                             // not rewritten on every single add).
-                            if pending.len() - flushed_len >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
-                                set_durable_mrf_backlog_summary(durable_mrf_backlog_summary_from_sizes(
-                                    pending.iter().map(|entry| (entry.bucket.clone(), entry.size)),
-                                ));
+                            if pending.len() - flushed_len >= 1000
+                                && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
+                            {
+                                set_durable_mrf_backlog_summary(durable_tracker.clone().into_summary());
+                                observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
                                 dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                                 flushed_len = pending.len();
                                 dirty = false;
@@ -944,20 +1038,18 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         }
                         None => {
                             // Channel closed (pool shutting down) — final flush.
-                            if dirty && flush_mrf_to_disk(&pending, &storage).await {
-                                set_durable_mrf_backlog_summary(durable_mrf_backlog_summary_from_sizes(
-                                    pending.iter().map(|entry| (entry.bucket.clone(), entry.size)),
-                                ));
+                            if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                                set_durable_mrf_backlog_summary(durable_tracker.clone().into_summary());
+                                observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
                                 dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             }
                             break;
                         }
                     },
                     _ = interval.tick() => {
-                        if dirty && flush_mrf_to_disk(&pending, &storage).await {
-                            set_durable_mrf_backlog_summary(durable_mrf_backlog_summary_from_sizes(
-                                pending.iter().map(|entry| (entry.bucket.clone(), entry.size)),
-                            ));
+                        if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                            set_durable_mrf_backlog_summary(durable_tracker.clone().into_summary());
+                            observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
                             dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             flushed_len = pending.len();
                             dirty = false;
@@ -977,30 +1069,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         stats: Arc<ReplicationStats>,
     ) {
         while let Some(operation) = rx.recv().await {
-            active_counter.fetch_add(1, Ordering::SeqCst);
-
-            match operation {
-                ReplicationOperation::Object(obj_info) => {
-                    let bucket = obj_info.bucket.clone();
-                    let size = obj_info.size;
-                    let delete_marker = obj_info.delete_marker;
-                    let op_type = obj_info.op_type;
-                    // Perform actual replication (placeholder)
-                    replicate_object(*obj_info, self.storage.clone()).await;
-
-                    stats.dec_q(&bucket, size, delete_marker, op_type);
-                }
-                ReplicationOperation::Delete(del_info) => {
-                    let bucket = del_info.bucket.clone();
-                    let op_type = del_info.op_type;
-                    // Perform actual delete replication (placeholder)
-                    replicate_delete(*del_info, self.storage.clone()).await;
-
-                    stats.dec_q(&bucket, 0, true, op_type);
-                }
-            }
-
-            active_counter.fetch_sub(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard::new(active_counter.clone());
+            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
         }
     }
 
@@ -1013,26 +1083,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         storage: Arc<S>,
     ) {
         while let Some(operation) = rx.recv().await {
-            active_counter.fetch_add(1, Ordering::SeqCst);
-
-            match operation {
-                ReplicationOperation::Object(obj_info) => {
-                    let bucket = obj_info.bucket.clone();
-                    let size = obj_info.size;
-                    let delete_marker = obj_info.delete_marker;
-                    let op_type = obj_info.op_type;
-                    replicate_object(*obj_info, storage.clone()).await;
-                    stats.dec_q(&bucket, size, delete_marker, op_type);
-                }
-                ReplicationOperation::Delete(del_info) => {
-                    let bucket = del_info.bucket.clone();
-                    let op_type = del_info.op_type;
-                    replicate_delete(*del_info, storage.clone()).await;
-                    stats.dec_q(&bucket, 0, true, op_type);
-                }
-            }
-
-            active_counter.fetch_sub(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard::new(active_counter.clone());
+            process_replication_operation(operation, stats.clone(), storage.clone()).await;
         }
     }
 
@@ -1044,27 +1096,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         stats: Arc<ReplicationStats>,
     ) {
         while let Some(operation) = rx.recv().await {
-            active_counter.fetch_add(1, Ordering::SeqCst);
-
-            match operation {
-                ReplicationOperation::Object(obj_info) => {
-                    let bucket = obj_info.bucket.clone();
-                    let size = obj_info.size;
-                    let delete_marker = obj_info.delete_marker;
-                    let op_type = obj_info.op_type;
-                    replicate_object(obj_info.as_ref().clone(), self.storage.clone()).await;
-
-                    stats.dec_q(&bucket, size, delete_marker, op_type);
-                }
-                ReplicationOperation::Delete(del_info) => {
-                    let bucket = del_info.bucket.clone();
-                    let op_type = del_info.op_type;
-                    replicate_delete(*del_info, self.storage.clone()).await;
-                    stats.dec_q(&bucket, 0, true, op_type);
-                }
-            }
-
-            active_counter.fetch_sub(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard::new(active_counter.clone());
+            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
         }
     }
 
@@ -1395,6 +1428,76 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 }
 
+struct ActiveWorkerGuard {
+    counter: Arc<AtomicI32>,
+}
+
+impl ActiveWorkerGuard {
+    fn new(counter: Arc<AtomicI32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ReplicationBacklogGuard {
+    stats: Arc<ReplicationStats>,
+    bucket: String,
+    size: i64,
+    is_delete_marker: bool,
+    op_type: ReplicationType,
+}
+
+impl ReplicationBacklogGuard {
+    fn for_object(stats: Arc<ReplicationStats>, object: &ReplicateObjectInfo) -> Self {
+        Self {
+            stats,
+            bucket: object.bucket.clone(),
+            size: object.size,
+            is_delete_marker: object.delete_marker,
+            op_type: object.op_type,
+        }
+    }
+
+    fn for_delete(stats: Arc<ReplicationStats>, delete: &DeletedObjectReplicationInfo) -> Self {
+        Self {
+            stats,
+            bucket: delete.bucket.clone(),
+            size: 0,
+            is_delete_marker: true,
+            op_type: delete.op_type,
+        }
+    }
+}
+
+impl Drop for ReplicationBacklogGuard {
+    fn drop(&mut self) {
+        self.stats.dec_q(&self.bucket, self.size, self.is_delete_marker, self.op_type);
+    }
+}
+
+async fn process_replication_operation<S: ReplicationStorage>(
+    operation: ReplicationOperation,
+    stats: Arc<ReplicationStats>,
+    storage: Arc<S>,
+) {
+    match operation {
+        ReplicationOperation::Object(obj_info) => {
+            let _backlog = ReplicationBacklogGuard::for_object(stats, obj_info.as_ref());
+            replicate_object(*obj_info, storage).await;
+        }
+        ReplicationOperation::Delete(del_info) => {
+            let _backlog = ReplicationBacklogGuard::for_delete(stats, del_info.as_ref());
+            replicate_delete(*del_info, storage).await;
+        }
+    }
+}
+
 async fn queue_mrf_save_entry(
     tx: &Sender<MrfReplicateEntry>,
     entry: MrfReplicateEntry,
@@ -1414,6 +1517,7 @@ async fn queue_mrf_save_entry(
         queue_type = queue_type,
         "MRF save channel unavailable — replication failure entry could not be persisted for retry"
     );
+    observe_mrf_missed(&entry.bucket);
     ReplicationQueueAdmission::Missed
 }
 
@@ -1424,15 +1528,18 @@ fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
 }
 
 /// Encodes `entries` and overwrites the MRF persistence file.
-/// Returns `true` on success; on failure logs the error and returns `false`.
-/// Callers must NOT clear their in-memory buffer on `false` so the next tick
+/// Returns the flush duration on success; on failure logs the error and returns `None`.
+/// Callers must NOT clear their in-memory buffer on `None` so the next tick
 /// can retry — otherwise a transient storage error permanently drops the batch.
-async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
+async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> Option<u64> {
+    let started = Instant::now();
     match encode_mrf_file(entries) {
         Ok(data) => {
             if let Err(e) =
                 ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, data).await
             {
+                let duration_millis = duration_millis_u64(started.elapsed());
+                observe_mrf_flush_failure(duration_millis);
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1440,11 +1547,12 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
                     error = %e,
                     "Failed to flush MRF entries to disk"
                 );
-                return false;
+                return None;
             }
-            true
+            Some(duration_millis_u64(started.elapsed()))
         }
         Err(e) => {
+            observe_mrf_flush_failure(0);
             warn!(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1452,9 +1560,13 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
                 error = %e,
                 "Failed to encode MRF entries for disk flush"
             );
-            false
+            None
         }
     }
+}
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Load bucket resync metadata from disk
@@ -2662,6 +2774,132 @@ mod tests {
             .await
             .expect("second MRF entry should be queued after capacity opens");
         assert_eq!(received.object, "second");
+    }
+
+    #[tokio::test]
+    async fn mrf_save_admission_records_missed_when_channel_is_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let bucket = "mrf-missed-hook-bucket";
+
+        let admission = queue_mrf_save_entry(
+            &tx,
+            MrfReplicateEntry {
+                bucket: bucket.to_string(),
+                object: "missed".to_string(),
+                version_id: None,
+                retry_count: 1,
+                size: 1,
+                op: MrfOpKind::Object,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+            },
+            "test",
+        )
+        .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Missed);
+        let snapshot = mrf_backlog_observability_snapshot();
+        let bucket = snapshot
+            .buckets
+            .iter()
+            .find(|stats| stats.bucket == "mrf-missed-hook-bucket")
+            .expect("missed MRF admission should be observable");
+        assert_eq!(bucket.missed_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mrf_flush_failure_keeps_pending_backlog_observable() {
+        let shared = empty_resync_shared_state();
+        shared.fail_next_write.store(true, Ordering::SeqCst);
+        let storage = Arc::new(LoadResyncNodeStore::new("mrf-flush-failure", shared));
+        let entry = MrfReplicateEntry {
+            bucket: "mrf-flush-failure-bucket".to_string(),
+            object: "pending".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 2048,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+        };
+        observe_mrf_pending(&entry);
+
+        let result = flush_mrf_to_disk(std::slice::from_ref(&entry), &storage).await;
+
+        assert_eq!(result, None);
+        let snapshot = mrf_backlog_observability_snapshot();
+        let bucket = snapshot
+            .buckets
+            .iter()
+            .find(|stats| stats.bucket == "mrf-flush-failure-bucket")
+            .expect("failed MRF flush should keep the bucket observable");
+        assert_eq!(bucket.pending_count, 1);
+        assert_eq!(bucket.pending_bytes, 2048);
+        assert_eq!(bucket.flush_failure_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replication_backlog_guard_decrements_on_drop() {
+        let stats = Arc::new(ReplicationStats::new());
+        stats.inc_q("guard-bucket", 256, false, ReplicationType::Object);
+
+        {
+            let object = ReplicateObjectInfo {
+                bucket: "guard-bucket".to_string(),
+                size: 256,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            };
+            let _guard = ReplicationBacklogGuard::for_object(stats.clone(), &object);
+        }
+
+        let queued = stats.get_latest_replication_stats("guard-bucket").await;
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 0);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 0);
+    }
+
+    #[test]
+    fn mrf_observability_tracker_separates_pending_drop_miss_and_flush_failure() {
+        let first = MrfReplicateEntry {
+            bucket: "tracker-bucket".to_string(),
+            object: "first".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 1024,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+        };
+        let second = MrfReplicateEntry {
+            object: "second".to_string(),
+            size: 512,
+            ..first.clone()
+        };
+        let mut tracker = MrfBacklogObservabilityTracker::default();
+
+        tracker.add_pending(&first);
+        tracker.add_pending(&second);
+        tracker.record_drop(&second);
+        tracker.record_missed("tracker-bucket");
+        tracker.record_flush_failure(7);
+        tracker.flush_pending_entries([&first], 11);
+
+        let snapshot = tracker.snapshot();
+        let bucket = snapshot
+            .buckets
+            .iter()
+            .find(|stats| stats.bucket == "tracker-bucket")
+            .expect("tracker bucket should be present");
+        assert_eq!(bucket.pending_count, 1);
+        assert_eq!(bucket.pending_bytes, 512);
+        assert_eq!(bucket.dropped_count, 1);
+        assert_eq!(bucket.missed_count, 1);
+        assert_eq!(bucket.flush_failure_count, 1);
+        assert_eq!(bucket.last_flush_duration_millis, 11);
     }
 
     #[test]
