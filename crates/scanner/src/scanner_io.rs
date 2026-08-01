@@ -30,6 +30,7 @@ use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, e
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
 use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo};
 use rustfs_filemeta::FileMeta;
+use rustfs_lock::{LockError, NamespaceLockGuard};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration};
 use sha2::{Digest as _, Sha256};
@@ -944,12 +945,83 @@ fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> 
     Some(usage)
 }
 
-pub(crate) fn scanner_cache_lock_resource(cache_name: &str) -> String {
-    path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name, SCANNER_CACHE_LOCK_SUFFIX])
+pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
+    let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
+    path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name, &lock_name])
 }
 
 pub(crate) fn scanner_cache_lock_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
+#[derive(Debug)]
+pub(crate) struct ScannerCacheLockGuards {
+    scoped: NamespaceLockGuard,
+}
+
+impl ScannerCacheLockGuards {
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.scoped.is_lock_lost()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ScannerCacheLockError {
+    Create { resource: String, source: Error },
+    Acquire { resource: String, source: LockError },
+}
+
+impl ScannerCacheLockError {
+    pub(crate) fn state(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "lock_create_failed",
+            Self::Acquire { .. } => "lock_acquire_failed",
+        }
+    }
+
+    pub(crate) fn is_contention(&self) -> bool {
+        matches!(
+            self,
+            Self::Acquire {
+                source: LockError::Timeout { .. } | LockError::AlreadyLocked { .. },
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for ScannerCacheLockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Create { resource, source } => write!(formatter, "create scanner cache lock {resource}: {source}"),
+            Self::Acquire { resource, source } => write!(formatter, "acquire scanner cache lock {resource}: {source}"),
+        }
+    }
+}
+
+pub(crate) async fn acquire_scanner_cache_locks(
+    store: &SetDisks,
+    cache_name: &str,
+    source: DataUsageCacheSource,
+) -> std::result::Result<ScannerCacheLockGuards, ScannerCacheLockError> {
+    let timeout = scanner_cache_lock_timeout();
+    let scoped_resource = scanner_cache_lock_resource(cache_name, source);
+    let scoped_lock = store
+        .new_ns_lock(RUSTFS_META_BUCKET, &scoped_resource)
+        .await
+        .map_err(|source| ScannerCacheLockError::Create {
+            resource: scoped_resource.clone(),
+            source,
+        })?;
+    let scoped = scoped_lock
+        .get_write_lock_quiet(timeout)
+        .await
+        .map_err(|source| ScannerCacheLockError::Acquire {
+            resource: scoped_resource,
+            source,
+        })?;
+
+    Ok(ScannerCacheLockGuards { scoped })
 }
 
 async fn await_scanner_disk_shutdown<F>(scan: Pin<&mut F>)
@@ -1698,6 +1770,19 @@ mod publish_gate_tests {
     }
 
     #[test]
+    fn scanner_cache_lock_resource_is_scoped_to_cache_source() {
+        let cache_name = "photos/.usage-cache.bin";
+        let first_source = DataUsageCacheSource::new(0, 1);
+        let same_source = DataUsageCacheSource::new(0, 1);
+        let other_source = DataUsageCacheSource::new(1, 0);
+
+        let first = scanner_cache_lock_resource(cache_name, first_source);
+        assert_eq!(first, scanner_cache_lock_resource(cache_name, same_source));
+        assert_ne!(first, scanner_cache_lock_resource(cache_name, other_source));
+        assert!(first.ends_with(".scanner-cycle.lock.pool-0.set-1"));
+    }
+
+    #[test]
     fn count_budget_serializes_set_and_disk_work() {
         assert_eq!(scanner_budgeted_concurrency_limit(8, true), 1);
         assert_eq!(scanner_budgeted_concurrency_limit(8, false), 8);
@@ -1797,24 +1882,7 @@ async fn persist_and_publish_cache_snapshot(
     cache_cycle_floor: &AtomicU64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
-    let lock_resource = scanner_cache_lock_resource(DATA_USAGE_CACHE_NAME);
-    let ns_lock = match store.new_ns_lock(RUSTFS_META_BUCKET, &lock_resource).await {
-        Ok(lock) => lock,
-        Err(err) => {
-            error!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
-                state = "lock_create_failed",
-                error = %err,
-                "Scanner cache snapshot lock creation failed"
-            );
-            return None;
-        }
-    };
-    let guard = match ns_lock.get_write_lock_quiet(scanner_cache_lock_timeout()).await {
+    let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
         Err(err) => {
             error!(
@@ -1823,7 +1891,7 @@ async fn persist_and_publish_cache_snapshot(
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
                 cache_name = DATA_USAGE_CACHE_NAME,
-                state = "lock_acquire_failed",
+                state = err.state(),
                 error = %err,
                 "Scanner cache snapshot lock acquisition failed"
             );
@@ -3080,32 +3148,35 @@ impl ScannerIOCache for SetDisks {
                         None
                     };
 
-                    // Lock order: scanner leader fence -> per-bucket cache lock ->
-                    // cache object read/write. The cache lock stays outermost for
-                    // local and rolling-upgrade workers so leader failover cannot
-                    // execute the same bucket concurrently.
-                    let lock_resource = scanner_cache_lock_resource(&cache_name);
-                    let ns_lock = match store_clone_clone.new_ns_lock(RUSTFS_META_BUCKET, &lock_resource).await {
-                        Ok(lock) => lock,
-                        Err(e) => {
-                            record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
-                            error!(
-                                target: "rustfs::scanner::io",
-                                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_IO,
-                                bucket = %bucket.name,
-                                cache_name = %cache_name,
-                                state = "lock_create_failed",
-                                error = %e,
-                                "Scanner bucket cache lock creation failed"
-                            );
-                            continue;
-                        }
-                    };
-                    let cache_guard = match ns_lock.get_write_lock_quiet(scanner_cache_lock_timeout()).await {
+                    // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
+                    // cache object read/write.
+                    let cache_guard = match acquire_scanner_cache_locks(store_clone_clone.as_ref(), &cache_name, source).await {
                         Ok(guard) => guard,
                         Err(e) => {
+                            if e.is_contention() {
+                                if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
+                                    increment_disk_bucket_scans_queued(
+                                        &queued_disk_bucket_scans_clone,
+                                        &pool_label_clone,
+                                        &set_label_clone,
+                                    );
+                                } else {
+                                    record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                }
+                                debug!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    cache_name = %cache_name,
+                                    state = "lock_contention_requeued",
+                                    error = %e,
+                                    "Scanner bucket cache lock contention requeued bucket work"
+                                );
+                                break;
+                            }
+
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                             error!(
                                 target: "rustfs::scanner::io",
@@ -3114,7 +3185,7 @@ impl ScannerIOCache for SetDisks {
                                 subsystem = LOG_SUBSYSTEM_IO,
                                 bucket = %bucket.name,
                                 cache_name = %cache_name,
-                                state = "lock_acquire_failed",
+                                state = e.state(),
                                 error = %e,
                                 "Scanner bucket cache lock acquisition failed"
                             );
@@ -3892,6 +3963,52 @@ mod tests {
         init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
         (temp_dir, store)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cache_locks_block_same_source_workers() {
+        let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+        let set = &store.pools[0].disk_set[0];
+        let source = DataUsageCacheSource::new(0, 0);
+        let cache_name = "photos/.usage-cache.bin";
+
+        let guards = acquire_scanner_cache_locks(set.as_ref(), cache_name, source)
+            .await
+            .expect("scanner cache locks should be acquired");
+        let scoped_lock = set
+            .new_ns_lock(RUSTFS_META_BUCKET, &scanner_cache_lock_resource(cache_name, source))
+            .await
+            .expect("scoped scanner cache lock should be created");
+        let scoped_err = scoped_lock
+            .get_write_lock_quiet(Duration::from_millis(100))
+            .await
+            .expect_err("same-source workers must be blocked while scanner cache lock is held");
+        assert!(matches!(scoped_err, LockError::Timeout { .. } | LockError::AlreadyLocked { .. }));
+
+        drop(guards);
+        acquire_scanner_cache_locks(set.as_ref(), cache_name, source)
+            .await
+            .expect("scanner cache locks should be released when guards drop");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cache_locks_allow_cross_source_workers() {
+        let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+        let first_set = &store.pools[0].disk_set[0];
+        let second_set = &store.pools[1].disk_set[0];
+        let cache_name = "photos/.usage-cache.bin";
+
+        let first = acquire_scanner_cache_locks(first_set.as_ref(), cache_name, DataUsageCacheSource::new(0, 0))
+            .await
+            .expect("first source scanner cache locks should be acquired");
+        let second = acquire_scanner_cache_locks(second_set.as_ref(), cache_name, DataUsageCacheSource::new(1, 0))
+            .await
+            .expect("different source scanner cache locks should not contend");
+
+        assert!(!first.is_lock_lost());
+        assert!(!second.is_lock_lost());
     }
 
     #[tokio::test]

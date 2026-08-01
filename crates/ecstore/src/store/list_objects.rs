@@ -4861,10 +4861,7 @@ async fn poll_merge_head(rx: &CancellationToken, in_channels: &mut [Receiver<Met
 
 async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEntry>, entry: MetaCacheEntry) -> Result<bool> {
     tokio::select! {
-        result = out_channel.send(entry) => {
-            result.map_err(Error::other)?;
-            Ok(true)
-        }
+        result = out_channel.send(entry) => Ok(result.is_ok()),
         _ = rx.cancelled() => Ok(false),
     }
 }
@@ -9856,6 +9853,28 @@ mod test {
         handle.await.unwrap().unwrap();
 
         assert_eq!(results, vec!["obj-a", "obj-b"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_treats_dropped_output_receiver_as_completion() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, out_rx) = mpsc::channel(1);
+
+        tx_a.send(test_meta_entry("obj-a")).await.unwrap();
+        tx_b.send(test_meta_entry("obj-b")).await.unwrap();
+        drop(tx_a);
+        drop(tx_b);
+        drop(out_rx);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            merge_entry_channels(CancellationToken::new(), vec![rx_a, rx_b], out_tx, 1),
+        )
+        .await
+        .expect("merge should stop promptly when its consumer disconnects");
+
+        assert!(result.is_ok(), "consumer disconnect must not surface as a merge worker error");
     }
 
     #[test]

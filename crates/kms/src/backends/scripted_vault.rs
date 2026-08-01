@@ -26,16 +26,16 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// One canned HTTP response.
-pub(crate) struct ScriptedResponse {
-    status: u16,
-    body: String,
+/// One scripted connection outcome.
+pub(crate) enum ScriptedResponse {
+    Http { status: u16, body: String },
+    Close,
 }
 
 impl ScriptedResponse {
     /// A 200 response carrying `data` inside the standard Vault envelope.
     pub(crate) fn ok(data: serde_json::Value) -> Self {
-        Self {
+        Self::Http {
             status: 200,
             body: serde_json::json!({
                 "request_id": "scripted",
@@ -50,10 +50,15 @@ impl ScriptedResponse {
 
     /// An error response in Vault's `{"errors": [...]}` format.
     pub(crate) fn error(status: u16, message: &str) -> Self {
-        Self {
+        Self::Http {
             status,
             body: serde_json::json!({ "errors": [message] }).to_string(),
         }
+    }
+
+    /// Close the connection after consuming a request without sending an HTTP response.
+    pub(crate) fn close() -> Self {
+        Self::Close
     }
 }
 
@@ -88,14 +93,14 @@ impl ScriptedVault {
                 let response = responses
                     .next()
                     .unwrap_or_else(|| ScriptedResponse::error(599, "scripted vault: script exhausted"));
-                let payload = format!(
-                    "HTTP/1.1 {} Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    response.status,
-                    response.body.len(),
-                    response.body
-                );
-                let _ = stream.write_all(payload.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                if let ScriptedResponse::Http { status, body } = response {
+                    let payload = format!(
+                        "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(payload.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
             }
         });
 

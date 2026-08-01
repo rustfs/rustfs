@@ -1512,6 +1512,8 @@ mod tests {
     use crate::backends::scripted_vault::{ScriptedResponse, ScriptedVault};
     use crate::config::{VaultAuthMethod, VaultConfig};
 
+    const SCRIPTED_RETRY_ATTEMPTS: u32 = 3;
+
     /// Vault + KMS config pair pointing at a scripted loopback Vault.
     fn scripted_configs(address: &str) -> (VaultConfig, KmsConfig) {
         let vault_config = VaultConfig {
@@ -1527,7 +1529,7 @@ mod tests {
         };
         let kms_config = KmsConfig {
             timeout: Duration::from_secs(5),
-            retry_attempts: 3,
+            retry_attempts: SCRIPTED_RETRY_ATTEMPTS,
             ..KmsConfig::default()
         };
         (vault_config, kms_config)
@@ -1593,6 +1595,31 @@ mod tests {
                 .iter()
                 .all(|line| line == "GET /v1/secret/data/rustfs/kms/keys/wired-key"),
             "both attempts must hit the same read endpoint: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_read_retries_closed_connections_within_budget() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::close(), ScriptedResponse::close()]).await;
+
+        let error = client
+            .get_key_data("wired-key")
+            .await
+            .expect_err("closed connections must exhaust the retry budget");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        let expected_requests = usize::try_from(SCRIPTED_RETRY_ATTEMPTS).expect("retry attempts must fit usize");
+        assert_eq!(
+            requests.len(),
+            expected_requests,
+            "all budgeted retry attempts must reach Vault: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|line| line == "GET /v1/secret/data/rustfs/kms/keys/wired-key"),
+            "all attempts must hit the same read endpoint: {requests:?}"
         );
     }
 
