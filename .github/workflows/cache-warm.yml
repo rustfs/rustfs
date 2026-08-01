@@ -65,6 +65,14 @@ on:
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
   workflow_dispatch:
+    inputs:
+      emit_timings:
+        description: >-
+          Also emit cargo --timings for the ci-dev build and upload it. Used to
+          decide whether sccache is worth adopting (rustfs/backlog#1601 gate).
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -103,6 +111,33 @@ jobs:
       # e2e_test, which test-and-lint's own run excludes. The second build adds
       # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
       # and that no lint lane enables.
+      # rustfs/backlog#1601 gate. sccache can only cache compilation units whose
+      # --emit includes link, so it covers workspace rlibs and nothing else:
+      # clippy is metadata-only, and the ~100 test binaries, the rustfs bin and
+      # every build script invoke the system linker. Before spending a bucket,
+      # credentials and a supply-chain boundary on it, measure how much of the
+      # build is actually rlib codegen.
+      #
+      # Read from the report: workspace lib codegen as a share of the build, and
+      # s3select-query's own rlib as a share. The plan adopts sccache only above
+      # 50% and 25% respectively; if linking dominates instead, the answer is
+      # mold/lld plus split-debuginfo, which is exactly the part sccache cannot
+      # touch. Off by default — this doubles the ci-dev build.
+      - name: Build ci-dev superset (with --timings)
+        if: inputs.emit_timings
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --workspace --all-targets --timings
+
+      - name: Upload cargo timings report
+        if: inputs.emit_timings
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: cargo-timings-ci-dev
+          path: target/cargo-timings/
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Build ci-dev superset
         env:
           # Same limit ci.yml puts on its nextest step: this builds the same
