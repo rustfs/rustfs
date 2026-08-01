@@ -14,8 +14,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use super::replication_error_boundary::Result;
 use super::replication_filemeta_boundary::{ReplicateDecision, ReplicationStatusType, ReplicationType};
-use super::replication_object_config::{check_replicate_delete, get_must_replicate_options, must_replicate};
+use super::replication_object_config::{
+    check_replicate_delete, check_replicate_delete_strict, get_must_replicate_options, must_replicate,
+};
 use super::replication_object_decision_boundary::MustReplicateOptions;
 use super::replication_pool::{schedule_replication, schedule_replication_delete};
 use super::replication_queue_boundary::DeletedObjectReplicationInfo;
@@ -48,6 +51,16 @@ impl ReplicationObjectBridge {
         get_error: Option<String>,
     ) -> ReplicateDecision {
         check_replicate_delete(bucket, object, source, opts, get_error).await
+    }
+
+    pub async fn check_delete_strict(
+        bucket: &str,
+        object: &ObjectToDelete,
+        source: &ObjectInfo,
+        opts: &ObjectOptions,
+        get_error: Option<String>,
+    ) -> Result<ReplicateDecision> {
+        check_replicate_delete_strict(bucket, object, source, opts, get_error).await
     }
 
     pub async fn schedule_object<S: ReplicationStorage>(
