@@ -210,7 +210,7 @@ fn is_replication_target_offline_error(err: &(impl Display + ?Sized)) -> bool {
         .any(|marker| message.contains(marker))
 }
 
-async fn mark_replication_target_offline_if_needed(target_client: &TargetClient, err: &(impl Display + ?Sized)) {
+async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetClient>, err: &(impl Display + ?Sized)) {
     if is_replication_target_offline_error(err) {
         ReplicationTargetStore::mark_target_offline(target_client).await;
     }
@@ -3093,7 +3093,7 @@ mod tests {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    fn test_target_client(endpoint: String) -> TargetClient {
+    fn test_target_client(endpoint: String) -> Arc<TargetClient> {
         let config = aws_sdk_s3::Config::builder()
             .endpoint_url(endpoint.clone())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -3103,7 +3103,7 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .build();
 
-        TargetClient {
+        Arc::new(TargetClient {
             endpoint,
             credentials: None,
             bucket: "target-bucket".to_string(),
@@ -3115,7 +3115,11 @@ mod tests {
             health_check_duration: std::time::Duration::from_secs(5),
             replicate_sync: false,
             client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
-        }
+        })
+    }
+
+    async fn register_test_target(target: &Arc<TargetClient>) {
+        ReplicationTargetStore::register_test_target(target).await;
     }
 
     #[test]
@@ -3131,6 +3135,7 @@ mod tests {
     async fn replication_target_network_failure_marks_target_offline() {
         let endpoint = format!("http://network-failure-{}.example:9000", Uuid::new_v4());
         let target_client = test_target_client(endpoint);
+        register_test_target(&target_client).await;
 
         assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
 
@@ -3144,6 +3149,7 @@ mod tests {
     async fn replication_target_service_failure_keeps_target_online() {
         let endpoint = format!("http://service-failure-{}.example:9000", Uuid::new_v4());
         let target_client = test_target_client(endpoint);
+        register_test_target(&target_client).await;
 
         assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
 
