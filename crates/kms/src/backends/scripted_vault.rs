@@ -66,7 +66,7 @@ impl ScriptedResponse {
 pub(crate) struct ScriptedVault {
     /// Base address (`http://127.0.0.1:port`) to point a Vault client at.
     pub(crate) address: String,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl ScriptedVault {
@@ -86,13 +86,10 @@ impl ScriptedVault {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let Some(request_line) = read_request(&mut stream).await else {
+                let Some(request) = read_request(&mut stream).await else {
                     continue;
                 };
-                recorded
-                    .lock()
-                    .expect("scripted vault request log poisoned")
-                    .push(request_line);
+                recorded.lock().expect("scripted vault request log poisoned").push(request);
                 let response = responses
                     .next()
                     .unwrap_or_else(|| ScriptedResponse::error(599, "scripted vault: script exhausted"));
@@ -112,14 +109,32 @@ impl ScriptedVault {
 
     /// The `METHOD /path` lines of every request served so far, in order.
     pub(crate) fn requests(&self) -> Vec<String> {
-        self.requests.lock().expect("scripted vault request log poisoned").clone()
+        self.requests
+            .lock()
+            .expect("scripted vault request log poisoned")
+            .iter()
+            .map(|(line, _)| line.clone())
+            .collect()
+    }
+
+    /// The request bodies, in the same order as [`Self::requests`]; empty for
+    /// bodyless requests. Lets tests assert what a write actually persisted
+    /// (record contents, check-and-set options), not just that a write happened.
+    pub(crate) fn request_bodies(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("scripted vault request log poisoned")
+            .iter()
+            .map(|(_, body)| body.clone())
+            .collect()
     }
 }
 
 /// Read one HTTP/1.1 request (head plus content-length body) and return its
-/// `METHOD /path` line. Draining the body before responding keeps the client
-/// from seeing a connection reset while it is still writing.
-async fn read_request(stream: &mut TcpStream) -> Option<String> {
+/// `METHOD /path` line together with the body. Draining the body before
+/// responding keeps the client from seeing a connection reset while it is
+/// still writing.
+async fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -151,14 +166,17 @@ async fn read_request(stream: &mut TcpStream) -> Option<String> {
         })
         .next()
         .unwrap_or(0);
-    let mut remaining = content_length.saturating_sub(buffer.len() - head_end);
+    let mut body = buffer[head_end..].to_vec();
+    let mut remaining = content_length.saturating_sub(body.len());
     while remaining > 0 {
         let read = stream.read(&mut chunk).await.ok()?;
         if read == 0 {
             break;
         }
+        body.extend_from_slice(&chunk[..read]);
         remaining = remaining.saturating_sub(read);
     }
+    body.truncate(content_length);
 
-    Some(format!("{method} {path}"))
+    Some((format!("{method} {path}"), String::from_utf8_lossy(&body).into_owned()))
 }
