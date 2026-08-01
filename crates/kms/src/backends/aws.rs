@@ -388,7 +388,7 @@ impl KmsBackend for AwsKmsBackend {
         let description = request.description.clone();
         // Sorted so the request AWS receives is deterministic for a given tag set.
         let mut tag_pairs: Vec<_> = request.tags.iter().collect();
-        tag_pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+        tag_pairs.sort_by_key(|(key, _)| *key);
         let tags = tag_pairs
             .into_iter()
             .map(|(key, value)| Tag::builder().tag_key(key).tag_value(value).build())
@@ -942,12 +942,15 @@ mod tests {
         assert_eq!(response.encryption_algorithm.as_deref(), Some("SYMMETRIC_DEFAULT"));
     }
 
+    /// Asserts that a mapped failure landed on the intended `KmsError` variant.
+    type ErrorPredicate = fn(&KmsError) -> bool;
+
     /// Every AWS error code the backend classifies must land on the intended
     /// typed error, so callers can keep reacting to categories rather than
     /// parsing messages.
     #[tokio::test]
     async fn aws_error_codes_map_to_typed_errors() {
-        let cases: Vec<(u16, &str, fn(&KmsError) -> bool)> = vec![
+        let cases: Vec<(u16, &str, ErrorPredicate)> = vec![
             (400, "NotFoundException", |error| matches!(error, KmsError::KeyNotFound { .. })),
             (400, "AccessDeniedException", |error| matches!(error, KmsError::AccessDenied { .. })),
             (400, "KMSInvalidStateException", |error| {
