@@ -48,10 +48,11 @@ use super::storage_api::multipart_usecase::s3_api::multipart::{
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
-    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
-    build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
-    extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error,
-    mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
+    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal,
+    apply_bucket_default_lock_retention, authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
+    extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
+    get_buffer_size_opt_in, map_get_object_reader_error, mark_encrypted_multipart_metadata, sse_decryption,
+    sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_data_cache::{
@@ -502,6 +503,7 @@ impl DefaultMultipartUsecase {
             sse_customer_key,
             sse_customer_key_md5,
             content_size: 0,
+            principal: None,
         }
         .validate_multipart_ssec(&multipart_info.user_defined)?;
         let cache_adapter = self.object_data_cache();
@@ -724,6 +726,9 @@ impl DefaultMultipartUsecase {
         let sse_customer_key = sse_customer_key.or(header_sse_customer_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(header_sse_customer_key_md5);
 
+        // The session data key is generated here, so this is where a multipart upload is held
+        // to the KMS key it names. Parts and the completion reuse the resulting envelope.
+        let session_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -733,6 +738,7 @@ impl DefaultMultipartUsecase {
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
+            principal: session_principal.as_ref(),
         };
 
         let (effective_sse, effective_kms_key_id) = match sse_prepare_encryption(encryption_request).await? {
@@ -956,6 +962,7 @@ impl DefaultMultipartUsecase {
             sse_customer_key: sse_customer_key.clone(),
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
+            principal: None,
         }
         .validate_multipart_ssec(&fi.user_defined)?;
         let (requested_sse, requested_kms_key_id) = if has_ssec {
@@ -965,6 +972,7 @@ impl DefaultMultipartUsecase {
                 metadata: &fi.user_defined,
                 sse_customer_key: sse_customer_key.as_ref(),
                 sse_customer_key_md5: sse_customer_key_md5.as_ref(),
+                principal: None,
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
@@ -977,12 +985,15 @@ impl DefaultMultipartUsecase {
             write_plan = write_plan.with_encryption(ssec_write);
             (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
         } else if let Some(server_side_encryption) = server_side_encryption {
+            // Reuses the envelope the create-multipart-upload call was authorized for; the
+            // KMS key was pinned into the session metadata then and cannot change here.
             let managed_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
                 key: &key,
                 metadata: &fi.user_defined,
                 sse_customer_key: None,
                 sse_customer_key_md5: None,
+                principal: None,
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
@@ -1141,6 +1152,8 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        // Captured before `req.input` is destructured below.
+        let copy_principal = SseKmsPrincipal::from_request(&req);
         let UploadPartCopyInput {
             bucket,
             key,
@@ -1197,6 +1210,7 @@ impl DefaultMultipartUsecase {
             sse_customer_key: sse_customer_key.clone(),
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: 0,
+            principal: None,
         }
         .validate_multipart_ssec(&mp_info.user_defined)?;
 
@@ -1221,6 +1235,11 @@ impl DefaultMultipartUsecase {
             .map_err(map_get_object_reader_error)?;
 
         let src_info = src_reader.object_info;
+
+        // Same shape as CopyObject: the part copy reads the source plaintext, and the source
+        // read resolves its material inside the object layer, which carries no request identity.
+        authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
+
         let src_stream = src_reader.stream;
         let resolved_src_version_id = src_info.version_id.map(|version_id| {
             if version_id == Uuid::nil() {
@@ -1307,6 +1326,7 @@ impl DefaultMultipartUsecase {
                 metadata: &mp_info.user_defined,
                 sse_customer_key: sse_customer_key.as_ref(),
                 sse_customer_key_md5: sse_customer_key_md5.as_ref(),
+                principal: None,
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
@@ -1323,12 +1343,15 @@ impl DefaultMultipartUsecase {
                 mp_info.user_defined.clone(),
             )
         } else if let Some(server_side_encryption) = server_side_encryption {
+            // Destination side of the part copy: reuses the session envelope authorized at
+            // create-multipart-upload time. The source side is authorized above.
             let managed_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
                 key: &key,
                 metadata: &mp_info.user_defined,
                 sse_customer_key: None,
                 sse_customer_key_md5: None,
+                principal: None,
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
@@ -1550,6 +1573,7 @@ mod tests {
                     sse_customer_algorithm: None,
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
+                    principal: None,
                 };
                 let session_material = sse_prepare_encryption(prepare_request)
                     .await
@@ -1568,6 +1592,7 @@ mod tests {
                     metadata: &session_metadata,
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
+                    principal: None,
                 })
                 .await
                 .expect("decrypt session one")
@@ -1605,6 +1630,7 @@ mod tests {
                     metadata: &session_metadata,
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
+                    principal: None,
                 })
                 .await
                 .expect("decrypt session two")
@@ -1668,6 +1694,7 @@ mod tests {
                     metadata: &session_metadata,
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
+                    principal: None,
                 })
                 .await
                 .expect("decrypt multipart")

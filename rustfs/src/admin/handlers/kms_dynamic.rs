@@ -17,8 +17,8 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_app_context, current_kms_runtime_service_manager, current_object_store_handle_for_context,
-    current_or_init_kms_runtime_service_manager,
+    current_app_context, current_kms_runtime_service_manager, current_notification_system_for_context,
+    current_object_store_handle_for_context, current_or_init_kms_runtime_service_manager,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
 use crate::auth::{check_key_valid, get_session_token};
@@ -32,6 +32,7 @@ use rustfs_kms::{
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use sha2::{Digest, Sha256};
 use tracing::{error, info, instrument, warn};
 
 /// Path to store KMS configuration in the cluster metadata
@@ -41,6 +42,13 @@ const STATIC_KMS_LOCAL_CONFIG_REQUIRED: &str =
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_KMS: &str = "kms";
 const EVENT_ADMIN_KMS_DYNAMIC_STATE: &str = "admin_kms_dynamic_state";
+/// Substituted for every secret value before a configuration is fingerprinted,
+/// so the digest depends on the shape of the configuration and never on key
+/// material an operator could recover by replaying candidate secrets.
+const REDACTED_CONFIG_VALUE: &str = "[redacted]";
+/// Configuration field names carrying secrets. Matched at any depth so a
+/// backend that nests its credentials cannot leak them into the fingerprint.
+const REDACTED_CONFIG_FIELDS: [&str; 6] = ["token", "secret_key", "secret_id", "master_key", "password", "client_secret"];
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
     current_kms_runtime_service_manager().unwrap_or_else(|| {
@@ -68,6 +76,8 @@ fn existing_vault_auth(config: &KmsConfig) -> Option<rustfs_kms::config::VaultAu
         rustfs_kms::config::BackendConfig::VaultTransit(vault) => Some(vault.auth_method.clone()),
         rustfs_kms::config::BackendConfig::Local(_) => None,
         rustfs_kms::config::BackendConfig::Static(_) => None,
+        // AWS credentials come from the aws-config chain, not from KMS config.
+        rustfs_kms::config::BackendConfig::Aws(_) => None,
     }
 }
 
@@ -284,6 +294,198 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
     }
 }
 
+fn redact_config_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, field) in object.iter_mut() {
+                if REDACTED_CONFIG_FIELDS.contains(&key.as_str()) {
+                    *field = serde_json::Value::String(REDACTED_CONFIG_VALUE.to_string());
+                } else {
+                    redact_config_secrets(field);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_config_secrets),
+        _ => {}
+    }
+}
+
+/// Serialize with object keys ordered so two nodes holding the same
+/// configuration always hash the same bytes, whatever their map iteration order.
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            out.push('{');
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String(key.clone()).to_string());
+                out.push(':');
+                write_canonical_json(&object[key], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+fn redacted_canonical_config(config: &KmsConfig) -> Option<String> {
+    let mut value = serde_json::to_value(config).ok()?;
+    redact_config_secrets(&mut value);
+    let mut canonical = String::new();
+    write_canonical_json(&value, &mut canonical);
+    Some(canonical)
+}
+
+/// Fingerprint of a KMS configuration in its persisted form, with every secret
+/// replaced before hashing.
+///
+/// Comparing fingerprints across nodes makes a configuration split visible
+/// without exposing what any node is configured with. Redaction is deliberate:
+/// two nodes holding the same backend with different credentials fingerprint
+/// alike, which is the price of a digest that is safe to report.
+pub fn kms_config_fingerprint(config: &KmsConfig) -> Option<String> {
+    let canonical = redacted_canonical_config(config)?;
+    Some(hex_simd::encode_to_string(
+        Sha256::digest(canonical.as_bytes()),
+        hex_simd::AsciiCase::Lower,
+    ))
+}
+
+/// Fingerprint of the configuration this node is currently running.
+///
+/// `None` when KMS has never been configured on this node, which is itself a
+/// divergence from a cluster that has.
+pub async fn current_kms_config_fingerprint() -> Option<String> {
+    kms_config_fingerprint(&kms_service_manager_from_context().get_config().await?)
+}
+
+fn kms_config_is_unchanged(current: &KmsConfig, candidate: &KmsConfig) -> bool {
+    match (serde_json::to_vec(current), serde_json::to_vec(candidate)) {
+        (Ok(current), Ok(candidate)) => current == candidate,
+        _ => false,
+    }
+}
+
+/// Re-read the cluster-persisted KMS configuration and switch this node to it.
+///
+/// Invoked on peers by the reload signal that a configure or reconfigure
+/// request broadcasts, so that a runtime change reaches every node instead of
+/// only the one that served the admin request.
+pub async fn reload_persisted_kms_config() -> Result<(), String> {
+    let Some(config) = load_kms_config().await else {
+        return Err("no persisted KMS configuration is available".to_string());
+    };
+
+    let service_manager = kms_service_manager_from_context();
+    if service_manager
+        .get_config()
+        .await
+        .is_some_and(|current| kms_config_is_unchanged(&current, &config))
+    {
+        info!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_state",
+            operation = "peer_reload",
+            state = "already_current",
+            "admin kms dynamic state"
+        );
+        return Ok(());
+    }
+
+    service_manager.reconfigure(config).await.map_err(|err| {
+        error!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_service_state",
+            operation = "peer_reload",
+            state = "reload_failed",
+            error = %err,
+            "admin kms dynamic state"
+        );
+        format!("failed to apply persisted KMS configuration: {err}")
+    })?;
+
+    info!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_KMS,
+        event = "kms_service_state",
+        operation = "peer_reload",
+        state = "reconfigured",
+        "admin kms dynamic state"
+    );
+    Ok(())
+}
+
+/// Ask every peer to adopt the configuration that was just persisted.
+///
+/// Returns the hosts that did not converge. Reporting is best effort by
+/// design: this node has already switched and KMS configuration has no quorum
+/// or authoritative holder to roll back to, so refusing the local change would
+/// trade a bounded divergence window for an outage.
+async fn broadcast_kms_config_reload() -> Vec<String> {
+    let context = current_app_context();
+    let Some(notification_sys) = current_notification_system_for_context(context.as_deref()) else {
+        return Vec::new();
+    };
+
+    let mut unconverged = Vec::new();
+    for outcome in notification_sys.reload_kms_config().await {
+        let Some(err) = outcome.err else {
+            continue;
+        };
+        let host = if outcome.host.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            outcome.host
+        };
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_peer_config_reload_failed",
+            peer = %host,
+            result = "peer_reload_failed",
+            error = %err,
+            "admin kms dynamic state"
+        );
+        unconverged.push(host);
+    }
+    unconverged
+}
+
+/// Fold a best-effort peer reload result into the local outcome.
+///
+/// The local outcome stays successful whatever the peers reported: this node
+/// has already switched, and a failed peer is named in the message so the
+/// operator can act on the divergence instead of being told nothing happened.
+fn local_success_with_peer_report(message: &str, unconverged: &[String]) -> (bool, String) {
+    if unconverged.is_empty() {
+        return (true, message.to_string());
+    }
+    (
+        true,
+        format!(
+            "{message}. {} peer(s) did not reload the new configuration and keep serving their previous KMS configuration until they do: {}",
+            unconverged.len(),
+            unconverged.join(", ")
+        ),
+    )
+}
+
 pub fn register_kms_dynamic_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -413,7 +615,9 @@ impl Operation for ConfigureKmsHandler {
                     status = ?status,
                     "admin kms dynamic state"
                 );
-                (true, "KMS configured successfully".to_string(), status)
+                let unconverged = broadcast_kms_config_reload().await;
+                let (success, message) = local_success_with_peer_report("KMS configured successfully", &unconverged);
+                (success, message, status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
@@ -884,7 +1088,10 @@ impl Operation for ReconfigureKmsHandler {
                     status = ?status,
                     "admin kms dynamic state"
                 );
-                (true, "KMS reconfigured and restarted successfully".to_string(), status)
+                let unconverged = broadcast_kms_config_reload().await;
+                let (success, message) =
+                    local_success_with_peer_report("KMS reconfigured and restarted successfully", &unconverged);
+                (success, message, status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");
@@ -934,8 +1141,9 @@ impl Operation for ReconfigureKmsHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_persisted_kms_config, ensure_kms_config_persistable, kms_configure_actions, kms_service_control_actions,
-        normalize_configure_request_secrets,
+        decode_persisted_kms_config, ensure_kms_config_persistable, kms_config_fingerprint, kms_config_is_unchanged,
+        kms_configure_actions, kms_service_control_actions, local_success_with_peer_report, normalize_configure_request_secrets,
+        redacted_canonical_config,
     };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use std::path::PathBuf;
@@ -1170,5 +1378,83 @@ mod tests {
         let backend_error = normalize_configure_request_secrets(&mut backend_change, Some(&existing))
             .expect_err("changing from the local backend must be rejected");
         assert_eq!(backend_error, "Changing from the Local KMS backend is not supported");
+    }
+
+    const VAULT_TOKEN: &str = "hvs-super-secret-token";
+
+    fn vault_config(address: &str, token: &str) -> rustfs_kms::KmsConfig {
+        let vault = rustfs_kms::config::VaultConfig {
+            address: address.to_string(),
+            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                token: token.to_string(),
+            },
+            ..Default::default()
+        };
+        rustfs_kms::KmsConfig {
+            backend: rustfs_kms::KmsBackend::VaultKv2,
+            backend_config: rustfs_kms::BackendConfig::VaultKv2(Box::new(vault)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn config_fingerprint_input_carries_no_credentials() {
+        let canonical = redacted_canonical_config(&vault_config("https://vault.internal:8200", VAULT_TOKEN))
+            .expect("vault configuration should serialize");
+        assert!(!canonical.contains(VAULT_TOKEN), "fingerprint input must not carry the vault token");
+        assert!(canonical.contains(super::REDACTED_CONFIG_VALUE));
+        assert!(
+            canonical.contains("vault.internal"),
+            "non-secret configuration must still drive the fingerprint"
+        );
+    }
+
+    #[test]
+    fn config_fingerprint_agrees_across_nodes_holding_the_same_configuration() {
+        let first = kms_config_fingerprint(&vault_config("https://vault.internal:8200", VAULT_TOKEN))
+            .expect("fingerprint should be computable");
+        let second = kms_config_fingerprint(&vault_config("https://vault.internal:8200", VAULT_TOKEN))
+            .expect("fingerprint should be computable");
+        assert_eq!(first, second);
+
+        let other_backend = kms_config_fingerprint(&vault_config("https://vault.other:8200", VAULT_TOKEN))
+            .expect("fingerprint should be computable");
+        assert_ne!(first, other_backend, "a different backend address must be visible as a split");
+
+        // Credentials are redacted before hashing, so a rotated token is not a
+        // split. Documented here so the trade-off is not silently regressed.
+        let rotated_token = kms_config_fingerprint(&vault_config("https://vault.internal:8200", "hvs-rotated-token"))
+            .expect("fingerprint should be computable");
+        assert_eq!(first, rotated_token);
+    }
+
+    #[test]
+    fn peer_reload_replays_only_when_the_persisted_configuration_moved() {
+        let current = vault_config("https://vault.internal:8200", VAULT_TOKEN);
+        assert!(kms_config_is_unchanged(
+            &current,
+            &vault_config("https://vault.internal:8200", VAULT_TOKEN)
+        ));
+        assert!(!kms_config_is_unchanged(&current, &vault_config("https://vault.other:8200", VAULT_TOKEN)));
+        assert!(
+            !kms_config_is_unchanged(&current, &vault_config("https://vault.internal:8200", "hvs-rotated-token")),
+            "a credential-only change must still be adopted, unlike the redacted fingerprint"
+        );
+    }
+
+    #[test]
+    fn peer_reload_failures_are_reported_without_failing_the_local_change() {
+        let (success, message) = local_success_with_peer_report("KMS configured successfully", &[]);
+        assert!(success);
+        assert_eq!(message, "KMS configured successfully");
+
+        let (success, message) = local_success_with_peer_report(
+            "KMS configured successfully",
+            &["10.0.0.2:9000".to_string(), "10.0.0.3:9000".to_string()],
+        );
+        assert!(success, "a peer that failed to reload must not fail the node that already switched");
+        assert!(message.contains("2 peer(s)"));
+        assert!(message.contains("10.0.0.2:9000"));
+        assert!(message.contains("10.0.0.3:9000"));
     }
 }

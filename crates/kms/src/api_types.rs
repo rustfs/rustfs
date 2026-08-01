@@ -418,6 +418,13 @@ pub enum BackendSummary {
         /// Configured key identifier
         key_id: String,
     },
+    /// AWS KMS backend summary
+    Aws {
+        /// Configured region, when pinned instead of resolved by the AWS chain
+        region: Option<String>,
+        /// Endpoint override, when set for an emulator or private endpoint
+        endpoint_url: Option<String>,
+    },
 }
 
 impl From<&KmsConfig> for KmsConfigSummary {
@@ -466,6 +473,10 @@ impl From<&KmsConfig> for KmsConfigSummary {
             },
             BackendConfig::Static(static_config) => BackendSummary::Static {
                 key_id: static_config.key_id.clone(),
+            },
+            BackendConfig::Aws(aws_config) => BackendSummary::Aws {
+                region: aws_config.region.clone(),
+                endpoint_url: aws_config.endpoint_url.clone(),
             },
         };
 

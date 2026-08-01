@@ -91,9 +91,10 @@ use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
 };
 use super::storage_api::object_usecase::sse::{
-    DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
-    encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
-    extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
+    DecryptionRequest, EncryptionRequest, SSEType, SseKmsPrincipal, apply_bucket_default_lock_retention,
+    authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
+    extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
+    get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
@@ -4084,12 +4085,14 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key.is_some()
         );
 
+        let read_principal = SseKmsPrincipal::from_request(req);
         let decryption_request = DecryptionRequest {
             bucket,
             key,
             metadata: &info.user_defined,
             sse_customer_key: req.input.sse_customer_key.as_ref(),
             sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
+            principal: read_principal.as_ref(),
         };
 
         let response_content_length = content_length;
@@ -5004,6 +5007,7 @@ impl DefaultObjectUsecase {
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
+        let write_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -5014,6 +5018,7 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
+            principal: write_principal.as_ref(),
         };
 
         let encryption_material = match sse_encryption(encryption_request).await {
@@ -6222,12 +6227,20 @@ impl DefaultObjectUsecase {
             copy_source_sse_customer_key_md5.as_ref(),
         );
 
+        let copy_principal = SseKmsPrincipal::from_request(&req);
+
         let gr = store
             .get_object_reader(&src_bucket, &src_key, None, h, &src_get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
 
         let mut src_info = gr.object_info.clone();
+
+        // A copy reads the source plaintext, so it needs the source key's decrypt permission
+        // as well as the destination key's generate permission below. The source read resolves
+        // its material inside the object layer, which has no request identity, so the check
+        // happens here.
+        authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
         // Capture the version actually read from the source before src_info is mutated/consumed
         // below. This is the exact source version copied (issue #4976): the response must echo it
@@ -6387,6 +6400,7 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
+            principal: copy_principal.as_ref(),
         };
 
         if let Some(material) = sse_encryption(encryption_request).await? {
@@ -7846,6 +7860,10 @@ impl DefaultObjectUsecase {
         let auth_region = req.region.clone();
         let auth_service = req.service.clone();
         let auth_trailing_headers = req.trailing_headers.clone();
+        // Extract uploads reject SSE-KMS before reaching the SSE layer, so the principal is
+        // only carried for the day that restriction lifts; the NotImplemented answer below
+        // deliberately stays ahead of any key authorization.
+        let extract_principal = SseKmsPrincipal::from_request(&req);
         if is_sse_kms_requested(&req.input, &req.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
@@ -8176,6 +8194,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key: sse_customer_key.clone(),
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
                 content_size: actual_size,
+                principal: extract_principal.as_ref(),
             })
             .await?
             {

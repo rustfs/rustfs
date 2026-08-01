@@ -25,7 +25,7 @@
 use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::{ExpiredKeyRemoval, KmsBackend};
 use crate::error::Result;
-use crate::types::{KeyStatus, ListKeysRequest, OperationContext};
+use crate::types::{KeyInfo, KeyStatus, ListKeysRequest, OperationContext};
 use async_trait::async_trait;
 use jiff::Zoned;
 use std::sync::Arc;
@@ -35,6 +35,109 @@ use tracing::{debug, info, warn};
 
 /// How often the worker looks for expired pending deletions.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------------
+// Metrics
+//
+// The sweep already pages through the whole key set, so everything below is
+// derived from the pages it has in hand: observing the key lifecycle costs no
+// extra backend call. Each metric is an aggregate — the gauges carry no labels
+// at all and the counter only a static outcome — because a per-key label would
+// carry key identifiers into the metric stream and grow the series count with
+// the key set. "This key is overdue for rotation" is a threshold on the
+// aggregate age and belongs in an alerting rule, not in a label.
+// ---------------------------------------------------------------------------
+
+/// Gauge: keys scheduled for deletion whose deadline has not passed, as of the
+/// end of the last sweep that saw the whole key set.
+const METRIC_PENDING_DELETION_KEYS: &str = "rustfs_kms_pending_deletion_keys";
+/// Gauge: keys left tombstoned by an interrupted removal and still awaiting
+/// the sweep, as of the end of the last sweep that saw the whole key set.
+const METRIC_TOMBSTONE_KEYS: &str = "rustfs_kms_deletion_tombstone_keys";
+/// Gauge: seconds since the least recently rotated usable key was rotated
+/// (its creation time when it was never rotated); `0` when there are none.
+const METRIC_OLDEST_ROTATION_AGE_SECONDS: &str = "rustfs_kms_oldest_key_rotation_age_seconds";
+/// Counter: keys the sweep acted on, by `outcome` (`removed`, `blocked`,
+/// `skipped`, `failed`).
+const METRIC_SWEEP_KEYS_TOTAL: &str = "rustfs_kms_deletion_sweep_keys_total";
+
+/// Register metric descriptions once per process.
+fn describe_metrics() {
+    static DESCRIBE: std::sync::Once = std::sync::Once::new();
+    DESCRIBE.call_once(|| {
+        metrics::describe_gauge!(
+            METRIC_PENDING_DELETION_KEYS,
+            "KMS keys scheduled for deletion whose deadline has not passed yet"
+        );
+        metrics::describe_gauge!(
+            METRIC_TOMBSTONE_KEYS,
+            "KMS keys left tombstoned by an interrupted removal, still awaiting the deletion sweep"
+        );
+        metrics::describe_gauge!(
+            METRIC_OLDEST_ROTATION_AGE_SECONDS,
+            "Seconds since the least recently rotated usable KMS key was last rotated, counting from creation for keys that were never rotated"
+        );
+        metrics::describe_counter!(METRIC_SWEEP_KEYS_TOTAL, "Total keys acted on by the KMS deletion sweep, by outcome");
+    });
+}
+
+/// Aggregate view of the key set, accumulated while the sweep pages through it.
+///
+/// Counts and one maximum age only: these feed label-less gauges, so no key
+/// identifier can reach the metric stream through them.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct KeyCensus {
+    pending_deletion: usize,
+    tombstones: usize,
+    /// Longest time since last rotation across keys that are still usable,
+    /// counting from creation for keys that were never rotated. Keys on their
+    /// way out are excluded: they will never be rotated again, and would
+    /// otherwise pin the gauge high until the sweep finishes removing them.
+    oldest_rotation_age_seconds: f64,
+}
+
+impl KeyCensus {
+    fn observe(&mut self, key: &KeyInfo, now: &Zoned) {
+        match key.status {
+            KeyStatus::PendingDeletion => self.pending_deletion += 1,
+            KeyStatus::Deleted => self.tombstones += 1,
+            KeyStatus::Active | KeyStatus::Disabled => {
+                let rotated_at = key.rotated_at.as_ref().unwrap_or(&key.created_at);
+                self.oldest_rotation_age_seconds = self.oldest_rotation_age_seconds.max(seconds_between(rotated_at, now));
+            }
+        }
+    }
+}
+
+/// Seconds from `earlier` to `now`, clamped at zero so clock skew (or a
+/// timestamp persisted by a node running ahead) cannot produce a negative age.
+fn seconds_between(earlier: &Zoned, now: &Zoned) -> f64 {
+    (now.timestamp().as_second() - earlier.timestamp().as_second()).max(0) as f64
+}
+
+/// Publish one sweep's counters, plus the lifecycle gauges when `census` covers
+/// the whole key set.
+fn record_sweep(report: &SweepReport, census: Option<KeyCensus>) {
+    describe_metrics();
+    for (outcome, count) in [
+        ("removed", report.removed.len()),
+        ("blocked", report.blocked.len()),
+        ("skipped", report.skipped),
+        ("failed", report.failed),
+    ] {
+        // Emitted even at zero so every outcome series exists from the first
+        // sweep on and a rate over it is defined.
+        metrics::counter!(METRIC_SWEEP_KEYS_TOTAL, "outcome" => outcome).increment(count as u64);
+    }
+
+    // A sweep that could not finish listing saw only part of the key set;
+    // publishing its counts would understate every gauge, so the previous
+    // (complete) values are left standing instead.
+    let Some(census) = census else { return };
+    metrics::gauge!(METRIC_PENDING_DELETION_KEYS).set(census.pending_deletion as f64);
+    metrics::gauge!(METRIC_TOMBSTONE_KEYS).set(census.tombstones as f64);
+    metrics::gauge!(METRIC_OLDEST_ROTATION_AGE_SECONDS).set(census.oldest_rotation_age_seconds);
+}
 
 /// Reports configuration that still references a KMS key.
 ///
@@ -127,10 +230,15 @@ impl DeletionWorker {
 
     /// Run one sweep at the given time. Exposed separately so tests can drive
     /// the expiry logic deterministically.
+    ///
+    /// Also feeds the lifecycle gauges: every key it lists is counted into a
+    /// [`KeyCensus`] on the way past, so the observability comes out of the
+    /// pages the sweep already had to fetch.
     pub(crate) async fn sweep(&self, now: &Zoned) -> SweepReport {
         let mut report = SweepReport::default();
+        let mut census = KeyCensus::default();
         let mut marker: Option<String> = None;
-        loop {
+        let listed_everything = loop {
             let request = ListKeysRequest {
                 limit: Some(100),
                 marker: marker.clone(),
@@ -142,40 +250,52 @@ impl DeletionWorker {
                 Err(error) => {
                     warn!(%error, "KMS deletion sweep could not list keys");
                     report.failed += 1;
-                    return report;
+                    break false;
                 }
             };
             for key in &response.keys {
-                if matches!(key.status, KeyStatus::PendingDeletion | KeyStatus::Deleted) {
-                    self.process_key(&key.key_id, now, &mut report).await;
+                // Keys this sweep destroys are left out of the census: the
+                // gauges describe the key set as it stands once the sweep is
+                // done, not as it was when the page was listed.
+                let removed = if matches!(key.status, KeyStatus::PendingDeletion | KeyStatus::Deleted) {
+                    self.process_key(&key.key_id, now, &mut report).await
+                } else {
+                    false
+                };
+                if !removed {
+                    census.observe(key, now);
                 }
             }
             if !response.truncated {
-                break;
+                break true;
             }
             match response.next_marker {
                 Some(next_marker) => marker = Some(next_marker),
-                None => break,
+                // Truncated without a marker: the rest of the key set is out
+                // of reach, so the census is incomplete.
+                None => break false,
             }
-        }
+        };
+        record_sweep(&report, listed_everything.then_some(census));
         report
     }
 
-    async fn process_key(&self, key_id: &str, now: &Zoned, report: &mut SweepReport) {
+    /// Handle one key that is on its way out; reports whether it was removed.
+    async fn process_key(&self, key_id: &str, now: &Zoned, report: &mut SweepReport) -> bool {
         // Never remove a key that live configuration still points at. The
         // default key check is built in; broader references (bucket
         // encryption settings, ...) come from the injected checker.
         if self.default_key_id.as_deref() == Some(key_id) {
             warn!(key_id, "expired KMS key is still the default key; refusing removal");
             report.blocked.push(key_id.to_string());
-            return;
+            return false;
         }
         if let Some(checker) = &self.reference_checker {
             let references = checker.references(key_id).await;
             if !references.is_empty() {
                 warn!(key_id, ?references, "expired KMS key is still referenced; refusing removal");
                 report.blocked.push(key_id.to_string());
-                return;
+                return false;
             }
         }
 
@@ -187,12 +307,17 @@ impl DeletionWorker {
             Ok(ExpiredKeyRemoval::Removed) => {
                 report.removed.push(key_id.to_string());
                 self.audit_removal(key_id, started, &outcome);
+                true
             }
-            Ok(ExpiredKeyRemoval::StateChanged | ExpiredKeyRemoval::NotExpired) => report.skipped += 1,
+            Ok(ExpiredKeyRemoval::StateChanged | ExpiredKeyRemoval::NotExpired) => {
+                report.skipped += 1;
+                false
+            }
             Err(error) => {
                 warn!(key_id, %error, "failed to remove expired KMS key; will retry next sweep");
                 report.failed += 1;
                 self.audit_removal(key_id, started, &outcome);
+                false
             }
         }
     }
@@ -478,5 +603,157 @@ mod tests {
 
         cancel.cancel();
         task.await.expect("worker task must stop after cancellation");
+    }
+
+    // -- Metric emission ----------------------------------------------------
+
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    type MetricEntry = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
+
+    /// Run `test` on a current-thread runtime under a debugging recorder and
+    /// return one snapshot of everything it emitted.
+    ///
+    /// A single snapshot per test on purpose: `Snapshotter::snapshot` drains
+    /// the recorded state, so taking it per assertion would only show the
+    /// first assertion any data.
+    fn record_metrics<Out>(
+        test: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Out>>>,
+    ) -> (Vec<MetricEntry>, Out) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let out = metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime must build");
+            runtime.block_on(test())
+        });
+        (snapshotter.snapshot().into_vec(), out)
+    }
+
+    fn gauge_value(snapshot: &[MetricEntry], name: &str) -> Option<f64> {
+        snapshot.iter().find_map(|(composite, _unit, _description, value)| {
+            let matches = composite.kind() == MetricKind::Gauge && composite.key().name() == name;
+            match (matches, value) {
+                (true, DebugValue::Gauge(value)) => Some(value.into_inner()),
+                _ => None,
+            }
+        })
+    }
+
+    fn counter_value(snapshot: &[MetricEntry], name: &str, outcome: &str) -> u64 {
+        snapshot
+            .iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                let matches = composite.kind() == MetricKind::Counter
+                    && composite.key().name() == name
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "outcome" && label.value() == outcome);
+                match (matches, value) {
+                    (true, DebugValue::Counter(count)) => Some(*count),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    fn key_info(key_id: &str, status: KeyStatus, created_at: Zoned, rotated_at: Option<Zoned>) -> KeyInfo {
+        KeyInfo {
+            key_id: key_id.to_string(),
+            description: None,
+            algorithm: "AES-256".to_string(),
+            usage: KeyUsage::EncryptDecrypt,
+            status,
+            version: 1,
+            metadata: std::collections::HashMap::new(),
+            tags: std::collections::HashMap::new(),
+            created_at,
+            rotated_at,
+            created_by: None,
+        }
+    }
+
+    #[test]
+    fn census_ages_from_rotation_and_ignores_departing_keys() {
+        let now = Zoned::now();
+        let day = Duration::from_secs(86400);
+        let mut census = KeyCensus::default();
+
+        // Rotation beats creation as the age baseline...
+        census.observe(
+            &key_info("rotated", KeyStatus::Active, now.clone() - 30 * day, Some(now.clone() - 2 * day)),
+            &now,
+        );
+        // ...and a key that was never rotated ages from its creation.
+        census.observe(&key_info("never-rotated", KeyStatus::Disabled, now.clone() - 5 * day, None), &now);
+        // Keys on their way out only ever move the counts: they will not be
+        // rotated again, so their age must not drive the rotation gauge.
+        census.observe(&key_info("pending", KeyStatus::PendingDeletion, now.clone() - 400 * day, None), &now);
+        census.observe(&key_info("tombstone", KeyStatus::Deleted, now.clone() - 400 * day, None), &now);
+
+        assert_eq!(census.pending_deletion, 1);
+        assert_eq!(census.tombstones, 1);
+        let expected = 5.0 * 86400.0;
+        assert!(
+            (census.oldest_rotation_age_seconds - expected).abs() < 1.0,
+            "expected the never-rotated key to set the age, got {}",
+            census.oldest_rotation_age_seconds
+        );
+    }
+
+    #[test]
+    fn sweep_publishes_lifecycle_gauges_without_key_labels() {
+        let (snapshot, key_ids) = record_metrics(|| {
+            Box::pin(async {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let backend = local_backend(&temp_dir).await;
+                let live = create_key(&backend, "live-key").await;
+                let doomed = create_key(&backend, "doomed-key").await;
+                schedule(&backend, &doomed).await;
+
+                // Three days in, still inside the seven-day window: the sweep
+                // observes the scheduled key instead of removing it.
+                let report = worker(backend.clone())
+                    .sweep(&(Zoned::now() + Duration::from_secs(3 * 86400)))
+                    .await;
+                assert_eq!(report.skipped, 1);
+                assert!(report.removed.is_empty());
+                vec![live, doomed]
+            })
+        });
+
+        assert_eq!(gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS), Some(1.0));
+        assert_eq!(gauge_value(&snapshot, METRIC_TOMBSTONE_KEYS), Some(0.0));
+        let age = gauge_value(&snapshot, METRIC_OLDEST_ROTATION_AGE_SECONDS).expect("rotation age gauge must be published");
+        // Both keys were just created, and only the usable one counts, so the
+        // reported age is the sweep's own offset into the future.
+        assert!(
+            (age - 3.0 * 86400.0).abs() < 60.0,
+            "expected the sweep offset as the rotation age, got {age}"
+        );
+        assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "skipped"), 1);
+        assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "removed"), 0);
+
+        for (composite, ..) in &snapshot {
+            for label in composite.key().labels() {
+                for key_id in &key_ids {
+                    assert!(
+                        !label.value().contains(key_id.as_str()),
+                        "metric {} leaked a key identifier through label {}",
+                        composite.key().name(),
+                        label.key()
+                    );
+                }
+            }
+        }
     }
 }

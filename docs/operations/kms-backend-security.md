@@ -12,6 +12,7 @@ For how the Vault backends authenticate (static token, AppRole, Vault Agent toke
 | Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | No state persisted by RustFS | Rejected (read-only backend) | Simple deployments with an external secret manager |
 | Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Versioned retention (immutable per-version records + current pointer) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
+| AWS KMS | `AWS` (alias `AwsKms`) | Key material never leaves AWS KMS; RustFS mirrors no key state | AWS KMS (cryptographic isolation) + IAM | Delegated to AWS | On-demand `RotateKeyOnDemand`; prior backing keys stay usable for decryption | Deployments already rooted in AWS IAM that want AWS as the cryptographic root — read [AWS KMS: deviations from the shared backend contract](#aws-kms-deviations-from-the-shared-backend-contract) first |
 
 ## Vault KV2: what the backend does and does not do
 
@@ -145,6 +146,25 @@ Follow the node-at-a-time procedure in the [multi-node restart runbook](rolling-
 Use **Vault Transit** (`VaultTransit`) when key material must be cryptographically isolated from anyone holding storage-level read access: Transit keeps key-encryption keys inside Vault and only ever returns ciphertext, and supports server-side key versioning/rotation.
 
 Use **Vault KV2** only when you accept that the Vault ACL on the key path *is* the confidentiality boundary and you want the operational simplicity of a single KV mount.
+
+## AWS KMS: deviations from the shared backend contract
+
+Select it with `RUSTFS_KMS_BACKEND=aws`. Credentials and region resolution are delegated entirely to the standard `aws-config` provider chain (environment, shared profile, container/IMDS role), so RustFS never stores, persists, or redacts AWS credential material of its own. Only two non-credential settings are read: `RUSTFS_KMS_AWS_REGION` and `RUSTFS_KMS_AWS_ENDPOINT_URL`. A plaintext (`http://`) endpoint override would expose every KMS request including plaintext data keys, so it is refused unless the development opt-in is set.
+
+AWS owns key state, backing-key rotation, and the deletion window, and this backend mirrors none of it locally. That makes four behaviours differ from every RustFS-managed backend. Verify each against your operational assumptions before switching:
+
+| Behaviour | RustFS-managed backends | AWS KMS backend |
+| --- | --- | --- |
+| Decryption with a `Disabled` or `PendingDeletion` key | Kept working, so disabling a key never breaks reads of objects already encrypted under it | **Refused by AWS.** Objects encrypted under a key that is later disabled become unreadable until it is re-enabled |
+| Key deletion | Physical deletion available | **No physical delete.** `ScheduleKeyDeletion` is the only removal path; AWS destroys the material when the 7-30 day window elapses. RustFS never destroys AWS-held material, and `force_immediate` is refused |
+| Cancelling a scheduled deletion | Key returns to `Enabled` | Key is left **`Disabled`**; enable it explicitly to make it usable again |
+| Creating a key under a caller-chosen name | The requested name becomes the key id | **Refused.** AWS assigns identifiers and this backend does not manage aliases, so a named create would produce a key unreachable by that name |
+
+Two consequences follow from that last row: **SSE-S3 key auto-creation and the synthetic KMS probe are unavailable on this backend**, because both address a key by a name they choose. Pre-create keys in AWS and reference them by AWS key id or ARN.
+
+Key versions are opaque. AWS addresses backing keys internally and picks the right one to decrypt with, so RustFS reports `key_version` as 1 and cannot enumerate versions. Rotation uses `RotateKeyOnDemand`, which retains prior backing keys for decryption; AWS's separate automatic yearly rotation is neither enabled nor reported on by RustFS.
+
+The AWS backend is not configurable through the KMS admin API — use the environment variables above at startup.
 
 ## Local backend durability and deployment support matrix
 
