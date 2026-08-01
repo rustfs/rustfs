@@ -39,7 +39,9 @@ const METRIC_CACHE_LOOKUPS_TOTAL: &str = "rustfs_kms_metadata_cache_lookups_tota
 /// `explicit`, `replaced`); only `expired` and `size` are true evictions, the
 /// rest are invalidations driven by key lifecycle operations.
 const METRIC_CACHE_EVICTIONS_TOTAL: &str = "rustfs_kms_metadata_cache_evictions_total";
-/// Gauge: entries currently held by the cache.
+/// Gauge: entries currently held by the cache. Republished whenever the entry
+/// set can have changed — every write path, plus the lookups that miss, since
+/// TTL expiry drops entries without any write taking place.
 const METRIC_CACHE_ENTRIES: &str = "rustfs_kms_metadata_cache_entries";
 
 /// Register metric descriptions once per process.
@@ -138,6 +140,18 @@ impl KmsCache {
     pub async fn get_key_metadata(&self, key_id: &str) -> Option<KeyMetadata> {
         let cached = self.key_metadata_cache.get(key_id).await;
         self.record_lookup(cached.is_some());
+
+        if cached.is_none() {
+            // TTL expiry is the one way the entry set shrinks without a write,
+            // and a miss is where it surfaces: moka reaps expired entries in
+            // the maintenance it runs on this very lookup, which reaches the
+            // eviction listener but never `record_entry_count`. Republishing
+            // here keeps a cache that only expires — no put, remove or clear
+            // to follow — from reporting a population that is already gone.
+            // Hits, the hot path, are left alone.
+            self.record_entry_count();
+        }
+
         cached
     }
 
@@ -432,5 +446,38 @@ mod tests {
         assert_eq!(stats.evictions, 1);
         assert_eq!(stats.entries, 1);
         assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), Some(1.0));
+    }
+
+    /// Entries that expire are dropped outside every write path, so the gauge
+    /// has to be republished from the lookup that observes the expiry — nothing
+    /// else runs afterwards to correct it.
+    ///
+    /// moka's clock is internal and cannot be driven by tokio's paused time,
+    /// hence the one short real sleep. The explicit `run_pending_tasks` stands
+    /// in for the maintenance moka schedules by itself on reads, so the test
+    /// does not depend on moka's internal 300ms housekeeping interval.
+    #[test]
+    fn expiry_without_further_writes_converges_the_entry_gauge() {
+        let ttl = Duration::from_millis(100);
+
+        let (stats, snapshot) = record_metrics(move || async move {
+            let mut cache = KmsCache::with_ttl(100, ttl);
+
+            cache.put_key_metadata("expiring", &test_metadata("expiring")).await;
+            assert_eq!(cache.stats().entries, 1);
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cache.key_metadata_cache.run_pending_tasks().await;
+
+            // The lookup that observes the expiry is the last thing to touch
+            // the cache: no put, remove or clear follows it.
+            assert!(cache.get_key_metadata("expiring").await.is_none());
+
+            cache.stats()
+        });
+
+        assert_eq!(counter_value(&snapshot, METRIC_CACHE_EVICTIONS_TOTAL, &[("cause", "expired")]), 1);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(gauge_value(&snapshot, METRIC_CACHE_ENTRIES), Some(0.0));
     }
 }
