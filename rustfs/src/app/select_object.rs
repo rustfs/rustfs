@@ -54,6 +54,11 @@ enum SelectOutputFormat {
     Json(JSONOutput),
 }
 
+enum SelectProducerOutcome {
+    Terminal(S3Result<SelectObjectContentEvent>),
+    ReceiverClosed,
+}
+
 pub async fn execute_select_object_content(
     req: S3Request<SelectObjectContentInput>,
 ) -> S3Result<S3Response<SelectObjectContentOutput>> {
@@ -100,16 +105,17 @@ async fn send_select_events_until_deadline(
     deadline: Instant,
     timeout_seconds: u64,
 ) {
-    if timeout_at(deadline, send_select_events(output, &tx, validation))
-        .await
-        .is_err()
-    {
-        terminal_permit.send(Err(map_query_error_to_s3(
+    let outcome = match timeout_at(deadline, send_select_events(output, &tx, validation)).await {
+        Ok(outcome) => outcome,
+        Err(_) => SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(
             S3SelectPolicyError::QueryTimeout {
                 seconds: timeout_seconds,
             }
             .into(),
-        )));
+        ))),
+    };
+    if let SelectProducerOutcome::Terminal(event) = outcome {
+        terminal_permit.send(event);
     }
 }
 
@@ -117,7 +123,7 @@ async fn send_select_events(
     mut output: SendableRecordBatchStream,
     tx: &mpsc::Sender<S3Result<SelectObjectContentEvent>>,
     validation: SelectValidation,
-) {
+) -> SelectProducerOutcome {
     let mut encoder = SelectOutputEncoder::new(validation.output_format);
     let mut progress = SelectProgress::default();
 
@@ -126,21 +132,20 @@ async fn send_select_events(
         .await
         .is_err()
     {
-        return;
+        return SelectProducerOutcome::ReceiverClosed;
     }
 
     let receiver_closed = tx.closed();
     tokio::pin!(receiver_closed);
     while let Some(result) = tokio::select! {
         biased;
-        _ = &mut receiver_closed => return,
+        _ = &mut receiver_closed => return SelectProducerOutcome::ReceiverClosed,
         result = output.next() => result,
     } {
         let batch = match result {
             Ok(batch) => batch,
             Err(err) => {
-                let _ = tx.send(Err(map_query_error_to_s3(err.into()))).await;
-                return;
+                return SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(err.into())));
             }
         };
 
@@ -153,7 +158,7 @@ async fn send_select_events(
                         .await
                         .is_err()
                     {
-                        return;
+                        return SelectProducerOutcome::ReceiverClosed;
                     }
                     if validation.progress_enabled
                         && tx
@@ -163,13 +168,12 @@ async fn send_select_events(
                             .await
                             .is_err()
                     {
-                        return;
+                        return SelectProducerOutcome::ReceiverClosed;
                     }
                 }
             }
             Err(err) => {
-                let _ = tx.send(Err(err)).await;
-                return;
+                return SelectProducerOutcome::Terminal(Err(err));
             }
         }
     }
@@ -178,9 +182,9 @@ async fn send_select_events(
         details: Some(progress.to_stats()),
     });
     if tx.send(Ok(stats)).await.is_err() {
-        return;
+        return SelectProducerOutcome::ReceiverClosed;
     }
-    let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+    SelectProducerOutcome::Terminal(Ok(SelectObjectContentEvent::End(EndEvent::default())))
 }
 
 fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectContentInput) -> S3Result<SelectValidation> {
@@ -649,7 +653,12 @@ fn is_json_document(json: &JSONInput) -> bool {
 mod tests {
     use super::*;
     use datafusion::{
-        arrow::datatypes::Schema, physical_plan::stream::RecordBatchStreamAdapter, sql::sqlparser::parser::ParserError,
+        arrow::{
+            array::{Array, ListArray},
+            datatypes::{Field, Int32Type, Schema},
+        },
+        physical_plan::stream::RecordBatchStreamAdapter,
+        sql::sqlparser::parser::ParserError,
     };
     use http::HeaderMap;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
@@ -694,6 +703,33 @@ mod tests {
                 scan_range: None,
             },
         }
+    }
+
+    fn csv_validation() -> SelectValidation {
+        SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        }
+    }
+
+    fn spawn_test_producer(
+        output: SendableRecordBatchStream,
+        channel_capacity: usize,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<S3Result<SelectObjectContentEvent>>) {
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let terminal_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("test channel should reserve terminal capacity");
+        let producer = tokio::spawn(send_select_events_until_deadline(
+            output,
+            tx,
+            terminal_permit,
+            csv_validation(),
+            Instant::now() + std::time::Duration::from_secs(1),
+            300,
+        ));
+        (producer, rx)
     }
 
     #[test]
@@ -799,16 +835,11 @@ mod tests {
         tx.send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
             .await
             .expect("test channel should accept the prefilled event");
-        let validation = SelectValidation {
-            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
-            progress_enabled: false,
-        };
-
         let producer = tokio::spawn(send_select_events_until_deadline(
             output,
             tx,
             terminal_permit,
-            validation,
+            csv_validation(),
             Instant::now() + std::time::Duration::from_secs(1),
             300,
         ));
@@ -841,14 +872,9 @@ mod tests {
         };
         let batches = [Ok(batch("a")), Ok(batch("b"))];
         let output = Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::iter(batches)));
-        let (tx, mut rx) = mpsc::channel(8);
-        let validation = SelectValidation {
-            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
-            progress_enabled: false,
-        };
+        let (producer, mut rx) = spawn_test_producer(output, 8);
 
-        send_select_events(output, &tx, validation).await;
-        drop(tx);
+        producer.await.expect("producer should finish at query EOF");
 
         assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
         for expected in [b"a\n".as_slice(), b"b\n".as_slice()] {
@@ -866,6 +892,82 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn eof_at_deadline_uses_reserved_slot_for_stats_then_end() {
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::unfold((), |_| async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                None::<(Result<RecordBatch, DataFusionError>, ())>
+            }),
+        ));
+        let (producer, mut rx) = spawn_test_producer(output, 3);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        producer.await.expect("producer should finish at the shared deadline");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let stats = rx
+            .recv()
+            .await
+            .expect("successful Select should send stats")
+            .expect("stats event should not be an error");
+        assert!(matches!(stats, SelectObjectContentEvent::Stats(_)));
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::End(_)))));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_error_at_deadline_uses_reserved_terminal_slot() {
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Err(DataFusionError::External(Box::new(S3SelectPolicyError::QueryConcurrencyLimit)))
+            }),
+        ));
+        let (producer, mut rx) = spawn_test_producer(output, 2);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        producer.await.expect("producer should finish at the shared deadline");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let stream_error = rx
+            .recv()
+            .await
+            .expect("stream failure should send one terminal error")
+            .expect_err("terminal event should be an error");
+        assert_eq!(stream_error.code(), &S3ErrorCode::SlowDown);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn encoder_error_uses_reserved_terminal_slot() {
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([Some([Some(1)])]);
+        let schema = Arc::new(Schema::new(vec![Field::new("items", values.data_type().clone(), false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).expect("test batch should be valid");
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok::<_, DataFusionError>(batch) }),
+        ));
+        let (producer, mut rx) = spawn_test_producer(output, 2);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        producer.await.expect("producer should not block on a terminal encoder error");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let encoder_error = rx
+            .recv()
+            .await
+            .expect("encoder failure should send one terminal error")
+            .expect_err("terminal event should be an error");
+        assert_eq!(encoder_error.code(), &S3ErrorCode::InternalError);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn producer_drops_query_stream_when_receiver_closes() {
         let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let output = Box::pin(RecordBatchStreamAdapter::new(
@@ -876,11 +978,7 @@ mod tests {
             }),
         ));
         let (tx, mut rx) = mpsc::channel(2);
-        let validation = SelectValidation {
-            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
-            progress_enabled: false,
-        };
-        let producer = send_select_events(output, &tx, validation);
+        let producer = send_select_events(output, &tx, csv_validation());
         tokio::pin!(producer);
 
         assert!(futures::poll!(producer.as_mut()).is_pending());
@@ -910,11 +1008,7 @@ mod tests {
             }),
         ));
         let (tx, mut rx) = mpsc::channel(2);
-        let validation = SelectValidation {
-            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
-            progress_enabled: false,
-        };
-        let producer = send_select_events(output, &tx, validation);
+        let producer = send_select_events(output, &tx, csv_validation());
         tokio::pin!(producer);
 
         assert!(futures::poll!(producer.as_mut()).is_pending());
