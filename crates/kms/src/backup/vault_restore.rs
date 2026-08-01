@@ -58,22 +58,36 @@
 //!
 //! # Writes
 //!
-//! [`dry_run_vault_restore`] issues reads only. [`restore_vault_backup`]
-//! writes exclusively through create-only check-and-set: a record that already
-//! exists is never overwritten, so the default
-//! [`RestoreConflictPolicy::Fail`] and the empty-target policy differ only in
-//! whether writing is attempted at all. Version regression, generation
+//! [`dry_run_vault_restore`] issues reads only. Every record
+//! [`restore_vault_backup`] publishes goes through create-only
+//! check-and-set: a record that already exists is never overwritten, so the
+//! default [`RestoreConflictPolicy::Fail`] and the empty-target policy differ
+//! only in whether writing is attempted at all. Version regression, generation
 //! rollback, and reviving deleted state are structurally impossible rather
-//! than merely rejected.
+//! than merely rejected. The single non-create-only write is the restore's own
+//! commit marker, updated check-and-set against the exact version the restore
+//! last observed.
 //!
 //! # Crash re-entry
 //!
 //! The commit marker is a reserved KV record published (create-only) before
 //! the first write and removed after the last. Before it, the target is
 //! untouched; with it published, re-running the same bundle rolls forward
-//! idempotently and [`abort_vault_restore`] rolls back exactly the records the
-//! marker names. Every interruption converges to the complete old or the
+//! idempotently. Every interruption converges to the complete old or the
 //! complete new state.
+//!
+//! # Abort and ownership
+//!
+//! The marker names the key ids a restore *intends* to publish, which is not
+//! evidence that it published them: the marker goes out first, and a record
+//! write can afterwards be lost to a concurrent creator, or never be reached
+//! at all. So each successful create-only write appends a receipt to the
+//! marker carrying the KV version it landed at, and
+//! [`abort_vault_restore`] removes a record only when the path still holds
+//! exactly that version. Anything else — no receipt, a different version, an
+//! already-empty path — is left alone and reported as skipped. An abort can
+//! therefore leave records behind, but it can never delete a record this
+//! restore did not write.
 
 use crate::backends::local::validate_key_id;
 use crate::backends::vault_credentials::{
@@ -477,21 +491,25 @@ impl VaultRestoreClient {
         }))
     }
 
+    /// Read the version a KV path currently sits at. `None` means it carries
+    /// no record.
+    async fn read_kv_generation(&self, path: &str) -> Result<Option<u64>> {
+        self.run("vault_restore_read_kv_generation", OpClass::ReadIdempotent, move || async move {
+            match kv2::read_metadata(&self.vault().map_err(AttemptError::fatal)?.client, &self.kv_mount, path).await {
+                Ok(metadata) => Ok(Some(metadata.current_version)),
+                Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                Err(error) => Err(AttemptError::from_vaultrs(error, |error| {
+                    KmsError::backend_error(format!("Failed to read KV generation of {path} during restore: {error}"))
+                })),
+            }
+        })
+        .await
+    }
+
     /// Read a KV record together with the secret version holding it. `None`
     /// means the path carries no readable record.
     async fn read_kv_record(&self, path: &str) -> Result<Option<ObservedKvRecord>> {
-        let generation = self
-            .run("vault_restore_read_kv_generation", OpClass::ReadIdempotent, move || async move {
-                match kv2::read_metadata(&self.vault().map_err(AttemptError::fatal)?.client, &self.kv_mount, path).await {
-                    Ok(metadata) => Ok(Some(metadata.current_version)),
-                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
-                    Err(error) => Err(AttemptError::from_vaultrs(error, |error| {
-                        KmsError::backend_error(format!("Failed to read KV generation of {path} during restore: {error}"))
-                    })),
-                }
-            })
-            .await?;
-        let Some(generation) = generation else {
+        let Some(generation) = self.read_kv_generation(path).await? else {
             return Ok(None);
         };
 
@@ -513,9 +531,11 @@ impl VaultRestoreClient {
     }
 
     /// Create a KV record, never overwriting: the check-and-set precondition is
-    /// "no version exists". `Ok(false)` means a concurrent writer got there
-    /// first, which the caller surfaces instead of clobbering.
-    async fn create_kv_record(&self, path: &str, content: &serde_json::Value) -> Result<bool> {
+    /// "no version exists". `Ok(None)` means a concurrent writer got there
+    /// first, which the caller surfaces instead of clobbering. `Ok(Some(v))`
+    /// returns the version the write landed at, which is the only evidence
+    /// that this restore — and not some other writer — owns the path.
+    async fn create_kv_record(&self, path: &str, content: &serde_json::Value) -> Result<Option<u64>> {
         self.run("vault_restore_create_kv_record", OpClass::MutatingNonIdempotent, move || async move {
             match kv2::set_with_options(
                 &self.vault().map_err(AttemptError::fatal)?.client,
@@ -526,8 +546,8 @@ impl VaultRestoreClient {
             )
             .await
             {
-                Ok(_) => Ok(true),
-                Err(error) if is_cas_conflict(&error) => Ok(false),
+                Ok(metadata) => Ok(Some(metadata.version)),
+                Err(error) if is_cas_conflict(&error) => Ok(None),
                 Err(error) => Err(AttemptError::from_vaultrs(error, |error| {
                     KmsError::backend_error(format!("Failed to create KV record {path} during restore: {error}"))
                 })),
@@ -536,8 +556,43 @@ impl VaultRestoreClient {
         .await
     }
 
-    /// Remove a KV record and all its versions. Only ever applied to records
-    /// this restore created (the commit marker names them).
+    /// Replace a KV record, check-and-set against the exact version the caller
+    /// last observed. Applied only to the restore's own commit marker: the
+    /// restore is the marker's sole writer, so losing this race means another
+    /// actor is writing the reserved path and the run must stop rather than
+    /// re-read and retry.
+    async fn update_kv_record(&self, path: &str, content: &serde_json::Value, expected_version: u64) -> Result<u64> {
+        let cas = u32::try_from(expected_version).map_err(|_| {
+            KmsError::internal_error(format!(
+                "KV record {path} sits at version {expected_version}, beyond what check-and-set can address"
+            ))
+        })?;
+        self.run("vault_restore_update_kv_record", OpClass::MutatingNonIdempotent, move || async move {
+            match kv2::set_with_options(
+                &self.vault().map_err(AttemptError::fatal)?.client,
+                &self.kv_mount,
+                path,
+                content,
+                SetSecretRequestOptions { cas },
+            )
+            .await
+            {
+                Ok(metadata) => Ok(metadata.version),
+                Err(error) if is_cas_conflict(&error) => Err(AttemptError::fatal(KmsError::invalid_operation(format!(
+                    "the restore commit marker at {path} was modified concurrently; another restore or \
+                     operator is acting on this target"
+                )))),
+                Err(error) => Err(AttemptError::from_vaultrs(error, |error| {
+                    KmsError::backend_error(format!("Failed to update KV record {path} during restore: {error}"))
+                })),
+            }
+        })
+        .await
+    }
+
+    /// Remove a KV record and all its versions. Only ever applied to the
+    /// commit marker and to records whose current version the caller has just
+    /// matched against the marker's write receipt for them.
     async fn delete_kv_record(&self, path: &str) -> Result<()> {
         self.run("vault_restore_delete_kv_record", OpClass::MutatingNonIdempotent, move || async move {
             match kv2::delete_metadata(&self.vault().map_err(AttemptError::fatal)?.client, &self.kv_mount, path).await {
@@ -576,9 +631,15 @@ fn latest_transit_version(keys: &ReadKeyData) -> u32 {
 }
 
 /// The commit marker: its create-only publication is the single commit point
-/// of a Vault restore. It names the exact bundle and the exact key ids this
-/// restore publishes, so re-entry completes the same work and an abort takes
-/// back precisely what was written — never a record that pre-existed.
+/// of a Vault restore, and from then on it doubles as the restore's write
+/// ledger.
+///
+/// `key_ids` is intent — what this restore set out to publish — and drives
+/// re-entry. `written` is evidence: one receipt per record the restore
+/// actually created, carrying the KV version its create-only write landed at.
+/// Intent alone proves nothing about ownership (a write can be lost to a
+/// concurrent creator after the marker is published), so only `written` may
+/// authorize an abort to remove anything.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VaultRestoreCommitMarker {
@@ -586,6 +647,18 @@ struct VaultRestoreCommitMarker {
     backup_id: String,
     manifest_digest: ContentDigest,
     key_ids: Vec<String>,
+    /// Absent in a marker published before the first record write.
+    #[serde(default)]
+    written: Vec<VaultRestoreWriteReceipt>,
+}
+
+/// Proof that this restore, and nothing else, created one KV record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultRestoreWriteReceipt {
+    key_id: String,
+    /// Version the create-only write landed at.
+    kv_version: u64,
 }
 
 impl VaultRestoreCommitMarker {
@@ -595,6 +668,7 @@ impl VaultRestoreCommitMarker {
             backup_id: manifest.backup_id.clone(),
             manifest_digest: manifest.manifest_digest.clone(),
             key_ids,
+            written: Vec::new(),
         }
     }
 
@@ -613,12 +687,42 @@ impl VaultRestoreCommitMarker {
         for key_id in &marker.key_ids {
             validate_key_id(key_id)?;
         }
+        for receipt in &marker.written {
+            validate_key_id(&receipt.key_id)?;
+            if !marker.key_ids.contains(&receipt.key_id) {
+                return Err(BackupError::corrupted(format!(
+                    "vault restore commit marker carries a write receipt for key '{}', which it never claimed",
+                    receipt.key_id
+                ))
+                .into());
+            }
+        }
         Ok(marker)
+    }
+
+    /// The version this restore wrote key `key_id` at, if it got that far.
+    fn receipt_for(&self, key_id: &str) -> Option<u64> {
+        self.written
+            .iter()
+            .find(|receipt| receipt.key_id == key_id)
+            .map(|receipt| receipt.kv_version)
     }
 
     fn matches_bundle(&self, manifest: &BackupManifest) -> bool {
         self.backup_id == manifest.backup_id && self.manifest_digest == manifest.manifest_digest
     }
+
+    fn to_content(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self)
+            .map_err(|error| KmsError::internal_error(format!("restore commit marker serialization failed: {error}")))
+    }
+}
+
+/// A commit marker as the target holds it, with the version to check-and-set
+/// against when the restore appends its next write receipt.
+struct PublishedMarker {
+    marker: VaultRestoreCommitMarker,
+    kv_version: u64,
 }
 
 /// One KV record decoded out of the bundle.
@@ -891,9 +995,12 @@ async fn plan_record(client: &VaultRestoreClient, prefix: &str, record: &Decoded
     })
 }
 
-async fn read_marker(client: &VaultRestoreClient, prefix: &str) -> Result<Option<VaultRestoreCommitMarker>> {
+async fn read_marker(client: &VaultRestoreClient, prefix: &str) -> Result<Option<PublishedMarker>> {
     match client.read_kv_record(&marker_kv_path(prefix)).await? {
-        Some(record) => Ok(Some(VaultRestoreCommitMarker::from_value(record.content)?)),
+        Some(record) => Ok(Some(PublishedMarker {
+            marker: VaultRestoreCommitMarker::from_value(record.content)?,
+            kv_version: record.generation,
+        })),
         None => Ok(None),
     }
 }
@@ -977,18 +1084,18 @@ pub async fn dry_run_vault_restore(
             return Ok(report);
         }
     };
-    if let Some(marker) = &marker
-        && !marker.matches_bundle(&decoded.manifest)
+    if let Some(published) = &marker
+        && !published.marker.matches_bundle(&decoded.manifest)
     {
         report.conflicts.push(RestoreConflict {
             key_id: VAULT_RESTORE_MARKER_KEY.to_string(),
             kind: RestoreConflictKind::KeyAlreadyExists,
-            detail: format!("target holds a restore marker for a different bundle ('{}')", marker.backup_id),
+            detail: format!("target holds a restore marker for a different bundle ('{}')", published.marker.backup_id),
         });
         return Ok(report);
     }
 
-    for record in selected_records(&decoded, marker.as_ref()) {
+    for record in selected_records(&decoded, marker.as_ref().map(|published| &published.marker)) {
         match plan_record(client, prefix, record).await? {
             RecordPlan::Publish | RecordPlan::AlreadyApplied => {}
             RecordPlan::Conflict(conflict) => report.conflicts.push(conflict),
@@ -1065,18 +1172,18 @@ pub async fn restore_vault_backup(
 
     let prefix = request.target.kv_path_prefix.as_str();
     let existing_marker = read_marker(client, prefix).await?;
-    if let Some(marker) = &existing_marker
-        && !marker.matches_bundle(&decoded.manifest)
+    if let Some(published) = &existing_marker
+        && !published.marker.matches_bundle(&decoded.manifest)
     {
         return Err(KmsError::invalid_operation(format!(
             "target holds a restore marker for a different bundle ('{}'); roll that restore forward \
              with its own bundle or abort it explicitly",
-            marker.backup_id
+            published.marker.backup_id
         )));
     }
 
     let mut plans = Vec::new();
-    for record in selected_records(&decoded, existing_marker.as_ref()) {
+    for record in selected_records(&decoded, existing_marker.as_ref().map(|published| &published.marker)) {
         match plan_record(client, prefix, record).await? {
             RecordPlan::Publish => plans.push((record, true)),
             RecordPlan::AlreadyApplied => plans.push((record, false)),
@@ -1093,8 +1200,8 @@ pub async fn restore_vault_backup(
     // The marker is the commit point: it names exactly the records this
     // restore is responsible for, computed before the first write and never
     // recomputed on re-entry.
-    let (marker, resumed) = match existing_marker {
-        Some(marker) => (marker, true),
+    let (mut marker, mut marker_version, resumed) = match existing_marker {
+        Some(published) => (published.marker, published.kv_version, true),
         None => {
             let key_ids = plans
                 .iter()
@@ -1102,15 +1209,16 @@ pub async fn restore_vault_backup(
                 .map(|(record, _)| record.key_id.clone())
                 .collect();
             let marker = VaultRestoreCommitMarker::new(&decoded.manifest, key_ids);
-            let content = serde_json::to_value(&marker)
-                .map_err(|error| KmsError::internal_error(format!("restore commit marker serialization failed: {error}")))?;
-            if !client.create_kv_record(&marker_kv_path(prefix), &content).await? {
+            let Some(version) = client
+                .create_kv_record(&marker_kv_path(prefix), &marker.to_content()?)
+                .await?
+            else {
                 return Err(KmsError::invalid_operation(
                     "another restore published a commit marker for this target concurrently; \
                      resolve it before retrying",
                 ));
-            }
-            (marker, false)
+            };
+            (marker, version, false)
         }
     };
 
@@ -1120,16 +1228,29 @@ pub async fn restore_vault_backup(
             if !*publish || !marker.key_ids.contains(&record.key_id) {
                 continue;
             }
-            if !client
+            let Some(kv_version) = client
                 .create_kv_record(&record_kv_path(prefix, &record.key_id), &record.content)
                 .await?
-            {
+            else {
                 return Err(KmsError::invalid_operation(format!(
                     "a concurrent writer created the Vault record for key '{}' during restore; \
                      restore never overwrites, so it stopped before touching it",
                     record.key_id
                 )));
-            }
+            };
+            // Record the receipt before moving on: it is what later lets an
+            // abort tell this restore's record apart from one that merely sits
+            // at the same path, and it is the one write here that is not
+            // create-only. Crashing between the two leaves the record without
+            // a receipt, which an abort then declines to remove — the safe
+            // direction, and roll-forward still recognizes it by content.
+            marker.written.push(VaultRestoreWriteReceipt {
+                key_id: record.key_id.clone(),
+                kv_version,
+            });
+            marker_version = client
+                .update_kv_record(&marker_kv_path(prefix), &marker.to_content()?, marker_version)
+                .await?;
         }
         sequence.complete(stage)?;
     }
@@ -1159,21 +1280,86 @@ pub async fn restore_vault_backup(
 /// Explicitly abort an interrupted Vault restore, returning the target to its
 /// pre-restore state.
 ///
-/// Removes exactly the records the published marker names — never one the
-/// restore found already present — then the marker itself. Fails closed on a
-/// marker it cannot strictly decode.
-pub async fn abort_vault_restore(client: &VaultRestoreClient, target: &VaultRestoreTarget) -> Result<()> {
+/// Removes only records the marker's write receipts prove this restore created
+/// and that still sit at the version it wrote them at; everything else the
+/// marker merely intended to write is left in place and reported. The marker
+/// itself goes last, so an abort that leaves records behind still clears the
+/// in-progress state. Fails closed on a marker it cannot strictly decode.
+pub async fn abort_vault_restore(client: &VaultRestoreClient, target: &VaultRestoreTarget) -> Result<VaultRestoreAbortReport> {
     let prefix = target.kv_path_prefix.as_str();
-    let Some(marker) = read_marker(client, prefix).await? else {
+    let Some(published) = read_marker(client, prefix).await? else {
         return Err(KmsError::invalid_operation(format!(
             "no vault restore is in progress under {}/{prefix}",
             target.kv_mount
         )));
     };
+    let marker = published.marker;
+
+    let mut removed_key_ids = Vec::new();
+    let mut skipped = Vec::new();
     for key_id in &marker.key_ids {
-        client.delete_kv_record(&record_kv_path(prefix, key_id)).await?;
+        let Some(written) = marker.receipt_for(key_id) else {
+            skipped.push(VaultRestoreAbortSkip {
+                key_id: key_id.clone(),
+                reason: VaultRestoreAbortSkipReason::NeverWritten,
+            });
+            continue;
+        };
+        let path = record_kv_path(prefix, key_id);
+        let observed = client.read_kv_generation(&path).await?;
+        if observed != Some(written) {
+            skipped.push(VaultRestoreAbortSkip {
+                key_id: key_id.clone(),
+                reason: VaultRestoreAbortSkipReason::NotAtWrittenVersion { written, observed },
+            });
+            continue;
+        }
+        client.delete_kv_record(&path).await?;
+        removed_key_ids.push(key_id.clone());
     }
-    client.delete_kv_record(&marker_kv_path(prefix)).await
+
+    client.delete_kv_record(&marker_kv_path(prefix)).await?;
+    Ok(VaultRestoreAbortReport {
+        backup_id: marker.backup_id,
+        removed_key_ids,
+        skipped,
+    })
+}
+
+/// Serializable outcome of an abort. Identifiers and versions only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultRestoreAbortReport {
+    /// Bundle the aborted restore was publishing.
+    pub backup_id: String,
+    /// Records the abort proved this restore wrote, and took back.
+    pub removed_key_ids: Vec<String>,
+    /// Records the marker named that the abort deliberately left in place.
+    /// A non-empty list means the target still needs an operator's eye.
+    pub skipped: Vec<VaultRestoreAbortSkip>,
+}
+
+/// One record an abort refused to remove, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultRestoreAbortSkip {
+    /// Key whose record was left in place.
+    pub key_id: String,
+    /// Why ownership could not be proven.
+    pub reason: VaultRestoreAbortSkipReason,
+}
+
+/// Why an abort could not prove it owns a record the marker names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultRestoreAbortSkipReason {
+    /// The marker carries no write receipt: the restore never created this
+    /// record, so whatever sits at the path is somebody else's.
+    NeverWritten,
+    /// The path no longer holds the version the restore wrote — it was
+    /// modified, or removed, after the fact. `observed` is `None` when the
+    /// path holds nothing at all.
+    NotAtWrittenVersion { written: u64, observed: Option<u64> },
 }
 
 fn blocker_for(error: &KmsError) -> Option<RestoreBlocker> {
@@ -1402,14 +1588,19 @@ mod tests {
         }))
     }
 
-    fn kv_write_response() -> ScriptedResponse {
+    fn kv_write_response_at(version: u64) -> ScriptedResponse {
         ScriptedResponse::ok(serde_json::json!({
             "created_time": "2026-08-01T00:00:00Z",
             "deletion_time": "",
             "custom_metadata": null,
             "destroyed": false,
-            "version": 1,
+            "version": version,
         }))
+    }
+
+    /// The response a create-only write gets: a fresh path lands at version 1.
+    fn kv_write_response() -> ScriptedResponse {
+        kv_write_response_at(1)
     }
 
     fn not_found() -> ScriptedResponse {
@@ -1420,13 +1611,26 @@ mod tests {
         ScriptedResponse::ok(serde_json::json!({}))
     }
 
-    fn marker_value(key_ids: &[&str], manifest_digest: &ContentDigest) -> serde_json::Value {
+    /// A marker as the target would hold it: `key_ids` is what the restore set
+    /// out to publish, `written` the receipts for what it actually created.
+    fn marker_value(key_ids: &[&str], written: &[(&str, u64)], manifest_digest: &ContentDigest) -> serde_json::Value {
         serde_json::json!({
             "format_version": VAULT_RESTORE_MARKER_FORMAT_VERSION,
             "backup_id": BACKUP_ID,
             "manifest_digest": manifest_digest,
             "key_ids": key_ids,
+            "written": written
+                .iter()
+                .map(|(key_id, kv_version)| serde_json::json!({ "key_id": key_id, "kv_version": kv_version }))
+                .collect::<Vec<_>>(),
         })
+    }
+
+    fn test_digest() -> ContentDigest {
+        ContentDigest {
+            algorithm: DigestAlgorithm::Sha256,
+            hex: "a".repeat(64),
+        }
     }
 
     async fn bundle_manifest(bundle: &Path) -> BackupManifest {
@@ -1665,11 +1869,12 @@ mod tests {
         let bundle = standard_bundle(temp.path()).await;
         let (vault, client, target) = scripted_client(vec![
             healthy_transit_key(),
-            not_found(),         // marker absent
-            not_found(),         // key record absent
-            kv_write_response(), // marker published
-            kv_write_response(), // record published
-            empty_ok(),          // marker removed
+            not_found(),             // marker absent
+            not_found(),             // key record absent
+            kv_write_response(),     // marker published
+            kv_write_response(),     // record published
+            kv_write_response_at(2), // write receipt appended to the marker
+            empty_ok(),              // marker removed
         ])
         .await;
 
@@ -1685,6 +1890,8 @@ mod tests {
         assert!(!report.resumed);
         assert_eq!(report.transit_key_name.as_deref(), Some(TRANSIT_KEY));
 
+        let marker_path = format!("POST /v1/{KV_MOUNT}/data/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}");
+        let record_path = format!("POST /v1/{KV_MOUNT}/data/{KV_PREFIX}/{KEY_ID}");
         let requests = vault.requests();
         assert_eq!(
             requests,
@@ -1692,18 +1899,40 @@ mod tests {
                 format!("GET /v1/{TRANSIT_MOUNT}/keys/{TRANSIT_KEY}"),
                 format!("GET /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
                 format!("GET /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{KEY_ID}"),
-                format!("POST /v1/{KV_MOUNT}/data/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
-                format!("POST /v1/{KV_MOUNT}/data/{KV_PREFIX}/{KEY_ID}"),
+                marker_path.clone(),
+                record_path.clone(),
+                marker_path.clone(),
                 format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
             ],
-            "the trust root is verified first and the marker brackets every write"
+            "the trust root is verified first, the marker brackets every write, \
+             and each published record is receipted before the run moves on"
         );
 
-        // Every write is create-only: restore can structurally not overwrite.
-        for body in vault.request_bodies().iter().filter(|body| !body.is_empty()) {
-            let parsed: serde_json::Value = serde_json::from_str(body).expect("write body is JSON");
-            assert_eq!(parsed["options"]["cas"], 0, "write was not create-only: {body}");
+        let writes: Vec<(String, serde_json::Value)> = requests
+            .iter()
+            .zip(vault.request_bodies())
+            .filter(|(_, body)| !body.is_empty())
+            .map(|(line, body)| (line.clone(), serde_json::from_str(&body).expect("write body is JSON")))
+            .collect();
+
+        // Record writes are create-only: restore can structurally not
+        // overwrite one. The marker is the sole exception, and even it moves
+        // only by check-and-set against the version just observed.
+        for (line, body) in &writes {
+            let expected_cas = if *line == record_path || body["data"]["written"] == serde_json::json!([]) {
+                0
+            } else {
+                1
+            };
+            assert_eq!(body["options"]["cas"], expected_cas, "unexpected check-and-set on {line}: {body}");
         }
+
+        let receipt = &writes.last().expect("the marker receipt is the last write").1;
+        assert_eq!(
+            receipt["data"]["written"],
+            serde_json::json!([{ "key_id": KEY_ID, "kv_version": 1 }]),
+            "the marker must record the version the record write landed at"
+        );
     }
 
     #[tokio::test]
@@ -1765,11 +1994,12 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let bundle = standard_bundle(temp.path()).await;
         let manifest = bundle_manifest(&bundle).await;
-        let marker = marker_value(&[KEY_ID], &manifest.manifest_digest);
+        // The interrupted attempt published the record and receipted it.
+        let marker = marker_value(&[KEY_ID], &[(KEY_ID, 1)], &manifest.manifest_digest);
         let (vault, client, target) = scripted_client(vec![
             healthy_transit_key(),
-            kv_metadata_response(1), // marker present
-            kv_read_response(marker, 1),
+            kv_metadata_response(2), // marker present
+            kv_read_response(marker, 2),
             kv_metadata_response(1), // the record this run already wrote
             kv_read_response(record_content(), 1),
             empty_ok(), // marker removed
@@ -1798,7 +2028,7 @@ mod tests {
     async fn a_marker_for_another_bundle_fails_closed() {
         let temp = TempDir::new().expect("temp dir");
         let bundle = standard_bundle(temp.path()).await;
-        let mut foreign = marker_value(&[KEY_ID], &bundle_manifest(&bundle).await.manifest_digest);
+        let mut foreign = marker_value(&[KEY_ID], &[], &bundle_manifest(&bundle).await.manifest_digest);
         foreign["backup_id"] = serde_json::json!("backup-other");
         let (_vault, client, target) =
             scripted_client(vec![healthy_transit_key(), kv_metadata_response(1), kv_read_response(foreign, 1)]).await;
@@ -1834,33 +2064,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_takes_back_exactly_the_marked_records() {
+    async fn abort_takes_back_exactly_the_records_it_receipted() {
         let (vault, client, target) = scripted_client(vec![
-            kv_metadata_response(1),
-            kv_read_response(
-                marker_value(
-                    &[KEY_ID],
-                    &ContentDigest {
-                        algorithm: DigestAlgorithm::Sha256,
-                        hex: "a".repeat(64),
-                    },
-                ),
-                1,
-            ),
-            empty_ok(), // record removed
-            empty_ok(), // marker removed
+            kv_metadata_response(2),
+            kv_read_response(marker_value(&[KEY_ID], &[(KEY_ID, 1)], &test_digest()), 2),
+            kv_metadata_response(1), // the record still sits at the version we wrote
+            empty_ok(),              // record removed
+            empty_ok(),              // marker removed
         ])
         .await;
 
-        abort_vault_restore(&client, &target).await.expect("abort should succeed");
+        let report = abort_vault_restore(&client, &target).await.expect("abort should succeed");
+        assert_eq!(report.removed_key_ids, [KEY_ID]);
+        assert!(report.skipped.is_empty(), "{report:?}");
         assert_eq!(
             vault.requests(),
             [
                 format!("GET /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
                 format!("GET /v1/{KV_MOUNT}/data/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
+                format!("GET /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{KEY_ID}"),
                 format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{KEY_ID}"),
                 format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
+            ],
+            "ownership is re-checked at the path before anything is removed"
+        );
+    }
+
+    /// The marker names what a restore *meant* to write, which after a crash
+    /// or a lost race is not what it wrote. Neither case may be deleted.
+    #[tokio::test]
+    async fn abort_skips_every_record_it_cannot_prove_it_wrote() {
+        const CRASHED_BEFORE: &str = "second-key";
+        const OVERWRITTEN: &str = "third-key";
+
+        let (vault, client, target) = scripted_client(vec![
+            kv_metadata_response(3),
+            kv_read_response(
+                marker_value(
+                    &[KEY_ID, CRASHED_BEFORE, OVERWRITTEN],
+                    // No receipt for CRASHED_BEFORE: the restore died before
+                    // reaching it. OVERWRITTEN was written, then moved on by
+                    // somebody else.
+                    &[(KEY_ID, 1), (OVERWRITTEN, 1)],
+                    &test_digest(),
+                ),
+                3,
+            ),
+            kv_metadata_response(1), // KEY_ID still at the version we wrote
+            empty_ok(),              // KEY_ID removed
+            kv_metadata_response(4), // OVERWRITTEN has moved past our version
+            empty_ok(),              // marker removed
+        ])
+        .await;
+
+        let report = abort_vault_restore(&client, &target).await.expect("abort should succeed");
+        assert_eq!(report.removed_key_ids, [KEY_ID]);
+        assert_eq!(
+            report.skipped,
+            [
+                VaultRestoreAbortSkip {
+                    key_id: CRASHED_BEFORE.to_string(),
+                    reason: VaultRestoreAbortSkipReason::NeverWritten,
+                },
+                VaultRestoreAbortSkip {
+                    key_id: OVERWRITTEN.to_string(),
+                    reason: VaultRestoreAbortSkipReason::NotAtWrittenVersion {
+                        written: 1,
+                        observed: Some(4),
+                    },
+                },
             ]
+        );
+
+        let requests = vault.requests();
+        let deletes: Vec<&str> = requests
+            .iter()
+            .filter(|line| line.starts_with("DELETE "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            deletes,
+            [
+                format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{KEY_ID}"),
+                format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{VAULT_RESTORE_MARKER_KEY}"),
+            ],
+            "only the receipted, unchanged record and the marker may be removed"
+        );
+    }
+
+    /// The review case: the marker is published, the record write then loses
+    /// the create-only race, and the abort that follows must leave the
+    /// winner's record where it is.
+    #[tokio::test]
+    async fn abort_after_a_lost_write_race_leaves_the_other_writer_alone() {
+        let temp = TempDir::new().expect("temp dir");
+        let bundle = standard_bundle(temp.path()).await;
+        let (vault, client, target) = scripted_client(vec![
+            // Restore: trust root, empty target, marker published, then the
+            // record write is beaten to the path.
+            healthy_transit_key(),
+            not_found(),
+            not_found(),
+            kv_write_response(),
+            ScriptedResponse::error(400, "check-and-set parameter did not match the current version"),
+            // Abort: the marker is there and still carries no receipt.
+            kv_metadata_response(1),
+            kv_read_response(marker_value(&[KEY_ID], &[], &bundle_manifest(&bundle).await.manifest_digest), 1),
+            empty_ok(), // marker removed
+        ])
+        .await;
+
+        restore_vault_backup(
+            &test_kek(),
+            &client,
+            &request(bundle, target.clone(), RestoreConflictPolicy::RestoreIntoEmptyTarget),
+        )
+        .await
+        .expect_err("a concurrent writer must stop the restore");
+
+        let report = abort_vault_restore(&client, &target).await.expect("abort should succeed");
+        assert!(report.removed_key_ids.is_empty(), "{report:?}");
+        assert_eq!(
+            report.skipped,
+            [VaultRestoreAbortSkip {
+                key_id: KEY_ID.to_string(),
+                reason: VaultRestoreAbortSkipReason::NeverWritten,
+            }]
+        );
+        assert!(
+            !vault
+                .requests()
+                .contains(&format!("DELETE /v1/{KV_MOUNT}/metadata/{KV_PREFIX}/{KEY_ID}")),
+            "the abort deleted a record this restore never wrote: {:?}",
+            vault.requests()
         );
     }
 

@@ -77,6 +77,7 @@ pub use manifest::{
     VaultTransitReference,
 };
 pub use vault_restore::{
-    VaultRestoreClient, VaultRestoreMismatch, VaultRestoreReport, VaultRestoreRequest, VaultRestoreSequence, VaultRestoreStage,
-    VaultRestoreTarget, abort_vault_restore, dry_run_vault_restore, restore_vault_backup,
+    VaultRestoreAbortReport, VaultRestoreAbortSkip, VaultRestoreAbortSkipReason, VaultRestoreClient, VaultRestoreMismatch,
+    VaultRestoreReport, VaultRestoreRequest, VaultRestoreSequence, VaultRestoreStage, VaultRestoreTarget, abort_vault_restore,
+    dry_run_vault_restore, restore_vault_backup,
 };
