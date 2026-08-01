@@ -32,6 +32,9 @@ const KMS_EVENTS: &[EventName] = &[
     EventName::KmsKeyDeletionCancelled,
     EventName::KmsKeyDeleted,
     EventName::KmsKeyAccessed,
+    EventName::KmsServiceConfigured,
+    EventName::KmsServiceStarted,
+    EventName::KmsServiceStopped,
 ];
 
 fn test_target() -> TargetID {
