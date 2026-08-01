@@ -79,6 +79,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -125,6 +127,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       # Docs-only PRs skip the full code CI, but they are exactly where a
       # planning-type document could be slipped in (git add -f bypasses
