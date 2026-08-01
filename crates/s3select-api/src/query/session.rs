@@ -349,9 +349,17 @@ impl SessionCtxFactory {
         };
         let rt = RuntimeEnvBuilder::new().with_memory_limit(memory_limit_bytes, 1.0).build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
+        let custom_two_byte_record_delimiter = context
+            .input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .and_then(|csv| csv.record_delimiter.as_deref())
+            .is_some_and(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != b"\r\n");
         let scan_range_requires_single_file_scan =
             context.input.request.scan_range.is_some() && context.input.request.input_serialization.parquet.is_none();
-        let config = if scan_range_requires_single_file_scan {
+        let config = if custom_two_byte_record_delimiter || scan_range_requires_single_file_scan {
             config.with_repartition_file_scans(false)
         } else {
             config
@@ -584,6 +592,66 @@ mod tests {
             .expect("JSON LINES ScanRange session should be created");
 
         assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn csv_scan_range_disables_file_repartitioning() {
+        let mut context = test_context();
+        Arc::make_mut(&mut context.input).request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(0),
+        });
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("CSV ScanRange session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn two_byte_csv_record_delimiter_disables_file_scan_repartition() {
+        let mut context = test_context();
+        Arc::get_mut(&mut context.input)
+            .expect("test context input should be uniquely owned")
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("test context should use CSV")
+            .record_delimiter = Some("^Y".to_string());
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(4)
+            .create_session_ctx(&context)
+            .await
+            .expect("session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn crlf_record_delimiter_retains_file_scan_repartition() {
+        let mut context = test_context();
+        Arc::get_mut(&mut context.input)
+            .expect("test context input should be uniquely owned")
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("test context should use CSV")
+            .record_delimiter = Some("\r\n".to_string());
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(4)
+            .create_session_ctx(&context)
+            .await
+            .expect("session should be created");
+
+        assert_eq!(
+            session.inner().config().options().optimizer.repartition_file_scans,
+            SessionConfig::new().options().optimizer.repartition_file_scans
+        );
     }
 
     #[tokio::test]

@@ -250,7 +250,8 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         validate_single_byte(csv.comments.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
-        validate_record_delimiter(csv.record_delimiter.as_deref())?;
+        validate_input_record_delimiter(csv.record_delimiter.as_deref())?;
+        validate_input_delimiter_pair(csv.field_delimiter.as_deref(), csv.record_delimiter.as_deref())?;
     }
 
     if let Some(json) = input.json.as_mut() {
@@ -276,7 +277,7 @@ fn normalize_output_serialization(output: &mut OutputSerialization) -> S3Result<
         validate_single_byte(csv.field_delimiter.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
-        validate_record_delimiter(csv.record_delimiter.as_deref())?;
+        validate_output_record_delimiter(csv.record_delimiter.as_deref())?;
         if let Some(quote_fields) = csv.quote_fields.as_ref()
             && !matches!(quote_fields.as_str(), QuoteFields::ALWAYS | QuoteFields::ASNEEDED)
         {
@@ -351,11 +352,35 @@ fn validate_single_byte(value: Option<&str>, code: S3ErrorCode) -> S3Result<()> 
     Ok(())
 }
 
-fn validate_record_delimiter(value: Option<&str>) -> S3Result<()> {
+fn validate_output_record_delimiter(value: Option<&str>) -> S3Result<()> {
     if let Some(value) = value
         && value.len() != 1
         && value != "\r\n"
     {
+        return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
+    }
+    Ok(())
+}
+
+fn validate_input_record_delimiter(value: Option<&str>) -> S3Result<()> {
+    if let Some(value) = value
+        && !(1..=2).contains(&value.len())
+    {
+        return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
+    }
+    Ok(())
+}
+
+fn validate_input_delimiter_pair(field_delimiter: Option<&str>, record_delimiter: Option<&str>) -> S3Result<()> {
+    let field_delimiter = field_delimiter.unwrap_or(",");
+    let record_delimiter = record_delimiter.unwrap_or("\n");
+    let normalized_field_delimiter = if field_delimiter.len() > 1 { "," } else { field_delimiter };
+    let normalized_record_delimiter = if record_delimiter.len() == 2 {
+        "\r\n"
+    } else {
+        record_delimiter
+    };
+    if record_delimiter.starts_with(field_delimiter) || normalized_record_delimiter.contains(normalized_field_delimiter) {
         return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
     }
     Ok(())
@@ -1050,6 +1075,120 @@ mod tests {
                 .map(|value| value.as_str()),
             Some(CompressionType::NONE)
         );
+    }
+
+    #[test]
+    fn validate_accepts_two_byte_csv_input_record_delimiter() {
+        let mut input = base_input();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("base input should use CSV")
+            .record_delimiter = Some("^Y".to_string());
+
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_supported_multibyte_csv_delimiter_pairs() {
+        let mut input = base_input();
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("base input should use CSV");
+        csv.field_delimiter = Some("\r\n".to_string());
+        csv.record_delimiter = Some("^Y".to_string());
+
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("input should still use CSV");
+        csv.field_delimiter = Some("\nX".to_string());
+        csv.record_delimiter = None;
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("input should still use CSV");
+        csv.field_delimiter = Some("aa".to_string());
+        csv.record_delimiter = Some("a".to_string());
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_csv_input_record_delimiter_outside_one_to_two_bytes() {
+        for delimiter in ["", "^YZ"] {
+            let mut input = base_input();
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("base input should use CSV")
+                .record_delimiter = Some(delimiter.to_string());
+
+            let err = validate_select_request(&HeaderMap::new(), &mut input)
+                .expect_err("record delimiter outside the supported length must be rejected");
+
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_overlapping_csv_input_delimiters() {
+        for (field_delimiter, record_delimiter) in [
+            (Some("^"), Some("^")),
+            (Some("\r"), Some("\r\n")),
+            (Some("a"), Some("aa")),
+            (None, Some(",")),
+            (Some("\n"), None),
+            (Some("||"), Some(",")),
+            (Some("\n"), Some("^Y")),
+            (Some("\r"), Some("^Y")),
+        ] {
+            let mut input = base_input();
+            let csv = input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("base input should use CSV");
+            csv.field_delimiter = field_delimiter.map(str::to_string);
+            csv.record_delimiter = record_delimiter.map(str::to_string);
+
+            let err = validate_select_request(&HeaderMap::new(), &mut input)
+                .expect_err("overlapping field and record delimiters must be rejected");
+
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
+        }
+    }
+
+    #[test]
+    fn validate_keeps_csv_output_record_delimiter_restriction() {
+        let mut input = base_input();
+        input
+            .request
+            .output_serialization
+            .csv
+            .as_mut()
+            .expect("base output should use CSV")
+            .record_delimiter = Some("^Y".to_string());
+
+        let err =
+            validate_select_request(&HeaderMap::new(), &mut input).expect_err("multi-byte output delimiter must remain rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
     }
 
     #[test]
