@@ -16,9 +16,10 @@
 //!
 //! The contract side defines the versioned backup manifest, the per-backend
 //! responsibility matrix, typed failure modes, and the restore dry-run
-//! report. [`local_export`] implements the producer side for the Local
-//! backend as a crate-internal API; restore orchestration and the admin API
-//! build on these pieces in follow-up changes.
+//! report. [`local_export`] implements the producer side and
+//! [`local_restore`] the consumer side for the Local backend as
+//! crate-internal APIs; the admin API builds on these pieces in follow-up
+//! changes.
 //!
 //! # Bundle model
 //!
@@ -51,6 +52,7 @@ mod capability;
 mod dry_run;
 mod error;
 pub mod local_export;
+pub mod local_restore;
 mod manifest;
 
 pub use capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
@@ -61,6 +63,10 @@ pub use error::BackupError;
 pub use local_export::{
     BackupKek, LOCAL_BUNDLE_MANIFEST_FILE, LocalBackupExportRequest, decrypt_bundle_artifact, export_local_backup,
     read_local_bundle_manifest,
+};
+pub use local_restore::{
+    LocalRestoreReport, LocalRestoreRequest, RestoreConflictPolicy, abort_local_restore, dry_run_local_restore,
+    restore_local_backup,
 };
 pub use manifest::{
     AeadAlgorithm, ArtifactDescriptor, ArtifactKind, BackupKekDescriptor, BackupManifest, CompletenessState, ContentDigest,
