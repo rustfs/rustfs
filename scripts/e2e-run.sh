@@ -40,7 +40,19 @@ export RUST_BACKTRACE=full
 "$BIN" --address "127.0.0.1:${RUSTFS_TEST_PORT}" "$VOLUME" > "${RUSTFS_TEST_LOG}" 2>&1 &
 RUSTFS_PID=$!
 
-sleep 10
+for _ in {1..60}; do
+    if curl --noproxy '*' --silent --fail "http://127.0.0.1:${RUSTFS_TEST_PORT}/health/ready" >/dev/null; then
+        break
+    fi
+
+    if ! kill -0 "${RUSTFS_PID}" 2>/dev/null; then
+        wait "${RUSTFS_PID}"
+    fi
+
+    sleep 1
+done
+
+curl --noproxy '*' --silent --show-error --fail "http://127.0.0.1:${RUSTFS_TEST_PORT}/health/ready" >/dev/null
 
 export AWS_ACCESS_KEY_ID="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
 export AWS_SECRET_ACCESS_KEY="${RUSTFS_SECRET_KEY:-rustfsadmin}"
