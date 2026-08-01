@@ -1289,7 +1289,7 @@ compare_baseline() {
     return
   fi
 
-  echo "size,tool,concurrency,new_median_reqps,baseline_median_reqps,delta_reqps_pct,new_median_latency_ms,baseline_median_latency_ms,delta_latency_pct,new_median_throughput_bps,baseline_median_throughput_bps,delta_throughput_pct" > "$COMPARE_CSV"
+  echo "size,tool,concurrency,new_median_reqps,baseline_median_reqps,delta_reqps_pct,new_median_latency_ms,baseline_median_latency_ms,delta_latency_pct,new_median_throughput_bps,baseline_median_throughput_bps,delta_throughput_pct,new_median_p90_latency_ms,baseline_median_p90_latency_ms,delta_p90_latency_pct,new_median_p99_latency_ms,baseline_median_p99_latency_ms,delta_p99_latency_pct,new_ok_rounds,baseline_ok_rounds,new_failed_rounds,baseline_failed_rounds,new_error_rate_pct,baseline_error_rate_pct,delta_error_rate_pct" > "$COMPARE_CSV"
 
   awk -F',' '
     NR==FNR {
@@ -1298,22 +1298,35 @@ compare_baseline() {
       b_req[key]=$7
       b_lat[key]=$8
       b_thr[key]=$6
+      b_p90[key]=$9
+      b_p99[key]=$10
+      b_ok[key]=$4
+      b_fail[key]=$5
       next
     }
     FNR==1 {next}
     {
       key=$1
-      n_thr=$6; n_req=$7; n_lat=$8
+      n_thr=$6; n_req=$7; n_lat=$8; n_p90=$9; n_p99=$10; n_ok=$4; n_fail=$5
       br=(key in b_req)?b_req[key]:"N/A"
       bl=(key in b_lat)?b_lat[key]:"N/A"
       bt=(key in b_thr)?b_thr[key]:"N/A"
+      bp90=(key in b_p90)?b_p90[key]:"N/A"
+      bp99=(key in b_p99)?b_p99[key]:"N/A"
+      bok=(key in b_ok)?b_ok[key]:"N/A"
+      bfail=(key in b_fail)?b_fail[key]:"N/A"
 
-      dr="N/A"; dl="N/A"; dt="N/A"
+      dr="N/A"; dl="N/A"; dt="N/A"; dp90="N/A"; dp99="N/A"; ne="N/A"; be="N/A"; de="N/A"
       if (br!="N/A" && n_req!="N/A" && br+0!=0) dr=sprintf("%.2f", ((n_req-br)/br)*100)
       if (bl!="N/A" && n_lat!="N/A" && bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
       if (bt!="N/A" && n_thr!="N/A" && bt+0!=0) dt=sprintf("%.2f", ((n_thr-bt)/bt)*100)
+      if (bp90!="N/A" && n_p90!="N/A" && bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
+      if (bp99!="N/A" && n_p99!="N/A" && bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+      if (n_ok!="N/A" && n_fail!="N/A" && n_ok+n_fail>0) ne=sprintf("%.2f", (n_fail/(n_ok+n_fail))*100)
+      if (bok!="N/A" && bfail!="N/A" && bok+bfail>0) be=sprintf("%.2f", (bfail/(bok+bfail))*100)
+      if (ne!="N/A" && be!="N/A") de=sprintf("%.2f", ne-be)
 
-      print key "," $2 "," $3 "," n_req "," br "," dr "," n_lat "," bl "," dl "," n_thr "," bt "," dt
+      print key "," $2 "," $3 "," n_req "," br "," dr "," n_lat "," bl "," dl "," n_thr "," bt "," dt "," n_p90 "," bp90 "," dp90 "," n_p99 "," bp99 "," dp99 "," n_ok "," bok "," n_fail "," bfail "," ne "," be "," de
     }
   ' "$BASELINE_CSV" "$MEDIAN_CSV" >> "$COMPARE_CSV"
 }

@@ -641,6 +641,7 @@ impl Erasure {
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
                             buf = BytesMut::with_capacity(ingest_capacity);
                             let queued_bytes = queued_block_bytes(&res);
+                            let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
                             if let Err(err) = send_queued(&tx, res, queued_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
@@ -670,6 +671,7 @@ impl Erasure {
                             let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
                             buf = returned_buf;
                             let queued_bytes = queued_block_bytes(&res);
+                            let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
                             if let Err(err) = send_queued(&tx, res, queued_bytes).await {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
@@ -712,6 +714,7 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
+            let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(queued_block_bytes(&block));
             let write_stage_start = stage_timer_if_enabled();
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
@@ -768,6 +771,7 @@ impl Erasure {
             let mut buf = vec![0u8; block_size];
             let mut pending_batch = Vec::with_capacity(batch_blocks);
             let mut pending_batch_bytes = 0usize;
+            let mut pending_batch_stage = None;
             loop {
                 match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
                     Ok(Some(n)) => {
@@ -779,6 +783,8 @@ impl Erasure {
                         let queued_bytes = queued_block_bytes(&res);
                         pending_batch_bytes = pending_batch_bytes.saturating_add(queued_bytes);
                         pending_batch.push(res);
+                        drop(pending_batch_stage.take());
+                        pending_batch_stage = Some(rustfs_io_metrics::track_ec_encode_producer_bytes(pending_batch_bytes));
 
                         if pending_batch.len() >= batch_blocks {
                             let send_wait_stage_start = stage_timer_if_enabled();
@@ -786,6 +792,7 @@ impl Erasure {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_batched_send_wait", send_wait_stage_start);
+                            drop(pending_batch_stage.take());
                             pending_batch = Vec::with_capacity(batch_blocks);
                             pending_batch_bytes = 0;
                         }
@@ -813,6 +820,7 @@ impl Erasure {
                     return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                 }
                 record_internal_stage_if_enabled("erasure_encode_batched_send_wait", send_wait_stage_start);
+                drop(pending_batch_stage);
             }
 
             Ok((reader, total))
@@ -828,6 +836,7 @@ impl Erasure {
             };
             record_internal_stage_if_enabled("erasure_encode_batched_recv_wait", recv_wait_stage_start);
             let batch = batch.into_inner();
+            let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(queued_batch_bytes(&batch));
             let write_stage_start = stage_timer_if_enabled();
             for block in batch {
                 if let Err(err) = writers.write(block).await {
@@ -1302,24 +1311,36 @@ mod tests {
     }
 
     async fn writer_error_aborts_blocked_producer(pipeline: EncodePipeline) {
-        const BLOCK_SIZE: usize = 16;
-
         let gauge_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let producer_baseline = rustfs_io_metrics::current_ec_encode_producer_bytes();
+        let writer_baseline = rustfs_io_metrics::current_ec_encode_writer_bytes();
+        let producer_peak_before = rustfs_io_metrics::current_ec_encode_producer_bytes_peak();
+        let writer_peak_before = rustfs_io_metrics::current_ec_encode_writer_bytes_peak();
+        let block_size = match pipeline {
+            EncodePipeline::Batched => usize::try_from(producer_peak_before.max(writer_peak_before).saturating_add(1))
+                .expect("stage peak fits the test address space"),
+            EncodePipeline::Vec | EncodePipeline::BytesMut => 16,
+        };
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+        let erasure = Arc::new(Erasure::new(1, 0, block_size));
+        let batch_blocks = encode_batch_block_count().min(encode_channel_capacity(
+            erasure.shard_size().saturating_mul(erasure.total_shard_count()),
+            erasure_encode_max_inflight_bytes(),
+        ));
         let blocks_before_pending = match pipeline {
-            EncodePipeline::Batched => encode_batch_block_count(),
+            EncodePipeline::Batched => batch_blocks,
             EncodePipeline::Vec | EncodePipeline::BytesMut => 1,
         };
         let (reader, reader_blocked, reader_dropped, _final_block) =
-            BlocksThenPendingReader::new(blocks_before_pending, BLOCK_SIZE);
+            BlocksThenPendingReader::new(blocks_before_pending, block_size);
         let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut writers = vec![Some(bitrot_writer(
             FailAfterReaderBlocksWriter {
                 reader_blocked,
                 writes: writes.clone(),
             },
-            BLOCK_SIZE,
+            block_size,
         ))];
-        let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
 
         let result = match pipeline {
             EncodePipeline::Vec => erasure.encode_with_ingest_mode(reader, &mut writers, 1, false).await,
@@ -1346,12 +1367,40 @@ mod tests {
             gauge_baseline,
             "writer failure must settle all queued and pending encoded bytes"
         );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes(),
+            producer_baseline,
+            "writer failure must settle producer stage bytes for every ingest pipeline"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes(),
+            writer_baseline,
+            "writer failure must settle writer stage bytes for every ingest pipeline"
+        );
+        if matches!(pipeline, EncodePipeline::Batched) {
+            let expected_batch_bytes = u64::try_from(block_size)
+                .expect("block size fits the stage gauge")
+                .checked_mul(u64::try_from(batch_blocks).expect("batch block count fits the stage gauge"))
+                .expect("test batch payload fits the stage gauge");
+            assert!(
+                rustfs_io_metrics::current_ec_encode_producer_bytes_peak() >= producer_peak_before.max(expected_batch_bytes),
+                "batched producer must expose its full pending batch before writer failure"
+            );
+            assert!(
+                rustfs_io_metrics::current_ec_encode_writer_bytes_peak() >= writer_peak_before.max(expected_batch_bytes),
+                "batched writer must expose its full batch before writer failure"
+            );
+        }
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
     }
 
     async fn aborting_full_queue_settles_pending_send() {
         const BLOCK_SIZE: usize = 16;
 
         let gauge_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let producer_baseline = rustfs_io_metrics::current_ec_encode_producer_bytes();
+        let writer_baseline = rustfs_io_metrics::current_ec_encode_writer_bytes();
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
         let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
         let inflight_blocks = encode_channel_capacity(
             erasure.shard_size().saturating_mul(erasure.total_shard_count()),
@@ -1389,6 +1438,15 @@ mod tests {
         })
         .await
         .expect("producer should account for the pending send after the queue fills");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rustfs_io_metrics::current_ec_encode_producer_bytes() == producer_baseline
+                || rustfs_io_metrics::current_ec_encode_writer_bytes() == writer_baseline
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full queue must retain producer and writer stage ownership before cancellation");
 
         encode.abort();
         assert!(matches!(encode.await, Err(err) if err.is_cancelled()), "encode task should be cancelled");
@@ -1406,6 +1464,17 @@ mod tests {
             gauge_baseline,
             "cancelling a full queue must settle queued and pending bytes"
         );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes(),
+            producer_baseline,
+            "cancelling a full queue must settle the pending producer stage"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes(),
+            writer_baseline,
+            "cancelling a full queue must settle the stalled writer stage"
+        );
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
     }
 
     #[tokio::test]
@@ -1870,6 +1939,61 @@ mod tests {
                 "shard {index} should receive bytesmut-ingest data"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bytesmut_streaming_encode_observes_all_payload_stage_peaks() {
+        let queue_baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+        let producer_peak_before = rustfs_io_metrics::current_ec_encode_producer_bytes_peak();
+        let queue_peak_before = rustfs_io_metrics::current_ec_encode_queue_bytes_peak();
+        let writer_peak_before = rustfs_io_metrics::current_ec_encode_writer_bytes_peak();
+        let prior_peak = producer_peak_before.max(queue_peak_before).max(writer_peak_before);
+        let block_size = usize::try_from(prior_peak.saturating_add(1)).expect("stage peak fits the test address space");
+        let erasure = Arc::new(Erasure::new(1, 0, block_size));
+        let encoded_block_bytes = erasure.shard_size() * erasure.total_shard_count();
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), block_size))];
+        let reader = tokio::io::BufReader::new(Cursor::new(vec![0x5a; block_size * 2]));
+
+        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+        let result = erasure.encode_with_ingest_mode(reader, &mut writers, 1, true).await;
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+
+        let (_reader, written) = result.expect("bytesmut streaming encode should complete");
+        assert_eq!(written, block_size * 2);
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+            queue_baseline,
+            "completed streaming encode must not retain queue bytes"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes(),
+            0,
+            "completed streaming encode must not retain producer bytes"
+        );
+        assert_eq!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes(),
+            0,
+            "completed streaming encode must not retain writer bytes"
+        );
+        let expected_peak = u64::try_from(encoded_block_bytes).expect("encoded block bytes fit the gauge");
+        assert!(
+            rustfs_io_metrics::current_ec_encode_producer_bytes_peak() >= producer_peak_before.max(expected_peak),
+            "producer peak must observe encoded bytes before queue hand-off"
+        );
+        assert!(
+            rustfs_io_metrics::current_ec_encode_queue_bytes_peak() >= queue_peak_before.max(expected_peak),
+            "queue peak must observe encoded bytes pending shard writers"
+        );
+        assert!(
+            rustfs_io_metrics::current_ec_encode_writer_bytes_peak() >= writer_peak_before.max(expected_peak),
+            "writer peak must observe encoded bytes after queue hand-off"
+        );
+        assert!(
+            !committed.lock().expect("committed buffer should be lockable").is_empty(),
+            "stage peak observation must not change writer commit behavior"
+        );
     }
 
     #[tokio::test]
