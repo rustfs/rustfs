@@ -104,7 +104,7 @@ jobs:
       - name: Assert the interop selector still matches tests
         run: |
           set -euo pipefail
-          selection="$(cargo nextest list --run-ignored all \
+          selection="$(cargo nextest list --run-ignored ignored-only \
             -p "$INTEROP_PACKAGE" --features "$INTEROP_FEATURES" \
             -E "$INTEROP_FILTER" --message-format json \
             | python3 -c 'import json,os,sys; d=json.load(sys.stdin); required=json.loads(os.environ["INTEROP_REQUIRED_TESTS"]); matched=[name for suite in d.get("rust-suites", {}).values() for name,test in suite.get("testcases", {}).items() if test.get("filter-match", {}).get("status") == "matches"]; missing=[test for test in required if not any(name.endswith("minio_generated_read_test::" + test) for name in matched)]; print(len(matched)); print(",".join(missing))')"
