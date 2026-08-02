@@ -49,8 +49,6 @@ pub use replication_config_boundary::{
     replication_target_arns, should_remove_replication_target, unsupported_replication_config_field,
     validate_replication_config_target_arns,
 };
-#[cfg(test)]
-pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
 pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
 pub use replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState,
