@@ -162,6 +162,17 @@ fn record_sweep(report: &SweepReport, census: Option<KeyCensus>) {
 /// referencing configuration lives (for example bucket encryption settings in
 /// the server) and are injected via
 /// [`crate::service_manager::KmsServiceManager::set_deletion_reference_checker`].
+///
+/// # Blocks only
+///
+/// This gate is one-directional and must stay that way: a checker may add a
+/// reason to keep material, never a reason to destroy it. Nothing that
+/// enumerates key usage — least of all a scan whose coverage depends on how
+/// far a background sweep got — may ever be wired in as a condition that
+/// releases a removal this gate is holding. One incomplete scan would then be
+/// enough to destroy the only copy of a key that still has data behind it,
+/// which is why [`crate::key_impact::KeyImpactReport`] exposes no clearance
+/// and is consumed only where a refusal is being decided.
 #[async_trait]
 pub trait DeletionReferenceChecker: Send + Sync {
     /// Identifiers of configuration still referencing `key_id` (bucket names,
