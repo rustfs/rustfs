@@ -33,7 +33,6 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use tracing::{error, info};
-use urlencoding;
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_KMS_KEYS: &str = "kms_keys";
@@ -96,19 +95,89 @@ pub struct GenerateDataKeyApiResponse {
     pub ciphertext_blob: String, // Base64 encoded
 }
 
+/// The query parameters of an admin KMS request.
+///
+/// Parsed with `form_urlencoded`, as the rest of the admin surface does, so a
+/// parameter written without a value (`?status`) arrives as an empty value
+/// rather than disappearing: a validated parameter must be able to tell "not
+/// asked for" from "asked for, unreadable".
 pub(super) fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
     if let Some(query) = uri.query() {
-        query.split('&').for_each(|pair| {
-            if let Some((key, value)) = pair.split_once('=') {
-                params.insert(
-                    urlencoding::decode(key).unwrap_or_default().into_owned(),
-                    urlencoding::decode(value).unwrap_or_default().into_owned(),
-                );
-            }
-        });
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params.insert(key.into_owned(), value.into_owned());
+        }
     }
     params
+}
+
+/// Status values a `status` filter may name, spelled as the response spells
+/// them.
+const KEY_STATUS_FILTERS: &[(&str, KeyStatus)] = &[
+    ("Active", KeyStatus::Active),
+    ("Disabled", KeyStatus::Disabled),
+    ("PendingDeletion", KeyStatus::PendingDeletion),
+    ("Deleted", KeyStatus::Deleted),
+];
+
+/// Usage values a `usage` filter may name, spelled as the response spells them.
+const KEY_USAGE_FILTERS: &[(&str, KeyUsage)] = &[
+    ("EncryptDecrypt", KeyUsage::EncryptDecrypt),
+    ("SignVerify", KeyUsage::SignVerify),
+];
+
+/// The status and usage filters of a key listing.
+struct KeyListFilters {
+    status: Option<KeyStatus>,
+    usage: Option<KeyUsage>,
+}
+
+/// A filter value with casing and word separators folded away, so the spelling
+/// the response uses (`PendingDeletion`) and the AWS-shaped one
+/// (`PENDING_DELETION`) name the same filter.
+fn canonical_filter_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '_' | '-'))
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn parse_key_filter<T: Clone>(name: &str, value: &str, accepted: &[(&str, T)]) -> Result<T, String> {
+    let wanted = canonical_filter_value(value);
+    accepted
+        .iter()
+        .find(|(spelling, _)| canonical_filter_value(spelling) == wanted)
+        .map(|(_, filter)| filter.clone())
+        .ok_or_else(|| {
+            let spellings: Vec<&str> = accepted.iter().map(|(spelling, _)| *spelling).collect();
+            format!("invalid value for '{name}': expected one of {}, got '{value}'", spellings.join(", "))
+        })
+}
+
+/// The `status` and `usage` filters a key listing was asked to apply.
+///
+/// An absent parameter means "no filter". A parameter that is present but names
+/// no known status or usage — an empty value included — is refused rather than
+/// dropped: a listing that ignored the filter would answer "show me the keys
+/// pending deletion" with every key there is, and nothing in the response would
+/// tell the caller that the narrowing never happened.
+///
+/// The filters narrow a page after the backend has cut it, so a filtered page
+/// can be shorter than `limit` — even empty — while `truncated` is still true.
+/// Callers must page until `truncated` is false rather than until a page comes
+/// back short.
+fn key_list_filters(query_params: &HashMap<String, String>) -> Result<KeyListFilters, String> {
+    Ok(KeyListFilters {
+        status: query_params
+            .get("status")
+            .map(|value| parse_key_filter("status", value, KEY_STATUS_FILTERS))
+            .transpose()?,
+        usage: query_params
+            .get("usage")
+            .map(|value| parse_key_filter("usage", value, KEY_USAGE_FILTERS))
+            .transpose()?,
+    })
 }
 
 fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
@@ -374,12 +443,12 @@ mod tests {
     use super::{
         CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, DeleteKmsKeyResponse,
         DescribeKmsKeyResponse, GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id,
-        key_impact_if_requested, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
-        kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, wants_key_impact,
+        extract_query_params, key_impact_if_requested, key_list_filters, kms_create_key_actions, kms_delete_key_actions,
+        kms_describe_key_actions, kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
-    use rustfs_kms::{KeyImpactReport, KeyReference, KeyReferenceKind, KmsError, ReferenceScope};
+    use rustfs_kms::{KeyImpactReport, KeyReference, KeyReferenceKind, KeyStatus, KeyUsage, KmsError, ReferenceScope};
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use rustfs_policy::policy::{Args, Policy};
     use std::collections::HashMap;
@@ -922,6 +991,71 @@ mod tests {
         }
     }
 
+    fn list_filters(query: &str) -> Result<(Option<KeyStatus>, Option<KeyUsage>), String> {
+        let uri: Uri = format!("/rustfs/admin/v3/kms/keys{query}").parse().expect("uri should parse");
+        key_list_filters(&extract_query_params(&uri)).map(|filters| (filters.status, filters.usage))
+    }
+
+    /// A filter is either applied or refused. Answering a narrowed listing with
+    /// the unfiltered key set looks, from the response alone, exactly like a key
+    /// set in which everything matches — the caller cannot tell that its
+    /// `status=PendingDeletion` never reached the backend.
+    #[test]
+    fn a_key_listing_filter_is_either_applied_or_refused() {
+        assert_eq!(list_filters(""), Ok((None, None)), "an unfiltered listing must stay unfiltered");
+        assert_eq!(
+            list_filters("?status=PendingDeletion&usage=EncryptDecrypt"),
+            Ok((Some(KeyStatus::PendingDeletion), Some(KeyUsage::EncryptDecrypt)))
+        );
+
+        // The spelling the response carries and the AWS-shaped one name the
+        // same filter, so a value read off a listing can be sent straight back.
+        for query in [
+            "?status=pending_deletion",
+            "?status=PENDING-DELETION",
+            "?status=pendingdeletion",
+        ] {
+            assert_eq!(list_filters(query), Ok((Some(KeyStatus::PendingDeletion), None)), "{query}");
+        }
+
+        // Present but unreadable — including a value-less or empty parameter —
+        // is refused instead of read as "no filter".
+        for (query, name) in [
+            ("?status=enabled", "status"),
+            ("?status=", "status"),
+            ("?status", "status"),
+            ("?usage=encrypt", "usage"),
+            ("?usage=", "usage"),
+            ("?status=Active&usage=sign", "usage"),
+        ] {
+            let error = list_filters(query).expect_err("an unreadable filter must be refused");
+            assert!(
+                error.contains(&format!("invalid value for '{name}'")),
+                "unhelpful message for {query}: {error}"
+            );
+        }
+    }
+
+    /// Both list endpoints must hand the caller's filters to the KMS. Pinning
+    /// them to `None` — as both did before they were wired up — answers a
+    /// narrowed listing with every key there is.
+    #[test]
+    fn both_list_handlers_pass_the_requested_filters_to_the_kms() {
+        let src = include_str!("kms_keys.rs");
+
+        for handler in ["ListKeysHandler", "ListKmsKeysHandler"] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("key_list_filters(&query_params)"),
+                "{handler} must read the requested filters"
+            );
+            assert!(
+                block.contains("status_filter: filters.status") && block.contains("usage_filter: filters.usage"),
+                "{handler} must pass the requested filters to the KMS"
+            );
+        }
+    }
+
     fn describe_uri(query: &str) -> Uri {
         format!("/rustfs/admin/v3/kms/keys/key-a{query}")
             .parse()
@@ -1006,6 +1140,10 @@ impl Operation for ListKeysHandler {
         let query_params = extract_query_params(&req.uri);
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
         let marker = query_params.get("marker").cloned();
+        // Validated before the listing runs, so a filter the service cannot
+        // apply fails as the input error it is instead of returning the whole
+        // key set as if it had been narrowed.
+        let filters = key_list_filters(&query_params).map_err(|message| s3_error!(InvalidArgument, "{}", message))?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "kms service is not initialized"));
@@ -1014,8 +1152,8 @@ impl Operation for ListKeysHandler {
         let request = ListKeysRequest {
             limit: Some(limit),
             marker,
-            status_filter: None,
-            usage_filter: None,
+            status_filter: filters.status,
+            usage_filter: filters.usage,
         };
 
         match service.list_keys_with_context(request, audit.context()).await {
@@ -1742,6 +1880,26 @@ impl Operation for ListKmsKeysHandler {
         let query_params = extract_query_params(&req.uri);
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
         let marker = query_params.get("marker").cloned();
+        // Validated before the listing runs, so a filter the service cannot
+        // apply fails as the input error it is instead of returning the whole
+        // key set as if it had been narrowed.
+        let filters = match key_list_filters(&query_params) {
+            Ok(filters) => filters,
+            Err(message) => {
+                let response = ListKmsKeysResponse {
+                    success: false,
+                    message,
+                    keys: vec![],
+                    truncated: false,
+                    next_marker: None,
+                };
+                let data =
+                    serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
+                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+            }
+        };
 
         let Some(service_manager) = kms_service_manager_from_context() else {
             let response = ListKmsKeysResponse {
@@ -1776,8 +1934,8 @@ impl Operation for ListKmsKeysHandler {
         let kms_request = ListKeysRequest {
             limit: Some(limit),
             marker,
-            status_filter: None,
-            usage_filter: None,
+            status_filter: filters.status,
+            usage_filter: filters.usage,
         };
 
         match manager.list_keys_with_context(kms_request, audit.context()).await {
