@@ -3249,8 +3249,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            let explicit_delete_marker = opts.tier_delete_journal_api.is_some()
+                && dobj.version_id.is_some()
+                && goi.delete_marker
+                && goi.version_id == version_id
+                && matches!(gerr.as_ref(), Some(StorageError::MethodNotAllowed));
             if let Some(err) = gerr.as_ref()
                 && !source_missing
+                && !explicit_delete_marker
             {
                 del_errs[i] = Some(err.clone());
                 continue;
@@ -3323,6 +3329,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 if versioned {
                     vr.version_id = Some(Uuid::new_v4());
                 }
+            }
+
+            if goi.delete_marker && dobj.version_id.is_some() && goi.version_id == version_id {
+                vr.deleted = true;
+                vr.mod_time = goi.mod_time;
             }
 
             let v = {
