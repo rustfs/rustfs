@@ -69,12 +69,24 @@ const ICEBERG_ERROR_NO_SUCH_RESOURCE: &str = "NoSuchResourceException";
 const ICEBERG_ERROR_NO_SUCH_TABLE: &str = "NoSuchTableException";
 const ICEBERG_ERROR_NO_SUCH_VIEW: &str = "NoSuchViewException";
 const ICEBERG_ERROR_REST: &str = "RESTException";
+const ICEBERG_ERROR_UNPROCESSABLE_ENTITY: &str = "UnprocessableEntityException";
+const ICEBERG_ERROR_UNSUPPORTED_OPERATION: &str = "UnsupportedOperationException";
+const ICEBERG_VIEW_FORMAT_VERSION: i64 = 1;
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REST_PAGE_TOKEN_VERSION: u8 = 1;
 const REST_PAGE_TOKEN_MAX_LENGTH: usize = 16 * 1024;
 const REST_DEFAULT_PAGE_SIZE: usize = 1000;
 const REST_MAX_PAGE_SIZE: usize = 1000;
 const REST_PAGE_TOKEN_QUERY_PARAMETER: &str = "pageToken";
 const REST_PAGE_SIZE_QUERY_PARAMETER: &str = "pageSize";
+const REST_NAMESPACE_SEPARATOR: char = '\u{1f}';
+const REST_NAMESPACE_SEPARATOR_UTF8: &str = "\u{1f}";
+const REST_NAMESPACE_SEPARATOR_URL_ENCODED: &str = "%1F";
+const TABLE_WAREHOUSE_READ_ACTIONS: &[S3Action] = &[S3Action::GetObjectAction];
+const TABLE_WAREHOUSE_WRITE_ACTIONS: &[S3Action] = &[S3Action::PutObjectAction, S3Action::DeleteObjectAction];
+const TABLE_COMMIT_MAX_MANIFESTS: usize = 10_000;
+const TABLE_COMMIT_MAX_AVRO_BYTES: usize = 512 * 1024 * 1024;
+const TABLE_COMMIT_MAX_FILE_REFERENCES: usize = 1_000_000;
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CATALOG_BACKING_CONFIG_KEY: &str = "rustfs.catalog-backing";
@@ -305,6 +317,8 @@ struct RestCommitTableRequest {
 struct RestCommitViewRequest {
     #[serde(default, rename = "identifier")]
     identifier: Option<RestTableIdentifier>,
+    #[serde(default, rename = "commit-id")]
+    commit_id: Option<String>,
     #[serde(default, rename = "expected-version-token")]
     expected_version_token: Option<String>,
     #[serde(default, rename = "expected-metadata-location")]
@@ -1350,6 +1364,14 @@ async fn authorize_table_catalog_s3_actions(
     object: &str,
     actions: &[S3Action],
 ) -> S3Result<()> {
+    if req.extensions.get::<ReqInfo>().is_none() {
+        let principal = table_catalog_request_principal(req).await?;
+        req.extensions.insert(ReqInfo {
+            cred: Some(principal.credentials),
+            is_owner: principal.owner,
+            ..Default::default()
+        });
+    }
     let original = {
         let req_info = req
             .extensions
@@ -1373,6 +1395,17 @@ async fn authorize_table_catalog_s3_actions(
         (req_info.bucket, req_info.object, req_info.version_id) = original;
     }
     result
+}
+
+async fn authorize_optional_table_catalog_object_read(
+    req: Option<&mut S3Request<Body>>,
+    bucket: &str,
+    object: &str,
+) -> S3Result<()> {
+    match req {
+        Some(req) => authorize_table_catalog_s3_actions(req, bucket, object, &[S3Action::GetObjectAction]).await,
+        None => Ok(()),
+    }
 }
 
 fn table_catalog_prefix_authorization_probe(object_prefix: &str) -> String {
@@ -1542,6 +1575,33 @@ fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
     Ok(warehouse)
 }
 
+fn rest_purge_requested_from_query(uri: &http::Uri) -> S3Result<bool> {
+    let mut purge_requested = None;
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key != "purgeRequested" {
+                continue;
+            }
+            if purge_requested.is_some() {
+                return Err(iceberg_rest_error(
+                    ICEBERG_ERROR_BAD_REQUEST,
+                    StatusCode::BAD_REQUEST,
+                    "purgeRequested query parameter must not be repeated",
+                ));
+            }
+            let value = value.parse::<bool>().map_err(|_| {
+                iceberg_rest_error(
+                    ICEBERG_ERROR_BAD_REQUEST,
+                    StatusCode::BAD_REQUEST,
+                    "purgeRequested query parameter must be true or false",
+                )
+            })?;
+            purge_requested = Some(value);
+        }
+    }
+    Ok(purge_requested.unwrap_or(false))
+}
+
 fn rest_pagination_from_query(uri: &http::Uri, context: RestPageContext<'_>) -> S3Result<RestPagination> {
     let mut page_token = None;
     let mut page_token_seen = false;
@@ -1676,6 +1736,67 @@ fn encode_rest_page_token(cursor: &str, context: &str) -> S3Result<String> {
         ));
     }
     Ok(encoded)
+}
+
+fn namespace_from_rest_value(
+    value: &str,
+) -> Result<crate::table_catalog::Namespace, crate::table_catalog::CatalogIdentifierError> {
+    let segments = value.split(REST_NAMESPACE_SEPARATOR).map(str::to_string).collect::<Vec<_>>();
+    crate::table_catalog::Namespace::from_segments(segments)
+}
+
+fn namespace_from_path_value(value: &str) -> S3Result<crate::table_catalog::Namespace> {
+    if value.contains('.') && !value.contains(REST_NAMESPACE_SEPARATOR) && !value.contains("%1F") && !value.contains("%1f") {
+        let decoded = percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))?;
+        return crate::table_catalog::Namespace::parse(decoded.as_ref())
+            .map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err));
+    }
+    let normalized = value
+        .replace(REST_NAMESPACE_SEPARATOR_URL_ENCODED, REST_NAMESPACE_SEPARATOR_UTF8)
+        .replace("%1f", REST_NAMESPACE_SEPARATOR_UTF8);
+    let segments = normalized
+        .split(REST_NAMESPACE_SEPARATOR)
+        .map(|segment| {
+            percent_decode_str(segment)
+                .decode_utf8()
+                .map(std::borrow::Cow::into_owned)
+                .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    crate::table_catalog::Namespace::from_segments(segments)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
+}
+
+fn rest_namespace_parent_from_query(uri: &http::Uri) -> S3Result<Option<crate::table_catalog::Namespace>> {
+    let mut parent = None;
+    let mut parent_seen = false;
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key != "parent" {
+                continue;
+            }
+            if parent_seen {
+                return Err(iceberg_rest_error(
+                    ICEBERG_ERROR_BAD_REQUEST,
+                    StatusCode::BAD_REQUEST,
+                    "parent query parameter must not be repeated",
+                ));
+            }
+            parent_seen = true;
+            if !value.is_empty() {
+                parent = Some(namespace_from_rest_value(&value).map_err(|err| {
+                    iceberg_rest_error(
+                        ICEBERG_ERROR_BAD_REQUEST,
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid parent namespace: {err}"),
+                    )
+                })?);
+            }
+        }
+    }
+    Ok(parent)
 }
 
 fn namespace_from_params(params: &Params<'_, '_>) -> S3Result<crate::table_catalog::Namespace> {
@@ -1869,24 +1990,6 @@ fn namespace_response_from_entry(entry: crate::table_catalog::NamespaceEntry) ->
     Ok(RestNamespaceResponse {
         namespace: namespace_segments(&namespace),
         properties: entry.properties,
-    })
-}
-
-fn list_namespaces_response_from_entries(
-    entries: Vec<crate::table_catalog::NamespaceEntry>,
-    next_page_token: Option<String>,
-) -> S3Result<RestListNamespacesResponse> {
-    let namespaces = entries
-        .into_iter()
-        .map(|entry| {
-            let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
-                .map_err(|err| s3_error!(InternalError, "persisted namespace entry is invalid: {}", err))?;
-            Ok(namespace_segments(&namespace))
-        })
-        .collect::<S3Result<Vec<_>>>()?;
-    Ok(RestListNamespacesResponse {
-        namespaces,
-        next_page_token,
     })
 }
 
@@ -2236,11 +2339,17 @@ fn table_commit_request_from_rest_request(
     let new_metadata_location = request
         .new_metadata_location
         .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires new-metadata-location"))?;
+    let commit_id = request.commit_id.unwrap_or_else(|| {
+        request.idempotency_key.as_deref().map_or_else(
+            || Uuid::new_v4().to_string(),
+            |idempotency_key| format!("idempotency-{}", table_catalog_path_hash(idempotency_key)),
+        )
+    });
     Ok(crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
         table: table.to_string(),
-        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        commit_id,
         idempotency_key: request.idempotency_key,
         operation: request.operation.unwrap_or_else(|| "commit".to_string()),
         expected_version_token: request
@@ -2701,7 +2810,9 @@ fn max_partition_field_id(value: &serde_json::Value) -> i64 {
     max_id
 }
 
-fn standard_commit_ids(commit_id: Option<String>) -> (String, String) {
+fn standard_commit_ids(commit_id: Option<String>, idempotency_key: Option<&str>) -> (String, String) {
+    let commit_id = commit_id
+        .or_else(|| idempotency_key.map(|idempotency_key| format!("idempotency-{}", table_catalog_path_hash(idempotency_key))));
     match commit_id {
         Some(commit_id) => match Uuid::parse_str(&commit_id) {
             Ok(uuid) => {
@@ -3647,11 +3758,18 @@ impl SnapshotFileChanges {
 }
 
 struct SnapshotChangeContext<'a> {
-    entry: &'a crate::table_catalog::TableEntry,
     snapshot: &'a serde_json::Value,
     current_live_files: &'a SnapshotLiveFiles,
     snapshot_id: i64,
     sequence_number: i64,
+}
+
+struct SnapshotReadContext<'a, B> {
+    metadata_backend: &'a B,
+    bucket: &'a str,
+    namespace: &'a crate::table_catalog::Namespace,
+    table: &'a crate::table_catalog::IdentifierSegment,
+    entry: &'a crate::table_catalog::TableEntry,
 }
 
 #[derive(PartialEq, Eq)]
@@ -3667,11 +3785,8 @@ struct SnapshotFileIdentity {
 }
 
 async fn validate_table_snapshot_commit_conflicts<B>(
-    metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
-    entry: &crate::table_catalog::TableEntry,
+    mut req: Option<&mut S3Request<Body>>,
+    context: &SnapshotReadContext<'_, B>,
     current_metadata: &serde_json::Value,
     updates: &[serde_json::Value],
 ) -> S3Result<()>
@@ -3697,15 +3812,11 @@ where
 
     let mut read_budget = SnapshotReadBudget::default();
     let current_live_files =
-        load_current_snapshot_live_files(metadata_backend, bucket, namespace, table, entry, current_metadata, &mut read_budget)
-            .await?;
+        load_current_snapshot_live_files(req.as_deref_mut(), context, current_metadata, &mut read_budget).await?;
     let changes = load_snapshot_file_changes(
-        metadata_backend,
-        bucket,
-        namespace,
-        table,
+        req,
+        context,
         SnapshotChangeContext {
-            entry,
             snapshot,
             current_live_files: &current_live_files,
             snapshot_id,
@@ -3779,11 +3890,8 @@ fn added_snapshot_update(updates: &[serde_json::Value]) -> S3Result<Option<&serd
 }
 
 async fn load_current_snapshot_live_files<B>(
-    metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
-    entry: &crate::table_catalog::TableEntry,
+    req: Option<&mut S3Request<Body>>,
+    context: &SnapshotReadContext<'_, B>,
     current_metadata: &serde_json::Value,
     read_budget: &mut SnapshotReadBudget,
 ) -> S3Result<SnapshotLiveFiles>
@@ -3807,9 +3915,7 @@ where
         .ok_or_else(|| s3_error!(InvalidRequest, "current snapshot metadata is missing"))?;
 
     let mut live_files = SnapshotLiveFiles::default();
-    for manifest in
-        read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot, read_budget).await?
-    {
+    for manifest in read_snapshot_manifest_references(req, context, snapshot, read_budget).await? {
         let SnapshotManifestLocation {
             manifest_path,
             sequence_number,
@@ -3851,29 +3957,17 @@ where
 }
 
 async fn load_snapshot_file_changes<B>(
-    metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
-    context: SnapshotChangeContext<'_>,
+    req: Option<&mut S3Request<Body>>,
+    read_context: &SnapshotReadContext<'_, B>,
+    change_context: SnapshotChangeContext<'_>,
     read_budget: &mut SnapshotReadBudget,
 ) -> S3Result<SnapshotFileChanges>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let mut changes = SnapshotFileChanges::default();
-    for manifest in read_snapshot_manifest_references(
-        metadata_backend,
-        bucket,
-        namespace,
-        table,
-        context.entry,
-        context.snapshot,
-        read_budget,
-    )
-    .await?
-    {
-        let inherited_identity = context
+    for manifest in read_snapshot_manifest_references(req, read_context, change_context.snapshot, read_budget).await? {
+        let inherited_identity = change_context
             .current_live_files
             .manifest_files
             .get(&manifest.location.manifest_path);
@@ -3896,14 +3990,14 @@ where
         if manifest
             .location
             .added_snapshot_id
-            .is_some_and(|added_snapshot_id| added_snapshot_id != context.snapshot_id)
+            .is_some_and(|added_snapshot_id| added_snapshot_id != change_context.snapshot_id)
         {
             return Err(s3_error!(InvalidRequest, "new manifest must belong to the committed snapshot"));
         }
         if manifest
             .location
             .sequence_number
-            .is_some_and(|sequence_number| sequence_number != context.sequence_number)
+            .is_some_and(|sequence_number| sequence_number != change_context.sequence_number)
         {
             return Err(s3_error!(InvalidRequest, "new manifest sequence must match the committed snapshot"));
         }
@@ -3912,7 +4006,7 @@ where
             let status = reference
                 .entry_status
                 .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
-            if matches!(status, 1 | 2) && reference.snapshot_id != Some(context.snapshot_id) {
+            if matches!(status, 1 | 2) && reference.snapshot_id != Some(change_context.snapshot_id) {
                 return Err(s3_error!(
                     InvalidRequest,
                     "manifest changed entries must belong to the committed snapshot"
@@ -3926,7 +4020,7 @@ where
                 return Err(s3_error!(InvalidRequest, "added manifest entry sequence must match its manifest"));
             }
             if status == 2
-                && context
+                && change_context
                     .current_live_files
                     .identity(&reference.location, &reference.object_kind)
                     .is_some_and(|current_identity| {
@@ -3970,31 +4064,29 @@ struct SnapshotManifestReferences {
 }
 
 async fn read_snapshot_manifest_references<B>(
-    metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
-    entry: &crate::table_catalog::TableEntry,
+    mut req: Option<&mut S3Request<Body>>,
+    context: &SnapshotReadContext<'_, B>,
     snapshot: &serde_json::Value,
     read_budget: &mut SnapshotReadBudget,
 ) -> S3Result<Vec<SnapshotManifestReferences>>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let manifest_locations =
-        snapshot_manifest_locations(metadata_backend, bucket, namespace, table, entry, snapshot, read_budget).await?;
+    let manifest_locations = snapshot_manifest_locations(req.as_deref_mut(), context, snapshot, read_budget).await?;
     let mut manifests = Vec::new();
     for manifest_location in manifest_locations {
         let manifest_key = table_commit_object_key(
-            bucket,
-            namespace,
-            table,
-            entry,
+            context.bucket,
+            context.namespace,
+            context.table,
+            context.entry,
             &manifest_location.manifest_path,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestFile,
         )?;
-        let manifest_object = metadata_backend
-            .read_object_limited(bucket, &manifest_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
+        authorize_optional_table_catalog_object_read(req.as_deref_mut(), context.bucket, &manifest_key).await?;
+        let manifest_object = context
+            .metadata_backend
+            .read_object_limited(context.bucket, &manifest_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
             .await
             .map_err(catalog_store_error)?
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
@@ -4013,7 +4105,7 @@ where
             if reference.file_sequence_number.is_none() {
                 reference.file_sequence_number = manifest_location.sequence_number;
             }
-            validate_manifest_data_file_reference(metadata_backend, bucket, namespace, table, entry, &reference).await?;
+            validate_manifest_data_file_reference(req.as_deref_mut(), context, &reference).await?;
             references.push(reference);
         }
         manifests.push(SnapshotManifestReferences {
@@ -4032,11 +4124,8 @@ struct SnapshotManifestLocation {
 }
 
 async fn snapshot_manifest_locations<B>(
-    metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
-    entry: &crate::table_catalog::TableEntry,
+    req: Option<&mut S3Request<Body>>,
+    context: &SnapshotReadContext<'_, B>,
     snapshot: &serde_json::Value,
     read_budget: &mut SnapshotReadBudget,
 ) -> S3Result<Vec<SnapshotManifestLocation>>
@@ -4045,15 +4134,17 @@ where
 {
     if let Some(manifest_list_location) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) {
         let manifest_list_key = table_commit_object_key(
-            bucket,
-            namespace,
-            table,
-            entry,
+            context.bucket,
+            context.namespace,
+            context.table,
+            context.entry,
             manifest_list_location,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestList,
         )?;
-        let manifest_list_object = metadata_backend
-            .read_object_limited(bucket, &manifest_list_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
+        authorize_optional_table_catalog_object_read(req, context.bucket, &manifest_list_key).await?;
+        let manifest_list_object = context
+            .metadata_backend
+            .read_object_limited(context.bucket, &manifest_list_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
             .await
             .map_err(catalog_store_error)?
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest-list object is missing"))?;
@@ -4098,20 +4189,25 @@ where
 }
 
 async fn validate_manifest_data_file_reference<B>(
-    metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
-    entry: &crate::table_catalog::TableEntry,
+    req: Option<&mut S3Request<Body>>,
+    context: &SnapshotReadContext<'_, B>,
     reference: &crate::table_catalog::ManifestDataFileReference,
 ) -> S3Result<()>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let object_key =
-        table_commit_object_key(bucket, namespace, table, entry, &reference.location, reference.object_kind.clone())?;
-    if !metadata_backend
-        .object_exists(bucket, &object_key)
+    let object_key = table_commit_object_key(
+        context.bucket,
+        context.namespace,
+        context.table,
+        context.entry,
+        &reference.location,
+        reference.object_kind.clone(),
+    )?;
+    authorize_optional_table_catalog_object_read(req, context.bucket, &object_key).await?;
+    if !context
+        .metadata_backend
+        .object_exists(context.bucket, &object_key)
         .await
         .map_err(catalog_store_error)?
     {
@@ -4144,6 +4240,13 @@ fn apply_set_snapshot_ref_update(metadata: &mut serde_json::Value, update: &serd
         .get("snapshot-id")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| s3_error!(InvalidRequest, "set-snapshot-ref requires snapshot-id"))?;
+    let ref_type = update
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-snapshot-ref requires type"))?;
+    if !matches!(ref_type, "branch" | "tag") {
+        return Err(s3_error!(InvalidRequest, "set-snapshot-ref type must be branch or tag"));
+    }
     let reference = update
         .as_object()
         .ok_or_else(|| s3_error!(InvalidRequest, "set-snapshot-ref must be a JSON object"))?
@@ -4396,28 +4499,84 @@ where
     namespace_response_from_entry(entry)
 }
 
-async fn list_namespaces_response<S>(store: &S, bucket: &str, uri: &http::Uri) -> S3Result<RestListNamespacesResponse>
+async fn list_namespaces_response<S>(
+    store: &S,
+    bucket: &str,
+    parent: Option<&crate::table_catalog::Namespace>,
+    uri: &http::Uri,
+) -> S3Result<RestListNamespacesResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let entries = match parent {
+        Some(parent) => store
+            .list_namespaces_under(bucket, &parent.public_name())
+            .await
+            .map_err(catalog_store_error)?,
+        None => store.list_namespaces(bucket).await.map_err(catalog_store_error)?,
+    };
+    let parent_depth = parent.map_or(0, |parent| parent.segments().len());
+    let mut parent_exists = parent.is_none();
+    let mut direct_children = BTreeMap::new();
+    for entry in entries {
+        if entry.state != crate::table_catalog::TableCatalogEntryState::Active {
+            continue;
+        }
+        let namespace = crate::table_catalog::Namespace::parse(&entry.namespace).map_err(|err| {
+            iceberg_rest_error(
+                ICEBERG_ERROR_REST,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("catalog namespace is invalid: {err}"),
+            )
+        })?;
+        if let Some(parent) = parent {
+            if !namespace.segments().starts_with(parent.segments()) {
+                continue;
+            }
+            parent_exists = true;
+        }
+        if namespace.segments().len() <= parent_depth {
+            continue;
+        }
+        let child_segments = namespace.segments()[..=parent_depth]
+            .iter()
+            .map(|segment| segment.as_str().to_string())
+            .collect::<Vec<_>>();
+        direct_children.entry(child_segments.join(".")).or_insert(child_segments);
+    }
+    if !parent_exists {
+        let parent_name = parent.map(crate::table_catalog::Namespace::public_name).unwrap_or_default();
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_NO_SUCH_NAMESPACE,
+            StatusCode::NOT_FOUND,
+            format!("namespace not found: {bucket}/{parent_name}"),
+        ));
+    }
+
+    let parent_name = parent.map(crate::table_catalog::Namespace::public_name);
     let context = RestPageContext {
         resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
         warehouse: bucket,
-        namespace: None,
+        namespace: parent_name.as_deref(),
     };
     let pagination = rest_pagination_from_query(uri, context)?;
     let page = match pagination.page_request() {
-        Some((cursor, limit)) => store
-            .list_namespaces_page(bucket, cursor, limit)
-            .await
-            .map_err(catalog_store_error)?,
+        Some((cursor, limit)) => crate::table_catalog::catalog_list_page_from_entries(
+            direct_children.into_iter().collect(),
+            cursor,
+            limit,
+            |entry: &(String, Vec<String>)| entry.0.as_str(),
+        ),
         None => crate::table_catalog::TableCatalogListPage {
-            entries: store.list_namespaces(bucket).await.map_err(catalog_store_error)?,
+            entries: direct_children.into_iter().collect(),
             next_cursor: None,
         },
     };
     let next_page_token = pagination.next_page_token(page.next_cursor)?;
-    list_namespaces_response_from_entries(page.entries, next_page_token)
+    Ok(RestListNamespacesResponse {
+        namespaces: page.entries.into_iter().map(|(_, segments)| segments).collect(),
+        next_page_token,
+    })
 }
 
 async fn get_namespace_response<S>(
@@ -4657,6 +4816,18 @@ where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
     let namespace = namespace.public_name();
+    let namespace_is_active = store
+        .get_namespace(bucket, &namespace)
+        .await
+        .map_err(catalog_store_error)?
+        .is_some_and(|entry| entry.state == crate::table_catalog::TableCatalogEntryState::Active);
+    if !namespace_is_active {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_NO_SUCH_NAMESPACE,
+            StatusCode::NOT_FOUND,
+            format!("namespace not found: {bucket}/{namespace}"),
+        ));
+    }
     let context = RestPageContext {
         resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
         warehouse: bucket,
@@ -4668,10 +4839,14 @@ where
             .list_tables_page(bucket, &namespace, cursor, limit)
             .await
             .map_err(catalog_store_error)?,
-        None => crate::table_catalog::TableCatalogListPage {
-            entries: store.list_tables(bucket, &namespace).await.map_err(catalog_store_error)?,
-            next_cursor: None,
-        },
+        None => {
+            let mut entries = store.list_tables(bucket, &namespace).await.map_err(catalog_store_error)?;
+            entries.retain(|entry| entry.state == crate::table_catalog::TableCatalogEntryState::Active);
+            crate::table_catalog::TableCatalogListPage {
+                entries,
+                next_cursor: None,
+            }
+        }
     };
     let next_page_token = pagination.next_page_token(page.next_cursor)?;
     list_tables_response_from_entries(page.entries, next_page_token)
@@ -4715,6 +4890,18 @@ where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
     let namespace = namespace.public_name();
+    let namespace_is_active = store
+        .get_namespace(bucket, &namespace)
+        .await
+        .map_err(catalog_store_error)?
+        .is_some_and(|entry| entry.state == crate::table_catalog::TableCatalogEntryState::Active);
+    if !namespace_is_active {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_NO_SUCH_NAMESPACE,
+            StatusCode::NOT_FOUND,
+            format!("namespace not found: {bucket}/{namespace}"),
+        ));
+    }
     let context = RestPageContext {
         resource: TABLE_CATALOG_VIEW_RESOURCE_ROOT,
         warehouse: bucket,
@@ -4726,10 +4913,14 @@ where
             .list_views_page(bucket, &namespace, cursor, limit)
             .await
             .map_err(catalog_store_error)?,
-        None => crate::table_catalog::TableCatalogListPage {
-            entries: store.list_views(bucket, &namespace).await.map_err(catalog_store_error)?,
-            next_cursor: None,
-        },
+        None => {
+            let mut entries = store.list_views(bucket, &namespace).await.map_err(catalog_store_error)?;
+            entries.retain(|entry| entry.state == crate::table_catalog::TableCatalogEntryState::Active);
+            crate::table_catalog::TableCatalogListPage {
+                entries,
+                next_cursor: None,
+            }
+        }
     };
     let next_page_token = pagination.next_page_token(page.next_cursor)?;
     list_views_response_from_entries(page.entries, next_page_token)
@@ -4829,7 +5020,7 @@ where
         )?;
         validate_metadata_view_location_in_bucket(bucket, &next_metadata)?;
         validate_metadata_matches_current_view_metadata(&current_metadata, &next_metadata)?;
-        let metadata_file_token = Uuid::new_v4().to_string();
+        let (_, metadata_file_token) = standard_commit_ids(request.commit_id.clone(), None);
         let next_generation = current.generation.saturating_add(1);
         let next_metadata_location = crate::table_catalog::default_view_metadata_file_path(
             namespace,
@@ -4999,6 +5190,13 @@ where
     Ok(table_metadata_location_response_from_entry(result.table))
 }
 
+#[derive(Clone, Copy)]
+struct RestTableRoute<'a> {
+    bucket: &'a str,
+    namespace: &'a crate::table_catalog::Namespace,
+    table: &'a str,
+}
+
 #[cfg(test)]
 async fn commit_table_response<S>(
     store: &S,
@@ -5020,7 +5218,19 @@ where
     } else {
         None
     };
-    commit_table_response_with_target_metadata(store, metadata_backend, bucket, namespace, table, request, target_metadata).await
+    commit_table_response_with_target_metadata(
+        None,
+        store,
+        metadata_backend,
+        RestTableRoute {
+            bucket,
+            namespace,
+            table,
+        },
+        request,
+        target_metadata,
+    )
+    .await
 }
 
 async fn table_commit_for_retry<S>(
@@ -5032,7 +5242,13 @@ async fn table_commit_for_retry<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let by_commit_id = match request.commit_id.as_deref() {
+    let derived_commit_id = request.commit_id.clone().or_else(|| {
+        request
+            .idempotency_key
+            .as_deref()
+            .map(|idempotency_key| format!("idempotency-{}", table_catalog_path_hash(idempotency_key)))
+    });
+    let by_commit_id = match derived_commit_id.as_deref() {
         Some(commit_id) => store
             .get_commit_by_id(bucket, table_id, commit_id)
             .await
@@ -5059,6 +5275,7 @@ where
 }
 
 async fn table_commit_warehouse_read_location<S>(
+    req: Option<&mut S3Request<Body>>,
     store: &S,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
@@ -5071,12 +5288,14 @@ where
     let Some(commit) = table_commit_for_retry(store, bucket, &current.table_id, request).await? else {
         return Ok(current.warehouse_location.clone());
     };
+    authorize_optional_table_catalog_object_read(req, bucket, &commit.previous_metadata_location).await?;
     let previous_metadata = read_table_metadata_json(metadata_backend, bucket, &commit.previous_metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &previous_metadata)?;
     Ok(metadata_table_location(&previous_metadata)?.to_string())
 }
 
 async fn commit_table_replay_response(
+    req: Option<&mut S3Request<Body>>,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
     result: crate::table_catalog::TableCommitResult,
@@ -5092,26 +5311,31 @@ async fn commit_table_replay_response(
             "persisted table metadata location is outside the protected table metadata directory",
         ));
     } else {
+        authorize_optional_table_catalog_object_read(req, bucket, &result.table.metadata_location).await?;
         read_table_metadata_json(metadata_backend, bucket, &result.table.metadata_location).await?
     };
     Ok(commit_table_response_from_result(result, metadata))
 }
 
 async fn commit_table_response_with_target_metadata<S>(
+    mut req: Option<&mut S3Request<Body>>,
     store: &S,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &str,
+    route: RestTableRoute<'_>,
     request: RestCommitTableRequest,
     target_metadata: Option<serde_json::Value>,
 ) -> S3Result<RestCommitTableResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let RestTableRoute {
+        bucket,
+        namespace,
+        table,
+    } = route;
     validate_rest_commit_identifier(request.identifier.as_ref(), namespace, table)?;
     if request.new_metadata_location.is_none() {
-        return standard_commit_table_response(store, metadata_backend, bucket, namespace, table, request).await;
+        return standard_commit_table_response_inner(req, store, metadata_backend, route, request).await;
     }
 
     let Some(current) = store
@@ -5145,6 +5369,8 @@ where
                 "commit retry does not match the original request",
             ));
         }
+        authorize_optional_table_catalog_object_read(req.as_deref_mut(), bucket, &existing_commit.previous_metadata_location)
+            .await?;
         let previous_metadata =
             read_table_metadata_json(metadata_backend, bucket, &existing_commit.previous_metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &previous_metadata)?;
@@ -5152,10 +5378,18 @@ where
         validate_metadata_matches_current_metadata(&previous_metadata, &target_metadata)?;
         let committed_metadata_location = request.new_metadata_location.clone();
         let result = store.commit_table(request).await.map_err(catalog_store_error)?;
-        return commit_table_replay_response(metadata_backend, bucket, result, &committed_metadata_location, target_metadata)
-            .await;
+        return commit_table_replay_response(
+            req,
+            metadata_backend,
+            bucket,
+            result,
+            &committed_metadata_location,
+            target_metadata,
+        )
+        .await;
     }
 
+    authorize_optional_table_catalog_object_read(req, bucket, &current.metadata_location).await?;
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
     validate_table_commit_requirements(&current_metadata, &client_requirements)?;
@@ -5175,6 +5409,35 @@ async fn standard_commit_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    standard_commit_table_response_inner(
+        None,
+        store,
+        metadata_backend,
+        RestTableRoute {
+            bucket,
+            namespace,
+            table,
+        },
+        request,
+    )
+    .await
+}
+
+async fn standard_commit_table_response_inner<S>(
+    mut req: Option<&mut S3Request<Body>>,
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    route: RestTableRoute<'_>,
+    request: RestCommitTableRequest,
+) -> S3Result<RestCommitTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let RestTableRoute {
+        bucket,
+        namespace,
+        table,
+    } = route;
     let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -5183,12 +5446,13 @@ where
         return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     if let Some(response) =
-        replay_standard_table_commit(store, metadata_backend, bucket, namespace, table, &current, &request).await?
+        replay_standard_table_commit(req.as_deref_mut(), store, metadata_backend, route, &current, &request).await?
     {
         return Ok(response);
     }
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    authorize_optional_table_catalog_object_read(req.as_deref_mut(), bucket, &current.metadata_location).await?;
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_table_commit_requirements(&current_metadata, &request.requirements)?;
     let expected_metadata = current_metadata.clone();
@@ -5200,17 +5464,15 @@ where
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     crate::table_catalog::validate_table_warehouse_relocation(&current, metadata_table_location(&next_metadata)?)
         .map_err(catalog_store_error)?;
-    validate_table_snapshot_commit_conflicts(
+    let snapshot_context = SnapshotReadContext {
         metadata_backend,
         bucket,
         namespace,
-        &table_name,
-        &current,
-        &expected_metadata,
-        &request.updates,
-    )
-    .await?;
-    let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id);
+        table: &table_name,
+        entry: &current,
+    };
+    validate_table_snapshot_commit_conflicts(req.as_deref_mut(), &snapshot_context, &expected_metadata, &request.updates).await?;
+    let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id, request.idempotency_key.as_deref());
     let next_generation = current.generation.saturating_add(1);
     let next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
         &current,
@@ -5230,6 +5492,7 @@ where
     match put_result {
         Ok(()) => {}
         Err(crate::table_catalog::TableCatalogStoreError::Conflict(_)) => {
+            authorize_optional_table_catalog_object_read(req, bucket, &next_metadata_location).await?;
             let existing_metadata = read_table_metadata_json(metadata_backend, bucket, &next_metadata_location).await?;
             let persisted_timestamp = existing_metadata
                 .get("last-updated-ms")
@@ -5273,17 +5536,21 @@ where
 }
 
 async fn replay_standard_table_commit<S>(
+    mut req: Option<&mut S3Request<Body>>,
     store: &S,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &str,
+    route: RestTableRoute<'_>,
     current: &crate::table_catalog::TableEntry,
     request: &RestCommitTableRequest,
 ) -> S3Result<Option<RestCommitTableResponse>>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let RestTableRoute {
+        bucket,
+        namespace,
+        table,
+    } = route;
     let Some(commit) = table_commit_for_retry(store, bucket, &current.table_id, request).await? else {
         return Ok(None);
     };
@@ -5300,8 +5567,10 @@ where
             "commit retry does not match the original request",
         ));
     }
+    authorize_optional_table_catalog_object_read(req.as_deref_mut(), bucket, &commit.previous_metadata_location).await?;
     let previous_metadata = read_table_metadata_json(metadata_backend, bucket, &commit.previous_metadata_location).await?;
     validate_table_commit_requirements(&previous_metadata, &request.requirements)?;
+    authorize_optional_table_catalog_object_read(req.as_deref_mut(), bucket, &commit.new_metadata_location).await?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &commit.new_metadata_location).await?;
     let commit_timestamp_ms = target_metadata
         .get("last-updated-ms")
@@ -5348,7 +5617,8 @@ where
         .await
         .map_err(catalog_store_error)?;
     Ok(Some(
-        commit_table_replay_response(metadata_backend, bucket, result, &committed_metadata_location, target_metadata).await?,
+        commit_table_replay_response(req, metadata_backend, bucket, result, &committed_metadata_location, target_metadata)
+            .await?,
     ))
 }
 
@@ -5521,7 +5791,7 @@ where
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    let (commit_id, metadata_file_token) = standard_commit_ids(None);
+    let (commit_id, metadata_file_token) = standard_commit_ids(None, None);
     let next_generation = current.generation.saturating_add(1);
     let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
         namespace,
@@ -6352,17 +6622,8 @@ impl Operation for RestListNamespacesHandler {
         };
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
-        let parent_name = parent.as_ref().map(crate::table_catalog::Namespace::public_name);
-        let pagination = rest_pagination_from_query(
-            &req.uri,
-            RestPageContext {
-                resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
-                warehouse: &warehouse,
-                namespace: parent_name.as_deref(),
-            },
-        )?;
         let store = table_catalog_store()?;
-        let response = list_namespaces_response(&store, &warehouse, &req.uri).await?;
+        let response = list_namespaces_response(&store, &warehouse, parent.as_ref(), &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -6464,15 +6725,6 @@ impl Operation for RestListTablesHandler {
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
-        let namespace_name = namespace.public_name();
-        let pagination = rest_pagination_from_query(
-            &req.uri,
-            RestPageContext {
-                resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
-                warehouse: &warehouse,
-                namespace: Some(&namespace_name),
-            },
-        )?;
         let store = table_catalog_store()?;
         let response = list_tables_response(&store, &warehouse, &namespace, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
@@ -6575,15 +6827,6 @@ impl Operation for RestListViewsHandler {
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
-        let namespace_name = namespace.public_name();
-        let pagination = rest_pagination_from_query(
-            &req.uri,
-            RestPageContext {
-                resource: TABLE_CATALOG_VIEW_RESOURCE_ROOT,
-                warehouse: &warehouse,
-                namespace: Some(&namespace_name),
-            },
-        )?;
         let store = table_catalog_store()?;
         let response = list_views_response(&store, &warehouse, &namespace, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
@@ -6683,7 +6926,8 @@ impl Operation for RestCommitTableHandler {
             .map_err(catalog_store_error)?
             .ok_or_else(|| iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"))?;
         let warehouse_read_location =
-            table_commit_warehouse_read_location(&store, &metadata_backend, &warehouse, &current, &request).await?;
+            table_commit_warehouse_read_location(Some(&mut req), &store, &metadata_backend, &warehouse, &current, &request)
+                .await?;
         authorize_table_warehouse_s3_actions(&mut req, &warehouse, &warehouse_read_location, TABLE_WAREHOUSE_READ_ACTIONS)
             .await?;
         let target_metadata = if let Some(metadata_location) = request.new_metadata_location.as_deref() {
@@ -6723,11 +6967,14 @@ impl Operation for RestCommitTableHandler {
             None
         };
         let response = commit_table_response_with_target_metadata(
+            Some(&mut req),
             &store,
             &metadata_backend,
-            &warehouse,
-            &namespace,
-            &table,
+            RestTableRoute {
+                bucket: &warehouse,
+                namespace: &namespace,
+                table: &table,
+            },
             request,
             target_metadata,
         )
@@ -6746,8 +6993,8 @@ impl Operation for RestDropTableHandler {
         let table = table_name_from_params(&params)?;
         if rest_purge_requested_from_query(&req.uri)? {
             return Err(iceberg_rest_error(
-                ICEBERG_ERROR_BAD_REQUEST,
-                StatusCode::BAD_REQUEST,
+                ICEBERG_ERROR_UNSUPPORTED_OPERATION,
+                StatusCode::NOT_ACCEPTABLE,
                 "purgeRequested=true is not supported",
             ));
         }
@@ -7264,6 +7511,7 @@ impl Operation for SyncExternalCatalogBridgeHandler {
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal =
             authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
+        authorize_table_catalog_resource_for_principal(&req, &principal, &resource, AdminAction::RegisterTableAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_object_store()?;
@@ -7283,9 +7531,6 @@ impl Operation for SyncExternalCatalogBridgeHandler {
             .map_err(catalog_store_error)?;
         let target_metadata =
             read_authorized_table_metadata_json(&mut req, &metadata_backend, &warehouse, &request.metadata_location).await?;
-        if current.is_none() {
-            authorize_table_catalog_resource_for_principal(&req, &principal, &resource, AdminAction::RegisterTableAction).await?;
-        }
         let response = sync_external_catalog_bridge_response_with_snapshot(
             &store,
             &metadata_backend,
@@ -7548,25 +7793,37 @@ mod tests {
         };
         let first_uri = "/iceberg/v1/analytics/namespaces?pageToken=&pageSize=2".parse().expect("URI");
         let first_pagination = rest_pagination_from_query(&first_uri, context).expect("first page query should parse");
-        let (first, next_page_token) = paginate_rest_entries(
+        let (cursor, limit) = first_pagination.page_request().expect("first page should be paginated");
+        let first = crate::table_catalog::catalog_list_page_from_entries(
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            first_pagination,
-            context,
+            cursor,
+            limit,
             String::as_str,
-        )
-        .expect("first page should paginate");
-        assert_eq!(first, vec!["a".to_string(), "b".to_string()]);
-        let next_page_token = next_page_token.expect("first page should return a token");
+        );
+        assert_eq!(first.entries, vec!["a".to_string(), "b".to_string()]);
+        let next_page_token = first_pagination
+            .next_page_token(first.next_cursor)
+            .expect("first page token should encode")
+            .expect("first page should return a token");
 
         let exact_page_uri = "/iceberg/v1/analytics/namespaces?pageToken=&pageSize=2"
             .parse()
             .expect("exact page URI");
         let exact_page_pagination = rest_pagination_from_query(&exact_page_uri, context).expect("exact page query should parse");
-        let (exact_page, exact_page_token) =
-            paginate_rest_entries(vec!["a".to_string(), "b".to_string()], exact_page_pagination, context, String::as_str)
-                .expect("exact page should paginate");
-        assert_eq!(exact_page, vec!["a".to_string(), "b".to_string()]);
-        assert!(exact_page_token.is_none());
+        let (cursor, limit) = exact_page_pagination.page_request().expect("exact page should be paginated");
+        let exact_page = crate::table_catalog::catalog_list_page_from_entries(
+            vec!["a".to_string(), "b".to_string()],
+            cursor,
+            limit,
+            String::as_str,
+        );
+        assert_eq!(exact_page.entries, vec!["a".to_string(), "b".to_string()]);
+        assert!(
+            exact_page_pagination
+                .next_page_token(exact_page.next_cursor)
+                .expect("terminal token should encode")
+                .is_none()
+        );
 
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("pageToken", &next_page_token)
@@ -7576,15 +7833,20 @@ mod tests {
             .parse()
             .expect("second page URI");
         let second_pagination = rest_pagination_from_query(&second_uri, context).expect("second page query should parse");
-        let (second, final_token) = paginate_rest_entries(
+        let (cursor, limit) = second_pagination.page_request().expect("second page should be paginated");
+        let second = crate::table_catalog::catalog_list_page_from_entries(
             vec!["aa".to_string(), "c".to_string(), "d".to_string()],
-            second_pagination,
-            context,
+            cursor,
+            limit,
             String::as_str,
-        )
-        .expect("second page should paginate after a deleted cursor");
-        assert_eq!(second, vec!["c".to_string(), "d".to_string()]);
-        assert!(final_token.is_none());
+        );
+        assert_eq!(second.entries, vec!["c".to_string(), "d".to_string()]);
+        assert!(
+            second_pagination
+                .next_page_token(second.next_cursor)
+                .expect("terminal token should encode")
+                .is_none()
+        );
     }
 
     #[test]
@@ -7612,7 +7874,8 @@ mod tests {
             warehouse: "analytics",
             namespace: Some("sales"),
         };
-        let table_token = encode_rest_page_token("orders", table_context).expect("table token should encode");
+        let table_token =
+            encode_rest_page_token("orders", &rest_page_context_fingerprint(table_context)).expect("table token should encode");
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("pageToken", &table_token)
             .finish();
@@ -7628,9 +7891,10 @@ mod tests {
             warehouse: "archive",
             namespace: None,
         };
-        let warehouse_token = encode_rest_page_token("sales", namespace_context).expect("namespace page token should encode");
+        let warehouse_token = encode_rest_page_token("sales", &rest_page_context_fingerprint(namespace_context))
+            .expect("namespace page token should encode");
         assert!(
-            decode_rest_page_token(&warehouse_token, other_warehouse_context).is_err(),
+            decode_rest_page_token(&warehouse_token, &rest_page_context_fingerprint(other_warehouse_context)).is_err(),
             "namespace page tokens must remain warehouse-scoped"
         );
 
@@ -7640,75 +7904,44 @@ mod tests {
             namespace: Some("sales"),
         };
         assert!(
-            decode_rest_page_token(&table_token, namespace_resource_context).is_err(),
+            decode_rest_page_token(&table_token, &rest_page_context_fingerprint(namespace_resource_context)).is_err(),
             "page tokens must remain resource-scoped even when warehouse and namespace match"
         );
 
         let oversized = "a".repeat(REST_PAGE_TOKEN_MAX_LENGTH + 1);
-        assert!(decode_rest_page_token(&oversized, namespace_context).is_err());
+        let namespace_context_fingerprint = rest_page_context_fingerprint(namespace_context);
+        assert!(decode_rest_page_token(&oversized, &namespace_context_fingerprint).is_err());
 
         for token in [
             RestPageToken {
                 version: REST_PAGE_TOKEN_VERSION + 1,
-                context: rest_page_context_fingerprint(namespace_context),
-                after: "sales".to_string(),
+                context: namespace_context_fingerprint.clone(),
+                cursor: "sales".to_string(),
             },
             RestPageToken {
                 version: REST_PAGE_TOKEN_VERSION,
-                context: rest_page_context_fingerprint(namespace_context),
-                after: String::new(),
+                context: namespace_context_fingerprint.clone(),
+                cursor: String::new(),
             },
         ] {
             let encoded =
                 base64_encode_url_safe_no_pad(&serde_json::to_vec(&token).expect("invalid test token should serialize"));
-            assert!(decode_rest_page_token(&encoded, namespace_context).is_err());
+            assert!(decode_rest_page_token(&encoded, &namespace_context_fingerprint).is_err());
         }
 
         let invalid_json = base64_encode_url_safe_no_pad(b"not-json");
-        assert!(decode_rest_page_token(&invalid_json, namespace_context).is_err());
+        assert!(decode_rest_page_token(&invalid_json, &namespace_context_fingerprint).is_err());
 
         let unknown_field = base64_encode_url_safe_no_pad(
             &serde_json::to_vec(&serde_json::json!({
                 "version": REST_PAGE_TOKEN_VERSION,
-                "context": rest_page_context_fingerprint(namespace_context),
-                "after": "sales",
+                "context": namespace_context_fingerprint,
+                "cursor": "sales",
                 "unexpected": true
             }))
             .expect("unknown-field token should serialize"),
         );
-        assert!(decode_rest_page_token(&unknown_field, namespace_context).is_err());
-    }
-
-    #[test]
-    fn rest_pagination_requires_page_token_to_start_pagination() {
-        let context = RestPageContext {
-            resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
-            warehouse: "analytics",
-            namespace: Some("sales"),
-        };
-        let uri = "/iceberg/v1/analytics/namespaces/sales/tables?pageToken=&pageSize=999999"
-            .parse()
-            .expect("URI");
-        let pagination = rest_pagination_from_query(&uri, context).expect("empty token should start pagination");
-        assert_eq!(pagination.after, None);
-        assert_eq!(pagination.limit, Some(REST_MAX_PAGE_SIZE));
-
-        let uri = "/iceberg/v1/analytics/namespaces/sales/tables?pageSize=2"
-            .parse()
-            .expect("URI");
-        let pagination = rest_pagination_from_query(&uri, context).expect("page size without a token should parse");
-        assert_eq!(pagination.after, None);
-        assert_eq!(pagination.limit, None);
-
-        let uri = "/iceberg/v1/analytics/namespaces/sales/tables".parse().expect("URI");
-        let pagination = rest_pagination_from_query(&uri, context).expect("request without pagination should parse");
-        let entries = (0..=REST_DEFAULT_PAGE_SIZE)
-            .map(|index| format!("table-{index:04}"))
-            .collect::<Vec<_>>();
-        let (page, next_page_token) = paginate_rest_entries(entries.clone(), pagination, context, String::as_str)
-            .expect("unpaginated request should preserve legacy behavior");
-        assert_eq!(page, entries);
-        assert!(next_page_token.is_none());
+        assert!(decode_rest_page_token(&unknown_field, &rest_page_context_fingerprint(namespace_context)).is_err());
     }
 
     #[test]
@@ -7744,16 +7977,6 @@ mod tests {
         let error = rest_namespace_parent_from_query(&uri).expect_err("repeated parent should fail");
         assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
         assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
-    }
-
-    #[test]
-    fn list_responses_expose_null_next_page_token_at_end() {
-        let response = RestListNamespacesResponse {
-            namespaces: vec![vec!["sales".to_string()]],
-            next_page_token: None,
-        };
-        let value = serde_json::to_value(response).expect("list response should serialize");
-        assert_eq!(value["next-page-token"], serde_json::Value::Null);
     }
 
     #[test]
@@ -7940,6 +8163,9 @@ mod tests {
         let warehouse_auth_block = function_block(src, "async fn authorize_table_warehouse_s3_actions");
         assert!(warehouse_auth_block.contains("table_catalog_prefix_authorization_probe"));
         assert!(warehouse_auth_block.contains("actions"));
+        let s3_auth_block = function_block(src, "async fn authorize_table_catalog_s3_actions");
+        assert!(s3_auth_block.contains("table_catalog_request_principal(req).await?"));
+        assert!(s3_auth_block.contains("ReqInfo"));
         assert_eq!(TABLE_WAREHOUSE_READ_ACTIONS, &[S3Action::GetObjectAction]);
         assert_eq!(TABLE_WAREHOUSE_WRITE_ACTIONS, &[S3Action::PutObjectAction, S3Action::DeleteObjectAction]);
         let metadata_auth_block = function_block(src, "async fn read_authorized_table_metadata_json");
@@ -7954,7 +8180,17 @@ mod tests {
         assert!(sync_bridge_block.contains("read_authorized_table_metadata_json"));
         assert!(
             sync_bridge_block.contains(".load_table(&warehouse, &namespace.public_name(), &table)"),
-            "external catalog sync should branch authorization on current table existence"
+            "external catalog sync should load the current table snapshot after authorization"
+        );
+        let register_auth_position = sync_bridge_block
+            .find("AdminAction::RegisterTableAction")
+            .expect("external catalog sync should authorize registration");
+        let bucket_write_position = sync_bridge_block
+            .find("ensure_table_bucket_entry")
+            .expect("external catalog sync should materialize the table bucket entry");
+        assert!(
+            register_auth_position < bucket_write_position,
+            "external catalog sync must authorize registration before it can materialize catalog state"
         );
         assert!(
             sync_bridge_block.contains("sync_external_catalog_bridge_response_with_snapshot")
@@ -7981,6 +8217,17 @@ mod tests {
             operation_block(src, "RestCommitTableHandler").contains("TABLE_WAREHOUSE_READ_ACTIONS"),
             "table commits should require read access to manifest and data objects under the warehouse prefix"
         );
+        for helper in [
+            "async fn table_commit_warehouse_read_location",
+            "async fn read_snapshot_manifest_references",
+            "async fn snapshot_manifest_locations",
+            "async fn validate_manifest_data_file_reference",
+        ] {
+            assert!(
+                function_block(src, helper).contains("authorize_optional_table_catalog_object_read"),
+                "{helper} should authorize every concrete object before reading it"
+            );
+        }
 
         let migration_block = operation_block(src, "GetTableCatalogMigrationHandler");
         assert!(
@@ -8073,7 +8320,7 @@ mod tests {
         for (handler, helper_call) in [
             (
                 "RestListNamespacesHandler",
-                "list_namespaces_response(&store, &warehouse, &req.uri).await?",
+                "list_namespaces_response(&store, &warehouse, parent.as_ref(), &req.uri).await?",
             ),
             (
                 "RestListTablesHandler",
@@ -9044,7 +9291,7 @@ mod tests {
         }
 
         let first_uri = "/?pageSize=1".parse::<http::Uri>().expect("first page URI should parse");
-        let namespaces = list_namespaces_response(&store, "warehouse", &first_uri)
+        let namespaces = list_namespaces_response(&store, "warehouse", None, &first_uri)
             .await
             .expect("namespace first page should load");
         assert_eq!(namespaces.namespaces, vec![vec!["alpha".to_string()]]);
@@ -9052,11 +9299,22 @@ mod tests {
         let namespace_uri = format!("/?pageSize=1&pageToken={namespace_token}")
             .parse::<http::Uri>()
             .expect("namespace continuation URI should parse");
-        let namespaces = list_namespaces_response(&store, "warehouse", &namespace_uri)
+        let namespaces = list_namespaces_response(&store, "warehouse", None, &namespace_uri)
             .await
             .expect("namespace second page should load");
         assert_eq!(namespaces.namespaces, vec![vec!["beta".to_string()]]);
         assert!(namespaces.next_page_token.is_none());
+
+        store.namespaces.lock().await.push(crate::table_catalog::NamespaceEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: namespace.public_name(),
+            namespace_id: "analytics".to_string(),
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        });
 
         let tables = list_tables_response(&store, "warehouse", &namespace, &first_uri)
             .await
@@ -9092,17 +9350,12 @@ mod tests {
 
         for uri in ["/", "/?pageSize=2"] {
             let uri = uri.parse::<http::Uri>().expect("list URI should parse");
-            let namespaces = list_namespaces_response(&store, "warehouse", &uri)
-                .await
-                .expect("namespace exact page should load");
             let tables = list_tables_response(&store, "warehouse", &namespace, &uri)
                 .await
                 .expect("table exact page should load");
             let views = list_views_response(&store, "warehouse", &namespace, &uri)
                 .await
                 .expect("view exact page should load");
-            assert_eq!(namespaces.namespaces.len(), 2);
-            assert!(namespaces.next_page_token.is_none());
             assert_eq!(tables.identifiers.len(), 2);
             assert!(tables.next_page_token.is_none());
             assert_eq!(views.identifiers.len(), 2);
@@ -9364,7 +9617,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_requests_accept_legacy_empty_defaults_and_reject_unsupported_view_commit_ids() {
+    fn commit_requests_accept_legacy_empty_defaults_and_view_commit_ids() {
         let table = serde_json::from_value::<RestCommitTableRequest>(serde_json::json!({}))
             .expect("legacy table commit should default omitted requirements and updates");
         assert!(table.requirements.is_empty());
@@ -9373,14 +9626,13 @@ mod tests {
             .expect("legacy view commit should default omitted requirements and updates");
         assert!(view.requirements.is_empty());
         assert!(view.updates.is_empty());
-        assert!(
-            serde_json::from_value::<RestCommitViewRequest>(serde_json::json!({
-                "commit-id": "non-standard-extension",
-                "requirements": [],
-                "updates": []
-            }))
-            .is_err()
-        );
+        let view = serde_json::from_value::<RestCommitViewRequest>(serde_json::json!({
+            "commit-id": "non-standard-extension",
+            "requirements": [],
+            "updates": []
+        }))
+        .expect("legacy view commit id should remain accepted");
+        assert_eq!(view.commit_id.as_deref(), Some("non-standard-extension"));
     }
 
     #[test]
@@ -9419,18 +9671,28 @@ mod tests {
     fn standard_commit_ids_use_uuid_for_metadata_file_when_provided() {
         let commit_id = "11111111-1111-4111-8111-111111111111";
         assert_eq!(
-            standard_commit_ids(Some(commit_id.to_string())),
+            standard_commit_ids(Some(commit_id.to_string()), None),
             (commit_id.to_string(), commit_id.to_string())
         );
     }
 
     #[test]
     fn standard_commit_ids_generate_metadata_hash_for_non_uuid_client_id() {
-        let (commit_id, metadata_file_token) = standard_commit_ids(Some("commit-1".to_string()));
+        let (commit_id, metadata_file_token) = standard_commit_ids(Some("commit-1".to_string()), None);
 
         assert_eq!(commit_id, "commit-1");
         assert_ne!(metadata_file_token, commit_id);
         assert_eq!(metadata_file_token, table_catalog_path_hash("commit-1"));
+    }
+
+    #[test]
+    fn standard_commit_ids_are_stable_for_idempotency_only_retries() {
+        let first = standard_commit_ids(None, Some("client-request"));
+        let second = standard_commit_ids(None, Some("client-request"));
+
+        assert_eq!(first, second);
+        assert!(first.0.starts_with("idempotency-"));
+        assert_eq!(first.1, table_catalog_path_hash(&first.0));
     }
 
     #[tokio::test]
@@ -10072,9 +10334,10 @@ mod tests {
                 .expect("current table should exist");
             let retry: RestCommitTableRequest = serde_json::from_value(first_request).expect("first commit retry should parse");
 
-            let read_location = table_commit_warehouse_read_location(&store, &metadata_backend, "warehouse", &current, &retry)
-                .await
-                .expect("retry read scope should resolve");
+            let read_location =
+                table_commit_warehouse_read_location(None, &store, &metadata_backend, "warehouse", &current, &retry)
+                    .await
+                    .expect("retry read scope should resolve");
             assert_eq!(read_location, original_warehouse_location, "{mode:?}");
 
             let replay = standard_commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", retry)
@@ -14393,7 +14656,7 @@ mod tests {
             &self,
             bucket: &str,
             object: &str,
-        ) -> crate::table_catalog::TableCatalogStoreResult<Box<dyn Send>> {
+        ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogObjectLock> {
             let lock = {
                 let mut locks = self.locks.lock().await;
                 locks
@@ -14833,7 +15096,7 @@ mod tests {
         assert_eq!(create.properties.get("owner").map(String::as_str), Some("lakehouse"));
 
         let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
-        let list = list_namespaces_response(&store, "warehouse", &unpaginated_uri)
+        let list = list_namespaces_response(&store, "warehouse", None, &unpaginated_uri)
             .await
             .expect("namespace list should load");
         assert_eq!(list.namespaces, vec![vec!["analytics".to_string()]]);
@@ -14862,7 +15125,7 @@ mod tests {
         drop_namespace_in_store(&store, "warehouse", "analytics")
             .await
             .expect("namespace should drop");
-        let list = list_namespaces_response(&store, "warehouse", &unpaginated_uri)
+        let list = list_namespaces_response(&store, "warehouse", None, &unpaginated_uri)
             .await
             .expect("namespace list should load after drop");
         assert!(list.namespaces.is_empty());
@@ -14894,46 +15157,30 @@ mod tests {
             .expect("namespace should be created");
         }
 
-        let top_level = list_namespaces_response(&store, "warehouse", None, RestPagination::default())
+        let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let top_level = list_namespaces_response(&store, "warehouse", None, &unpaginated_uri)
             .await
             .expect("top-level namespaces should list");
         assert_eq!(top_level.namespaces, vec![vec!["analytics".to_string()], vec!["sales".to_string()]]);
 
         let analytics = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        let children = list_namespaces_response(
-            &store,
-            "warehouse",
-            Some(&analytics),
-            RestPagination {
-                after: None,
-                limit: Some(1),
-            },
-        )
-        .await
-        .expect("direct children should list");
+        let first_page_uri = "/?pageSize=1".parse::<http::Uri>().expect("first page URI should parse");
+        let children = list_namespaces_response(&store, "warehouse", Some(&analytics), &first_page_uri)
+            .await
+            .expect("direct children should list");
         assert_eq!(children.namespaces, vec![vec!["analytics".to_string(), "curated".to_string()]]);
         let next_page_token = children.next_page_token.expect("first child page should return a token");
-        let parent_context = RestPageContext {
-            resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
-            warehouse: "warehouse",
-            namespace: Some("analytics"),
-        };
-        let second_page = list_namespaces_response(
-            &store,
-            "warehouse",
-            Some(&analytics),
-            RestPagination {
-                after: Some(decode_rest_page_token(&next_page_token, parent_context).expect("parent token should decode")),
-                limit: Some(1),
-            },
-        )
-        .await
-        .expect("second child page should list");
+        let second_page_uri = format!("/?pageSize=1&pageToken={next_page_token}")
+            .parse::<http::Uri>()
+            .expect("second page URI should parse");
+        let second_page = list_namespaces_response(&store, "warehouse", Some(&analytics), &second_page_uri)
+            .await
+            .expect("second child page should list");
         assert_eq!(second_page.namespaces, vec![vec!["analytics".to_string(), "raw".to_string()]]);
         assert!(second_page.next_page_token.is_none());
 
         let missing = crate::table_catalog::Namespace::parse("missing").expect("namespace should parse");
-        let error = list_namespaces_response(&store, "warehouse", Some(&missing), RestPagination::default())
+        let error = list_namespaces_response(&store, "warehouse", Some(&missing), &unpaginated_uri)
             .await
             .expect_err("missing parent should fail");
         assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
@@ -14944,13 +15191,15 @@ mod tests {
             warehouse: "warehouse",
             namespace: Some("analytics"),
         };
-        let token = encode_rest_page_token("analytics.raw", parent_context).expect("parent token should encode");
+        let token = encode_rest_page_token("analytics.raw", &rest_page_context_fingerprint(parent_context))
+            .expect("parent token should encode");
         let wrong_parent_context = RestPageContext {
             resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
             warehouse: "warehouse",
             namespace: Some("sales"),
         };
-        let error = decode_rest_page_token(&token, wrong_parent_context).expect_err("token must stay parent-scoped");
+        let error = decode_rest_page_token(&token, &rest_page_context_fingerprint(wrong_parent_context))
+            .expect_err("token must stay parent-scoped");
         assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
     }
 
@@ -14982,13 +15231,14 @@ mod tests {
             .expect("archived namespace should exist")
             .state = crate::table_catalog::TableCatalogEntryState::Deleted;
 
-        let top_level = list_namespaces_response(&store, "warehouse", None, RestPagination::default())
+        let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let top_level = list_namespaces_response(&store, "warehouse", None, &unpaginated_uri)
             .await
             .expect("top-level namespaces should list");
         assert_eq!(top_level.namespaces, vec![vec!["analytics".to_string()]]);
 
         let analytics = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        let children = list_namespaces_response(&store, "warehouse", Some(&analytics), RestPagination::default())
+        let children = list_namespaces_response(&store, "warehouse", Some(&analytics), &unpaginated_uri)
             .await
             .expect("synthesized namespace children should list");
         assert_eq!(children.namespaces, vec![vec!["analytics".to_string(), "raw".to_string()]]);
@@ -15010,7 +15260,8 @@ mod tests {
     async fn table_list_reports_missing_namespace() {
         let store = TestTableCatalogStore::default();
         let namespace = crate::table_catalog::Namespace::parse("missing").expect("namespace should parse");
-        let error = list_tables_response(&store, "warehouse", &namespace, RestPagination::default())
+        let uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let error = list_tables_response(&store, "warehouse", &namespace, &uri)
             .await
             .expect_err("missing namespace should fail");
         assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
@@ -15021,7 +15272,8 @@ mod tests {
     async fn view_list_reports_missing_namespace_and_paginates_active_entries() {
         let store = TestTableCatalogStore::default();
         let missing = crate::table_catalog::Namespace::parse("missing").expect("namespace should parse");
-        let error = list_views_response(&store, "warehouse", &missing, RestPagination::default())
+        let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let error = list_views_response(&store, "warehouse", &missing, &unpaginated_uri)
             .await
             .expect_err("missing namespace should fail");
         assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
@@ -15072,17 +15324,10 @@ mod tests {
             });
         }
 
-        let first = list_views_response(
-            &store,
-            "warehouse",
-            &namespace,
-            RestPagination {
-                after: None,
-                limit: Some(2),
-            },
-        )
-        .await
-        .expect("first view page should load");
+        let first_page_uri = "/?pageSize=2".parse::<http::Uri>().expect("first page URI should parse");
+        let first = list_views_response(&store, "warehouse", &namespace, &first_page_uri)
+            .await
+            .expect("first view page should load");
         assert_eq!(
             first
                 .identifiers
@@ -15092,22 +15337,12 @@ mod tests {
             vec!["alpha", "beta"]
         );
         let token = first.next_page_token.expect("first view page should return a token");
-        let context = RestPageContext {
-            resource: TABLE_CATALOG_VIEW_RESOURCE_ROOT,
-            warehouse: "warehouse",
-            namespace: Some("analytics"),
-        };
-        let second = list_views_response(
-            &store,
-            "warehouse",
-            &namespace,
-            RestPagination {
-                after: Some(decode_rest_page_token(&token, context).expect("view token should decode")),
-                limit: Some(2),
-            },
-        )
-        .await
-        .expect("second view page should load");
+        let second_page_uri = format!("/?pageSize=2&pageToken={token}")
+            .parse::<http::Uri>()
+            .expect("second page URI should parse");
+        let second = list_views_response(&store, "warehouse", &namespace, &second_page_uri)
+            .await
+            .expect("second view page should load");
         assert_eq!(
             second
                 .identifiers
@@ -15161,7 +15396,8 @@ mod tests {
             });
         }
 
-        let response = list_tables_response(&store, "warehouse", &namespace, RestPagination::default())
+        let uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let response = list_tables_response(&store, "warehouse", &namespace, &uri)
             .await
             .expect("table list should load");
         assert_eq!(

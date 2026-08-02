@@ -80,6 +80,7 @@ pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub(crate) const TABLE_METADATA_JSON_MAX_SIZE: usize = 50 * 1024 * 1024;
 pub(crate) const TABLE_MANIFEST_AVRO_MAX_SIZE: usize = 128 * 1024 * 1024;
 const TABLE_MANIFEST_AVRO_MAX_RECORDS: usize = 1_000_000;
+const TABLE_MANIFEST_AVRO_MAX_HEADER_ENTRIES: usize = 1_024;
 pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";
 const NAMESPACE_PROPERTIES_MAX_ENTRIES: usize = 256;
 const NAMESPACE_PROPERTY_KEY_MAX_LEN: usize = 256;
@@ -2000,7 +2001,7 @@ where
     TableCatalogListPage { entries, next_cursor }
 }
 
-fn catalog_list_page_from_entries<T, F>(
+pub(crate) fn catalog_list_page_from_entries<T, F>(
     mut entries: Vec<T>,
     cursor: Option<&str>,
     limit: NonZeroUsize,
@@ -2038,18 +2039,25 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>>;
 
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let parent = parse_namespace_for_store(parent)?.public_name();
+        Ok(self
+            .list_namespaces(table_bucket)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.namespace == parent || namespace_is_descendant(&entry.namespace, &parent))
+            .collect())
+    }
+
     async fn list_namespaces_page(
         &self,
         table_bucket: &str,
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
-        Ok(catalog_list_page_from_entries(
-            self.list_namespaces(table_bucket).await?,
-            cursor,
-            limit,
-            |entry| &entry.namespace,
-        ))
+        let mut entries = self.list_namespaces(table_bucket).await?;
+        entries.retain(|entry| entry.state == TableCatalogEntryState::Active);
+        Ok(catalog_list_page_from_entries(entries, cursor, limit, |entry| &entry.namespace))
     }
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>>;
@@ -2081,12 +2089,9 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
-        Ok(catalog_list_page_from_entries(
-            self.list_tables(table_bucket, namespace).await?,
-            cursor,
-            limit,
-            |entry| &entry.table,
-        ))
+        let mut entries = self.list_tables(table_bucket, namespace).await?;
+        entries.retain(|entry| entry.state == TableCatalogEntryState::Active);
+        Ok(catalog_list_page_from_entries(entries, cursor, limit, |entry| &entry.table))
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>>;
@@ -2128,12 +2133,9 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
-        Ok(catalog_list_page_from_entries(
-            self.list_views(table_bucket, namespace).await?,
-            cursor,
-            limit,
-            |entry| &entry.view,
-        ))
+        let mut entries = self.list_views(table_bucket, namespace).await?;
+        entries.retain(|entry| entry.state == TableCatalogEntryState::Active);
+        Ok(catalog_list_page_from_entries(entries, cursor, limit, |entry| &entry.view))
     }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>>;
@@ -2155,32 +2157,6 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         table_id: &str,
         idempotency_key: &str,
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TableCatalogPage<T> {
-    pub entries: Vec<T>,
-    pub has_more: bool,
-}
-
-fn catalog_page<T, F>(entries: Vec<T>, after: Option<&str>, limit: usize, key: F) -> TableCatalogStoreResult<TableCatalogPage<T>>
-where
-    F: Fn(&T) -> &str,
-{
-    if limit == 0 {
-        return Err(TableCatalogStoreError::Invalid(
-            "catalog page limit must be greater than zero".to_string(),
-        ));
-    }
-    let start = after.map_or(0, |after| entries.partition_point(|entry| key(entry) <= after));
-    let mut entries = entries
-        .into_iter()
-        .skip(start)
-        .take(limit.saturating_add(1))
-        .collect::<Vec<_>>();
-    let has_more = entries.len() > limit;
-    entries.truncate(limit);
-    Ok(TableCatalogPage { entries, has_more })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2209,6 +2185,30 @@ pub(crate) enum TableCatalogPutPrecondition {
     IfMatch(String),
 }
 
+pub(crate) trait TableCatalogObjectLockGuard: Send + Sync {
+    fn is_lock_lost(&self) -> bool {
+        false
+    }
+}
+
+impl TableCatalogObjectLockGuard for rustfs_lock::NamespaceLockGuard {
+    fn is_lock_lost(&self) -> bool {
+        rustfs_lock::NamespaceLockGuard::is_lock_lost(self)
+    }
+}
+
+#[cfg(test)]
+impl TableCatalogObjectLockGuard for tokio::sync::OwnedMutexGuard<()> {}
+
+pub(crate) type TableCatalogObjectLock = Box<dyn TableCatalogObjectLockGuard>;
+
+fn ensure_table_catalog_lock_held(guard: &dyn TableCatalogObjectLockGuard) -> TableCatalogStoreResult<()> {
+    if guard.is_lock_lost() {
+        return Err(TableCatalogStoreError::Conflict("table catalog lock lease was lost".to_string()));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
@@ -2232,9 +2232,38 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         self.read_object(bucket, object).await
     }
 
+    async fn read_object_unlocked_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let result = self.read_object_unlocked(bucket, object).await?;
+        if result.as_ref().is_some_and(|object| object.data.len() > max_size) {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+            )));
+        }
+        Ok(result)
+    }
+
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
         Ok(self
             .read_object(bucket, object)
+            .await?
+            .map(|object| TableCatalogObjectMetadata {
+                etag: object.etag,
+                mod_time: object.mod_time,
+            }))
+    }
+
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        Ok(self
+            .read_object_unlocked(bucket, object)
             .await?
             .map(|object| TableCatalogObjectMetadata {
                 etag: object.etag,
@@ -2290,11 +2319,11 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         Ok(TableCatalogObjectListPage { objects, is_truncated })
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogObjectLock> {
         self.acquire_write_lock(bucket, object).await
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>>;
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogObjectLock>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2930,8 +2959,12 @@ where
             if entry.state != TableCatalogEntryState::Active {
                 continue;
             }
-            let metadata_root = table_metadata_dir_path_for_entry(entry)?;
-            let warehouse_object_prefix = table_warehouse_object_prefix(entry)?;
+            let Ok(metadata_root) = table_metadata_dir_path_for_entry(entry) else {
+                continue;
+            };
+            let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(entry) else {
+                continue;
+            };
             if !state
                 .table_buckets
                 .get(table_bucket)
@@ -2969,6 +3002,15 @@ where
             if entry.state != TableCatalogEntryState::Active {
                 continue;
             }
+            if state
+                .tables
+                .get(&(table_bucket.clone(), namespace.clone(), view.clone()))
+                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "active table and view share the same identifier: {table_bucket}/{namespace}/{view}"
+                )));
+            }
             if !state
                 .table_buckets
                 .get(table_bucket)
@@ -2987,15 +3029,13 @@ where
                     "active view {table_bucket}/{namespace}/{view} has no active namespace"
                 )));
             }
-            validate_view_warehouse_location(table_bucket, &entry.warehouse_location)?;
+            if validate_view_warehouse_location(table_bucket, &entry.warehouse_location).is_err() {
+                continue;
+            }
             let namespace = parse_namespace_for_store(namespace)?;
             let view = parse_table_for_store(view)?;
             if !is_valid_view_metadata_location(&namespace, &view, &entry.metadata_location) {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "active view {table_bucket}/{}/{} has an invalid metadata location",
-                    namespace.public_name(),
-                    view.as_str()
-                )));
+                continue;
             }
         }
         state.warehouse_index = warehouse_index;
@@ -3419,7 +3459,7 @@ where
         request: &TableCommitRequest,
     ) -> TableCatalogStoreResult<TableEntry> {
         let Some(current) = state.tables.get(key).cloned() else {
-            return Err(TableCatalogStoreError::NotFound(format!(
+            return Err(TableCatalogStoreError::TableNotFound(format!(
                 "table {}/{}/{}",
                 request.table_bucket, request.namespace, request.table
             )));
@@ -3666,7 +3706,11 @@ where
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
-            if state.namespaces.contains_key(&key) {
+            if state
+                .namespaces
+                .get(&key)
+                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "catalog object already exists: namespace {}/{}",
                     entry.table_bucket, entry.namespace
@@ -3685,11 +3729,31 @@ where
         let mut entries = state
             .namespaces
             .iter()
-            .filter(|((bucket, _), _)| bucket == table_bucket)
+            .filter(|((bucket, _), entry)| bucket == table_bucket && entry.state == TableCatalogEntryState::Active)
             .map(|(_, entry)| entry.clone())
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
         Ok(entries)
+    }
+
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        self.hydrate_state().await?;
+        let parent = parse_namespace_for_store(parent)?.public_name();
+        let state = self.state.lock().await;
+        let exact = state
+            .namespaces
+            .get(&(table_bucket.to_string(), parent.clone()))
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned();
+        let descendant_start = (table_bucket.to_string(), format!("{parent}."));
+        let descendants = state
+            .namespaces
+            .range(descendant_start..)
+            .take_while(|((bucket, namespace), _)| bucket == table_bucket && namespace_is_descendant(namespace, &parent))
+            .filter(|(_, entry)| entry.state == TableCatalogEntryState::Active)
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>();
+        Ok(exact.into_iter().chain(descendants).collect())
     }
 
     async fn list_namespaces_page(
@@ -3713,6 +3777,7 @@ where
             .namespaces
             .range((start, Bound::Unbounded))
             .take_while(|((bucket, _), _)| bucket == table_bucket)
+            .filter(|(_, entry)| entry.state == TableCatalogEntryState::Active)
             .take(limit.get().saturating_add(1))
             .map(|(_, entry)| entry.clone())
             .collect();
@@ -3736,7 +3801,7 @@ where
         if Self::has_active_namespace_descendant_locked(&state, table_bucket, &parent) {
             return Ok(Some(synthetic_namespace_entry(table_bucket, &namespace)));
         }
-        Ok(exact)
+        Ok(None)
     }
 
     async fn update_namespace_properties(
@@ -3789,22 +3854,26 @@ where
                     "namespace {table_bucket}/{parent} has child namespaces"
                 )));
             }
-            if !state.namespaces.contains_key(&key) {
+            if !state
+                .namespaces
+                .get(&key)
+                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            {
                 return Err(TableCatalogStoreError::NamespaceNotFound(format!(
                     "namespace {}/{}",
                     table_bucket,
                     namespace.public_name()
                 )));
             }
-            if state
-                .tables
-                .keys()
-                .any(|(bucket, namespace_name, _)| bucket == table_bucket && namespace_name == &namespace.public_name())
-                || state
-                    .views
-                    .keys()
-                    .any(|(bucket, namespace_name, _)| bucket == table_bucket && namespace_name == &namespace.public_name())
-            {
+            if state.tables.iter().any(|((bucket, namespace_name, _), entry)| {
+                bucket == table_bucket
+                    && namespace_name == &namespace.public_name()
+                    && entry.state == TableCatalogEntryState::Active
+            }) || state.views.iter().any(|((bucket, namespace_name, _), entry)| {
+                bucket == table_bucket
+                    && namespace_name == &namespace.public_name()
+                    && entry.state == TableCatalogEntryState::Active
+            }) {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "namespace {}/{} is not empty",
                     table_bucket,
@@ -3910,10 +3979,21 @@ where
             None => Bound::Included((table_bucket.to_string(), namespace.clone(), String::new())),
         };
         let state = self.state.lock().await;
+        if !state
+            .namespaces
+            .get(&(table_bucket.to_string(), namespace.clone()))
+            .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+        {
+            return Ok(TableCatalogListPage {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let entries = state
             .tables
             .range((start, Bound::Unbounded))
             .take_while(|((bucket, entry_namespace, _), _)| bucket == table_bucket && entry_namespace == &namespace)
+            .filter(|(_, entry)| entry.state == TableCatalogEntryState::Active)
             .take(limit.get().saturating_add(1))
             .map(|(_, entry)| entry.clone())
             .collect();
@@ -4114,7 +4194,7 @@ where
             .await?;
         let Some(new_metadata_object) = self
             .object_backend
-            .read_object_unlocked(&request.table_bucket, &request.new_metadata_location)
+            .read_object_unlocked_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return table_commit_result(
@@ -4284,10 +4364,21 @@ where
             None => Bound::Included((table_bucket.to_string(), namespace.clone(), String::new())),
         };
         let state = self.state.lock().await;
+        if !state
+            .namespaces
+            .get(&(table_bucket.to_string(), namespace.clone()))
+            .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+        {
+            return Ok(TableCatalogListPage {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let entries = state
             .views
             .range((start, Bound::Unbounded))
             .take_while(|((bucket, entry_namespace, _), _)| bucket == table_bucket && entry_namespace == &namespace)
+            .filter(|(_, entry)| entry.state == TableCatalogEntryState::Active)
             .take(limit.get().saturating_add(1))
             .map(|(_, entry)| entry.clone())
             .collect();
@@ -4331,10 +4422,10 @@ where
             .await?;
         let Some(new_metadata_object) = self
             .object_backend
-            .read_object_unlocked(&request.table_bucket, &request.new_metadata_location)
+            .read_object_unlocked_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
-            return Err(TableCatalogStoreError::NotFound(format!(
+            return Err(TableCatalogStoreError::TableNotFound(format!(
                 "new view metadata object {}",
                 request.new_metadata_location
             )));
@@ -4454,15 +4545,17 @@ where
         RUSTFS_META_BUCKET
     }
 
-    async fn list_entry_page<T>(
+    async fn list_entry_page<T, P>(
         &self,
         prefix: &str,
         entry_file: &str,
         cursor: Option<&str>,
         limit: NonZeroUsize,
+        include: P,
     ) -> TableCatalogStoreResult<TableCatalogListPage<T>>
     where
         T: DeserializeOwned,
+        P: Fn(&T) -> bool,
     {
         let cursor = catalog_list_cursor(cursor, OBJECT_CATALOG_LIST_CURSOR_PREFIX)?;
         if cursor.is_some_and(|cursor| !cursor.starts_with(prefix)) {
@@ -4475,7 +4568,6 @@ where
             .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
         let mut entries = Vec::with_capacity(limit.get());
         let mut last_entry_path = None;
-
         let page = self
             .backend
             .list_objects_page(self.catalog_bucket(), prefix, cursor, scan_limit)
@@ -4495,6 +4587,12 @@ where
             if !object.ends_with(entry_file) {
                 continue;
             }
+            let Some((entry, _)) = self.read_entry::<T>(self.catalog_bucket(), &object).await? else {
+                continue;
+            };
+            if !include(&entry) {
+                continue;
+            }
             if entries.len() == limit.get() {
                 let last_entry_path = last_entry_path.ok_or_else(|| {
                     TableCatalogStoreError::Internal("catalog page cursor is missing its last entry".to_string())
@@ -4504,9 +4602,6 @@ where
                     next_cursor: Some(format!("{OBJECT_CATALOG_LIST_CURSOR_PREFIX}{last_entry_path}")),
                 });
             }
-            let Some((entry, _)) = self.read_entry::<T>(self.catalog_bucket(), &object).await? else {
-                continue;
-            };
             last_entry_path = Some(object);
             entries.push(entry);
         }
@@ -4519,6 +4614,92 @@ where
         Ok(TableCatalogListPage { entries, next_cursor })
     }
 
+    async fn has_active_namespace_descendant(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
+        let parent = namespace.public_name();
+        let namespace_path = self.paths.namespace_entry_path(table_bucket, namespace);
+        let descendant_prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), namespace.storage_id());
+        for object in self.backend.list_objects(self.catalog_bucket(), &descendant_prefix).await? {
+            if object == namespace_path || !object.ends_with(NAMESPACE_ENTRY_FILE) {
+                continue;
+            }
+            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await?
+                && entry.state == TableCatalogEntryState::Active
+                && namespace_is_descendant(&entry.namespace, &parent)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn ensure_table_warehouse_prefix_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
+        if candidate.state != TableCatalogEntryState::Active {
+            return Ok(());
+        }
+        let candidate_namespace = parse_namespace_for_store(&candidate.namespace)?;
+        let candidate_table = parse_table_for_store(&candidate.table)?;
+        let candidate_path = self
+            .paths
+            .table_entry_path(&candidate.table_bucket, &candidate_namespace, &candidate_table);
+        let candidate_prefix = table_warehouse_object_prefix(candidate)?;
+        let candidate_metadata_root = table_metadata_dir_path_for_entry(candidate)?;
+        for object in self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.warehouse_index_entries_prefix(&candidate.table_bucket))
+            .await?
+        {
+            if object == self.paths.warehouse_index_state_path(&candidate.table_bucket) || !object.ends_with(".json") {
+                continue;
+            }
+            let Some((existing, _)) = self
+                .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &object)
+                .await?
+            else {
+                continue;
+            };
+            if existing.table_bucket != candidate.table_bucket
+                || self
+                    .paths
+                    .warehouse_index_entry_path(&existing.table_bucket, &existing.warehouse_object_prefix)
+                    != object
+            {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "warehouse index entry does not match its catalog object path: {object}"
+                )));
+            }
+            if existing.namespace == candidate.namespace && existing.table == candidate.table {
+                continue;
+            }
+            if warehouse_object_prefixes_overlap(&existing.warehouse_object_prefix, &candidate_prefix)
+                && self.warehouse_index_entry_has_active_owner_unlocked(&existing).await?
+            {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table warehouse location overlaps an active table: {candidate_prefix}"
+                )));
+            }
+        }
+        for object in self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(&candidate.table_bucket))
+            .await?
+        {
+            if object == candidate_path || !object.ends_with(TABLE_ENTRY_FILE) {
+                continue;
+            }
+            let Some((existing, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
+                continue;
+            };
+            if existing.state == TableCatalogEntryState::Active
+                && table_metadata_dir_path_for_entry(&existing).is_ok_and(|root| root == candidate_metadata_root)
+            {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table metadata directory is already registered: {candidate_metadata_root}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn read_backing_migration_fence(
         &self,
         table_bucket: &str,
@@ -4527,7 +4708,7 @@ where
             .await
     }
 
-    async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogObjectLock> {
         let fence_path = self.paths.backing_migration_global_fence_path();
         let lock_path = self.paths.backing_migration_global_fence_lock_path();
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
@@ -4543,7 +4724,10 @@ where
         Ok(guard)
     }
 
-    async fn acquire_object_backed_catalog_write_permit(&self, table_bucket: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_object_backed_catalog_write_permit(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogObjectLock> {
         let lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
         if self.read_backing_migration_fence(table_bucket).await?.is_some() {
@@ -4608,7 +4792,7 @@ where
     async fn collect_bucket_snapshot_with_locks(
         &self,
         table_bucket: &str,
-        guards: &mut Vec<Box<dyn Send>>,
+        guards: &mut Vec<TableCatalogObjectLock>,
     ) -> TableCatalogStoreResult<StrongTableCatalogBucketSnapshot> {
         let bucket_path = self.paths.table_bucket_entry_path(table_bucket);
         guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?);
@@ -4688,6 +4872,10 @@ where
                         "table {} does not match its catalog namespace",
                         table_entry.table
                     )));
+                }
+                if namespace_entry.state != TableCatalogEntryState::Active || table_entry.state != TableCatalogEntryState::Active
+                {
+                    continue;
                 }
 
                 for commit_object in self
@@ -4769,9 +4957,13 @@ where
                         view_entry.view
                     )));
                 }
-                views.push(view_entry);
+                if namespace_entry.state == TableCatalogEntryState::Active && view_entry.state == TableCatalogEntryState::Active {
+                    views.push(view_entry);
+                }
             }
-            namespaces.push(namespace_entry);
+            if namespace_entry.state == TableCatalogEntryState::Active {
+                namespaces.push(namespace_entry);
+            }
         }
         if let Some(object) = unmatched_table_objects.first() {
             return Err(TableCatalogStoreError::Invalid(format!(
@@ -5018,11 +5210,21 @@ where
             && state.state == TableCatalogEntryState::Active)
     }
 
-    async fn warehouse_index_entry_has_active_owner(&self, index: &TableWarehouseIndexEntry) -> TableCatalogStoreResult<bool> {
+    async fn warehouse_index_entry_has_active_owner_unlocked(
+        &self,
+        index: &TableWarehouseIndexEntry,
+    ) -> TableCatalogStoreResult<bool> {
         if index.state != TableCatalogEntryState::Active {
             return Ok(false);
         }
-        let Some(table) = self.load_table(&index.table_bucket, &index.namespace, &index.table).await? else {
+        // The bucket ownership lock is already held; reacquiring namespace/table locks here would invert the catalog lock order.
+        let namespace = parse_namespace_for_store(&index.namespace)?;
+        let table = parse_table_for_store(&index.table)?;
+        let table_path = self.paths.table_entry_path(&index.table_bucket, &namespace, &table);
+        let Some((table, _)) = self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &table_path)
+            .await?
+        else {
             return Ok(false);
         };
         if table.state != TableCatalogEntryState::Active {
@@ -5129,7 +5331,7 @@ where
                     }
                     if existing.table_bucket != index.table_bucket
                         || existing.warehouse_object_prefix != index.warehouse_object_prefix
-                        || self.warehouse_index_entry_has_active_owner(&existing).await?
+                        || self.warehouse_index_entry_has_active_owner_unlocked(&existing).await?
                     {
                         return Err(TableCatalogStoreError::Conflict(format!(
                             "table warehouse location is already registered: {}",
@@ -5370,6 +5572,7 @@ where
         table_bucket: &str,
         namespace: &str,
         table: &str,
+        ownership_guard: &dyn TableCatalogObjectLockGuard,
     ) -> TableCatalogStoreResult<()> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
@@ -5381,19 +5584,25 @@ where
         if current.state != TableCatalogEntryState::Active {
             return Ok(());
         }
+        ensure_table_catalog_lock_held(ownership_guard)?;
         self.reserve_table_warehouse_index(&current).await.map(|_| ())
     }
 
     async fn backfill_table_warehouse_index(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
         let ownership_lock_path = self.paths.warehouse_index_ownership_lock_path(table_bucket);
-        let _ownership_guard = self
+        let ownership_guard = self
             .backend
             .acquire_write_lock(self.catalog_bucket(), &ownership_lock_path)
             .await?;
-        self.backfill_table_warehouse_index_ownership_locked(table_bucket).await
+        self.backfill_table_warehouse_index_ownership_locked(table_bucket, ownership_guard.as_ref())
+            .await
     }
 
-    async fn backfill_table_warehouse_index_ownership_locked(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+    async fn backfill_table_warehouse_index_ownership_locked(
+        &self,
+        table_bucket: &str,
+        ownership_guard: &dyn TableCatalogObjectLockGuard,
+    ) -> TableCatalogStoreResult<()> {
         let state_object = self.paths.warehouse_index_state_path(table_bucket);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &state_object).await?;
         if self.read_warehouse_index_state_unlocked(table_bucket).await? {
@@ -5407,10 +5616,11 @@ where
                 if table.state != TableCatalogEntryState::Active {
                     continue;
                 }
-                self.backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
+                self.backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table, ownership_guard)
                     .await?;
             }
         }
+        ensure_table_catalog_lock_held(ownership_guard)?;
         self.write_warehouse_index_state_unlocked(table_bucket).await
     }
 
@@ -5492,11 +5702,11 @@ where
         }
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
         let ownership_lock_path = self.paths.warehouse_index_ownership_lock_path(&entry.table_bucket);
-        let _ownership_guard = self
+        let ownership_guard = self
             .backend
             .acquire_write_lock(self.catalog_bucket(), &ownership_lock_path)
             .await?;
-        self.backfill_table_warehouse_index_ownership_locked(&entry.table_bucket)
+        self.backfill_table_warehouse_index_ownership_locked(&entry.table_bucket, ownership_guard.as_ref())
             .await?;
         let namespace_path = self.paths.namespace_entry_path(&entry.table_bucket, &namespace);
         let _namespace_guard = self
@@ -5529,6 +5739,7 @@ where
         let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &table);
         let _table_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
         self.ensure_table_warehouse_prefix_available(&entry).await?;
+        ensure_table_catalog_lock_held(ownership_guard.as_ref())?;
         let reservation = self.reserve_table_warehouse_index(&entry).await?;
         let result = async {
             if materialize_namespace {
@@ -5540,6 +5751,7 @@ where
                 )
                 .await?;
             }
+            ensure_table_catalog_lock_held(ownership_guard.as_ref())?;
             self.write_entry_unlocked(self.catalog_bucket(), &table_path, &entry, precondition)
                 .await
         }
@@ -8314,7 +8526,7 @@ where
                 )));
             }
             self.ensure_table_maintenance_object_owner(&entry, metadata_location).await?;
-            let Some(candidate_object) = self.backend.read_object(table_bucket, metadata_location).await? else {
+            let Some(candidate_object) = self.backend.object_metadata(table_bucket, metadata_location).await? else {
                 continue;
             };
             if !planned_deletable_locations.contains(metadata_location.as_str()) {
@@ -8416,7 +8628,7 @@ where
             .await?;
         let Some(locked_current_metadata) = self
             .backend
-            .read_object_unlocked(table_bucket, &current_entry.metadata_location)
+            .object_metadata_unlocked(table_bucket, &current_entry.metadata_location)
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -8435,7 +8647,10 @@ where
         let mut deleted_metadata_locations = Vec::new();
         for (metadata_location, expected) in cleanup_candidate_locations {
             let candidate_guard = self.backend.acquire_write_lock(table_bucket, &metadata_location).await?;
-            let candidate = self.backend.read_object_unlocked(table_bucket, &metadata_location).await?;
+            let candidate = self
+                .backend
+                .object_metadata_unlocked(table_bucket, &metadata_location)
+                .await?;
             if candidate.as_ref().is_some_and(|candidate| {
                 candidate.etag == expected.etag
                     && candidate.mod_time == expected.mod_time
@@ -8449,7 +8664,7 @@ where
         let mut deleted_object_locations = Vec::new();
         for (object_location, expected) in cleanup_object_candidate_locations {
             let candidate_guard = self.backend.acquire_write_lock(table_bucket, &object_location).await?;
-            let candidate = self.backend.read_object_unlocked(table_bucket, &object_location).await?;
+            let candidate = self.backend.object_metadata_unlocked(table_bucket, &object_location).await?;
             if candidate.as_ref().is_some_and(|candidate| {
                 candidate.etag == expected.etag
                     && candidate.mod_time == expected.mod_time
@@ -8537,7 +8752,21 @@ where
         let bucket_path = self.paths.table_bucket_entry_path(&entry.table_bucket);
         let _bucket_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?;
         let object = self.paths.namespace_entry_path(&entry.table_bucket, &namespace);
-        self.write_entry(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::IfAbsent)
+        let _namespace_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
+        let precondition = match self
+            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &object)
+            .await?
+        {
+            Some((current, _)) if current.state == TableCatalogEntryState::Active => {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "catalog object already exists: namespace {}/{}",
+                    entry.table_bucket, entry.namespace
+                )));
+            }
+            Some(_) => TableCatalogPutPrecondition::Any,
+            None => TableCatalogPutPrecondition::IfAbsent,
+        };
+        self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, precondition)
             .await
     }
 
@@ -8551,7 +8780,27 @@ where
             if !object.ends_with(NAMESPACE_ENTRY_FILE) {
                 continue;
             }
-            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await? {
+            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await?
+                && entry.state == TableCatalogEntryState::Active
+            {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        Ok(entries)
+    }
+
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let parent = parse_namespace_for_store(parent)?;
+        let prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), parent.storage_id());
+        let mut entries = Vec::new();
+        for object in self.backend.list_objects(self.catalog_bucket(), &prefix).await? {
+            if !object.ends_with(NAMESPACE_ENTRY_FILE) {
+                continue;
+            }
+            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await?
+                && entry.state == TableCatalogEntryState::Active
+            {
                 entries.push(entry);
             }
         }
@@ -8565,8 +8814,14 @@ where
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
-        self.list_entry_page(&self.paths.namespace_entries_prefix(table_bucket), NAMESPACE_ENTRY_FILE, cursor, limit)
-            .await
+        self.list_entry_page(
+            &self.paths.namespace_entries_prefix(table_bucket),
+            NAMESPACE_ENTRY_FILE,
+            cursor,
+            limit,
+            |entry: &NamespaceEntry| entry.state == TableCatalogEntryState::Active,
+        )
+        .await
     }
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
@@ -8584,7 +8839,7 @@ where
         if self.has_active_namespace_descendant(table_bucket, &namespace).await? {
             return Ok(Some(synthetic_namespace_entry(table_bucket, &namespace)));
         }
-        Ok(exact)
+        Ok(None)
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
@@ -8604,10 +8859,10 @@ where
                 "namespace {table_bucket}/{parent} has child namespaces"
             )));
         }
-        if self
+        if !self
             .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
             .await?
-            .is_none()
+            .is_some_and(|(entry, _)| entry.state == TableCatalogEntryState::Active)
         {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
@@ -8676,6 +8931,7 @@ where
             TABLE_ENTRY_FILE,
             cursor,
             limit,
+            |entry: &TableEntry| entry.state == TableCatalogEntryState::Active,
         )
         .await
     }
@@ -8744,11 +9000,11 @@ where
         let table = parse_table_for_store(&request.table)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?;
         let ownership_lock_path = self.paths.warehouse_index_ownership_lock_path(&request.table_bucket);
-        let _ownership_guard = self
+        let ownership_guard = self
             .backend
             .acquire_write_lock(self.catalog_bucket(), &ownership_lock_path)
             .await?;
-        self.backfill_table_warehouse_index_ownership_locked(&request.table_bucket)
+        self.backfill_table_warehouse_index_ownership_locked(&request.table_bucket, ownership_guard.as_ref())
             .await?;
         let table_path = self.paths.table_entry_path(&request.table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
@@ -8764,7 +9020,7 @@ where
                 &request.commit_id,
                 &request.operation,
                 commit_started,
-                Err(TableCatalogStoreError::NotFound(format!(
+                Err(TableCatalogStoreError::TableNotFound(format!(
                     "table {}/{}/{}",
                     request.table_bucket, request.namespace, request.table
                 ))),
@@ -8917,7 +9173,7 @@ where
             .await?;
         let Some(new_metadata_object) = self
             .backend
-            .read_object_unlocked(&request.table_bucket, &request.new_metadata_location)
+            .read_object_unlocked_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return table_commit_result(
@@ -8979,6 +9235,7 @@ where
         if next.warehouse_location != current.warehouse_location {
             self.ensure_table_warehouse_prefix_available(&next).await?;
         }
+        ensure_table_catalog_lock_held(ownership_guard.as_ref())?;
         let reservation = self.reserve_table_warehouse_index(&next).await?;
 
         let staged_write_result = async {
@@ -9020,6 +9277,19 @@ where
         }
 
         let cas_started = Instant::now();
+        if let Err(err) = ensure_table_catalog_lock_held(ownership_guard.as_ref()) {
+            self.delete_created_table_warehouse_index(&next, reservation, "warehouse ownership lock lost")
+                .await;
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(err),
+            );
+        }
         let cas_result = self
             .write_entry_unlocked(
                 self.catalog_bucket(),
@@ -9068,7 +9338,7 @@ where
         let table = parse_table_for_store(table)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
         let ownership_lock_path = self.paths.warehouse_index_ownership_lock_path(table_bucket);
-        let _ownership_guard = self
+        let ownership_guard = self
             .backend
             .acquire_write_lock(self.catalog_bucket(), &ownership_lock_path)
             .await?;
@@ -9087,6 +9357,7 @@ where
                 table.as_str()
             )));
         };
+        ensure_table_catalog_lock_held(ownership_guard.as_ref())?;
         self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await?;
         if let Err(err) = self.delete_table_warehouse_index(&entry).await {
             if let Err(restore_err) = self
@@ -9148,8 +9419,14 @@ where
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
-        self.list_entry_page(&self.paths.view_entries_prefix(table_bucket, &namespace), VIEW_ENTRY_FILE, cursor, limit)
-            .await
+        self.list_entry_page(
+            &self.paths.view_entries_prefix(table_bucket, &namespace),
+            VIEW_ENTRY_FILE,
+            cursor,
+            limit,
+            |entry: &ViewEntry| entry.state == TableCatalogEntryState::Active,
+        )
+        .await
     }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
@@ -9228,7 +9505,7 @@ where
             .await?;
         let Some(new_metadata_object) = self
             .backend
-            .read_object_unlocked(&request.table_bucket, &request.new_metadata_location)
+            .read_object_unlocked_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -9336,6 +9613,13 @@ where
         match self {
             Self::ObjectBacked(store) => store.list_namespaces(table_bucket).await,
             Self::DurableStrong(store) => store.list_namespaces(table_bucket).await,
+        }
+    }
+
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_namespaces_under(table_bucket, parent).await,
+            Self::DurableStrong(store) => store.list_namespaces_under(table_bucket, parent).await,
         }
     }
 
@@ -9803,8 +10087,45 @@ where
         .await
     }
 
+    async fn read_object_unlocked_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.read_object_with_options(
+            bucket,
+            object,
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+            Some(max_size),
+        )
+        .await
+    }
+
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
         match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
+            Ok(info) => Ok(Some(TableCatalogObjectMetadata {
+                etag: info.etag,
+                mod_time: info.mod_time,
+            })),
+            Err(err) if is_missing_storage_error(&err) => Ok(None),
+            Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
+        }
+    }
+
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        match self.store.get_object_info(bucket, object, &opts).await {
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
@@ -9923,7 +10244,7 @@ where
         })
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogObjectLock> {
         let lock = self
             .store
             .new_ns_lock(bucket, object)
@@ -9936,7 +10257,7 @@ where
         Ok(Box::new(guard))
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogObjectLock> {
         let lock = self
             .store
             .new_ns_lock(bucket, object)
@@ -10436,6 +10757,7 @@ pub(crate) fn manifest_list_references_from_manifest_list_avro(
             "manifest list exceeds the maximum size of {TABLE_MANIFEST_AVRO_MAX_SIZE} bytes"
         )));
     }
+    validate_uncompressed_avro_container(data)?;
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list Avro: {err}")))?;
     let mut manifest_paths = Vec::new();
@@ -10473,6 +10795,7 @@ pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatal
             "manifest exceeds the maximum size of {TABLE_MANIFEST_AVRO_MAX_SIZE} bytes"
         )));
     }
+    validate_uncompressed_avro_container(data)?;
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest Avro: {err}")))?;
     let mut files = Vec::new();
@@ -10524,6 +10847,101 @@ pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatal
         });
     }
     Ok(files)
+}
+
+fn validate_uncompressed_avro_container(data: &[u8]) -> TableCatalogStoreResult<()> {
+    if !data.starts_with(b"Obj\x01") {
+        return Err(TableCatalogStoreError::Invalid("Avro container has invalid header magic".to_string()));
+    }
+    let mut offset = 4;
+    let mut entry_count = 0usize;
+    let mut codec = None;
+    loop {
+        let block_count = read_avro_long(data, &mut offset)?;
+        if block_count == 0 {
+            break;
+        }
+        let (block_count, expected_end) = if block_count < 0 {
+            let block_count = block_count
+                .checked_neg()
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(|| TableCatalogStoreError::Invalid("Avro header block count is invalid".to_string()))?;
+            let block_size = read_avro_long(data, &mut offset)?;
+            let block_size = usize::try_from(block_size)
+                .map_err(|_| TableCatalogStoreError::Invalid("Avro header block size is invalid".to_string()))?;
+            let expected_end = offset
+                .checked_add(block_size)
+                .filter(|end| *end <= data.len())
+                .ok_or_else(|| TableCatalogStoreError::Invalid("Avro header block exceeds the object size".to_string()))?;
+            (block_count, Some(expected_end))
+        } else {
+            let block_count = usize::try_from(block_count)
+                .map_err(|_| TableCatalogStoreError::Invalid("Avro header block count is invalid".to_string()))?;
+            (block_count, None)
+        };
+        entry_count = entry_count
+            .checked_add(block_count)
+            .filter(|count| *count <= TABLE_MANIFEST_AVRO_MAX_HEADER_ENTRIES)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Avro header has too many metadata entries".to_string()))?;
+        for _ in 0..block_count {
+            let key = read_avro_bytes(data, &mut offset)?;
+            let value = read_avro_bytes(data, &mut offset)?;
+            if key == b"avro.codec" {
+                codec = Some(value);
+            }
+        }
+        if expected_end.is_some_and(|expected_end| offset != expected_end) {
+            return Err(TableCatalogStoreError::Invalid(
+                "Avro header block size does not match its contents".to_string(),
+            ));
+        }
+    }
+    offset
+        .checked_add(16)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| TableCatalogStoreError::Invalid("Avro container is missing its sync marker".to_string()))?;
+    if codec.is_some_and(|codec| codec != b"null") {
+        return Err(TableCatalogStoreError::Invalid(
+            "compressed Avro codecs are not supported for table commit validation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_avro_long(data: &[u8], offset: &mut usize) -> TableCatalogStoreResult<i64> {
+    let mut raw = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *data
+            .get(*offset)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Avro header is truncated".to_string()))?;
+        *offset = offset
+            .checked_add(1)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Avro header offset overflowed".to_string()))?;
+        if shift == 63 && byte & 0xfe != 0 {
+            return Err(TableCatalogStoreError::Invalid("Avro long is out of range".to_string()));
+        }
+        raw |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            let magnitude =
+                i64::try_from(raw >> 1).map_err(|_| TableCatalogStoreError::Invalid("Avro long is out of range".to_string()))?;
+            let sign = if raw & 1 == 0 { 0 } else { -1 };
+            return Ok(magnitude ^ sign);
+        }
+    }
+    Err(TableCatalogStoreError::Invalid("Avro long is out of range".to_string()))
+}
+
+fn read_avro_bytes<'a>(data: &'a [u8], offset: &mut usize) -> TableCatalogStoreResult<&'a [u8]> {
+    let length = read_avro_long(data, offset)?;
+    let length = usize::try_from(length)
+        .map_err(|_| TableCatalogStoreError::Invalid("Avro header byte string length is invalid".to_string()))?;
+    let end = offset
+        .checked_add(length)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| TableCatalogStoreError::Invalid("Avro header byte string is truncated".to_string()))?;
+    let value = &data[*offset..end];
+    *offset = end;
+    Ok(value)
 }
 
 fn avro_record_field<'a>(value: &'a apache_avro::types::Value, name: &str) -> Option<&'a apache_avro::types::Value> {
@@ -12822,8 +13240,19 @@ pub(crate) fn commit_log_matches_request(commit_log: &CommitLogEntry, request: &
         && commit_log.expected_version_token == request.expected_version_token
         && commit_log.previous_metadata_location == request.expected_metadata_location
         && commit_log.new_metadata_location == request.new_metadata_location
-        && commit_log.requirements == request.requirements
+        && commit_requirements_match(&commit_log.requirements, &request.requirements)
         && commit_log.writer == request.writer
+}
+
+fn commit_requirements_match(persisted: &[serde_json::Value], requested: &[serde_json::Value]) -> bool {
+    if persisted == requested {
+        return true;
+    }
+    let Some((internal_digest, client_requirements)) = requested.split_last() else {
+        return false;
+    };
+    persisted == client_requirements
+        && internal_digest.get("type").and_then(serde_json::Value::as_str) == Some(TABLE_METADATA_DIGEST_REQUIREMENT_TYPE)
 }
 
 fn table_matches_committed_log(table: &TableEntry, commit_log: &CommitLogEntry) -> bool {
@@ -13228,6 +13657,9 @@ impl Namespace {
     pub const MAX_LEN: usize = 512;
 
     pub fn parse(value: &str) -> Result<Self, CatalogIdentifierError> {
+        if value.len() > Self::MAX_LEN {
+            return Err(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN });
+        }
         let segments = value.split('.').map(str::to_string).collect::<Vec<_>>();
         Self::from_segments(segments)
     }
@@ -13236,7 +13668,11 @@ impl Namespace {
         if values.is_empty() {
             return Err(CatalogIdentifierError::Empty);
         }
-        if value.len() > Self::MAX_LEN {
+        let value_len = values
+            .iter()
+            .try_fold(values.len().saturating_sub(1), |length, value| length.checked_add(value.len()))
+            .ok_or(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN })?;
+        if value_len > Self::MAX_LEN {
             return Err(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN });
         }
 
@@ -14082,6 +14518,17 @@ mod tests {
     type TestCatalogObjectLocks = Arc<tokio::sync::Mutex<BTreeMap<TestCatalogObjectLockKey, TestCatalogObjectLock>>>;
     type TestCatalogObjectReplacements = BTreeMap<TestCatalogObjectLockKey, BTreeMap<usize, TestCatalogObjectReplacement>>;
 
+    struct TestCatalogObjectLockGuard {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+        lost: bool,
+    }
+
+    impl TableCatalogObjectLockGuard for TestCatalogObjectLockGuard {
+        fn is_lock_lost(&self) -> bool {
+            self.lost
+        }
+    }
+
     struct TestCatalogObjectReplacement {
         data: Vec<u8>,
         preserve_etag: bool,
@@ -14114,6 +14561,7 @@ mod tests {
         pause_put_attempts: BTreeMap<(String, String), BTreeMap<usize, TestCatalogObjectPause>>,
         fail_delete_attempts: BTreeMap<(String, String), BTreeSet<usize>>,
         replace_on_write_lock_acquisitions: TestCatalogObjectReplacements,
+        lost_write_lock_acquisitions: BTreeMap<TestCatalogObjectLockKey, BTreeSet<usize>>,
         put_attempts: BTreeMap<(String, String), usize>,
         delete_attempts: BTreeMap<(String, String), usize>,
         write_lock_acquisitions: BTreeMap<(String, String), usize>,
@@ -14121,7 +14569,6 @@ mod tests {
         metadata_calls: usize,
         list_calls: usize,
         list_prefixes: Vec<(String, String)>,
-        list_page_limits: Vec<i32>,
         next_etag: u64,
     }
 
@@ -14189,16 +14636,19 @@ mod tests {
                 );
         }
 
+        async fn lose_next_write_lock(&self, bucket: &str, object: &str) {
+            let mut state = self.state.lock().await;
+            let key = (bucket.to_string(), object.to_string());
+            let attempt = state.write_lock_acquisitions.get(&key).copied().unwrap_or_default() + 1;
+            state.lost_write_lock_acquisitions.entry(key).or_default().insert(attempt);
+        }
+
         async fn list_call_count(&self) -> usize {
             self.state.lock().await.list_calls
         }
 
         async fn list_prefixes(&self) -> Vec<(String, String)> {
             self.state.lock().await.list_prefixes.clone()
-        }
-
-        async fn list_page_limits(&self) -> Vec<i32> {
-            self.state.lock().await.list_page_limits.clone()
         }
 
         async fn read_call_count(&self) -> usize {
@@ -14215,7 +14665,6 @@ mod tests {
             state.metadata_calls = 0;
             state.list_calls = 0;
             state.list_prefixes.clear();
-            state.list_page_limits.clear();
         }
 
         async fn write_lock_acquisition_count(&self, bucket: &str, object: &str) -> usize {
@@ -14328,6 +14777,10 @@ mod tests {
     }
 
     fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
+        manifest_list_avro_bytes_with_codec(manifest_paths, apache_avro::Codec::Null)
+    }
+
+    fn manifest_list_avro_bytes_with_codec(manifest_paths: &[&str], codec: apache_avro::Codec) -> Vec<u8> {
         let schema = apache_avro::Schema::parse_str(
             r#"
             {
@@ -14343,7 +14796,7 @@ mod tests {
             "#,
         )
         .expect("manifest list avro schema should parse");
-        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), codec);
         for manifest_path in manifest_paths {
             writer
                 .append(apache_avro::types::Value::Record(vec![
@@ -14416,6 +14869,10 @@ mod tests {
     }
 
     fn manifest_avro_bytes_with_status(files: &[(&str, i32, i32)]) -> Vec<u8> {
+        manifest_avro_bytes_with_status_and_codec(files, apache_avro::Codec::Null)
+    }
+
+    fn manifest_avro_bytes_with_status_and_codec(files: &[(&str, i32, i32)], codec: apache_avro::Codec) -> Vec<u8> {
         let schema = apache_avro::Schema::parse_str(
             r#"
             {
@@ -14444,7 +14901,7 @@ mod tests {
             "#,
         )
         .expect("manifest avro schema should parse");
-        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), codec);
         for (file_path, content, status) in files {
             writer
                 .append(apache_avro::types::Value::Record(vec![
@@ -14789,37 +15246,29 @@ mod tests {
             &self,
             bucket: &str,
             prefix: &str,
-            after: Option<&str>,
-            limit: i32,
-        ) -> TableCatalogStoreResult<TableCatalogPage<String>> {
-            if limit <= 0 {
-                return Err(TableCatalogStoreError::Invalid(
-                    "catalog object page limit must be greater than zero".to_string(),
-                ));
-            }
-            let limit = usize::try_from(limit)
-                .map_err(|_| TableCatalogStoreError::Invalid("catalog object page limit is too large".to_string()))?;
+            start_after: Option<&str>,
+            limit: NonZeroUsize,
+        ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
+            let limit = limit.get();
             let mut state = self.state.lock().await;
             state.list_calls += 1;
-            state.list_page_limits.push(i32::try_from(limit).unwrap_or(i32::MAX));
             let mut objects = state
                 .objects
                 .keys()
                 .filter(|(entry_bucket, object)| {
-                    entry_bucket == bucket && object.starts_with(prefix) && after.is_none_or(|after| object.as_str() > after)
+                    entry_bucket == bucket
+                        && object.starts_with(prefix)
+                        && start_after.is_none_or(|start_after| object.as_str() > start_after)
                 })
                 .map(|(_, object)| object.clone())
                 .take(limit.saturating_add(1))
                 .collect::<Vec<_>>();
-            let has_more = objects.len() > limit;
+            let is_truncated = objects.len() > limit;
             objects.truncate(limit);
-            Ok(TableCatalogPage {
-                entries: objects,
-                has_more,
-            })
+            Ok(TableCatalogObjectListPage { objects, is_truncated })
         }
 
-        async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+        async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogObjectLock> {
             let attempt = {
                 let mut state = self.state.lock().await;
                 let acquisitions = state
@@ -14839,6 +15288,10 @@ mod tests {
             };
             let guard = lock.lock_owned().await;
             let mut state = self.state.lock().await;
+            let lost = state
+                .lost_write_lock_acquisitions
+                .get(&key)
+                .is_some_and(|attempts| attempts.contains(&attempt));
             let replacement = state
                 .replace_on_write_lock_acquisitions
                 .get_mut(&key)
@@ -14866,7 +15319,7 @@ mod tests {
                 state.objects.insert(key, TestCatalogObjectRecord { data, etag, mod_time });
             }
             drop(state);
-            Ok(Box::new(guard))
+            Ok(Box::new(TestCatalogObjectLockGuard { _guard: guard, lost }))
         }
     }
 
@@ -14956,15 +15409,18 @@ mod tests {
                 .expect("namespace should be created");
         }
         for name in ["alpha", "beta"] {
-            let identifier = IdentifierSegment::parse(name).expect("table and view name should parse");
-            let metadata_location = default_table_metadata_file_path(namespace, &identifier, "00001.metadata.json");
-            let mut table = test_table_entry(bucket, namespace, &identifier, metadata_location.clone());
+            let table_identifier = IdentifierSegment::parse(name).expect("table name should parse");
+            let table_metadata_location = default_table_metadata_file_path(namespace, &table_identifier, "00001.metadata.json");
+            let mut table = test_table_entry(bucket, namespace, &table_identifier, table_metadata_location);
             table.table_id = format!("table-{name}");
             table.table_uuid = format!("table-uuid-{name}");
             table.warehouse_location = format!("s3://{bucket}/tables/table-{name}");
             store.create_table(table).await.expect("table should be created");
 
-            let mut view = test_view_entry(bucket, namespace, &identifier, metadata_location);
+            let view_name = format!("view_{name}");
+            let view_identifier = IdentifierSegment::parse(&view_name).expect("view name should parse");
+            let view_metadata_location = default_view_metadata_file_path(namespace, &view_identifier, "00001.metadata.json");
+            let mut view = test_view_entry(bucket, namespace, &view_identifier, view_metadata_location);
             view.view_id = format!("view-{name}");
             view.view_uuid = format!("view-uuid-{name}");
             view.warehouse_location = format!("s3://{bucket}/views/view-{name}");
@@ -15727,10 +16183,19 @@ mod tests {
             .delete_object(RUSTFS_META_BUCKET, &table_path)
             .await
             .expect("listed table entry should be deleted before backfill");
+        let ownership_guard = backend
+            .acquire_write_lock(store.catalog_bucket(), &store.paths.warehouse_index_ownership_lock_path(bucket))
+            .await
+            .expect("warehouse ownership lock should be acquired");
 
         for table in listed {
             store
-                .backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
+                .backfill_active_table_warehouse_index(
+                    &table.table_bucket,
+                    &table.namespace,
+                    &table.table,
+                    ownership_guard.as_ref(),
+                )
                 .await
                 .expect("backfill should skip a table deleted after listing");
         }
@@ -15779,7 +16244,7 @@ mod tests {
             .await
             .expect("first table page should load");
         assert_eq!(table_page.entries[0].table, "alpha");
-        assert_eq!(backend.read_call_count().await, 1);
+        assert_eq!(backend.read_call_count().await, 2);
         let table_page = store
             .list_tables_page(bucket, &namespace_name, table_page.next_cursor.as_deref(), one)
             .await
@@ -15791,12 +16256,12 @@ mod tests {
             .list_views_page(bucket, &namespace_name, None, one)
             .await
             .expect("first view page should load");
-        assert_eq!(view_page.entries[0].view, "alpha");
+        assert_eq!(view_page.entries[0].view, "view_alpha");
         let view_page = store
             .list_views_page(bucket, &namespace_name, view_page.next_cursor.as_deref(), one)
             .await
             .expect("second view page should load");
-        assert_eq!(view_page.entries[0].view, "beta");
+        assert_eq!(view_page.entries[0].view, "view_beta");
         assert!(view_page.next_cursor.is_none());
 
         let exact_page = store
@@ -15855,6 +16320,61 @@ mod tests {
         assert_eq!(second.entries[0].namespace, namespace.public_name());
         assert!(second.next_cursor.is_none());
         assert_eq!(backend.list_call_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn object_catalog_pagination_does_not_emit_token_for_trailing_inactive_entry() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let alpha = IdentifierSegment::parse("alpha").expect("table should parse");
+        let beta = IdentifierSegment::parse("beta").expect("table should parse");
+        let mut active = test_table_entry(
+            bucket,
+            &namespace,
+            &alpha,
+            default_table_metadata_file_path(&namespace, &alpha, "00001.metadata.json"),
+        );
+        active.table_id = "alpha-id".to_string();
+        active.warehouse_location = format!("s3://{bucket}/tables/alpha-id");
+        let mut inactive = test_table_entry(
+            bucket,
+            &namespace,
+            &beta,
+            default_table_metadata_file_path(&namespace, &beta, "00001.metadata.json"),
+        );
+        inactive.table_id = "beta-id".to_string();
+        inactive.warehouse_location = format!("s3://{bucket}/tables/beta-id");
+        inactive.state = TableCatalogEntryState::Deleted;
+
+        for entry in [&active, &inactive] {
+            let table = IdentifierSegment::parse(entry.table.clone()).expect("table should parse");
+            store
+                .write_entry(
+                    store.catalog_bucket(),
+                    &store.paths.table_entry_path(bucket, &namespace, &table),
+                    entry,
+                    TableCatalogPutPrecondition::Any,
+                )
+                .await
+                .expect("table entry should be seeded");
+        }
+        backend.reset_call_counts().await;
+
+        let page = store
+            .list_tables_page(
+                bucket,
+                &namespace.public_name(),
+                None,
+                NonZeroUsize::new(1).expect("page size should be non-zero"),
+            )
+            .await
+            .expect("table page should load");
+
+        assert_eq!(page.entries, vec![active]);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(backend.read_call_count().await, 2);
     }
 
     #[tokio::test]
@@ -18418,6 +18938,46 @@ mod tests {
             error,
             TableCatalogStoreError::Invalid(message) if message.contains("content must be an int")
         );
+    }
+
+    #[test]
+    fn table_commit_manifest_readers_reject_compressed_avro() {
+        let codec = apache_avro::Codec::Deflate(apache_avro::DeflateSettings::default());
+        let manifest_list = manifest_list_avro_bytes_with_codec(&["metadata/manifest.avro"], codec);
+        let manifest = manifest_avro_bytes_with_status_and_codec(&[("data/part.parquet", 0, 1)], codec);
+
+        for result in [
+            manifest_list_references_from_manifest_list_avro(&manifest_list).map(|_| ()),
+            data_file_references_from_manifest_avro(&manifest).map(|_| ()),
+        ] {
+            assert_matches!(
+                result,
+                Err(TableCatalogStoreError::Invalid(message))
+                    if message.contains("compressed Avro codecs are not supported")
+            );
+        }
+    }
+
+    #[test]
+    fn commit_requirements_accept_legacy_logs_without_internal_metadata_digest() {
+        let client_requirement = serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"});
+        let internal_digest = serde_json::json!({
+            "type": TABLE_METADATA_DIGEST_REQUIREMENT_TYPE,
+            "sha256": "digest"
+        });
+
+        assert!(commit_requirements_match(
+            std::slice::from_ref(&client_requirement),
+            &[client_requirement.clone(), internal_digest.clone()],
+        ));
+        assert!(commit_requirements_match(
+            &[client_requirement.clone(), internal_digest.clone()],
+            &[client_requirement.clone(), internal_digest.clone()],
+        ));
+        assert!(!commit_requirements_match(
+            std::slice::from_ref(&client_requirement),
+            &[internal_digest, client_requirement.clone()],
+        ));
     }
 
     #[tokio::test]
@@ -21117,12 +21677,12 @@ mod tests {
             .list_views_page(bucket, &namespace_name, None, one)
             .await
             .expect("first strong view page should load");
-        assert_eq!(first.entries[0].view, "alpha");
+        assert_eq!(first.entries[0].view, "view_alpha");
         let second = store
             .list_views_page(bucket, &namespace_name, first.next_cursor.as_deref(), one)
             .await
             .expect("second strong view page should load");
-        assert_eq!(second.entries[0].view, "beta");
+        assert_eq!(second.entries[0].view, "view_beta");
         assert!(second.next_cursor.is_none());
 
         let exact = NonZeroUsize::new(2).expect("exact page size should be non-zero");
@@ -22856,6 +23416,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_table_catalog_store_does_not_commit_after_warehouse_ownership_lock_loss() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .unwrap();
+        store.backfill_table_warehouse_index(bucket).await.unwrap();
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend
+            .lose_next_write_lock(store.catalog_bucket(), &store.paths.warehouse_index_ownership_lock_path(bucket))
+            .await;
+
+        let error = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-lock-loss".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata.clone(),
+                new_metadata_location: new_metadata,
+                requirements: Vec::new(),
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .expect_err("a lost warehouse ownership lock must prevent the table CAS");
+
+        assert_matches!(
+            error,
+            TableCatalogStoreError::Conflict(message) if message.contains("lock lease was lost")
+        );
+        let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
+        assert_eq!(loaded.metadata_location, current_metadata);
+        assert!(
+            store
+                .get_commit_by_id(bucket, "table-id", "commit-lock-loss")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn object_table_catalog_store_syncs_warehouse_location_from_committed_metadata() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -24190,10 +24807,11 @@ mod tests {
                 view.warehouse_location = format!("s3://{bucket}/views/{view_name}-id");
                 store.create_view(view).await.expect("view should be created");
             }
-            backend.reset_call_counts().await;
+            let one = NonZeroUsize::new(1).expect("one is non-zero");
+            let two = NonZeroUsize::new(2).expect("two is non-zero");
 
             let table_page = store
-                .list_tables_page(bucket, "sales", None, 2)
+                .list_tables_page(bucket, "sales", None, two)
                 .await
                 .expect("table page should load");
             assert_eq!(
@@ -24204,9 +24822,15 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["alpha", "beta"]
             );
-            assert!(table_page.has_more);
+            assert!(table_page.next_cursor.is_some());
+            let table_cursor = store
+                .list_tables_page(bucket, "sales", None, one)
+                .await
+                .expect("single table page should load")
+                .next_cursor
+                .expect("single table page should return a cursor");
             let exact_table_page = store
-                .list_tables_page(bucket, "sales", Some("alpha"), 2)
+                .list_tables_page(bucket, "sales", Some(&table_cursor), two)
                 .await
                 .expect("exact table page should load");
             assert_eq!(
@@ -24217,19 +24841,25 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["beta", "gamma"]
             );
-            assert!(!exact_table_page.has_more);
+            assert!(exact_table_page.next_cursor.is_none());
 
             let view_page = store
-                .list_views_page(bucket, "sales", None, 2)
+                .list_views_page(bucket, "sales", None, two)
                 .await
                 .expect("view page should load");
             assert_eq!(
                 view_page.entries.iter().map(|entry| entry.view.as_str()).collect::<Vec<_>>(),
                 vec!["view_alpha", "view_beta"]
             );
-            assert!(view_page.has_more);
+            assert!(view_page.next_cursor.is_some());
+            let view_cursor = store
+                .list_views_page(bucket, "sales", None, one)
+                .await
+                .expect("single view page should load")
+                .next_cursor
+                .expect("single view page should return a cursor");
             let exact_view_page = store
-                .list_views_page(bucket, "sales", Some("view_alpha"), 2)
+                .list_views_page(bucket, "sales", Some(&view_cursor), two)
                 .await
                 .expect("exact view page should load");
             assert_eq!(
@@ -24240,15 +24870,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["view_beta", "view_gamma"]
             );
-            assert!(!exact_view_page.has_more);
-            assert_eq!(
-                backend.list_page_limits().await,
-                if mode == TableCatalogBackingMode::ObjectBacked {
-                    vec![3, 3, 3, 3]
-                } else {
-                    Vec::new()
-                }
-            );
+            assert!(exact_view_page.next_cursor.is_none());
         }
     }
 
