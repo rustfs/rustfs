@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 
 /// Machine-readable category of a restore blocker.
 ///
-/// The first six codes mirror the [`BackupError`] variants; the remaining
-/// codes cover preflight conditions that are not bundle defects.
+/// The first six codes mirror the [`BackupError`] variants (two of which map
+/// onto `UnknownFormatVersion`, for the manifest and for a bundled key
+/// record); the remaining codes cover preflight conditions that are not
+/// bundle defects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestoreBlockerCode {
@@ -73,6 +75,7 @@ impl From<&BackupError> for RestoreBlocker {
             BackupError::WrongKek { .. } => RestoreBlockerCode::WrongBackupKek,
             BackupError::MissingArtifact { .. } => RestoreBlockerCode::MissingArtifact,
             BackupError::IncompleteBundle { .. } => RestoreBlockerCode::IncompleteBundle,
+            BackupError::UnsupportedRecordVersion { .. } => RestoreBlockerCode::UnknownFormatVersion,
         };
         Self {
             code,

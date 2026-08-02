@@ -54,7 +54,7 @@
 
 use crate::backends::local::{
     LOCAL_KMS_MASTER_KEY_SALT_FILE, LOCAL_KMS_MASTER_KEY_SALT_LEN, LOCAL_RESTORE_COMMIT_MARKER_FILE, LocalKmsClient,
-    StoredKeyProtection, durable_file, is_orphan_commit_temp_name, validate_key_id,
+    StoredKeyProtection, durable_file, is_orphan_commit_temp_name, unknown_protection_marker, validate_key_id,
 };
 use crate::backup::capability::AtRestProtection;
 use crate::backup::dry_run::{
@@ -605,6 +605,14 @@ fn decode_key_record(
         .to_string();
     validate_key_id(&stem)?;
 
+    // Classify the protection marker before the schema parse: a record from a
+    // newer build is not a damaged bundle, and reporting it as corruption
+    // sends the operator into disaster recovery instead of a version change.
+    let unknown_marker = unknown_protection_marker(&plaintext)
+        .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' is not valid JSON: {error}")))?;
+    if let Some(version) = unknown_marker {
+        return Err(BackupError::UnsupportedRecordVersion { key_id: stem, version }.into());
+    }
     let probe: RestoredRecordProbe = serde_json::from_slice(&plaintext)
         .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' does not deserialize: {error}")))?;
     if probe.key_id != stem {
