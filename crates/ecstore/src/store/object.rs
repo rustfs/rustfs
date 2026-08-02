@@ -188,7 +188,6 @@ async fn prepare_prefix_tier_delete_journal_entries(
     }
     Ok(persisted)
 }
-
 async fn delete_prefix_with_tier_delete_journal(
     store: &ECStore,
     bucket: &str,
