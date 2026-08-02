@@ -16,11 +16,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required to allocate an ephemeral loopback port" >&2
   exit 1
 fi
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required to verify the ephemeral Vault mounts" >&2
-  exit 1
-fi
-
 TMP_DIR="$(mktemp -d -t rustfs-vault-approle-live.XXXXXX)"
 VAULT_PID=""
 
@@ -81,15 +76,8 @@ if [[ "$ready" != 1 ]]; then
   exit 1
 fi
 
-if ! vault_cli secrets list -format=json | jq -e 'has("secret/")' >/dev/null; then
-  vault_cli secrets enable -path=secret kv-v2 >/dev/null
-fi
-if ! vault_cli secrets list -format=json | jq -e 'has("transit/")' >/dev/null; then
-  vault_cli secrets enable -path=transit transit >/dev/null
-fi
-if ! vault_cli auth list -format=json | jq -e 'has("approle/")' >/dev/null; then
-  vault_cli auth enable approle >/dev/null
-fi
+vault_cli secrets enable -path=transit transit >/dev/null
+vault_cli auth enable approle >/dev/null
 
 POLICY_NAME="rustfs-kms-live-$$"
 ROLE_NAME="rustfs-kms-live-$$"

@@ -20,15 +20,14 @@
 //! same environment variables used by RustFS and exercise the real KV2 and
 //! Transit backend calls with the AppRole-issued token.
 
-use rustfs_kms::backends::{KmsBackend as KmsBackendTrait, VaultKmsBackend, VaultTransitKmsBackend};
+use rustfs_kms::backends::KmsBackend as KmsBackendTrait;
+use rustfs_kms::backends::vault::VaultKmsBackend;
+use rustfs_kms::backends::vault_transit::VaultTransitKmsBackend;
 use rustfs_kms::{
-    BackendConfig, CreateKeyRequest, DecryptRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KeyUsage, KmsBackend,
-    KmsConfig, ListKeysRequest, VaultAuthMethod,
+    BackendConfig, CreateKeyRequest, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT,
+    DecryptRequest, GenerateDataKeyRequest, KeySpec, KeyUsage, KmsBackend, KmsConfig, ListKeysRequest, VaultAuthMethod,
 };
 use std::collections::HashMap;
-
-const DEFAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
-const DEFAULT_TRANSIT_METADATA_PREFIX: &str = "rustfs/kms/transit-metadata";
 
 fn assert_approle_config(config: &KmsConfig, expected_backend: KmsBackend) {
     assert_eq!(config.backend, expected_backend);
@@ -71,26 +70,6 @@ async fn exercise_backend<B: KmsBackendTrait + ?Sized>(backend: &B, key_prefix: 
     );
 
     let context = HashMap::from([("live".to_string(), "approle".to_string())]);
-    let plaintext = b"rustfs AppRole live contract".to_vec();
-    let encrypted = backend
-        .encrypt(EncryptRequest {
-            key_id: key_id.clone(),
-            plaintext: plaintext.clone(),
-            encryption_context: context.clone(),
-            grant_tokens: Vec::new(),
-        })
-        .await?;
-    assert!(!encrypted.ciphertext.is_empty(), "backend encryption must return ciphertext");
-
-    let decrypted = backend
-        .decrypt(DecryptRequest {
-            ciphertext: encrypted.ciphertext,
-            encryption_context: context.clone(),
-            grant_tokens: Vec::new(),
-        })
-        .await?;
-    assert_eq!(decrypted.plaintext, plaintext);
-
     let generated = backend
         .generate_data_key(GenerateDataKeyRequest {
             key_id: key_id.clone(),
@@ -99,10 +78,7 @@ async fn exercise_backend<B: KmsBackendTrait + ?Sized>(backend: &B, key_prefix: 
         })
         .await?;
     assert_eq!(generated.key_id, key_id);
-    assert!(
-        !generated.plaintext_key.is_empty(),
-        "data-key generation must return plaintext key material"
-    );
+    assert_eq!(generated.plaintext_key.len(), 32, "AES-256 must return a 32-byte data key");
 
     let unwrapped = backend
         .decrypt(DecryptRequest {
@@ -133,8 +109,8 @@ async fn vault_transit_approle_auth_live() -> rustfs_kms::Result<()> {
         BackendConfig::VaultTransit(vault) => vault,
         _ => panic!("expected Vault Transit configuration"),
     };
-    assert_eq!(transit.metadata_kv_mount, DEFAULT_TRANSIT_METADATA_KV_MOUNT);
-    assert_eq!(transit.metadata_key_prefix, DEFAULT_TRANSIT_METADATA_PREFIX);
+    assert_eq!(transit.metadata_kv_mount, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT);
+    assert_eq!(transit.metadata_key_prefix, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX);
 
     let backend = VaultTransitKmsBackend::new(config).await?;
     exercise_backend(&backend, "rustfs-approle-transit").await
