@@ -35,6 +35,10 @@ use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+use rustfs_replication::{
+    REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+};
 use rustfs_security_governance::{AdminRouteSpec, HttpMethod};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -644,6 +648,7 @@ pub struct RuntimeCapabilitiesSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    pub replication: ReplicationCapabilities,
     pub manual_transition_jobs: ManualTransitionJobCapabilities,
     pub diagnostic_probes: DiagnosticProbeCapabilities,
     pub inspect_archive: super::inspect_archive::InspectArchiveCapability,
@@ -655,6 +660,100 @@ pub struct RuntimeCapabilitiesResponse {
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationFieldState {
+    Supported,
+    ReadOnlyHistorical,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReplicationFieldCapability {
+    pub name: &'static str,
+    pub state: ReplicationFieldState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplicationFeatureCapabilities {
+    pub contract_version: u32,
+    pub status: CapabilityStatus,
+    pub fields: Vec<ReplicationFieldCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplicationCapabilities {
+    pub contract_version: u32,
+    pub bucket_replication: ReplicationFeatureCapabilities,
+    pub remote_targets: ReplicationFeatureCapabilities,
+    pub mixed_version_policy: &'static str,
+}
+
+impl ReplicationCapabilities {
+    fn current() -> Self {
+        let remote_target_routes = [
+            admin_route_capability(HttpMethod::Get, "/rustfs/admin/v3/list-remote-targets"),
+            admin_route_capability(HttpMethod::Put, "/rustfs/admin/v3/set-remote-target"),
+            admin_route_capability(HttpMethod::Delete, "/rustfs/admin/v3/remove-remote-target"),
+        ];
+        let remote_targets_supported = remote_target_routes
+            .iter()
+            .all(|status| status.state == CapabilityState::Supported);
+
+        Self {
+            contract_version: REPLICATION_CAPABILITY_CONTRACT_VERSION,
+            bucket_replication: ReplicationFeatureCapabilities {
+                contract_version: REPLICATION_CAPABILITY_CONTRACT_VERSION,
+                status: CapabilityStatus::supported()
+                    .with_reason("bucket replication validation and execution contracts are registered"),
+                fields: REPLICATION_WRITABLE_FIELDS
+                    .iter()
+                    .copied()
+                    .map(|name| ReplicationFieldCapability {
+                        name,
+                        state: ReplicationFieldState::Supported,
+                    })
+                    .chain(
+                        REPLICATION_READ_ONLY_HISTORICAL_FIELDS
+                            .iter()
+                            .copied()
+                            .map(|name| ReplicationFieldCapability {
+                                name,
+                                state: ReplicationFieldState::ReadOnlyHistorical,
+                            }),
+                    )
+                    .collect(),
+            },
+            remote_targets: ReplicationFeatureCapabilities {
+                contract_version: REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION,
+                status: if remote_targets_supported {
+                    CapabilityStatus::supported().with_reason("remote target routes and field validation are registered")
+                } else {
+                    CapabilityStatus::unsupported().with_reason("one or more remote target routes are unavailable")
+                },
+                fields: REMOTE_TARGET_WRITABLE_FIELDS
+                    .iter()
+                    .copied()
+                    .map(|name| ReplicationFieldCapability {
+                        name,
+                        state: ReplicationFieldState::Supported,
+                    })
+                    .chain(
+                        REMOTE_TARGET_UNSUPPORTED_FIELDS
+                            .iter()
+                            .copied()
+                            .map(|name| ReplicationFieldCapability {
+                                name,
+                                state: ReplicationFieldState::Unsupported,
+                            }),
+                    )
+                    .collect(),
+            },
+            mixed_version_policy: "fail_closed_when_capability_unknown_or_unsupported",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -871,6 +970,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        replication: ReplicationCapabilities::current(),
         manual_transition_jobs: ManualTransitionJobCapabilities::current(),
         diagnostic_probes: DiagnosticProbeCapabilities::current(),
         inspect_archive: super::inspect_archive::InspectArchiveCapability::current(local_drive_count),
@@ -1144,6 +1244,41 @@ mod tests {
         assert_eq!(response.summary.site_replication_resync.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_repair.state, CapabilityState::Supported);
         assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
+        assert_eq!(response.replication.contract_version, 1);
+        assert_eq!(response.replication.bucket_replication.contract_version, 1);
+        assert_eq!(response.replication.remote_targets.contract_version, 1);
+        assert_eq!(response.replication.bucket_replication.status.state, CapabilityState::Supported);
+        assert_eq!(response.replication.remote_targets.status.state, CapabilityState::Supported);
+        assert_eq!(
+            response.replication.mixed_version_policy,
+            "fail_closed_when_capability_unknown_or_unsupported"
+        );
+        assert!(
+            response
+                .replication
+                .bucket_replication
+                .fields
+                .iter()
+                .any(|field| field.name == "Rule.DeleteReplication.Status"
+                    && field.state == super::ReplicationFieldState::Supported)
+        );
+        assert!(
+            response
+                .replication
+                .bucket_replication
+                .fields
+                .iter()
+                .any(|field| field.name == "Destination.EncryptionConfiguration"
+                    && field.state == super::ReplicationFieldState::ReadOnlyHistorical)
+        );
+        assert!(
+            response
+                .replication
+                .remote_targets
+                .fields
+                .iter()
+                .any(|field| field.name == "disableProxy" && field.state == super::ReplicationFieldState::Unsupported)
+        );
         assert_eq!(response.manual_transition_jobs.contract_version, 1);
         assert_eq!(response.manual_transition_jobs.status.state, CapabilityState::Supported);
         assert_eq!(response.manual_transition_jobs.modes, ["enqueue_only", "async"]);
@@ -1203,6 +1338,29 @@ mod tests {
         assert_eq!(value["summary"]["site_replication_resync"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_repair"]["state"], "supported");
         assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
+        assert_eq!(value["replication"]["contract_version"], 1);
+        assert_eq!(value["replication"]["bucket_replication"]["contract_version"], 1);
+        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 1);
+        assert_eq!(value["replication"]["bucket_replication"]["status"]["state"], "supported");
+        assert_eq!(value["replication"]["remote_targets"]["status"]["state"], "supported");
+        assert_eq!(
+            value["replication"]["mixed_version_policy"],
+            "fail_closed_when_capability_unknown_or_unsupported"
+        );
+        assert!(
+            value["replication"]["bucket_replication"]["fields"]
+                .as_array()
+                .expect("bucket replication fields should be an array")
+                .iter()
+                .any(|field| field["name"] == "Destination.EncryptionConfiguration" && field["state"] == "read_only_historical")
+        );
+        assert!(
+            value["replication"]["remote_targets"]["fields"]
+                .as_array()
+                .expect("remote target fields should be an array")
+                .iter()
+                .any(|field| field["name"] == "disableProxy" && field["state"] == "unsupported")
+        );
         assert_eq!(value["manual_transition_jobs"]["contract_version"], 1);
         assert_eq!(value["manual_transition_jobs"]["status"]["state"], "supported");
         assert_eq!(value["manual_transition_jobs"]["modes"], json!(["enqueue_only", "async"]));

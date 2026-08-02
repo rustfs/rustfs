@@ -9080,6 +9080,7 @@ dependencies = [
  "rustfs-policy",
  "rustfs-protocols",
  "rustfs-protos",
+ "rustfs-replication",
  "rustfs-rio",
  "rustfs-s3-ops",
  "rustfs-s3-types",
