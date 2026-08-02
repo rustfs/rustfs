@@ -229,6 +229,7 @@ ROLE_ID="$(vault_exec "$OLD_LEADER" read -field=role_id "auth/approle/role/${ROL
 SECRET_ID="$(vault_exec "$OLD_LEADER" write -f -field=secret_id "auth/approle/role/${ROLE_NAME}/secret-id")"
 
 cd "$PROJECT_ROOT"
+cargo test -p rustfs-kms --test vault_ha_failover_live --no-run
 env \
   -u RUSTFS_KMS_VAULT_TOKEN \
   -u RUSTFS_KMS_VAULT_TOKEN_FILE \

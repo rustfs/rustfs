@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use metrics_util::MetricKind;
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rustfs_kms::backends::KmsBackend as KmsBackendTrait;
 use rustfs_kms::backends::vault::VaultKmsBackend;
 use rustfs_kms::backends::vault_transit::VaultTransitKmsBackend;
@@ -151,6 +151,19 @@ fn histogram_values(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)
         .collect()
 }
 
+fn retryable_failures(snapshot: &[MetricEntry], operation: &str) -> u64 {
+    ["retryable_conn", "retryable_status", "attempt_timeout"]
+        .into_iter()
+        .map(|error_class| {
+            counter_value(
+                snapshot,
+                ATTEMPT_FAILURES_TOTAL,
+                &[("operation", operation), ("error_class", error_class)],
+            )
+        })
+        .sum()
+}
+
 async fn wait_for_count(counter: &AtomicU64, minimum: u64, description: &str) {
     tokio::time::timeout(Duration::from_secs(20), async {
         while counter.load(Ordering::SeqCst) < minimum {
@@ -192,7 +205,7 @@ async fn decrypt_loop<B: KmsBackendTrait + Send + Sync + 'static>(
     }
 }
 
-async fn exercise_failover() {
+async fn exercise_failover(snapshotter: &Snapshotter) {
     let address = required_env("RUSTFS_TEST_VAULT_ADDRESS");
     let marker = PathBuf::from(required_env("RUSTFS_TEST_VAULT_FAILOVER_MARKER"));
     let elected = marker.with_extension("elected");
@@ -252,6 +265,30 @@ async fn exercise_failover() {
         grant_tokens: Vec::new(),
     };
 
+    for _ in 0..2 {
+        let kv2_response = kv2
+            .decrypt(kv2_request.clone())
+            .await
+            .expect("healthy KV2 decrypt before failover");
+        assert_eq!(kv2_response.plaintext, kv2_data_key.plaintext_key);
+        let transit_response = transit
+            .decrypt(transit_request.clone())
+            .await
+            .expect("healthy Transit decrypt before failover");
+        assert_eq!(transit_response.plaintext, transit_data_key.plaintext_key);
+    }
+    let baseline = snapshotter.snapshot().into_vec();
+    assert_eq!(
+        retryable_failures(&baseline, "vault_kv2_read_key"),
+        0,
+        "healthy KV2 baseline must not retry"
+    );
+    assert_eq!(
+        retryable_failures(&baseline, "vault_transit_decrypt"),
+        0,
+        "healthy Transit baseline must not retry"
+    );
+
     let stop = CancellationToken::new();
     let failed = Arc::new(AtomicBool::new(false));
     let kv2_completed = Arc::new(AtomicU64::new(0));
@@ -302,17 +339,10 @@ fn vault_raft_leader_failure_preserves_kv2_and_transit_decrypts() {
             .enable_all()
             .build()
             .expect("current-thread runtime must build")
-            .block_on(exercise_failover());
+            .block_on(exercise_failover(&snapshotter));
     });
     let snapshot = snapshotter.snapshot().into_vec();
 
-    let retryable_failures = counter_value(&snapshot, ATTEMPT_FAILURES_TOTAL, &[("error_class", "retryable_conn")])
-        + counter_value(&snapshot, ATTEMPT_FAILURES_TOTAL, &[("error_class", "retryable_status")])
-        + counter_value(&snapshot, ATTEMPT_FAILURES_TOTAL, &[("error_class", "attempt_timeout")]);
-    assert!(
-        retryable_failures > 0,
-        "the killed leader must be observed as a retryable attempt failure"
-    );
     assert_eq!(
         counter_value(&snapshot, OPERATIONS_TOTAL, &[("outcome", "circuit_open")]),
         0,
@@ -328,6 +358,10 @@ fn vault_raft_leader_failure_preserves_kv2_and_transit_decrypts() {
         ("vault-kv2", "vault_kv2_read_key"),
         ("vault-transit", "vault_transit_decrypt"),
     ] {
+        assert!(
+            retryable_failures(&snapshot, operation) > 0,
+            "{operation} must observe the killed leader as a retryable attempt failure"
+        );
         let attempts = histogram_values(&snapshot, OPERATION_ATTEMPTS, &[("operation", operation), ("outcome", "success")]);
         assert!(!attempts.is_empty(), "{operation} must record successful attempts");
         assert!(
