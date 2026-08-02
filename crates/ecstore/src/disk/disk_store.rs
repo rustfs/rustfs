@@ -488,6 +488,25 @@ impl DiskHealthTracker {
         }
     }
 
+    pub(crate) fn metric_epoch_for_reconnect(&self) -> Self {
+        let tracker = Self::new();
+        {
+            let source_metrics = self.operation_metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut target_metrics = tracker
+                .operation_metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *target_metrics = source_metrics.clone();
+        }
+        tracker
+            .total_errors_availability
+            .store(self.total_errors_availability.load(Ordering::Relaxed), Ordering::Relaxed);
+        tracker
+            .total_errors_timeout
+            .store(self.total_errors_timeout.load(Ordering::Relaxed), Ordering::Relaxed);
+        tracker
+    }
+
     pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
         let ts = self.last_capacity_probe_unix_secs.load(Ordering::Acquire);
         if ts <= 0 {
@@ -821,8 +840,8 @@ impl LocalDiskWrapper {
         wrapper
     }
 
-    pub(crate) fn health_tracker_for_reconnect(&self) -> Arc<DiskHealthTracker> {
-        self.health.clone()
+    pub(crate) fn health_tracker_epoch_for_reconnect(&self) -> Arc<DiskHealthTracker> {
+        Arc::new(self.health.metric_epoch_for_reconnect())
     }
 
     pub fn get_disk(&self) -> Arc<LocalDisk> {

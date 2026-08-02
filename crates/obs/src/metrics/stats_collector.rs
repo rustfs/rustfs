@@ -1378,6 +1378,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
 
 pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRuntimeStats> {
     let metrics = global_metrics().report().await;
+    let runtime_details = global_metrics().scanner_runtime_details_report();
     let now = Utc::now();
     let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
     let bucket_scans_started = scanner_bucket_scans_started(&metrics.life_time_ops, bucket_scans_finished);
@@ -1408,9 +1409,11 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
         source_work: scanner_source_work_stats(&metrics.source_work),
         current_cycle_source_work: scanner_current_cycle_source_work_stats(&metrics),
         last_cycle_source_work: scanner_source_work_stats(&metrics.last_cycle_source_work),
-        bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.bucket_drive_results),
-        current_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.current_cycle_bucket_drive_results),
-        last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.last_cycle_bucket_drive_results),
+        bucket_drive_results: scanner_bucket_drive_result_stats(&runtime_details.bucket_drive_results),
+        current_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(
+            &runtime_details.current_cycle_bucket_drive_results,
+        ),
+        last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&runtime_details.last_cycle_bucket_drive_results),
         stats: ScannerStats {
             bucket_scans_finished,
             bucket_scans_started,

@@ -72,6 +72,9 @@ mod tests {
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
     use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    static S3_OP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Collect the label-key sets recorded against `rustfs_s3_operations_total`.
     fn ops_metric_label_key_sets(recorder: &DebuggingRecorder) -> Vec<HashSet<String>> {
@@ -90,6 +93,7 @@ mod tests {
 
     #[test]
     fn record_s3_op_labels_by_op_only_no_bucket() {
+        let _guard = S3_OP_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let recorder = DebuggingRecorder::new();
         let label_key_sets = ops_metric_label_key_sets(&recorder);
 
@@ -105,6 +109,7 @@ mod tests {
 
     #[test]
     fn record_s3_op_cardinality_bounded_by_distinct_ops() {
+        let _guard = S3_OP_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
@@ -146,6 +151,7 @@ mod tests {
 
     #[test]
     fn s3_op_metrics_snapshot_reports_recorded_totals() {
+        let _guard = S3_OP_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = s3_op_metrics_snapshot()
             .into_iter()
             .find(|snapshot| snapshot.op == S3Operation::GetObject.as_str())

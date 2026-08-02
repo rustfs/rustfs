@@ -299,7 +299,7 @@ type AuditTargetKey = (String, String); // (server, target_id)
 type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
 type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
 type DriveInfoKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, disk_id)
-type ScannerBucketDriveResultKey = (String, String, String, String); // (server, bucket, drive, result)
+type ScannerBucketDriveResultKey = (String, String, String, String, String); // (server, cycle_scope, bucket, drive, result)
 
 fn drive_info_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveInfoKey> {
     stats.iter().filter_map(drive_info_key).collect()
@@ -329,21 +329,38 @@ fn retire_drive_info_metric_series(key: &DriveInfoKey) -> usize {
     retire_metric_series(&DRIVE_INFO_MD.get_full_metric_name(), &labels)
 }
 
-fn scanner_last_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerBucketDriveResultKey> {
+fn scanner_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerBucketDriveResultKey> {
     stats
-        .last_cycle_bucket_drive_results
+        .current_cycle_bucket_drive_results
         .iter()
-        .map(|result| (stats.server.clone(), result.bucket.clone(), result.drive.clone(), result.result.clone()))
+        .map(|result| {
+            (
+                stats.server.clone(),
+                "current".to_string(),
+                result.bucket.clone(),
+                result.drive.clone(),
+                result.result.clone(),
+            )
+        })
+        .chain(stats.last_cycle_bucket_drive_results.iter().map(|result| {
+            (
+                stats.server.clone(),
+                "last".to_string(),
+                result.bucket.clone(),
+                result.drive.clone(),
+                result.result.clone(),
+            )
+        }))
         .collect()
 }
 
 fn retire_scanner_last_bucket_drive_result_metric_series(key: &ScannerBucketDriveResultKey) -> usize {
     let labels = [
         (SERVER_LABEL, Cow::Owned(key.0.clone())),
-        (SCANNER_CYCLE_SCOPE_LABEL, Cow::Borrowed("last")),
-        (SCANNER_BUCKET_LABEL, Cow::Owned(key.1.clone())),
-        (SCANNER_DRIVE_LABEL, Cow::Owned(key.2.clone())),
-        (SCANNER_RESULT_LABEL, Cow::Owned(key.3.clone())),
+        (SCANNER_CYCLE_SCOPE_LABEL, Cow::Owned(key.1.clone())),
+        (SCANNER_BUCKET_LABEL, Cow::Owned(key.2.clone())),
+        (SCANNER_DRIVE_LABEL, Cow::Owned(key.3.clone())),
+        (SCANNER_RESULT_LABEL, Cow::Owned(key.4.clone())),
     ];
     retire_metric_series(&SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD.get_full_metric_name(), &labels)
 }
@@ -2037,7 +2054,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
                             let mut retire_scanner_last_bucket_drive_result_keys = Vec::new();
                             if let Some(stats) = collect_scanner_runtime_metric_stats().await {
-                                let current_keys = scanner_last_bucket_drive_result_live_keys(&stats);
+                                let current_keys = scanner_bucket_drive_result_live_keys(&stats);
                                 if has_seen_scanner_snapshot {
                                     retire_scanner_last_bucket_drive_result_keys = prev_scanner_last_bucket_drive_result_keys
                                         .difference(&current_keys)
@@ -2419,6 +2436,19 @@ mod tests {
         }
     }
 
+    fn scanner_stats_with_current_result(bucket: &str) -> ScannerRuntimeStats {
+        ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            current_cycle_bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
+                bucket: bucket.to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn drive_info_live_keys_detect_disk_identity_replacement() {
         let previous = drive_info_live_keys(&[drive_info_stat("disk-old")]);
@@ -2445,12 +2475,42 @@ mod tests {
 
     #[test]
     fn scanner_last_bucket_drive_result_keys_detect_superseded_cycle_results() {
-        let previous = scanner_last_bucket_drive_result_live_keys(&scanner_stats_with_last_result("photos"));
-        let current = scanner_last_bucket_drive_result_live_keys(&scanner_stats_with_last_result("logs"));
+        let previous = scanner_bucket_drive_result_live_keys(&scanner_stats_with_last_result("photos"));
+        let current = scanner_bucket_drive_result_live_keys(&scanner_stats_with_last_result("logs"));
         let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
 
-        assert!(retired.contains(&("server-a".to_string(), "photos".to_string(), "/data1".to_string(), "success".to_string(),)));
-        assert!(current.contains(&("server-a".to_string(), "logs".to_string(), "/data1".to_string(), "success".to_string(),)));
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "last".to_string(),
+            "photos".to_string(),
+            "/data1".to_string(),
+            "success".to_string(),
+        )));
+        assert!(current.contains(&(
+            "server-a".to_string(),
+            "last".to_string(),
+            "logs".to_string(),
+            "/data1".to_string(),
+            "success".to_string(),
+        )));
+    }
+
+    #[test]
+    fn scanner_bucket_drive_result_keys_detect_completed_current_cycle_results() {
+        let previous = scanner_bucket_drive_result_live_keys(&scanner_stats_with_current_result("photos"));
+        let current = scanner_bucket_drive_result_live_keys(&ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            ..Default::default()
+        });
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "current".to_string(),
+            "photos".to_string(),
+            "/data1".to_string(),
+            "success".to_string(),
+        )));
     }
 
     #[test]

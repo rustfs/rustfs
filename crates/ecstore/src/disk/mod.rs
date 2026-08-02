@@ -143,9 +143,9 @@ impl Disk {
         }
     }
 
-    pub(crate) fn local_health_tracker_for_reconnect(&self) -> Option<Arc<disk_store::DiskHealthTracker>> {
+    pub(crate) fn local_health_tracker_epoch_for_reconnect(&self) -> Option<Arc<disk_store::DiskHealthTracker>> {
         match self {
-            Disk::Local(local_disk) => Some(local_disk.health_tracker_for_reconnect()),
+            Disk::Local(local_disk) => Some(local_disk.health_tracker_epoch_for_reconnect()),
             Disk::Remote(_) => None,
         }
     }

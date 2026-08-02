@@ -328,7 +328,7 @@ impl SetDisks {
                 .iter()
                 .filter_map(|disk| disk.as_ref())
                 .find(|disk| disk.endpoint() == *ep)
-                .and_then(|disk| disk.local_health_tracker_for_reconnect())
+                .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect())
         };
 
         let (new_disk, fm) = match Self::connect_endpoint(ep, previous_health).await {
@@ -731,6 +731,7 @@ mod tests {
             .disk_info(&DiskInfoOptions::default())
             .await
             .expect("renewed disk_info should record a drive API metric");
+        renewed_disk.force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Offline);
 
         set_disks.renew_disk(&endpoints[0]).await;
 

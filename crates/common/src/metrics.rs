@@ -1195,8 +1195,6 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub current_disk_bucket_scans_active: u64,
     #[serde(default)]
-    pub disk_bucket_scan_states: Vec<ScannerDiskBucketScanSnapshot>,
-    #[serde(default)]
     pub current_cycle_objects_scanned: u64,
     #[serde(default)]
     pub current_cycle_directories_scanned: u64,
@@ -1243,12 +1241,6 @@ pub struct ScannerMetricsReport {
     pub last_cycle_bucket_drive_scans: u64,
     #[serde(default)]
     pub last_cycle_bucket_drive_failures: u64,
-    #[serde(default)]
-    pub bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
-    #[serde(default)]
-    pub current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
-    #[serde(default)]
-    pub last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
     #[serde(default)]
     pub last_cycle_yield_events: u64,
     #[serde(default)]
@@ -1337,6 +1329,18 @@ pub struct ScannerMetricsReport {
     pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(default)]
     pub partial_cycles: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScannerRuntimeDetailsReport {
+    #[serde(default)]
+    pub disk_bucket_scan_states: Vec<ScannerDiskBucketScanSnapshot>,
+    #[serde(default)]
+    pub bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
+    #[serde(default)]
+    pub current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
+    #[serde(default)]
+    pub last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
 }
 
 impl CurrentCycle {
@@ -2707,6 +2711,52 @@ impl Metrics {
         }))
     }
 
+    pub fn scanner_runtime_details_report(&self) -> ScannerRuntimeDetailsReport {
+        let current_cycle_bucket_drive_results = if self.current_scan_cycle_work_active.load(Ordering::Acquire) {
+            self.current_cycle_bucket_drive_result_snapshots()
+        } else {
+            Vec::new()
+        };
+        ScannerRuntimeDetailsReport {
+            disk_bucket_scan_states: self.scanner_disk_bucket_scan_state_snapshots(),
+            bucket_drive_results: self.scanner_bucket_drive_result_counter_snapshots(),
+            current_cycle_bucket_drive_results,
+            last_cycle_bucket_drive_results: self
+                .last_scan_cycle_bucket_drive_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        }
+    }
+
+    fn scanner_disk_bucket_scan_state_snapshots(&self) -> Vec<ScannerDiskBucketScanSnapshot> {
+        let mut disk_bucket_scan_states = match self.scanner_disk_bucket_scan_states.lock() {
+            Ok(states) => states
+                .iter()
+                .map(|((pool, set), state)| ScannerDiskBucketScanSnapshot {
+                    pool: pool.clone(),
+                    set: set.clone(),
+                    concurrency_limit: state.concurrency_limit,
+                    queued: state.queued,
+                    active: state.active,
+                })
+                .collect::<Vec<_>>(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .iter()
+                .map(|((pool, set), state)| ScannerDiskBucketScanSnapshot {
+                    pool: pool.clone(),
+                    set: set.clone(),
+                    concurrency_limit: state.concurrency_limit,
+                    queued: state.queued,
+                    active: state.active,
+                })
+                .collect::<Vec<_>>(),
+        };
+        disk_bucket_scan_states.sort_by(|left, right| left.pool.cmp(&right.pool).then_with(|| left.set.cmp(&right.set)));
+        disk_bucket_scan_states
+    }
+
     fn scanner_source_work_values(&self) -> Vec<ScannerSourceWorkValues> {
         ScannerWorkSource::all()
             .iter()
@@ -2928,7 +2978,6 @@ impl Metrics {
                 m.current_cycle_source_work = self.scanner_source_work_snapshots(&current_source_work);
                 m.current_cycle_replication_repair =
                     self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
-                m.current_cycle_bucket_drive_results = self.current_cycle_bucket_drive_result_snapshots();
             }
             has_cycle
         };
@@ -2959,30 +3008,7 @@ impl Metrics {
         m.current_set_scan_concurrency_limit = self.scanner_set_scan_concurrency_limit.load(Ordering::Relaxed);
         m.current_set_scans_queued = self.scanner_set_scans_queued.load(Ordering::Relaxed);
         m.current_set_scans_active = self.scanner_set_scans_active.load(Ordering::Relaxed);
-        let mut disk_bucket_scan_states = match self.scanner_disk_bucket_scan_states.lock() {
-            Ok(states) => states
-                .iter()
-                .map(|((pool, set), state)| ScannerDiskBucketScanSnapshot {
-                    pool: pool.clone(),
-                    set: set.clone(),
-                    concurrency_limit: state.concurrency_limit,
-                    queued: state.queued,
-                    active: state.active,
-                })
-                .collect::<Vec<_>>(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .iter()
-                .map(|((pool, set), state)| ScannerDiskBucketScanSnapshot {
-                    pool: pool.clone(),
-                    set: set.clone(),
-                    concurrency_limit: state.concurrency_limit,
-                    queued: state.queued,
-                    active: state.active,
-                })
-                .collect::<Vec<_>>(),
-        };
-        disk_bucket_scan_states.sort_by(|left, right| left.pool.cmp(&right.pool).then_with(|| left.set.cmp(&right.set)));
+        let disk_bucket_scan_states = self.scanner_disk_bucket_scan_state_snapshots();
         let (disk_scan_concurrency_limit, disk_bucket_scans_queued, disk_bucket_scans_active) =
             disk_bucket_scan_states.iter().fold((0, 0, 0), |acc, state| {
                 (acc.0 + state.concurrency_limit, acc.1 + state.queued, acc.2 + state.active)
@@ -2990,7 +3016,6 @@ impl Metrics {
         m.current_disk_scan_concurrency_limit = disk_scan_concurrency_limit;
         m.current_disk_bucket_scans_queued = disk_bucket_scans_queued;
         m.current_disk_bucket_scans_active = disk_bucket_scans_active;
-        m.disk_bucket_scan_states = disk_bucket_scan_states;
         let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
         m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
         m.last_cycle_result_code = last_cycle_result as u64;
@@ -3008,12 +3033,6 @@ impl Metrics {
         m.last_cycle_directories_scanned = self.last_scan_cycle_directories_scanned.load(Ordering::Relaxed);
         m.last_cycle_bucket_drive_scans = self.last_scan_cycle_bucket_drive_scans.load(Ordering::Relaxed);
         m.last_cycle_bucket_drive_failures = self.last_scan_cycle_bucket_drive_failures.load(Ordering::Relaxed);
-        m.bucket_drive_results = self.scanner_bucket_drive_result_counter_snapshots();
-        m.last_cycle_bucket_drive_results = self
-            .last_scan_cycle_bucket_drive_results
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         m.last_cycle_yield_events = self.last_scan_cycle_yield_events.load(Ordering::Relaxed);
         m.last_cycle_yield_duration_seconds = self.last_scan_cycle_yield_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.last_cycle_throttle_sleep_events = self.last_scan_cycle_throttle_sleep_events.load(Ordering::Relaxed);
@@ -4267,7 +4286,7 @@ mod tests {
         let cycle_start = metrics.start_scan_cycle_work();
         metrics.record_scanner_bucket_drive_result("photos", "/data1", "partial");
 
-        let active_report = metrics.report().await;
+        let active_report = metrics.scanner_runtime_details_report();
         assert_eq!(
             active_report.current_cycle_bucket_drive_results,
             vec![ScannerBucketDriveResultSnapshot {
@@ -4280,7 +4299,7 @@ mod tests {
 
         metrics.finish_scan_cycle_work(cycle_start);
 
-        let report = metrics.report().await;
+        let report = metrics.scanner_runtime_details_report();
 
         assert_eq!(
             report.bucket_drive_results,
@@ -4319,7 +4338,7 @@ mod tests {
         }
         metrics.record_scanner_bucket_drive_result("overflow", "/data1", "success");
 
-        let report = metrics.report().await;
+        let report = metrics.scanner_runtime_details_report();
 
         assert_eq!(report.bucket_drive_results.len(), MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS);
         assert!(
@@ -4522,15 +4541,6 @@ mod tests {
 
         assert_eq!(snapshot.current_cycle, 10);
         assert_eq!(snapshot.current_cycle_objects_scanned, 1);
-        assert_eq!(
-            snapshot.current_cycle_bucket_drive_results,
-            vec![ScannerBucketDriveResultSnapshot {
-                bucket: "cycle-ten".to_string(),
-                drive: "/data1".to_string(),
-                result: "partial".to_string(),
-                count: 1,
-            }]
-        );
 
         metrics
             .finish_scan_cycle_work_with_cycle(cycle_eleven_start, CurrentCycle::default())
