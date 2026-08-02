@@ -404,17 +404,15 @@ fn drive_api_latency_micros(actions: impl Iterator<Item = (u64, u64)>) -> Option
         acc_time_ns = acc_time_ns.saturating_add(action_acc_time_ns);
     }
 
-    if count == 0 { None } else { Some(acc_time_ns / count / 1_000) }
+    acc_time_ns.checked_div(count).map(|avg_time_ns| avg_time_ns / 1_000)
 }
 
 fn drive_api_latency_by_api_micros<'a>(actions: impl Iterator<Item = (&'a String, u64, u64)>) -> Vec<(String, u64)> {
     let mut values = actions
         .filter_map(|(api, count, acc_time)| {
-            if count == 0 {
-                None
-            } else {
-                Some((api.clone(), acc_time / count / 1_000))
-            }
+            acc_time
+                .checked_div(count)
+                .map(|avg_time_ns| (api.clone(), avg_time_ns / 1_000))
         })
         .collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1276,6 +1274,32 @@ fn scanner_source_work_stats(source_work: &[ScannerSourceWorkSnapshot]) -> Vec<S
     stats
 }
 
+fn scanner_current_cycle_source_work_stats(metrics: &ScannerMetricsReport) -> Vec<ScannerSourceWorkStats> {
+    let current = scanner_source_work_stats(&metrics.current_cycle_source_work);
+    if !current.is_empty() {
+        return current;
+    }
+
+    let mut sources = scanner_source_work_stats(&metrics.last_cycle_source_work)
+        .into_iter()
+        .map(|work| work.source)
+        .chain(
+            scanner_source_work_stats(&metrics.source_work)
+                .into_iter()
+                .map(|work| work.source),
+        )
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    sources
+        .into_iter()
+        .map(|source| ScannerSourceWorkStats {
+            source,
+            ..Default::default()
+        })
+        .collect()
+}
+
 fn scanner_bucket_drive_result_stats(results: &[ScannerBucketDriveResultSnapshot]) -> Vec<ScannerBucketDriveResultStats> {
     let mut stats = results
         .iter()
@@ -1407,7 +1431,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
         partial_cycles_objects: metrics.partial_cycles_objects,
         partial_cycles_directories: metrics.partial_cycles_directories,
         source_work: scanner_source_work_stats(&metrics.source_work),
-        current_cycle_source_work: scanner_source_work_stats(&metrics.current_cycle_source_work),
+        current_cycle_source_work: scanner_current_cycle_source_work_stats(&metrics),
         last_cycle_source_work: scanner_source_work_stats(&metrics.last_cycle_source_work),
         bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.bucket_drive_results),
         current_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.current_cycle_bucket_drive_results),
@@ -1699,6 +1723,17 @@ mod tests {
     }
 
     #[test]
+    fn drive_api_latency_skips_zero_denominators() {
+        let last_minute = HashMap::from([("zero".to_string(), (0, 9_000))]);
+
+        assert_eq!(drive_api_latency_micros(last_minute.values().copied()), None);
+        assert!(
+            drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time)))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn derive_erasure_set_quorum_shape_handles_standard_layout() {
         let shape = derive_erasure_set_quorum_shape(16, 4);
 
@@ -1887,6 +1922,56 @@ mod tests {
         assert_eq!(stats[0].missed, 12);
         assert_eq!(stats[1].source, "usage");
         assert_eq!(stats[1].failed, 4);
+    }
+
+    #[test]
+    fn scanner_current_cycle_source_work_stats_zeroes_idle_sources() {
+        let report = ScannerMetricsReport {
+            source_work: vec![ScannerSourceWorkSnapshot {
+                source: "usage".to_string(),
+                checked: 11,
+                queued: 2,
+                ..Default::default()
+            }],
+            last_cycle_source_work: vec![ScannerSourceWorkSnapshot {
+                source: "lifecycle".to_string(),
+                checked: 21,
+                queued: 7,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let stats = scanner_current_cycle_source_work_stats(&report);
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].source, "lifecycle");
+        assert_eq!(stats[0].checked, 0);
+        assert_eq!(stats[1].source, "usage");
+        assert_eq!(stats[1].queued, 0);
+    }
+
+    #[test]
+    fn scanner_current_cycle_source_work_stats_keeps_active_values() {
+        let report = ScannerMetricsReport {
+            source_work: vec![ScannerSourceWorkSnapshot {
+                source: "usage".to_string(),
+                checked: 11,
+                ..Default::default()
+            }],
+            current_cycle_source_work: vec![ScannerSourceWorkSnapshot {
+                source: "usage".to_string(),
+                checked: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let stats = scanner_current_cycle_source_work_stats(&report);
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].source, "usage");
+        assert_eq!(stats[0].checked, 3);
     }
 
     #[test]

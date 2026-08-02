@@ -1350,9 +1350,10 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
         if opts.noop && opts.metrics {
-            let mut info = DiskInfo::default();
-            // Add health metrics
-            info.metrics = self.health.metrics_snapshot();
+            let info = DiskInfo {
+                metrics: self.health.metrics_snapshot(),
+                ..Default::default()
+            };
             if self.health.is_faulty() {
                 return Err(DiskError::FaultyDisk);
             }

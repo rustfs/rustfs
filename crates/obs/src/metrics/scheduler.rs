@@ -27,6 +27,7 @@ use crate::metrics::collectors::{
     AuditTargetStats,
     BucketReplicationBacklogStats,
     BucketReplicationBandwidthStats,
+    BucketReplicationStats,
     NotificationStats,
     NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
@@ -87,9 +88,12 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD,
     BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
     BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD,
-    BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD, BUCKET_REPL_MRF_FLUSH_FAILURES_MD,
-    BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD, BUCKET_REPL_MRF_MISSED_COUNT_MD, BUCKET_REPL_MRF_PENDING_BYTES_MD,
-    BUCKET_REPL_MRF_PENDING_COUNT_MD, TARGET_ARN_L,
+    BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_LATENCY_MS_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD,
+    BUCKET_REPL_MRF_FLUSH_FAILURES_MD, BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD, BUCKET_REPL_MRF_MISSED_COUNT_MD,
+    BUCKET_REPL_MRF_PENDING_BYTES_MD, BUCKET_REPL_MRF_PENDING_COUNT_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD,
+    BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD,
+    BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD, BUCKET_REPL_TARGET_SENT_COUNT_MD,
+    BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
 };
 use crate::metrics::schema::cluster::{CLUSTER_BUCKETS_TOTAL_MD, CLUSTER_OBJECTS_TOTAL_MD};
 use crate::metrics::schema::cluster_usage::{
@@ -275,7 +279,9 @@ static METRICS_RUNTIME_COLLECTOR_HEALTH: OnceLock<MetricsRuntimeCollectorHealth>
 type ReplBwKey = (String, String); // (bucket, target_arn)
 type BucketKey = String;
 type BucketRangeKey = (String, String); // (bucket, range)
+type AuditLegacyTargetKey = String;
 type AuditTargetKey = (String, String); // (server, target_id)
+type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
 type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -653,6 +659,17 @@ fn repl_backlog_target_live_keys(stats: &[BucketReplicationBacklogStats]) -> Has
         .collect()
 }
 
+fn repl_flow_live_keys(stats: &[BucketReplicationStats]) -> HashSet<ReplBwKey> {
+    stats
+        .iter()
+        .flat_map(|stat| {
+            stat.targets
+                .iter()
+                .map(|target| (stat.bucket.clone(), target.target_arn.clone()))
+        })
+        .collect()
+}
+
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
     has_seen_valid_snapshot: &mut bool,
     prev_live_keys: &mut HashSet<T>,
@@ -912,14 +929,17 @@ fn audit_target_live_keys(stats: &[AuditTargetStats]) -> HashSet<AuditTargetKey>
         .collect()
 }
 
-fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey, u8>) -> Vec<PrometheusMetric> {
+fn audit_legacy_target_live_keys(stats: &[AuditTargetStats]) -> HashSet<AuditLegacyTargetKey> {
+    stats.iter().map(|stat| stat.target_id.clone()).collect()
+}
+
+fn collect_audit_legacy_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditLegacyTargetKey, u8>) -> Vec<PrometheusMetric> {
     if zero_tombstones.is_empty() {
         return Vec::new();
     }
 
-    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 8);
-    for (server, target_id) in zero_tombstones.keys() {
-        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for target_id in zero_tombstones.keys() {
         let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_MD, 0.0)
@@ -934,9 +954,22 @@ fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey
                 .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
         );
         zero_metrics.push(
-            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0)
-                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0).with_label(AUDIT_TARGET_ID_LABEL, target_id_label),
         );
+    }
+
+    zero_metrics
+}
+
+fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (server, target_id) in zero_tombstones.keys() {
+        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
+        let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
                 .with_label(AUDIT_SERVER_LABEL, server_label.clone())
@@ -962,17 +995,20 @@ fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey
     zero_metrics
 }
 
-fn retire_audit_target_metric_series(server: &str, target_id: &str) -> usize {
+fn retire_audit_legacy_target_metric_series(target_id: &str) -> usize {
     let labels = [(AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string()))];
-    let server_labels = [
-        (AUDIT_SERVER_LABEL, Cow::Owned(server.to_string())),
-        (AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
-    ];
     retire_metric_series(&AUDIT_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&AUDIT_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
-        + retire_metric_series(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+}
+
+fn retire_audit_target_metric_series(server: &str, target_id: &str) -> usize {
+    let server_labels = [
+        (AUDIT_SERVER_LABEL, Cow::Owned(server.to_string())),
+        (AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+    ];
+    retire_metric_series(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
         + retire_metric_series(&AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
         + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
         + retire_metric_series(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
@@ -985,16 +1021,22 @@ fn notification_target_live_keys(stats: &[NotificationTargetStats]) -> HashSet<N
         .collect()
 }
 
-fn collect_notification_target_zero_tombstone_metrics(
-    zero_tombstones: &HashMap<NotificationTargetKey, u8>,
+fn notification_legacy_target_live_keys(stats: &[NotificationTargetStats]) -> HashSet<NotificationLegacyTargetKey> {
+    stats
+        .iter()
+        .map(|stat| (stat.target_id.clone(), stat.target_type.clone()))
+        .collect()
+}
+
+fn collect_notification_legacy_target_zero_tombstone_metrics(
+    zero_tombstones: &HashMap<NotificationLegacyTargetKey, u8>,
 ) -> Vec<PrometheusMetric> {
     if zero_tombstones.is_empty() {
         return Vec::new();
     }
 
-    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 8);
-    for (server, target_id, target_type) in zero_tombstones.keys() {
-        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (target_id, target_type) in zero_tombstones.keys() {
         let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
         let target_type_label: Cow<'static, str> = Cow::Owned(target_type.clone());
         zero_metrics.push(
@@ -1014,9 +1056,26 @@ fn collect_notification_target_zero_tombstone_metrics(
         );
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, 0.0)
-                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
-                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label)
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label),
         );
+    }
+
+    zero_metrics
+}
+
+fn collect_notification_target_zero_tombstone_metrics(
+    zero_tombstones: &HashMap<NotificationTargetKey, u8>,
+) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (server, target_id, target_type) in zero_tombstones.keys() {
+        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
+        let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
+        let target_type_label: Cow<'static, str> = Cow::Owned(target_type.clone());
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
                 .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
@@ -1046,13 +1105,8 @@ fn collect_notification_target_zero_tombstone_metrics(
     zero_metrics
 }
 
-fn retire_notification_target_metric_series(server: &str, target_id: &str, target_type: &str) -> usize {
+fn retire_notification_legacy_target_metric_series(target_id: &str, target_type: &str) -> usize {
     let labels = [
-        (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
-        (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
-    ];
-    let server_labels = [
-        (NOTIFICATION_SERVER_LABEL, Cow::Owned(server.to_string())),
         (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
         (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
     ];
@@ -1060,7 +1114,15 @@ fn retire_notification_target_metric_series(server: &str, target_id: &str, targe
         + retire_metric_series(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
-        + retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+}
+
+fn retire_notification_target_metric_series(server: &str, target_id: &str, target_type: &str) -> usize {
+    let server_labels = [
+        (NOTIFICATION_SERVER_LABEL, Cow::Owned(server.to_string())),
+        (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+        (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
+    ];
+    retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
         + retire_metric_series(
             &NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(),
             &server_labels,
@@ -1195,6 +1257,43 @@ fn collect_repl_backlog_target_zero_tombstone_metrics(zero_tombstones: &HashMap<
     zero_metrics
 }
 
+fn collect_repl_flow_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 9);
+    for (bucket, target_arn) in zero_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+        for descriptor in [
+            &BUCKET_REPL_TARGET_SENT_BYTES_MD,
+            &BUCKET_REPL_TARGET_SENT_COUNT_MD,
+            &BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD,
+            &BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
+            &BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD,
+            &BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD,
+            &BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD,
+            &BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
+        ] {
+            zero_metrics.push(
+                PrometheusMetric::from_descriptor(descriptor, 0.0)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_arn_label.clone()),
+            );
+        }
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label)
+                .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
+                .with_label(RANGE_L, Cow::Borrowed("all"))
+                .with_label(TARGET_ARN_L, target_arn_label),
+        );
+    }
+
+    zero_metrics
+}
+
 fn retire_repl_bw_metric_series(bucket: &str, target_arn: &str) -> usize {
     let labels = [
         (BUCKET_L, Cow::Owned(bucket.to_string())),
@@ -1202,6 +1301,33 @@ fn retire_repl_bw_metric_series(bucket: &str, target_arn: &str) -> usize {
     ];
     retire_metric_series(&BUCKET_REPL_BANDWIDTH_LIMIT_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_repl_flow_metric_series(bucket: &str, target_arn: &str) -> usize {
+    let labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    let latency_labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (OPERATION_L, Cow::Borrowed("object_replication")),
+        (RANGE_L, Cow::Borrowed("all")),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    [
+        BUCKET_REPL_TARGET_SENT_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_SENT_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD.get_full_metric_name(),
+    ]
+    .iter()
+    .map(|name| retire_metric_series(name, &labels))
+    .sum::<usize>()
+        + retire_metric_series(&BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name(), &latency_labels)
 }
 
 fn retire_repl_backlog_metric_series(bucket: &str) -> usize {
@@ -1559,6 +1685,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut prev_backlog_target_live_keys: HashSet<ReplBwKey> = HashSet::new();
         let mut backlog_target_zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
         let mut has_seen_valid_backlog_target_snapshot = false;
+        let mut prev_flow_live_keys: HashSet<ReplBwKey> = HashSet::new();
+        let mut flow_zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
+        let mut has_seen_valid_flow_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1610,9 +1739,17 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 );
                             }
                             metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
+                            update_series_zero_tombstones(
+                                &mut has_seen_valid_flow_snapshot,
+                                &mut prev_flow_live_keys,
+                                &mut flow_zero_tombstones,
+                                repl_flow_live_keys(&bucket_replication),
+                                repl_bw_zero_tombstone_cycles,
+                            );
                             metrics.extend(collect_bucket_replication_backlog_metrics(&bucket_replication_backlog));
                             metrics.extend(collect_repl_backlog_zero_tombstone_metrics(&backlog_zero_tombstones));
                             metrics.extend(collect_repl_backlog_target_zero_tombstone_metrics(&backlog_target_zero_tombstones));
+                            metrics.extend(collect_repl_flow_zero_tombstone_metrics(&flow_zero_tombstones));
                             let replication = collect_replication_stats().await;
                             metrics.extend(collect_replication_metrics(&replication));
                             report_metrics(&metrics);
@@ -1629,6 +1766,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 &mut backlog_target_zero_tombstones,
                             ) {
                                 let _ = retire_repl_backlog_target_metric_series(&bucket, &target_arn);
+                            }
+                            for (bucket, target_arn) in expire_series_zero_tombstones(&mut flow_zero_tombstones) {
+                                let _ = retire_repl_flow_metric_series(&bucket, &target_arn);
                             }
                         },
                     ).await;
@@ -1649,6 +1789,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut has_seen_audit_snapshot = false;
         let mut prev_audit_target_keys: HashSet<AuditTargetKey> = HashSet::new();
         let mut audit_zero_tombstones: HashMap<AuditTargetKey, u8> = HashMap::new();
+        let mut has_seen_audit_legacy_snapshot = false;
+        let mut prev_audit_legacy_target_keys: HashSet<AuditLegacyTargetKey> = HashSet::new();
+        let mut audit_legacy_zero_tombstones: HashMap<AuditLegacyTargetKey, u8> = HashMap::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1672,9 +1815,20 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             audit_target_live_keys(&stats),
                             tombstone_cycles,
                         );
+                        update_series_zero_tombstones(
+                            &mut has_seen_audit_legacy_snapshot,
+                            &mut prev_audit_legacy_target_keys,
+                            &mut audit_legacy_zero_tombstones,
+                            audit_legacy_target_live_keys(&stats),
+                            tombstone_cycles,
+                        );
                         let mut metrics = collect_audit_metrics(&stats);
+                        metrics.extend(collect_audit_legacy_zero_tombstone_metrics(&audit_legacy_zero_tombstones));
                         metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
                         report_metrics(&metrics);
+                        for target_id in expire_series_zero_tombstones(&mut audit_legacy_zero_tombstones) {
+                            let _ = retire_audit_legacy_target_metric_series(&target_id);
+                        }
                         for (server, target_id) in expire_series_zero_tombstones(&mut audit_zero_tombstones) {
                             let _ = retire_audit_target_metric_series(&server, &target_id);
                         }
@@ -1696,6 +1850,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut has_seen_notification_target_snapshot = false;
         let mut prev_notification_target_keys: HashSet<NotificationTargetKey> = HashSet::new();
         let mut notification_target_zero_tombstones: HashMap<NotificationTargetKey, u8> = HashMap::new();
+        let mut has_seen_notification_legacy_target_snapshot = false;
+        let mut prev_notification_legacy_target_keys: HashSet<NotificationLegacyTargetKey> = HashSet::new();
+        let mut notification_legacy_target_zero_tombstones: HashMap<NotificationLegacyTargetKey, u8> = HashMap::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1728,11 +1885,24 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             notification_target_live_keys(&target_stats),
                             tombstone_cycles,
                         );
+                        update_series_zero_tombstones(
+                            &mut has_seen_notification_legacy_target_snapshot,
+                            &mut prev_notification_legacy_target_keys,
+                            &mut notification_legacy_target_zero_tombstones,
+                            notification_legacy_target_live_keys(&target_stats),
+                            tombstone_cycles,
+                        );
                         metrics.extend(collect_notification_target_metrics(&target_stats));
+                        metrics.extend(collect_notification_legacy_target_zero_tombstone_metrics(
+                            &notification_legacy_target_zero_tombstones,
+                        ));
                         metrics.extend(collect_notification_target_zero_tombstone_metrics(
                             &notification_target_zero_tombstones,
                         ));
                         report_metrics(&metrics);
+                        for (target_id, target_type) in expire_series_zero_tombstones(&mut notification_legacy_target_zero_tombstones) {
+                            let _ = retire_notification_legacy_target_metric_series(&target_id, &target_type);
+                        }
                         for (server, target_id, target_type) in expire_series_zero_tombstones(&mut notification_target_zero_tombstones) {
                             let _ = retire_notification_target_metric_series(&server, &target_id, &target_type);
                         }
@@ -2247,19 +2417,44 @@ mod tests {
     }
 
     #[test]
+    fn repl_flow_tombstones_zero_removed_target_series() {
+        let zero_tombstones = HashMap::from([(repl_bw_key("photos", "arn:rustfs:replication:target-a"), 2)]);
+
+        let metrics = collect_repl_flow_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 9);
+        assert!(metrics.iter().all(|metric| metric.value == 0.0));
+        let names = metrics.iter().map(|metric| metric.name.to_string()).collect::<HashSet<_>>();
+        assert!(names.contains(&BUCKET_REPL_TARGET_SENT_BYTES_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_SENT_COUNT_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name()));
+        for metric in metrics {
+            let labels = metric
+                .labels
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(labels.get(BUCKET_L).map(String::as_str), Some("photos"));
+            assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
+            if metric.name == BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name() {
+                assert_eq!(labels.get(OPERATION_L).map(String::as_str), Some("object_replication"));
+                assert_eq!(labels.get(RANGE_L).map(String::as_str), Some("all"));
+            }
+        }
+    }
+
+    #[test]
     fn audit_target_tombstones_include_server_detail_metrics() {
         let zero_tombstones = HashMap::from([(audit_target_key("node1:9000", "audit-webhook"), 2)]);
         let metrics = collect_audit_zero_tombstone_metrics(&zero_tombstones);
 
-        assert_eq!(metrics.len(), 8);
-        assert!(metrics.iter().any(|metric| {
-            metric.name == AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name()
-                && metric.value == 0.0
-                && metric
-                    .labels
-                    .iter()
-                    .any(|(name, value)| *name == AUDIT_TARGET_ID_LABEL && value == "audit-webhook")
-        }));
+        assert_eq!(metrics.len(), 4);
         assert!(metrics.iter().any(|metric| {
             metric.name == AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
                 && metric.value == 0.0
@@ -2275,23 +2470,43 @@ mod tests {
     }
 
     #[test]
-    fn notification_target_tombstones_include_server_detail_metrics() {
-        let zero_tombstones = HashMap::from([(notification_target_key("node1:9000", "primary:webhook", "webhook"), 2)]);
-        let metrics = collect_notification_target_zero_tombstone_metrics(&zero_tombstones);
+    fn audit_legacy_tombstones_follow_target_only_liveness() {
+        let mut has_seen_snapshot = true;
+        let mut prev_live_keys = HashSet::from(["audit-webhook".to_string()]);
+        let mut zero_tombstones = HashMap::new();
+        let stats = vec![AuditTargetStats {
+            server: "node2:9000".to_string(),
+            target_id: "audit-webhook".to_string(),
+            ..Default::default()
+        }];
 
-        assert_eq!(metrics.len(), 8);
+        update_series_zero_tombstones(
+            &mut has_seen_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            audit_legacy_target_live_keys(&stats),
+            2,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        let metrics = collect_audit_legacy_zero_tombstone_metrics(&HashMap::from([("removed-webhook".to_string(), 2)]));
+        assert_eq!(metrics.len(), 4);
         assert!(metrics.iter().any(|metric| {
-            metric.name == NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+            metric.name == AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name()
                 && metric.value == 0.0
                 && metric
                     .labels
                     .iter()
-                    .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "primary:webhook")
-                && metric
-                    .labels
-                    .iter()
-                    .any(|(name, value)| *name == NOTIFICATION_TARGET_TYPE_LABEL && value == "webhook")
+                    .any(|(name, value)| *name == AUDIT_TARGET_ID_LABEL && value == "removed-webhook")
         }));
+    }
+
+    #[test]
+    fn notification_target_tombstones_include_server_detail_metrics() {
+        let zero_tombstones = HashMap::from([(notification_target_key("node1:9000", "primary:webhook", "webhook"), 2)]);
+        let metrics = collect_notification_target_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 4);
         assert!(metrics.iter().any(|metric| {
             metric.name == NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
                 && metric.value == 0.0
@@ -2303,6 +2518,46 @@ mod tests {
                     .labels
                     .iter()
                     .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "primary:webhook")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_TYPE_LABEL && value == "webhook")
+        }));
+    }
+
+    #[test]
+    fn notification_legacy_tombstones_follow_target_only_liveness() {
+        let mut has_seen_snapshot = true;
+        let mut prev_live_keys = HashSet::from([("primary:webhook".to_string(), "webhook".to_string())]);
+        let mut zero_tombstones = HashMap::new();
+        let stats = vec![NotificationTargetStats {
+            server: "node2:9000".to_string(),
+            target_id: "primary:webhook".to_string(),
+            target_type: "webhook".to_string(),
+            ..Default::default()
+        }];
+
+        update_series_zero_tombstones(
+            &mut has_seen_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            notification_legacy_target_live_keys(&stats),
+            2,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        let metrics = collect_notification_legacy_target_zero_tombstone_metrics(&HashMap::from([(
+            ("removed:webhook".to_string(), "webhook".to_string()),
+            2,
+        )]));
+        assert_eq!(metrics.len(), 4);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "removed:webhook")
                 && metric
                     .labels
                     .iter()

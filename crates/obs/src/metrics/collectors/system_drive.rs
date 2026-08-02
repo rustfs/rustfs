@@ -283,9 +283,12 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
             }
             push_topology_metric(&mut metrics, &DRIVE_HEALING_MD, if stat.healing { 1.0 } else { 0.0 }, labels);
             push_topology_metric(&mut metrics, &DRIVE_SCANNING_MD, if stat.scanning { 1.0 } else { 0.0 }, labels);
-            if let Some(value) = stat.offline_duration_seconds {
-                push_topology_metric(&mut metrics, &DRIVE_OFFLINE_DURATION_SECONDS_MD, value as f64, labels);
-            }
+            push_topology_metric(
+                &mut metrics,
+                &DRIVE_OFFLINE_DURATION_SECONDS_MD,
+                stat.offline_duration_seconds.unwrap_or(0) as f64,
+                labels,
+            );
             for (api, value) in &stat.api_calls {
                 metrics.push(
                     PrometheusMetric::from_descriptor(&DRIVE_API_CALLS_MD, *value as f64)
@@ -559,6 +562,35 @@ mod tests {
                 .labels
                 .iter()
                 .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "suspect")
+        }));
+    }
+
+    #[test]
+    fn drive_offline_duration_zeroes_recovered_topology_drive() {
+        let stats = vec![DriveDetailedStats {
+            server: "node1:9000".to_string(),
+            drive: "/data/disk1".to_string(),
+            pool_index: Some("0".to_string()),
+            set_index: Some("1".to_string()),
+            drive_index: Some("2".to_string()),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: None,
+            ..Default::default()
+        }];
+
+        let metrics = collect_drive_detailed_metrics(&stats);
+
+        assert!(metrics.iter().any(|metric| {
+            metric.name == DRIVE_OFFLINE_DURATION_SECONDS_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == DRIVE_INDEX_LABEL && value == "2")
         }));
     }
 
