@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
-use crate::app::storage_api::runtime_sources::ExpiryState;
 #[cfg(test)]
 use crate::app::storage_api::runtime_sources::TierConfigMgr;
 use crate::runtime_sources as root_runtime_sources;
@@ -24,6 +23,7 @@ pub(crate) use crate::runtime_sources::{
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use s3s::dto::SelectObjectContentInput;
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::sync::RwLock;
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
@@ -53,10 +53,6 @@ pub(crate) async fn current_s3select_db(
     root_runtime_sources::fallback_s3select_db_interface()
         .get(input, enable_debug)
         .await
-}
-
-pub(crate) fn current_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
-    root_runtime_sources::current_expiry_state_handle().unwrap_or_else(ExpiryState::new)
 }
 
 #[cfg(test)]

@@ -23,10 +23,12 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
+use crate::object_api::ObjectInfo;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease};
 use crate::storage_api_contracts::lifecycle::TransitionedObject;
 use crate::store::ECStore;
 use rustfs_utils::get_env_usize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::VecDeque;
@@ -257,6 +259,8 @@ impl ObjSweeper {
                     rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact
                 ),
                 version_state: self.transition_version_state,
+                state: TierDeleteJournalState::Committed,
+                source: None,
             });
         }
         None
@@ -285,6 +289,76 @@ impl ObjSweeper {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum TierDeleteJournalState {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TierDeleteSourceIdentity {
+    pub(crate) bucket: String,
+    pub(crate) object: String,
+    pub(crate) version_id: Option<String>,
+    pub(crate) versioned: bool,
+    pub(crate) version_suspended: bool,
+    pub(crate) data_dir: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) mod_time: Option<String>,
+}
+
+impl TierDeleteSourceIdentity {
+    pub(crate) fn from_object_info(
+        bucket: &str,
+        object: &str,
+        info: &ObjectInfo,
+        versioned: bool,
+        version_suspended: bool,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: info.version_id.map(|id| id.to_string()),
+            versioned,
+            version_suspended,
+            data_dir: info.data_dir.map(|id| id.to_string()),
+            etag: info.etag.clone(),
+            mod_time: info.mod_time.map(|time| time.to_string()),
+        }
+    }
+
+    pub(crate) fn lookup_options(&self) -> crate::object_api::ObjectOptions {
+        crate::object_api::ObjectOptions {
+            version_id: self.version_id.clone(),
+            versioned: self.versioned,
+            version_suspended: self.version_suspended,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn matches(&self, info: &ObjectInfo) -> bool {
+        if self.bucket != info.bucket {
+            return false;
+        }
+        if let Some(version_id) = &self.version_id {
+            return info.version_id.map(|id| id.to_string()).as_deref() == Some(version_id.as_str())
+                && self.data_dir == info.data_dir.map(|id| id.to_string());
+        }
+        if self.data_dir.is_some() {
+            return self.data_dir == info.data_dir.map(|id| id.to_string());
+        }
+        self.etag.is_some()
+            && self.etag == info.etag
+            && self.mod_time.is_some()
+            && self.mod_time == info.mod_time.map(|time| time.to_string())
+    }
+
+    pub(crate) fn has_stable_identity(&self) -> bool {
+        self.version_id.is_some() || self.data_dir.is_some() || (self.etag.is_some() && self.mod_time.is_some())
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(unused_assignments)]
 pub struct Jentry {
@@ -294,6 +368,8 @@ pub struct Jentry {
     pub(crate) backend_identity: Option<TierDestinationId>,
     pub(crate) version_id_exact: bool,
     pub(crate) version_state: rustfs_filemeta::TransitionVersionState,
+    pub(crate) state: TierDeleteJournalState,
+    pub(crate) source: Option<TierDeleteSourceIdentity>,
 }
 
 impl ExpiryOp for Jentry {
@@ -554,7 +630,46 @@ pub fn transitioned_force_delete_journal_entry(
             rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact
         ),
         version_state: transition_version_state,
+        state: TierDeleteJournalState::Committed,
+        source: None,
     })
+}
+
+pub(crate) fn attach_tier_delete_source(
+    je: &mut Jentry,
+    bucket: &str,
+    object: &str,
+    info: &ObjectInfo,
+    versioned: bool,
+    version_suspended: bool,
+) {
+    je.state = TierDeleteJournalState::Prepared;
+    je.source = Some(TierDeleteSourceIdentity::from_object_info(
+        bucket,
+        object,
+        info,
+        versioned,
+        version_suspended,
+    ));
+}
+
+pub(crate) fn transitioned_delete_journal_entry_for_source(
+    version_id: Option<Uuid>,
+    versioned: bool,
+    suspended: bool,
+    bucket: &str,
+    object: &str,
+    source: &ObjectInfo,
+) -> Option<Jentry> {
+    let mut je = transitioned_delete_journal_entry(
+        version_id,
+        versioned,
+        suspended,
+        &source.transitioned_object,
+        source.transition_version_state,
+    )?;
+    attach_tier_delete_source(&mut je, bucket, object, source, versioned, suspended);
+    Some(je)
 }
 
 #[cfg(test)]
