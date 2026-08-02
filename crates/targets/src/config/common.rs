@@ -23,7 +23,7 @@ use rustfs_config::{
     NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_TLS_CA,
     PULSAR_TOPIC, PULSAR_USERNAME,
 };
-use rustfs_utils::egress::OutboundPolicy;
+use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy, OutboundPolicyError};
 use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
@@ -223,12 +223,26 @@ pub(super) fn validate_outbound_http_url(value: &Url, field_label: &str) -> Resu
         OutboundPolicy::from_env_cached().map_err(|err| TargetError::Configuration(format!("invalid outbound policy: {err}")))?;
     policy
         .validate_url(value)
-        .map_err(|e| TargetError::Configuration(format!("{field_label} is not allowed: {e}")))
+        .map_err(|err| TargetError::Configuration(format_outbound_http_url_error(field_label, value, err)))
+}
+
+fn format_outbound_http_url_error(field_label: &str, value: &Url, err: OutboundPolicyError) -> String {
+    let base = format!("{field_label} is not allowed: {err}");
+    if matches!(err, OutboundPolicyError::ForbiddenHost { .. }) {
+        let origin = value.origin().ascii_serialization();
+        return format!(
+            "{base}; set {ENV_OUTBOUND_ALLOW_ORIGINS}={origin} to allow this operator-owned endpoint (origin only, no path)"
+        );
+    }
+    base
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_jetstream_enable, parse_url, validate_nats_server_config, validate_pulsar_broker_config};
+    use super::{
+        format_outbound_http_url_error, parse_jetstream_enable, parse_url, validate_nats_server_config,
+        validate_pulsar_broker_config,
+    };
     use async_nats::ServerAddr;
     use rustfs_config::server_config::KVS;
     use rustfs_config::{
@@ -236,7 +250,9 @@ mod tests {
         NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
         PULSAR_TOPIC,
     };
+    use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicyError};
     use std::str::FromStr;
+    use url::Url;
 
     fn nats_server() -> ServerAddr {
         ServerAddr::from_str("nats://127.0.0.1:4222").expect("valid nats address")
@@ -246,6 +262,24 @@ mod tests {
     fn parse_url_error_does_not_echo_the_configured_value() {
         let err = parse_url("not a URL containing secret-token", "endpoint URL").expect_err("invalid URL should fail");
         assert!(!err.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn outbound_http_error_names_allowlist_origin_without_path() {
+        let url = Url::parse("http://192.168.1.2:1880/webhook/rustfs").expect("valid endpoint");
+        let err = format_outbound_http_url_error(
+            "endpoint URL",
+            &url,
+            OutboundPolicyError::ForbiddenHost {
+                host: "192.168.1.2".to_string(),
+                reason: "private address",
+            },
+        );
+
+        assert!(err.contains(ENV_OUTBOUND_ALLOW_ORIGINS));
+        assert!(err.contains("http://192.168.1.2:1880"));
+        assert!(!err.contains("webhook/rustfs"));
+        assert!(err.contains("origin only, no path"));
     }
 
     // Absolute on Linux, macOS, and Windows. temp_dir needs no filesystem to exist for a
