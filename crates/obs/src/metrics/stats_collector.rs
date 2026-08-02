@@ -21,7 +21,7 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::ilm::IlmActionTaskStats;
-use crate::metrics::collectors::scanner::ScannerSourceWorkStats;
+use crate::metrics::collectors::scanner::{ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetBacklogStats,
     BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
@@ -39,7 +39,7 @@ use crate::metrics::{
 use crate::node_identity::current_local_node_identity;
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
+use rustfs_common::metrics::{ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource_and_system,
@@ -1275,6 +1275,26 @@ fn scanner_source_work_stats(source_work: &[ScannerSourceWorkSnapshot]) -> Vec<S
     stats
 }
 
+fn scanner_bucket_drive_result_stats(results: &[ScannerBucketDriveResultSnapshot]) -> Vec<ScannerBucketDriveResultStats> {
+    let mut stats = results
+        .iter()
+        .filter(|result| !result.bucket.is_empty() && !result.drive.is_empty() && !result.result.is_empty() && result.count > 0)
+        .map(|result| ScannerBucketDriveResultStats {
+            bucket: result.bucket.clone(),
+            drive: result.drive.clone(),
+            result: result.result.clone(),
+            count: result.count,
+        })
+        .collect::<Vec<_>>();
+    stats.sort_by(|left, right| {
+        left.bucket
+            .cmp(&right.bucket)
+            .then_with(|| left.drive.cmp(&right.drive))
+            .then_with(|| left.result.cmp(&right.result))
+    });
+    stats
+}
+
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let metrics = global_metrics().report().await;
     let now = Utc::now();
@@ -1388,6 +1408,9 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
         source_work: scanner_source_work_stats(&metrics.source_work),
         current_cycle_source_work: scanner_source_work_stats(&metrics.current_cycle_source_work),
         last_cycle_source_work: scanner_source_work_stats(&metrics.last_cycle_source_work),
+        bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.bucket_drive_results),
+        current_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.current_cycle_bucket_drive_results),
+        last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.last_cycle_bucket_drive_results),
     })
 }
 

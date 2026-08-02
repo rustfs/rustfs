@@ -171,6 +171,12 @@ pub struct ScannerStats {
     pub current_cycle_source_work: Vec<ScannerSourceWorkStats>,
     /// Last cycle source work snapshots
     pub last_cycle_source_work: Vec<ScannerSourceWorkStats>,
+    /// Lifetime bucket-drive scan results
+    pub bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
+    /// Current cycle bucket-drive scan results
+    pub current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
+    /// Last cycle bucket-drive scan results
+    pub last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
 }
 
 /// Scanner source-work metrics for a source.
@@ -183,6 +189,15 @@ pub struct ScannerSourceWorkStats {
     pub failed: u64,
     pub skipped: u64,
     pub missed: u64,
+}
+
+/// Scanner bucket-drive result metrics for a structured bucket/drive pair.
+#[derive(Debug, Clone, Default)]
+pub struct ScannerBucketDriveResultStats {
+    pub bucket: String,
+    pub drive: String,
+    pub result: String,
+    pub count: u64,
 }
 
 /// Collects scanner metrics from the given stats.
@@ -224,6 +239,38 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
             push_source_work_metric(metrics, descriptor, server, &work.source, "failed", work.failed, cycle_scope);
             push_source_work_metric(metrics, descriptor, server, &work.source, "skipped", work.skipped, cycle_scope);
             push_source_work_metric(metrics, descriptor, server, &work.source, "missed", work.missed, cycle_scope);
+        }
+    }
+
+    fn push_bucket_drive_result_metric(
+        metrics: &mut Vec<PrometheusMetric>,
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        server: &str,
+        result: &ScannerBucketDriveResultStats,
+        cycle_scope: Option<&str>,
+    ) {
+        let mut metric =
+            PrometheusMetric::from_descriptor(descriptor, result.count as f64).with_label_owned(SERVER_LABEL, server.to_string());
+        if let Some(cycle_scope) = cycle_scope {
+            metric = metric.with_label_owned(CYCLE_SCOPE_LABEL, cycle_scope.to_string());
+        }
+        metrics.push(
+            metric
+                .with_label_owned(BUCKET_LABEL, result.bucket.clone())
+                .with_label_owned(DRIVE_LABEL, result.drive.clone())
+                .with_label_owned(RESULT_LABEL, result.result.clone()),
+        );
+    }
+
+    fn push_bucket_drive_result_metrics(
+        metrics: &mut Vec<PrometheusMetric>,
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        server: &str,
+        results: &[ScannerBucketDriveResultStats],
+        cycle_scope: Option<&str>,
+    ) {
+        for result in results {
+            push_bucket_drive_result_metric(metrics, descriptor, server, result, cycle_scope);
         }
     }
 
@@ -378,6 +425,27 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
         &stats.last_cycle_source_work,
         Some("last"),
     );
+    push_bucket_drive_result_metrics(
+        &mut metrics,
+        &SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD,
+        &stats.server,
+        &stats.bucket_drive_results,
+        None,
+    );
+    push_bucket_drive_result_metrics(
+        &mut metrics,
+        &SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
+        &stats.server,
+        &stats.current_cycle_bucket_drive_results,
+        Some("current"),
+    );
+    push_bucket_drive_result_metrics(
+        &mut metrics,
+        &SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
+        &stats.server,
+        &stats.last_cycle_bucket_drive_results,
+        Some("last"),
+    );
 
     metrics
 }
@@ -491,12 +559,30 @@ mod tests {
                 skipped: 15,
                 missed: 16,
             }],
+            bucket_drive_results: vec![ScannerBucketDriveResultStats {
+                bucket: "photos".to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 3,
+            }],
+            current_cycle_bucket_drive_results: vec![ScannerBucketDriveResultStats {
+                bucket: "photos".to_string(),
+                drive: "/data1".to_string(),
+                result: "partial".to_string(),
+                count: 1,
+            }],
+            last_cycle_bucket_drive_results: vec![ScannerBucketDriveResultStats {
+                bucket: "videos".to_string(),
+                drive: "/data2".to_string(),
+                result: "error".to_string(),
+                count: 2,
+            }],
         };
 
         let metrics = collect_scanner_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 87);
+        assert_eq!(metrics.len(), 90);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -509,6 +595,17 @@ mod tests {
             .find(|m| m.name == SCANNER_ACTIVE_PATHS_MD.get_full_metric_name());
         assert_eq!(active_paths.map(|m| m.value), Some(4.0));
         assert_eq!(active_paths.map(|m| m.labels.len()), Some(0));
+
+        let bucket_drive_result = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD.get_full_metric_name());
+        assert_eq!(bucket_drive_result.map(|m| m.value), Some(3.0));
+        assert_eq!(
+            bucket_drive_result
+                .and_then(|m| m.labels.iter().find(|(name, _)| *name == BUCKET_LABEL))
+                .map(|(_, value)| value.as_ref()),
+            Some("photos")
+        );
 
         let oldest_active_path_age = metrics
             .iter()
