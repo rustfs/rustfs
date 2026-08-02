@@ -65,8 +65,7 @@ pub enum AtRestProtection {
     /// for bundling purposes: re-wrap is mandatory.
     LegacyUnspecified,
     /// Vault KV2 as currently shipped: material confidentiality relies on
-    /// Vault ACLs, KV2 at-rest encryption, and TLS only (the backend reports
-    /// `at_rest_protection = "vault-kv2-acl"`); RustFS applies no
+    /// Vault ACLs, KV2 at-rest encryption, and TLS only; RustFS applies no
     /// cryptographic wrapping of its own.
     StorageOnly,
     /// Vault KV2 with material wrapped by Vault Transit before storage. Not
