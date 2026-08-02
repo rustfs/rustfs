@@ -133,16 +133,13 @@ pub fn delete_replication_state_from_config(
         replica: source.replica,
         ..Default::default()
     };
-    let target_arns = config.filter_target_arns(&opts);
-    if target_arns.is_empty() {
+    let target_decisions = config.filter_target_replication_decisions(&opts);
+    if target_decisions.is_empty() {
         return None;
     }
 
     let mut decision = ReplicateDecision::new();
-    for target_arn in target_arns {
-        let mut target_opts = opts.clone();
-        target_opts.target_arn = target_arn.clone();
-        let replicate = config.replicate(&target_opts);
+    for (target_arn, replicate) in target_decisions {
         decision.set(ReplicateTargetDecision::new(target_arn, replicate, false));
     }
     if !decision.replicate_any() {
@@ -174,20 +171,13 @@ pub struct ReplicationDeleteScheduleInput<'a> {
     pub deleted_delete_marker_version: bool,
 }
 
-fn delete_version_purge_source_status(status: &ReplicationStatusType) -> bool {
-    status == &ReplicationStatusType::Replica
-        || status == &ReplicationStatusType::Pending
-        || status == &ReplicationStatusType::Completed
-        || status == &ReplicationStatusType::Failed
-}
-
 pub fn should_schedule_delete_replication(input: ReplicationDeleteScheduleInput<'_>) -> bool {
     if input.replication_request {
         return false;
     }
 
-    if input.version_id_requested && !input.deleted_delete_marker_version && !input.source_delete_marker {
-        return delete_version_purge_source_status(input.source_replication_status);
+    if input.version_id_requested {
+        return input.source_version_purge_status == &VersionPurgeStatusType::Pending;
     }
 
     input.source_replication_status == &ReplicationStatusType::Replica
@@ -433,9 +423,7 @@ mod tests {
             delete_marker_replication: Some(DeleteMarkerReplication {
                 status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
             }),
-            delete_replication: Some(DeleteReplication {
-                status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
-            }),
+            delete_replication: None,
             destination: Destination {
                 bucket: arn.to_string(),
                 ..Default::default()
@@ -500,11 +488,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_replication_state_tracks_delete_marker_version_purges() {
+    fn delete_replication_state_uses_delete_switch_for_marker_version_purges() {
         let arn = "arn:aws:s3:::target-bucket";
-        let config = ReplicationConfiguration {
+        let mut rule = delete_replication_rule(arn, false);
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        let mut config = ReplicationConfiguration {
             role: arn.to_string(),
-            rules: vec![delete_replication_rule(arn, false)],
+            rules: vec![rule],
         };
         let source = ReplicationDeleteStateSource {
             name: "test/object.txt".to_string(),
@@ -514,8 +506,16 @@ mod tests {
             replica: false,
         };
 
+        assert!(
+            delete_replication_state_from_config(&config, &source).is_none(),
+            "delete-marker version purge must not use the enabled marker-creation switch"
+        );
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
         let state = delete_replication_state_from_config(&config, &source)
-            .expect("delete-marker version purge should honor delete replication rules");
+            .expect("delete-marker version purge should honor the enabled permanent-delete switch");
         let pending = format!("{arn}=PENDING;");
 
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
@@ -536,8 +536,8 @@ mod tests {
     }
 
     #[test]
-    fn delete_replication_schedule_keeps_marker_and_version_purges() {
-        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+    fn delete_replication_schedule_requires_current_admission_for_version_purges() {
+        assert!(!should_schedule_delete_replication(ReplicationDeleteScheduleInput {
             replication_request: false,
             version_id_requested: true,
             source_delete_marker: true,
@@ -549,8 +549,16 @@ mod tests {
             replication_request: false,
             version_id_requested: true,
             source_delete_marker: false,
-            source_replication_status: &ReplicationStatusType::Completed,
-            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            source_replication_status: &ReplicationStatusType::Empty,
+            source_version_purge_status: &VersionPurgeStatusType::Pending,
+            deleted_delete_marker_version: true,
+        }));
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: true,
+            source_delete_marker: false,
+            source_replication_status: &ReplicationStatusType::Empty,
+            source_version_purge_status: &VersionPurgeStatusType::Pending,
             deleted_delete_marker_version: false,
         }));
         assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {

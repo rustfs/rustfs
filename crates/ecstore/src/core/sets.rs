@@ -615,7 +615,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
         self.get_disks_by_key(object).delete_object(bucket, object, opts).await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, objects, opts))]
     async fn delete_objects(
         &self,
         bucket: &str,

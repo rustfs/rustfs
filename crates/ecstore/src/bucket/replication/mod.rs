@@ -45,8 +45,9 @@ mod runtime_boundary;
 
 pub use datatypes::ResyncStatusType;
 pub use replication_config_boundary::{
-    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, replication_target_arns,
-    should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_target_arns,
+    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, invalid_replication_config_status_field,
+    replication_target_arns, should_remove_replication_target, unsupported_replication_config_field,
+    validate_replication_config_target_arns,
 };
 #[cfg(test)]
 pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
@@ -62,7 +63,7 @@ pub(crate) use replication_filemeta_boundary::{
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
-pub use replication_object_config::ReplicationConfig;
+pub use replication_object_config::{DeleteReplicationConfigSnapshot, ReplicationConfig};
 pub use replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, delete_replication_state_from_config,
     delete_replication_version_id, should_schedule_delete_replication, should_use_existing_delete_replication_info,

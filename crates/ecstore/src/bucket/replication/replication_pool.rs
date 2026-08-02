@@ -1967,7 +1967,24 @@ pub(crate) async fn queue_replication_heal_internal(
         };
     }
 
-    roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+    roi = match get_heal_replicate_object_info(&oi, &rcfg).await {
+        Ok(roi) => roi,
+        Err(err) => {
+            warn!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                error = %err,
+                "Failed to classify object for replication heal"
+            );
+            return ReplicationHealQueueResult {
+                object_info: roi,
+                admission: ReplicationQueueAdmission::Missed,
+            };
+        }
+    };
     roi.retry_count = retry_count;
 
     match replication_heal_queue_action(&mut roi) {
@@ -2859,6 +2876,55 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[tokio::test]
+    async fn heal_queue_marks_missing_versioning_state_as_missed() {
+        use super::super::replication_target_boundary::BucketTargets;
+        use s3s::dto::{
+            DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule,
+            ReplicationRuleStatus,
+        };
+
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let result = queue_replication_heal_internal(
+            "missing-versioning-state",
+            ObjectInfo {
+                bucket: "missing-versioning-state".to_string(),
+                name: "object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                version_purge_status: super::super::replication_filemeta_boundary::VersionPurgeStatusType::Pending,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            },
+            ReplicationConfig::new(
+                Some(ReplicationConfiguration {
+                    role: String::new(),
+                    rules: vec![ReplicationRule {
+                        delete_marker_replication: None,
+                        delete_replication: Some(DeleteReplication {
+                            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                        }),
+                        destination: Destination {
+                            bucket: arn.to_string(),
+                            ..Default::default()
+                        },
+                        existing_object_replication: None,
+                        filter: None,
+                        id: Some("delete".to_string()),
+                        prefix: Some(String::new()),
+                        priority: Some(1),
+                        source_selection_criteria: None,
+                        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    }],
+                }),
+                Some(BucketTargets::default()),
+            ),
+            0,
+        )
+        .await;
+
+        assert_eq!(result.admission, ReplicationQueueAdmission::Missed);
     }
 
     #[tokio::test]

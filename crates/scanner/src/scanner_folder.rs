@@ -1038,7 +1038,7 @@ impl ScannerItem {
     }
 
     async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
-        if oi.version_id.is_none_or(|v| v.is_nil()) {
+        if oi.version_id.is_none_or(|version| version.is_nil()) && !oi.delete_marker && oi.version_purge_status.is_empty() {
             return;
         }
 
@@ -3186,6 +3186,61 @@ mod tests {
             ..Default::default()
         };
         assert!(!ScannerItem::should_account_replication_stats(&purge_version));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_heal_replication_only_queues_pending_null_deletes() {
+        async fn replication_skipped_count() -> u64 {
+            global_metrics()
+                .report()
+                .await
+                .source_work
+                .iter()
+                .find(|work| work.source == ScannerWorkSource::BucketReplication.as_str())
+                .map(|work| work.skipped)
+                .unwrap_or_default()
+        }
+
+        let temp_dir = std::env::temp_dir();
+        let file_type = std::fs::metadata(&temp_dir)
+            .expect("temp dir metadata should be readable")
+            .file_type();
+        let mut item = ScannerItem {
+            path: temp_dir.join("object").to_string_lossy().to_string(),
+            bucket: "bucket".to_string(),
+            prefix: String::new(),
+            object_name: "object".to_string(),
+            file_type,
+            lifecycle: None,
+            object_lock: None,
+            replication: Some(Arc::new(ReplicationConfig::new(None, None))),
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+        let null_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::nil()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let mut size_summary = SizeSummary::default();
+        let before = replication_skipped_count().await;
+
+        item.heal_replication(&null_object, &mut size_summary).await;
+        assert_eq!(replication_skipped_count().await, before);
+
+        item.heal_replication(
+            &ObjectInfo {
+                version_purge_status: VersionPurgeStatusType::Pending,
+                ..null_object
+            },
+            &mut size_summary,
+        )
+        .await;
+        assert_eq!(replication_skipped_count().await, before + 1);
     }
 
     #[tokio::test]

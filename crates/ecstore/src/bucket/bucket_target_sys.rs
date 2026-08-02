@@ -1995,6 +1995,49 @@ mod tests {
     use super::*;
     use rcgen::generate_simple_self_signed;
 
+    #[derive(Clone, Debug)]
+    struct RecordingHttpConnector {
+        request_uris: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SmithyHttpConnector for RecordingHttpConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.request_uris
+                .lock()
+                .expect("recorded request lock should not be poisoned")
+                .push(request.uri().to_string());
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(204_u16).expect("204 should be a valid response status"),
+                SdkBody::empty(),
+            )))
+        }
+    }
+
+    fn recording_target_client() -> (TargetClient, Arc<std::sync::Mutex<Vec<String>>>) {
+        let request_uris = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(RecordingHttpConnector {
+            request_uris: Arc::clone(&request_uris),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let client = s3_client_with_http_client(443, http_client);
+        (
+            TargetClient {
+                endpoint: "https://localhost:443".to_string(),
+                credentials: None,
+                bucket: "target-bucket".to_string(),
+                storage_class: String::new(),
+                disable_proxy: false,
+                arn: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
+                reset_id: String::new(),
+                secure: true,
+                health_check_duration: Duration::from_secs(5),
+                replicate_sync: false,
+                client: Arc::new(client),
+            },
+            request_uris,
+        )
+    }
+
     fn spawn_single_request_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
 
@@ -2283,6 +2326,32 @@ mod tests {
         let vid = Uuid::new_v4().to_string();
         let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(true, false));
         assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[tokio::test]
+    async fn remove_object_writes_null_purge_and_omits_marker_creation_version_queries() {
+        let (client, request_uris) = recording_target_client();
+        client
+            .remove_object("target-bucket", "object", Some("null".to_string()), remove_opts(true, false))
+            .await
+            .expect("explicit null version purge should reach the target client");
+        client
+            .remove_object("target-bucket", "object", Some(Uuid::new_v4().to_string()), remove_opts(true, true))
+            .await
+            .expect("delete marker creation should reach the target client");
+
+        let request_uris = request_uris.lock().expect("recorded request lock should not be poisoned");
+        assert_eq!(request_uris.len(), 2);
+        assert!(
+            request_uris[0].contains("versionId=null"),
+            "an explicit null purge must be emitted as a target versionId query: {}",
+            request_uris[0]
+        );
+        assert!(
+            !request_uris[1].contains("versionId="),
+            "delete marker creation must omit the target versionId query: {}",
+            request_uris[1]
+        );
     }
 
     #[test]
