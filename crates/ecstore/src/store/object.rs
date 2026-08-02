@@ -18,7 +18,9 @@ use crate::bucket::lifecycle::{
         abort_tier_delete_journal_entry, commit_tier_delete_journal_entry, enqueue_committed_tier_delete_journal_entry,
         persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
     },
-    tier_sweeper::{Jentry, transitioned_delete_journal_entry_for_source},
+    tier_sweeper::{
+        Jentry, attach_tier_delete_source, transitioned_delete_journal_entry_for_source, transitioned_force_delete_journal_entry,
+    },
 };
 use crate::bucket::replication::ReplicationObjectBridge;
 use crate::disk::OldCurrentSize;
@@ -48,14 +50,21 @@ fn build_tier_delete_journal_entry(
 ) -> Result<Option<Jentry>> {
     let version_id = opts.version_id.as_deref().map(Uuid::parse_str).transpose()?;
     let source_object = decode_dir_object(object);
-    let Some(mut je) = transitioned_delete_journal_entry_for_source(
-        version_id,
-        opts.versioned,
-        opts.version_suspended,
-        bucket,
-        source_object.as_str(),
-        source,
-    ) else {
+    let Some(mut je) = (if opts.delete_prefix {
+        transitioned_force_delete_journal_entry(&source.transitioned_object, source.transition_version_state).map(|mut je| {
+            attach_tier_delete_source(&mut je, bucket, source_object.as_str(), source, opts.versioned, opts.version_suspended);
+            je
+        })
+    } else {
+        transitioned_delete_journal_entry_for_source(
+            version_id,
+            opts.versioned,
+            opts.version_suspended,
+            bucket,
+            source_object.as_str(),
+            source,
+        )
+    }) else {
         return Ok(None);
     };
     record_tier_delete_journal_backend_identity(&mut je, &source.user_defined).map_err(Error::other)?;
@@ -108,6 +117,40 @@ async fn commit_prepared_tier_delete_journal_entry(api: &Arc<ECStore>, je: &Jent
             error = ?err,
             "tier delete journal committed but could not be queued; recovery will retry"
         );
+    }
+}
+
+async fn delete_prefix_with_tier_delete_journal(
+    store: &ECStore,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    tier_journal_api: Option<&Arc<ECStore>>,
+) -> Result<()> {
+    let journal_entry = if let Some(api) = tier_journal_api {
+        let lookup_opts = version_aware_lookup_opts(opts, true);
+        match store.get_pool_info_existing_with_opts(bucket, object, &lookup_opts).await {
+            Ok((pinfo, _)) => prepare_tier_delete_journal_entry(api, bucket, object, opts, &pinfo.object_info).await?,
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+
+    match store.delete_prefix(bucket, object, opts).await {
+        Ok(()) => {
+            if let (Some(api), Some(je)) = (tier_journal_api, journal_entry.as_ref()) {
+                commit_prepared_tier_delete_journal_entry(api, je).await;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let (Some(api), Some(je)) = (tier_journal_api, journal_entry.as_ref()) {
+                abort_prepared_tier_delete_journal_entry(api, je).await;
+            }
+            Err(err)
+        }
     }
 }
 
@@ -1227,7 +1270,7 @@ impl ECStore {
         if opts.delete_prefix && !opts.delete_prefix_object {
             // Prefix deletes cover multiple object keys; an exact lock on the prefix string
             // would not protect child objects.
-            self.delete_prefix(bucket, object, &opts).await?;
+            delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
 
@@ -1239,7 +1282,7 @@ impl ECStore {
         };
 
         if opts.delete_prefix {
-            self.delete_prefix(bucket, object, &opts).await?;
+            delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
 
