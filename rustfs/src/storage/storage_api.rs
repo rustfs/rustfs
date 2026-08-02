@@ -103,7 +103,7 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
-        req_info_mut, req_info_ref,
+        replication_request_authorized, req_info_mut, req_info_ref,
     };
 
     pub(crate) mod contract {
@@ -180,10 +180,11 @@ pub(crate) mod options_consumer {
     #[cfg(test)]
     pub(crate) use super::super::options::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use super::super::options::{
-        copy_dst_opts, copy_src_opts, del_opts_with_versioning, extract_metadata, extract_metadata_from_mime,
-        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
-        parse_copy_source_range, put_opts, validate_archive_content_encoding,
+        copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
+        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
+        get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
+        namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
+        put_opts_with_replication_authorization, validate_archive_content_encoding,
     };
 
     pub(crate) mod contract {

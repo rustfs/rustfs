@@ -37,7 +37,11 @@ use rustfs_policy::policy::{
     bucket_policy_uses_existing_object_tag_conditions,
 };
 use rustfs_trusted_proxies::ClientInfo;
-use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_FORCE_DELETE, get_header};
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
+};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
@@ -51,9 +55,37 @@ pub(crate) struct ReqInfo {
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
+    pub replication_request_authorized: bool,
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
     pub request_context: Option<RequestContext>,
+}
+
+pub(crate) fn replication_request_authorized<T>(req: &S3Request<T>) -> bool {
+    req.extensions
+        .get::<ReqInfo>()
+        .is_some_and(|req_info| req_info.replication_request_authorized)
+}
+
+fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS)
+        || get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_SSEC_CRC).is_some()
+        || get_header(headers, SUFFIX_SOURCE_ETAG).is_some()
+        || get_header(headers, SUFFIX_SOURCE_MTIME).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_CHECK).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).is_some()
+        || get_header(headers, SUFFIX_SOURCE_VERSION_ID).is_some()
+}
+
+async fn authorize_replication_only_put_headers<T>(req: &mut S3Request<T>) -> S3Result<()> {
+    if !has_replication_only_put_headers(&req.headers) {
+        return Ok(());
+    }
+
+    authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+    req_info_mut(req)?.replication_request_authorized = true;
+    Ok(())
 }
 
 pub(crate) fn recursive_force_delete_is_authorized(headers: &HeaderMap, is_owner: bool, replica_request: bool) -> bool {
@@ -1106,7 +1138,8 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, complete_multipart_upload_authorize_action()).await
+        authorize_request(req, complete_multipart_upload_authorize_action()).await?;
+        authorize_replication_only_put_headers(req).await
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.
@@ -1140,6 +1173,8 @@ impl S3Access for FS {
 
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
+        authorize_replication_only_put_headers(req).await?;
+
         if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
             authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
         }
@@ -1158,6 +1193,8 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+
+        authorize_replication_only_put_headers(req).await?;
 
         if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
             authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
@@ -2032,6 +2069,8 @@ impl S3Access for FS {
         if req.method == http::Method::POST {
             return Ok(());
         }
+
+        authorize_replication_only_put_headers(req).await?;
 
         if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
             authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;

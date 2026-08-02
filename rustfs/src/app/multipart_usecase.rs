@@ -15,7 +15,7 @@
 //! Multipart application use-case contracts.
 
 use super::storage_api::multipart_usecase::ECStore;
-use super::storage_api::multipart_usecase::access::has_bypass_governance_header;
+use super::storage_api::multipart_usecase::access::{has_bypass_governance_header, replication_request_authorized};
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
@@ -39,8 +39,9 @@ use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, Ha
 use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan};
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
-    copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
-    namespace_reserved_user_metadata, parse_copy_source_range, put_opts, validate_archive_content_encoding,
+    copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
+    get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, parse_copy_source_range,
+    put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::multipart_usecase::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
@@ -384,6 +385,7 @@ impl DefaultMultipartUsecase {
             EventName::ObjectCreatedCompleteMultipartUpload,
             S3Operation::CompleteMultipartUpload,
         );
+        let replication_authorized = replication_request_authorized(&req);
         let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
@@ -448,7 +450,8 @@ impl DefaultMultipartUsecase {
             ));
         };
 
-        let mut opts = get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let mut opts = get_complete_multipart_upload_opts_with_replication_authorization(&req.headers, replication_authorized)
+            .map_err(ApiError::from)?;
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
         opts.versioned = versioned;
@@ -661,6 +664,7 @@ impl DefaultMultipartUsecase {
         let helper =
             OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
                 .suppress_event();
+        let replication_authorized = replication_request_authorized(&req);
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -761,9 +765,10 @@ impl DefaultMultipartUsecase {
         // compression here would make GET decode the completed object as one stream.
 
         let mt2 = metadata.clone();
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
+        let mut opts: ObjectOptions =
+            put_opts_with_replication_authorization(&bucket, &key, version_id, &req.headers, metadata, replication_authorized)
+                .await
+                .map_err(ApiError::from)?;
 
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())

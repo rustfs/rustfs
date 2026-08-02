@@ -20,8 +20,8 @@ use rustfs_io_metrics::buffered_write;
 use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized, req_info_mut,
-    req_info_ref,
+    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
+    replication_request_authorized, req_info_mut, req_info_ref,
 };
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 #[cfg(test)]
@@ -81,9 +81,10 @@ use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cac
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
-    copy_dst_opts, copy_src_opts, del_opts_with_versioning, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
-    normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
+    copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
+    extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
+    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, put_opts_with_replication_authorization,
+    validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -4923,9 +4924,16 @@ impl DefaultObjectUsecase {
         )?;
         apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
 
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
-            .await
-            .map_err(ApiError::from)?;
+        let mut opts: ObjectOptions = put_opts_with_replication_authorization(
+            &bucket,
+            &key,
+            version_id.clone(),
+            &req.headers,
+            metadata.clone(),
+            replication_request_authorized(&req),
+        )
+        .await
+        .map_err(ApiError::from)?;
         apply_put_request_object_lock_opts(
             &bucket,
             object_lock_legal_hold_status,
@@ -6194,9 +6202,16 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let mut dst_opts = copy_dst_opts(&bucket, &key, dest_version_id.clone(), &req.headers, HashMap::new())
-            .await
-            .map_err(ApiError::from)?;
+        let mut dst_opts = copy_dst_opts_with_replication_authorization(
+            &bucket,
+            &key,
+            dest_version_id.clone(),
+            &req.headers,
+            HashMap::new(),
+            replication_request_authorized(&req),
+        )
+        .await
+        .map_err(ApiError::from)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
         let expected_current_version_id = expected_current_version_id(&req.headers)?;
@@ -7978,6 +7993,7 @@ impl DefaultObjectUsecase {
         if is_sse_kms_requested(&req.input, &req.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
+        let replication_authorized = replication_request_authorized(&req);
         let input = req.input;
 
         let PutObjectInput {
@@ -8249,9 +8265,16 @@ impl DefaultObjectUsecase {
                 storage_class.clone(),
             )?;
             apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
-            let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
-                .await
-                .map_err(ApiError::from)?;
+            let mut opts = put_opts_with_replication_authorization(
+                &bucket,
+                &fpath,
+                None,
+                &req.headers,
+                metadata.clone(),
+                replication_authorized,
+            )
+            .await
+            .map_err(ApiError::from)?;
             apply_extract_entry_pax_extensions(&mut f, &mut metadata, &mut opts).await?;
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
