@@ -263,7 +263,8 @@ impl StaticKmsBackend {
         })
     }
 
-    /// List the single configured key, honouring the pagination marker.
+    /// List the single configured key, honouring the pagination marker and the
+    /// status and usage filters.
     pub(crate) fn list_configured_key(&self, request: &ListKeysRequest) -> Result<ListKeysResponse> {
         // A caller asking for no keys gets none, even from a backend whose
         // whole key set is one key.
@@ -285,15 +286,25 @@ impl StaticKmsBackend {
             created_by: None,
         };
 
-        // Apply prefix filter if provided
+        // The marker is an exclusive lower bound on the identifier, as it is
+        // for every other backend.
         if let Some(ref marker) = request.marker
             && self.key_id <= *marker
         {
-            return Ok(ListKeysResponse {
-                keys: vec![],
-                next_marker: None,
-                truncated: false,
-            });
+            return Ok(empty_key_page());
+        }
+
+        // The configured key is filtered like any other: a caller narrowing the
+        // listing to disabled or signing keys must get an empty page rather
+        // than this active encryption key, which it would otherwise have to
+        // recognise as a non-match on its own.
+        if request
+            .status_filter
+            .as_ref()
+            .is_some_and(|status| status != &key_info.status)
+            || request.usage_filter.as_ref().is_some_and(|usage| usage != &key_info.usage)
+        {
+            return Ok(empty_key_page());
         }
 
         Ok(ListKeysResponse {
@@ -681,6 +692,42 @@ mod tests {
         assert!(response.keys.is_empty());
         assert!(!response.truncated);
         assert!(response.next_marker.is_none());
+    }
+
+    /// A filter that excludes the configured key must empty the page. Handing
+    /// the key back regardless would answer "list the disabled keys" with an
+    /// active one, and the response says nothing about the filter having been
+    /// dropped.
+    #[tokio::test]
+    async fn a_filter_the_configured_key_does_not_match_empties_the_page() {
+        let (backend, key_id, _key) = create_test_backend().await;
+
+        for request in [
+            ListKeysRequest {
+                status_filter: Some(KeyStatus::Disabled),
+                ..Default::default()
+            },
+            ListKeysRequest {
+                usage_filter: Some(KeyUsage::SignVerify),
+                ..Default::default()
+            },
+        ] {
+            let response = backend.list_configured_key(&request).expect("a filtered list must succeed");
+            assert!(response.keys.is_empty(), "excluded key was listed for {request:?}");
+            assert!(!response.truncated);
+            assert!(response.next_marker.is_none());
+        }
+
+        // The filters the key does match still list it.
+        let response = backend
+            .list_configured_key(&ListKeysRequest {
+                status_filter: Some(KeyStatus::Active),
+                usage_filter: Some(KeyUsage::EncryptDecrypt),
+                ..Default::default()
+            })
+            .expect("a matching list must succeed");
+        assert_eq!(response.keys.len(), 1);
+        assert_eq!(response.keys[0].key_id, key_id);
     }
 
     #[tokio::test]

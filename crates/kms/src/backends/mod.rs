@@ -234,7 +234,18 @@ pub trait KmsBackend: Send + Sync {
     /// Describe a key
     async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse>;
 
-    /// List keys
+    /// List keys.
+    ///
+    /// `status_filter` and `usage_filter` narrow a page after it has been cut,
+    /// so a filtered page can be shorter than the requested limit — and even
+    /// empty — while keys remain: a caller must page until `truncated` is false
+    /// rather than until a page comes back short. Every backend applies both
+    /// filters; a backend that cannot answer a filter must fail rather than
+    /// return the unfiltered set.
+    ///
+    /// Backends that slice their own key set do so with [`paginate_keys`],
+    /// which fixes the ordering and the marker semantics; a backend paging
+    /// through a remote API passes that API's own cursor through instead.
     async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse>;
 
     /// Delete a key
