@@ -550,6 +550,8 @@ pub enum MrfOpKind {
     #[default]
     #[serde(rename = "object")]
     Object,
+    #[serde(rename = "metadata")]
+    Metadata,
     #[serde(rename = "delete")]
     Delete,
 }
@@ -831,7 +833,11 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: retry_count_to_mrf(self.retry_count),
             size: self.size,
-            op: MrfOpKind::Object,
+            op: if self.op_type == ReplicationType::Metadata {
+                MrfOpKind::Metadata
+            } else {
+                MrfOpKind::Object
+            },
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -886,7 +892,11 @@ impl ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: retry_count_to_mrf(self.retry_count),
             size: self.size,
-            op: MrfOpKind::Object,
+            op: if self.op_type == ReplicationType::Metadata {
+                MrfOpKind::Metadata
+            } else {
+                MrfOpKind::Object
+            },
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -1112,6 +1122,18 @@ mod tests {
 
         assert!(!synchronous.replicate_any());
         assert_eq!(asynchronous.replicate_target_arns(), vec!["arn:async".to_string()]);
+    }
+
+    #[test]
+    fn metadata_replication_mrf_entry_preserves_operation_kind() {
+        let info = ReplicateObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            op_type: ReplicationType::Metadata,
+            ..Default::default()
+        };
+
+        assert_eq!(info.to_mrf_entry().op, MrfOpKind::Metadata);
     }
 
     #[test]
