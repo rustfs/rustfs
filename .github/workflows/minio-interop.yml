@@ -75,6 +75,7 @@ jobs:
       INTEROP_PACKAGE: rustfs
       INTEROP_FEATURES: rio-v2
       INTEROP_FILTER: "test(minio_generated_read_test::)"
+      INTEROP_REQUIRED_TESTS: '["reads_minio_generated_sse_s3_multipart_fixture", "reads_minio_generated_sse_kms_multipart_fixture", "rejects_minio_generated_sse_s3_fixture_with_wrong_kms_key", "rejects_minio_generated_sse_s3_fixture_with_truncated_ciphertext"]'
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -95,20 +96,23 @@ jobs:
       # is a perfectly valid filterset that matches zero tests, so the next
       # rename or module move would leave this job selecting nothing and
       # reporting success without executing a single interop assertion. Count
-      # the selection and fail with a reason instead.
+      # the selection and require every core reader test, while allowing new
+      # reader cases to be added without changing this guard.
       #
       # Count only `filter-match.status == "matches"`: the top-level
       # `test-count` in the JSON is the package total and ignores `-E` entirely.
       - name: Assert the interop selector still matches tests
         run: |
           set -euo pipefail
-          count="$(cargo nextest list --run-ignored all \
+          selection="$(cargo nextest list --run-ignored all \
             -p "$INTEROP_PACKAGE" --features "$INTEROP_FEATURES" \
             -E "$INTEROP_FILTER" --message-format json \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for s in d.get("rust-suites", {}).values() for t in s.get("testcases", {}).values() if t.get("filter-match", {}).get("status") == "matches"))')"
+            | python3 -c 'import json,os,sys; d=json.load(sys.stdin); required=json.loads(os.environ["INTEROP_REQUIRED_TESTS"]); matched=[name for suite in d.get("rust-suites", {}).values() for name,test in suite.get("testcases", {}).items() if test.get("filter-match", {}).get("status") == "matches"]; missing=[test for test in required if not any(name.endswith("minio_generated_read_test::" + test) for name in matched)]; print(len(matched)); print(",".join(missing))')"
+          count="$(printf '%s\n' "$selection" | sed -n '1p')"
+          missing="$(printf '%s\n' "$selection" | sed -n '2p')"
           echo "interop tests selected: ${count}"
-          if [ "${count}" -eq 0 ]; then
-            echo "::error::Selector '${INTEROP_FILTER}' in package '${INTEROP_PACKAGE}' matched 0 tests. The MinIO interop reader tests have moved or been renamed again; fix the selector instead of letting this job pass without running them. Context: rustfs/backlog#1638."
+          if [ -n "${missing}" ]; then
+            echo "::error::Selector '${INTEROP_FILTER}' in package '${INTEROP_PACKAGE}' is missing required tests: ${missing}. The MinIO interop reader tests have moved or been renamed; fix the selector instead of running an incomplete matrix. Context: rustfs/backlog#1638."
             exit 1
           fi
 
