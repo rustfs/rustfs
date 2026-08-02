@@ -969,6 +969,15 @@ impl ECStore {
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
                 if src_info.metadata_only {
+                    // Zero-copy update: only xl.meta is rewritten, the data blocks stay as they
+                    // are. The caller must therefore guarantee that the destination metadata
+                    // still describes the stored bytes. In particular a copy that re-derives
+                    // encryption material may NOT set metadata_only — that would leave a fresh
+                    // DEK beside ciphertext sealed under the old one, permanently destroying the
+                    // object. The S3 handler enforces this before calling in (see the
+                    // metadata_only decision in rustfs/src/app/object_usecase.rs); the sibling
+                    // versioned branch below resolves the same risk by rewriting through
+                    // put_object (issue #4238).
                     return self.pools[pool_idx]
                         .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
                         .await;

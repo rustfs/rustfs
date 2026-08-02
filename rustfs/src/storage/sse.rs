@@ -3430,6 +3430,7 @@ mod tests {
         DARE_CIPHER_AES_256_GCM, DARE_CIPHER_CHACHA20_POLY1305, MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM, SEALED_KEY_IV_SIZE,
         SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
     };
+    use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
 
     #[test]
     fn parse_simple_sse_cmk_rejects_bad_keys_without_crashing() {
@@ -4581,6 +4582,89 @@ mod tests {
             .collect();
         assert!(inherited.is_empty(), "copy destination inherited encryption markers: {inherited:?}");
         assert!(metadata.contains_key("content-type"));
+    }
+
+    /// A same-name CopyObject is normally serviced as a metadata-only update that reuses the
+    /// stored ciphertext, while the handler rebuilds the destination metadata around a *fresh*
+    /// DEK. `ObjectInfo::is_encrypted` — i.e. `is_object_encryption_marker` — is the guard that
+    /// keeps that shortcut away from encrypted objects (see the `metadata_only` decision in
+    /// `rustfs/src/app/object_usecase.rs`). Any encryption flavour whose headers
+    /// `strip_managed_encryption_metadata` drops must therefore also be *detected* there — a
+    /// flavour that is stripped but not detected would resurrect "new DEK + old ciphertext",
+    /// which leaves the object permanently undecryptable.
+    #[test]
+    fn every_strippable_encryption_shape_is_detected_as_encrypted() {
+        let shapes: [(&str, Vec<(&str, &str)>); 4] = [
+            (
+                "sse-s3",
+                vec![
+                    ("x-amz-server-side-encryption", "AES256"),
+                    (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, "sealed"),
+                    (MINIO_INTERNAL_ENCRYPTION_IV_HEADER, "iv"),
+                ],
+            ),
+            (
+                "sse-kms",
+                vec![
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    (MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, "sealed"),
+                    (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, "key-1"),
+                ],
+            ),
+            (
+                "legacy rustfs managed",
+                vec![
+                    ("x-amz-server-side-encryption", "AES256"),
+                    (INTERNAL_ENCRYPTION_KEY_HEADER, "wrapped"),
+                    (INTERNAL_ENCRYPTION_IV_HEADER, "iv"),
+                ],
+            ),
+            (
+                "sse-c",
+                vec![
+                    (SSEC_ALGORITHM_HEADER, "AES256"),
+                    (MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, "sealed"),
+                ],
+            ),
+        ];
+
+        for (label, entries) in shapes {
+            let metadata: HashMap<String, String> = entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+
+            assert!(
+                metadata
+                    .keys()
+                    .any(|key| rustfs_utils::http::is_object_encryption_marker(key)),
+                "{label}: an encrypted object must be detected, otherwise a same-name copy would re-key it \
+                 without rewriting the ciphertext"
+            );
+
+            let mut stripped = metadata.clone();
+            strip_managed_encryption_metadata(&mut stripped);
+            assert_ne!(
+                stripped, metadata,
+                "{label}: the copy path strips this shape's encryption metadata, so the destination cannot \
+                 reuse the source ciphertext"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_object_metadata_is_not_flagged_as_encrypted() {
+        // The metadata-only self-copy shortcut must stay available for unencrypted objects.
+        let metadata: HashMap<String, String> = [("content-type", "text/plain"), ("x-amz-meta-stage", "before")]
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+
+        assert!(
+            !metadata
+                .keys()
+                .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+        );
     }
 
     #[cfg(feature = "rio-v2")]
