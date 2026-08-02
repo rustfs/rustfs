@@ -696,8 +696,15 @@ impl VaultKmsClient {
     async fn ensure_version_history_consistent(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let recorded = self.recorded_version_numbers(key_id).await?;
 
+        // A first-rotation record set (the current v1 record and, at most, the
+        // next v2 record) can be in flight while another caller is between its
+        // create-only writes and the baseline CAS. The material check below
+        // validates the v1 record before adopting it; a later key with a
+        // missing persisted baseline still indicates a lost baseline and fails
+        // closed.
         if key_data.baseline_version.is_none()
             && let Some(oldest_recorded) = recorded.iter().min().copied()
+            && !(key_data.version == 1 && recorded.iter().all(|version| *version <= 2))
         {
             warn!(
                 key_id,
@@ -1888,6 +1895,19 @@ mod tests {
 
     async fn scripted_client(responses: Vec<ScriptedResponse>) -> (ScriptedVault, VaultKmsClient) {
         let vault = ScriptedVault::serve(responses).await;
+        let (vault_config, kms_config) = scripted_configs(&vault.address);
+        let client = VaultKmsClient::new(vault_config, &kms_config)
+            .await
+            .expect("scripted Vault client");
+        (vault, client)
+    }
+
+    async fn scripted_kv2_client(key_data: &VaultKeyData) -> (ScriptedVault, VaultKmsClient) {
+        let vault = ScriptedVault::serve_kv2(
+            "rustfs/kms/keys/wired-key",
+            serde_json::to_value(key_data).expect("serialize scripted KV2 key"),
+        )
+        .await;
         let (vault_config, kms_config) = scripted_configs(&vault.address);
         let client = VaultKmsClient::new(vault_config, &kms_config)
             .await
@@ -3223,6 +3243,100 @@ mod tests {
         );
     }
 
+    /// Concurrent rotations use KV2 create-only records and a CAS pointer
+    /// switch. The stateful scripted Vault applies those preconditions to real
+    /// HTTP requests, so this test proves committed versions are unique and
+    /// contiguous instead of only checking that several calls returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wired_concurrent_kv2_rotations_commit_unique_monotonic_versions() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        const ATTEMPTS: usize = 8;
+        let (vault, client) = scripted_kv2_client(&healthy_key_data()).await;
+        let client = Arc::new(client);
+        let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
+        let tasks: Vec<_> = (0..ATTEMPTS)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    client.rotate_key("wired-key", None).await
+                })
+            })
+            .collect();
+
+        let mut committed_versions = Vec::new();
+        let mut errors = Vec::new();
+        for task in tasks {
+            match task.await.expect("join concurrent rotation task") {
+                Ok(result) => committed_versions.push(result.version),
+                Err(error) => errors.push(error),
+            }
+        }
+
+        assert!(
+            !committed_versions.is_empty(),
+            "at least one concurrent rotation must commit; errors: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(
+                |error| matches!(error, KmsError::InvalidOperation { message } if message.contains("Concurrent modification"))
+            ),
+            "a lost CAS race must be the only expected failure: {errors:?}"
+        );
+
+        let mut sorted_versions = committed_versions.clone();
+        sorted_versions.sort_unstable();
+        let unique_versions: HashSet<_> = sorted_versions.iter().copied().collect();
+        assert_eq!(
+            unique_versions.len(),
+            sorted_versions.len(),
+            "concurrent rotations must never return a version twice: {committed_versions:?}"
+        );
+
+        let successful_rotations = u32::try_from(sorted_versions.len()).expect("test attempts fit u32");
+        let current_version = 1u32 + successful_rotations;
+        assert_eq!(
+            sorted_versions,
+            (2..=current_version).collect::<Vec<_>>(),
+            "committed versions must form one monotonic sequence: {sorted_versions:?}"
+        );
+
+        let snapshot = vault.kv2_snapshot().expect("stateful KV2 snapshot");
+        let persisted_version = snapshot.current_data["version"]
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .expect("current KV2 record must carry a u32 key version");
+        assert_eq!(persisted_version, current_version);
+        assert!(
+            snapshot.current_secret_version >= u64::from(current_version),
+            "the KV2 secret version must advance with each committed pointer switch"
+        );
+        assert_eq!(
+            snapshot.version_records.keys().copied().collect::<Vec<_>>(),
+            (1..=current_version).collect::<Vec<_>>(),
+            "every committed KMS version must have exactly one immutable record"
+        );
+
+        let mut materials = HashSet::new();
+        for (version, record) in &snapshot.version_records {
+            let material = record["encrypted_key_material"]
+                .as_str()
+                .expect("version record must carry encrypted key material");
+            assert!(materials.insert(material), "version {version} reuses another version's material");
+        }
+        assert_eq!(
+            snapshot.current_data["encrypted_key_material"],
+            snapshot
+                .version_records
+                .get(&current_version)
+                .expect("current version record")["encrypted_key_material"],
+            "the top-level fast path must match the current immutable version record"
+        );
+    }
+
     /// The tags write-back after a create is a check-and-set read-modify-write
     /// that carries the key material over from the freshly read record.
     #[tokio::test]
@@ -3462,6 +3576,50 @@ mod tests {
             committed["data"]["encrypted_key_material"],
             serde_json::json!(adopted_material),
             "{committed}"
+        );
+    }
+
+    /// A concurrent first rotation may leave both immutable records visible
+    /// before this caller observes the baseline CAS. That transient state must
+    /// continue through the create-only/adopt path rather than being reported
+    /// as a permanently lost baseline.
+    #[tokio::test]
+    async fn wired_rotate_recovers_concurrent_first_rotation_without_baseline() {
+        let key_data = healthy_key_data();
+        let record_v2 = VaultKeyVersionRecord {
+            version: 2,
+            encrypted_key_material: rotated_material(),
+            created_at: Zoned::now(),
+        };
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+            // Another rotation already created the baseline record.
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            ScriptedResponse::ok(kv2_read_version_record_data(&VaultKeyVersionRecord {
+                version: 1,
+                encrypted_key_material: key_data.encrypted_key_material.clone(),
+                created_at: key_data.created_at.clone(),
+            })),
+            // Persist the baseline pointer, then adopt the already-created v2.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            ScriptedResponse::ok(kv2_read_version_record_data(&record_v2)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect("an in-flight first rotation must be recoverable");
+        assert_eq!(rotated.version, 2);
+        assert_eq!(
+            parse_write_body(&vault.request_bodies()[8])["data"]["encrypted_key_material"],
+            serde_json::json!(record_v2.encrypted_key_material),
+            "the pointer must adopt the immutable v2 material"
         );
     }
 
