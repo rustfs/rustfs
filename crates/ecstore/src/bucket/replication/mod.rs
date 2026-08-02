@@ -74,8 +74,8 @@ pub use replication_pool::{
     init_background_replication, read_durable_mrf_backlog, resync_start_conflict_id,
 };
 pub use replication_queue_boundary::{
-    DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,
-    ReplicationQueueAdmission,
+    DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,
+    ReplicationPriority, ReplicationQueueAdmission,
 };
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;

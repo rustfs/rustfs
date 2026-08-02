@@ -45,7 +45,8 @@ use super::storage_api::object_usecase::bucket::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, delete_replication_state_from_config,
         delete_replication_version_id, deleted_object_has_pending_replication_delete, has_active_delete_rule,
         load_delete_config_snapshot, must_replicate_object, schedule_object_replication, schedule_replication_delete,
-        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        schedule_replication_deletes, set_deleted_object_replication_state, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -7031,14 +7032,26 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        for result in &delete_results {
-            if let Some(dobj) = &result.delete_object
-                && replicate_deletes
-                && deleted_object_has_pending_replication_delete(dobj)
-            {
+        let replication_deletes = if replicate_deletes {
+            delete_results
+                .iter()
+                .filter_map(|result| result.delete_object.as_ref())
+                .filter(|dobj| deleted_object_has_pending_replication_delete(dobj))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !replication_deletes.is_empty() {
+            let bucket_for_replication = bucket.clone();
+            let replication_task = tokio::spawn(async move {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-                schedule_replication_delete(dobj.clone(), bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
-            }
+                schedule_replication_deletes(replication_deletes, bucket_for_replication, REPLICATE_INCOMING_DELETE.to_string())
+                    .await;
+            });
+            // The spawned task owns every locally committed delete. Dropping the
+            // join handle on request cancellation therefore cannot lose the tail.
+            let _ = replication_task.await;
         }
 
         let req_headers = req.headers.clone();
