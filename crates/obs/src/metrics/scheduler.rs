@@ -28,6 +28,7 @@ use crate::metrics::collectors::{
     BucketReplicationBacklogStats,
     BucketReplicationBandwidthStats,
     BucketReplicationStats,
+    DriveDetailedStats,
     NotificationStats,
     NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
@@ -110,6 +111,9 @@ use crate::metrics::schema::notification_target::{
     NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
     NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER as NOTIFICATION_SERVER_LABEL,
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
+};
+use crate::metrics::schema::system_drive::{
+    DISK_ID_LABEL, DRIVE_INDEX_LABEL, DRIVE_INFO_MD, DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL,
 };
 use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
@@ -283,6 +287,35 @@ type AuditLegacyTargetKey = String;
 type AuditTargetKey = (String, String); // (server, target_id)
 type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
 type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
+type DriveInfoKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, disk_id)
+
+fn drive_info_live_keys(stats: &[DriveDetailedStats]) -> HashSet<DriveInfoKey> {
+    stats.iter().filter_map(drive_info_key).collect()
+}
+
+fn drive_info_key(stat: &DriveDetailedStats) -> Option<DriveInfoKey> {
+    let disk_id = stat.disk_id.as_ref().filter(|disk_id| !disk_id.is_empty())?;
+    Some((
+        stat.server.clone(),
+        stat.drive.clone(),
+        stat.pool_index.as_ref()?.clone(),
+        stat.set_index.as_ref()?.clone(),
+        stat.drive_index.as_ref()?.clone(),
+        disk_id.clone(),
+    ))
+}
+
+fn retire_drive_info_metric_series(key: &DriveInfoKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
+        (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
+        (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
+        (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
+        (DISK_ID_LABEL, Cow::Owned(key.5.clone())),
+    ];
+    retire_metric_series(&DRIVE_INFO_MD.get_full_metric_name(), &labels)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub struct MetricsRuntimeCollectorHealthSnapshot {
@@ -1652,15 +1685,28 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = metrics_interval(node_interval, Duration::ZERO);
+        let mut prev_drive_info_keys: HashSet<DriveInfoKey> = HashSet::new();
+        let mut has_seen_drive_info_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::NodeDiskStats, "node_disk_stats", async {
                         let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
+                        let current_drive_info_keys = drive_info_live_keys(&drive_stats);
+                        let retire_drive_info_keys = if has_seen_drive_info_snapshot {
+                            prev_drive_info_keys.difference(&current_drive_info_keys).cloned().collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        prev_drive_info_keys = current_drive_info_keys;
+                        has_seen_drive_info_snapshot = true;
                         let mut metrics = collect_node_metrics(&disk_stats);
                         metrics.extend(collect_drive_detailed_metrics(&drive_stats));
                         metrics.extend(collect_drive_count_metrics(&drive_counts));
                         report_metrics(&metrics);
+                        for key in retire_drive_info_keys {
+                            let _ = retire_drive_info_metric_series(&key);
+                        }
                     }).await;
                 }
                 _ = token_clone.cancelled() => {
@@ -2253,6 +2299,42 @@ mod tests {
 
     fn notification_target_key(server: &str, target_id: &str, target_type: &str) -> NotificationTargetKey {
         (server.to_string(), target_id.to_string(), target_type.to_string())
+    }
+
+    fn drive_info_stat(disk_id: &str) -> DriveDetailedStats {
+        DriveDetailedStats {
+            server: "server-a".to_string(),
+            drive: "/data1".to_string(),
+            pool_index: Some("0".to_string()),
+            set_index: Some("1".to_string()),
+            drive_index: Some("2".to_string()),
+            disk_id: Some(disk_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drive_info_live_keys_detect_disk_identity_replacement() {
+        let previous = drive_info_live_keys(&[drive_info_stat("disk-old")]);
+        let current = drive_info_live_keys(&[drive_info_stat("disk-new")]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(current.contains(&(
+            "server-a".to_string(),
+            "/data1".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+            "disk-new".to_string(),
+        )));
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "/data1".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+            "disk-old".to_string(),
+        )));
     }
 
     #[test]

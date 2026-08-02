@@ -736,6 +736,8 @@ impl ScannerBucketDriveResultKey {
     }
 }
 
+const MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -2371,8 +2373,16 @@ impl Metrics {
             .scanner_bucket_drive_results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let count = results.entry(key).or_default();
-        *count = count.saturating_add(1);
+        let has_new_key_capacity = results.len() < MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS;
+        match results.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() = entry.get().saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) if has_new_key_capacity => {
+                entry.insert(1);
+            }
+            std::collections::hash_map::Entry::Vacant(_) => {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2896,6 +2906,7 @@ impl Metrics {
             };
             m.current_cycle_active = self.current_scan_cycle_work_active.load(Ordering::Acquire);
             if m.current_cycle_active {
+                // Keep cycle_info before cycle-baseline locks so active scrapes cannot mix two cycle identities.
                 let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
                 let current_source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
                 let current_replication_repair_work =
@@ -2917,6 +2928,7 @@ impl Metrics {
                 m.current_cycle_source_work = self.scanner_source_work_snapshots(&current_source_work);
                 m.current_cycle_replication_repair =
                     self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
+                m.current_cycle_bucket_drive_results = self.current_cycle_bucket_drive_result_snapshots();
             }
             has_cycle
         };
@@ -2997,9 +3009,6 @@ impl Metrics {
         m.last_cycle_bucket_drive_scans = self.last_scan_cycle_bucket_drive_scans.load(Ordering::Relaxed);
         m.last_cycle_bucket_drive_failures = self.last_scan_cycle_bucket_drive_failures.load(Ordering::Relaxed);
         m.bucket_drive_results = self.scanner_bucket_drive_result_counter_snapshots();
-        if m.current_cycle_active {
-            m.current_cycle_bucket_drive_results = self.current_cycle_bucket_drive_result_snapshots();
-        }
         m.last_cycle_bucket_drive_results = self
             .last_scan_cycle_bucket_drive_results
             .lock()
@@ -4257,6 +4266,18 @@ mod tests {
 
         let cycle_start = metrics.start_scan_cycle_work();
         metrics.record_scanner_bucket_drive_result("photos", "/data1", "partial");
+
+        let active_report = metrics.report().await;
+        assert_eq!(
+            active_report.current_cycle_bucket_drive_results,
+            vec![ScannerBucketDriveResultSnapshot {
+                bucket: "photos".to_string(),
+                drive: "/data1".to_string(),
+                result: "partial".to_string(),
+                count: 1,
+            }]
+        );
+
         metrics.finish_scan_cycle_work(cycle_start);
 
         let report = metrics.report().await;
@@ -4287,6 +4308,25 @@ mod tests {
                 result: "partial".to_string(),
                 count: 1,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_bucket_drive_results_are_bounded() {
+        let metrics = Metrics::new();
+        for index in 0..MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS {
+            metrics.record_scanner_bucket_drive_result(&format!("bucket-{index}"), "/data1", "success");
+        }
+        metrics.record_scanner_bucket_drive_result("overflow", "/data1", "success");
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.bucket_drive_results.len(), MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS);
+        assert!(
+            report
+                .bucket_drive_results
+                .iter()
+                .all(|snapshot| snapshot.bucket != "overflow")
         );
     }
 
@@ -4455,6 +4495,7 @@ mod tests {
         };
         let cycle_ten_start = metrics.start_scan_cycle_work_with_cycle(cycle_ten.clone()).await;
         metrics.operations[Metric::ScanObject as usize].store(1, Ordering::Relaxed);
+        metrics.record_scanner_bucket_drive_result("cycle-ten", "/data1", "partial");
 
         let paths = metrics.current_paths.write().await;
         let mut report = Box::pin(metrics.report());
@@ -4474,12 +4515,22 @@ mod tests {
             })
             .await;
         metrics.operations[Metric::ScanObject as usize].store(101, Ordering::Relaxed);
+        metrics.record_scanner_bucket_drive_result("cycle-eleven", "/data1", "partial");
 
         drop(paths);
         let snapshot = report.await;
 
         assert_eq!(snapshot.current_cycle, 10);
         assert_eq!(snapshot.current_cycle_objects_scanned, 1);
+        assert_eq!(
+            snapshot.current_cycle_bucket_drive_results,
+            vec![ScannerBucketDriveResultSnapshot {
+                bucket: "cycle-ten".to_string(),
+                drive: "/data1".to_string(),
+                result: "partial".to_string(),
+                count: 1,
+            }]
+        );
 
         metrics
             .finish_scan_cycle_work_with_cycle(cycle_eleven_start, CurrentCycle::default())

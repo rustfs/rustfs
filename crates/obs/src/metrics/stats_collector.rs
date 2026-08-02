@@ -396,24 +396,21 @@ fn drive_inode_stats(used_inodes: u64, free_inodes: u64) -> (Option<u64>, Option
 fn drive_api_latency_micros(actions: impl Iterator<Item = (u64, u64)>) -> Option<u64> {
     let mut count = 0u64;
     let mut acc_time_ns = 0u64;
+    let mut saw_action = false;
     for (action_count, action_acc_time_ns) in actions {
-        if action_count == 0 {
-            continue;
+        saw_action = true;
+        if action_count > 0 {
+            count = count.saturating_add(action_count);
+            acc_time_ns = acc_time_ns.saturating_add(action_acc_time_ns);
         }
-        count = count.saturating_add(action_count);
-        acc_time_ns = acc_time_ns.saturating_add(action_acc_time_ns);
     }
 
-    acc_time_ns.checked_div(count).map(|avg_time_ns| avg_time_ns / 1_000)
+    saw_action.then(|| acc_time_ns.checked_div(count).unwrap_or_default() / 1_000)
 }
 
 fn drive_api_latency_by_api_micros<'a>(actions: impl Iterator<Item = (&'a String, u64, u64)>) -> Vec<(String, u64)> {
     let mut values = actions
-        .filter_map(|(api, count, acc_time)| {
-            acc_time
-                .checked_div(count)
-                .map(|avg_time_ns| (api.clone(), avg_time_ns / 1_000))
-        })
+        .map(|(api, count, acc_time)| (api.clone(), acc_time.checked_div(count).unwrap_or_default() / 1_000))
         .collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
@@ -1726,11 +1723,12 @@ mod tests {
     fn drive_api_latency_skips_zero_denominators() {
         let last_minute = HashMap::from([("zero".to_string(), (0, 9_000))]);
 
-        assert_eq!(drive_api_latency_micros(last_minute.values().copied()), None);
-        assert!(
-            drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time)))
-                .is_empty()
+        assert_eq!(drive_api_latency_micros(last_minute.values().copied()), Some(0));
+        assert_eq!(
+            drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time))),
+            vec![("zero".to_string(), 0)]
         );
+        assert_eq!(drive_api_latency_micros([].into_iter()), None);
     }
 
     #[test]

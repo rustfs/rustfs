@@ -440,10 +440,7 @@ impl DiskHealthTracker {
 
     fn record_operation_metrics(&self, op: &'static str, elapsed: Duration) {
         let now_sec = current_unix_secs();
-        let mut metrics = self
-            .operation_metrics
-            .lock()
-            .expect("disk operation metrics lock should not be poisoned");
+        let mut metrics = self.operation_metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         metrics.entry(op).or_default().record(now_sec, elapsed);
     }
 
@@ -457,15 +454,12 @@ impl DiskHealthTracker {
 
     pub fn metrics_snapshot(&self) -> DiskMetrics {
         let now_sec = current_unix_secs();
-        let operation_metrics = self
-            .operation_metrics
-            .lock()
-            .expect("disk operation metrics lock should not be poisoned");
+        let operation_metrics = self.operation_metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut last_minute = HashMap::with_capacity(operation_metrics.len());
         let mut api_calls = HashMap::with_capacity(operation_metrics.len());
         for (op, action) in operation_metrics.iter() {
             let window = action.last_minute_snapshot(now_sec);
-            if window.count > 0 {
+            if action.lifetime_calls > 0 {
                 last_minute.insert((*op).to_string(), window);
             }
             api_calls.insert((*op).to_string(), action.lifetime_calls);
@@ -1170,12 +1164,12 @@ impl LocalDiskWrapper {
 
     /// Track disk health for an operation.
     /// This method should wrap disk operations to ensure health checking.
-    pub async fn track_disk_health<T, F, Fut>(&self, operation: F, timeout_duration: Duration) -> Result<T>
+    pub async fn track_disk_health<T, F, Fut>(&self, op: &'static str, operation: F, timeout_duration: Duration) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        self.track_disk_health_with_op("unknown", operation, timeout_duration).await
+        self.track_disk_health_with_op(op, operation, timeout_duration).await
     }
 
     pub async fn track_disk_health_with_op<T, F, Fut>(
@@ -1392,13 +1386,21 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn make_volume(&self, volume: &str) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.make_volume(volume).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "make_volume",
+            || async { self.disk.make_volume(volume).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.make_volumes(volumes).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "make_volumes",
+            || async { self.disk.make_volumes(volumes).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
@@ -1407,13 +1409,21 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        self.track_disk_health(|| async { self.disk.stat_volume(volume).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "stat_volume",
+            || async { self.disk.stat_volume(volume).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete_volume(volume, force_delete).await }, Duration::ZERO)
-            .await
+        self.track_disk_health(
+            "delete_volume",
+            || async { self.disk.delete_volume(volume, force_delete).await },
+            Duration::ZERO,
+        )
+        .await
     }
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
@@ -1442,6 +1452,7 @@ impl DiskAPI for LocalDiskWrapper {
         opts: DeleteOptions,
     ) -> Result<()> {
         self.track_disk_health(
+            "delete_version",
             || async { self.disk.delete_version(volume, path, fi, force_del_marker, opts).await },
             get_max_timeout_duration(),
         )
@@ -1451,11 +1462,13 @@ impl DiskAPI for LocalDiskWrapper {
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         // Check if disk is faulty before proceeding
         if self.health.is_faulty() {
+            self.health.record_availability_error();
             return vec![Some(DiskError::FaultyDisk); versions.len()];
         }
 
         // Check if disk is stale
         if let Err(e) = self.check_disk_stale().await {
+            self.health.record_availability_error();
             return vec![Some(e); versions.len()];
         }
 
@@ -1479,12 +1492,17 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete_paths(volume, paths).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "delete_paths",
+            || async { self.disk.delete_paths(volume, paths).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
         self.track_disk_health(
+            "acquire_snapshot_lease",
             || async { self.disk.acquire_snapshot_lease(volume, path).await },
             get_max_timeout_duration(),
         )
@@ -1493,6 +1511,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
         self.track_disk_health(
+            "release_snapshot_lease",
             || async { self.disk.release_snapshot_lease(volume, path, token).await },
             get_max_timeout_duration(),
         )
@@ -1501,6 +1520,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
         self.track_disk_health(
+            "renew_snapshot_lease",
             || async { self.disk.renew_snapshot_lease(volume, path, token).await },
             get_max_timeout_duration(),
         )
@@ -1509,6 +1529,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
         self.track_disk_health(
+            "delete_data_dir",
             || async { self.disk.delete_data_dir(volume, path, opts).await },
             get_max_timeout_duration(),
         )
@@ -1517,6 +1538,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         self.track_disk_health(
+            "write_metadata",
             || async { self.disk.write_metadata(org_volume, volume, path, fi).await },
             get_max_timeout_duration(),
         )
@@ -1525,6 +1547,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         self.track_disk_health(
+            "update_metadata",
             || async { self.disk.update_metadata(volume, path, fi, opts).await },
             get_max_timeout_duration(),
         )
@@ -1540,6 +1563,7 @@ impl DiskAPI for LocalDiskWrapper {
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
         self.track_disk_health(
+            "read_version",
             || async { self.disk.read_version(org_volume, volume, path, version_id, opts).await },
             get_max_timeout_duration(),
         )
@@ -1547,8 +1571,12 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
-        self.track_disk_health(|| async { self.disk.read_xl(volume, path, read_data).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "read_xl",
+            || async { self.disk.read_xl(volume, path, read_data).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn rename_data(
@@ -1578,12 +1606,17 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<crate::disk::FileReader> {
-        self.track_disk_health(|| async { self.disk.read_file(volume, path).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "read_file",
+            || async { self.disk.read_file(volume, path).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<crate::disk::FileReader> {
         self.track_disk_health(
+            "read_file_stream",
             || async { self.disk.read_file_stream(volume, path, offset, length).await },
             get_max_timeout_duration(),
         )
@@ -1592,6 +1625,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
         self.track_disk_health(
+            "read_file_mmap_copy",
             || async { self.disk.read_file_mmap_copy(volume, path, offset, length).await },
             get_max_timeout_duration(),
         )
@@ -1607,6 +1641,7 @@ impl DiskAPI for LocalDiskWrapper {
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<bytes::Bytes> {
         self.track_disk_health(
+            "read_file_mmap_copy_with_metrics",
             || async {
                 self.disk
                     .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
@@ -1618,12 +1653,13 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<crate::disk::FileWriter> {
-        self.track_disk_health(|| async { self.disk.append_file(volume, path).await }, Duration::ZERO)
+        self.track_disk_health("append_file", || async { self.disk.append_file(volume, path).await }, Duration::ZERO)
             .await
     }
 
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<crate::disk::FileWriter> {
         self.track_disk_health(
+            "create_file",
             || async { self.disk.create_file(origvolume, volume, path, file_size).await },
             Duration::ZERO,
         )
@@ -1632,6 +1668,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         self.track_disk_health(
+            "rename_file",
             || async { self.disk.rename_file(src_volume, src_path, dst_volume, dst_path).await },
             get_max_timeout_duration(),
         )
@@ -1640,6 +1677,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         self.track_disk_health(
+            "rename_part",
             || async { self.disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await },
             get_max_timeout_duration(),
         )
@@ -1655,6 +1693,7 @@ impl DiskAPI for LocalDiskWrapper {
         meta: Bytes,
     ) -> Result<()> {
         self.track_disk_health(
+            "prepare_part_transaction",
             || async {
                 self.disk
                     .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
@@ -1667,6 +1706,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: crate::disk::PartTransactionAction) -> Result<()> {
         self.track_disk_health(
+            "settle_part_transaction",
             || async { self.disk.settle_part_transaction(volume, path, action).await },
             get_max_timeout_duration(),
         )
@@ -1674,38 +1714,50 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete(volume, path, opt).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "delete",
+            || async { self.disk.delete(volume, path, opt).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        self.track_disk_health(|| async { self.disk.verify_file(volume, path, fi).await }, Duration::ZERO)
+        self.track_disk_health("verify_file", || async { self.disk.verify_file(volume, path, fi).await }, Duration::ZERO)
             .await
     }
 
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        self.track_disk_health(|| async { self.disk.check_parts(volume, path, fi).await }, Duration::ZERO)
+        self.track_disk_health("check_parts", || async { self.disk.check_parts(volume, path, fi).await }, Duration::ZERO)
             .await
     }
 
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        self.track_disk_health(|| async { self.disk.read_parts(bucket, paths).await }, Duration::ZERO)
+        self.track_disk_health("read_parts", || async { self.disk.read_parts(bucket, paths).await }, Duration::ZERO)
             .await
     }
 
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
-        self.track_disk_health(|| async { self.disk.read_multiple(req).await }, Duration::ZERO)
+        self.track_disk_health("read_multiple", || async { self.disk.read_multiple(req).await }, Duration::ZERO)
             .await
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.write_all(volume, path, data).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "write_all",
+            || async { self.disk.write_all(volume, path, data).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
-        self.track_disk_health(|| async { self.disk.read_all(volume, path).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health(
+            "read_all",
+            || async { self.disk.read_all(volume, path).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 }
 
@@ -1716,6 +1768,7 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use std::{
         io,
+        panic::{AssertUnwindSafe, catch_unwind},
         pin::Pin,
         task::{Context, Poll},
     };
@@ -1764,6 +1817,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disk_health_metrics_snapshot_keeps_expired_operation_windows() {
+        let health = DiskHealthTracker::new();
+        let mut metrics = DiskOperationMetrics::default();
+        metrics.record(current_unix_secs().saturating_sub(60), Duration::from_micros(13));
+        health
+            .operation_metrics
+            .lock()
+            .expect("test should lock operation metrics")
+            .insert("read_all", metrics);
+
+        let snapshot = health.metrics_snapshot();
+
+        assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
+        assert_eq!(snapshot.last_minute.get("read_all").map(|action| action.count), Some(0));
+    }
+
+    #[test]
+    fn disk_operation_metrics_recovers_poisoned_lock() {
+        let health = DiskHealthTracker::new();
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = health.operation_metrics.lock().expect("test should lock operation metrics");
+            panic!("poison disk operation metrics lock");
+        }));
+
+        assert!(panic_result.is_err());
+        health.record_operation_metrics("read_all", Duration::from_micros(13));
+        let snapshot = health.metrics_snapshot();
+
+        assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
+    }
+
     #[tokio::test]
     async fn local_disk_health_wrapper_balances_task_cancellation() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -1774,7 +1859,7 @@ mod tests {
         let task_wrapper = Arc::clone(&wrapper);
         let task = tokio::spawn(async move {
             task_wrapper
-                .track_disk_health(|| async { std::future::pending::<Result<()>>().await }, Duration::ZERO)
+                .track_disk_health("test_pending", || async { std::future::pending::<Result<()>>().await }, Duration::ZERO)
                 .await
         });
 
@@ -1789,6 +1874,52 @@ mod tests {
         let _ = task.await;
 
         assert_eq!(wrapper.health.waiting_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_versions_counts_faulty_drive_availability_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let result = wrapper
+            .delete_versions("bucket", vec![FileInfoVersions::default()], DeleteOptions::default())
+            .await;
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result.first(), Some(Some(DiskError::FaultyDisk))));
+        assert_eq!(wrapper.health.metrics_snapshot().total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_versions_counts_stale_drive_availability_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        {
+            let mut format_info = disk.format_info.write().await;
+            format_info.id = Some(Uuid::new_v4());
+            format_info.file_info = Some(
+                tokio::fs::metadata(dir.path())
+                    .await
+                    .expect("temp dir metadata should be readable"),
+            );
+            format_info.last_check = Some(::time::OffsetDateTime::now_utc());
+        }
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+
+        let result = wrapper
+            .delete_versions("bucket", vec![FileInfoVersions::default()], DeleteOptions::default())
+            .await;
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result.first(), Some(Some(DiskError::DiskNotFound))));
+        assert_eq!(wrapper.health.metrics_snapshot().total_errors_availability, 1);
     }
 
     impl AsyncWrite for PendingWriter {
