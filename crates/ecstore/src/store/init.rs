@@ -593,7 +593,7 @@ mod tests {
             tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
             warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
-        storage_api_contracts::{list::ListOperations as _, object::ObjectOperations as _},
+        storage_api_contracts::list::ListOperations as _,
     };
     use crate::{
         core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
@@ -1415,6 +1415,99 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn recursive_delete_checks_object_lock_on_every_version_page() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "recursive-delete-pagination", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("recursive-page-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create plain bucket");
+        for object in ["prefix/a.bin", "prefix/b.bin"] {
+            let mut reader = PutObjReader::from_vec(b"plain".to_vec());
+            store
+                .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("write first-page object");
+        }
+        let locked_object = "prefix/z-locked.bin";
+        let mut reader = PutObjReader::from_vec(b"locked".to_vec());
+        store
+            .put_object(
+                &bucket,
+                locked_object,
+                &mut reader,
+                &ObjectOptions {
+                    user_defined: HashMap::from([
+                        (
+                            s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                        ),
+                        (
+                            s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                            "2099-01-01T00:00:00Z".to_string(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write second-page locked object");
+
+        let first_page = store.pools[0].disk_set[0]
+            .clone()
+            .inner_list_object_versions_for_recursive_delete(&bucket, "prefix/", None, None, 2)
+            .await
+            .expect("list the first recursive-delete validation page");
+        assert!(first_page.is_truncated, "the fixture must require a continuation page");
+        assert!(
+            first_page.objects.iter().all(|object| object.name != locked_object),
+            "the locked object must not be visible on the first page"
+        );
+        let second_page = store.pools[0].disk_set[0]
+            .clone()
+            .inner_list_object_versions_for_recursive_delete(
+                &bucket,
+                "prefix/",
+                first_page.next_marker,
+                first_page.next_version_idmarker,
+                2,
+            )
+            .await
+            .expect("list the recursive-delete continuation page");
+        assert!(
+            second_page.objects.iter().any(|object| object.name == locked_object),
+            "the continuation page must contain the locked object"
+        );
+
+        let err = store
+            .delete_object(
+                &bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("recursive delete must scan the continuation page and find the locked object");
+        assert!(
+            matches!(err, StorageError::PrefixAccessDenied(ref name, ref object) if name == &bucket && object == locked_object),
+            "unexpected recursive delete error: {err:?}"
+        );
+        for object in ["prefix/a.bin", "prefix/b.bin", locked_object] {
+            store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("a rejected recursive delete must leave every page intact");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn delete_holds_bucket_incarnation_sentinel_through_object_commit() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
@@ -1759,8 +1852,11 @@ mod tests {
             .await
             .expect("read initial bucket incarnation");
 
-        let barrier =
-            crate::set_disk::PutObjectCommitBarrier::install(&bucket, object, crate::set_disk::PutObjectCommitPause::BeforeLock);
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
         let put_store = Arc::clone(&store);
         let put_bucket = bucket.clone();
         let put = tokio::spawn(async move {
@@ -2165,7 +2261,95 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn complete_multipart_rejects_upload_from_recreated_bucket_incarnation() {
+    async fn pre_upgrade_multipart_upload_can_complete_and_abort_in_the_same_bucket_lifetime() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-upgrade-compat", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("multipart-upgrade-compat-{}", uuid::Uuid::new_v4());
+        let created = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed timestamp should be valid");
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    created_at: Some(created),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create bucket");
+
+        let complete_object = "complete.bin";
+        let complete_upload = store.pools[0]
+            .new_multipart_upload(
+                &bucket,
+                complete_object,
+                &ObjectOptions {
+                    mod_time: Some(created + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create a pre-upgrade multipart upload without an incarnation stamp");
+        let mut part_reader = PutObjReader::from_vec(b"pre-upgrade multipart body".to_vec());
+        let part = store.pools[0]
+            .put_object_part(
+                &bucket,
+                complete_object,
+                &complete_upload.upload_id,
+                1,
+                &mut part_reader,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("stage a pre-upgrade multipart part");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                complete_object,
+                &complete_upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("a pre-upgrade upload from the current bucket lifetime should complete");
+        store
+            .get_object_info(&bucket, complete_object, &ObjectOptions::default())
+            .await
+            .expect("completed pre-upgrade upload should be visible");
+
+        let abort_object = "abort.bin";
+        let abort_upload = store.pools[0]
+            .new_multipart_upload(
+                &bucket,
+                abort_object,
+                &ObjectOptions {
+                    mod_time: Some(created + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create another pre-upgrade multipart upload");
+        store
+            .abort_multipart_upload(&bucket, abort_object, &abort_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("a pre-upgrade upload from the current bucket lifetime should abort");
+        let err = store
+            .get_multipart_info(&bucket, abort_object, &abort_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("aborted pre-upgrade upload should be removed");
+        assert!(matches!(err, StorageError::InvalidUploadID(..)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn complete_multipart_rejects_legacy_upload_from_recreated_bucket_incarnation() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-bucket-incarnation", &[4])).await;
@@ -2173,25 +2357,45 @@ mod tests {
 
         let bucket = format!("multipart-incarnation-{}", uuid::Uuid::new_v4());
         let object = "object.bin";
+        let created = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed timestamp should be valid");
         store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    created_at: Some(created),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("create initial bucket");
         let old_incarnation = store
             .bucket_incarnation_id(&bucket)
             .await
             .expect("read initial bucket incarnation");
-        let upload = store
-            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+        let upload = store.pools[0]
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(created + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
             .await
-            .expect("create old-generation multipart upload");
+            .expect("create old-generation legacy multipart upload");
 
         store
             .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
             .await
             .expect("delete bucket with an incomplete multipart upload");
         store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    created_at: Some(created + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("recreate same-name bucket");
         let new_incarnation = store

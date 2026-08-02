@@ -417,6 +417,22 @@ mod tests {
     }
 
     #[test]
+    fn deletion_with_fabricated_bucket_metadata_fails_closed() {
+        let err = check_object_lock_for_deletion_with_state(&ObjectLockConfigState::Fabricated, &ObjectInfo::default(), false)
+            .expect_err("non-authoritative Object Lock metadata must block deletion");
+
+        assert!(err.to_string().contains("not authoritative"));
+    }
+
+    #[test]
+    fn recursive_force_delete_with_fabricated_bucket_metadata_fails_closed() {
+        let err = ensure_recursive_force_delete_allowed_for_state("bucket", &ObjectLockConfigState::Fabricated)
+            .expect_err("non-authoritative Object Lock metadata must block recursive deletion");
+
+        assert!(err.to_string().contains("not authoritative"));
+    }
+
+    #[test]
     fn deletion_rejects_incomplete_persisted_retention_metadata() {
         let mut user_defined = std::collections::HashMap::new();
         user_defined.insert(

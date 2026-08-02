@@ -238,6 +238,7 @@ impl ECStore {
     }
 
     #[instrument(skip(self))]
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_list_multipart_uploads(
         &self,
         bucket: &str,

@@ -37,7 +37,7 @@ impl RestoreCleanupIdentity {
     }
 
     fn matches_file_info(&self, fi: &FileInfo, expected_etag: &str) -> bool {
-        self.version_id == fi.version_id
+        self.version_id.filter(|version_id| !version_id.is_nil()) == fi.version_id.filter(|version_id| !version_id.is_nil())
             && self.data_dir == fi.data_dir
             && self.mod_time == fi.mod_time
             && self.size == fi.size

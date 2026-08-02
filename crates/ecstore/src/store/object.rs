@@ -40,6 +40,11 @@ use std::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 
+#[cfg(not(test))]
+const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
+#[cfg(test)]
+const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
+
 /// A GET whose object identity has been resolved while its namespace read lock
 /// remains held, but whose body reader has not been constructed yet.
 ///
@@ -1402,7 +1407,7 @@ impl ECStore {
                                     object,
                                     marker.clone(),
                                     version_marker.clone(),
-                                    1000,
+                                    RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
                                 )
                                 .await?;
                             for object_info in &page.objects {
@@ -1871,6 +1876,27 @@ impl ECStore {
             if opts.expected_bucket_incarnation_id != Some(current_incarnation_id) {
                 return Err(StorageError::BucketNotFound(bucket.to_string()));
             }
+        }
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("restore is missing its bucket incarnation snapshot"))?;
+            let lifecycle_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("restore is missing its bucket lifecycle fence"))?;
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(bucket, lifecycle_fence)
+                        .await?
+                }
+            };
+            if !snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) {
+                return Err(Error::other("restore Object Lock snapshot does not match the target bucket generation"));
+            }
+            snapshot.add_lock_fences(&mut opts);
+            opts.object_lock_config_snapshot = Some(snapshot);
         }
         // Deliberately NOT holding the object write lock across the tier
         // copy-back (backlog#1304): non-SELECT restore-vs-restore is

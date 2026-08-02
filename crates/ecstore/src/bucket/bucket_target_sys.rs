@@ -1409,15 +1409,15 @@ impl BucketTargetSys {
         let mut retired_endpoint_candidates = HashSet::new();
         if let Some(old_targets) = targets_map.remove(bucket) {
             let needs_remaining_arns = old_targets.iter().any(|target| !prepared_clients.contains_key(&target.arn));
-            let remaining_arns = needs_remaining_arns
-                .then(|| {
-                    targets_map
-                        .values()
-                        .flatten()
-                        .map(|target| target.arn.as_str())
-                        .collect::<HashSet<_>>()
-                })
-                .unwrap_or_default();
+            let remaining_arns = if needs_remaining_arns {
+                targets_map
+                    .values()
+                    .flatten()
+                    .map(|target| target.arn.as_str())
+                    .collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            };
             for target in old_targets {
                 if !prepared_clients.contains_key(&target.arn) && remaining_arns.contains(target.arn.as_str()) {
                     if let Some(endpoint) = target_endpoint_health_key(&target) {
@@ -2809,6 +2809,70 @@ mod tests {
         (port, handle)
     }
 
+    fn spawn_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>, requests: usize) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        ensure_rustls_crypto_provider();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test TLS listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test TLS listener should have an address")
+            .port();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls_pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+                    .expect("test TLS private key should convert"),
+            )
+            .expect("test TLS server config should build");
+
+        let handle = std::thread::spawn(move || {
+            let server_config = Arc::new(server_config);
+            for _ in 0..requests {
+                let (stream, _) = listener.accept().expect("test TLS client should connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("test TLS read timeout should configure");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .expect("test TLS write timeout should configure");
+                let connection =
+                    rustls::ServerConnection::new(Arc::clone(&server_config)).expect("test TLS connection should build");
+                let mut stream = rustls::StreamOwned::new(connection, stream);
+                let mut request = [0_u8; 8192];
+                if stream.read(&mut request).is_err() {
+                    continue;
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .expect("test TLS response should be written");
+                stream.flush().expect("test TLS response should flush");
+            }
+        });
+
+        (port, handle)
+    }
+
+    fn spawn_http_status_server(status: u16) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address")
+            .port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+            let mut request = [0_u8; 8192];
+            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+            assert!(bytes_read > 0, "test HTTP request should not be empty");
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test HTTP response should be written");
+        });
+        (port, handle)
+    }
+
     fn s3_client_with_http_client(port: u16, http_client: SharedHttpClient) -> S3Client {
         let credentials = SdkCredentials::builder()
             .access_key_id("test-access")
@@ -2825,6 +2889,40 @@ mod tests {
             .build();
 
         S3Client::from_conf(config)
+    }
+
+    fn s3_client_for_endpoint_test(endpoint: String, http_client: Option<SharedHttpClient>) -> S3Client {
+        let credentials = SdkCredentials::builder()
+            .access_key_id("test-access")
+            .secret_access_key("test-secret")
+            .provider_name("bucket_target_health_test")
+            .build();
+        let mut config = S3Config::builder()
+            .endpoint_url(endpoint)
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .region(SdkRegion::new("us-east-1"))
+            .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+        if let Some(http_client) = http_client {
+            config = config.http_client(http_client);
+        }
+        S3Client::from_conf(config.build())
+    }
+
+    fn target_client_for_test(arn: &str, endpoint: String, client: S3Client) -> Arc<TargetClient> {
+        Arc::new(TargetClient {
+            endpoint,
+            credentials: None,
+            bucket: "target-bucket".to_string(),
+            storage_class: String::new(),
+            disable_proxy: false,
+            arn: arn.to_string(),
+            reset_id: String::new(),
+            secure: true,
+            health_check_duration: Duration::from_secs(5),
+            replicate_sync: false,
+            client: Arc::new(client),
+        })
     }
 
     #[test]
@@ -2970,6 +3068,220 @@ mod tests {
         assert_eq!(health.offline_count, 2);
         assert_eq!(health.offline_duration, Duration::from_millis(75));
         assert_eq!(health.last_online, Some(now));
+    }
+
+    #[tokio::test]
+    async fn target_health_check_rejects_untrusted_self_signed_certificate() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let endpoint = format!("https://localhost:{port}");
+        let target = target_client_for_test("arn:default-tls", endpoint.clone(), s3_client_for_endpoint_test(endpoint, None));
+
+        assert!(!BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_honors_skip_tls_verify_client() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let endpoint = format!("https://localhost:{port}");
+        let target = target_client_for_test(
+            "arn:skip-tls",
+            endpoint.clone(),
+            s3_client_for_endpoint_test(endpoint, Some(build_insecure_aws_s3_http_client())),
+        );
+
+        assert!(BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_honors_custom_ca_client() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let http_client = build_aws_s3_http_client_from_target_ca_pem(&cert.cert.pem())
+            .await
+            .expect("custom CA client should build");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let endpoint = format!("https://localhost:{port}");
+        let target = target_client_for_test(
+            "arn:custom-ca",
+            endpoint.clone(),
+            s3_client_for_endpoint_test(endpoint, Some(http_client)),
+        );
+
+        assert!(BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_treats_client_errors_as_online_and_server_errors_as_offline() {
+        for (status, expected_online) in [(403, true), (500, false)] {
+            let (port, server) = spawn_http_status_server(status);
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let target = target_client_for_test(
+                &format!("arn:http-{status}"),
+                endpoint.clone(),
+                s3_client_for_endpoint_test(endpoint, None),
+            );
+
+            assert_eq!(BucketTargetSys::check_endpoint_health(&target).await, expected_online);
+            server.join().expect("test HTTP server should stop");
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_tls_health_isolated_by_arn_for_shared_endpoint() {
+        let sys = BucketTargetSys::default();
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 2);
+        let endpoint = format!("https://localhost:{port}");
+        let strict = target_client_for_test("arn:strict", endpoint.clone(), s3_client_for_endpoint_test(endpoint.clone(), None));
+        let insecure = target_client_for_test(
+            "arn:insecure",
+            endpoint.clone(),
+            s3_client_for_endpoint_test(endpoint, Some(build_insecure_aws_s3_http_client())),
+        );
+        {
+            let mut remotes = sys.arn_remotes_map.write().await;
+            remotes.insert(strict.arn.clone(), ArnTarget::with_client(strict.clone()));
+            remotes.insert(insecure.arn.clone(), ArnTarget::with_client(insecure.clone()));
+        }
+
+        sys.heartbeat_once().await;
+
+        assert!(sys.target_is_offline(&strict).await);
+        assert!(!sys.target_is_offline(&insecure).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_discards_result_from_replaced_client_with_same_arn() {
+        let sys = Arc::new(BucketTargetSys::default());
+        let (stale, started, release, _) = blocking_target_client();
+        let stale = Arc::new(stale);
+        let target_arn = stale.arn.clone();
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(stale.arn.clone(), ArnTarget::with_client(Arc::clone(&stale)));
+
+        let heartbeat_sys = Arc::clone(&sys);
+        let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("heartbeat should reach the stale target connector");
+
+        let replacement_endpoint = "https://replacement.example:9443".to_string();
+        let replacement = target_client_for_test(
+            &target_arn,
+            replacement_endpoint.clone(),
+            s3_client_for_endpoint_test(replacement_endpoint, None),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(replacement.arn.clone(), ArnTarget::with_client(Arc::clone(&replacement)));
+        sys.init_target_health(&replacement).await;
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), heartbeat)
+            .await
+            .expect("heartbeat should finish after the stale response")
+            .expect("heartbeat task should not panic");
+
+        assert!(!sys.target_is_offline(&replacement).await);
+    }
+
+    #[tokio::test]
+    async fn target_update_mutex_reuses_live_lock_and_reclaims_dead_entries() {
+        let sys = BucketTargetSys::default();
+        let first = sys.target_update_mutex("first").await;
+        let same = sys.target_update_mutex("first").await;
+        assert!(Arc::ptr_eq(&first, &same));
+        drop(first);
+        drop(same);
+
+        let _second = sys.target_update_mutex("second").await;
+        let mutexes = sys.update_mutexes.lock().await;
+        assert!(!mutexes.contains_key("first"));
+        assert!(mutexes.contains_key("second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn target_updates_serialize_client_build_through_publication_per_bucket() {
+        let sys = Arc::new(BucketTargetSys::default());
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
+            arn: "arn:first".to_string(),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let target = |arn: &str| BucketTarget {
+            arn: arn.to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+        let first_targets = BucketTargets {
+            targets: vec![target("arn:first")],
+        };
+        let second_targets = BucketTargets {
+            targets: vec![target("arn:second")],
+        };
+        let first_sys = Arc::clone(&sys);
+        let first = tokio::spawn(async move {
+            first_sys.update_all_targets("bucket", Some(&first_targets)).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.acquire())
+            .await
+            .expect("first client build should start")
+            .expect("first started semaphore should remain open")
+            .forget();
+
+        let second_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let second_release = Arc::new(tokio::sync::Semaphore::new(0));
+        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
+            arn: "arn:second".to_string(),
+            started: Arc::clone(&second_started),
+            release: Arc::clone(&second_release),
+        });
+        let second_sys = Arc::clone(&sys);
+        let second = tokio::spawn(async move {
+            second_sys.update_all_targets("bucket", Some(&second_targets)).await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_started.acquire())
+                .await
+                .is_err()
+        );
+        assert!(!sys.targets_map.read().await.contains_key("bucket"));
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first target update should not stall")
+            .expect("first target update should finish");
+        tokio::time::timeout(Duration::from_secs(1), second_started.acquire())
+            .await
+            .expect("second client build should start after first update publishes")
+            .expect("second started semaphore should remain open")
+            .forget();
+        second_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second target update should not stall")
+            .expect("second target update should finish");
+        let targets = sys.targets_map.read().await;
+        assert_eq!(targets["bucket"][0].arn, "arn:second");
     }
 
     #[tokio::test]

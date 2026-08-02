@@ -86,6 +86,7 @@ const METRIC_DELETE_BATCH_SIZE: &str = "rustfs_replication_delete_batch_size";
 const MRF_PENDING_CAP: usize = 200_000;
 const MRF_REPLAY_BATCH_SIZE: usize = 256;
 const MRF_REPLAY_CONCURRENCY: usize = 10;
+const MRF_ACK_SAVE_ATTEMPTS: usize = 4;
 const MRF_SAVE_CHANNEL_CAP: usize = 1_024;
 const MRF_SAVE_REQUEST_CAP: usize = 1_000;
 const MAX_MRF_TARGET_FIELD_LEN: usize = 1_024;
@@ -99,15 +100,21 @@ tokio::task_local! {
 struct MrfSaveRequest {
     file: &'static str,
     entries: Vec<MrfReplicateEntry>,
-    persisted: oneshot::Sender<()>,
+    persisted: oneshot::Sender<bool>,
     permit: OwnedSemaphorePermit,
 }
 
 #[derive(Default)]
 struct PendingMrfFile {
     entries: Vec<MrfReplicateEntry>,
-    persisted: Vec<oneshot::Sender<()>>,
+    persisted: Vec<oneshot::Sender<bool>>,
     permits: Vec<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MrfMergeOutcome {
+    duration_millis: u64,
+    additions_persisted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -446,6 +453,10 @@ fn observe_mrf_pending_flushed(entries: &[MrfReplicateEntry], duration_millis: u
     update_mrf_backlog_observability(|tracker| tracker.flush_pending_entries(entries, duration_millis));
 }
 
+fn observe_mrf_drop(entry: &MrfReplicateEntry) {
+    update_mrf_backlog_observability(|tracker| tracker.record_drop(entry));
+}
+
 fn observe_mrf_missed(bucket: &str) {
     update_mrf_backlog_observability(|tracker| tracker.record_missed(bucket));
 }
@@ -727,7 +738,6 @@ async fn recovered_mrf_operations<S: ReplicationStorage>(entry: &MrfReplicateEnt
                 ReplicationHealQueueAction::QueueResyncDeletes(batch) => RecoveredMrfOperations::Work(
                     batch
                         .target_delete_infos()
-                        .into_iter()
                         .map(|delete| ReplicationOperation::Delete(Box::new(delete)))
                         .collect(),
                 ),
@@ -795,49 +805,58 @@ async fn acknowledge_mrf_batch<S: ReplicationStorage>(
     if acknowledgements.is_empty() {
         return Some(0);
     }
-    if replay_lock_lost_signal.as_ref().is_some_and(|signal| signal.is_lost()) {
-        return None;
-    }
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await
-        .ok()?;
-    let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await.ok()?;
-    let contents = read_mrf_entries_no_lock(file, storage).await.ok()?;
-    let entries = contents.entries;
-    let mut replacements = acknowledgements
+    let replacements = acknowledgements
         .into_iter()
         .map(|ack| (ack.original, ack.replacements))
         .collect::<HashMap<_, _>>();
-    let mut matched = 0usize;
-    let mut remaining = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let encoded = encoded_mrf_entry(&entry).ok()?;
-        if let Some(retry_entries) = replacements.remove(&encoded) {
-            matched = matched.saturating_add(1);
-            remaining.extend(retry_entries);
-        } else {
-            remaining.push(entry);
+    for _ in 0..MRF_ACK_SAVE_ATTEMPTS {
+        if replay_lock_lost_signal.as_ref().is_some_and(|signal| signal.is_lost()) {
+            return None;
+        }
+        let lock = storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+            .await
+            .ok()?;
+        let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await.ok()?;
+        let contents = read_mrf_entries_no_lock(file, storage).await.ok()?;
+        let entries = contents.entries;
+        let mut pending_replacements = replacements.clone();
+        let mut matched = 0usize;
+        let mut remaining = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let encoded = encoded_mrf_entry(&entry).ok()?;
+            if let Some(retry_entries) = pending_replacements.remove(&encoded) {
+                matched = matched.saturating_add(1);
+                remaining.extend(retry_entries);
+            } else {
+                remaining.push(entry);
+            }
+        }
+        if matched == 0 {
+            return Some(0);
+        }
+        if remaining.len() > MRF_PENDING_CAP {
+            return None;
+        }
+        let encoded = encode_mrf_file(&remaining).ok()?;
+        if guard.is_lock_lost() || replay_lock_lost_signal.as_ref().is_some_and(|signal| signal.is_lost()) {
+            return None;
+        }
+        drop(guard);
+        if ReplicationConfigStore::save_conditional(
+            storage.clone(),
+            file,
+            encoded,
+            contents.expected_etag,
+            replay_lock_lost_signal.iter().cloned().collect(),
+        )
+        .await
+        .is_ok()
+        {
+            return (!replay_lock_lost_signal.as_ref().is_some_and(|signal| signal.is_lost())).then_some(matched);
         }
     }
-    if matched == 0 {
-        return Some(0);
-    }
-    let encoded = encode_mrf_file(&remaining).ok()?;
-    if guard.is_lock_lost() || replay_lock_lost_signal.as_ref().is_some_and(|signal| signal.is_lost()) {
-        return None;
-    }
-    drop(guard);
-    ReplicationConfigStore::save_conditional(
-        storage.clone(),
-        file,
-        encoded,
-        contents.expected_etag,
-        replay_lock_lost_signal.iter().cloned().collect(),
-    )
-    .await
-    .ok()?;
-    (!replay_lock_lost_signal.as_ref().is_some_and(|signal| signal.is_lost())).then_some(matched)
+    None
 }
 
 async fn commit_mrf_replay_batch<S: ReplicationStorage>(
@@ -854,7 +873,7 @@ async fn commit_mrf_replay_batch<S: ReplicationStorage>(
         || (external.iter().all(targeted_mrf_entry_is_valid)
             && merge_mrf_entries_to_disk(ReplicationMetadataStore::TARGETED_MRF_REPLICATION_FILE, &external, storage)
                 .await
-                .is_some());
+                .is_some_and(|outcome| outcome.additions_persisted));
     let acknowledgements = pending
         .into_iter()
         .filter(|(_, _, external)| external.is_empty() || external_persisted)
@@ -1609,7 +1628,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let Ok(permit_count) = u32::try_from(entries.len()) else {
             return ReplicationQueueAdmission::Missed;
         };
-        let Ok(permit) = self.mrf_save_permits.clone().acquire_many_owned(permit_count).await else {
+        let Ok(permit) = self.mrf_save_permits.clone().try_acquire_many_owned(permit_count) else {
+            for entry in &entries {
+                observe_mrf_drop(entry);
+            }
             return ReplicationQueueAdmission::Missed;
         };
         let stats_entries = entries.clone();
@@ -1635,21 +1657,23 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             }
             return ReplicationQueueAdmission::Missed;
         }
-        if completion.await.is_ok() {
-            ReplicationQueueAdmission::Queued
-        } else {
-            dec_mrf_entries(self.stats.as_ref(), &stats_entries);
-            for entry in &stats_entries {
-                observe_mrf_missed(&entry.bucket);
+        match completion.await {
+            Ok(true) => ReplicationQueueAdmission::Queued,
+            Ok(false) => ReplicationQueueAdmission::Missed,
+            Err(_) => {
+                dec_mrf_entries(self.stats.as_ref(), &stats_entries);
+                for entry in &stats_entries {
+                    observe_mrf_missed(&entry.bucket);
+                }
+                warn!(
+                    event = EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type,
+                    "MRF persistence task stopped before durable acknowledgement"
+                );
+                ReplicationQueueAdmission::Missed
             }
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                queue_type,
-                "MRF persistence task stopped before durable acknowledgement"
-            );
-            ReplicationQueueAdmission::Missed
         }
     }
 
@@ -2282,11 +2306,44 @@ async fn read_mrf_entries_no_lock<S: ReplicationObjectIO>(file: &str, storage: &
     }
 }
 
+fn merge_mrf_entries_with_cap(
+    entries: &mut Vec<MrfReplicateEntry>,
+    additions: &[MrfReplicateEntry],
+    cap: usize,
+) -> Result<bool, EcstoreError> {
+    let original_len = entries.len();
+    let mut fingerprints = HashMap::<[u8; 32], Vec<usize>>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let encoded = encoded_mrf_entry_identity(entry)?;
+        fingerprints.entry(Sha256::digest(encoded).into()).or_default().push(index);
+    }
+    for addition in additions {
+        let encoded = encoded_mrf_entry_identity(addition)?;
+        let fingerprint = Sha256::digest(&encoded).into();
+        let duplicate = mrf_entry_has_stable_identity(addition)
+            && fingerprints.get(&fingerprint).is_some_and(|indices| {
+                indices
+                    .iter()
+                    .any(|index| encoded_mrf_entry_identity(&entries[*index]).is_ok_and(|existing| existing == encoded))
+            });
+        if duplicate {
+            continue;
+        }
+        if entries.len() >= cap {
+            entries.truncate(original_len);
+            return Ok(false);
+        }
+        fingerprints.entry(fingerprint).or_default().push(entries.len());
+        entries.push(addition.clone());
+    }
+    Ok(true)
+}
+
 async fn merge_mrf_entries_to_disk<S: ReplicationStorage>(
     file: &str,
     additions: &[MrfReplicateEntry],
     storage: &Arc<S>,
-) -> Option<u64> {
+) -> Option<MrfMergeOutcome> {
     if file == ReplicationMetadataStore::TARGETED_MRF_REPLICATION_FILE && !additions.iter().all(targeted_mrf_entry_is_valid) {
         return None;
     }
@@ -2334,29 +2391,24 @@ async fn merge_mrf_entries_to_disk<S: ReplicationStorage>(
         }
     };
     let mut entries = contents.entries;
-    let mut fingerprints = HashMap::<[u8; 32], Vec<usize>>::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let Ok(encoded) = encoded_mrf_entry_identity(entry) else {
+    let dropped_existing = (entries.len() > MRF_PENDING_CAP).then(|| entries.split_off(MRF_PENDING_CAP));
+    let additions_persisted = match merge_mrf_entries_with_cap(&mut entries, additions, MRF_PENDING_CAP) {
+        Ok(persisted) => persisted,
+        Err(_) => {
             observe_mrf_flush_failure(duration_millis_u64(started.elapsed()));
             return None;
-        };
-        fingerprints.entry(Sha256::digest(encoded).into()).or_default().push(index);
-    }
-    for addition in additions {
-        let Ok(encoded) = encoded_mrf_entry_identity(addition) else {
-            observe_mrf_flush_failure(duration_millis_u64(started.elapsed()));
-            return None;
-        };
-        let fingerprint = Sha256::digest(&encoded).into();
-        let duplicate = mrf_entry_has_stable_identity(addition)
-            && fingerprints.get(&fingerprint).is_some_and(|indices| {
-                indices
-                    .iter()
-                    .any(|index| encoded_mrf_entry_identity(&entries[*index]).is_ok_and(|existing| existing == encoded))
+        }
+    };
+    if !additions_persisted {
+        for entry in additions {
+            observe_mrf_drop(entry);
+        }
+        if dropped_existing.is_none() {
+            drop(guard);
+            return Some(MrfMergeOutcome {
+                duration_millis: duration_millis_u64(started.elapsed()),
+                additions_persisted: false,
             });
-        if !duplicate {
-            fingerprints.entry(fingerprint).or_default().push(entries.len());
-            entries.push(addition.clone());
         }
     }
     let data = match encode_mrf_file(&entries) {
@@ -2389,7 +2441,15 @@ async fn merge_mrf_entries_to_disk<S: ReplicationStorage>(
         );
         return None;
     }
-    Some(duration_millis_u64(started.elapsed()))
+    if let Some(dropped_existing) = dropped_existing {
+        for entry in &dropped_existing {
+            observe_mrf_drop(entry);
+        }
+    }
+    Some(MrfMergeOutcome {
+        duration_millis: duration_millis_u64(started.elapsed()),
+        additions_persisted,
+    })
 }
 
 async fn flush_pending_mrf_file<S: ReplicationStorage>(
@@ -2398,15 +2458,15 @@ async fn flush_pending_mrf_file<S: ReplicationStorage>(
     storage: &Arc<S>,
     stats: &ReplicationStats,
 ) -> bool {
-    let Some(duration_millis) = merge_mrf_entries_to_disk(file, &pending.entries, storage).await else {
+    let Some(outcome) = merge_mrf_entries_to_disk(file, &pending.entries, storage).await else {
         return false;
     };
-    observe_mrf_pending_flushed(&pending.entries, duration_millis);
+    observe_mrf_pending_flushed(&pending.entries, outcome.duration_millis);
     dec_mrf_entries(stats, &pending.entries);
     pending.entries.clear();
     pending.permits.clear();
     for persisted in pending.persisted.drain(..) {
-        let _ = persisted.send(());
+        let _ = persisted.send(outcome.additions_persisted);
     }
     true
 }
@@ -4011,7 +4071,7 @@ mod tests {
         assert_eq!(request.entries[0].object, "object-0");
         request
             .persisted
-            .send(())
+            .send(true)
             .expect("batch admission should still await persistence");
 
         let summary = tokio::time::timeout(Duration::from_secs(1), &mut admission)
@@ -4381,6 +4441,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persisted_mrf_cap_rejects_a_batch_without_partial_append() {
+        let base = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "base".to_string(),
+            version_id: Some(Uuid::from_u128(1)),
+            retry_count: 0,
+            size: 1,
+            op: MrfOpKind::Object,
+            force_delete: false,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            target_delete_marker_version_id: None,
+            source_mod_time: None,
+            enqueued_order: None,
+        };
+        let first = MrfReplicateEntry {
+            object: "first".to_string(),
+            version_id: Some(Uuid::from_u128(2)),
+            ..base.clone()
+        };
+        let second = MrfReplicateEntry {
+            object: "second".to_string(),
+            version_id: Some(Uuid::from_u128(3)),
+            ..base.clone()
+        };
+        let mut entries = vec![base.clone()];
+
+        assert!(!merge_mrf_entries_with_cap(&mut entries, &[first, second], 2).expect("MRF entries should encode"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].object, base.object);
+        assert_eq!(entries[0].version_id, base.version_id);
+        assert!(
+            merge_mrf_entries_with_cap(&mut entries, std::slice::from_ref(&base), 1).expect("duplicate MRF entry should encode")
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].object, base.object);
+        assert_eq!(entries[0].version_id, base.version_id);
+    }
+
     #[tokio::test]
     async fn conditional_merge_retries_after_stale_snapshot_without_overwrite() {
         let shared = empty_resync_shared_state();
@@ -4527,6 +4629,64 @@ mod tests {
             Some(0),
             "a repeated acknowledgement must not remove a different entry"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_ack_retries_cas_conflict_without_replaying_work() {
+        let shared = empty_resync_shared_state();
+        let node_a = Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()));
+        let node_b = Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()));
+        let acknowledged = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "acknowledged".to_string(),
+            version_id: Some(Uuid::from_u128(1)),
+            retry_count: 0,
+            size: 1,
+            op: MrfOpKind::Object,
+            force_delete: false,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            target_delete_marker_version_id: None,
+            source_mod_time: None,
+            enqueued_order: None,
+        };
+        let concurrent = MrfReplicateEntry {
+            object: "concurrent".to_string(),
+            version_id: Some(Uuid::from_u128(2)),
+            ..acknowledged.clone()
+        };
+        *shared.data.lock().expect("test MRF data lock should not be poisoned") =
+            encode_mrf_file(std::slice::from_ref(&acknowledged)).expect("test MRF entry should encode");
+        shared.block_next_write.store(true, Ordering::SeqCst);
+        let acknowledgement = MrfReplayAcknowledgement {
+            original: encoded_mrf_entry(&acknowledged).expect("acknowledged entry should encode"),
+            replacements: Vec::new(),
+        };
+        let acknowledge = tokio::spawn(async move {
+            acknowledge_mrf_batch(ReplicationMetadataStore::MRF_REPLICATION_FILE, vec![acknowledgement], &node_a, None).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), shared.write_started.notified())
+            .await
+            .expect("acknowledgement write should pause after its snapshot");
+
+        assert!(
+            merge_mrf_entries_to_disk(
+                ReplicationMetadataStore::MRF_REPLICATION_FILE,
+                std::slice::from_ref(&concurrent),
+                &node_b,
+            )
+            .await
+            .is_some()
+        );
+        shared.allow_write.notify_one();
+
+        assert_eq!(acknowledge.await.expect("acknowledgement task should finish"), Some(1));
+        let data = shared.data.lock().expect("test MRF data lock should not be poisoned").clone();
+        let entries = decode_mrf_file(&data).expect("acknowledged MRF should decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].object, "concurrent");
     }
 
     #[tokio::test]

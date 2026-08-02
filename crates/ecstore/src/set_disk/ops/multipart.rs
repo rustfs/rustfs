@@ -180,20 +180,47 @@ fn multipart_bucket_incarnation_matches(metadata: &HashMap<String, String>, expe
     matches!(multipart_bucket_incarnation_id(metadata), Ok(Some(actual)) if actual == expected)
 }
 
-fn ensure_multipart_bucket_incarnation(
+fn validate_multipart_bucket_incarnation(
     metadata: &HashMap<String, String>,
     bucket: &str,
     object: &str,
     upload_id: &str,
     expected: Option<Uuid>,
+    upload_initiated: Option<OffsetDateTime>,
+    bucket_created: Option<OffsetDateTime>,
 ) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
     };
-    if multipart_bucket_incarnation_matches(metadata, expected) {
-        return Ok(());
+    match multipart_bucket_incarnation_id(metadata) {
+        Ok(Some(actual)) if actual == expected => return Ok(()),
+        Ok(None)
+            if matches!(
+                (upload_initiated, bucket_created),
+                (Some(upload_initiated), Some(bucket_created)) if upload_initiated >= bucket_created
+            ) =>
+        {
+            return Ok(());
+        }
+        _ => {}
     }
     Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+}
+
+async fn ensure_multipart_bucket_incarnation(
+    ctx: &crate::runtime::instance::InstanceContext,
+    fi: &FileInfo,
+    bucket: &str,
+    object: &str,
+    upload_id: &str,
+    expected: Option<Uuid>,
+) -> Result<()> {
+    let bucket_created = if expected.is_some() && matches!(multipart_bucket_incarnation_id(&fi.metadata), Ok(None)) {
+        Some(metadata_sys::created_at_in(ctx, bucket).await?)
+    } else {
+        None
+    };
+    validate_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, expected, fi.mod_time, bucket_created)
 }
 
 fn ensure_multipart_bucket_lifecycle_lock_held(bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
@@ -745,7 +772,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
-        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
+            .await?;
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
@@ -997,12 +1025,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             };
             let (commit_fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
             ensure_multipart_bucket_incarnation(
-                &commit_fi.metadata,
+                &self.ctx,
+                &commit_fi,
                 bucket,
                 object,
                 upload_id,
                 opts.expected_bucket_incarnation_id,
-            )?;
+            )
+            .await?;
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
             if _upload_commit_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
@@ -1076,7 +1106,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_read_lock("list_object_parts", bucket, object, upload_id, opts)
             .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
-        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
+            .await?;
 
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
@@ -1405,7 +1436,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .check_upload_id_exists(bucket, object, upload_id, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
-        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
+            .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
         Ok(MultipartInfo {
@@ -1426,7 +1458,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
-        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
+            .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
@@ -1479,7 +1512,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
-        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
+            .await?;
         let has_layout_candidate = range_seek_rollout_enabled
             && fi
                 .data_dir
@@ -2128,17 +2162,51 @@ mod tests {
     }
 
     #[test]
-    fn multipart_bucket_incarnation_gate_rejects_missing_or_stale_uploads() {
+    fn multipart_bucket_incarnation_gate_accepts_only_current_or_same_lifetime_legacy_uploads() {
         let expected = Uuid::new_v4();
         let stale = Uuid::new_v4();
+        let bucket_created = OffsetDateTime::now_utc();
+        let upload_initiated = bucket_created + time::Duration::seconds(1);
         let mut current_metadata = HashMap::new();
         insert_str(&mut current_metadata, SUFFIX_BUCKET_INCARNATION_ID, expected.to_string());
         assert!(multipart_bucket_incarnation_matches(&current_metadata, expected));
+        validate_multipart_bucket_incarnation(&current_metadata, "bucket", "object", "upload", Some(expected), None, None)
+            .expect("a matching stamped upload should pass");
 
         let missing_metadata = HashMap::new();
         assert!(!multipart_bucket_incarnation_matches(&missing_metadata, expected));
+        validate_multipart_bucket_incarnation(
+            &missing_metadata,
+            "bucket",
+            "object",
+            "upload",
+            Some(expected),
+            Some(upload_initiated),
+            Some(bucket_created),
+        )
+        .expect("a legacy upload initiated during the current bucket lifetime should pass");
         assert!(matches!(
-            ensure_multipart_bucket_incarnation(&missing_metadata, "bucket", "object", "upload", Some(expected)),
+            validate_multipart_bucket_incarnation(
+                &missing_metadata,
+                "bucket",
+                "object",
+                "upload",
+                Some(expected),
+                Some(bucket_created - time::Duration::seconds(1)),
+                Some(bucket_created),
+            ),
+            Err(StorageError::InvalidUploadID(..))
+        ));
+        assert!(matches!(
+            validate_multipart_bucket_incarnation(
+                &missing_metadata,
+                "bucket",
+                "object",
+                "upload",
+                Some(expected),
+                None,
+                Some(bucket_created),
+            ),
             Err(StorageError::InvalidUploadID(..))
         ));
 
@@ -2146,7 +2214,15 @@ mod tests {
         insert_str(&mut stale_metadata, SUFFIX_BUCKET_INCARNATION_ID, stale.to_string());
         assert!(!multipart_bucket_incarnation_matches(&stale_metadata, expected));
         assert!(matches!(
-            ensure_multipart_bucket_incarnation(&stale_metadata, "bucket", "object", "upload", Some(expected)),
+            validate_multipart_bucket_incarnation(
+                &stale_metadata,
+                "bucket",
+                "object",
+                "upload",
+                Some(expected),
+                Some(upload_initiated),
+                Some(bucket_created),
+            ),
             Err(StorageError::InvalidUploadID(..))
         ));
     }

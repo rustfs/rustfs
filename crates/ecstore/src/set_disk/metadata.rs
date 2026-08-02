@@ -538,6 +538,7 @@ impl SetDisks {
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
             || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            // Raw compatibility keys are normalized and hashed separately below.
             || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
     }
 
@@ -551,6 +552,18 @@ impl SetDisks {
         for (name, value) in entries {
             Self::update_hash_str(hasher, name);
             Self::update_hash_str(hasher, value);
+        }
+    }
+
+    fn update_hash_target_delete_marker_versions(hasher: &mut Sha256, metadata: &HashMap<String, String>) {
+        let (versions, corrupt) = http::target_delete_marker_versions(metadata);
+        hasher.update([u8::from(corrupt)]);
+        let mut versions = versions.iter().collect::<Vec<_>>();
+        versions.sort_by(|left, right| left.0.cmp(right.0));
+        hasher.update(versions.len().to_le_bytes());
+        for (arn, version_id) in versions {
+            Self::update_hash_str(hasher, arn);
+            Self::update_hash_str(hasher, version_id);
         }
     }
 
@@ -593,6 +606,7 @@ impl SetDisks {
         Self::update_hash_optional_bytes(hasher, meta.checksum.as_ref());
 
         Self::update_hash_quorum_metadata_map(hasher, &meta.metadata);
+        Self::update_hash_target_delete_marker_versions(hasher, &meta.metadata);
 
         hasher.update(meta.parts.len().to_le_bytes());
         for part in meta.parts.iter() {
@@ -1417,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn target_delete_marker_version_metadata_is_excluded_from_quorum_hash() {
+    fn target_delete_marker_version_metadata_is_included_in_quorum_hash() {
         let suffix = "replication-delete-marker-version-arn:rustfs:replication::target:bucket";
         assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
             "{}{}",
@@ -1438,6 +1452,45 @@ mod tests {
         right
             .metadata
             .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-b".to_string());
-        assert_eq!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+        assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+
+        let mut dual_prefixed = left.clone();
+        dual_prefixed
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&left),
+            SetDisks::file_info_quorum_hash(&dual_prefixed),
+            "compatible prefixes carrying the same mapping must share one identity"
+        );
+    }
+
+    #[test]
+    fn target_delete_marker_version_quorum_ignores_a_stale_first_disk() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let suffix = format!(
+            "{}{}",
+            http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+            "arn:rustfs:replication::target:bucket"
+        );
+        let mut current = metadata_quorum_test_fileinfo(mod_time, 1);
+        http::insert_str(&mut current.metadata, &suffix, "target-version-current".to_string());
+        let mut stale = current.clone();
+        http::insert_str(&mut stale.metadata, &suffix, "target-version-stale".to_string());
+        let mut parts_metadata = vec![stale];
+        for index in 2..=4 {
+            let mut replica = current.clone();
+            replica.erasure.index = index;
+            parts_metadata.push(replica);
+        }
+
+        let selected = SetDisks::find_file_info_in_quorum(&parts_metadata, &Some(mod_time), &None, 3)
+            .expect("the three matching target mappings should determine metadata identity");
+        let (versions, corrupt) = http::target_delete_marker_versions(&selected.metadata);
+        assert!(!corrupt);
+        assert_eq!(
+            versions.get("arn:rustfs:replication::target:bucket").map(String::as_str),
+            Some("target-version-current")
+        );
     }
 }

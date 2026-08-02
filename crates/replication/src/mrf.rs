@@ -189,6 +189,7 @@ mod tests {
             retry_count: 1,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
             delete_marker_mtime: None,

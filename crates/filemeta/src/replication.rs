@@ -434,7 +434,7 @@ impl ReplicatedTargetInfo {
 }
 
 /// ReplicatedInfos struct contains replication information for multiple targets
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReplicatedInfos {
     pub replication_timestamp: Option<OffsetDateTime>,
     pub targets: Vec<ReplicatedTargetInfo>,

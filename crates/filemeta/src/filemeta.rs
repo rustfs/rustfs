@@ -27,7 +27,7 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
     SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
     SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
-    contains_key_str, has_internal_suffix, insert_bytes, internal_key_starts_with, is_internal_key, remove_bytes,
+    contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -164,10 +164,17 @@ fn valid_target_delete_marker_version(arn: &str, version_id: &str) -> bool {
         && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
 }
 
-fn persist_target_delete_marker_versions(meta_sys: &mut HashMap<String, Vec<u8>>, versions: &HashMap<String, String>) {
-    meta_sys.retain(|key, _| !internal_key_starts_with(key, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX));
+fn persist_target_delete_marker_versions(
+    meta_sys: &mut HashMap<String, Vec<u8>>,
+    versions: &HashMap<String, String>,
+    transport_metadata: &HashMap<String, String>,
+) {
+    // The in-memory map is intentionally skipped by the positional FileInfo wire
+    // format. Treat an empty map as non-authoritative and merge the RPC metadata
+    // carrier so a remote disk cannot erase an existing exact target version.
     let mut bounded = BTreeMap::new();
-    for (arn, version_id) in versions {
+    let (transport_versions, _) = rustfs_utils::http::target_delete_marker_versions(transport_metadata);
+    for (arn, version_id) in transport_versions.iter().chain(versions.iter()) {
         if !valid_target_delete_marker_version(arn, version_id)
             || (bounded.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES
                 && bounded.last_key_value().is_some_and(|(largest, _)| arn >= *largest))
@@ -559,7 +566,11 @@ impl FileMeta {
                 && let Some(state) = fi.replication_state_internal.as_ref()
             {
                 persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
-                persist_target_delete_marker_versions(&mut delete_marker.meta_sys, &state.target_delete_marker_version_ids);
+                persist_target_delete_marker_versions(
+                    &mut delete_marker.meta_sys,
+                    &state.target_delete_marker_version_ids,
+                    &fi.metadata,
+                );
             }
         }
 
@@ -639,6 +650,7 @@ impl FileMeta {
                                 persist_target_delete_marker_versions(
                                     &mut delete_marker.meta_sys,
                                     &state.target_delete_marker_version_ids,
+                                    &fi.metadata,
                                 );
                             }
                         }
@@ -1365,7 +1377,7 @@ mod test {
         ]);
         let mut meta_sys = HashMap::new();
 
-        persist_target_delete_marker_versions(&mut meta_sys, &versions);
+        persist_target_delete_marker_versions(&mut meta_sys, &versions, &HashMap::new());
 
         assert_eq!(
             meta_sys.get(&format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
@@ -1385,7 +1397,7 @@ mod test {
             .collect();
         let mut meta_sys = HashMap::new();
 
-        persist_target_delete_marker_versions(&mut meta_sys, &versions);
+        persist_target_delete_marker_versions(&mut meta_sys, &versions, &HashMap::new());
 
         assert_eq!(meta_sys.len(), MAX_REPLICATION_TARGET_VERSION_ENTRIES * 2);
         let excluded_suffix = format!(
@@ -1396,7 +1408,7 @@ mod test {
     }
 
     #[test]
-    fn persist_target_delete_marker_versions_removes_stale_targets() {
+    fn persist_target_delete_marker_versions_preserves_existing_targets_on_empty_update() {
         let stale_suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:rustfs:replication::target:stale");
         let mut meta_sys = HashMap::from([
             (format!("{RUSTFS_INTERNAL_PREFIX}{stale_suffix}"), b"stale-rustfs".to_vec()),
@@ -1404,9 +1416,37 @@ mod test {
             ("unrelated".to_string(), b"kept".to_vec()),
         ]);
 
-        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new());
+        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new(), &HashMap::new());
 
-        assert_eq!(meta_sys, HashMap::from([("unrelated".to_string(), b"kept".to_vec())]));
+        assert_eq!(
+            meta_sys,
+            HashMap::from([
+                (format!("{RUSTFS_INTERNAL_PREFIX}{stale_suffix}"), b"stale-rustfs".to_vec()),
+                (format!("{MINIO_INTERNAL_PREFIX}{stale_suffix}"), b"stale-minio".to_vec()),
+                ("unrelated".to_string(), b"kept".to_vec()),
+            ])
+        );
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_reads_rpc_transport_metadata() {
+        let arn = "arn:rustfs:replication::target:remote";
+        let version_id = "opaque-remote-version";
+        let suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let mut transport_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut transport_metadata, &suffix, version_id.to_string());
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new(), &transport_metadata);
+
+        assert_eq!(
+            meta_sys.get(&format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(
+            meta_sys.get(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
     }
 
     #[test]

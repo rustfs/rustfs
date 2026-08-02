@@ -1920,7 +1920,7 @@ impl BucketMetadataSys {
                 self.missing_buckets.insert(bucket.to_string(), ()).await;
                 return Ok(BucketMetadataAuthority::MissingBucket);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         };
 
         let (mut metadata, persisted) = await_bucket_namespace_operation(
@@ -2017,7 +2017,7 @@ impl BucketMetadataSys {
         {
             Ok(_) => {}
             Err(Error::VolumeNotFound) => return Ok(BucketMetadataAuthority::MissingBucket),
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
 
         let (metadata, persisted) = await_bucket_namespace_operation(
