@@ -20,7 +20,8 @@ use rustfs_io_metrics::buffered_write;
 use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
+    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized, req_info_mut,
+    req_info_ref,
 };
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 #[cfg(test)]
@@ -6614,6 +6615,13 @@ impl DefaultObjectUsecase {
             ));
         }
 
+        if !recursive_force_delete_is_authorized(&req.headers, req_info_ref(&req)?.is_owner, false) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                "Recursive force-delete is restricted to administrative requests",
+            ));
+        }
+
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -7071,6 +7079,14 @@ impl DefaultObjectUsecase {
 
         if replica {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
+        }
+
+        let is_owner = req_info_ref(&req)?.is_owner;
+        if !recursive_force_delete_is_authorized(&req.headers, is_owner, replica) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                "Recursive force-delete is restricted to internal or administrative requests",
+            ));
         }
 
         // Establish bucket existence before any bucket-metadata work (matches
@@ -13384,6 +13400,60 @@ mod tests {
             normalize_delete_objects_version_id(Some(" \t ".to_string())).expect("empty version marker should normalize");
         assert_eq!(wire_version_id, None);
         assert_eq!(internal_version_id, None);
+    }
+
+    #[test]
+    fn recursive_force_delete_requires_administrative_or_replica_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+
+        assert!(!recursive_force_delete_is_authorized(&headers, false, false));
+        assert!(recursive_force_delete_is_authorized(&headers, true, false));
+        assert!(recursive_force_delete_is_authorized(&headers, false, true));
+        assert!(recursive_force_delete_is_authorized(&HeaderMap::new(), false, false));
+    }
+
+    #[tokio::test]
+    async fn execute_delete_object_rejects_untrusted_force_delete_before_store_access() {
+        let input = DeleteObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("prefix/object".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::DELETE);
+        req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+        req.extensions.insert(crate::storage::access::ReqInfo::default());
+
+        let err = DefaultObjectUsecase::without_context()
+            .execute_delete_object(req)
+            .await
+            .expect_err("untrusted force-delete must be rejected before storage lookup");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_objects_rejects_untrusted_force_delete_before_store_access() {
+        let input = DeleteObjectsInput::builder()
+            .bucket("test-bucket".to_string())
+            .delete(Delete {
+                objects: vec![ObjectIdentifier {
+                    key: "prefix/object".to_string(),
+                    version_id: None,
+                    ..Default::default()
+                }],
+                quiet: None,
+            })
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::POST);
+        req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+        req.extensions.insert(crate::storage::access::ReqInfo::default());
+
+        let err = DefaultObjectUsecase::without_context()
+            .execute_delete_objects(req)
+            .await
+            .expect_err("untrusted force-delete must be rejected before storage lookup");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
     // backlog#929 (HP-8): the pre-delete stat may only be skipped when every

@@ -102,7 +102,8 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,
+        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
+        req_info_mut, req_info_ref,
     };
 
     pub(crate) mod contract {
