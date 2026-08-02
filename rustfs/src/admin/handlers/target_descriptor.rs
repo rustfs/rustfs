@@ -977,9 +977,7 @@ mod webhook_request_tests {
             .message()
             .expect("the validation error should explain the operator action");
 
-        assert!(message.contains(&format!(
-            "add http://192.168.1.2:1880 to {ENV_OUTBOUND_ALLOW_ORIGINS}"
-        )));
+        assert!(message.contains(&format!("add http://192.168.1.2:1880 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
         assert!(message.contains("private address"));
         assert!(message.contains("comma-separated"));
         assert!(message.contains("restart RustFS"), "unexpected message: {message}");

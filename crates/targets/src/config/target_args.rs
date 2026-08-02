@@ -786,9 +786,7 @@ mod tests {
         let err = build_webhook_args(&config, "/tmp/webhook-queue", TargetType::NotifyEvent)
             .expect_err("loopback endpoint should be rejected");
         let message = err.to_string();
-        assert!(message.contains(&format!(
-            "add https://127.0.0.1:8443 to {ENV_OUTBOUND_ALLOW_ORIGINS}"
-        )));
+        assert!(message.contains(&format!("add https://127.0.0.1:8443 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
         assert!(message.contains("loopback address"));
         assert!(message.contains("comma-separated"));
         assert!(message.contains("restart RustFS"));
