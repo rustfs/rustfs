@@ -1,0 +1,31 @@
+---
+source: rustfs/src/admin/handlers/kms_keys.rs
+expression: "stable_json_value(DeleteKmsKeyResponse\n{\n    success: true, message: \"key scheduled for deletion\".to_string(), key_id:\n    \"key-a\".to_string(), deletion_date:\n    Some(\"2026-02-01T00:00:00Z\".to_string()), impact:\n    Some(referenced_impact()),\n})"
+---
+{
+  "deletion_date": "2026-02-01T00:00:00Z",
+  "impact": {
+    "completeness": "exact",
+    "coverage": {
+      "not_scanned": [
+        "object-envelopes",
+        "in-progress-multipart-uploads"
+      ],
+      "scanned": [
+        "bucket-default-encryption",
+        "service-default-key"
+      ]
+    },
+    "key_id": "key-a",
+    "references": [
+      {
+        "detail": "bucket default encryption names this key",
+        "id": "sse-bucket",
+        "kind": "bucket-default-encryption"
+      }
+    ]
+  },
+  "key_id": "key-a",
+  "message": "key scheduled for deletion",
+  "success": true
+}
