@@ -609,7 +609,7 @@ fn decode_key_record(
     // newer build is not a damaged bundle, and reporting it as corruption
     // sends the operator into disaster recovery instead of a version change.
     let unknown_marker = unknown_protection_marker(&plaintext)
-        .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' is not valid JSON: {error}")))?;
+        .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' is not a readable JSON object: {error}")))?;
     if let Some(version) = unknown_marker {
         return Err(BackupError::UnsupportedRecordVersion { key_id: stem, version }.into());
     }

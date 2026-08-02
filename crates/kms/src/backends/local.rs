@@ -855,7 +855,7 @@ impl LocalKmsClient {
         // unsupported format (a newer build may still read the key) instead of being
         // folded into generic corruption with every other malformed record.
         let unknown_marker = unknown_protection_marker(&content)
-            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not valid JSON: {e}")))?;
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not a readable JSON object: {e}")))?;
         if let Some(version) = unknown_marker {
             return Err(KmsError::unsupported_format_version(key_id, version));
         }

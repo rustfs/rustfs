@@ -380,8 +380,9 @@ async fn collect_snapshot(client: &LocalKmsClient) -> Result<CollectedSnapshot> 
         // classified first so a record from a newer build keeps its own
         // verdict — an operator who reads "material corrupt" starts a
         // disaster recovery for what is only a version mismatch.
-        let unknown_marker = unknown_protection_marker(&raw)
-            .map_err(|error| KmsError::material_corrupt(&stem, format!("stored key record is not valid JSON: {error}")))?;
+        let unknown_marker = unknown_protection_marker(&raw).map_err(|error| {
+            KmsError::material_corrupt(&stem, format!("stored key record is not a readable JSON object: {error}"))
+        })?;
         if let Some(version) = unknown_marker {
             return Err(KmsError::unsupported_format_version(&stem, version));
         }
