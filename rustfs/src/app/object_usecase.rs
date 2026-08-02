@@ -6344,7 +6344,35 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() {
+        // A same-name copy is normally serviced as a metadata-only update: the store layer
+        // rewrites xl.meta in place and leaves the data blocks alone. That shortcut is only sound
+        // when the destination's physical bytes are identical to the source's, and encryption
+        // breaks exactly that. The destination metadata is rebuilt from scratch below —
+        // `strip_managed_encryption_metadata` drops the source DEK and `sse_encryption` mints a
+        // fresh one — so reusing the stored ciphertext would leave a new DEK sitting beside bytes
+        // it cannot decrypt, permanently destroying the object (GET fails with an AEAD tag
+        // mismatch). The mirror case is worse because it is silent: an encrypted source copied
+        // without any destination SSE keeps its ciphertext while losing the key metadata, so GET
+        // hands back raw ciphertext as if it were plaintext. So whenever either side is
+        // encrypted, leave metadata_only = false and let the store layer do a full read/write
+        // rewrite through put_object, the same resolution the versioned historical-restore path
+        // uses (issue #4238, crates/ecstore/src/store/object.rs).
+        //
+        // This mirrors MinIO's `isSourceEncrypted || isTargetEncrypted -> metadataOnly = false`
+        // in CopyObjectHandler, with one deliberate difference: MinIO decides "target encrypted"
+        // from request headers alone, while `effective_sse` here also resolves the bucket default
+        // encryption rule. `sse_encryption` mints a DEK from that resolved value, so a
+        // header-only check would miss a self-copy under a bucket default rule. The source half
+        // deliberately reuses `ObjectInfo::is_encrypted` rather than naming individual headers,
+        // so a future encryption flavour is covered here the moment it is recognised there.
+        //
+        // The zero-copy shortcut is only recoverable for encrypted objects by *preserving* the
+        // DEK that sealed the bytes and re-wrapping it under a new master key (MinIO's
+        // `rotateKey` + `keyRotation` flag, which is why it may keep metadataOnly = true). RustFS
+        // has no such rewrap primitive today; adding one is backlog#1637, and it would enter here
+        // as an explicit exception rather than by relaxing this guard.
+        let copy_changes_encryption = src_info.is_encrypted() || effective_sse.is_some() || has_explicit_ssec;
+        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() && !copy_changes_encryption {
             src_info.metadata_only = true;
         }
 
