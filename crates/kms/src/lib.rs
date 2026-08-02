@@ -82,6 +82,45 @@ pub mod service_manager;
 mod time_serde;
 pub mod types;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    pub(crate) struct CapturedWriter(CapturedLogs);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.output.lock().expect("log buffer lock poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(self.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        pub(crate) fn output(&self) -> String {
+            String::from_utf8(self.output.lock().expect("log buffer lock poisoned").clone())
+                .expect("captured logs should be UTF-8")
+        }
+    }
+}
+
 // Re-export public API
 pub use api_types::{
     CacheSummary, ConfigureAwsKmsRequest, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest,

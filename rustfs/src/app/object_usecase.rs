@@ -7288,16 +7288,26 @@ impl DefaultObjectUsecase {
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
-                schedule_replication_delete(
-                    StorageDeletedObject {
-                        object_name: key.clone(),
-                        force_delete: true,
+                let mut delete_object = StorageDeletedObject {
+                    object_name: key.clone(),
+                    force_delete: true,
+                    ..Default::default()
+                };
+                if let Some(replication_state) = delete_replication_state_from_config(
+                    delete_config_snapshot
+                        .replication_config()
+                        .unwrap_or_else(|| unreachable!("force-delete requires a replication config")),
+                    &ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: key.clone(),
                         ..Default::default()
                     },
-                    bucket.clone(),
-                    REPLICATE_INCOMING_DELETE.to_string(),
-                )
-                .await;
+                    None,
+                    false,
+                ) {
+                    set_deleted_object_replication_state(&mut delete_object, &replication_state);
+                }
+                schedule_replication_delete(delete_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper

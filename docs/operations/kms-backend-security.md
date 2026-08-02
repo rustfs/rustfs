@@ -119,6 +119,7 @@ This section states only what is true of the current implementation. It is writt
 Nothing in this list requires a coordinated format cutover. The compatibility is deliberate and is covered by decode tests.
 
 - **DEK envelopes.** `DataKeyEnvelope::master_key_version` is optional and omitted when absent, so envelopes written by non-rotating backends stay byte-identical to the historical seven-field JSON shape. An upgraded node reading a pre-versioning envelope resolves `None` to the key's recorded baseline version, or — for a key that was never rotated, and so has no baseline — to the current version, which is exactly the pre-versioning behavior.
+- **Local key records.** Each `<key_id>.key` record carries `format_version: 1`; records written before that field existed default to version 1 when read. A reader accepts a record whose version is at most the version it understands, and rejects a newer version with `UnsupportedFormatVersion` before it attempts to decrypt key material. Unknown fields remain accepted for rollback compatibility, but their names are emitted at `warn` level without values.
 - **KV2 key records.** `baseline_version` is read with a serde default, so records written by older builds deserialize unchanged, and `None` correctly means "never rotated".
 - **Transit metadata records.** Metadata persisted in KV v2 by either build decodes on the other.
 

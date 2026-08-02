@@ -51,6 +51,11 @@ pub enum BackupError {
         supplied_kek_version: u32,
     },
 
+    /// A bundled key record declares a format version this build does not
+    /// understand.
+    #[error("bundled key record '{key_id}' declares unsupported format version {version}; this build cannot restore it")]
+    UnsupportedFormatVersion { key_id: String, version: String },
+
     /// Manifest requires an artifact that is not present in the bundle.
     #[error("backup bundle is missing a required artifact: {artifact}")]
     MissingArtifact { artifact: String },
@@ -126,6 +131,15 @@ mod tests {
         assert_eq!(
             unknown.to_string(),
             "unknown backup manifest format version 9 (this build supports version 1)"
+        );
+
+        assert_eq!(
+            BackupError::UnsupportedFormatVersion {
+                key_id: "alpha".to_string(),
+                version: "9".to_string(),
+            }
+            .to_string(),
+            "bundled key record 'alpha' declares unsupported format version 9; this build cannot restore it"
         );
 
         assert_eq!(
