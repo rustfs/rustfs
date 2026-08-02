@@ -629,6 +629,46 @@ pub(crate) mod bucket {
         #[cfg(test)]
         pub(crate) use replication_contracts::replication_statuses_map;
 
+        pub(crate) async fn persist_force_delete_intent(
+            store: Arc<crate::storage::storage_api::ECStore>,
+            bucket: String,
+            object: String,
+            target_arns: Vec<String>,
+            generation: time::OffsetDateTime,
+        ) -> crate::storage::storage_api::Result<Uuid> {
+            let operation_id = Uuid::new_v4();
+            crate::storage::storage_api::persist_force_delete_intent(
+                store,
+                replication_contracts::MrfReplicateEntry {
+                    bucket,
+                    object,
+                    version_id: None,
+                    retry_count: 0,
+                    size: 0,
+                    op: replication_contracts::MrfOpKind::Delete,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                    target_arns,
+                    force_delete_id: Some(operation_id),
+                    force_delete_generation: Some(match i64::try_from(generation.unix_timestamp_nanos()) {
+                        Ok(value) => value,
+                        Err(_) => i64::MAX,
+                    }),
+                    force_delete_local_commit: false,
+                },
+            )
+            .await
+            .map(|_| operation_id)
+        }
+
+        pub(crate) async fn commit_force_delete_intent(
+            store: Arc<crate::storage::storage_api::ECStore>,
+            operation_id: Uuid,
+        ) -> crate::storage::storage_api::Result<()> {
+            crate::storage::storage_api::commit_force_delete_intent(store, operation_id).await
+        }
+
         /// Test-only counter of `must_replicate_object` invocations.
         ///
         /// Used by white-box regression tests to assert that a single PUT
@@ -664,6 +704,13 @@ pub(crate) mod bucket {
 
         pub(crate) fn has_active_delete_rule(snapshot: &DeleteReplicationConfigSnapshot, object: &str) -> bool {
             ReplicationObjectBridge::has_active_delete_rule(snapshot, object)
+        }
+
+        pub(crate) fn force_delete_target_set(
+            snapshot: &DeleteReplicationConfigSnapshot,
+            prefix: &str,
+        ) -> Option<(Vec<String>, time::OffsetDateTime)> {
+            ReplicationObjectBridge::force_delete_target_set(snapshot, prefix)
         }
 
         pub(crate) fn delete_replication_version_id(

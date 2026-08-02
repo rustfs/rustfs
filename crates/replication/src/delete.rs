@@ -50,10 +50,14 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
                 .delete_marker_mtime
                 .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
             target_arns: if self.target_arn.is_empty() {
-                Vec::new()
+                self.delete_object.force_delete_target_arns.clone()
             } else {
                 vec![self.target_arn.clone()]
             },
+            force_delete_id: self.delete_object.force_delete_id,
+            force_delete_generation: self.delete_object.force_delete_generation,
+            force_delete_local_commit: self.delete_object.force_delete,
+            ..Default::default()
         }
     }
 

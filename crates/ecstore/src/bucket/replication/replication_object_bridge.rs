@@ -89,6 +89,13 @@ impl ReplicationObjectBridge {
         snapshot.has_active_rule(object)
     }
 
+    pub fn force_delete_target_set(
+        snapshot: &DeleteReplicationConfigSnapshot,
+        prefix: &str,
+    ) -> Option<(Vec<String>, time::OffsetDateTime)> {
+        snapshot.force_delete_target_set(prefix)
+    }
+
     pub fn check_delete_with_snapshot(
         object: &ObjectToDelete,
         source: &ObjectInfo,

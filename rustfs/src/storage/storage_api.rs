@@ -1441,6 +1441,21 @@ pub(crate) async fn get_bucket_replication_config(
     ecstore_bucket::metadata_sys::get_replication_config(bucket).await
 }
 
+pub(crate) async fn persist_force_delete_intent(
+    api: Arc<ECStore>,
+    entry: ecstore_bucket::replication::MrfReplicateEntry,
+) -> Result<()> {
+    ecstore_bucket::replication::persist_force_delete_intent(api, entry).await
+}
+
+pub(crate) async fn commit_force_delete_intent(api: Arc<ECStore>, operation_id: uuid::Uuid) -> Result<()> {
+    ecstore_bucket::replication::commit_force_delete_intent(api, operation_id).await
+}
+
+pub(crate) async fn complete_force_delete_intent(api: Arc<ECStore>, operation_id: uuid::Uuid) -> Result<()> {
+    ecstore_bucket::replication::complete_force_delete_intent(api, operation_id).await
+}
+
 pub(crate) async fn get_bucket_request_payment_config(
     bucket: &str,
 ) -> Result<(s3s::dto::RequestPaymentConfiguration, time::OffsetDateTime)> {

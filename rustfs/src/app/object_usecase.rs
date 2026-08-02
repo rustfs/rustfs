@@ -46,7 +46,8 @@ use super::storage_api::object_usecase::bucket::{
         delete_replication_version_id, deleted_object_has_pending_replication_delete, has_active_delete_rule,
         load_delete_config_snapshot, must_replicate_object, schedule_object_replication, schedule_replication_delete,
         schedule_replication_deletes, set_deleted_object_replication_state, should_schedule_delete_replication,
-        should_use_existing_delete_replication_info,
+        should_use_existing_delete_replication_info, commit_force_delete_intent, force_delete_target_set,
+        persist_force_delete_intent,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -7206,6 +7207,7 @@ impl DefaultObjectUsecase {
         opts.expected_current_version_id = expected_current_version_id.clone();
 
         let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
+        let mut force_delete_intent = None;
 
         // Check Object Lock retention before deletion
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
@@ -7245,10 +7247,33 @@ impl DefaultObjectUsecase {
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
         }
 
+        if replicate_force_delete
+            && let Some((target_arns, generation)) = force_delete_target_set(&delete_config_snapshot, &key)
+            && !target_arns.is_empty()
+        {
+            let operation_id =
+                persist_force_delete_intent(store.clone(), bucket.clone(), key.clone(), target_arns.clone(), generation)
+                    .await
+                    .map_err(ApiError::from)?;
+            force_delete_intent = Some((operation_id, target_arns, generation));
+        }
+
         let obj_info = {
             match store.delete_object(&bucket, &key, opts.clone()).await {
                 Ok(obj) => obj,
                 Err(err) => {
+                    if let Some((operation_id, _, _)) = force_delete_intent.as_ref()
+                        && let Err(cleanup_error) =
+                            crate::storage::storage_api::complete_force_delete_intent(store.clone(), *operation_id).await
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %key,
+                            operation_id = %operation_id,
+                            error = %cleanup_error,
+                            "failed to remove uncommitted force-delete intent after local delete failure"
+                        );
+                    }
                     if is_err_bucket_not_found(&err) {
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
                     }
@@ -7287,11 +7312,27 @@ impl DefaultObjectUsecase {
         }
 
         if obj_info.name.is_empty() {
-            if replicate_force_delete {
+            if let Some((operation_id, target_arns, generation)) = force_delete_intent {
+                if let Err(error) = commit_force_delete_intent(store.clone(), operation_id).await {
+                    warn!(
+                        bucket = %bucket,
+                        object = %key,
+                        operation_id = %operation_id,
+                        error = %error,
+                        "failed to mark force-delete intent committed after local delete"
+                    );
+                }
+                let generation = match i64::try_from(generation.unix_timestamp_nanos()) {
+                    Ok(value) => value,
+                    Err(_) => i64::MAX,
+                };
                 schedule_replication_delete(
                     StorageDeletedObject {
                         object_name: key.clone(),
                         force_delete: true,
+                        force_delete_id: Some(operation_id),
+                        force_delete_target_arns: target_arns,
+                        force_delete_generation: Some(generation),
                         ..Default::default()
                     },
                     bucket.clone(),

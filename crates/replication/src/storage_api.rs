@@ -49,6 +49,9 @@ pub struct DeletedObject {
     pub replication_state: Option<ReplicationState>,
     pub found: bool,
     pub force_delete: bool,
+    pub force_delete_id: Option<Uuid>,
+    pub force_delete_target_arns: Vec<String>,
+    pub force_delete_generation: Option<i64>,
 }
 
 impl DeletedObject {
