@@ -36,6 +36,8 @@ Inventory the source before choosing: bucket default-encryption settings mean ob
 
 The same limitation applies in reverse — objects RustFS encrypts are not readable by MinIO. For the code-level breakdown of which seams block each SSE mode, see [MinIO file-format interoperability, Part C](../architecture/minio-file-format-compat.md#part-c--server-side-encryption-sse).
 
+The migration warning is not a wire-protocol promise: the **AWS KMS wire protocol** and **MinIO KES wire protocol** are explicit non-targets for this document. The AWS backend uses the AWS SDK client path (`crates/kms/src/backends/aws.rs:830`), and KES remains outside the MinIO on-disk interop scope. Track those ecosystem evaluations and the MinIO/RustFS SSE compatibility matrix in the [#1562 Production Ready exit gate](https://github.com/rustfs/backlog/issues/1562); #1638 alone does not satisfy that gate.
+
 ## Vault KV2: what the backend does and does not do
 
 The Vault KV2 backend uses Vault purely as a **secure storage** service:

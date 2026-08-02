@@ -226,6 +226,10 @@ missing piece is a source adapter that points the importer at a MinIO
 
 Container-format parity does **not** extend to encrypted object payloads. RustFS currently does not support reading objects that MinIO wrote with server-side encryption — SSE-S3, SSE-KMS, or SSE-C. This is true of every released binary and container image. Tracked in rustfs/backlog#1638.
 
+### Scope boundary: KMS wire protocols and the production gate
+
+This document covers MinIO on-disk metadata and object-encryption seams only. The **AWS KMS wire protocol** and the **MinIO KES wire protocol** are explicit non-targets: RustFS's AWS backend uses the AWS SDK's `awsJson1_1` client path (`crates/kms/src/backends/aws.rs:830`), while KES compatibility is outside this interop work. Those ecosystem evaluations remain separate work in the [#1562 Production Ready exit gate](https://github.com/rustfs/backlog/issues/1562), whose compatibility criterion covers MinIO/RustFS SSE data and rolling upgrades. Closing #1638 does not by itself close that gate.
+
 Note the asymmetry with Parts A and B: the `xl.meta` around a MinIO SSE object parses fine, so such objects list, HEAD, and report plausible sizes. Only the payload is unreadable.
 
 ### What can and cannot be migrated
