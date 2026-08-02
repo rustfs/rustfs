@@ -1,0 +1,10 @@
+---
+source: rustfs/src/admin/handlers/kms_keys.rs
+expression: "stable_json_value(DescribeKmsKeyResponse\n{\n    success: false, message: \"key not found\".to_string(), key_metadata: None,\n    impact: None,\n})"
+---
+{
+  "impact": null,
+  "key_metadata": null,
+  "message": "key not found",
+  "success": false
+}

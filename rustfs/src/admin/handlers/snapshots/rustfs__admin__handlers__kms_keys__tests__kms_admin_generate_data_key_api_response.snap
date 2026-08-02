@@ -1,0 +1,9 @@
+---
+source: rustfs/src/admin/handlers/kms_keys.rs
+expression: "stable_json_value(GenerateDataKeyApiResponse\n{\n    key_id: \"key-a\".to_string(), plaintext_key:\n    \"cGxhaW50ZXh0LXBsYWNlaG9sZGVy\".to_string(), ciphertext_blob:\n    \"Y2lwaGVydGV4dC1wbGFjZWhvbGRlcg==\".to_string(),\n})"
+---
+{
+  "ciphertext_blob": "Y2lwaGVydGV4dC1wbGFjZWhvbGRlcg==",
+  "key_id": "key-a",
+  "plaintext_key": "cGxhaW50ZXh0LXBsYWNlaG9sZGVy"
+}

@@ -21,7 +21,6 @@ use crate::config::{
     redacted_secret, redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
-use crate::types::KeyMetadata;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -1199,6 +1198,19 @@ mod tests {
         }
     }
 
+    /// The shapes this crate owns, and only those.
+    ///
+    /// The first four are served verbatim by the dynamic-configuration admin
+    /// handlers, so pinning them here pins the wire. The last three never
+    /// reach a socket: `ObjectEncryptionService` returns them and the admin
+    /// layer answers with its own `KmsKeyMetadataResponse` instead, so what
+    /// they pin is this crate's public API, not the wire.
+    ///
+    /// No key-management response belongs in this test. Those endpoints are
+    /// served from types defined in the `rustfs` crate, and a copy here could
+    /// only ever agree with them by accident — see
+    /// `kms_key_admin_responses_have_stable_json_shapes` in
+    /// `rustfs/src/admin/handlers/kms_keys.rs`.
     #[test]
     fn kms_management_responses_have_stable_json_shapes() {
         insta::assert_json_snapshot!(
@@ -1235,41 +1247,6 @@ mod tests {
             })
         );
         insta::assert_json_snapshot!(
-            "kms_delete_key_response",
-            stable_json_value(DeleteKeyResponse {
-                success: true,
-                message: "key scheduled for deletion".to_string(),
-                key_id: "key-a".to_string(),
-                deletion_date: Some("2026-07-01T00:00:00Z".to_string()),
-            })
-        );
-        insta::assert_json_snapshot!(
-            "kms_list_keys_response",
-            stable_json_value(ListKeysResponse {
-                success: true,
-                message: "keys listed".to_string(),
-                keys: vec!["key-a".to_string(), "key-b".to_string()],
-                truncated: true,
-                next_marker: Some("key-b".to_string()),
-            })
-        );
-        insta::assert_json_snapshot!(
-            "kms_describe_key_response_missing",
-            stable_json_value(DescribeKeyResponse {
-                success: false,
-                message: "key not found".to_string(),
-                key_metadata: None,
-            })
-        );
-        insta::assert_json_snapshot!(
-            "kms_cancel_key_deletion_response",
-            stable_json_value(CancelKeyDeletionResponse {
-                success: true,
-                message: "key deletion canceled".to_string(),
-                key_id: "key-a".to_string(),
-            })
-        );
-        insta::assert_json_snapshot!(
             "kms_update_key_description_response",
             stable_json_value(UpdateKeyDescriptionResponse {
                 success: true,
@@ -1299,60 +1276,18 @@ mod tests {
 // ========================================
 // Key Management API Types
 // ========================================
-
-/// JSON shape returned by the admin delete-key endpoint.
-///
-/// The delete *request* shape lives in [`crate::types::DeleteKeyRequest`] —
-/// there is deliberately no copy here, because the immediate-deletion gate
-/// (`force_immediate` + `confirm_key_id`) must have exactly one definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteKeyResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Key ID that was deleted or scheduled for deletion
-    pub key_id: String,
-    /// Deletion date (if scheduled)
-    pub deletion_date: Option<String>,
-}
-
-/// Response from list keys operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListKeysResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// List of key IDs
-    pub keys: Vec<String>,
-    /// Whether more keys are available
-    pub truncated: bool,
-    /// Next marker for pagination
-    pub next_marker: Option<String>,
-}
-
-/// Response from describe key operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DescribeKeyResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Key metadata
-    pub key_metadata: Option<KeyMetadata>,
-}
-
-/// Response from cancel key deletion operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelKeyDeletionResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Key ID
-    pub key_id: String,
-}
+//
+// What remains here is the key-metadata trio, and nothing else belongs.
+// Create, delete, list, describe and cancel-deletion are served from types
+// defined in the `rustfs` crate (`rustfs/src/admin/handlers/kms_keys.rs`)
+// carrying fields this crate knows nothing about, so a copy here would shadow
+// `crate::types` under the same name while agreeing with the wire only by
+// accident.
+//
+// The same holds for `DeleteKeyRequest`: it lives in `crate::types` alone, so
+// the immediate-deletion gate (`force_immediate` + `confirm_key_id`) has
+// exactly one definition and cannot be silently dropped by deserializing into
+// a copy that lacks it.
 
 /// Request to update key description
 #[derive(Debug, Clone, Serialize, Deserialize)]

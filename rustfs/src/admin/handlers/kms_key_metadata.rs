@@ -407,12 +407,13 @@ impl Operation for UntagKmsKeyHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::kms_keys::stable_json_value;
     use base64::Engine as _;
     use rustfs_kms::KmsManager;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::backends::static_kms::StaticKmsBackend;
     use rustfs_kms::config::KmsConfig;
-    use rustfs_kms::types::CreateKeyRequest;
+    use rustfs_kms::types::{CreateKeyRequest, KeyState, KeyUsage};
     use rustfs_policy::policy::action::AdminAction;
     use std::sync::Arc;
 
@@ -615,6 +616,46 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(metadata_error_status(&KmsError::key_not_found("gone")), StatusCode::NOT_FOUND);
+    }
+
+    /// The single JSON body all three metadata endpoints answer with.
+    ///
+    /// `rustfs-kms` returns a separate `TagKeyResponse`/`UntagKeyResponse`/
+    /// `UpdateKeyDescriptionResponse` per operation, but this handler discards
+    /// those and builds its own reply, so only a snapshot in this crate can
+    /// fail when the served shape changes.
+    #[test]
+    fn kms_key_metadata_response_has_a_stable_json_shape() {
+        insta::assert_json_snapshot!(
+            "kms_admin_key_metadata_response",
+            stable_json_value(KmsKeyMetadataResponse {
+                success: true,
+                message: "key tags updated".to_string(),
+                key_id: "key-a".to_string(),
+                key_metadata: Some(KeyMetadata {
+                    key_id: "key-a".to_string(),
+                    key_state: KeyState::Enabled,
+                    key_usage: KeyUsage::EncryptDecrypt,
+                    description: Some("snapshot key".to_string()),
+                    creation_date: "2026-01-01T00:00:00Z[UTC]".parse().expect("snapshot timestamp should parse"),
+                    deletion_date: None,
+                    origin: "RUSTFS_KMS".to_string(),
+                    key_manager: "RUSTFS".to_string(),
+                    tags: HashMap::from([("name".to_string(), "key-a".to_string())]),
+                }),
+            })
+        );
+        // A describe that failed after the update succeeded drops the echo,
+        // and the field stays present as `null` rather than disappearing.
+        insta::assert_json_snapshot!(
+            "kms_admin_key_metadata_response_without_metadata",
+            stable_json_value(KmsKeyMetadataResponse {
+                success: false,
+                message: "Failed to tag key: key not found".to_string(),
+                key_id: "key-a".to_string(),
+                key_metadata: None,
+            })
+        );
     }
 
     #[test]
