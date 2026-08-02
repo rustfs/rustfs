@@ -411,7 +411,7 @@ impl SetDisks {
 
     pub(in crate::set_disk) async fn connect_endpoint(
         ep: &Endpoint,
-        health: Option<std::sync::Arc<disk::disk_store::DiskHealthTracker>>,
+        reconnect: Option<disk::disk_store::ReconnectDiskHealthState>,
     ) -> disk::error::Result<(DiskStore, FormatV3)> {
         let disk = crate::disk::new_disk_with_health_tracker(
             ep,
@@ -419,7 +419,7 @@ impl SetDisks {
                 cleanup: false,
                 health_check: true,
             },
-            health,
+            reconnect,
         )
         .await?;
 
