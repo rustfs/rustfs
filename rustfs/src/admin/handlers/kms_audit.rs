@@ -442,7 +442,7 @@ mod tests {
     use base64::Engine;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::config::KmsConfig;
-    use rustfs_kms::types::{CreateKeyRequest, DescribeKeyRequest, GenerateDataKeyRequest, KeySpec};
+    use rustfs_kms::types::{CreateKeyRequest, DeleteKeyRequest, DescribeKeyRequest, GenerateDataKeyRequest, KeySpec};
     use rustfs_kms::{KmsAuditOperation, KmsManager};
     use std::sync::{Arc, Mutex};
 
@@ -543,6 +543,55 @@ mod tests {
         assert_eq!(entry.api.status.as_deref(), Some("failure"));
         assert_eq!(entry.error.as_deref(), Some("key_not_found"));
         assert_eq!(entry.request_id.as_deref(), Some("req-kms-1"));
+    }
+
+    /// Scheduling and an immediate-deletion refusal are both attempts to
+    /// delete a key; neither may be mistaken for the worker's irreversible
+    /// `DeleteKey` event.
+    #[tokio::test]
+    async fn deletion_guards_are_audited_as_scheduling_attempts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sink = Arc::new(CapturingSink::default());
+        let manager = local_manager(&temp_dir, sink.clone()).await;
+        let audit = request_audit();
+
+        for (name, immediate) in [("scheduled", false), ("immediate", true)] {
+            let key_id = manager
+                .create_key_with_context(
+                    CreateKeyRequest {
+                        key_name: Some(format!("audited-{name}-delete")),
+                        ..Default::default()
+                    },
+                    audit.context(),
+                )
+                .await
+                .expect("key should be created")
+                .key_id;
+            sink.drain();
+
+            let result = manager
+                .delete_key_with_context(
+                    DeleteKeyRequest {
+                        key_id: key_id.clone(),
+                        pending_window_in_days: (!immediate).then_some(7),
+                        force_immediate: immediate.then_some(true),
+                        confirm_key_id: immediate.then(|| key_id.clone()),
+                    },
+                    audit.context(),
+                )
+                .await;
+            if immediate {
+                result.expect_err("default configuration must refuse immediate deletion");
+            } else {
+                result.expect("scheduled deletion should succeed");
+            }
+
+            let entry = sink.drain().pop().expect("deletion attempt should be audited");
+            assert_eq!(entry.event, EventName::KmsKeyDeletionScheduled);
+            assert_eq!(entry.api.status.as_deref(), Some(if immediate { "failure" } else { "success" }));
+            assert_eq!(entry.error.as_deref(), immediate.then_some("invalid_operation"));
+            assert_eq!(tag(&entry, "keyId"), Some(&Value::String(key_id)));
+        }
     }
 
     /// A denied request never reaches the KMS layer, so the handler-side entry

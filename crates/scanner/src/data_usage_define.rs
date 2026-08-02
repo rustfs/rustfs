@@ -27,8 +27,8 @@ use rustfs_common::heal_channel::HealScanMode;
 #[cfg(test)]
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
-    BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageEntry, DataUsageHash, DataUsageHashMap,
-    DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, hash_path,
+    AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageEntry, DataUsageHash,
+    DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, TierStats, hash_path,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -184,69 +184,6 @@ pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
 
 const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq)]
-pub struct TierStats {
-    pub total_size: u64,
-    pub num_versions: i32,
-    pub num_objects: i32,
-}
-
-impl TierStats {
-    pub fn add(&self, u: &TierStats) -> TierStats {
-        TierStats {
-            total_size: self.total_size + u.total_size,
-            num_versions: self.num_versions + u.num_versions,
-            num_objects: self.num_objects + u.num_objects,
-        }
-    }
-
-    pub fn from_object_info(oi: &ObjectInfo) -> Self {
-        TierStats {
-            total_size: oi.size as u64,
-            num_versions: 1,
-            num_objects: if oi.is_latest { 1 } else { 0 },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct AllTierStats {
-    pub tiers: HashMap<String, TierStats>,
-}
-
-impl AllTierStats {
-    pub fn new() -> Self {
-        Self { tiers: HashMap::new() }
-    }
-
-    pub fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
-        for (tier, st) in tiers {
-            self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
-        }
-    }
-
-    pub fn merge(&mut self, other: AllTierStats) {
-        for (tier, st) in other.tiers {
-            self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
-        }
-    }
-
-    pub fn populate_stats(&self, stats: &mut HashMap<String, TierStats>) {
-        for (tier, st) in &self.tiers {
-            stats.insert(
-                tier.clone(),
-                TierStats {
-                    total_size: st.total_size,
-                    num_versions: st.num_versions,
-                    num_objects: st.num_objects,
-                },
-            );
-        }
-    }
-}
-
 /// Size summary for a single object or group of objects
 #[derive(Debug, Default, Clone)]
 pub struct SizeSummary {
@@ -301,7 +238,11 @@ impl SizeSummary {
         }
 
         if let Some(tier_stats) = self.tier_stats.get_mut(&tier) {
-            *tier_stats = tier_stats.add(&TierStats::from_object_info(oi));
+            *tier_stats = tier_stats.add(&TierStats {
+                total_size: u64::try_from(oi.size).unwrap_or(0),
+                num_versions: 1,
+                num_objects: u64::from(oi.is_latest),
+            });
         }
     }
 }
@@ -963,6 +904,7 @@ impl DataUsageCache {
             versions_total_count: flat.versions as u64,
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
+            tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             ..Default::default()

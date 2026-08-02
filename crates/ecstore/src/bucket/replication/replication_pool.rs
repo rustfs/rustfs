@@ -1823,12 +1823,20 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     dsc: ReplicateDecision,
     op_type: ReplicationType,
 ) {
-    let synchronous = dsc.is_synchronous();
-    let ri = replicate_object_info_from_object_info(oi, dsc, op_type);
+    let (synchronous, asynchronous) = dsc.partition_by_sync();
+    let mut async_oi = oi;
 
-    if synchronous {
-        replicate_object(ri, o).await
-    } else if let Some(pool) = runtime_sources::replication_pool() {
+    if synchronous.replicate_any() {
+        let ri = replicate_object_info_from_object_info(async_oi.clone(), synchronous, op_type);
+        let state = replicate_object(ri, o.clone()).await;
+        async_oi.replication_status_internal = state.replication_status_internal;
+        async_oi.version_purge_status_internal = state.version_purge_status_internal;
+    }
+
+    if asynchronous.replicate_any()
+        && let Some(pool) = runtime_sources::replication_pool()
+    {
+        let ri = replicate_object_info_from_object_info(async_oi, asynchronous, op_type);
         let _ = pool.queue_replica_task(ri).await;
     }
 }

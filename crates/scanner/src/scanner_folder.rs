@@ -461,6 +461,8 @@ fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) 
             .pending_count
             .saturating_add(u64::try_from(st.pending_count).unwrap_or(u64::MAX));
     }
+
+    into.add_tier_sizes(&summary.tier_stats);
 }
 
 /// Cached folder information for scanning
@@ -3049,7 +3051,7 @@ mod tests {
 
     use super::*;
     use crate::storage_api::VersionPurgeStatusType;
-    use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, new_disk};
+    use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
     use rustfs_filemeta::{FileInfo, FileMeta};
     use serial_test::serial;
     #[cfg(unix)]
@@ -3126,6 +3128,56 @@ mod tests {
         assert_eq!(target_stats.replicated_count, u64::MAX);
         assert_eq!(target_stats.failed_count, u64::MAX);
         assert_eq!(target_stats.pending_count, u64::MAX);
+    }
+
+    #[test]
+    fn scanner_size_summary_application_accumulates_tier_stats() {
+        let mut entry = DataUsageEntry::default();
+        let mut summary = SizeSummary::default();
+        summary.tier_stats.insert(
+            "WARM".to_string(),
+            TierStats {
+                total_size: 100,
+                num_versions: 2,
+                num_objects: 1,
+            },
+        );
+        // Scanners seed a zeroed entry for every configured tier; those must not
+        // reach the cache as empty keys.
+        summary
+            .tier_stats
+            .insert(storageclass::STANDARD.to_string(), TierStats::default());
+
+        apply_scanner_size_summary(&mut entry, &summary);
+        apply_scanner_size_summary(&mut entry, &summary);
+
+        let tiers = entry.all_tier_stats.as_ref().expect("tier stats should be recorded");
+        assert_eq!(
+            tiers.tiers.get("WARM"),
+            Some(&TierStats {
+                total_size: 200,
+                num_versions: 4,
+                num_objects: 2,
+            })
+        );
+        assert!(!tiers.tiers.contains_key(storageclass::STANDARD));
+    }
+
+    #[test]
+    fn scanner_size_summary_application_skips_untiered_summaries() {
+        let mut entry = DataUsageEntry::default();
+        let mut summary = SizeSummary {
+            total_size: 10,
+            ..Default::default()
+        };
+        summary
+            .tier_stats
+            .insert(storageclass::STANDARD.to_string(), TierStats::default());
+        summary.tier_stats.insert(storageclass::RRS.to_string(), TierStats::default());
+
+        apply_scanner_size_summary(&mut entry, &summary);
+
+        assert!(entry.all_tier_stats.is_none(), "zero-only tier maps must not allocate cache state");
     }
 
     async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
