@@ -113,6 +113,8 @@ pub struct DriveCountStats {
 ///
 /// Returns a vector of Prometheus metrics for each drive.
 pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<PrometheusMetric> {
+    const DRIVE_RUNTIME_STATES: [&str; 5] = ["online", "offline", "returning", "suspect", "unknown"];
+
     fn topology_labels(stat: &DriveDetailedStats) -> Option<[Cow<'static, str>; 5]> {
         Some([
             Cow::Owned(stat.server.clone()),
@@ -121,6 +123,18 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
             Cow::Owned(stat.set_index.as_ref()?.clone()),
             Cow::Owned(stat.drive_index.as_ref()?.clone()),
         ])
+    }
+
+    fn has_topology_labels(stat: &DriveDetailedStats) -> bool {
+        stat.pool_index.is_some() && stat.set_index.is_some() && stat.drive_index.is_some()
+    }
+
+    fn normalized_runtime_state(runtime_state: &str) -> &str {
+        DRIVE_RUNTIME_STATES
+            .iter()
+            .copied()
+            .find(|state| state.eq_ignore_ascii_case(runtime_state))
+            .unwrap_or("unknown")
     }
 
     fn push_topology_metric(
@@ -153,7 +167,18 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
         );
     }
 
-    let mut metrics = Vec::with_capacity(stats.len() * 31);
+    let metric_capacity = stats
+        .iter()
+        .map(|stat| {
+            let api_metrics = if has_topology_labels(stat) {
+                stat.api_calls.len() + stat.api_latency_by_api_micros.len()
+            } else {
+                0
+            };
+            31 + api_metrics
+        })
+        .sum();
+    let mut metrics = Vec::with_capacity(metric_capacity);
 
     for stat in stats {
         let server_label = stat.server.as_str();
@@ -240,7 +265,8 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
                 );
             }
             if let Some(runtime_state) = stat.runtime_state.as_ref().filter(|state| !state.is_empty()) {
-                for state in ["online", "offline", "returning", "unknown"] {
+                let runtime_state = normalized_runtime_state(runtime_state);
+                for state in DRIVE_RUNTIME_STATES {
                     metrics.push(
                         PrometheusMetric::from_descriptor(
                             &DRIVE_RUNTIME_STATE_MD,
@@ -401,7 +427,7 @@ mod tests {
         let metrics = collect_drive_detailed_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 33);
+        assert_eq!(metrics.len(), 34);
 
         // Verify total bytes metric
         let total_bytes_name = DRIVE_TOTAL_BYTES_MD.get_full_metric_name();
@@ -500,6 +526,40 @@ mod tests {
                 .iter()
                 .all(|metric| metric.name != DRIVE_IO_ERRORS_MD.get_full_metric_name())
         );
+    }
+
+    #[test]
+    fn drive_runtime_state_metrics_keep_suspect_state_active() {
+        let stats = vec![DriveDetailedStats {
+            server: "node1:9000".to_string(),
+            drive: "/data/disk1".to_string(),
+            pool_index: Some("0".to_string()),
+            set_index: Some("1".to_string()),
+            drive_index: Some("2".to_string()),
+            runtime_state: Some("suspect".to_string()),
+            ..Default::default()
+        }];
+
+        let metrics = collect_drive_detailed_metrics(&stats);
+        let state_metrics = metrics
+            .iter()
+            .filter(|metric| metric.name == DRIVE_RUNTIME_STATE_MD.get_full_metric_name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(state_metrics.len(), 5);
+        assert!(state_metrics.iter().any(|metric| {
+            metric.value == 1.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "suspect")
+        }));
+        assert!(state_metrics.iter().filter(|metric| metric.value == 1.0).all(|metric| {
+            metric
+                .labels
+                .iter()
+                .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "suspect")
+        }));
     }
 
     #[test]
