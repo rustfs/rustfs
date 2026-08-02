@@ -18,12 +18,15 @@ use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::KmsBackend;
 use crate::cache::{KmsCache, KmsCacheStats};
 use crate::config::{ENV_KMS_ALLOW_IMMEDIATE_DELETION, KmsConfig};
+use crate::deletion_worker::DeletionReferenceChecker;
 use crate::error::{KmsError, Result};
 use crate::types::{
     CancelKeyDeletionRequest, CancelKeyDeletionResponse, CreateKeyRequest, CreateKeyResponse,
     DEFAULT_PENDING_DELETION_WINDOW_DAYS, DecryptRequest, DecryptResponse, DeleteKeyRequest, DeleteKeyResponse,
-    DescribeKeyRequest, DescribeKeyResponse, EncryptRequest, EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse,
-    ListKeysRequest, ListKeysResponse, MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext,
+    DescribeDataKeyWrappingRequest, DescribeDataKeyWrappingResponse, DescribeKeyRequest, DescribeKeyResponse, EncryptRequest,
+    EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse, ListKeysRequest, ListKeysResponse,
+    MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext, RewrapDataKeyRequest,
+    RewrapDataKeyResponse,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +44,7 @@ pub struct KmsManager {
     backend_kind: &'static str,
     audit_sink: Option<Arc<dyn KmsAuditSink>>,
     allow_immediate_deletion: bool,
+    reference_checker: Option<Arc<dyn DeletionReferenceChecker>>,
 }
 
 impl KmsManager {
@@ -60,7 +64,19 @@ impl KmsManager {
             backend_kind: config.backend.as_str(),
             audit_sink: None,
             allow_immediate_deletion: config.allow_immediate_deletion,
+            reference_checker: None,
         }
+    }
+
+    /// Consult `checker` before immediate deletion destroys key material.
+    ///
+    /// This is the same checker the deletion worker consults before it removes
+    /// an expired key; installing it here extends that gate to the one
+    /// deletion path that never reaches the worker. It can only add a refusal:
+    /// without a checker the manager behaves exactly as before.
+    pub fn with_deletion_reference_checker(mut self, checker: Option<Arc<dyn DeletionReferenceChecker>>) -> Self {
+        self.reference_checker = checker;
+        self
     }
 
     /// Send an audit record for every management operation to `sink`.
@@ -151,6 +167,29 @@ impl KmsManager {
     #[hotpath::measure]
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
         self.backend.generate_data_key(request).await
+    }
+
+    /// Re-wrap an existing data key envelope onto the master key's current
+    /// version, leaving the data key — and therefore every object body it
+    /// protects — untouched.
+    ///
+    /// Backends without retained version history reject this with
+    /// [`KmsError::UnsupportedCapability`]; check
+    /// [`Self::backend_capabilities`] before offering it.
+    pub async fn rewrap_data_key(&self, request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        self.backend.rewrap_data_key(request).await
+    }
+
+    /// Report which master key version wraps an existing data key envelope.
+    ///
+    /// The read-only side of [`Self::rewrap_data_key`], and the supported way to
+    /// ask that question: where the version is recorded differs per backend, so
+    /// callers must not inspect envelopes themselves.
+    pub async fn describe_data_key_wrapping(
+        &self,
+        request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        self.backend.describe_data_key_wrapping(request).await
     }
 
     /// Describe a key
@@ -262,6 +301,9 @@ impl KmsManager {
     /// defensive assertion for callers that hold a backend handle directly.
     async fn delete_key_inner(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
         self.check_deletion_request(&request)?;
+        if request.force_immediate.unwrap_or(false) {
+            self.refuse_referenced_immediate_deletion(&request.key_id).await?;
+        }
 
         let response = self.backend.delete_key(request).await?;
 
@@ -310,6 +352,41 @@ impl KmsManager {
             "immediate KMS key deletion accepted; key material is destroyed without a waiting window and cannot be recovered"
         );
         Ok(())
+    }
+
+    /// Refuse an immediate deletion while configuration still points at the
+    /// key.
+    ///
+    /// A scheduled deletion is re-checked against these same references by the
+    /// deletion worker before it destroys anything, and stays cancellable
+    /// until then. Immediate deletion has neither property: it destroys
+    /// material on the spot and never reaches the worker, so the check has to
+    /// happen here or not at all.
+    ///
+    /// Only ever a refusal. An empty reference set is not a clearance — it
+    /// means the sources consulted here raised no objection, while the caller
+    /// still had to pass the server-side opt-in and the key-id confirmation to
+    /// get this far. With no checker installed the manager has no
+    /// configuration source to consult and behaves as it did before, matching
+    /// the deletion worker, which also skips a checker it was not given.
+    async fn refuse_referenced_immediate_deletion(&self, key_id: &str) -> Result<()> {
+        let mut references = Vec::new();
+        if self.default_key_id.as_deref() == Some(key_id) {
+            references.push("kms-service-default-key".to_string());
+        }
+        if let Some(checker) = &self.reference_checker {
+            references.extend(checker.references(key_id).await);
+        }
+        if references.is_empty() {
+            return Ok(());
+        }
+
+        warn!(
+            key_id,
+            ?references,
+            "immediate KMS key deletion refused; configuration still references the key"
+        );
+        Err(KmsError::key_still_referenced(key_id, references))
     }
 
     /// Cancel key deletion
@@ -1254,6 +1331,191 @@ mod tests {
             .await
             .expect_err("an immediately deleted key must be gone");
         assert!(matches!(error, KmsError::KeyNotFound { .. }), "expected KeyNotFound, got {error:?}");
+    }
+
+    /// Reference checker whose answer is fixed, standing in for the server's
+    /// bucket-configuration gate.
+    struct StaticReferences(Vec<String>);
+
+    #[async_trait]
+    impl DeletionReferenceChecker for StaticReferences {
+        async fn references(&self, _key_id: &str) -> Vec<String> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_is_refused_while_configuration_references_the_key() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(vec!["bucket:sse-bucket".to_string()]))));
+        let key_id = create_named_key(&manager, "referenced-force-delete").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        // Server opt-in granted and the confirmation exact: the reference is
+        // the only thing left to refuse this.
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("immediate deletion must be refused while configuration references the key");
+
+        match error {
+            KmsError::KeyStillReferenced {
+                key_id: refused,
+                references,
+            } => {
+                assert_eq!(refused, key_id);
+                assert_eq!(references, vec!["bucket:sse-bucket".to_string()], "the caller must learn what refused it");
+            }
+            other => panic!("expected KeyStillReferenced, got {other:?}"),
+        }
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_deletion_of_the_service_default_key_is_refused() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let mut config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        config.allow_immediate_deletion = true;
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
+        let key_id = KmsManager::new(backend.clone(), config.clone())
+            .create_key(CreateKeyRequest {
+                key_name: Some("default-key-force-delete".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create key")
+            .key_id;
+
+        config.default_key_id = Some(key_id.clone());
+        let manager = KmsManager::new(backend, config);
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("the service default key must not be destroyed out from under the deployment");
+        assert!(
+            matches!(error, KmsError::KeyStillReferenced { .. }),
+            "expected KeyStillReferenced, got {error:?}"
+        );
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    /// A checker that reports nothing must not become a shortcut around the
+    /// gates that were already there: it is not a clearance, only the absence
+    /// of one more objection.
+    #[tokio::test]
+    async fn an_empty_reference_set_grants_no_deletion_on_its_own() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
+        let key_id = create_named_key(&manager, "unreferenced-force-delete").await;
+        let probe = data_key_probe(&manager, &key_id).await;
+
+        // Server opt-in withheld, then confirmation missing: both still refuse.
+        let error = manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an unreferenced key still needs the server-side opt-in");
+        assert!(
+            matches!(error, KmsError::InvalidOperation { .. }),
+            "expected InvalidOperation, got {error:?}"
+        );
+
+        let allowed = deletion_manager(&temp_dir, true)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
+        let error = allowed
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an unreferenced key still needs the key-id confirmation");
+        assert!(
+            matches!(error, KmsError::InvalidOperation { .. }),
+            "expected InvalidOperation, got {error:?}"
+        );
+
+        assert_key_material_intact(&manager, &key_id, &probe).await;
+    }
+
+    /// The refusal is the only thing the checker adds: a fully authorized
+    /// immediate deletion of a key nothing points at still goes through.
+    #[tokio::test]
+    async fn immediate_deletion_still_succeeds_when_nothing_references_the_key() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, true)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(Vec::new()))));
+        let key_id = create_named_key(&manager, "unreferenced-confirmed-force-delete").await;
+
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("a confirmed immediate deletion must still be allowed when nothing references the key");
+
+        let error = manager
+            .describe_key(DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect_err("an immediately deleted key must be gone");
+        assert!(matches!(error, KmsError::KeyNotFound { .. }), "expected KeyNotFound, got {error:?}");
+    }
+
+    /// Scheduling stays a schedule: it destroys nothing, stays cancellable,
+    /// and is re-checked against the same references by the deletion worker
+    /// before any material goes away. Turning references into an up-front
+    /// refusal here would let one unreadable bucket block routine operations.
+    #[tokio::test]
+    async fn scheduled_deletion_is_unaffected_by_references() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let manager = deletion_manager(&temp_dir, false)
+            .await
+            .with_deletion_reference_checker(Some(Arc::new(StaticReferences(vec!["bucket:sse-bucket".to_string()]))));
+        let key_id = create_named_key(&manager, "referenced-schedule").await;
+
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("a scheduled deletion must still be accepted while configuration references the key");
+
+        let state = manager
+            .describe_key(DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect("a scheduled key must still be describable")
+            .key_metadata
+            .key_state;
+        assert_eq!(state, KeyState::PendingDeletion);
     }
 
     #[tokio::test]

@@ -50,6 +50,8 @@ The implemented test list currently covers the common object-storage surface:
 | SSE-C and selected SSE-KMS edge cases | Supported | `implemented_tests.txt` |
 | Selected versioning, object-lock, checksum, CORS, raw request, and conditional write behavior | Supported | `implemented_tests.txt` |
 
+"Supported" for the SSE row means RustFS encrypts and decrypts its own objects. It does not mean RustFS can read objects another implementation encrypted: objects MinIO wrote with SSE-S3, SSE-KMS, or SSE-C are not readable by RustFS today, which matters when migrating. See [MinIO file-format interoperability, Part C](minio-file-format-compat.md#part-c--server-side-encryption-sse) and rustfs/backlog#1638.
+
 ## Planned Standard Coverage
 
 These are standard S3 areas that remain planned work and must not be described

@@ -114,10 +114,13 @@ use vaultrs::api::transit::responses::ReadKeyData;
 use vaultrs::error::ClientError;
 use vaultrs::{kv2, transit::key};
 
+// The bundle layout names are pub(crate) so the drill harness
+// (`crate::backup::drill`) addresses the exact paths a Vault bundle uses
+// instead of copies that could drift.
 /// Bundle-relative directory holding one KV record artifact per key.
-const VAULT_RECORD_ARTIFACT_DIR: &str = "vault/records";
+pub(crate) const VAULT_RECORD_ARTIFACT_DIR: &str = "vault/records";
 /// Bundle-relative suffix of a KV record artifact.
-const VAULT_RECORD_ARTIFACT_SUFFIX: &str = ".json.enc";
+pub(crate) const VAULT_RECORD_ARTIFACT_SUFFIX: &str = ".json.enc";
 /// KV path segment (under the bundle's path prefix) of the restore commit
 /// marker. The leading dot keeps it out of the key id space the backends
 /// address; a bundle naming a key id equal to it is rejected.

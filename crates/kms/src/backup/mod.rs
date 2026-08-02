@@ -21,7 +21,8 @@
 //! [`vault_restore`] orchestrates the consumer side for the Vault backends,
 //! whose cryptographic root is restored by Vault's own disaster-recovery
 //! flow. All are crate-internal APIs; the admin API builds on these pieces in
-//! follow-up changes.
+//! follow-up changes. [`drill`] rehearses the whole loop end to end and turns
+//! it into machine-readable evidence.
 //!
 //! # Bundle model
 //!
@@ -51,6 +52,7 @@
 //! format version.
 
 mod capability;
+pub mod drill;
 mod dry_run;
 mod error;
 pub mod local_export;
@@ -59,6 +61,10 @@ mod manifest;
 pub mod vault_restore;
 
 pub use capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
+pub use drill::{
+    DRILL_EVIDENCE_FORMAT_VERSION, DrillBundleEvidence, DrillDataset, DrillDisaster, DrillEvidence, DrillPhase, DrillPhaseTiming,
+    DrillRecoveryEvidence, DrillRequest, DrillRpoEvidence, DrillVerdict, EnvelopeProbe, run_local_drill,
+};
 pub use dry_run::{
     ExternalDependencyMismatch, RestoreBlocker, RestoreBlockerCode, RestoreConflict, RestoreConflictKind, RestoreDryRunReport,
 };

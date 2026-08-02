@@ -156,6 +156,8 @@ pub fn error_class(error: &KmsError) -> &'static str {
         KmsError::UnsupportedCapability { .. } => "unsupported_capability",
         KmsError::CredentialsUnavailable { .. } => "credentials_unavailable",
         KmsError::BaselineVersionLost { .. } => "baseline_version_lost",
+        KmsError::KeyStillReferenced { .. } => "key_still_referenced",
+        KmsError::RewrapWouldExposePlaintext { .. } => "rewrap_would_expose_plaintext",
     }
 }
 

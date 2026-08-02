@@ -18,16 +18,16 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo,
-    ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
-    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos,
+    ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
+    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
-use super::replication_object_config::{ReplicationConfig, check_replicate_delete, get_replication_config, must_replicate};
+use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
     is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
@@ -642,6 +642,21 @@ impl ReplicationResyncer {
         };
 
         let rcfg = ReplicationConfig::new(cfg.clone(), Some(targets));
+        if let Err(err) = rcfg.validate() {
+            error!(
+                event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %opts.bucket,
+                arn = %opts.arn,
+                error = %err,
+                reason = "replication_config_invalid",
+                "Replication resync config is invalid"
+            );
+            self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                .await;
+            return;
+        }
 
         let target_arns = if let Some(cfg) = cfg {
             cfg.filter_target_arns(&ObjectOpts {
@@ -982,7 +997,36 @@ impl ReplicationResyncer {
             }
             last_checkpoint = None;
 
-            let roi = get_heal_replicate_object_info(&object, &rcfg).await;
+            let roi = match get_heal_replicate_object_info(&object, &rcfg).await {
+                Ok(roi) => roi,
+                Err(err) => {
+                    error!(
+                        event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        object = %object.name,
+                        error = %err,
+                        "Failed to classify object for replication resync"
+                    );
+                    let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+                    if worker_failed {
+                        error!(
+                            event = EVENT_RESYNC_TASK_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                            bucket = %opts.bucket,
+                            arn = %opts.arn,
+                            reason = "worker_join_failed_after_classification_error",
+                            "Replication resync worker cleanup observed task failure"
+                        );
+                    }
+                    self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                        .await;
+                    return;
+                }
+            };
             if !roi.existing_obj_resync.must_resync() {
                 continue;
             }
@@ -1037,18 +1081,25 @@ impl ReplicationResyncer {
     }
 }
 
-pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
+pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> Result<ReplicateObjectInfo> {
     let mut oi = oi.clone();
     let mut user_defined = (*oi.user_defined).clone();
+    let delete_path = heal_uses_delete_replication_path(oi.delete_marker, &oi.version_purge_status);
+    let stored_delete_decision = if delete_path && !oi.replication_decision.is_empty() {
+        Some(parse_replicate_decision(&oi.bucket, &oi.replication_decision)?)
+    } else {
+        None
+    };
+    let has_stored_delete_decision = stored_delete_decision.is_some();
 
     if let Some(rc) = rcfg.config.as_ref()
         && !rc.role.is_empty()
     {
-        if !oi.version_purge_status.is_empty() {
+        if oi.version_purge_status_internal.is_none() && !oi.version_purge_status.is_empty() {
             oi.version_purge_status_internal = Some(format!("{}={};", rc.role, oi.version_purge_status.as_str()));
         }
 
-        if !oi.replication_status.is_empty() {
+        if oi.replication_status_internal.is_none() && !oi.replication_status.is_empty() {
             oi.replication_status_internal = Some(format!("{}={};", rc.role, oi.replication_status.as_str()));
         }
 
@@ -1064,23 +1115,31 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         }
     }
 
-    let dsc = if heal_uses_delete_replication_path(oi.delete_marker, &oi.version_purge_status) {
-        check_replicate_delete(
-            oi.bucket.as_str(),
-            &ObjectToDelete {
-                object_name: oi.name.clone(),
-                version_id: oi.version_id,
-                ..Default::default()
-            },
-            &oi,
-            &ObjectOptions {
-                versioned: ReplicationVersioningStore::prefix_enabled(&oi.bucket, &oi.name).await,
-                version_suspended: ReplicationVersioningStore::prefix_suspended(&oi.bucket, &oi.name).await,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
+    let delete_state = if delete_path && !has_stored_delete_decision {
+        ReplicationVersioningStore::prefix_state(&oi.bucket, &oi.name).await?
+    } else {
+        (false, false)
+    };
+    let dsc = if let Some(decision) = stored_delete_decision {
+        decision
+    } else if delete_path {
+        if !delete_state.0 && !delete_state.1 {
+            ReplicateDecision::default()
+        } else {
+            rcfg.check_delete_for_heal(
+                &ObjectToDelete {
+                    object_name: oi.name.clone(),
+                    version_id: oi.version_id,
+                    ..Default::default()
+                },
+                &oi,
+                &ObjectOptions {
+                    versioned: delete_state.0,
+                    version_suspended: delete_state.1,
+                    ..Default::default()
+                },
+            )
+        }
     } else {
         must_replicate(
             oi.bucket.as_str(),
@@ -1092,12 +1151,16 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
 
     let target_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let target_purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
-    let existing_obj_resync = rcfg.resync(oi.clone(), dsc.clone(), &target_statuses).await;
+    let existing_obj_resync = if delete_path && !has_stored_delete_decision && !delete_state.0 && !delete_state.1 {
+        Default::default()
+    } else {
+        rcfg.resync(oi.clone(), dsc.clone(), &target_statuses).await
+    };
     let mut replication_state = oi.replication_state();
     replication_state.replicate_decision_str = dsc.to_string();
     let actual_size = oi.get_actual_size().unwrap_or_default();
 
-    ReplicateObjectInfo {
+    Ok(ReplicateObjectInfo {
         name: oi.name.clone(),
         size: oi.size,
         actual_size,
@@ -1122,7 +1185,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         user_tags: (*oi.user_tags).clone(),
         checksum: oi.checksum.clone(),
         retry_count: 0,
-    }
+    })
 }
 
 pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
@@ -1566,7 +1629,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
             .remove_object(
                 &tgt_client.bucket,
                 &dobj.delete_object.object_name,
-                Some(delete_marker_version_id.to_string()),
+                target_delete_version_id(delete_marker_version_id, true),
                 replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
             )
             .await;
@@ -1796,6 +1859,14 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     }
 }
 
+fn target_delete_version_id(version_id: Uuid, version_purge: bool) -> Option<String> {
+    if version_id.is_nil() {
+        version_purge.then(|| NULL_VERSION_ID.to_string())
+    } else {
+        Some(version_id.to_string())
+    }
+}
+
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
@@ -1835,11 +1906,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    let version_id = if version_id.is_nil() {
-        None
-    } else {
-        Some(version_id.to_string())
-    };
+    let version_id = target_delete_version_id(version_id, is_version_purge);
 
     if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
         match head_object_with_proxy_stats(
@@ -3088,7 +3155,12 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
     use super::*;
+    use s3s::dto::{
+        BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ExcludedPrefix, ReplicationRule,
+        ReplicationRuleStatus, VersioningConfiguration,
+    };
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
@@ -3536,7 +3608,9 @@ mod tests {
             ..Default::default()
         };
         let rcfg = ReplicationConfig::new(None, None);
-        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+        let roi = get_heal_replicate_object_info(&oi, &rcfg)
+            .await
+            .expect("non-delete heal classification should succeed");
 
         assert_eq!(roi.replication_status, ReplicationStatusType::Failed);
         assert_eq!(roi.op_type, ReplicationType::Heal);
@@ -3561,7 +3635,9 @@ mod tests {
         };
         let rcfg = ReplicationConfig::new(None, None);
 
-        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+        let roi = get_heal_replicate_object_info(&oi, &rcfg)
+            .await
+            .expect("non-delete heal classification should succeed");
 
         assert!(roi.ssec);
         assert_eq!(roi.checksum, Some(checksum));
@@ -3577,6 +3653,7 @@ mod tests {
             version_purge_status: VersionPurgeStatusType::Pending,
             version_id: Some(Uuid::nil()),
             mod_time: Some(OffsetDateTime::now_utc()),
+            replication_decision: format!("{role}=true;false;{role};"),
             ..Default::default()
         };
         let rcfg = ReplicationConfig::new(
@@ -3586,11 +3663,174 @@ mod tests {
             }),
             None,
         );
-        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+        let roi = get_heal_replicate_object_info(&oi, &rcfg)
+            .await
+            .expect("stored purge admission should classify without a live versioning lookup");
 
         assert_eq!(roi.replication_status_internal, None);
         assert_eq!(roi.version_purge_status_internal.as_deref(), Some(format!("{role}=PENDING;").as_str()));
         assert_eq!(roi.target_purge_statuses.get(role), Some(&VersionPurgeStatusType::Pending));
+    }
+
+    #[tokio::test]
+    async fn heal_pending_purge_reads_one_versioning_generation() {
+        let bucket = format!("heal-versioning-snapshot-{}", Uuid::new_v4());
+        let object = "archive/object";
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        ReplicationVersioningStore::install_prefix_state_test_config(
+            &bucket,
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                excluded_prefixes: Some(vec![ExcludedPrefix {
+                    prefix: Some("archive/".to_string()),
+                }]),
+                ..Default::default()
+            },
+        );
+        let rcfg = ReplicationConfig::new(
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    }),
+                    destination: Destination {
+                        bucket: arn.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("delete".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+            Some(BucketTargets {
+                targets: vec![BucketTarget {
+                    arn: arn.to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
+        let oi = ObjectInfo {
+            bucket,
+            name: object.to_string(),
+            version_id: Some(Uuid::nil()),
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+
+        let roi = get_heal_replicate_object_info(&oi, &rcfg)
+            .await
+            .expect("pending null purge classification should succeed");
+
+        assert!(roi.dsc.targets_map.get(arn).is_some_and(|target| target.replicate));
+        assert!(
+            roi.existing_obj_resync
+                .targets
+                .get(arn)
+                .is_some_and(|target| target.replicate)
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_pending_purge_preserves_the_persisted_admission_decision() {
+        let admitted_arn = "arn:rustfs:replication:us-east-1:target:admitted";
+        let current_role = "arn:rustfs:replication:us-east-1:target:current";
+        let rcfg = ReplicationConfig::new(
+            Some(ReplicationConfiguration {
+                role: current_role.to_string(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+                    }),
+                    destination: Destination {
+                        bucket: current_role.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("delete".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+            Some(BucketTargets {
+                targets: vec![
+                    BucketTarget {
+                        arn: admitted_arn.to_string(),
+                        ..Default::default()
+                    },
+                    BucketTarget {
+                        arn: current_role.to_string(),
+                        ..Default::default()
+                    },
+                ],
+            }),
+        );
+        let oi = ObjectInfo {
+            bucket: "heal-persisted-delete-decision".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            version_purge_status: VersionPurgeStatusType::Pending,
+            version_purge_status_internal: Some(format!("{admitted_arn}=PENDING;")),
+            replication_decision: format!("{admitted_arn}=true;false;{admitted_arn};"),
+            ..Default::default()
+        };
+
+        let roi = get_heal_replicate_object_info(&oi, &rcfg)
+            .await
+            .expect("persisted delete admission should survive live rule disablement");
+
+        assert_eq!(
+            roi.version_purge_status_internal.as_deref(),
+            Some(format!("{admitted_arn}=PENDING;").as_str())
+        );
+        assert!(roi.dsc.targets_map.get(admitted_arn).is_some_and(|target| target.replicate));
+        assert!(!roi.dsc.targets_map.contains_key(current_role));
+        assert!(
+            roi.existing_obj_resync
+                .targets
+                .get(admitted_arn)
+                .is_some_and(|target| target.replicate)
+        );
+        assert!(!roi.existing_obj_resync.targets.contains_key(current_role));
+    }
+
+    #[tokio::test]
+    async fn heal_rejects_semantically_invalid_replication_config() {
+        let rcfg = ReplicationConfig::new(
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: None,
+                    destination: Destination {
+                        bucket: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("invalid".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static("Enabld"),
+                }],
+            }),
+            Some(BucketTargets::default()),
+        );
+        let err = rcfg
+            .validate()
+            .expect_err("invalid string-backed statuses must fail before heal classification loop");
+
+        assert!(err.to_string().contains("Rule.Status"));
     }
 
     #[tokio::test]
@@ -3758,5 +3998,14 @@ mod tests {
         );
         assert_eq!(resync_status_duration(ResyncStatusType::ResyncStarted, Some(start), end), None);
         assert_eq!(resync_status_duration(ResyncStatusType::ResyncFailed, None, end), None);
+    }
+
+    #[test]
+    fn target_delete_version_id_preserves_explicit_null_purges() {
+        let version_id = Uuid::new_v4();
+
+        assert_eq!(target_delete_version_id(version_id, true), Some(version_id.to_string()));
+        assert_eq!(target_delete_version_id(Uuid::nil(), true).as_deref(), Some(NULL_VERSION_ID));
+        assert_eq!(target_delete_version_id(Uuid::nil(), false), None);
     }
 }

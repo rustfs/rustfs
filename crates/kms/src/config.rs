@@ -297,8 +297,15 @@ impl Default for LocalConfig {
 
 /// Static single-key KMS backend configuration
 ///
-/// Uses a pre-configured AES-256 key to derive data encryption keys via
-/// HMAC-SHA256 + AES-256-GCM, matching the MinIO builtin/static KMS wire format.
+/// The configured 32-byte key is used directly as the AES-256-GCM key that
+/// wraps data encryption keys — there is no HMAC-SHA256 derivation step — and
+/// each wrapped DEK is serialized as a RustFS `DataKeyEnvelope` JSON blob.
+///
+/// This mirrors the *concept* of MinIO's builtin/static single-key KMS, but is
+/// not wire-compatible with it: MinIO wraps DEKs in a different (`{"aead": ...}`)
+/// blob that this backend neither produces nor accepts, so KMS ciphertext
+/// written by MinIO cannot be opened here. Reading MinIO-written SSE objects is
+/// tracked separately in rustfs/backlog#1638.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct StaticConfig {
     /// Key identifier (name) for the single configured key

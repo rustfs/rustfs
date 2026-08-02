@@ -129,6 +129,9 @@ fn normalize_configure_request_secrets(
         ConfigureKmsRequest::VaultTransit(req) => token_is_blank(&req.auth_method),
         ConfigureKmsRequest::Local(_) => false,
         ConfigureKmsRequest::Static(_) => false,
+        // AWS credentials come from the aws-config chain, so there is nothing
+        // to carry over from the existing configuration.
+        ConfigureKmsRequest::Aws(_) => false,
     };
 
     if !needs_existing_auth {
@@ -144,6 +147,7 @@ fn normalize_configure_request_secrets(
         ConfigureKmsRequest::VaultTransit(req) => req.auth_method = existing_auth,
         ConfigureKmsRequest::Local(_) => {}
         ConfigureKmsRequest::Static(_) => {}
+        ConfigureKmsRequest::Aws(_) => {}
     }
 
     Ok(())
@@ -1181,9 +1185,9 @@ impl Operation for ReconfigureKmsHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_persisted_kms_config, ensure_kms_config_persistable, kms_config_fingerprint, kms_config_is_unchanged,
-        kms_configure_actions, kms_service_control_actions, local_success_with_peer_report, normalize_configure_request_secrets,
-        redacted_canonical_config,
+        decode_persisted_kms_config, ensure_kms_config_persistable, ensure_kms_request_persistable, kms_config_fingerprint,
+        kms_config_is_unchanged, kms_configure_actions, kms_service_control_actions, local_success_with_peer_report,
+        normalize_configure_request_secrets, redacted_canonical_config,
     };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use std::path::PathBuf;
@@ -1418,6 +1422,72 @@ mod tests {
         let backend_error = normalize_configure_request_secrets(&mut backend_change, Some(&existing))
             .expect_err("changing from the local backend must be rejected");
         assert_eq!(backend_error, "Changing from the Local KMS backend is not supported");
+    }
+
+    fn aws_configure_request(region: &str) -> rustfs_kms::ConfigureKmsRequest {
+        rustfs_kms::ConfigureKmsRequest::Aws(rustfs_kms::ConfigureAwsKmsRequest {
+            region: region.to_string(),
+            endpoint_url: None,
+            default_key_id: Some("arn:aws:kms:us-east-1:111122223333:key/1234abcd".to_string()),
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
+        })
+    }
+
+    /// The AWS backend holds no credential material of its own, so its
+    /// configuration is safe to persist cluster-wide and needs nothing carried
+    /// over from a previous configuration.
+    #[test]
+    fn aws_configure_request_is_persistable_and_needs_no_existing_credentials() {
+        let mut request = aws_configure_request("us-east-1");
+        normalize_configure_request_secrets(&mut request, None).expect("aws request needs no existing credentials");
+        assert!(ensure_kms_request_persistable(&request).is_ok());
+
+        let config = request.to_kms_config();
+        assert!(ensure_kms_config_persistable(&config).is_ok());
+
+        let canonical = redacted_canonical_config(&config).expect("aws configuration should serialize");
+        assert!(canonical.contains("us-east-1"), "the pinned region must drive the fingerprint");
+        for credential_field in ["access_key", "secret_access_key", "session_token"] {
+            assert!(
+                !canonical.contains(credential_field),
+                "aws configuration must carry no credential material: {canonical}"
+            );
+        }
+    }
+
+    /// Two nodes cannot be allowed to read the same AWS configuration as
+    /// different regions, so the pinned region has to be part of what a
+    /// fingerprint comparison would flag as a split.
+    #[test]
+    fn aws_config_fingerprint_tracks_the_pinned_region() {
+        let first = kms_config_fingerprint(&aws_configure_request("us-east-1").to_kms_config())
+            .expect("fingerprint should be computable");
+        let same = kms_config_fingerprint(&aws_configure_request("us-east-1").to_kms_config())
+            .expect("fingerprint should be computable");
+        let other = kms_config_fingerprint(&aws_configure_request("eu-central-1").to_kms_config())
+            .expect("fingerprint should be computable");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn local_backend_cannot_be_switched_to_aws() {
+        let mut existing = rustfs_kms::KmsConfig::local(PathBuf::from("/var/lib/rustfs/kms"));
+        let rustfs_kms::BackendConfig::Local(existing_local) = &mut existing.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        existing_local.master_key = Some("stored-master-key".to_string());
+
+        let mut request = aws_configure_request("us-east-1");
+        let error = normalize_configure_request_secrets(&mut request, Some(&existing))
+            .expect_err("switching away from the local backend must be rejected");
+        assert_eq!(error, "Changing from the Local KMS backend is not supported");
     }
 
     const VAULT_TOKEN: &str = "hvs-super-secret-token";

@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::*;
+use crate::bucket::replication::ReplicationObjectBridge;
 use crate::disk::OldCurrentSize;
+use crate::object_api::DeleteLockFence;
 use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
@@ -154,6 +156,13 @@ impl ObjectLockDiagGuard {
             owner,
             mode,
             acquired_at: Instant::now(),
+        }
+    }
+
+    fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+        match &self.guard {
+            rustfs_lock::NamespaceLockGuard::Standard(guard) => Some(guard.lock_lost()),
+            rustfs_lock::NamespaceLockGuard::Fast(_) => None,
         }
     }
 }
@@ -594,6 +603,9 @@ impl ECStore {
             guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
         }
         opts.no_lock = true;
+        opts.delete_lock_fence = Some(DeleteLockFence::new(
+            guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal).collect(),
+        ));
 
         Ok(guards)
     }
@@ -1222,7 +1234,7 @@ impl ECStore {
         Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, objects, opts))]
     pub(super) async fn handle_delete_objects(
         &self,
         bucket: &str,
@@ -1248,6 +1260,17 @@ impl ECStore {
         }
 
         let mut opts = opts;
+        if opts.delete_replication_config_snapshot.is_none() {
+            match ReplicationObjectBridge::delete_request_config_in(&self.ctx, bucket).await {
+                Ok(snapshot) => opts.delete_replication_config_snapshot = Some(Arc::new(snapshot)),
+                Err(err) => {
+                    let message = err.to_string();
+                    let errors = (0..objects.len()).map(|_| Some(Error::other(message.clone()))).collect();
+                    return (del_objects, errors);
+                }
+            }
+        }
+
         let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
             Ok(guards) => guards,
             Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
@@ -2540,6 +2563,7 @@ mod tests {
 
         assert_eq!(guards.len(), 2, "duplicate object names should share one namespace lock");
         assert!(opts.no_lock, "set layer should not reacquire locks already held by ECStore");
+        assert!(opts.delete_lock_fence.is_some(), "set layer must receive the outer write-lock loss fence");
 
         let alpha_lock = store
             .handle_new_ns_lock("bucket", "alpha")

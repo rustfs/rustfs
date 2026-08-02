@@ -36,6 +36,11 @@ use tracing::{debug, info, warn};
 /// How often the worker looks for expired pending deletions.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Keys requested per `ListKeys` call while sweeping. The sweep follows
+/// `truncated`/`next_marker` until the key set is exhausted, so this bounds the
+/// working set of one call, not how many keys a sweep can reach.
+const SWEEP_PAGE_SIZE: u32 = 100;
+
 // ---------------------------------------------------------------------------
 // Metrics
 //
@@ -102,6 +107,17 @@ impl KeyCensus {
             KeyStatus::PendingDeletion => self.pending_deletion += 1,
             KeyStatus::Deleted => self.tombstones += 1,
             KeyStatus::Active | KeyStatus::Disabled => {
+                // A missing rotation time means either "never rotated" or "the
+                // build that rotated it did not record when". Both fall back to
+                // creation, and the two are not worth separate series: for the
+                // first, creation *is* the correct baseline; for the second it
+                // is an upper bound on the true age, so the gauge can only
+                // overstate how overdue a key is, never hide an overdue one.
+                // The overstatement is self-healing — the next rotation stamps
+                // the record — and erring loud is the right direction for a
+                // rotation-readiness alert. Backends never fabricate a
+                // timestamp to close the gap, so nothing here can turn an
+                // unstamped key into a freshly rotated one.
                 let rotated_at = key.rotated_at.as_ref().unwrap_or(&key.created_at);
                 self.oldest_rotation_age_seconds = self.oldest_rotation_age_seconds.max(seconds_between(rotated_at, now));
             }
@@ -146,6 +162,17 @@ fn record_sweep(report: &SweepReport, census: Option<KeyCensus>) {
 /// referencing configuration lives (for example bucket encryption settings in
 /// the server) and are injected via
 /// [`crate::service_manager::KmsServiceManager::set_deletion_reference_checker`].
+///
+/// # Blocks only
+///
+/// This gate is one-directional and must stay that way: a checker may add a
+/// reason to keep material, never a reason to destroy it. Nothing that
+/// enumerates key usage — least of all a scan whose coverage depends on how
+/// far a background sweep got — may ever be wired in as a condition that
+/// releases a removal this gate is holding. One incomplete scan would then be
+/// enough to destroy the only copy of a key that still has data behind it,
+/// which is why [`crate::key_impact::KeyImpactReport`] exposes no clearance
+/// and is consumed only where a refusal is being decided.
 #[async_trait]
 pub trait DeletionReferenceChecker: Send + Sync {
     /// Identifiers of configuration still referencing `key_id` (bucket names,
@@ -240,7 +267,7 @@ impl DeletionWorker {
         let mut marker: Option<String> = None;
         let listed_everything = loop {
             let request = ListKeysRequest {
-                limit: Some(100),
+                limit: Some(SWEEP_PAGE_SIZE),
                 marker: marker.clone(),
                 usage_filter: None,
                 status_filter: None,
@@ -270,6 +297,13 @@ impl DeletionWorker {
                 break true;
             }
             match response.next_marker {
+                // A backend that hands back the cursor it was just given cannot
+                // advance. Following it would re-list the same page forever, so
+                // the sweep stops and reports the key set as partially seen.
+                Some(ref next_marker) if marker.as_ref() == Some(next_marker) => {
+                    warn!(marker = %next_marker, "KMS deletion sweep listing did not advance");
+                    break false;
+                }
                 Some(next_marker) => marker = Some(next_marker),
                 // Truncated without a marker: the rest of the key set is out
                 // of reach, so the census is incomplete.
@@ -424,6 +458,41 @@ mod tests {
         // Re-running the sweep after the removal is a no-op.
         let report = worker.sweep(&after_window()).await;
         assert_eq!(report, SweepReport::default());
+    }
+
+    /// Schedule `count` keys for deletion and report their identifiers.
+    async fn schedule_keys(backend: &LocalKmsBackend, count: usize) -> Vec<String> {
+        let mut key_ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let key_id = create_key(backend, &format!("expiring-{index:04}")).await;
+            schedule(backend, &key_id).await;
+            key_ids.push(key_id);
+        }
+        key_ids
+    }
+
+    /// A deployment with more keys than fit in one listing page must still have
+    /// every expired key destroyed: the sweep has to follow the cursor instead
+    /// of stopping at the first page.
+    #[tokio::test]
+    async fn sweep_removes_expired_keys_beyond_the_first_page() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let backend = local_backend(&temp_dir).await;
+        let total = SWEEP_PAGE_SIZE as usize + 5;
+        let key_ids = schedule_keys(&backend, total).await;
+
+        let report = worker(backend.clone()).sweep(&after_window()).await;
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            report.removed.len(),
+            total,
+            "every expired key must be swept, not just the ones on the first page"
+        );
+        // The keys sorting last are the ones a first-page-only sweep leaves
+        // behind for good.
+        for key_id in key_ids.iter().rev().take(5) {
+            assert_key_gone(&backend, key_id).await;
+        }
     }
 
     #[tokio::test]
@@ -756,5 +825,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The census counts the whole key set, not the first page of it. A sweep
+    /// that stops after one page would publish a gauge that understates every
+    /// large deployment by exactly the keys it never listed.
+    #[test]
+    fn lifecycle_gauges_count_keys_beyond_the_first_page() {
+        let total = SWEEP_PAGE_SIZE as usize + 5;
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async move {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let backend = local_backend(&temp_dir).await;
+                schedule_keys(&backend, total).await;
+
+                // Well inside the seven-day window: every key is observed as
+                // pending rather than removed.
+                let report = worker(backend.clone()).sweep(&Zoned::now()).await;
+                assert_eq!(report.skipped, total, "every scheduled key must be inspected");
+                assert!(report.removed.is_empty());
+            })
+        });
+
+        assert_eq!(gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS), Some(total as f64));
     }
 }

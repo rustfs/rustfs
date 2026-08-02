@@ -16,7 +16,7 @@
 
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits,
-    ensure_tag_keys_are_mutable,
+    ensure_tag_keys_are_mutable, paginate_keys,
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
@@ -480,6 +480,36 @@ pub(crate) enum StoredKeyProtection {
     PlaintextDevOnly,
 }
 
+/// The record's `at_rest_protection` value when this build cannot interpret
+/// it, rendered for diagnostics. `Ok(None)` means the marker is absent
+/// (pre-beta.9 records) or names a protection mode this build implements.
+///
+/// Every reader of a stored key record must consult this before its own
+/// schema parse. Letting a strict [`StoredKeyProtection`] field fail inside a
+/// larger struct collapses "written by a newer build" into "corrupt", and an
+/// operator who reads corruption starts a disaster recovery instead of a
+/// version rollback. The probe deliberately ignores every other field, so the
+/// verdict is available even for records whose schema this build cannot
+/// satisfy, and no key material is copied out of the caller's buffer.
+///
+/// `Err` carries the JSON error so callers can keep their own classification
+/// for bytes that are not a record at all.
+pub(crate) fn unknown_protection_marker(record: &[u8]) -> serde_json::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct MarkerProbe {
+        #[serde(default)]
+        at_rest_protection: Option<serde_json::Value>,
+    }
+
+    let Some(marker) = serde_json::from_slice::<MarkerProbe>(record)?.at_rest_protection else {
+        return Ok(None);
+    };
+    if serde_json::from_value::<StoredKeyProtection>(marker.clone()).is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(marker.as_str().map(str::to_owned).unwrap_or_else(|| marker.to_string())))
+}
+
 /// Serializable representation of a master key stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMasterKey {
@@ -741,10 +771,18 @@ impl LocalKmsClient {
     /// real problem (restore the salt file or the whole directory) instead of
     /// a generic decrypt failure.
     ///
-    /// Files that do not parse are ignored here — startup key validation
-    /// reports them with their own errors right after. Legacy pre-marker files
-    /// are also ignored: pre-beta.9 directories legitimately have no salt file
-    /// yet, and an empty directory must keep initializing as before.
+    /// A record this build cannot read or cannot interpret blocks generation
+    /// just as hard. Skipping it would publish a fresh salt over a directory
+    /// whose protection state is unknown, and that publication is
+    /// irreversible in the only way that matters: the next startup finds a
+    /// salt file, never re-enters this guard, and the evidence that the real
+    /// salt was missing is gone. Every record this rejects also fails startup
+    /// key validation a few lines later, so no directory that initializes
+    /// today stops initializing — the salt is simply no longer written first.
+    ///
+    /// Legacy pre-marker files stay allowed: they parse here, pre-beta.9
+    /// directories legitimately have no salt file yet, and an empty directory
+    /// must keep initializing as before.
     async fn ensure_missing_salt_can_be_generated(config: &LocalConfig) -> Result<()> {
         #[derive(Deserialize)]
         struct ProtectionProbe {
@@ -758,12 +796,23 @@ impl LocalKmsClient {
             if path.extension().is_none_or(|extension| extension != "key") {
                 continue;
             }
-            let Ok(content) = fs::read(&path).await else {
-                continue;
-            };
-            let Ok(probe) = serde_json::from_slice::<ProtectionProbe>(&content) else {
-                continue;
-            };
+            let content = fs::read(&path).await.map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} cannot be read ({error}); \
+                     refusing to generate a replacement salt while a record's protection state is unknown",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
+            let probe = serde_json::from_slice::<ProtectionProbe>(&content).map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} is not interpretable by this build ({error}); \
+                     refusing to generate a replacement salt — restore the salt file from backup, or run a build that \
+                     understands the record",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
             if probe.at_rest_protection == StoredKeyProtection::EncryptedMasterKey {
                 return Err(KmsError::configuration_error(format!(
                     "Local KMS master key salt at {} is missing but {} is marked encrypted-master-key; \
@@ -805,15 +854,12 @@ impl LocalKmsClient {
         // Two-stage parse so an unrecognised protection marker is reported as an
         // unsupported format (a newer build may still read the key) instead of being
         // folded into generic corruption with every other malformed record.
-        let raw: serde_json::Value = serde_json::from_slice(&content)
-            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not valid JSON: {e}")))?;
-        if let Some(marker) = raw.get("at_rest_protection")
-            && serde_json::from_value::<StoredKeyProtection>(marker.clone()).is_err()
-        {
-            let version = marker.as_str().map(str::to_owned).unwrap_or_else(|| marker.to_string());
+        let unknown_marker = unknown_protection_marker(&content)
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not a readable JSON object: {e}")))?;
+        if let Some(version) = unknown_marker {
             return Err(KmsError::unsupported_format_version(key_id, version));
         }
-        let stored_key: StoredMasterKey = serde_json::from_value(raw)
+        let stored_key: StoredMasterKey = serde_json::from_slice(&content)
             .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record does not deserialize: {e}")))?;
         if stored_key.key_id != key_id {
             return Err(KmsError::invalid_key(format!(
@@ -1214,6 +1260,32 @@ impl LocalKmsClient {
         Ok(master_key.into())
     }
 
+    /// Every key identifier in the key directory, sorted.
+    ///
+    /// `read_dir` order is arbitrary and may differ between calls over the same
+    /// directory, so it cannot carry a pagination cursor. Sorting gives the key
+    /// set a stable total order that a marker can point into.
+    async fn sorted_key_ids(&self) -> Result<Vec<String>> {
+        let mut key_ids = Vec::new();
+        let mut entries = fs::read_dir(&self.config.key_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "key")
+                && let Some(key_id) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                key_ids.push(key_id.to_string());
+            }
+        }
+        key_ids.sort_unstable();
+        Ok(key_ids)
+    }
+
+    /// One page of the key set, ordered by key identifier.
+    ///
+    /// Paging is real here rather than a first-page-only approximation:
+    /// callers that must see every key — the deletion sweep above all, which
+    /// only destroys expired material for keys it actually lists — depend on
+    /// `truncated` and `next_marker` to reach past the first page.
     pub(crate) async fn list_keys(
         &self,
         request: &ListKeysRequest,
@@ -1221,44 +1293,48 @@ impl LocalKmsClient {
     ) -> Result<ListKeysResponse> {
         debug!("Listing keys");
 
-        let mut keys = Vec::new();
-        let limit = request.limit.unwrap_or(100) as usize;
-        let mut count = 0;
+        let key_ids = self.sorted_key_ids().await?;
+        let page = paginate_keys(&key_ids, request, String::as_str);
 
-        let mut entries = fs::read_dir(&self.config.key_dir).await?;
+        // Only the page is read from disk, so the cost of a list stays bounded
+        // by the requested limit rather than by the size of the key set.
+        let mut keys = Vec::with_capacity(page.items.len());
+        for key_id in page.items {
+            let key_info = match self.describe_key(key_id, None).await {
+                Ok(key_info) => key_info,
+                // A key that vanished between the scan and the read is dropped
+                // from the page: concurrent removal is normal, and the cursor
+                // is derived from the identifier list, so the listing still
+                // advances past it.
+                Err(KmsError::KeyNotFound { .. }) => {
+                    debug!(key_id, "skipping key removed while listing");
+                    continue;
+                }
+                // Anything else means the record is still there and this build
+                // cannot interpret it. Dropping it would answer "these are
+                // your keys" with a set that silently omits one, and the
+                // deletion sweep would count a census it never fully saw.
+                Err(error) => return Err(error),
+            };
 
-        while let Some(entry) = entries.next_entry().await? {
-            if count >= limit {
-                break;
-            }
-
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "key")
-                && let Some(stem) = path.file_stem()
-                && let Some(key_id) = stem.to_str()
-                && let Ok(key_info) = self.describe_key(key_id, None).await
+            if let Some(ref status_filter) = request.status_filter
+                && &key_info.status != status_filter
             {
-                // Apply filters
-                if let Some(ref status_filter) = request.status_filter
-                    && &key_info.status != status_filter
-                {
-                    continue;
-                }
-                if let Some(ref usage_filter) = request.usage_filter
-                    && &key_info.usage != usage_filter
-                {
-                    continue;
-                }
-
-                keys.push(key_info);
-                count += 1;
+                continue;
             }
+            if let Some(ref usage_filter) = request.usage_filter
+                && &key_info.usage != usage_filter
+            {
+                continue;
+            }
+
+            keys.push(key_info);
         }
 
         Ok(ListKeysResponse {
             keys,
-            next_marker: None, // Simple implementation without pagination
-            truncated: false,
+            next_marker: page.next_marker,
+            truncated: page.truncated,
         })
     }
 
@@ -2937,6 +3013,129 @@ mod tests {
         );
     }
 
+    /// The salt guard must fail closed on every record it cannot interpret,
+    /// not just on the ones that spell out `encrypted-master-key`.
+    ///
+    /// Skipping such a record publishes a fresh salt, and that write is the
+    /// irreversible step: the next startup sees a salt file, never re-enters
+    /// the guard, and the only signal that the real salt was lost is gone.
+    /// Every input below also fails startup key validation, so this rejects
+    /// nothing that used to initialize — it only stops the salt from being
+    /// written before that failure.
+    #[tokio::test]
+    async fn missing_salt_with_uninterpretable_key_records_fails_closed_without_generating_a_salt() {
+        let (client, temp_dir) = create_test_client().await;
+        client.create_key("sealed-key", "AES_256", None).await.expect("create key");
+        let config = client.config.clone();
+        let key_path = client.master_key_path("sealed-key").expect("valid key id");
+        let salt_path = LocalKmsClient::master_key_salt_path(&config);
+        let pristine: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key file")).expect("decode record");
+        drop(client);
+
+        let mut newer_build_record = pristine.clone();
+        newer_build_record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        let newer_build_record = serde_json::to_vec_pretty(&newer_build_record).expect("encode record");
+        let truncated = {
+            let bytes = serde_json::to_vec_pretty(&pristine).expect("encode record");
+            bytes[..bytes.len() / 2].to_vec()
+        };
+
+        for (name, content) in [
+            ("record from a newer build", newer_build_record),
+            ("record that does not decode", truncated),
+        ] {
+            fs::write(&key_path, &content).await.expect("write record");
+            fs::remove_file(&salt_path).await.ok();
+
+            let error = match LocalKmsClient::new(config.clone()).await {
+                Ok(_) => panic!("{name}: a missing salt must not be papered over"),
+                Err(error) => error,
+            };
+            // Asserted first: publishing a replacement salt is the
+            // irreversible step, and it happens before any error is produced.
+            assert!(!salt_path.exists(), "{name}: a replacement salt must never be generated");
+            assert!(
+                matches!(error, KmsError::ConfigurationError { .. }),
+                "{name}: expected a salt-specific configuration error, got {error:?}"
+            );
+            assert!(error.to_string().contains("salt"), "{name}: error must point at the salt: {error}");
+            assert_eq!(
+                sorted_dir_file_names(temp_dir.path()).await,
+                vec!["sealed-key.key".to_string()],
+                "{name}: the failed startup must not modify the key directory"
+            );
+        }
+    }
+
+    /// Compatibility floor for the guard above: a record written before the
+    /// protection marker existed carries no marker at all, and such a
+    /// directory legitimately has no salt yet. It must keep initializing.
+    /// A record this build cannot interpret must not be edited out of a
+    /// listing. The page would claim to describe the key set while omitting a
+    /// key that is still on disk, and the deletion sweep — which counts the
+    /// lifecycle gauges out of the pages it lists — would report a census it
+    /// never fully saw as complete.
+    #[tokio::test]
+    async fn list_keys_fails_closed_on_a_record_it_cannot_interpret() {
+        let (client, _temp_dir) = create_test_client().await;
+        client.create_key("alpha", "AES_256", None).await.expect("create alpha");
+        client.create_key("beta", "AES_256", None).await.expect("create beta");
+
+        let key_path = client.master_key_path("beta").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a listing must not quietly omit a key it cannot read");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "beta" && version == "post-quantum-v2"),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_salt_with_pre_marker_key_records_still_initializes() {
+        let (dev_client, temp_dir) = create_dev_mode_client().await;
+        dev_client
+            .create_key("pre-marker-key", "AES_256", None)
+            .await
+            .expect("create key");
+        let key_path = dev_client.master_key_path("pre-marker-key").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key file")).expect("decode record");
+        drop(dev_client);
+
+        // Pre-beta.9 records carry no protection marker at all, and their
+        // directories legitimately hold no salt file yet.
+        record
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("at_rest_protection");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        let client = LocalKmsClient::new(test_config(temp_dir.path()))
+            .await
+            .expect("a pre-marker directory must keep initializing");
+        assert!(
+            LocalKmsClient::master_key_salt_path(&client.config).exists(),
+            "first-time salt creation must still happen"
+        );
+        client
+            .describe_key("pre-marker-key", None)
+            .await
+            .expect("the pre-marker record must stay readable");
+    }
+
     #[tokio::test]
     async fn missing_salt_with_only_plaintext_dev_keys_still_initializes() {
         let (dev_client, temp_dir) = create_dev_mode_client().await;
@@ -3086,5 +3285,202 @@ mod tests {
             .await
             .expect("repeat removal");
         assert_eq!(outcome, crate::backends::ExpiredKeyRemoval::Removed);
+    }
+
+    // -- Listing and pagination ---------------------------------------------
+
+    fn page_request(limit: u32, marker: Option<&str>) -> ListKeysRequest {
+        ListKeysRequest {
+            limit: Some(limit),
+            marker: marker.map(str::to_string),
+            usage_filter: None,
+            status_filter: None,
+        }
+    }
+
+    fn filtered_page_request(limit: u32, marker: Option<&str>, status: KeyStatus) -> ListKeysRequest {
+        ListKeysRequest {
+            status_filter: Some(status),
+            ..page_request(limit, marker)
+        }
+    }
+
+    async fn create_keys(client: &LocalKmsClient, key_ids: &[String]) {
+        for key_id in key_ids {
+            client
+                .create_key(key_id, "AES_256", None)
+                .await
+                .expect("key should be created");
+        }
+    }
+
+    /// Paging must reach every key exactly once. A backend that reports the
+    /// first page as the whole key set strands everything behind it — the
+    /// deletion sweep would never destroy expired material past page one.
+    #[tokio::test]
+    async fn list_keys_pages_through_the_whole_key_set() {
+        let (client, _temp_dir) = create_test_client().await;
+        let expected: Vec<String> = (0..7).map(|index| format!("page-key-{index:02}")).collect();
+        create_keys(&client, &expected).await;
+
+        let mut seen = Vec::new();
+        let mut marker: Option<String> = None;
+        // Bounded so a listing that cannot advance fails the assertion below
+        // instead of hanging the test run.
+        for _ in 0..expected.len() + 1 {
+            let response = client
+                .list_keys(&page_request(3, marker.as_deref()), None)
+                .await
+                .expect("list should succeed");
+            assert!(response.keys.len() <= 3, "a page must not exceed the requested limit");
+            seen.extend(response.keys.iter().map(|key| key.key_id.clone()));
+            if !response.truncated {
+                assert!(response.next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(response.next_marker.expect("a truncated page must offer a cursor"));
+        }
+
+        assert_eq!(seen, expected, "paging must visit every key exactly once, in identifier order");
+    }
+
+    /// Exact-limit boundary: a page that ends on the last key is complete.
+    #[tokio::test]
+    async fn list_keys_page_ending_on_the_last_key_is_not_truncated() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = (0..3).map(|index| format!("exact-key-{index}")).collect();
+        create_keys(&client, &key_ids).await;
+
+        let response = client
+            .list_keys(&page_request(3, None), None)
+            .await
+            .expect("list should succeed");
+        assert_eq!(response.keys.len(), 3);
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+
+        // One key short of the set, the same listing is truncated.
+        let response = client
+            .list_keys(&page_request(2, None), None)
+            .await
+            .expect("list should succeed");
+        assert!(response.truncated);
+        assert_eq!(response.next_marker.as_deref(), Some("exact-key-1"));
+    }
+
+    /// The cursor is an identifier, not an index, so it keeps working after the
+    /// key it names is destroyed — which is exactly what the deletion sweep
+    /// does to the keys it retires between pages.
+    #[tokio::test]
+    async fn list_keys_resumes_after_a_deleted_marker_key() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = ["marker-a", "marker-b", "marker-c"].iter().map(|id| id.to_string()).collect();
+        create_keys(&client, &key_ids).await;
+
+        fs::remove_file(client.master_key_path("marker-b").expect("key path"))
+            .await
+            .expect("key file should be removable");
+
+        let response = client
+            .list_keys(&page_request(10, Some("marker-b")), None)
+            .await
+            .expect("list should succeed");
+        let listed: Vec<&str> = response.keys.iter().map(|key| key.key_id.as_str()).collect();
+        assert_eq!(listed, vec!["marker-c"], "a vanished marker must not restart the listing");
+        assert!(!response.truncated);
+    }
+
+    /// A zero limit means zero keys, and no cursor to loop on.
+    #[tokio::test]
+    async fn list_keys_with_zero_limit_returns_an_empty_page() {
+        let (client, _temp_dir) = create_test_client().await;
+        create_keys(&client, &["zero-limit-key".to_string()]).await;
+
+        let response = client
+            .list_keys(&page_request(0, None), None)
+            .await
+            .expect("a zero-limit list must succeed");
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+    }
+
+    /// A filter narrows a page after it has been cut, so a page can come back
+    /// empty while keys still remain. The traversal has to continue on
+    /// `truncated` rather than on a short page, and the cursor has to advance
+    /// across the keys the filter removed — otherwise a filtered listing ends
+    /// at the first run of non-matching keys and reports a partial key set as
+    /// the whole one.
+    #[tokio::test]
+    async fn filtered_paging_crosses_a_page_that_matches_nothing() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = (0..12).map(|index| format!("filter-key-{index:02}")).collect();
+        create_keys(&client, &key_ids).await;
+        // A page worth of adjacent keys is excluded, so one page of the
+        // traversal matches nothing at all.
+        for key_id in &key_ids[3..6] {
+            client.disable_key(key_id, None).await.expect("key should be disabled");
+        }
+        let still_active: Vec<String> = key_ids
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !(3..6).contains(index))
+            .map(|(_, key_id)| key_id.clone())
+            .collect();
+
+        let mut seen = Vec::new();
+        let mut pages_without_a_match = 0;
+        let mut marker: Option<String> = None;
+        // Bounded so a listing that cannot advance fails the assertions below
+        // instead of hanging the test run.
+        for _ in 0..key_ids.len() + 1 {
+            let response = client
+                .list_keys(&filtered_page_request(3, marker.as_deref(), KeyStatus::Active), None)
+                .await
+                .expect("list should succeed");
+            assert!(response.keys.len() <= 3, "a page must not exceed the requested limit");
+            assert!(
+                response.keys.iter().all(|key| key.status == KeyStatus::Active),
+                "a filtered page must carry matches only"
+            );
+            if response.keys.is_empty() {
+                pages_without_a_match += 1;
+            }
+            seen.extend(response.keys.iter().map(|key| key.key_id.clone()));
+            if !response.truncated {
+                assert!(response.next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(response.next_marker.expect("a truncated page must offer a cursor"));
+        }
+
+        assert_eq!(seen, still_active, "filtered paging must visit every match exactly once");
+        assert_eq!(pages_without_a_match, 1, "the excluded run must produce a page with no match");
+
+        // The keys the first filter excluded are exactly the ones the opposite
+        // filter lists, so nothing fell out of the key set on the way.
+        let response = client
+            .list_keys(&filtered_page_request(key_ids.len() as u32, None, KeyStatus::Disabled), None)
+            .await
+            .expect("list should succeed");
+        let listed: Vec<&str> = response.keys.iter().map(|key| key.key_id.as_str()).collect();
+        assert_eq!(listed, key_ids[3..6].iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!response.truncated, "a page covering the whole key set is complete");
+    }
+
+    /// A limit past the end of the key set returns everything, once.
+    #[tokio::test]
+    async fn list_keys_limit_beyond_the_key_set_returns_one_complete_page() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = (0..3).map(|index| format!("huge-limit-key-{index}")).collect();
+        create_keys(&client, &key_ids).await;
+
+        let response = client
+            .list_keys(&page_request(u32::MAX, None), None)
+            .await
+            .expect("list should succeed");
+        assert_eq!(response.keys.len(), 3);
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
     }
 }

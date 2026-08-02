@@ -35,9 +35,13 @@ const RESYNC_CANCELED_TOTAL: &str = "resync_canceled_total";
 const RESYNC_DURATION_MS_TOTAL: &str = "resync_duration_ms_total";
 const CURRENT_BACKLOG_COUNT: &str = "current_backlog_count";
 const CURRENT_BACKLOG_BYTES: &str = "current_backlog_bytes";
+const CURRENT_TARGET_BACKLOG_COUNT: &str = "current_target_backlog_count";
+const CURRENT_TARGET_BACKLOG_BYTES: &str = "current_target_backlog_bytes";
 const DURABLE_MRF_AVAILABLE: &str = "durable_mrf_available";
 const DURABLE_MRF_BACKLOG_COUNT: &str = "durable_mrf_backlog_count";
 const DURABLE_MRF_BACKLOG_BYTES: &str = "durable_mrf_backlog_bytes";
+const DURABLE_MRF_TARGET_BACKLOG_COUNT: &str = "durable_mrf_target_backlog_count";
+const DURABLE_MRF_TARGET_BACKLOG_BYTES: &str = "durable_mrf_target_backlog_bytes";
 const MRF_PENDING_COUNT: &str = "mrf_pending_count";
 const MRF_PENDING_BYTES: &str = "mrf_pending_bytes";
 const MRF_DROPPED_COUNT: &str = "mrf_dropped_count";
@@ -108,6 +112,24 @@ pub static BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = La
     )
 });
 
+pub static BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(CURRENT_TARGET_BACKLOG_COUNT),
+        "Current number of target-scoped operations admitted to in-memory replication worker queues for a bucket and target ARN",
+        &[BUCKET_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(CURRENT_TARGET_BACKLOG_BYTES),
+        "Current bytes in target-scoped operations admitted to in-memory replication worker queues for a bucket and target ARN",
+        &[BUCKET_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
 pub static BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::from(DURABLE_MRF_AVAILABLE),
@@ -131,6 +153,24 @@ pub static BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD: LazyLock<MetricDescriptor> 
         MetricName::from(DURABLE_MRF_BACKLOG_BYTES),
         "Current bytes in the durable MRF backlog file for a bucket on this node",
         &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(DURABLE_MRF_TARGET_BACKLOG_COUNT),
+        "Current number of target-scoped operations in the durable MRF backlog file for a bucket and target ARN on this node",
+        &[BUCKET_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(DURABLE_MRF_TARGET_BACKLOG_BYTES),
+        "Current bytes in target-scoped operations in the durable MRF backlog file for a bucket and target ARN on this node",
+        &[BUCKET_L, TARGET_ARN_L],
         subsystems::BUCKET_REPLICATION,
     )
 });

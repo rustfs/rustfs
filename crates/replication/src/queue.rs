@@ -411,6 +411,21 @@ mod tests {
     }
 
     #[test]
+    fn heal_queue_action_preserves_pending_null_version_purge() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+        roi.version_id = Some(Uuid::nil());
+        roi.version_purge_status = VersionPurgeStatusType::Pending;
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        let ReplicationHealQueueAction::QueueDelete(delete_info) = action else {
+            panic!("expected null-version purge delete queue action");
+        };
+        assert_eq!(delete_info.delete_object.version_id, Some(Uuid::nil()));
+        assert_eq!(delete_info.delete_object.delete_marker_version_id, None);
+    }
+
+    #[test]
     fn replication_priority_parses_known_values_and_defaults_unknown() {
         assert_eq!(ReplicationPriority::from_str("fast"), Ok(ReplicationPriority::Fast));
         assert_eq!(ReplicationPriority::from_str("slow"), Ok(ReplicationPriority::Slow));

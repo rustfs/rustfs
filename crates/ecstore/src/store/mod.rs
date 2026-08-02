@@ -519,7 +519,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         result
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, objects, opts))]
     async fn delete_objects(
         &self,
         bucket: &str,

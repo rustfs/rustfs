@@ -144,6 +144,25 @@ pub enum KmsError {
         "Baseline version lost for key {key_id}: master key version records exist (oldest {oldest_version}) but the key record carries no baseline version, so data keys written before versioned rotation can no longer be resolved to the master key version that wrapped them. A node older than versioned rotation rewrote the key record and dropped the field. Finish upgrading every node, restore baseline_version to {oldest_version} on the key record, then retry"
     )]
     BaselineVersionLost { key_id: String, oldest_version: u32 },
+
+    /// Configuration still points at the key, so its material must not be
+    /// destroyed. Distinct from the generic invalid-operation errors so that
+    /// callers can tell "this key is still wired into the deployment" apart
+    /// from a malformed request and act on the listed references.
+    #[error(
+        "Key {key_id} is still referenced by configuration and its material must not be destroyed: {}. Remove or repoint the listed configuration, then retry",
+        .references.join(", ")
+    )]
+    KeyStillReferenced { key_id: String, references: Vec<String> },
+
+    /// The only available way to rewrap this envelope would pull the plaintext
+    /// data key into the RustFS process. Refused rather than performed: the
+    /// point of a backend-side rewrap is that the data key stays inside the
+    /// backend, so silently falling back to unwrap-then-rewrap would hand back
+    /// a correct envelope while quietly dropping the property that justified
+    /// the operation.
+    #[error("Cannot rewrap a data key of key {key_id} without exposing its plaintext: {reason}")]
+    RewrapWouldExposePlaintext { key_id: String, reason: String },
 }
 
 impl KmsError {
@@ -252,6 +271,14 @@ impl KmsError {
         Self::OperationCancelled { message: message.into() }
     }
 
+    /// Create a still-referenced error
+    pub fn key_still_referenced<S: Into<String>>(key_id: S, references: Vec<String>) -> Self {
+        Self::KeyStillReferenced {
+            key_id: key_id.into(),
+            references,
+        }
+    }
+
     /// Create a material missing error
     pub fn material_missing<S: Into<String>>(key_id: S) -> Self {
         Self::MaterialMissing { key_id: key_id.into() }
@@ -308,6 +335,14 @@ impl KmsError {
         Self::BaselineVersionLost {
             key_id: key_id.into(),
             oldest_version,
+        }
+    }
+
+    /// Create a rewrap-would-expose-plaintext error
+    pub fn rewrap_would_expose_plaintext<S1: Into<String>, S2: Into<String>>(key_id: S1, reason: S2) -> Self {
+        Self::RewrapWouldExposePlaintext {
+            key_id: key_id.into(),
+            reason: reason.into(),
         }
     }
 }

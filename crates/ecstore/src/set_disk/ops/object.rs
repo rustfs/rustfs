@@ -35,14 +35,17 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
+use crate::bucket::replication::{DeleteReplicationConfigSnapshot, VersionPurgeStatusType, version_purge_status_to_filemeta};
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
 use crate::error::is_err_invalid_upload_id;
+use crate::object_api::DeleteLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
 use futures::FutureExt as _;
 use http::HeaderValue;
+use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
 
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
@@ -3111,25 +3114,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         quorum_result
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, objects, opts))]
     async fn delete_objects(
         &self,
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let delete_config_snapshot = opts
+            .delete_replication_config_snapshot
+            .clone()
+            .unwrap_or_else(|| Arc::new(DeleteReplicationConfigSnapshot::default()));
+
         for object in &objects {
             self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
         }
 
-        // Default return value
-        let mut del_objects = vec![DeletedObject::default(); objects.len()];
-
-        let mut del_errs = Vec::with_capacity(objects.len());
-
-        for _ in 0..objects.len() {
-            del_errs.push(None)
-        }
+        let mut del_errs = (0..objects.len()).map(|_| None).collect::<Vec<_>>();
 
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
@@ -3195,14 +3197,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        let ver_cfg = BucketVersioningSys::get_in(&self.ctx, bucket).await.unwrap_or_default();
-
-        // backlog#929 (HP-8): the per-object stat below exists solely to feed
-        // check_object_lock_delete (#4297). Resolve the bucket lock
-        // configuration once (in-memory cache) and skip the whole stat fanout
-        // for buckets without Object Lock; unknown metadata fails closed and
-        // keeps the stat, so the #4297 protection is preserved verbatim for
-        // every object-lock-enabled bucket.
+        // Resolve Object Lock once; replication still reads each matching
+        // object's tags below while the batch write lock is held.
         let object_lock_checks_required =
             object_lock_delete_check_required(metadata_sys::get_in(&self.ctx, bucket).await.ok().as_deref());
 
@@ -3213,31 +3209,75 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 continue;
             }
 
+            let replication_object_name = decode_dir_object(&dobj.object_name);
             let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let version_id = delete_file_info_version_id(dobj.version_id);
-            if object_lock_checks_required {
-                let check_opts = ObjectOptions {
-                    version_id: version_id.map(|version_id| version_id.to_string()),
-                    versioned: ver_cfg.prefix_enabled(dobj.object_name.as_str()),
-                    version_suspended: ver_cfg.suspended(),
-                    object_lock_delete: opts.object_lock_delete.clone(),
-                    no_lock: true,
-                    ..Default::default()
-                };
+            let (versioned, version_suspended) = delete_config_snapshot
+                .versioning_config()
+                .delete_state(replication_object_name.as_str());
+            let check_opts = ObjectOptions {
+                version_id: version_id.map(|version_id| version_id.to_string()),
+                versioned,
+                version_suspended,
+                object_lock_delete: opts.object_lock_delete.clone(),
+                no_lock: true,
+                ..Default::default()
+            };
+            let replicate_delete = delete_config_snapshot.has_active_rule(&replication_object_name);
+            let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
+            let replication_needs_source = replicate_delete
+                && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
+            let (goi, gerr) = if object_lock_checks_required || replication_needs_source {
                 let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
-                if gerr.is_none()
-                    && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
-                {
-                    del_errs[i] = Some(err);
-                    continue;
-                }
+                (goi, gerr)
+            } else {
+                (ObjectInfo::default(), None)
+            };
+            let source_missing = gerr
+                .as_ref()
+                .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            if let Some(err) = gerr.as_ref()
+                && !source_missing
+            {
+                del_errs[i] = Some(err.clone());
+                continue;
+            }
+            if object_lock_checks_required
+                && !source_missing
+                && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
+            {
+                del_errs[i] = Some(err);
+                continue;
             }
 
+            let mut admitted = dobj.clone();
+            admitted.object_name = replication_object_name;
+            if admitted.synthetic_version_id {
+                admitted.version_id = None;
+            }
+            if replicate_delete {
+                let dsc = ReplicationObjectBridge::check_delete_with_snapshot(
+                    &admitted,
+                    &goi,
+                    &check_opts,
+                    source_missing,
+                    &delete_config_snapshot,
+                );
+                if dsc.replicate_any() {
+                    if admitted.version_id.is_some() {
+                        admitted.version_purge_status = Some(version_purge_status_to_filemeta(VersionPurgeStatusType::Pending));
+                        admitted.version_purge_statuses = dsc.pending_status();
+                    } else {
+                        admitted.delete_marker_replication_status = dsc.pending_status();
+                    }
+                    admitted.replicate_decision_str = Some(dsc.to_string());
+                }
+            }
             let mut vr = FileInfo {
                 name: dobj.object_name.clone(),
                 version_id,
                 idx: i,
-                replication_state_internal: Some(dobj.replication_state()),
+                replication_state_internal: Some(admitted.replication_state()),
                 ..Default::default()
             };
 
@@ -3247,14 +3287,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // del_objects[i].object_name.clone_from(&vr.name);
             // del_objects[i].version_id = vr.version_id.map(|v| v.to_string());
 
-            if dobj.version_id.is_none() {
-                let (suspended, versioned) = (ver_cfg.suspended(), ver_cfg.prefix_enabled(dobj.object_name.as_str()));
-                if suspended || versioned {
-                    vr.mod_time = Some(OffsetDateTime::now_utc());
-                    vr.deleted = true;
-                    if versioned {
-                        vr.version_id = Some(Uuid::new_v4());
-                    }
+            if dobj.version_id.is_none() && (version_suspended || versioned) {
+                vr.mod_time = Some(OffsetDateTime::now_utc());
+                vr.deleted = true;
+                if versioned {
+                    vr.version_id = Some(Uuid::new_v4());
                 }
             }
 
@@ -3310,6 +3347,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
 
             vers.push(fi_vers);
+        }
+
+        if opts.delete_lock_fence.as_ref().is_some_and(DeleteLockFence::is_lock_lost) {
+            if dist_erasure {
+                self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
+            }
+            for (index, object) in objects.iter().enumerate() {
+                if del_errs[index].is_none() {
+                    del_errs[index] = Some(Error::NamespaceLockQuorumUnavailable {
+                        mode: "delete_objects_commit",
+                        bucket: bucket.to_string(),
+                        object: decode_dir_object(&object.object_name),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+            }
+            return (del_objects, del_errs);
         }
 
         let rollback_dir = Uuid::new_v4();
@@ -3490,6 +3545,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        let preserve_delete_replication_state = should_preserve_delete_replication_state(&opts);
+        let delete_config_snapshot = if opts.delete_prefix || opts.transition.expire_restored || preserve_delete_replication_state
+        {
+            None
+        } else if let Some(snapshot) = opts.delete_replication_config_snapshot.clone() {
+            Some(snapshot)
+        } else {
+            Some(Arc::new(DeleteReplicationConfigSnapshot::default()))
+        };
+
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         // Guard lock for single object delete
@@ -3580,18 +3645,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let otd = ObjectToDelete {
-            object_name: object.to_string(),
-            version_id: opts
-                .version_id
-                .clone()
-                .map(|v| Uuid::parse_str(v.as_str()).ok().unwrap_or_default()),
+            object_name: decode_dir_object(object),
+            version_id: if opts.synthetic_version_id {
+                None
+            } else {
+                opts.version_id.as_deref().map(Uuid::parse_str).transpose()?
+            },
+            synthetic_version_id: opts.synthetic_version_id,
             ..Default::default()
         };
 
-        let dsc = if should_preserve_delete_replication_state(&opts) {
-            ReplicateDecision::default()
+        let dsc = if let Some(snapshot) = delete_config_snapshot {
+            ReplicationObjectBridge::check_delete_with_snapshot(&otd, &goi, &opts, gerr.is_some(), &snapshot)
         } else {
-            ReplicationObjectBridge::check_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
+            ReplicateDecision::default()
         };
 
         if dsc.replicate_any() {
@@ -3649,6 +3716,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+            oi.user_tags = Arc::clone(&goi.user_tags);
             oi.replication_decision = goi.replication_decision;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
             return Ok(oi);
@@ -3680,6 +3748,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
+        obj_info.user_tags = Arc::clone(&goi.user_tags);
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(obj_info)
     }
@@ -7802,6 +7871,56 @@ mod object_tagging_namespace_lock_tests {
     }
 
     #[tokio::test]
+    async fn version_delete_returns_tags_read_under_the_delete_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "delete-locked-tags";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(b"body".to_vec());
+        let uploaded = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned object should be written");
+        let version_id = uploaded.version_id.expect("versioned PUT should return an ID").to_string();
+        let version_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id),
+            delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+            ..Default::default()
+        };
+        set_disks
+            .put_object_tags(bucket, object, "generation=stale", &version_opts)
+            .await
+            .expect("initial tags should be written");
+        let advisory = set_disks
+            .get_object_info(bucket, object, &version_opts)
+            .await
+            .expect("advisory pre-read should succeed");
+        set_disks
+            .put_object_tags(bucket, object, "generation=locked", &version_opts)
+            .await
+            .expect("concurrent tag update should commit before delete");
+
+        let deleted = set_disks
+            .delete_object(bucket, object, version_opts)
+            .await
+            .expect("version delete should succeed");
+
+        assert_eq!(advisory.user_tags.as_str(), "generation=stale");
+        assert_eq!(deleted.user_tags.as_str(), "generation=locked");
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn tagging_serializes_with_put_and_delete_for_versioned_and_unversioned_objects() {
         for versioned in [false, true] {
@@ -7815,6 +7934,7 @@ mod object_tagging_namespace_lock_tests {
 
                 let object_opts = ObjectOptions {
                     versioned,
+                    delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
                     ..Default::default()
                 };
                 let original_body = b"original body".to_vec();
@@ -8012,6 +8132,276 @@ mod delete_objects_lock_gating_tests {
                 .await
                 .expect_err("deleted object must be gone");
         }
+    }
+
+    #[tokio::test]
+    async fn delete_objects_derives_per_object_versioning_from_the_request_snapshot() {
+        use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-versioning-snapshot-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        put_plain_object(&set_disks, bucket, "marker-object").await;
+        put_plain_object(&set_disks, bucket, "archive/unversioned-object").await;
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                excluded_prefixes: Some(vec![ExcludedPrefix {
+                    prefix: Some("archive/".to_string()),
+                }]),
+                ..Default::default()
+            },
+            None,
+        ));
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "marker-object".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "archive/unversioned-object".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    versioned: true,
+                    delete_replication_config_snapshot: Some(snapshot),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            errors.iter().all(Option::is_none),
+            "snapshot-backed batch delete should succeed: {errors:?}"
+        );
+        assert!(deleted[0].delete_marker);
+        assert!(deleted[0].delete_marker_version_id.is_some());
+        assert!(!deleted[1].delete_marker);
+        set_disks
+            .get_object_info(bucket, "archive/unversioned-object", &ObjectOptions::default())
+            .await
+            .expect_err("the snapshot-excluded object should be removed without a delete marker");
+    }
+
+    #[tokio::test]
+    async fn batch_version_delete_uses_tags_read_under_the_delete_lock() {
+        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+        use s3s::dto::{
+            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
+            ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+        };
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-delete-locked-tags";
+        let object = "object";
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(b"body".to_vec());
+        let uploaded = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    user_defined: HashMap::from([(AMZ_OBJECT_TAGGING.to_string(), "generation=stale".to_string())]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned object should be written");
+        let version_id = uploaded.version_id.expect("versioned PUT should return an ID");
+        let version_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            ..Default::default()
+        };
+        set_disks
+            .put_object_tags(bucket, object, "generation=locked", &version_opts)
+            .await
+            .expect("tag update should commit before the batch delete");
+
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    }),
+                    destination: Destination {
+                        bucket: arn.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: Some(ReplicationRuleFilter {
+                        tag: Some(Tag {
+                            key: Some("generation".to_string()),
+                            value: Some("locked".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    id: Some("delete".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+        ));
+        let (deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(version_id),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    versioned: true,
+                    delete_replication_config_snapshot: Some(snapshot),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(errors.iter().all(Option::is_none), "batch version delete should succeed: {errors:?}");
+        let state = deleted[0]
+            .replication_state
+            .as_ref()
+            .expect("locked decision should be persisted");
+        assert_eq!(
+            state.version_purge_status_internal.as_deref(),
+            Some("arn:rustfs:replication:us-east-1:target:bucket=PENDING;")
+        );
+        assert!(state.replicate_decision_str.contains(arn));
+    }
+
+    #[tokio::test]
+    async fn synthetic_directory_delete_uses_decoded_prefix_and_marker_switch() {
+        use s3s::dto::{
+            BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
+            DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter,
+            ReplicationRuleStatus, VersioningConfiguration,
+        };
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-directory-replication";
+        let object = encode_dir_object("photos/");
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, &object).await;
+
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: Some(DeleteMarkerReplication {
+                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+                    }),
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+                    }),
+                    destination: Destination {
+                        bucket: arn.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: Some(ReplicationRuleFilter {
+                        prefix: Some("photos/".to_string()),
+                        ..Default::default()
+                    }),
+                    id: Some("directory-marker".to_string()),
+                    prefix: None,
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+        ));
+
+        let (deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object,
+                    version_id: Some(Uuid::nil()),
+                    synthetic_version_id: true,
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    versioned: true,
+                    delete_replication_config_snapshot: Some(snapshot),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(errors[0].is_none(), "directory delete should succeed: {:?}", errors[0]);
+        let state = deleted[0]
+            .replication_state
+            .as_ref()
+            .expect("marker replication decision should be persisted");
+        assert_eq!(state.replication_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
+        assert!(state.version_purge_status_internal.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_objects_aborts_before_disk_mutation_after_outer_lock_loss() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-lost-outer-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, object).await;
+
+        let (_deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    no_lock: true,
+                    delete_lock_fence: Some(DeleteLockFence::lost_for_test()),
+                    delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(errors[0], Some(Error::NamespaceLockQuorumUnavailable { .. })),
+            "lost outer lock must fail the batch before disk mutation: {:?}",
+            errors[0]
+        );
+        set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("object must survive a lost-lock batch");
     }
 
     #[tokio::test]

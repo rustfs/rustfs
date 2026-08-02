@@ -18,7 +18,14 @@
 # This is NOT a PR gate. The fixtures are real MinIO backend trees generated on
 # the fly (they are gitignored, never committed), so the job regenerates them
 # each run with Docker and then runs the `#[ignore]` reader tests in
-# crates/ecstore/tests/minio_generated_read_test.rs.
+# rustfs/src/storage/minio_generated_read_test.rs.
+#
+# Scope: end-to-end MinIO-to-RustFS SSE interop is NOT implemented yet. Both
+# envelope parsers reject MinIO's own wrapped-DEK shape — see
+# `is_data_key_envelope` in crates/kms/src/encryption/dek.rs and the
+# `deny_unknown_fields` `LocalSseDekEnvelope` in rustfs/src/storage/sse.rs — and
+# closing that gap is tracked in rustfs/backlog#1638. Treat this job as the
+# harness for #1638, not as standing evidence that a MinIO migration reads back.
 #
 # Runner: GitHub-hosted `ubuntu-latest`. It reliably ships Docker + Python,
 # unlike the self-hosted fleet, whose pods drift in Docker/pip availability
@@ -55,6 +62,19 @@ jobs:
     env:
       # Fixed 32-byte test KMS key baked into the fixture lab; not a secret.
       RUSTFS_MINIO_STATIC_KMS_KEY_B64: IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g=
+      # Single definition of "the interop tests", shared by the guard step and
+      # the run step so the two cannot drift apart.
+      #
+      # These used to live in crates/ecstore/tests/minio_generated_read_test.rs
+      # and were selected with `-p rustfs-ecstore -E
+      # 'binary(minio_generated_read_test)'`. #5435 moved them into the `rustfs`
+      # crate as a `#[cfg(test)] mod`, which deleted that test binary; the
+      # selector was never updated and has selected zero interop tests ever
+      # since (cargo-nextest 0.9.140 now rejects it outright: "operator didn't
+      # match any binary names", exit 94).
+      INTEROP_PACKAGE: rustfs
+      INTEROP_FEATURES: rio-v2
+      INTEROP_FILTER: "test(minio_generated_read_test::)"
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -71,8 +91,29 @@ jobs:
       - name: Generate real MinIO fixtures via Docker
         run: bash crates/rio-v2/tests/minio_fixture_lab/capture_via_docker.sh
 
+      # `binary(...)` at least dies loudly when nothing matches, but `test(...)`
+      # is a perfectly valid filterset that matches zero tests, so the next
+      # rename or module move would leave this job selecting nothing and
+      # reporting success without executing a single interop assertion. Count
+      # the selection and fail with a reason instead.
+      #
+      # Count only `filter-match.status == "matches"`: the top-level
+      # `test-count` in the JSON is the package total and ignores `-E` entirely.
+      - name: Assert the interop selector still matches tests
+        run: |
+          set -euo pipefail
+          count="$(cargo nextest list --run-ignored all \
+            -p "$INTEROP_PACKAGE" --features "$INTEROP_FEATURES" \
+            -E "$INTEROP_FILTER" --message-format json \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for s in d.get("rust-suites", {}).values() for t in s.get("testcases", {}).values() if t.get("filter-match", {}).get("status") == "matches"))')"
+          echo "interop tests selected: ${count}"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::Selector '${INTEROP_FILTER}' in package '${INTEROP_PACKAGE}' matched 0 tests. The MinIO interop reader tests have moved or been renamed again; fix the selector instead of letting this job pass without running them. Context: rustfs/backlog#1638."
+            exit 1
+          fi
+
       - name: Run MinIO interop reader tests
         run: |
-          cargo nextest run --run-ignored ignored-only \
-            -p rustfs-ecstore --features rio-v2 \
-            -E 'binary(minio_generated_read_test)'
+          cargo nextest run --run-ignored ignored-only --no-tests=fail \
+            -p "$INTEROP_PACKAGE" --features "$INTEROP_FEATURES" \
+            -E "$INTEROP_FILTER"

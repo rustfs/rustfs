@@ -20,6 +20,47 @@ use crate::storage_api_contracts::{
     },
 };
 
+#[derive(Clone, Default)]
+pub struct DeleteLockFence {
+    signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
+    #[cfg(test)]
+    forced_lost: bool,
+}
+
+impl Debug for DeleteLockFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteLockFence")
+            .field("signal_count", &self.signals.len())
+            .finish()
+    }
+}
+
+impl DeleteLockFence {
+    pub(crate) fn new(signals: Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> Self {
+        Self {
+            signals: Arc::new(signals),
+            #[cfg(test)]
+            forced_lost: false,
+        }
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        #[cfg(test)]
+        if self.forced_lost {
+            return true;
+        }
+        self.signals.iter().any(|signal| signal.is_lost())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lost_for_test() -> Self {
+        Self {
+            signals: Arc::default(),
+            forced_lost: true,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -54,8 +95,11 @@ pub struct ObjectOptions {
     pub http_preconditions: Option<HTTPPreconditions>,
 
     pub delete_replication: Option<ReplicationState>,
+    pub delete_replication_config_snapshot: Option<Arc<DeleteReplicationConfigSnapshot>>,
+    pub delete_lock_fence: Option<DeleteLockFence>,
     pub replication_request: bool,
     pub delete_marker: bool,
+    pub synthetic_version_id: bool,
 
     pub transition: TransitionOptions,
     pub expiration: ExpirationOptions,

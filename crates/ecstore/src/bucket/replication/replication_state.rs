@@ -22,9 +22,9 @@ use super::replication_stats_boundary::{
     QueueCache, ReplicationMetricScope, SRMetricsSummary, XferStats,
 };
 use super::runtime_boundary as runtime_sources;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
@@ -151,6 +151,83 @@ pub struct ReplicationStats {
     // Bucket replication cache
     pub cache: Arc<RwLock<HashMap<String, BucketReplicationStats>>>,
     pub most_recent_stats: Arc<Mutex<HashMap<String, BucketStats>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeReplicationTargetBacklog {
+    pub bucket: String,
+    pub target_arn: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+type TargetQueueKey = (String, String);
+type TargetQueueCache = HashMap<TargetQueueKey, InQueueMetric>;
+
+struct TargetQueueCacheSlot {
+    owner: Weak<StdMutex<QueueCache>>,
+    metrics: TargetQueueCache,
+}
+
+impl TargetQueueCacheSlot {
+    fn new(owner: &Arc<StdMutex<QueueCache>>) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            metrics: TargetQueueCache::default(),
+        }
+    }
+
+    fn belongs_to(&self, owner: &Arc<StdMutex<QueueCache>>) -> bool {
+        self.owner.upgrade().is_some_and(|current| Arc::ptr_eq(&current, owner))
+    }
+}
+
+// Keep runtime target counters outside ReplicationStats to preserve its public struct shape.
+static TARGET_QUEUE_CACHES: LazyLock<StdMutex<Vec<TargetQueueCacheSlot>>> = LazyLock::new(|| StdMutex::new(Vec::new()));
+
+fn i64_to_u64_floor_zero(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(0)
+}
+
+fn normalized_target_arns(target_arns: &[String]) -> Vec<&str> {
+    let mut target_arns = target_arns
+        .iter()
+        .map(String::as_str)
+        .filter(|target_arn| !target_arn.is_empty())
+        .collect::<Vec<_>>();
+    target_arns.sort_unstable();
+    target_arns.dedup();
+    target_arns
+}
+
+fn target_queue_cache_snapshot(cache: &TargetQueueCache) -> Vec<RuntimeReplicationTargetBacklog> {
+    cache
+        .iter()
+        .filter_map(|((bucket, target_arn), metric)| {
+            let count = i64_to_u64_floor_zero(metric.curr.get_current_count());
+            let bytes = i64_to_u64_floor_zero(metric.curr.get_current_bytes());
+            (count > 0 || bytes > 0).then(|| RuntimeReplicationTargetBacklog {
+                bucket: bucket.clone(),
+                target_arn: target_arn.clone(),
+                count,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn prune_stale_target_queue_caches(caches: &mut Vec<TargetQueueCacheSlot>) {
+    caches.retain(|slot| slot.owner.strong_count() > 0);
+}
+
+fn with_target_queue_caches<T>(f: impl FnOnce(&mut Vec<TargetQueueCacheSlot>) -> T) -> T {
+    match TARGET_QUEUE_CACHES.lock() {
+        Ok(mut caches) => f(&mut caches),
+        Err(poisoned) => {
+            let mut caches = poisoned.into_inner();
+            f(&mut caches)
+        }
+    }
 }
 
 impl ReplicationStats {
@@ -684,6 +761,68 @@ impl ReplicationStats {
         }
     }
 
+    pub(crate) fn inc_target_q(&self, bucket: &str, target_arns: &[String], size: i64) {
+        let target_arns = normalized_target_arns(target_arns);
+        if target_arns.is_empty() {
+            return;
+        }
+        with_target_queue_caches(|caches| {
+            prune_stale_target_queue_caches(caches);
+            let slot_index = match caches.iter().position(|slot| slot.belongs_to(&self.q_cache)) {
+                Some(index) => index,
+                None => {
+                    caches.push(TargetQueueCacheSlot::new(&self.q_cache));
+                    caches.len() - 1
+                }
+            };
+            let slot = &mut caches[slot_index];
+            let bucket = bucket.to_string();
+            for target_arn in target_arns {
+                let metric = match slot.metrics.entry((bucket.clone(), target_arn.to_string())) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(InQueueMetric::default()),
+                };
+                metric.curr.add_current(size, 1);
+            }
+        });
+    }
+
+    pub(crate) fn dec_target_q(&self, bucket: &str, target_arns: &[String], size: i64) {
+        let target_arns = normalized_target_arns(target_arns);
+        if target_arns.is_empty() {
+            return;
+        }
+        with_target_queue_caches(|caches| {
+            prune_stale_target_queue_caches(caches);
+            if let Some(slot) = caches.iter_mut().find(|slot| slot.belongs_to(&self.q_cache)) {
+                let bucket = bucket.to_string();
+                for target_arn in target_arns {
+                    if let Some(metric) = slot.metrics.get_mut(&(bucket.clone(), target_arn.to_string())) {
+                        metric.curr.subtract_current(size, 1);
+                    }
+                }
+                slot.metrics
+                    .retain(|_, metric| metric.curr.get_current_count() > 0 || metric.curr.get_current_bytes() > 0);
+            }
+        });
+    }
+
+    pub fn runtime_target_backlog_snapshot(&self) -> Vec<RuntimeReplicationTargetBacklog> {
+        let mut snapshot = with_target_queue_caches(|caches| {
+            caches
+                .iter()
+                .find(|slot| slot.belongs_to(&self.q_cache))
+                .map(|slot| target_queue_cache_snapshot(&slot.metrics))
+                .unwrap_or_default()
+        });
+        snapshot.sort_by(|left, right| {
+            left.bucket
+                .cmp(&right.bucket)
+                .then_with(|| left.target_arn.cmp(&right.target_arn))
+        });
+        snapshot
+    }
+
     /// Increase proxy metrics
     pub async fn inc_proxy(&self, bucket: &str, api: &str, is_err: bool) {
         let mut p_cache = self.p_cache.lock().await;
@@ -706,6 +845,94 @@ impl Default for ReplicationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_target_backlog_snapshot_tracks_targets() {
+        let stats = ReplicationStats::new();
+        stats.inc_target_q(
+            "photos",
+            &[
+                "arn:rustfs:replication:target-b".to_string(),
+                "arn:rustfs:replication:target-a".to_string(),
+                "arn:rustfs:replication:target-a".to_string(),
+            ],
+            1024,
+        );
+
+        let snapshot = stats.runtime_target_backlog_snapshot();
+
+        assert_eq!(
+            snapshot,
+            vec![
+                RuntimeReplicationTargetBacklog {
+                    bucket: "photos".to_string(),
+                    target_arn: "arn:rustfs:replication:target-a".to_string(),
+                    count: 1,
+                    bytes: 1024,
+                },
+                RuntimeReplicationTargetBacklog {
+                    bucket: "photos".to_string(),
+                    target_arn: "arn:rustfs:replication:target-b".to_string(),
+                    count: 1,
+                    bytes: 1024,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_target_backlog_ignores_empty_targets() {
+        let stats = ReplicationStats::new();
+        stats.inc_target_q("photos", &["".to_string()], 1024);
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_target_backlog_is_scoped_to_stats_instance() {
+        let first = ReplicationStats::new();
+        let second = ReplicationStats::new();
+        first.inc_target_q("photos", &["arn:rustfs:replication:target-a".to_string()], 1024);
+
+        assert!(second.runtime_target_backlog_snapshot().is_empty());
+        assert_eq!(first.runtime_target_backlog_snapshot()[0].count, 1);
+    }
+
+    #[test]
+    fn runtime_target_backlog_decrements_with_saturation() {
+        let stats = ReplicationStats::new();
+        let target_arns = ["arn:rustfs:replication:target-a".to_string()];
+        stats.inc_target_q("photos", &target_arns, 1024);
+        stats.dec_target_q("photos", &target_arns, 2048);
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_target_backlog_prunes_stale_sidecar_on_next_access() {
+        {
+            let stats = ReplicationStats::new();
+            stats.inc_target_q("photos", &["arn:rustfs:replication:target-a".to_string()], 1024);
+            assert!(
+                TARGET_QUEUE_CACHES
+                    .lock()
+                    .expect("target queue cache mutex")
+                    .iter()
+                    .any(|slot| slot.owner.strong_count() > 0)
+            );
+        }
+
+        let stats = ReplicationStats::new();
+        stats.inc_target_q("photos", &["arn:rustfs:replication:target-b".to_string()], 1024);
+
+        assert!(
+            TARGET_QUEUE_CACHES
+                .lock()
+                .expect("target queue cache mutex")
+                .iter()
+                .all(|slot| slot.owner.strong_count() > 0)
+        );
+    }
 
     #[tokio::test]
     async fn test_replication_stats_new() {

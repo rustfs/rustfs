@@ -89,8 +89,8 @@ pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, get_buffer_size_opt_in,
-    get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
-    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    get_validated_store, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
+    process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled,
     validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
@@ -102,7 +102,8 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,
+        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
+        req_info_mut, req_info_ref,
     };
 
     pub(crate) mod contract {
@@ -151,10 +152,6 @@ pub(crate) mod ecfs_extend_consumer {
             pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
         }
 
-        pub(crate) mod object {
-            pub(crate) use super::super::super::contract::object::ObjectToDelete;
-        }
-
         pub(crate) mod multipart {
             pub(crate) use super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
@@ -183,10 +180,10 @@ pub(crate) mod options_consumer {
     #[cfg(test)]
     pub(crate) use super::super::options::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use super::super::options::{
-        bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
-        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
-        get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
-        normalize_content_encoding_for_storage, parse_copy_source_range, put_opts, validate_archive_content_encoding,
+        copy_dst_opts, copy_src_opts, del_opts_with_versioning, extract_metadata, extract_metadata_from_mime,
+        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
+        get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+        parse_copy_source_range, put_opts, validate_archive_content_encoding,
     };
 
     pub(crate) mod contract {

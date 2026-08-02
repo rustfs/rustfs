@@ -73,6 +73,7 @@ pub mod config;
 pub mod deletion_worker;
 mod encryption;
 mod error;
+pub mod key_impact;
 pub mod manager;
 mod policy;
 pub mod probe;
@@ -83,9 +84,9 @@ pub mod types;
 
 // Re-export public API
 pub use api_types::{
-    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureStaticKmsRequest,
-    ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest,
-    StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
+    CacheSummary, ConfigureAwsKmsRequest, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest,
+    ConfigureStaticKmsRequest, ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse,
+    StartKmsRequest, StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use audit::{KmsAuditOperation, KmsAuditOutcome, KmsAuditRecord, KmsAuditSink, redact_encryption_context};
@@ -94,6 +95,7 @@ pub use config::*;
 pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
+pub use key_impact::{KeyImpactReport, KeyReference, KeyReferenceKind, ReferenceCompleteness, ReferenceCoverage, ReferenceScope};
 pub use manager::KmsManager;
 pub use probe::{ProbeFailureKind, ProbeResult, ProbeStatus};
 pub use service::{DataKey, ObjectEncryptionService};
