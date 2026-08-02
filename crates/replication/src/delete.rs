@@ -57,7 +57,6 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
             force_delete_id: self.delete_object.force_delete_id,
             force_delete_generation: self.delete_object.force_delete_generation,
             force_delete_local_commit: self.delete_object.force_delete,
-            ..Default::default()
         }
     }
 

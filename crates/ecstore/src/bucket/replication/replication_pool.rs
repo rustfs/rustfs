@@ -3978,7 +3978,7 @@ mod tests {
         };
         assert!(!should_replay_force_delete_intent(&pending));
 
-        let mut committed = pending.clone();
+        let mut committed = pending;
         committed.force_delete_local_commit = true;
         let recovered = decode_mrf_file(&encode_mrf_file(&[committed]).expect("force-delete intent should encode"))
             .expect("force-delete intent should decode");

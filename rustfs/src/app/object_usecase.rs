@@ -7321,10 +7321,7 @@ impl DefaultObjectUsecase {
                         "failed to mark force-delete intent committed after local delete"
                     );
                 }
-                let generation = match i64::try_from(generation.unix_timestamp_nanos()) {
-                    Ok(value) => value,
-                    Err(_) => i64::MAX,
-                };
+                let generation = i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX);
                 schedule_replication_delete(
                     StorageDeletedObject {
                         object_name: key.clone(),

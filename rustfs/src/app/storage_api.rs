@@ -651,10 +651,7 @@ pub(crate) mod bucket {
                     delete_marker_mtime: None,
                     target_arns,
                     force_delete_id: Some(operation_id),
-                    force_delete_generation: Some(match i64::try_from(generation.unix_timestamp_nanos()) {
-                        Ok(value) => value,
-                        Err(_) => i64::MAX,
-                    }),
+                    force_delete_generation: Some(i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX)),
                     force_delete_local_commit: false,
                 },
             )
