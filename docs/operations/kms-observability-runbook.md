@@ -4,11 +4,11 @@ This runbook covers the KMS metrics, the Grafana dashboard that visualizes them,
 
 ## Metric reference
 
-Across every family below, label values are exclusively static enum strings — key identifiers, key material, ciphertext, paths, and tokens never appear in metric labels, and any change that would add such a label is a regression.
+Across every family below, label values come from bounded enums or fixed call-site tokens — key identifiers, key material, ciphertext, paths, and tokens never appear in metric labels, and any change that would add such a label is a regression.
 
 ### Backend operation metrics
 
-All four are emitted at the single operation-policy choke point (`crates/kms/src/policy.rs`) that every instrumented KMS backend call flows through.
+All six are emitted at the single operation-policy choke point (`crates/kms/src/policy.rs`) that every instrumented KMS backend call flows through.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -16,15 +16,19 @@ All four are emitted at the single operation-policy choke point (`crates/kms/src
 | `rustfs_kms_backend_attempt_failures_total` | counter | `operation`, `error_class` | Individual failed attempts, including attempts the retry policy later absorbed |
 | `rustfs_kms_backend_operation_duration_seconds` | histogram | `operation`, `outcome` | Wall-clock duration of a whole operation, including retries and backoff sleeps |
 | `rustfs_kms_backend_operation_attempts` | histogram | `operation`, `outcome` | Number of attempts one operation used before completing |
+| `rustfs_kms_backend_in_flight` | gauge | `backend`, `scope` | External backend attempts currently in flight after admission |
+| `rustfs_kms_backend_circuit_open` | gauge | `backend`, `scope` | Open or half-open circuits; `0` means closed |
 
 Label values:
 
-- `outcome`: `success`, `fatal` (a non-retryable failure ended the operation on first observation), `budget_exhausted` (the attempt budget ran out on retryable failures), `deadline_exceeded` (the operation deadline ran out before another attempt could complete), `cancelled` (shutdown or caller cancellation).
+- `outcome`: `success`, `fatal` (a non-retryable failure ended the operation on first observation), `budget_exhausted` (the attempt budget ran out on retryable failures), `deadline_exceeded` (the operation deadline ran out before another attempt could complete), `backpressure_timeout` (the deadline elapsed before capacity admission completed), `backpressure_rejected` (active capacity and the bounded queue were full or unavailable), `circuit_open` (a retryable failure opened the breaker or an open breaker rejected the operation), `cancelled` (shutdown or caller cancellation).
 - `op_class`: `read_idempotent` (safe to retry), `mutating_non_idempotent` (never replayed — a retryable failure terminates after a single attempt because the server may have processed the request), `auth` (login and token renewal).
 - `error_class`: `retryable_conn` (connection-level failure: dial, TLS, broken connection), `retryable_status` (retryable backend status, e.g. Vault 5xx or a sealed Vault's 503), `attempt_timeout` (the per-attempt timeout cut the attempt off; retried like a connection failure because the server may still have processed the request), `fatal` (non-retryable: authentication, permissions, malformed request, missing key or version).
 - `operation`: static per-call-site names, e.g. `vault_kv2_read_key_version`, `vault_kv2_cas_write_key`, `vault_transit_encrypt`, `vault_transit_decrypt`, `vault_login`, `vault_token_renew`.
 
-Instrumentation boundary: the Local and Static backends do not flow through the choke point and emit no operation metrics; bringing them under the same instrumentation is tracked separately (rustfs/backlog#1569). Absence of these four series on a cluster using those backends is expected, not an outage. The families below sit above the backend layer and are emitted regardless.
+Admission sharing follows two different boundaries. Active backend capacity is shared by backend identity, so separate policy scopes cannot bypass the concurrency cap. The bounded wait queue and circuit breaker are shared only by backend identity plus policy scope, so data operations, login, and renewal do not trip or fill one another's scope-local breaker and queue.
+
+Instrumentation boundary: the Local and Static backends do not flow through the choke point and emit no operation metrics; bringing them under the same instrumentation is tracked separately (rustfs/backlog#1569). Absence of these six series on a cluster using those backends is expected, not an outage. The families below sit above the backend layer and are emitted regardless.
 
 ### Key metadata cache metrics
 
@@ -116,14 +120,16 @@ Related signals: the "Attempt Failure Rate by Error Class" and "Backend Operatio
 
 ### KmsBackendHighErrorRate
 
-Meaning: more than 5% of KMS operations are terminating without success (`fatal`, `budget_exhausted`, or `deadline_exceeded`; `cancelled` is excluded because shutdown windows legitimately produce it). A traffic guard suppresses the alert below ~0.02 ops/s so a single failure on a near-idle cluster does not page.
+Meaning: more than 5% of KMS operations are terminating without success (`fatal`, `budget_exhausted`, `deadline_exceeded`, `backpressure_timeout`, `backpressure_rejected`, or `circuit_open`; `cancelled` is excluded because shutdown windows legitimately produce it). A traffic guard suppresses the alert below ~0.02 ops/s so a single failure on a near-idle cluster does not page.
 
 Investigation:
 
 1. Break the failures down by outcome: `sum by (outcome) (rate(rustfs_kms_backend_operations_total{outcome!~"success|cancelled"}[5m]))`.
 2. If `fatal` dominates, follow [KmsBackendFatalErrors](#kmsbackendfatalerrors).
 3. If `budget_exhausted` or `deadline_exceeded` dominates, follow [KmsBackendRetryBudgetExhausted](#kmsbackendretrybudgetexhausted) — the backend is unavailable or too slow for longer than the retry policy can bridge.
-4. Correlate with client impact: encrypted-object PUT/GET failures and S3 error rates on buckets with encryption configured.
+4. If `backpressure_timeout` or `backpressure_rejected` dominates, compare `rustfs_kms_backend_in_flight` by `backend` and `scope`; active capacity is shared by backend identity, while each identity-and-scope pair has its own bounded queue.
+5. If `circuit_open` dominates, follow [KmsBackendCircuitOpen](#kmsbackendcircuitopen).
+6. Correlate with client impact: encrypted-object PUT/GET failures and S3 error rates on buckets with encryption configured.
 
 Related signals: the "Non-Success Outcome Ratio" dashboard panel; the KMS-related warnings listed under the other alerts in this runbook.
 
@@ -170,9 +176,23 @@ Investigation:
 
 Related signals: the "Backend Operation Rate by Outcome" panel; retry-backoff warnings in RustFS logs; Vault availability monitoring.
 
+### KmsBackendCircuitOpen
+
+Meaning: `rustfs_kms_backend_circuit_open` has remained above `0` for a `backend` and `scope` for one minute. This direct gauge alert does not depend on operation traffic: it remains visible when the circuit is open and rejecting calls, and while the single half-open recovery probe is running.
+
+Investigation:
+
+1. Identify the affected scope with `rustfs_kms_backend_circuit_open > 0`.
+2. Break recent rejections down by operation: `sum by (operation) (rate(rustfs_kms_backend_operations_total{outcome="circuit_open"}[5m]))`.
+3. Check `sum by (error_class) (rate(rustfs_kms_backend_attempt_failures_total{error_class=~"retryable_conn|retryable_status|attempt_timeout"}[5m]))` to distinguish transport failures, retryable backend responses such as a sealed Vault, and attempt timeouts. An attempt timeout counts toward the breaker as a retryable connection failure.
+4. After the open interval, the next eligible operation is the only half-open probe. A success or non-retryable failure closes the circuit; a retryable failure reopens it. A non-retryable probe still fails as `fatal`, so follow [KmsBackendFatalErrors](#kmsbackendfatalerrors) even after the circuit gauge clears. Do not restart RustFS just to clear the state.
+5. Remember the sharing boundary: breaker and queue state are per backend identity plus scope, while active capacity is shared by backend identity. Check other scopes for capacity pressure even when their circuits remain closed.
+
+Related signals: `circuit_open`, `backpressure_timeout`, and `backpressure_rejected` on the "Backend Operation Rate by Outcome" panel; `rustfs_kms_backend_in_flight`; Vault availability and seal status.
+
 ## Threshold calibration
 
-Every numeric threshold in `rustfs-kms-alerts.yml` (5% error ratio, 2s p99, 0.5/s attempt failures, 0.05/s budget exhaustion) is a conservative default chosen without a production baseline, biased toward not paging on healthy-but-busy systems. Before relying on these alerts for paging: run the workload in staging for at least a week, record the steady-state values of the expressions above, then tighten thresholds to sit clearly above observed peaks. Once a stable baseline exists, consider converting `KmsBackendAttemptFailureSpike` to a baseline-relative form (`offset 1d` ratio, see `.docker/observability/prometheus-rules/rustfs-get-optimization-alerts.yaml` for the pattern). Formal SLO targets for KMS operations are deliberately out of scope until that baseline exists (rustfs/backlog#1584).
+Every numeric traffic or latency threshold in `rustfs-kms-alerts.yml` (5% error ratio, 2s p99, 0.5/s attempt failures, 0.05/s budget exhaustion) is a conservative default chosen without a production baseline, biased toward not paging on healthy-but-busy systems. Before relying on these alerts for paging: run the workload in staging for at least a week, record the steady-state values of the expressions above, then tighten thresholds to sit clearly above observed peaks. `KmsBackendCircuitOpen` is different: its gauge is direct state, and the one-minute hold only suppresses a circuit that recovers immediately. Once a stable baseline exists, consider converting `KmsBackendAttemptFailureSpike` to a baseline-relative form (`offset 1d` ratio, see `.docker/observability/prometheus-rules/rustfs-get-optimization-alerts.yaml` for the pattern). Formal SLO targets for KMS operations are deliberately out of scope until that baseline exists (rustfs/backlog#1584).
 
 ## Coverage gaps
 

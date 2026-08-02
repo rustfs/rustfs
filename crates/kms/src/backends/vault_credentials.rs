@@ -520,8 +520,10 @@ impl VaultConnectionSettings {
 /// Refresh and fail-closed tuning for a [`VaultCredentialProvider`].
 #[derive(Debug, Clone)]
 pub(crate) struct VaultCredentialPolicy {
-    /// Retry budget for one login/renewal cycle.
+    /// Retry budget for one login cycle.
     pub(crate) retry: RetryPolicy,
+    /// Retry budget for one token-renewal cycle.
+    pub(crate) renew_retry: RetryPolicy,
     /// Fail-closed margin: once the current token is within this window of
     /// expiry without a successful refresh, [`VaultCredentialProvider::current`]
     /// refuses to hand it out.
@@ -536,8 +538,14 @@ impl VaultCredentialPolicy {
     /// The default safety window equals the per-attempt timeout: a request
     /// issued now can stay in flight for up to one attempt timeout, so the
     /// token must outlive at least that.
-    pub(crate) fn from_kms_config(config: &KmsConfig, auth_method: &VaultAuthMethod) -> Self {
-        let retry = RetryPolicy::from_config(config);
+    pub(crate) fn from_kms_config(
+        config: &KmsConfig,
+        auth_method: &VaultAuthMethod,
+        backend: &'static str,
+        endpoint: &str,
+        namespace: Option<&str>,
+    ) -> Self {
+        let retry = RetryPolicy::for_backend(config, backend, endpoint, namespace, "credentials-login");
         let safety_window = match auth_method {
             VaultAuthMethod::AppRole {
                 refresh_safety_window_secs: Some(secs),
@@ -551,6 +559,7 @@ impl VaultCredentialPolicy {
         };
         Self {
             retry,
+            renew_retry: RetryPolicy::for_backend(config, backend, endpoint, namespace, "credentials-renew"),
             safety_window,
             retry_interval: DEFAULT_REFRESH_RETRY_INTERVAL,
         }
@@ -717,7 +726,7 @@ impl VaultCredentialProvider {
 
         let renewable = current.lease.map(|lease| lease.renewable).unwrap_or(false);
         let renewed = if renewable {
-            match policy::execute("vault_token_renew", OpClass::Auth, &self.policy.retry, cancel, || {
+            match policy::execute("vault_token_renew", OpClass::Auth, &self.policy.renew_retry, cancel, || {
                 self.source.renew(&current.client)
             })
             .await
@@ -868,14 +877,23 @@ mod tests {
     /// Tight retry budget so paused-clock tests stay deterministic: one
     /// attempt per cycle, failed cycles spaced by `retry_interval`.
     fn test_policy(safety_window: Duration, retry_interval: Duration) -> VaultCredentialPolicy {
+        let retry = RetryPolicy::for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let renew_retry = RetryPolicy::for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
         VaultCredentialPolicy {
-            retry: RetryPolicy {
-                attempt_timeout: Duration::from_secs(1),
-                op_deadline: Duration::from_secs(1),
-                max_attempts: 1,
-                base_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(10),
-            },
+            retry,
+            renew_retry,
             safety_window,
             retry_interval,
         }
@@ -1084,11 +1102,12 @@ mod tests {
             "expected CredentialsUnavailable, got {error:?}"
         );
 
-        // Recovery: the next retry cycle succeeds, installs a fresh
-        // generation, and the provider serves requests again.
+        // Recovery: after the failed-refresh circuit's cool-down, its single
+        // half-open probe succeeds, installs a fresh generation, and the
+        // provider serves requests again.
         state.fail_renew.store(false, Ordering::SeqCst);
         state.fail_login.store(false, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_secs(31)).await;
         let handle = provider.current().expect("provider must recover after a successful refresh");
         assert!(handle.generation >= 1);
 

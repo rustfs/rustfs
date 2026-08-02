@@ -452,12 +452,24 @@ impl VaultRestoreClient {
             attempt_timeout: kms_config.effective_timeout(),
         };
         let source = token_source_for(&target.auth_method, &settings)?;
-        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &target.auth_method);
+        let policy = VaultCredentialPolicy::from_kms_config(
+            kms_config,
+            &target.auth_method,
+            "vault-restore",
+            &target.address,
+            target.namespace.as_deref(),
+        );
         let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
         Ok(Self {
             credentials,
             kv_mount: target.kv_mount.clone(),
-            retry: RetryPolicy::from_config(kms_config),
+            retry: RetryPolicy::for_backend(
+                kms_config,
+                "vault-restore",
+                &target.address,
+                target.namespace.as_deref(),
+                "operations",
+            ),
             cancel: CancellationToken::new(),
         })
     }
