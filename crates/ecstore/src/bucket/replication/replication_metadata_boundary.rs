@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::metadata_sys;
+use std::sync::Arc;
+
+use crate::bucket::{metadata::BucketMetadata, metadata_sys};
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::runtime::instance::InstanceContext;
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
 
 use super::replication_error_boundary::{Error, Result};
+
+pub(crate) type ReplicationInstanceContext = InstanceContext;
 
 const REPLICATION_DIR: &str = ".replication";
 const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -43,6 +48,20 @@ impl ReplicationMetadataStore {
             }
         };
         Ok(config)
+    }
+
+    pub(crate) async fn delete_metadata(bucket: &str) -> Result<Arc<BucketMetadata>> {
+        let sys = metadata_sys::get_bucket_metadata_sys()?;
+        let sys = sys.read().await;
+        Ok(sys.get_config(bucket).await?.0)
+    }
+
+    pub(crate) async fn delete_metadata_in(ctx: &ReplicationInstanceContext, bucket: &str) -> Result<Arc<BucketMetadata>> {
+        let sys = ctx
+            .bucket_metadata_sys()
+            .ok_or_else(|| Error::other("request instance bucket metadata system is not initialized"))?;
+        let sys = sys.read().await;
+        Ok(sys.get_config(bucket).await?.0)
     }
 
     pub(crate) fn rustfs_meta_bucket() -> &'static str {

@@ -34,8 +34,8 @@ use super::storage_api::bucket_usecase::bucket::{
     metadata_sys,
     policy_sys::PolicySys,
     replication::{
-        ReplicationTargetValidationError, replication_target_arns, should_remove_replication_target,
-        unsupported_replication_config_field, validate_replication_config_target_arns,
+        ReplicationTargetValidationError, invalid_replication_config_status_field, replication_target_arns,
+        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -90,9 +90,9 @@ use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use rustfs_utils::string::parse_bool;
 use s3s::dto::{
-    BucketLifecycleConfiguration, BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput,
-    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
-    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
+    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput,
+    CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
+    DeleteBucketInput, DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
     DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
     DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
     ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
@@ -557,6 +557,12 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
 }
 
 fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+    if let Some(field) = invalid_replication_config_status_field(config) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("replication field {field} has an invalid status"),
+        ));
+    }
     if let Some(field) = unsupported_replication_config_field(config) {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -677,6 +683,16 @@ fn versioning_configuration_has_object_lock_incompatible_settings(config: &Versi
 }
 
 async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConfiguration) -> S3Result<()> {
+    if config
+        .status
+        .as_ref()
+        .is_some_and(|status| !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED))
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "bucket versioning configuration has an invalid status",
+        ));
+    }
     match metadata_sys::get_object_lock_config(bucket).await {
         Ok((object_lock_config, _)) => {
             if object_lock_config.enabled() && versioning_configuration_has_object_lock_incompatible_settings(config) {
@@ -3104,6 +3120,36 @@ mod tests {
             err.to_string()
                 .contains("Destination.EncryptionConfiguration is not supported")
         );
+    }
+
+    #[test]
+    fn validate_replication_config_capabilities_rejects_invalid_status_before_write() {
+        let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        rule.status = ReplicationRuleStatus::from_static("Invalid");
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+
+        let err = validate_replication_config_capabilities(&config)
+            .expect_err("an invalid string-backed replication status must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.to_string().contains("Rule.Status has an invalid status"));
+    }
+
+    #[tokio::test]
+    async fn validate_bucket_versioning_update_rejects_invalid_status_before_metadata_lookup() {
+        let config = VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static("Invalid")),
+            ..Default::default()
+        };
+
+        let err = validate_bucket_versioning_update("unregistered-test-bucket", &config)
+            .await
+            .expect_err("an invalid string-backed versioning status must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
     #[test]

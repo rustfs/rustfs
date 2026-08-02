@@ -16,6 +16,7 @@ use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
+use crate::bucket::replication::invalid_replication_config_status_field;
 use crate::bucket::utils::deserialize;
 use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
@@ -25,9 +26,9 @@ use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
-    ObjectLockConfiguration, PublicAccessBlockConfiguration, ReplicationConfiguration, RequestPaymentConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
+    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration,
+    NotificationConfiguration, ObjectLockConfiguration, PublicAccessBlockConfiguration, ReplicationConfiguration,
+    RequestPaymentConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
 use sha2::{Digest, Sha256};
@@ -751,11 +752,33 @@ impl BucketMetadata {
                 self.object_lock_config_updated_at = updated;
             }
             BUCKET_VERSIONING_CONFIG => {
+                let config = if data.is_empty() {
+                    None
+                } else {
+                    let config = deserialize::<VersioningConfiguration>(&data)?;
+                    if config.status.as_ref().is_some_and(|status| {
+                        !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED)
+                    }) {
+                        return Err(Error::other("bucket versioning configuration has an invalid status"));
+                    }
+                    Some(config)
+                };
                 self.versioning_config_xml = data;
+                self.versioning_config = config;
                 self.versioning_config_updated_at = updated;
             }
             BUCKET_REPLICATION_CONFIG => {
+                let config = if data.is_empty() {
+                    None
+                } else {
+                    let config = deserialize::<ReplicationConfiguration>(&data)?;
+                    if let Some(field) = invalid_replication_config_status_field(&config) {
+                        return Err(Error::other(format!("replication field {field} has an invalid status")));
+                    }
+                    Some(config)
+                };
                 self.replication_config_xml = data;
+                self.replication_config = config;
                 self.replication_config_updated_at = updated;
             }
             BUCKET_TARGETS_FILE => {
@@ -825,7 +848,6 @@ impl BucketMetadata {
     /// ambient (first) one. [`BucketMetadata::save`] keeps the ambient default.
     pub async fn save_with_store(&mut self, store: std::sync::Arc<crate::store::ECStore>) -> Result<()> {
         self.parse_all_configs()?;
-
         let mut buf: Vec<u8> = vec![0; 4];
 
         LittleEndian::write_u16(&mut buf[0..2], BUCKET_METADATA_FORMAT);
@@ -906,6 +928,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.versioning_config = None;
         if !self.versioning_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<VersioningConfiguration>(&self.versioning_config_xml).map(|c| self.versioning_config = Some(c))
@@ -960,6 +983,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.replication_config = None;
         if !self.replication_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ReplicationConfiguration>(&self.replication_config_xml).map(|c| self.replication_config = Some(c))
@@ -1343,6 +1367,66 @@ mod test {
         // A re-parse must not resurrect them either.
         bm.parse_all_configs().expect("cleared tagging should parse");
         assert!(bm.tagging_config.is_none());
+    }
+
+    #[test]
+    fn delete_admission_configs_update_parsed_state_atomically() {
+        let mut bm = BucketMetadata::new("test-bucket");
+        let versioning_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        let replication_xml = b"<ReplicationConfiguration><Role>arn:aws:s3:::target-bucket</Role><Rule><ID>rule1</ID><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::target-bucket</Bucket></Destination></Rule></ReplicationConfiguration>";
+
+        bm.update_config(BUCKET_VERSIONING_CONFIG, versioning_xml.to_vec())
+            .expect("valid versioning config should update parsed state");
+        bm.update_config(BUCKET_REPLICATION_CONFIG, replication_xml.to_vec())
+            .expect("valid replication config should update parsed state");
+
+        assert!(bm.versioning_config.as_ref().is_some_and(VersioningConfiguration::enabled));
+        assert_eq!(
+            bm.replication_config.as_ref().map(|config| config.role.as_str()),
+            Some("arn:aws:s3:::target-bucket")
+        );
+
+        assert!(
+            bm.update_config(BUCKET_VERSIONING_CONFIG, b"<VersioningConfiguration>".to_vec())
+                .is_err()
+        );
+        assert!(
+            bm.update_config(BUCKET_REPLICATION_CONFIG, b"<ReplicationConfiguration>".to_vec())
+                .is_err()
+        );
+
+        assert_eq!(bm.versioning_config_xml, versioning_xml);
+        assert_eq!(bm.replication_config_xml, replication_xml);
+        assert!(bm.versioning_config.as_ref().is_some_and(VersioningConfiguration::enabled));
+        assert_eq!(
+            bm.replication_config.as_ref().map(|config| config.role.as_str()),
+            Some("arn:aws:s3:::target-bucket")
+        );
+
+        assert!(
+            bm.update_config(
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabld</Status></VersioningConfiguration>".to_vec(),
+            )
+            .is_err()
+        );
+        assert!(
+            bm.update_config(
+                BUCKET_REPLICATION_CONFIG,
+                b"<ReplicationConfiguration><Role>arn:aws:s3:::target-bucket</Role><Rule><ID>rule1</ID><Status>Enabld</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::target-bucket</Bucket></Destination></Rule></ReplicationConfiguration>".to_vec(),
+            )
+            .is_err()
+        );
+        assert_eq!(bm.versioning_config_xml, versioning_xml);
+        assert_eq!(bm.replication_config_xml, replication_xml);
+
+        bm.versioning_config_xml = b"<VersioningConfiguration>".to_vec();
+        bm.replication_config_xml = b"<ReplicationConfiguration>".to_vec();
+        bm.parse_all_configs()
+            .expect("bulk config parsing reports malformed fields through cleared typed state");
+
+        assert!(bm.versioning_config.is_none());
+        assert!(bm.replication_config.is_none());
     }
 
     #[tokio::test]

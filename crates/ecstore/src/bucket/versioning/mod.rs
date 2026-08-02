@@ -19,6 +19,9 @@ pub trait VersioningApi {
     fn enabled(&self) -> bool;
     fn prefix_enabled(&self, prefix: &str) -> bool;
     fn prefix_suspended(&self, prefix: &str) -> bool;
+    fn delete_state(&self, prefix: &str) -> (bool, bool) {
+        (self.prefix_enabled(prefix), self.suspended())
+    }
     fn versioned(&self, prefix: &str) -> bool;
     fn suspended(&self) -> bool;
 }
@@ -90,5 +93,62 @@ impl VersioningApi for VersioningConfiguration {
     }
     fn suspended(&self) -> bool {
         self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix};
+
+    use super::*;
+
+    struct LegacyVersioning;
+
+    impl VersioningApi for LegacyVersioning {
+        fn enabled(&self) -> bool {
+            false
+        }
+
+        fn prefix_enabled(&self, _prefix: &str) -> bool {
+            false
+        }
+
+        fn prefix_suspended(&self, _prefix: &str) -> bool {
+            false
+        }
+
+        fn versioned(&self, _prefix: &str) -> bool {
+            false
+        }
+
+        fn suspended(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn delete_state_has_a_backward_compatible_default() {
+        assert_eq!(LegacyVersioning.delete_state("object"), (false, false));
+    }
+
+    #[test]
+    fn delete_state_treats_excluded_prefixes_as_unversioned() {
+        let config = VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            excluded_prefixes: Some(vec![ExcludedPrefix {
+                prefix: Some("archive/".to_string()),
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(config.delete_state("archive/object"), (false, false));
+        assert!(config.prefix_suspended("archive/object"));
+        assert_eq!(config.delete_state("live/object"), (true, false));
+
+        let suspended = VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+            ..Default::default()
+        };
+        assert_eq!(suspended.delete_state("archive/object"), (false, true));
     }
 }

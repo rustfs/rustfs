@@ -1027,7 +1027,6 @@ impl BucketMetadataSys {
     /// server's metadata never leaks into the ambient (first) instance.
     pub(crate) async fn persist_and_set(&self, bm: BucketMetadata) -> Result<()> {
         let mut bm = bm;
-
         bm.save_with_store(self.api.clone()).await?;
 
         self.set(bm.name.clone(), Arc::new(bm)).await;
@@ -1221,7 +1220,9 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = &bm.versioning_config {
+        if !bm.versioning_config_xml.is_empty() && bm.versioning_config.is_none() {
+            Err(Error::other("persisted bucket versioning configuration is invalid"))
+        } else if let Some(config) = &bm.versioning_config {
             Ok((config.clone(), bm.versioning_config_updated_at))
         } else {
             Ok((VersioningConfiguration::default(), bm.versioning_config_updated_at))
@@ -1407,7 +1408,9 @@ impl BucketMetadataSys {
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if let Some(config) = &bm.replication_config {
+        if !bm.replication_config_xml.is_empty() && bm.replication_config.is_none() {
+            Err(Error::other("persisted bucket replication configuration is invalid"))
+        } else if let Some(config) = &bm.replication_config {
             Ok((config.clone(), bm.replication_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
@@ -1480,6 +1483,28 @@ mod tests {
     use crate::bucket::target::{BucketTarget, BucketTargetType, Credentials};
     use serial_test::serial;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn malformed_delete_configs_are_not_treated_as_absent() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "malformed-delete-config";
+        let mut metadata = BucketMetadata::new(bucket);
+        metadata.versioning_config_xml = b"<VersioningConfiguration>".to_vec();
+        metadata.versioning_config = None;
+        metadata.replication_config_xml = b"<ReplicationConfiguration>".to_vec();
+        metadata.replication_config = None;
+        sys.set(bucket.to_string(), Arc::new(metadata)).await;
+
+        assert!(
+            sys.get_versioning_config(bucket).await.is_err(),
+            "malformed versioning metadata must block destructive requests"
+        );
+        assert!(
+            sys.get_replication_config(bucket).await.is_err(),
+            "malformed replication metadata must not be reported as ConfigNotFound"
+        );
+    }
 
     /// Concurrent cache misses for one bucket must collapse into a single disk
     /// load.

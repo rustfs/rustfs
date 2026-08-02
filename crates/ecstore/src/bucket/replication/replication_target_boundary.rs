@@ -35,6 +35,8 @@ use time::format_description::well_known::Rfc3339;
 pub(crate) use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
+#[cfg(test)]
+pub(crate) use crate::bucket::target::BucketTarget;
 pub(crate) use crate::bucket::target::BucketTargets;
 
 use super::replication_config_store::ReplicationConfigStore;

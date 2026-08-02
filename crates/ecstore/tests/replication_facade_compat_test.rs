@@ -15,6 +15,8 @@
 mod storage_api;
 
 use s3s::dto::ReplicationConfiguration;
+use std::future::Future;
+use storage_api::contract_compat::{Error, ObjectInfo, ObjectOptions, ObjectToDelete};
 use storage_api::replication_compat::{
     BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
     ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, ReplicationObjectBridge,
@@ -33,6 +35,8 @@ fn type_name_unsized<T: ?Sized>() -> &'static str {
 }
 
 fn assert_replication_config_ext<T: ReplicationConfigurationExt>() {}
+
+fn assert_strict_delete_future<F: Future<Output = Result<ReplicateDecision, Error>>>(_: &F) {}
 
 #[test]
 fn replication_facade_exports_config_extension_contract() {
@@ -58,6 +62,13 @@ fn replication_facade_exports_runtime_and_dto_types() {
     assert!(type_name::<DeletedObjectReplicationInfo>().contains("DeletedObjectReplicationInfo"));
     assert!(type_name::<ReplicationObjectBridge>().contains("ReplicationObjectBridge"));
     assert!(type_name_unsized::<DynReplicationPool>().contains("ReplicationPoolTrait"));
+
+    let object = ObjectToDelete::default();
+    let source = ObjectInfo::default();
+    let opts = ObjectOptions::default();
+    let future = ReplicationObjectBridge::check_delete_strict("bucket", &object, &source, &opts, None);
+    assert_strict_delete_future(&future);
+    assert!(!std::any::type_name_of_val(&future).is_empty());
 }
 
 #[test]

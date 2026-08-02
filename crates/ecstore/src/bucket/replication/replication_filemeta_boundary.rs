@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) use rustfs_filemeta::NULL_VERSION_ID;
 pub use rustfs_replication::{MrfOpKind, MrfReplicateEntry};
 pub(crate) use rustfs_replication::{
     REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL_DELETE, ReplicateTargetDecision, ReplicatedInfos,

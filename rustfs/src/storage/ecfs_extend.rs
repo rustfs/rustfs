@@ -12,19 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::StorageReplicationConfigExt as _;
-use super::{
-    StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
-};
+use super::{StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config};
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_api::ecfs_extend_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
-use crate::storage::storage_api::ecfs_extend_consumer::contract::{
-    bucket::{BucketOperations, BucketOptions},
-    object::ObjectToDelete,
-};
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -729,22 +723,6 @@ where
         }
     }
     Ok(())
-}
-
-pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
-    let (cfg, _created) = match get_bucket_replication_config(bucket).await {
-        Ok(replication_config) => replication_config,
-        Err(_err) => {
-            return false;
-        }
-    };
-
-    for object in objects {
-        if cfg.has_active_rules(&object.object_name, true) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Bucket validation cache to avoid repeated stat_volume() calls on every GET.
