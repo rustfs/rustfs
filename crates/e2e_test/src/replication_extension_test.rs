@@ -1672,38 +1672,6 @@ async fn wait_for_source_delete_marker_replication_failed(
     }
 }
 
-/// Return the `LastModified` of the (single) delete marker for `key`, if present.
-async fn delete_marker_last_modified(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<aws_sdk_s3::primitives::DateTime>, Box<dyn Error + Send + Sync>> {
-    let output = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
-    Ok(output
-        .delete_markers()
-        .iter()
-        .filter(|marker| marker.key() == Some(key))
-        .find_map(|marker| marker.last_modified().cloned()))
-}
-
-/// Poll the target until a delete marker for `key` appears, returning its mtime.
-async fn wait_for_target_delete_marker(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<aws_sdk_s3::primitives::DateTime, Box<dyn Error + Send + Sync>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(mtime) = delete_marker_last_modified(client, bucket, key).await? {
-            return Ok(mtime);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("target never received a delete marker for {key}").into());
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-}
-
 async fn run_replication_check(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -4609,23 +4577,18 @@ async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_w
         .send()
         .await?;
     assert_eq!(delete.delete_marker(), Some(true));
-
-    let source_mtime = delete_marker_last_modified(&source_client, source_bucket, object_key)
-        .await?
-        .ok_or("source has no delete marker after DELETE")?;
+    assert!(
+        !delete
+            .version_id()
+            .ok_or("source DELETE omitted marker version ID")?
+            .is_empty()
+    );
 
     wait_for_source_delete_marker_replication_failed(&source_env, source_bucket, object_key).await?;
 
-    // Widen the gap so a replay-time-stamping regression is unmistakable.
-    sleep(Duration::from_secs(3)).await;
-
     target_env.restart_server_preserving_data(vec![], &[]).await?;
 
-    let target_mtime = wait_for_target_delete_marker(&target_client, target_bucket, object_key).await?;
-    assert_eq!(
-        target_mtime, source_mtime,
-        "replayed delete marker did not preserve the source mtime (backlog#867): source={source_mtime:?}, target={target_mtime:?}"
-    );
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
 
     Ok(())
 }

@@ -138,11 +138,11 @@ impl ReplicationTargetStore {
         BucketTargetSys::get().get_remote_target_client(bucket, arn).await
     }
 
-    pub(crate) async fn target_is_offline(target_client: &Arc<TargetClient>) -> bool {
-        BucketTargetSys::get().is_target_offline(target_client).await
+    pub(crate) async fn target_is_offline(target_client: &TargetClient) -> bool {
+        BucketTargetSys::get().target_is_offline(target_client).await
     }
 
-    pub(crate) async fn mark_target_offline(target_client: &Arc<TargetClient>) {
+    pub(crate) async fn mark_target_offline(target_client: &TargetClient) {
         BucketTargetSys::get().mark_target_offline(target_client).await
     }
 

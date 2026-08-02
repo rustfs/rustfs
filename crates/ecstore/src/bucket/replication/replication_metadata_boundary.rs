@@ -32,6 +32,7 @@ pub(crate) struct ReplicationMetadataStore;
 
 impl ReplicationMetadataStore {
     pub(crate) const MRF_REPLICATION_FILE: &'static str = "config/replication/mrf.bin";
+    pub(crate) const TARGETED_MRF_REPLICATION_FILE: &'static str = "config/replication/mrf-targeted-v2.bin";
 
     pub(crate) async fn replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
         metadata_sys::get_replication_config(bucket).await
@@ -109,5 +110,9 @@ mod tests {
             "buckets/bucket-a/.replication/resync.bin"
         );
         assert_eq!(ReplicationMetadataStore::MRF_REPLICATION_FILE, "config/replication/mrf.bin");
+        assert_eq!(
+            ReplicationMetadataStore::TARGETED_MRF_REPLICATION_FILE,
+            "config/replication/mrf-targeted-v2.bin"
+        );
     }
 }

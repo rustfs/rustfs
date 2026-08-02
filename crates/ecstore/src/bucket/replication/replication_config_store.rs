@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::replication_error_boundary::Result;
+use super::replication_error_boundary::{Error, Result};
 use super::replication_storage_boundary::ReplicationObjectIO;
 use crate::config::{com, storageclass};
+use crate::storage_api_contracts::object::HTTPPreconditions;
+use rustfs_lock::distributed_lock::LockLostSignal;
 use std::sync::Arc;
 
 pub(crate) struct ReplicationConfigStore;
@@ -30,10 +32,59 @@ impl ReplicationConfigStore {
         com::read_config(api, file).await
     }
 
+    pub(crate) async fn read_preserve_empty<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::read_config_preserve_empty(api, file).await
+    }
+
     pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
     where
         S: ReplicationObjectIO,
     {
         com::save_config(api, file, data).await
+    }
+
+    pub(crate) async fn read_no_lock<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, String)>
+    where
+        S: ReplicationObjectIO,
+    {
+        let (data, object_info) = com::read_config_no_lock_preserve_empty_with_metadata(api, file).await?;
+        let etag = object_info
+            .etag
+            .filter(|etag| !etag.trim().is_empty())
+            .ok_or_else(|| Error::other("persisted MRF file has no ETag"))?;
+        Ok((data, etag))
+    }
+
+    pub(crate) async fn save_conditional<S>(
+        api: Arc<S>,
+        file: &str,
+        data: Vec<u8>,
+        expected_etag: Option<String>,
+        lock_lost_signals: Vec<Arc<LockLostSignal>>,
+    ) -> Result<()>
+    where
+        S: ReplicationObjectIO,
+    {
+        let mut opts = crate::object_api::ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(match expected_etag {
+                Some(etag) => HTTPPreconditions {
+                    if_match: Some(etag),
+                    ..Default::default()
+                },
+                None => HTTPPreconditions {
+                    if_none_match: Some("*".to_string()),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        for signal in lock_lost_signals {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        com::save_config_with_opts(api, file, data, &opts).await
     }
 }

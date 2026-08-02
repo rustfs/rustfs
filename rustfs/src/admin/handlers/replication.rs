@@ -19,7 +19,6 @@ use crate::admin::runtime_sources::{
     AppContext, app_context_from_req, current_notification_system_for_context, current_replication_stats_handle_for_context,
     current_runtime_port, object_store_from_req,
 };
-use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
@@ -510,6 +509,9 @@ impl Operation for SetRemoteTargetHandler {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty".to_string()));
         }
         let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+        let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_lock(bucket)
+            .await
+            .map_err(ApiError::from)?;
 
         if update {
             let Some(mut target) = bucket_target_sys
@@ -554,14 +556,12 @@ impl Operation for SetRemoteTargetHandler {
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
         })?;
 
-        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        metadata_sys::update_bucket_targets_under_transaction_lock(&metadata_guard, bucket, json_targets)
             .await
             .map_err(|e| {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
-        bucket_target_sys.update_all_targets(bucket, Some(&targets)).await;
-
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
         // MinIO-compatible clients encrypt the request payload for this endpoint,
@@ -657,6 +657,9 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let sys = BucketTargetSys::get();
         let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+        let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_lock(bucket)
+            .await
+            .map_err(ApiError::from)?;
 
         let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
@@ -665,14 +668,12 @@ impl Operation for RemoveRemoteTargetHandler {
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
         })?;
 
-        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        metadata_sys::update_bucket_targets_under_transaction_lock(&metadata_guard, bucket, json_targets)
             .await
             .map_err(|e| {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
-        sys.update_all_targets(bucket, Some(&targets)).await;
-
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
 }
@@ -1124,7 +1125,10 @@ mod tests {
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    source_mod_time: None,
+                    enqueued_order: None,
                     target_arns: vec!["arn-a".to_string(), "arn-durable-only".to_string()],
+                    target_delete_marker_version_id: None,
                 },
                 MrfReplicateEntry {
                     bucket: "other-bucket".to_string(),
@@ -1137,7 +1141,10 @@ mod tests {
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    source_mod_time: None,
+                    enqueued_order: None,
                     target_arns: Vec::new(),
+                    target_delete_marker_version_id: None,
                 },
             ],
         };
@@ -1196,7 +1203,10 @@ mod tests {
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
+                source_mod_time: None,
+                enqueued_order: None,
                 target_arns: Vec::new(),
+                target_delete_marker_version_id: None,
             }],
         };
 

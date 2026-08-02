@@ -162,6 +162,59 @@ fn map_upload_id_metadata_error(bucket: &str, object: &str, upload_id: &str, err
     err.into()
 }
 
+fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
+    let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) else {
+        if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) {
+            return Err(Error::other("invalid multipart bucket incarnation metadata"));
+        }
+        return Ok(None);
+    };
+    let incarnation = Uuid::parse_str(value).map_err(|_| Error::other("invalid multipart bucket incarnation metadata"))?;
+    if incarnation.is_nil() {
+        return Err(Error::other("invalid multipart bucket incarnation metadata"));
+    }
+    Ok(Some(incarnation))
+}
+
+fn multipart_bucket_incarnation_matches(metadata: &HashMap<String, String>, expected: Uuid) -> bool {
+    matches!(multipart_bucket_incarnation_id(metadata), Ok(Some(actual)) if actual == expected)
+}
+
+fn ensure_multipart_bucket_incarnation(
+    metadata: &HashMap<String, String>,
+    bucket: &str,
+    object: &str,
+    upload_id: &str,
+    expected: Option<Uuid>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if multipart_bucket_incarnation_matches(metadata, expected) {
+        return Ok(());
+    }
+    Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+}
+
+fn ensure_multipart_bucket_lifecycle_lock_held(bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    let Some(fence) = opts.bucket_lifecycle_lock_fence.as_ref() else {
+        if opts.expected_bucket_incarnation_id.is_some() && !crate::bucket::utils::is_meta_bucketname(bucket) {
+            return Err(Error::other("multipart bucket lifecycle lock fence is missing"));
+        }
+        return Ok(());
+    };
+    if fence.is_lock_lost() {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "multipart_bucket_generation",
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
 fn empty_upload_fallback_possible(successful_responses: usize, errs: &[Option<DiskError>]) -> bool {
     successful_responses == 0
         && errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound)))
@@ -451,6 +504,200 @@ impl SetDisks {
 
         Ok((fi, parts_metadata))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_multipart_uploads_for_incarnation(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Result<ListMultipartsInfo> {
+        let disks = self.disks.read().await.clone();
+        if disks.is_empty() {
+            return Err(Error::ErasureReadQuorum);
+        }
+        let discovery_quorum = if self.default_parity_count == 0 {
+            disks.len()
+        } else {
+            (disks.len() / 2).max(1)
+        };
+        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
+        let mut candidate_counts = HashMap::<String, usize>::new();
+        let mut discovery_tasks = JoinSet::new();
+        for (index, disk) in disks.iter().enumerate() {
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            discovery_tasks.spawn(async move {
+                let result = match disk {
+                    Some(disk) => multipart_upload_paths_on_disk(disk, &bucket).await,
+                    None => Err(DiskError::DiskNotFound),
+                };
+                (index, result)
+            });
+        }
+
+        while let Some(task_result) = discovery_tasks.join_next().await {
+            let Ok((index, result)) = task_result else {
+                continue;
+            };
+            match result {
+                Ok(paths) => {
+                    discovery_errors[index] = None;
+                    for path in paths {
+                        *candidate_counts.entry(path).or_insert(0) += 1;
+                    }
+                }
+                Err(err) => discovery_errors[index] = Some(err),
+            }
+        }
+
+        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        }
+
+        let candidate_paths = candidate_counts
+            .into_iter()
+            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
+            .collect::<Vec<_>>();
+        let listed_uploads = stream::iter(candidate_paths)
+            .map(|upload_path| {
+                let disks = &disks;
+                async move {
+                    let (sha_dir, raw_upload_id) = upload_path
+                        .rsplit_once('/')
+                        .filter(|(sha_dir, upload_id)| !sha_dir.is_empty() && !upload_id.is_empty())
+                        .ok_or(DiskError::CorruptedFormat)?;
+                    let (parts_metadata, errs) = Self::read_all_fileinfo(
+                        disks,
+                        bucket,
+                        RUSTFS_META_MULTIPART_BUCKET,
+                        &upload_path,
+                        "",
+                        false,
+                        false,
+                        false,
+                    )
+                    .await?;
+                    let missing_metadata = errs
+                        .iter()
+                        .filter(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::VolumeNotFound)))
+                        .count();
+                    if missing_metadata >= discovery_quorum {
+                        if expected_incarnation_id.is_some() {
+                            return Ok(None);
+                        }
+                        // Completion moves the authoritative upload metadata into the
+                        // committed object before it removes the staging directory. A
+                        // crash in that window intentionally leaves a reclaimable
+                        // upload directory whose object name can still be proven for
+                        // an exact-key listing by matching the namespace hash.
+                        if !prefix.is_empty() && sha_dir == Self::get_multipart_sha_dir(bucket, prefix) {
+                            let initiated = raw_upload_id
+                                .rsplit_once('x')
+                                .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
+                                .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok());
+                            return Ok(Some(MultipartInfo {
+                                bucket: bucket.to_owned(),
+                                object: prefix.to_owned(),
+                                upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
+                                initiated,
+                                ..Default::default()
+                            }));
+                        }
+                        return Ok(None);
+                    }
+                    let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+                    let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+                    if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+                        return Err(err);
+                    }
+                    let (_, mod_time, etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
+                    let file_info = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, read_quorum)?;
+                    if expected_incarnation_id
+                        .is_some_and(|expected| !multipart_bucket_incarnation_matches(&file_info.metadata, expected))
+                    {
+                        return Ok(None);
+                    }
+
+                    let object = match (
+                        file_info.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
+                        file_info.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY),
+                    ) {
+                        (Some(stored_bucket), Some(object)) if stored_bucket == bucket && !object.is_empty() => object.clone(),
+                        _ => return Err(DiskError::CorruptedFormat),
+                    };
+                    if !object.starts_with(prefix) {
+                        return Ok(None);
+                    }
+
+                    let initiated = raw_upload_id
+                        .rsplit_once('x')
+                        .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
+                        .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok())
+                        .or(file_info.mod_time);
+
+                    Ok(Some(MultipartInfo {
+                        bucket: bucket.to_owned(),
+                        object,
+                        upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
+                        initiated,
+                        ..Default::default()
+                    }))
+                }
+            })
+            .buffer_unordered(MULTIPART_LIST_IO_CONCURRENCY)
+            .collect::<Vec<disk::error::Result<Option<MultipartInfo>>>>()
+            .await;
+
+        let mut uploads = Vec::with_capacity(listed_uploads.len());
+        for result in listed_uploads {
+            if let Some(upload) = result.map_err(Error::from)? {
+                uploads.push(upload);
+            }
+        }
+
+        let mut common_prefixes = HashSet::new();
+        let mut unfolded_uploads = Vec::with_capacity(uploads.len());
+        let delimiter_value = delimiter.as_deref().filter(|delimiter| !delimiter.is_empty());
+        for upload in uploads {
+            let Some(delimiter) = delimiter_value else {
+                unfolded_uploads.push(upload);
+                continue;
+            };
+            let suffix = upload.object.strip_prefix(prefix).ok_or(DiskError::CorruptedFormat)?;
+            if let Some((common_prefix, _)) = suffix.split_once(delimiter) {
+                common_prefixes.insert(format!("{prefix}{common_prefix}{delimiter}"));
+            } else {
+                unfolded_uploads.push(upload);
+            }
+        }
+
+        let page = paginate_multipart_listing(
+            unfolded_uploads,
+            common_prefixes.into_iter().collect(),
+            key_marker.as_deref(),
+            key_marker.as_ref().and(upload_id_marker.as_deref()),
+            max_uploads,
+            false,
+        );
+
+        Ok(ListMultipartsInfo {
+            key_marker: key_marker.to_owned(),
+            upload_id_marker: upload_id_marker.to_owned(),
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
+            max_uploads,
+            is_truncated: page.is_truncated,
+            uploads: page.uploads,
+            common_prefixes: page.common_prefixes,
+            prefix: prefix.to_owned(),
+            delimiter: delimiter.to_owned(),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -498,6 +745,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
@@ -747,7 +995,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         .await?,
                 )
             };
-            self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+            let (commit_fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+            ensure_multipart_bucket_incarnation(
+                &commit_fi.metadata,
+                bucket,
+                object,
+                upload_id,
+                opts.expected_bucket_incarnation_id,
+            )?;
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
             if _upload_commit_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
@@ -759,6 +1014,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     achieved: 0,
                 });
             }
+            ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
             let _ = self
                 .rename_part(
@@ -820,6 +1076,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_read_lock("list_object_parts", bucket, object, upload_id, opts)
             .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
 
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
@@ -927,6 +1184,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num).unwrap_or_default();
         }
 
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         Ok(ret)
     }
 
@@ -940,179 +1198,44 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        let disks = self.disks.read().await.clone();
-        if disks.is_empty() {
-            return Err(Error::ErasureReadQuorum);
-        }
-        let discovery_quorum = if self.default_parity_count == 0 {
-            disks.len()
+        let bucket_lifecycle_guard = if crate::bucket::utils::is_meta_bucketname(bucket) {
+            None
         } else {
-            (disks.len() / 2).max(1)
+            Some(
+                metadata_sys::object_store_in(&self.ctx)
+                    .await?
+                    .acquire_bucket_lifecycle_read_lock(bucket)
+                    .await?,
+            )
         };
-        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
-        let mut candidate_counts = HashMap::<String, usize>::new();
-        let mut discovery_tasks = JoinSet::new();
-        for (index, disk) in disks.iter().enumerate() {
-            let disk = disk.clone();
-            let bucket = bucket.to_string();
-            discovery_tasks.spawn(async move {
-                let result = match disk {
-                    Some(disk) => multipart_upload_paths_on_disk(disk, &bucket).await,
-                    None => Err(DiskError::DiskNotFound),
-                };
-                (index, result)
+        let expected_incarnation_id = if bucket_lifecycle_guard.is_some() {
+            Some(metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?)
+        } else {
+            None
+        };
+        let result = self
+            .list_multipart_uploads_for_incarnation(
+                bucket,
+                prefix,
+                key_marker,
+                upload_id_marker,
+                delimiter,
+                max_uploads,
+                expected_incarnation_id,
+            )
+            .await;
+
+        if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "multipart_bucket_generation",
+                bucket: bucket.to_string(),
+                object: prefix.to_string(),
+                required: 1,
+                achieved: 0,
             });
         }
 
-        while let Some(task_result) = discovery_tasks.join_next().await {
-            let Ok((index, result)) = task_result else {
-                continue;
-            };
-            match result {
-                Ok(paths) => {
-                    discovery_errors[index] = None;
-                    for path in paths {
-                        *candidate_counts.entry(path).or_insert(0) += 1;
-                    }
-                }
-                Err(err) => discovery_errors[index] = Some(err),
-            }
-        }
-
-        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        let candidate_paths = candidate_counts
-            .into_iter()
-            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
-            .collect::<Vec<_>>();
-        let listed_uploads = stream::iter(candidate_paths)
-            .map(|upload_path| {
-                let disks = &disks;
-                async move {
-                    let (sha_dir, raw_upload_id) = upload_path
-                        .rsplit_once('/')
-                        .filter(|(sha_dir, upload_id)| !sha_dir.is_empty() && !upload_id.is_empty())
-                        .ok_or(DiskError::CorruptedFormat)?;
-                    let (parts_metadata, errs) = Self::read_all_fileinfo(
-                        disks,
-                        bucket,
-                        RUSTFS_META_MULTIPART_BUCKET,
-                        &upload_path,
-                        "",
-                        false,
-                        false,
-                        false,
-                    )
-                    .await?;
-                    let missing_metadata = errs
-                        .iter()
-                        .filter(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::VolumeNotFound)))
-                        .count();
-                    if missing_metadata >= discovery_quorum {
-                        // Completion moves the authoritative upload metadata into the
-                        // committed object before it removes the staging directory. A
-                        // crash in that window intentionally leaves a reclaimable
-                        // upload directory whose object name can still be proven for
-                        // an exact-key listing by matching the namespace hash.
-                        if !prefix.is_empty() && sha_dir == Self::get_multipart_sha_dir(bucket, prefix) {
-                            let initiated = raw_upload_id
-                                .rsplit_once('x')
-                                .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
-                                .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok());
-                            return Ok(Some(MultipartInfo {
-                                bucket: bucket.to_owned(),
-                                object: prefix.to_owned(),
-                                upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
-                                initiated,
-                                ..Default::default()
-                            }));
-                        }
-                        return Ok(None);
-                    }
-                    let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
-                    let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
-                    if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
-                        return Err(err);
-                    }
-                    let (_, mod_time, etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
-                    let file_info = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, read_quorum)?;
-
-                    let object = match (
-                        file_info.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
-                        file_info.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY),
-                    ) {
-                        (Some(stored_bucket), Some(object)) if stored_bucket == bucket && !object.is_empty() => object.clone(),
-                        _ => return Err(DiskError::CorruptedFormat),
-                    };
-                    if !object.starts_with(prefix) {
-                        return Ok(None);
-                    }
-
-                    let initiated = raw_upload_id
-                        .rsplit_once('x')
-                        .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
-                        .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok())
-                        .or(file_info.mod_time);
-
-                    Ok(Some(MultipartInfo {
-                        bucket: bucket.to_owned(),
-                        object,
-                        upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
-                        initiated,
-                        ..Default::default()
-                    }))
-                }
-            })
-            .buffer_unordered(MULTIPART_LIST_IO_CONCURRENCY)
-            .collect::<Vec<disk::error::Result<Option<MultipartInfo>>>>()
-            .await;
-
-        let mut uploads = Vec::with_capacity(listed_uploads.len());
-        for result in listed_uploads {
-            if let Some(upload) = result.map_err(Error::from)? {
-                uploads.push(upload);
-            }
-        }
-
-        let mut common_prefixes = HashSet::new();
-        let mut unfolded_uploads = Vec::with_capacity(uploads.len());
-        let delimiter_value = delimiter.as_deref().filter(|delimiter| !delimiter.is_empty());
-        for upload in uploads {
-            let Some(delimiter) = delimiter_value else {
-                unfolded_uploads.push(upload);
-                continue;
-            };
-            let suffix = upload.object.strip_prefix(prefix).ok_or(DiskError::CorruptedFormat)?;
-            if let Some((common_prefix, _)) = suffix.split_once(delimiter) {
-                common_prefixes.insert(format!("{prefix}{common_prefix}{delimiter}"));
-            } else {
-                unfolded_uploads.push(upload);
-            }
-        }
-
-        let page = paginate_multipart_listing(
-            unfolded_uploads,
-            common_prefixes.into_iter().collect(),
-            key_marker.as_deref(),
-            key_marker.as_ref().and(upload_id_marker.as_deref()),
-            max_uploads,
-            false,
-        );
-
-        Ok(ListMultipartsInfo {
-            key_marker: key_marker.to_owned(),
-            upload_id_marker: upload_id_marker.to_owned(),
-            next_key_marker: page.next_key_marker,
-            next_upload_id_marker: page.next_upload_id_marker,
-            max_uploads,
-            is_truncated: page.is_truncated,
-            uploads: page.uploads,
-            common_prefixes: page.common_prefixes,
-            prefix: prefix.to_owned(),
-            delimiter: delimiter.to_owned(),
-        })
+        result
     }
 
     #[tracing::instrument(skip(self))]
@@ -1225,6 +1348,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         user_defined.insert(RUSTFS_MULTIPART_BUCKET_KEY.to_string(), bucket.to_string());
         user_defined.insert(RUSTFS_MULTIPART_OBJECT_KEY.to_string(), object.to_string());
+        if let Some(incarnation_id) = opts.expected_bucket_incarnation_id {
+            insert_str(&mut user_defined, SUFFIX_BUCKET_INCARNATION_ID, incarnation_id.to_string());
+        }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
         let mod_time = opts.mod_time.unwrap_or_else(OffsetDateTime::now_utc);
@@ -1243,6 +1369,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         Self::write_unique_file_info(
             &shuffle_disks,
             bucket,
@@ -1278,6 +1405,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .check_upload_id_exists(bucket, object, upload_id, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
+        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
         Ok(MultipartInfo {
             bucket: bucket.to_owned(),
@@ -1297,6 +1426,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         self.delete_all_with_quorum(
@@ -1348,6 +1479,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        ensure_multipart_bucket_incarnation(&fi.metadata, bucket, object, upload_id, opts.expected_bucket_incarnation_id)?;
         let has_layout_candidate = range_seek_rollout_enabled
             && fi
                 .data_dir
@@ -1786,6 +1918,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 achieved: 0,
             });
         }
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
         self.require_current_restore_operation_id(
             bucket,
@@ -1978,6 +2111,65 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
+
+    #[test]
+    fn multipart_bucket_incarnation_metadata_is_consistent_and_non_nil() {
+        let incarnation = Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_BUCKET_INCARNATION_ID, incarnation.to_string());
+        assert_eq!(multipart_bucket_incarnation_id(&metadata).unwrap(), Some(incarnation));
+
+        metadata.insert("x-minio-internal-bucket-incarnation-id".to_string(), Uuid::new_v4().to_string());
+        assert!(multipart_bucket_incarnation_id(&metadata).is_err());
+
+        let mut nil_metadata = HashMap::new();
+        insert_str(&mut nil_metadata, SUFFIX_BUCKET_INCARNATION_ID, Uuid::nil().to_string());
+        assert!(multipart_bucket_incarnation_id(&nil_metadata).is_err());
+    }
+
+    #[test]
+    fn multipart_bucket_incarnation_gate_rejects_missing_or_stale_uploads() {
+        let expected = Uuid::new_v4();
+        let stale = Uuid::new_v4();
+        let mut current_metadata = HashMap::new();
+        insert_str(&mut current_metadata, SUFFIX_BUCKET_INCARNATION_ID, expected.to_string());
+        assert!(multipart_bucket_incarnation_matches(&current_metadata, expected));
+
+        let missing_metadata = HashMap::new();
+        assert!(!multipart_bucket_incarnation_matches(&missing_metadata, expected));
+        assert!(matches!(
+            ensure_multipart_bucket_incarnation(&missing_metadata, "bucket", "object", "upload", Some(expected)),
+            Err(StorageError::InvalidUploadID(..))
+        ));
+
+        let mut stale_metadata = HashMap::new();
+        insert_str(&mut stale_metadata, SUFFIX_BUCKET_INCARNATION_ID, stale.to_string());
+        assert!(!multipart_bucket_incarnation_matches(&stale_metadata, expected));
+        assert!(matches!(
+            ensure_multipart_bucket_incarnation(&stale_metadata, "bucket", "object", "upload", Some(expected)),
+            Err(StorageError::InvalidUploadID(..))
+        ));
+    }
+
+    #[test]
+    fn multipart_commit_rejects_missing_or_lost_bucket_lifecycle_fence() {
+        let expected = Uuid::new_v4();
+        let missing = ObjectOptions {
+            expected_bucket_incarnation_id: Some(expected),
+            ..Default::default()
+        };
+        assert!(ensure_multipart_bucket_lifecycle_lock_held("bucket", "object", &missing).is_err());
+
+        let lost = ObjectOptions {
+            expected_bucket_incarnation_id: Some(expected),
+            bucket_lifecycle_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ensure_multipart_bucket_lifecycle_lock_held("bucket", "object", &lost),
+            Err(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
+    }
 
     struct SetupTypeGuard {
         previous: SetupType,
@@ -3721,7 +3913,7 @@ mod tests {
         // A single page must never return more than max_uploads entries.
         let max_uploads = 2usize;
         let page = set_disks
-            .list_multipart_uploads(bucket, object, None, None, None, max_uploads)
+            .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, max_uploads, None)
             .await
             .expect("list should succeed");
         assert_eq!(
@@ -3738,7 +3930,7 @@ mod tests {
 
         // Exact boundary: max_uploads == total must not falsely report truncation.
         let exact = set_disks
-            .list_multipart_uploads(bucket, object, None, None, None, total)
+            .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, total, None)
             .await
             .expect("list should succeed");
         assert_eq!(exact.uploads.len(), total, "exact boundary must return every upload");
@@ -3756,7 +3948,15 @@ mod tests {
         let mut pages = 0usize;
         loop {
             let page = set_disks
-                .list_multipart_uploads(bucket, object, key_marker.clone(), upload_id_marker.clone(), None, 1)
+                .list_multipart_uploads_for_incarnation(
+                    bucket,
+                    object,
+                    key_marker.clone(),
+                    upload_id_marker.clone(),
+                    None,
+                    1,
+                    None,
+                )
                 .await
                 .expect("list should succeed");
             assert!(page.uploads.len() <= 1, "max_uploads=1 must never return more than one upload");
@@ -3802,7 +4002,7 @@ mod tests {
         expected.sort();
 
         let all = set_disks
-            .list_multipart_uploads(bucket, "", None, None, None, 1000)
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
             .await
             .expect("bucket-wide multipart listing should succeed");
         let listed = all
@@ -3814,14 +4014,14 @@ mod tests {
         assert!(!all.is_truncated);
 
         let logs = set_disks
-            .list_multipart_uploads(bucket, "logs/", None, None, None, 1000)
+            .list_multipart_uploads_for_incarnation(bucket, "logs/", None, None, None, 1000, None)
             .await
             .expect("prefix multipart listing should succeed");
         assert_eq!(logs.uploads.len(), 3);
         assert!(logs.uploads.iter().all(|upload| upload.object.starts_with("logs/")));
 
         let exact = set_disks
-            .list_multipart_uploads(bucket, "logs/a.bin", None, None, None, 1000)
+            .list_multipart_uploads_for_incarnation(bucket, "logs/a.bin", None, None, None, 1000, None)
             .await
             .expect("exact-key multipart listing should remain supported");
         assert_eq!(exact.uploads.len(), 2);
@@ -3851,7 +4051,15 @@ mod tests {
         let mut listed = Vec::new();
         for _ in 0..expected.len() {
             let page = set_disks
-                .list_multipart_uploads(bucket, "logs/", key_marker.clone(), upload_id_marker.clone(), None, 1)
+                .list_multipart_uploads_for_incarnation(
+                    bucket,
+                    "logs/",
+                    key_marker.clone(),
+                    upload_id_marker.clone(),
+                    None,
+                    1,
+                    None,
+                )
                 .await
                 .expect("multipart page should succeed");
             assert_eq!(page.uploads.len(), 1);
@@ -3868,7 +4076,7 @@ mod tests {
         assert_eq!(listed, expected);
 
         let key_only = set_disks
-            .list_multipart_uploads(bucket, "logs/", Some("logs/a.bin".to_string()), None, None, 1000)
+            .list_multipart_uploads_for_incarnation(bucket, "logs/", Some("logs/a.bin".to_string()), None, None, 1000, None)
             .await
             .expect("key-only marker should succeed");
         assert_eq!(
@@ -3881,7 +4089,7 @@ mod tests {
         );
 
         let upload_only = set_disks
-            .list_multipart_uploads(bucket, "logs/", None, Some(expected[0].1.clone()), None, 1000)
+            .list_multipart_uploads_for_incarnation(bucket, "logs/", None, Some(expected[0].1.clone()), None, 1000, None)
             .await
             .expect("an upload marker without a key marker should be ignored");
         assert_eq!(upload_only.uploads.len(), expected.len());
@@ -3909,7 +4117,7 @@ mod tests {
         }
 
         let first = set_disks
-            .list_multipart_uploads(bucket, "logs/", None, None, Some("/".to_string()), 2)
+            .list_multipart_uploads_for_incarnation(bucket, "logs/", None, None, Some("/".to_string()), 2, None)
             .await
             .expect("delimiter multipart listing should succeed");
         assert_eq!(first.uploads.len(), 1);
@@ -3920,13 +4128,14 @@ mod tests {
         assert!(first.next_upload_id_marker.is_none());
 
         let second = set_disks
-            .list_multipart_uploads(
+            .list_multipart_uploads_for_incarnation(
                 bucket,
                 "logs/",
                 first.next_key_marker,
                 first.next_upload_id_marker,
                 Some("/".to_string()),
                 2,
+                None,
             )
             .await
             .expect("delimiter continuation should succeed");
@@ -3936,12 +4145,54 @@ mod tests {
         assert!(!second.is_truncated);
 
         let exact_boundary = set_disks
-            .list_multipart_uploads(bucket, "logs/", None, None, Some("/".to_string()), 4)
+            .list_multipart_uploads_for_incarnation(bucket, "logs/", None, None, Some("/".to_string()), 4, None)
             .await
             .expect("delimiter exact boundary should succeed");
         assert_eq!(exact_boundary.uploads.len(), 2);
         assert_eq!(exact_boundary.common_prefixes.len(), 2);
         assert!(!exact_boundary.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_hides_uploads_from_another_incarnation() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-incarnation-list-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let incarnation = Uuid::new_v4();
+        let (fence, _loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let current = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    bucket_lifecycle_lock_fence: Some(fence),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("current multipart upload should be created");
+        set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("legacy multipart upload should be created");
+
+        let unscoped = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, 1000, None)
+            .await
+            .expect("unscoped multipart listing should succeed");
+        assert_eq!(unscoped.uploads.len(), 2);
+
+        let scoped = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, 1000, Some(incarnation))
+            .await
+            .expect("incarnation-scoped multipart listing should succeed");
+        assert_eq!(scoped.uploads.len(), 1);
+        assert_eq!(scoped.uploads[0].upload_id, current.upload_id);
     }
 
     /// Recursively collect every file named `file_name` under the multipart
@@ -4425,7 +4676,7 @@ mod tests {
 
         async fn upload_is_listed(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, upload_id: &str) -> bool {
             let page = set_disks
-                .list_multipart_uploads(bucket, object, None, None, None, 1000)
+                .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, 1000, None)
                 .await
                 .expect("listing multipart uploads should succeed");
             page.uploads.iter().any(|u| u.upload_id == upload_id)

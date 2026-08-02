@@ -538,6 +538,7 @@ impl SetDisks {
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
             || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
     }
 
     fn update_hash_quorum_metadata_map(hasher: &mut Sha256, entries: &HashMap<String, String>) {
@@ -1413,5 +1414,30 @@ mod tests {
         let (fallback_disks, fallback_parts) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
         assert!(fallback_disks.iter().any(Option::is_none));
         assert!(fallback_parts.iter().any(|part| !part.is_valid()));
+    }
+
+    #[test]
+    fn target_delete_marker_version_metadata_is_excluded_from_quorum_hash() {
+        let suffix = "replication-delete-marker-version-arn:rustfs:replication::target:bucket";
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::RUSTFS_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::MINIO_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-unrelated"));
+
+        let mut left = metadata_quorum_test_fileinfo(OffsetDateTime::now_utc(), 1);
+        let mut right = left.clone();
+        left.metadata
+            .insert(format!("{}{}", http::RUSTFS_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        right
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-b".to_string());
+        assert_eq!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
     }
 }

@@ -348,10 +348,19 @@ pub(crate) async fn enqueue_runtime_newer_noncurrent(
     event: Event,
     src: &LcEventSrc,
 ) -> bool {
-    ecstore_expiry_state_handle()
-        .write()
-        .await
-        .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
+    let Some(store) = ecstore_resolve_object_store_handle() else {
+        return false;
+    };
+    let Ok(bucket_incarnation_id) = store.bucket_incarnation_id(bucket).await else {
+        return false;
+    };
+    ecstore_expiry_state_handle().write().await.enqueue_by_newer_noncurrent(
+        bucket,
+        to_delete_objs,
+        event,
+        src,
+        bucket_incarnation_id,
+    )
 }
 
 pub(crate) async fn queue_replication_heal(

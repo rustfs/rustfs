@@ -73,6 +73,9 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: vec!["arn:target-a".to_string()],
+                target_delete_marker_version_id: None,
+                source_mod_time: None,
+                enqueued_order: None,
             },
             MrfReplicateEntry {
                 bucket: "bucket-a".to_string(),
@@ -86,6 +89,9 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
+                target_delete_marker_version_id: None,
+                source_mod_time: None,
+                enqueued_order: None,
             },
             MrfReplicateEntry {
                 bucket: "bucket-a".to_string(),
@@ -99,6 +105,9 @@ mod tests {
                 delete_marker: true,
                 delete_marker_mtime: Some(1_705_312_200_123_456_789),
                 target_arns: vec!["arn:target-a".to_string()],
+                target_delete_marker_version_id: Some("opaque-target-version".to_string()),
+                source_mod_time: None,
+                enqueued_order: None,
             },
         ];
 
@@ -119,6 +128,7 @@ mod tests {
         assert_eq!(decoded[2].op, MrfOpKind::Delete);
         assert!(decoded[2].force_delete);
         assert_eq!(decoded[2].target_arns, vec!["arn:target-a".to_string()]);
+        assert_eq!(decoded[2].target_delete_marker_version_id.as_deref(), Some("opaque-target-version"));
         assert!(decoded[2].delete_marker);
         assert_eq!(
             decoded[2].delete_marker_mtime,
@@ -159,6 +169,41 @@ mod tests {
         // Old files lack the deleteMarkerMtime key; it must default to None so replay keeps the
         // pre-#867 fallback to the current time.
         assert_eq!(decoded[0].delete_marker_mtime, None);
+        assert_eq!(decoded[0].target_delete_marker_version_id, None);
+    }
+
+    #[test]
+    fn older_mrf_reader_ignores_target_delete_marker_version_id() {
+        #[derive(serde::Deserialize)]
+        struct LegacyMrfEntry {
+            bucket: String,
+            object: String,
+            #[serde(rename = "retryCount")]
+            retry_count: i32,
+        }
+
+        let entry = MrfReplicateEntry {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 0,
+            op: MrfOpKind::Delete,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            delete_marker_mtime: None,
+            target_arns: vec!["arn:target".to_string()],
+            target_delete_marker_version_id: Some("opaque-target-version".to_string()),
+            source_mod_time: None,
+            enqueued_order: None,
+        };
+        let encoded = encode_mrf_file(&[entry]).expect("new MRF should encode");
+        let legacy: Vec<LegacyMrfEntry> = rmp_serde::from_slice(&encoded[4..]).expect("old reader should ignore new map keys");
+
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].bucket, "bucket");
+        assert_eq!(legacy[0].object, "object");
+        assert_eq!(legacy[0].retry_count, 1);
     }
 
     #[test]

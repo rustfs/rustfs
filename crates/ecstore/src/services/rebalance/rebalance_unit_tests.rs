@@ -34,20 +34,19 @@ use super::migration::{
     rebalance_delete_marker_opts,
 };
 use super::worker::{
-    ensure_rebalance_listing_disks_available, is_transient_rebalance_error, load_rebalance_bucket_configs,
-    parse_rebalance_max_attempts, rebalance_listing_retry_delay, rebalance_migration_retry_delay,
-    resolve_load_rebalance_stats_update_result, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
-    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-    resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
-    resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-    resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal,
-    should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
-    should_retry_rebalance_listing, should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks,
-    wait_rebalance_listing_retry, with_rebalance_entry_context,
+    ensure_rebalance_listing_disks_available, is_transient_rebalance_error, parse_rebalance_max_attempts,
+    rebalance_listing_retry_delay, rebalance_migration_retry_delay, resolve_load_rebalance_stats_update_result,
+    resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+    resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
+    resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result,
+    resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+    send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
+    should_defer_rebalance_entry_failure, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
+    wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
 };
 use super::{
-    DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome,
-    RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
+    DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketConfigs,
+    RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
 };
 use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
 use crate::data_movement;
@@ -2097,13 +2096,11 @@ fn test_resolve_rebalance_optional_bucket_config_result_wraps_other_errors() {
     );
 }
 
-#[tokio::test]
-async fn test_load_rebalance_bucket_configs_skips_meta_bucket_lookup() {
-    let configs = load_rebalance_bucket_configs(RUSTFS_META_BUCKET)
-        .await
-        .expect("meta bucket config loading should short-circuit");
+#[test]
+fn test_rebalance_meta_bucket_configs_are_empty() {
+    let configs = RebalanceBucketConfigs::default();
     assert!(configs.lifecycle_config.is_none());
-    assert!(configs.lock_retention.is_none());
+    assert!(configs.object_lock_config.is_none());
     assert!(configs.replication_config.is_none());
 }
 

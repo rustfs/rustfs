@@ -25,6 +25,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const REPLICATION_RESET: &str = "replication-reset";
+const MAX_REPLICATION_TARGET_VERSION_ENTRIES: usize = 1_000;
+const MAX_REPLICATION_TARGET_ARN_LEN: usize = 1_024;
+const MAX_REPLICATION_TARGET_VERSION_ID_LEN: usize = 1_024;
 pub const REPLICATION_STATUS: &str = "replication-status";
 
 // ReplicateQueued - replication being queued trail
@@ -239,6 +242,10 @@ pub struct ReplicationState {
     pub targets: HashMap<String, ReplicationStatusType>,
     pub purge_targets: HashMap<String, VersionPurgeStatusType>,
     pub reset_statuses_map: HashMap<String, String>,
+    #[serde(skip)]
+    pub target_delete_marker_version_ids: HashMap<String, String>,
+    #[serde(skip)]
+    pub target_delete_marker_version_ids_corrupt: bool,
 }
 
 impl ReplicationState {
@@ -311,6 +318,7 @@ impl ReplicationState {
             arn: arn.to_string(),
             prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
             version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
+            target_delete_marker_version_id: self.target_delete_marker_version_ids.get(arn).cloned(),
             resync_timestamp,
             ..Default::default()
         }
@@ -414,6 +422,8 @@ pub struct ReplicatedTargetInfo {
     pub endpoint: String,
     pub secure: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_delete_marker_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
@@ -617,8 +627,25 @@ pub struct MrfReplicateEntry {
     #[serde(rename = "deleteMarkerMtime", skip_serializing_if = "Option::is_none", default)]
     pub delete_marker_mtime: Option<i64>,
 
+    #[serde(rename = "sourceModTime", skip_serializing_if = "Option::is_none", default)]
+    pub source_mod_time: Option<i64>,
+
+    #[serde(rename = "enqueuedOrder", skip_serializing_if = "Option::is_none", default)]
+    pub enqueued_order: Option<u64>,
+
     #[serde(rename = "targetARNs", skip_serializing_if = "Vec::is_empty", default)]
     pub target_arns: Vec<String>,
+
+    #[serde(rename = "targetDeleteMarkerVersionID", skip_serializing_if = "Option::is_none", default)]
+    pub target_delete_marker_version_id: Option<String>,
+}
+
+pub const MRF_BLOCKED_DELETE_MARKER_VERSION_STATE_RETRY_COUNT: i32 = i32::MIN;
+
+impl MrfReplicateEntry {
+    pub fn blocked_delete_marker_version_state(&self) -> bool {
+        self.op == MrfOpKind::Delete && self.retry_count == MRF_BLOCKED_DELETE_MARKER_VERSION_STATE_RETRY_COUNT
+    }
 }
 
 fn retry_count_to_mrf(retry_count: u32) -> i32 {
@@ -864,7 +891,10 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            source_mod_time: self.mod_time.and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
+            enqueued_order: None,
             target_arns: self.admitted_target_arns(),
+            target_delete_marker_version_id: None,
         }
     }
 
@@ -944,7 +974,10 @@ impl ReplicateObjectInfo {
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            source_mod_time: self.mod_time.and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
+            enqueued_order: None,
             target_arns: self.admitted_target_arns(),
+            target_delete_marker_version_id: None,
         }
     }
 }
@@ -1035,6 +1068,32 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map.insert(key, value);
     }
 
+    let mut target_delete_marker_version_ids = prev_state.target_delete_marker_version_ids.clone();
+    target_delete_marker_version_ids.retain(|arn, version_id| {
+        !arn.is_empty()
+            && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+            && !version_id.is_empty()
+            && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+    });
+    if target_delete_marker_version_ids.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+        target_delete_marker_version_ids.clear();
+    }
+    for target in &rinfos.targets {
+        let Some(version_id) = target.target_delete_marker_version_id.as_ref() else {
+            continue;
+        };
+        if (!target_delete_marker_version_ids.contains_key(&target.arn)
+            && target_delete_marker_version_ids.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            || target.arn.is_empty()
+            || target.arn.len() > MAX_REPLICATION_TARGET_ARN_LEN
+            || version_id.is_empty()
+            || version_id.len() > MAX_REPLICATION_TARGET_VERSION_ID_LEN
+        {
+            continue;
+        }
+        target_delete_marker_version_ids.insert(target.arn.clone(), version_id.clone());
+    }
+
     ReplicationState {
         replicate_decision_str: prev_state.replicate_decision_str.clone(),
         reset_statuses_map,
@@ -1045,6 +1104,8 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         replication_timestamp: rinfos.replication_timestamp,
         purge_targets,
         version_purge_status_internal: vpurge_statuses,
+        target_delete_marker_version_ids,
+        target_delete_marker_version_ids_corrupt: prev_state.target_delete_marker_version_ids_corrupt,
 
         ..Default::default()
     }
@@ -1257,5 +1318,26 @@ mod tests {
             replication_statuses_map(&state.replication_status_internal.unwrap_or_default()).get(&target_b),
             Some(&ReplicationStatusType::Completed)
         );
+    }
+
+    #[test]
+    fn get_replication_state_carries_target_delete_marker_version_id() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let version_id = "opaque-target-version";
+        let state = get_replication_state(
+            &ReplicatedInfos {
+                targets: vec![ReplicatedTargetInfo {
+                    arn: arn.to_string(),
+                    target_delete_marker_version_id: Some(version_id.to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &ReplicationState::default(),
+            None,
+        );
+
+        assert_eq!(state.target_delete_marker_version_ids.get(arn).map(String::as_str), Some(version_id));
+        assert_eq!(state.target_state(arn).target_delete_marker_version_id.as_deref(), Some(version_id));
     }
 }

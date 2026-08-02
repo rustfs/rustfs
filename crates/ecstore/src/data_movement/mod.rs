@@ -567,6 +567,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
             ObjectOptions {
                 delete_prefix: true,
                 delete_prefix_object: true,
+                data_movement: true,
                 no_lock: true,
                 ..Default::default()
             },

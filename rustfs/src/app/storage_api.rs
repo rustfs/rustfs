@@ -217,8 +217,9 @@ pub(crate) mod runtime_sources {
 
 pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
+        recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 
@@ -266,10 +267,6 @@ pub(crate) mod bucket {
         <s3s::dto::RestoreRequest as crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps>::validate(
             request, api,
         )
-    }
-
-    pub(crate) mod bucket_target_sys {
-        pub(crate) type BucketTargetSys = crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
     }
 
     pub(crate) mod lifecycle {
@@ -461,6 +458,7 @@ pub(crate) mod bucket {
         use super::target::BucketTargets;
 
         pub(crate) type BucketMetadataSys = crate::storage::storage_api::ecstore_bucket::metadata_sys::BucketMetadataSys;
+        pub(crate) type ObjectLockConfigState = crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
 
         #[cfg(test)]
         pub(crate) async fn init_bucket_metadata_sys(api: Arc<crate::storage::storage_api::ECStore>, buckets: Vec<String>) {
@@ -472,6 +470,19 @@ pub(crate) mod bucket {
             config_file: &str,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
+        }
+
+        pub(crate) async fn delete_if_incarnation(
+            bucket: &str,
+            config_file: &str,
+            expected_incarnation_id: uuid::Uuid,
+        ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
+            crate::storage::storage_api::delete_bucket_metadata_config_if_incarnation(
+                bucket,
+                config_file,
+                Some(expected_incarnation_id),
+            )
+            .await
         }
 
         pub(crate) async fn get_bucket_policy(
@@ -551,6 +562,21 @@ pub(crate) mod bucket {
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
         }
+
+        pub(crate) async fn update_if_incarnation(
+            bucket: &str,
+            config_file: &str,
+            data: Vec<u8>,
+            expected_incarnation_id: uuid::Uuid,
+        ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
+            crate::storage::storage_api::update_bucket_metadata_config_if_incarnation(
+                bucket,
+                config_file,
+                data,
+                Some(expected_incarnation_id),
+            )
+            .await
+        }
     }
 
     pub(crate) mod object_lock {
@@ -569,22 +595,6 @@ pub(crate) mod bucket {
         }
 
         pub(crate) mod objectlock_sys {
-            pub(crate) type ObjectLockBlockReason =
-                crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
-
-            pub(crate) async fn check_object_lock_for_deletion(
-                bucket: &str,
-                obj_info: &crate::storage::storage_api::StorageObjectInfo,
-                bypass_governance: bool,
-            ) -> Option<ObjectLockBlockReason> {
-                crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::check_object_lock_for_deletion(
-                    bucket,
-                    obj_info,
-                    bypass_governance,
-                )
-                .await
-            }
-
             pub(crate) fn is_retention_active(mode: &str, retain_until_date: Option<&s3s::dto::Date>) -> bool {
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::is_retention_active(
                     mode,
@@ -906,8 +916,7 @@ pub(crate) mod ecfs {
 
 pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{
-        DiskError, StorageError, is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found,
-        is_err_version_not_found,
+        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
     };
 
     pub(crate) type Error = StorageError;
@@ -945,7 +954,7 @@ pub(crate) mod options {
         extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
         get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
         namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
-        put_opts_with_replication_authorization, validate_archive_content_encoding,
+        preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
     };
 }
 
@@ -956,8 +965,9 @@ pub(crate) mod request_context {
 pub(crate) mod sse {
     pub(crate) use crate::storage::storage_api::sse_consumer::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
-        authorize_sse_kms_object_read, extract_server_side_encryption_from_headers, get_buffer_size_opt_in, sse_decryption,
-        sse_encryption, sse_prepare_encryption,
+        authorize_sse_kms_object_read, extract_server_side_encryption_from_headers, get_buffer_size_opt_in,
+        load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
+        validate_bucket_object_lock_enabled_state,
     };
     pub(crate) use crate::storage::storage_api::sse_consumer::{
         EncryptionKeyKind, SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
@@ -1037,6 +1047,8 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
+    pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
+
     pub(crate) mod object_cache {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_object::GetObjectBodySource;
@@ -1074,9 +1086,8 @@ pub(crate) mod object_usecase {
         ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
         parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists,
-        validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write,
-        validate_ssec_for_read, wrap_response_with_cors,
+        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_object_key,
+        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
     };
 }
 
@@ -1130,7 +1141,9 @@ pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
     pub(crate) mod contract {
         pub(crate) mod bucket {
-            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions, MakeBucketOptions};
+            pub(crate) use super::super::super::storage_contracts::{
+                BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+            };
         }
 
         pub(crate) mod heal {

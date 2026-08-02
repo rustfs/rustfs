@@ -577,6 +577,17 @@ pub(crate) fn namespace_reserved_user_metadata(metadata: &mut HashMap<String, St
         .collect();
 }
 
+pub(crate) fn preserve_unclassified_user_metadata(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+    let classified_user_metadata = USER_METADATA_PREFIXES
+        .iter()
+        .any(|prefix| key.strip_prefix(prefix).is_some_and(|suffix| !suffix.is_empty()));
+    if classified_user_metadata || SUPPORTED_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header)) {
+        return;
+    }
+
+    metadata.insert(stored_user_metadata_key(key), value.to_owned());
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,

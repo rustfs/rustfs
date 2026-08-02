@@ -16,7 +16,10 @@ use super::*;
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
+use futures::{StreamExt, stream};
 use std::collections::HashSet;
+
+const MULTIPART_LIST_SET_CONCURRENCY: usize = 4;
 
 fn map_multipart_namespace_lock_error(
     bucket: &str,
@@ -36,7 +39,143 @@ fn map_multipart_namespace_lock_error(
     }
 }
 
+fn ensure_multipart_bucket_lifecycle_guard_held(
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    bucket: &str,
+    object: &str,
+) -> Result<()> {
+    if guard.is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost) {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "multipart_bucket_generation",
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_pool_multipart_uploads_for_incarnation(
+    pool: &crate::core::sets::Sets,
+    bucket: &str,
+    prefix: &str,
+    key_marker: Option<String>,
+    upload_id_marker: Option<String>,
+    delimiter: Option<String>,
+    max_uploads: usize,
+    expected_incarnation_id: Option<Uuid>,
+) -> Result<ListMultipartsInfo> {
+    let per_set_limit = max_uploads.saturating_add(1);
+    let results = stream::iter(pool.disk_set.iter().cloned())
+        .map(|set| {
+            let key_marker = key_marker.clone();
+            let upload_id_marker = upload_id_marker.clone();
+            let delimiter = delimiter.clone();
+            async move {
+                set.list_multipart_uploads_for_incarnation(
+                    bucket,
+                    prefix,
+                    key_marker,
+                    upload_id_marker,
+                    delimiter,
+                    per_set_limit,
+                    expected_incarnation_id,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(MULTIPART_LIST_SET_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut uploads = Vec::new();
+    let mut common_prefixes = HashSet::new();
+    let mut source_truncated = false;
+    for result in results {
+        let page = result?;
+        uploads.extend(page.uploads);
+        common_prefixes.extend(page.common_prefixes);
+        source_truncated |= page.is_truncated;
+    }
+
+    let page = paginate_multipart_listing(
+        uploads,
+        common_prefixes.into_iter().collect(),
+        key_marker.as_deref(),
+        key_marker.as_ref().and(upload_id_marker.as_deref()),
+        max_uploads,
+        source_truncated,
+    );
+
+    Ok(ListMultipartsInfo {
+        key_marker,
+        upload_id_marker,
+        next_key_marker: page.next_key_marker,
+        next_upload_id_marker: page.next_upload_id_marker,
+        max_uploads,
+        is_truncated: page.is_truncated,
+        uploads: page.uploads,
+        common_prefixes: page.common_prefixes,
+        prefix: prefix.to_owned(),
+        delimiter,
+    })
+}
+
 impl ECStore {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_multipart_uploads_for_bucket_incarnation(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+        expected_incarnation_id: Uuid,
+    ) -> Result<ListMultipartsInfo> {
+        self.handle_list_multipart_uploads(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            delimiter,
+            max_uploads,
+            Some(expected_incarnation_id),
+        )
+        .await
+    }
+
+    /// Multipart lock order is bucket lifecycle, generation validation, then
+    /// object/upload locks in the selected set.
+    async fn guard_multipart_bucket_incarnation(
+        &self,
+        bucket: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectOptions, Option<rustfs_lock::NamespaceLockGuard>)> {
+        let mut opts = opts.clone();
+        if is_meta_bucketname(bucket) {
+            return Ok((opts, None));
+        }
+        if opts.expected_bucket_incarnation_id.is_none() {
+            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
+        }
+        let guard = if opts.bucket_lifecycle_lock_fence.is_some() {
+            None
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        };
+        if let Some(guard) = guard.as_ref() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
+        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+        if opts.expected_bucket_incarnation_id != Some(current) {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        Ok((opts, guard))
+    }
+
     async fn acquire_list_parts_read_lock(
         &self,
         bucket: &str,
@@ -66,6 +205,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ListPartsInfo> {
         check_list_parts_args(bucket, object, upload_id)?;
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
 
         let _object_lock_guard = self.acquire_list_parts_read_lock(bucket, object, opts).await?;
 
@@ -105,17 +246,34 @@ impl ECStore {
         upload_id_marker: Option<String>,
         delimiter: Option<String>,
         max_uploads: usize,
+        expected_incarnation_id: Option<Uuid>,
     ) -> Result<ListMultipartsInfo> {
         check_list_multipart_args(bucket, prefix, &key_marker, &upload_id_marker, &delimiter)?;
+        let guard_opts = ObjectOptions {
+            expected_bucket_incarnation_id: expected_incarnation_id,
+            ..Default::default()
+        };
+        let (opts, bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, &guard_opts).await?;
+        let expected_incarnation_id = opts.expected_bucket_incarnation_id;
 
         if prefix.is_empty() {
             // TODO: return from cache
         }
 
         if self.single_pool() {
-            return self.pools[0]
-                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
-                .await;
+            let result = list_pool_multipart_uploads_for_incarnation(
+                &self.pools[0],
+                bucket,
+                prefix,
+                key_marker,
+                upload_id_marker,
+                delimiter,
+                max_uploads,
+                expected_incarnation_id,
+            )
+            .await;
+            ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, prefix)?;
+            return result;
         }
 
         let mut uploads = Vec::new();
@@ -126,16 +284,17 @@ impl ECStore {
             if self.is_suspended(pool.pool_idx).await {
                 continue;
             }
-            let res = pool
-                .list_multipart_uploads(
-                    bucket,
-                    prefix,
-                    key_marker.clone(),
-                    upload_id_marker.clone(),
-                    delimiter.clone(),
-                    max_uploads,
-                )
-                .await?;
+            let res = list_pool_multipart_uploads_for_incarnation(
+                pool,
+                bucket,
+                prefix,
+                key_marker.clone(),
+                upload_id_marker.clone(),
+                delimiter.clone(),
+                max_uploads,
+                expected_incarnation_id,
+            )
+            .await?;
             uploads.extend(res.uploads);
             common_prefixes.extend(res.common_prefixes);
             source_truncated |= res.is_truncated;
@@ -146,6 +305,7 @@ impl ECStore {
         // and derive the truncation markers so a bucket whose uploads span pools
         // pages correctly instead of being silently reported complete.
         let page = merge_multipart_upload_pages(uploads, common_prefixes.into_iter().collect(), max_uploads, source_truncated);
+        ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, prefix)?;
 
         Ok(ListMultipartsInfo {
             key_marker,
@@ -180,6 +340,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<(MultipartUploadResult, usize)> {
         check_new_multipart_args(bucket, object)?;
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
 
         if self.single_pool() {
             return self.pools[0]
@@ -192,9 +354,17 @@ impl ECStore {
             if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
                 continue;
             }
-            let res = pool
-                .list_multipart_uploads(bucket, object, None, None, None, MAX_UPLOADS_LIST)
-                .await?;
+            let res = list_pool_multipart_uploads_for_incarnation(
+                pool,
+                bucket,
+                object,
+                None,
+                None,
+                None,
+                MAX_UPLOADS_LIST,
+                opts.expected_bucket_incarnation_id,
+            )
+            .await?;
 
             if !res.uploads.is_empty() {
                 let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
@@ -249,6 +419,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         check_put_object_part_args(bucket, object, upload_id)?;
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
 
         if self.single_pool() {
             return self.pools[0]
@@ -289,6 +461,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<MultipartInfo> {
         check_list_parts_args(bucket, object, upload_id)?;
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
         if self.single_pool() {
             return self.pools[0].get_multipart_info(bucket, object, upload_id, opts).await;
         }
@@ -322,6 +496,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         check_abort_multipart_args(bucket, object, upload_id)?;
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
 
         // TODO: defer DeleteUploadID
 
@@ -360,6 +536,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
 
         if self.single_pool() {
             return self.pools[0]

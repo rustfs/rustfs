@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::metadata_sys::get_object_lock_config;
+use crate::bucket::metadata_sys::{ObjectLockConfigState, get_object_lock_config, get_object_lock_config_state};
 use crate::bucket::object_lock::objectlock;
+use crate::error::{Error, Result, StorageError};
 use crate::object_api::ObjectInfo;
-use s3s::dto::{DefaultRetention, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
+use s3s::dto::{Date, DefaultRetention, ObjectLockConfiguration, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
+use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -34,6 +36,20 @@ impl BucketObjectLockSys {
             return object_lock_rule.default_retention;
         }
         None
+    }
+}
+
+pub(crate) fn ensure_recursive_force_delete_allowed_for_state(bucket: &str, state: &ObjectLockConfigState) -> Result<()> {
+    match state {
+        ObjectLockConfigState::ConfirmedAbsent => Ok(()),
+        ObjectLockConfigState::Configured { .. } => Err(StorageError::InvalidArgument(
+            bucket.to_string(),
+            String::new(),
+            "force-delete is forbidden on Object Locking enabled buckets".to_string(),
+        )),
+        ObjectLockConfigState::Fabricated => {
+            Err(Error::other(format!("bucket Object Lock metadata is not authoritative: {bucket}")))
+        }
     }
 }
 
@@ -205,77 +221,266 @@ fn check_retention_blocks_deletion(
     None
 }
 
+/// Check an object's lock metadata using an already resolved bucket Object
+/// Lock configuration. `None` means the configuration is confirmed absent.
+///
 /// # S3 Standard Behavior
 /// - COMPLIANCE mode: Cannot be deleted even with bypass header
 /// - GOVERNANCE mode: Can be deleted if bypass_governance is true (caller must verify s3:BypassGovernanceRetention permission)
 /// - Legal Hold: Cannot be bypassed regardless of mode
-pub async fn check_object_lock_for_deletion(
-    bucket: &str,
+pub(crate) fn check_object_lock_for_deletion_with_config(
+    config: Option<&ObjectLockConfiguration>,
     obj_info: &ObjectInfo,
     bypass_governance: bool,
-) -> Option<ObjectLockBlockReason> {
+) -> Result<Option<ObjectLockBlockReason>> {
     if obj_info.delete_marker {
-        return None;
+        return Ok(None);
     }
 
-    // 1. Check legal hold - cannot be bypassed (reuse has_legal_hold)
-    if has_legal_hold(&obj_info.user_defined) {
-        return Some(ObjectLockBlockReason::LegalHold);
-    }
-
-    // 2. Check explicit retention
-    let explicit_ret = objectlock::get_object_retention_meta(&obj_info.user_defined);
-    if let Some(mode) = &explicit_ret.mode {
-        let mode_str = mode.as_str();
-        if is_retention_active(mode_str, explicit_ret.retain_until_date.as_ref())
-            && let Some(reason) = check_retention_blocks_deletion(
-                mode_str,
-                explicit_ret.retain_until_date.map(OffsetDateTime::from),
-                bypass_governance,
-            )
-        {
-            return Some(reason);
+    if let Some(status) = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
+        if status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::ON) {
+            return Ok(Some(ObjectLockBlockReason::LegalHold));
+        }
+        if !status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::OFF) {
+            return Err(Error::other("persisted object legal-hold metadata is invalid"));
         }
     }
 
-    // 3. Check default retention only if no explicit retention is set
-    if explicit_ret.mode.is_none()
-        && let Some(default_retention) = BucketObjectLockSys::get(bucket).await
+    let mode = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str());
+    let retain_until = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
+    let explicit_ret = match (mode, retain_until) {
+        (None, None) => None,
+        (Some(mode), Some(retain_until)) => {
+            let mode =
+                objectlock::parse_ret_mode(mode).ok_or_else(|| Error::other("persisted object retention mode is invalid"))?;
+            let retain_until = OffsetDateTime::parse(retain_until, &time::format_description::well_known::Iso8601::DEFAULT)
+                .map(Date::from)
+                .map_err(|_| Error::other("persisted object retention date is invalid"))?;
+            Some((mode, retain_until))
+        }
+        _ => return Err(Error::other("persisted object retention metadata is incomplete")),
+    };
+
+    if let Some((mode, retain_until)) = &explicit_ret {
+        let mode_str = mode.as_str();
+        if is_retention_active(mode_str, Some(retain_until))
+            && let Some(reason) =
+                check_retention_blocks_deletion(mode_str, Some(OffsetDateTime::from(retain_until.clone())), bypass_governance)
+        {
+            return Ok(Some(reason));
+        }
+    }
+
+    if explicit_ret.is_none()
+        && let Some(default_retention) = config.and_then(|config| config.rule.as_ref()?.default_retention.as_ref())
         && let Some(mode) = &default_retention.mode
     {
         let mode_str = mode.as_str();
         if mode_str == ObjectLockRetentionMode::COMPLIANCE || mode_str == ObjectLockRetentionMode::GOVERNANCE {
             // Calculate retention expiration date from object modification time
-            if let Some(mod_time) = obj_info.mod_time {
-                let now = objectlock::utc_now_ntp();
-                let retain_until = if let Some(days) = default_retention.days {
-                    mod_time.saturating_add(time::Duration::days(days as i64))
-                } else {
-                    let years = default_retention.years?;
-                    add_years(mod_time, years)
-                };
+            let mod_time = obj_info
+                .mod_time
+                .ok_or_else(|| Error::other("persisted object modification time is missing"))?;
+            let now = objectlock::utc_now_ntp();
+            let retain_until = if let Some(days) = default_retention.days {
+                mod_time.saturating_add(time::Duration::days(i64::from(days)))
+            } else {
+                let years = default_retention
+                    .years
+                    .ok_or_else(|| Error::other("persisted bucket Object Lock retention period is invalid"))?;
+                add_years(mod_time, years)
+            };
 
-                if retain_until.unix_timestamp() > now.unix_timestamp()
-                    && let Some(reason) = check_retention_blocks_deletion(mode_str, Some(retain_until), bypass_governance)
-                {
-                    return Some(reason);
-                }
+            if retain_until.unix_timestamp() > now.unix_timestamp()
+                && let Some(reason) = check_retention_blocks_deletion(mode_str, Some(retain_until), bypass_governance)
+            {
+                return Ok(Some(reason));
             }
         }
     }
 
-    None
+    Ok(None)
+}
+
+pub(crate) fn check_object_lock_for_deletion_with_state(
+    state: &ObjectLockConfigState,
+    obj_info: &ObjectInfo,
+    bypass_governance: bool,
+) -> Result<Option<ObjectLockBlockReason>> {
+    match state {
+        ObjectLockConfigState::Configured { config, .. } => {
+            check_object_lock_for_deletion_with_config(Some(config), obj_info, bypass_governance)
+        }
+        ObjectLockConfigState::ConfirmedAbsent => check_object_lock_for_deletion_with_config(None, obj_info, bypass_governance),
+        ObjectLockConfigState::Fabricated => Err(Error::other("bucket Object Lock metadata is not authoritative")),
+    }
+}
+
+/// Compatibility wrapper for callers that predate fallible metadata lookup.
+/// An authority/read/parse failure is represented as a blocking reason rather
+/// than the old fail-open `None` result.
+pub async fn check_object_lock_for_deletion(
+    bucket: &str,
+    obj_info: &ObjectInfo,
+    bypass_governance: bool,
+) -> Option<ObjectLockBlockReason> {
+    match get_object_lock_config_state(bucket)
+        .await
+        .and_then(|state| check_object_lock_for_deletion_with_state(&state, obj_info, bypass_governance))
+    {
+        Ok(reason) => reason,
+        Err(_) => Some(ObjectLockBlockReason::LegalHold),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use s3s::dto::{ObjectLockEnabled, ObjectLockRule};
     use time::{Date, Month, PrimitiveDateTime, Time};
 
     fn make_datetime(year: i32, month: u8, day: u8) -> OffsetDateTime {
         let date = Date::from_calendar_date(year, Month::try_from(month).unwrap(), day).unwrap();
         let time = Time::from_hms(0, 0, 0).unwrap();
         PrimitiveDateTime::new(date, time).assume_utc()
+    }
+
+    fn default_retention_config(mode: &'static str) -> ObjectLockConfiguration {
+        ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(mode)),
+                    days: Some(30),
+                    years: None,
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn deletion_with_config_blocks_active_default_compliance_even_with_bypass() {
+        let config = default_retention_config(ObjectLockRetentionMode::COMPLIANCE);
+        let obj_info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let result = check_object_lock_for_deletion_with_config(Some(&config), &obj_info, true);
+
+        assert!(matches!(result, Ok(Some(ObjectLockBlockReason::Retention { .. }))));
+    }
+
+    #[test]
+    fn deletion_with_config_allows_active_default_governance_with_bypass() {
+        let config = default_retention_config(ObjectLockRetentionMode::GOVERNANCE);
+        let obj_info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            check_object_lock_for_deletion_with_config(Some(&config), &obj_info, true),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn deletion_with_default_retention_rejects_missing_object_mod_time() {
+        let config = default_retention_config(ObjectLockRetentionMode::COMPLIANCE);
+
+        let err = check_object_lock_for_deletion_with_config(Some(&config), &ObjectInfo::default(), false)
+            .expect_err("default retention needs an authoritative object modification time");
+
+        assert!(err.to_string().contains("modification time"));
+    }
+
+    #[test]
+    fn deletion_with_confirmed_absence_still_blocks_explicit_compliance() {
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(30);
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert("x-amz-object-lock-mode".to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            retain_until
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("retain-until date should format"),
+        );
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        let result = check_object_lock_for_deletion_with_config(None, &obj_info, true);
+
+        assert!(matches!(result, Ok(Some(ObjectLockBlockReason::Retention { .. }))));
+    }
+
+    #[test]
+    fn deletion_rejects_incomplete_persisted_retention_metadata() {
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        let err = check_object_lock_for_deletion_with_config(None, &obj_info, false)
+            .expect_err("mode without retain-until date must fail closed");
+
+        assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn deletion_rejects_each_malformed_persisted_retention_shape() {
+        let valid_date = (OffsetDateTime::now_utc() + time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("retain-until date should format");
+        let cases = [
+            ("invalid mode", Some("INVALID"), Some(valid_date.as_str()), "retention mode"),
+            (
+                "invalid date",
+                Some(ObjectLockRetentionMode::COMPLIANCE),
+                Some("not-a-date"),
+                "retention date",
+            ),
+            ("date only", None, Some(valid_date.as_str()), "incomplete"),
+        ];
+
+        for (case, mode, retain_until, expected) in cases {
+            let mut user_defined = std::collections::HashMap::new();
+            if let Some(mode) = mode {
+                user_defined.insert(X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), mode.to_string());
+            }
+            if let Some(retain_until) = retain_until {
+                user_defined.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until.to_string());
+            }
+            let obj_info = ObjectInfo {
+                user_defined: Arc::new(user_defined),
+                ..Default::default()
+            };
+
+            let err = check_object_lock_for_deletion_with_config(None, &obj_info, false).expect_err(case);
+            assert!(err.to_string().contains(expected), "unexpected {case} error: {err}");
+        }
+    }
+
+    #[test]
+    fn deletion_rejects_invalid_persisted_legal_hold_metadata() {
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "INVALID".to_string());
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        let err = check_object_lock_for_deletion_with_config(None, &obj_info, false)
+            .expect_err("invalid legal-hold value must fail closed");
+
+        assert!(err.to_string().contains("legal-hold"));
     }
 
     #[test]

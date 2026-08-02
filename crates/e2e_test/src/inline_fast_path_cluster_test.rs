@@ -1689,6 +1689,22 @@ async fn four_node_inline_storage_and_get_boundaries() -> TestResult {
 
 #[tokio::test]
 #[serial]
+async fn four_node_empty_legacy_volumes_start_as_fresh() -> TestResult {
+    init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    for data_dir in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+        tokio::fs::create_dir_all(Path::new(data_dir).join(".minio.sys")).await?;
+    }
+
+    cluster.start().await?;
+    cluster.create_s3_client(0)?.list_buckets().send().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn four_node_inline_fallback_controls() -> TestResult {
     init_logging();
 

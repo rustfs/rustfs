@@ -16,12 +16,11 @@
 
 use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
-use super::storage_api::bucket_usecase::access::{ReqInfo, authorize_request, req_info_ref};
+use super::storage_api::bucket_usecase::access::{ReqInfo, authorize_request, bucket_config_mutation_incarnation, req_info_ref};
 #[cfg(test)]
 use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
 use super::storage_api::bucket_usecase::bucket::{
     ObjectLockConfigExt as _, VersioningConfigExt as _,
-    bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, run_stale_multipart_upload_cleanup_once,
         validate_lifecycle_config, validate_transition_tier,
@@ -382,6 +381,29 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
 }
 
+async fn update_bucket_config_for_incarnation(
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> Result<time::OffsetDateTime, StorageError> {
+    match expected_incarnation_id {
+        Some(incarnation_id) => metadata_sys::update_if_incarnation(bucket, config_file, data, incarnation_id).await,
+        None => metadata_sys::update(bucket, config_file, data).await,
+    }
+}
+
+async fn delete_bucket_config_for_incarnation(
+    bucket: &str,
+    config_file: &str,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> Result<time::OffsetDateTime, StorageError> {
+    match expected_incarnation_id {
+        Some(incarnation_id) => metadata_sys::delete_if_incarnation(bucket, config_file, incarnation_id).await,
+        None => metadata_sys::delete(bucket, config_file).await,
+    }
+}
+
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
@@ -603,10 +625,7 @@ async fn replication_targets_without_config_targets(
 
     let mut targets = match metadata_sys::get_bucket_targets_config(bucket).await {
         Ok(targets) => targets,
-        Err(StorageError::ConfigNotFound) => {
-            BucketTargetSys::get().update_all_targets(bucket, None).await;
-            return Ok(None);
-        }
+        Err(StorageError::ConfigNotFound) => return Ok(None),
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
@@ -631,12 +650,16 @@ fn remove_replication_targets_from_config_targets(targets: &mut BucketTargets, t
     original_len - targets.targets.len()
 }
 
-async fn write_replication_targets_after_config_delete(bucket: &str, targets: &BucketTargets, removed: usize) -> S3Result<()> {
+async fn write_replication_targets_after_config_delete(
+    bucket: &str,
+    targets: &BucketTargets,
+    removed: usize,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> S3Result<()> {
     let json_targets = serde_json::to_vec(&targets).map_err(to_internal_error)?;
-    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+    update_bucket_config_for_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(targets)).await;
     info!(bucket = %bucket, removed, "removed replication remote targets referenced by deleted bucket replication config");
 
     Ok(())
@@ -646,10 +669,13 @@ async fn restore_replication_config_after_target_cleanup_failure(
     bucket: &str,
     config: &ReplicationConfiguration,
     cleanup_err: S3Error,
+    expected_incarnation_id: Option<uuid::Uuid>,
 ) -> S3Error {
     match serialize(config) {
         Ok(data) => {
-            if let Err(restore_err) = metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data).await {
+            if let Err(restore_err) =
+                update_bucket_config_for_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id).await
+            {
                 error!(
                     bucket = %bucket,
                     error = ?restore_err,
@@ -1410,6 +1436,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
@@ -1422,7 +1449,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_SSECONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1441,6 +1468,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
@@ -1453,7 +1481,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_CORS_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1472,6 +1500,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
@@ -1484,7 +1513,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1502,6 +1531,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
@@ -1514,7 +1544,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1532,6 +1562,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
@@ -1555,14 +1586,21 @@ impl DefaultBucketUsecase {
             None
         };
 
-        metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
         if let Some((targets, removed)) = updated_targets
-            && let Err(err) = write_replication_targets_after_config_delete(&bucket, &targets, removed).await
+            && let Err(err) =
+                write_replication_targets_after_config_delete(&bucket, &targets, removed, expected_incarnation_id).await
         {
             if let Some(config) = replication_config.as_ref() {
-                return Err(restore_replication_config_after_target_cleanup_failure(&bucket, config, err).await);
+                return Err(restore_replication_config_after_target_cleanup_failure(
+                    &bucket,
+                    config,
+                    err,
+                    expected_incarnation_id,
+                )
+                .await);
             }
             return Err(err);
         }
@@ -1585,10 +1623,11 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
-        metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1608,6 +1647,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
@@ -1620,7 +1660,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2036,6 +2076,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketEncryptionInput {
             bucket,
@@ -2074,7 +2115,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&server_side_encryption_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2096,6 +2137,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketLifecycleConfigurationInput {
             bucket,
@@ -2135,7 +2177,7 @@ impl DefaultBucketUsecase {
 
         input_cfg.expiry_updated_at = Some(Timestamp::from(time::OffsetDateTime::now_utc()));
         let data = serialize_config(&input_cfg)?;
-        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2191,6 +2233,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_region = req.region.clone();
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
 
@@ -2212,7 +2255,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&notification_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2265,6 +2308,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
@@ -2315,7 +2359,7 @@ impl DefaultBucketUsecase {
 
         let data = policy.as_bytes().to_vec();
 
-        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2332,6 +2376,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketCorsInput {
             bucket,
@@ -2349,7 +2394,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&cors_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_CORS_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2369,6 +2414,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketReplicationInput {
             bucket,
@@ -2391,7 +2437,7 @@ impl DefaultBucketUsecase {
         let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         validate_bucket_replication_update(&bucket, &replication_configuration).await?;
         let data = serialize_config(&replication_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
         drop(targets_guard);
@@ -2414,6 +2460,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutPublicAccessBlockInput {
             bucket,
@@ -2431,7 +2478,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&public_access_block_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2445,6 +2492,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
@@ -2459,7 +2507,7 @@ impl DefaultBucketUsecase {
 
         let data = serialize_config(&tagging)?;
 
-        metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2480,6 +2528,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketVersioningInput {
             bucket,
@@ -2491,7 +2540,7 @@ impl DefaultBucketUsecase {
 
         let data = serialize_config(&versioning_configuration)?;
 
-        metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_VERSIONING_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
