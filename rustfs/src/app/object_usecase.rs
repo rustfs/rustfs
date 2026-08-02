@@ -6615,7 +6615,8 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        if !recursive_force_delete_is_authorized(&req.headers, req_info_ref(&req)?.is_owner, false) {
+        let is_owner = req_info_ref(&req).map(|info| info.is_owner).unwrap_or(false);
+        if !recursive_force_delete_is_authorized(&req.headers, is_owner, false) {
             return Err(S3Error::with_message(
                 S3ErrorCode::AccessDenied,
                 "Recursive force-delete is restricted to administrative requests",
@@ -7081,7 +7082,7 @@ impl DefaultObjectUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
         }
 
-        let is_owner = req_info_ref(&req)?.is_owner;
+        let is_owner = req_info_ref(&req).map(|info| info.is_owner).unwrap_or(false);
         if !recursive_force_delete_is_authorized(&req.headers, is_owner, replica) {
             return Err(S3Error::with_message(
                 S3ErrorCode::AccessDenied,
@@ -13386,6 +13387,23 @@ mod tests {
 
         let err = usecase.execute_delete_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Not init"));
+    }
+
+    #[tokio::test]
+    async fn execute_delete_object_allows_non_force_request_without_req_info_until_store_lookup() {
+        let input = DeleteObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let err = DefaultObjectUsecase::without_context()
+            .execute_delete_object(build_request(input, Method::DELETE))
+            .await
+            .expect_err("an uninitialized store should be reported after non-force admission");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Not init"));
     }
 
     #[test]
