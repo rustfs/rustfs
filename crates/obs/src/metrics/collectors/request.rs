@@ -26,6 +26,8 @@ use std::collections::HashMap;
 /// API request statistics for a specific API endpoint.
 #[derive(Debug, Clone, Default)]
 pub struct ApiRequestStats {
+    /// Server identifier
+    pub server: String,
     /// API name (e.g., "GetObject", "PutObject")
     pub name: String,
     /// Request type (e.g., "s3", "admin")
@@ -56,11 +58,19 @@ pub struct ApiRequestStats {
 pub fn collect_request_metrics(stats: &[ApiRequestStats]) -> Vec<PrometheusMetric> {
     let mut metrics = Vec::new();
     let mut traffic_by_type: HashMap<&str, (u64, u64)> = HashMap::with_capacity(stats.len());
+    let mut traffic_by_server_type: HashMap<(&str, &str), (u64, u64)> = HashMap::with_capacity(stats.len());
 
     for stat in stats {
         let entry = traffic_by_type.entry(stat.req_type.as_str()).or_default();
         entry.0 = entry.0.saturating_add(stat.sent_bytes);
         entry.1 = entry.1.saturating_add(stat.recv_bytes);
+        if !stat.server.is_empty() {
+            let entry = traffic_by_server_type
+                .entry((stat.server.as_str(), stat.req_type.as_str()))
+                .or_default();
+            entry.0 = entry.0.saturating_add(stat.sent_bytes);
+            entry.1 = entry.1.saturating_add(stat.recv_bytes);
+        }
 
         // In-flight requests
         metrics.push(
@@ -113,6 +123,54 @@ pub fn collect_request_metrics(stats: &[ApiRequestStats]) -> Vec<PrometheusMetri
                     .with_label_owned(LE_LABEL, le.clone()),
             );
         }
+
+        if !stat.server.is_empty() {
+            metrics.push(
+                PrometheusMetric::from_descriptor(&API_REQUESTS_IN_FLIGHT_TOTAL_BY_SERVER_MD, stat.in_flight as f64)
+                    .with_label_owned(SERVER_LABEL, stat.server.clone())
+                    .with_label_owned(NAME_LABEL, stat.name.clone())
+                    .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&API_REQUESTS_TOTAL_BY_SERVER_MD, stat.total as f64)
+                    .with_label_owned(SERVER_LABEL, stat.server.clone())
+                    .with_label_owned(NAME_LABEL, stat.name.clone())
+                    .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&API_REQUESTS_ERRORS_TOTAL_BY_SERVER_MD, stat.errors_total as f64)
+                    .with_label_owned(SERVER_LABEL, stat.server.clone())
+                    .with_label_owned(NAME_LABEL, stat.name.clone())
+                    .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&API_REQUESTS_5XX_ERRORS_TOTAL_BY_SERVER_MD, stat.errors_5xx as f64)
+                    .with_label_owned(SERVER_LABEL, stat.server.clone())
+                    .with_label_owned(NAME_LABEL, stat.name.clone())
+                    .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&API_REQUESTS_4XX_ERRORS_TOTAL_BY_SERVER_MD, stat.errors_4xx as f64)
+                    .with_label_owned(SERVER_LABEL, stat.server.clone())
+                    .with_label_owned(NAME_LABEL, stat.name.clone())
+                    .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&API_REQUESTS_CANCELED_TOTAL_BY_SERVER_MD, stat.canceled as f64)
+                    .with_label_owned(SERVER_LABEL, stat.server.clone())
+                    .with_label_owned(NAME_LABEL, stat.name.clone())
+                    .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            );
+            for (le, value) in &stat.ttfb_distribution {
+                metrics.push(
+                    PrometheusMetric::from_descriptor(&API_REQUESTS_TTFB_SECONDS_DISTRIBUTION_BY_SERVER_MD, *value)
+                        .with_label_owned(SERVER_LABEL, stat.server.clone())
+                        .with_label_owned(NAME_LABEL, stat.name.clone())
+                        .with_label_owned(TYPE_LABEL, stat.req_type.clone())
+                        .with_label_owned(LE_LABEL, le.clone()),
+                );
+            }
+        }
     }
 
     for (req_type, (sent_bytes, recv_bytes)) in traffic_by_type {
@@ -122,6 +180,19 @@ pub fn collect_request_metrics(stats: &[ApiRequestStats]) -> Vec<PrometheusMetri
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&API_TRAFFIC_RECV_BYTES_MD, recv_bytes as f64)
+                .with_label_owned(TYPE_LABEL, req_type.to_string()),
+        );
+    }
+
+    for ((server, req_type), (sent_bytes, recv_bytes)) in traffic_by_server_type {
+        metrics.push(
+            PrometheusMetric::from_descriptor(&API_TRAFFIC_SENT_BYTES_BY_SERVER_MD, sent_bytes as f64)
+                .with_label_owned(SERVER_LABEL, server.to_string())
+                .with_label_owned(TYPE_LABEL, req_type.to_string()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&API_TRAFFIC_RECV_BYTES_BY_SERVER_MD, recv_bytes as f64)
+                .with_label_owned(SERVER_LABEL, server.to_string())
                 .with_label_owned(TYPE_LABEL, req_type.to_string()),
         );
     }
@@ -137,6 +208,7 @@ mod tests {
     #[test]
     fn test_collect_request_metrics() {
         let stats = vec![ApiRequestStats {
+            server: "node1:9000".to_string(),
             name: "GetObject".to_string(),
             req_type: "s3".to_string(),
             in_flight: 10,
@@ -158,8 +230,7 @@ mod tests {
         let metrics = collect_request_metrics(&stats);
         report_metrics(&metrics);
 
-        // 6 base metrics + 4 TTFB buckets + 2 traffic metrics = 12
-        assert_eq!(metrics.len(), 12);
+        assert_eq!(metrics.len(), 24);
 
         let total_name = API_REQUESTS_TOTAL_MD.get_full_metric_name();
         let total = metrics.iter().find(|m| m.name == total_name);
@@ -170,6 +241,23 @@ mod tests {
         let in_flight = metrics.iter().find(|m| m.name == in_flight_name);
         assert!(in_flight.is_some());
         assert_eq!(in_flight.map(|m| m.value), Some(10.0));
+
+        let by_server_total_name = API_REQUESTS_TOTAL_BY_SERVER_MD.get_full_metric_name();
+        let by_server_total = metrics.iter().find(|m| {
+            m.name == by_server_total_name
+                && m.labels.iter().any(|(key, value)| *key == SERVER_LABEL && value == "node1:9000")
+                && m.labels.iter().any(|(key, value)| *key == NAME_LABEL && value == "GetObject")
+                && m.labels.iter().any(|(key, value)| *key == TYPE_LABEL && value == "s3")
+        });
+        assert_eq!(by_server_total.map(|m| m.value), Some(10000.0));
+
+        let by_server_sent_name = API_TRAFFIC_SENT_BYTES_BY_SERVER_MD.get_full_metric_name();
+        let by_server_sent = metrics.iter().find(|m| {
+            m.name == by_server_sent_name
+                && m.labels.iter().any(|(key, value)| *key == SERVER_LABEL && value == "node1:9000")
+                && m.labels.iter().any(|(key, value)| *key == TYPE_LABEL && value == "s3")
+        });
+        assert_eq!(by_server_sent.map(|m| m.value), Some((1024 * 1024 * 500) as f64));
     }
 
     #[test]
@@ -183,6 +271,7 @@ mod tests {
     fn test_collect_request_metrics_aggregates_traffic_per_type() {
         let stats = vec![
             ApiRequestStats {
+                server: String::new(),
                 name: "GetObject".to_string(),
                 req_type: "s3".to_string(),
                 in_flight: 1,
@@ -196,6 +285,7 @@ mod tests {
                 recv_bytes: 10,
             },
             ApiRequestStats {
+                server: String::new(),
                 name: "HeadObject".to_string(),
                 req_type: "s3".to_string(),
                 in_flight: 2,
