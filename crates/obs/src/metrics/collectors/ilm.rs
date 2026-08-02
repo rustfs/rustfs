@@ -28,8 +28,6 @@ use crate::metrics::schema::ilm::*;
 /// ILM statistics for metrics collection.
 #[derive(Debug, Clone, Default)]
 pub struct IlmStats {
-    /// Server identifier
-    pub server: String,
     /// Number of pending ILM expiry tasks
     pub expiry_pending_tasks: u64,
     /// Number of active ILM transition tasks
@@ -48,16 +46,22 @@ pub struct IlmStats {
     pub transition_compensation_running_tasks: u64,
     /// Total number of object versions scanned for ILM
     pub versions_scanned: u64,
-    /// Additional bounded action/state task details
-    pub action_tasks: Vec<IlmActionTaskStats>,
 }
 
 /// ILM task metrics by action and state.
 #[derive(Debug, Clone, Default)]
-pub struct IlmActionTaskStats {
-    pub action: String,
-    pub state: String,
-    pub value: u64,
+pub(crate) struct IlmActionTaskStats {
+    pub(crate) action: String,
+    pub(crate) state: String,
+    pub(crate) value: u64,
+}
+
+/// ILM statistics with runtime-local node identity and bounded action/state details.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmRuntimeStats {
+    pub(crate) server: String,
+    pub(crate) stats: IlmStats,
+    pub(crate) action_tasks: Vec<IlmActionTaskStats>,
 }
 
 fn is_live_action_task_state(state: &str) -> bool {
@@ -69,7 +73,7 @@ fn is_live_action_task_state(state: &str) -> bool {
 /// Uses the metric descriptors from `metrics_type::ilm` module.
 /// Returns a vector of Prometheus metrics for ILM statistics.
 pub fn collect_ilm_metrics(stats: &IlmStats) -> Vec<PrometheusMetric> {
-    let mut metrics = vec![
+    vec![
         PrometheusMetric::from_descriptor(&ILM_EXPIRY_PENDING_TASKS_MD, stats.expiry_pending_tasks as f64),
         PrometheusMetric::from_descriptor(&ILM_TRANSITION_ACTIVE_TASKS_MD, stats.transition_active_tasks as f64),
         PrometheusMetric::from_descriptor(&ILM_TRANSITION_PENDING_TASKS_MD, stats.transition_pending_tasks as f64),
@@ -91,7 +95,11 @@ pub fn collect_ilm_metrics(stats: &IlmStats) -> Vec<PrometheusMetric> {
             stats.transition_compensation_running_tasks as f64,
         ),
         PrometheusMetric::from_descriptor(&ILM_VERSIONS_SCANNED_MD, stats.versions_scanned as f64),
-    ];
+    ]
+}
+
+pub(crate) fn collect_ilm_runtime_metrics(stats: &IlmRuntimeStats) -> Vec<PrometheusMetric> {
+    let mut metrics = collect_ilm_metrics(&stats.stats);
 
     metrics.extend(
         stats
@@ -116,7 +124,6 @@ mod tests {
     #[test]
     fn test_collect_ilm_metrics() {
         let stats = IlmStats {
-            server: "node1:9000".to_string(),
             expiry_pending_tasks: 100,
             transition_active_tasks: 5,
             transition_pending_tasks: 50,
@@ -126,6 +133,10 @@ mod tests {
             transition_compensation_scheduled_tasks: 4,
             transition_compensation_running_tasks: 1,
             versions_scanned: 1000000,
+        };
+        let runtime_stats = IlmRuntimeStats {
+            server: "node1:9000".to_string(),
+            stats,
             action_tasks: vec![
                 IlmActionTaskStats {
                     action: "expiry".to_string(),
@@ -145,7 +156,7 @@ mod tests {
             ],
         };
 
-        let metrics = collect_ilm_metrics(&stats);
+        let metrics = collect_ilm_runtime_metrics(&runtime_stats);
 
         assert_eq!(metrics.len(), 11);
 

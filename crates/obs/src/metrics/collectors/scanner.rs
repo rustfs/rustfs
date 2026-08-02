@@ -25,8 +25,6 @@ use crate::metrics::schema::scanner::*;
 /// Scanner statistics.
 #[derive(Debug, Clone, Default)]
 pub struct ScannerStats {
-    /// Server identifier
-    pub server: String,
     /// Number of bucket-drive scans finished
     pub bucket_scans_finished: u64,
     /// Number of bucket-drive scans started
@@ -165,18 +163,6 @@ pub struct ScannerStats {
     pub partial_cycles_objects: u64,
     /// Number of scanner cycles stopped by directory budget
     pub partial_cycles_directories: u64,
-    /// Lifetime source work snapshots
-    pub source_work: Vec<ScannerSourceWorkStats>,
-    /// Current cycle source work snapshots
-    pub current_cycle_source_work: Vec<ScannerSourceWorkStats>,
-    /// Last cycle source work snapshots
-    pub last_cycle_source_work: Vec<ScannerSourceWorkStats>,
-    /// Lifetime bucket-drive scan results
-    pub bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
-    /// Current cycle bucket-drive scan results
-    pub current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
-    /// Last cycle bucket-drive scan results
-    pub last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
 }
 
 /// Scanner source-work metrics for a source.
@@ -200,11 +186,32 @@ pub struct ScannerBucketDriveResultStats {
     pub count: u64,
 }
 
+/// Scanner statistics with runtime-local node identity and bounded source/result details.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScannerRuntimeStats {
+    pub(crate) server: String,
+    pub(crate) stats: ScannerStats,
+    pub(crate) source_work: Vec<ScannerSourceWorkStats>,
+    pub(crate) current_cycle_source_work: Vec<ScannerSourceWorkStats>,
+    pub(crate) last_cycle_source_work: Vec<ScannerSourceWorkStats>,
+    pub(crate) bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
+    pub(crate) current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
+    pub(crate) last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
+}
+
 /// Collects scanner metrics from the given stats.
 ///
 /// Uses the metric descriptors from `metrics_type::scanner` module.
 /// Returns a vector of Prometheus metrics for scanner statistics.
 pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
+    collect_scanner_metrics_with_runtime(stats, None)
+}
+
+pub(crate) fn collect_scanner_runtime_metrics(stats: &ScannerRuntimeStats) -> Vec<PrometheusMetric> {
+    collect_scanner_metrics_with_runtime(&stats.stats, Some(stats))
+}
+
+fn collect_scanner_metrics_with_runtime(stats: &ScannerStats, runtime: Option<&ScannerRuntimeStats>) -> Vec<PrometheusMetric> {
     fn push_source_work_metric(
         metrics: &mut Vec<PrometheusMetric>,
         descriptor: &'static crate::metrics::schema::MetricDescriptor,
@@ -410,42 +417,44 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
             .with_label("reason", "directories"),
     ];
 
-    push_source_work_metrics(&mut metrics, &SCANNER_SOURCE_WORK_TOTAL_MD, &stats.server, &stats.source_work, None);
-    push_source_work_metrics(
-        &mut metrics,
-        &SCANNER_CYCLE_SOURCE_WORK_MD,
-        &stats.server,
-        &stats.current_cycle_source_work,
-        Some("current"),
-    );
-    push_source_work_metrics(
-        &mut metrics,
-        &SCANNER_CYCLE_SOURCE_WORK_MD,
-        &stats.server,
-        &stats.last_cycle_source_work,
-        Some("last"),
-    );
-    push_bucket_drive_result_metrics(
-        &mut metrics,
-        &SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD,
-        &stats.server,
-        &stats.bucket_drive_results,
-        None,
-    );
-    push_bucket_drive_result_metrics(
-        &mut metrics,
-        &SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
-        &stats.server,
-        &stats.current_cycle_bucket_drive_results,
-        Some("current"),
-    );
-    push_bucket_drive_result_metrics(
-        &mut metrics,
-        &SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
-        &stats.server,
-        &stats.last_cycle_bucket_drive_results,
-        Some("last"),
-    );
+    if let Some(runtime) = runtime {
+        push_source_work_metrics(&mut metrics, &SCANNER_SOURCE_WORK_TOTAL_MD, &runtime.server, &runtime.source_work, None);
+        push_source_work_metrics(
+            &mut metrics,
+            &SCANNER_CYCLE_SOURCE_WORK_MD,
+            &runtime.server,
+            &runtime.current_cycle_source_work,
+            Some("current"),
+        );
+        push_source_work_metrics(
+            &mut metrics,
+            &SCANNER_CYCLE_SOURCE_WORK_MD,
+            &runtime.server,
+            &runtime.last_cycle_source_work,
+            Some("last"),
+        );
+        push_bucket_drive_result_metrics(
+            &mut metrics,
+            &SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD,
+            &runtime.server,
+            &runtime.bucket_drive_results,
+            None,
+        );
+        push_bucket_drive_result_metrics(
+            &mut metrics,
+            &SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
+            &runtime.server,
+            &runtime.current_cycle_bucket_drive_results,
+            Some("current"),
+        );
+        push_bucket_drive_result_metrics(
+            &mut metrics,
+            &SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
+            &runtime.server,
+            &runtime.last_cycle_bucket_drive_results,
+            Some("last"),
+        );
+    }
 
     metrics
 }
@@ -461,77 +470,8 @@ mod tests {
 
     #[test]
     fn test_collect_scanner_metrics() {
-        let stats = ScannerStats {
+        let stats = ScannerRuntimeStats {
             server: "node1:9000".to_string(),
-            bucket_scans_finished: 100,
-            bucket_scans_started: 100,
-            bucket_scans_failed: 2,
-            directories_scanned: 50000,
-            objects_scanned: 1000000,
-            versions_scanned: 1500000,
-            last_activity_seconds: 30,
-            active_paths: 4,
-            oldest_active_path_age_seconds: 17,
-            current_set_scan_concurrency_limit: 3,
-            current_set_scans_queued: 5,
-            current_set_scans_active: 2,
-            current_disk_scan_concurrency_limit: 6,
-            current_disk_bucket_scans_queued: 18,
-            current_disk_bucket_scans_active: 4,
-            throttle_idle_mode_enabled: true,
-            throttle_sleep_factor: 10.0,
-            throttle_max_sleep_seconds: 15.0,
-            yield_every_n_objects: 128,
-            cycle_interval_seconds: 3600.0,
-            cycle_max_duration_seconds: 1800.0,
-            cycle_max_objects: 1_000_000,
-            cycle_max_directories: 100_000,
-            bitrot_cycle_enabled: true,
-            bitrot_cycle_seconds: 86400.0,
-            current_cycle: 12,
-            completed_cycles: 11,
-            current_cycle_age_seconds: 90,
-            current_cycle_objects_scanned: 250,
-            current_cycle_directories_scanned: 20,
-            current_cycle_bucket_drive_scans: 2,
-            current_cycle_bucket_drive_failures: 1,
-            current_cycle_objects_per_second: 12.5,
-            current_cycle_directories_per_second: 1.0,
-            current_cycle_bucket_drive_scans_per_second: 0.1,
-            current_cycle_yield_events: 8,
-            current_cycle_yield_duration_seconds: 1.25,
-            current_cycle_throttle_sleep_events: 4,
-            current_cycle_throttle_sleep_duration_seconds: 2.5,
-            current_cycle_ilm_actions: 6,
-            current_cycle_heal_objects: 2,
-            current_cycle_replication_checks: 5,
-            current_cycle_usage_saves: 3,
-            current_scan_mode: 2,
-            last_cycle_result: 1,
-            last_cycle_partial_reason: 3,
-            last_cycle_duration_seconds: 42.5,
-            last_cycle_objects_scanned: 900,
-            last_cycle_directories_scanned: 80,
-            last_cycle_bucket_drive_scans: 6,
-            last_cycle_bucket_drive_failures: 2,
-            last_cycle_objects_per_second: 18.0,
-            last_cycle_directories_per_second: 1.6,
-            last_cycle_bucket_drive_scans_per_second: 0.12,
-            last_cycle_yield_events: 30,
-            last_cycle_yield_duration_seconds: 9.5,
-            last_cycle_throttle_sleep_events: 12,
-            last_cycle_throttle_sleep_duration_seconds: 6.75,
-            last_cycle_ilm_actions: 44,
-            last_cycle_heal_objects: 7,
-            last_cycle_replication_checks: 12,
-            last_cycle_usage_saves: 9,
-            failed_cycles: 3,
-            superseded_cycles: 5,
-            partial_cycles: 10,
-            partial_cycles_unknown: 1,
-            partial_cycles_runtime: 2,
-            partial_cycles_objects: 3,
-            partial_cycles_directories: 4,
             source_work: vec![ScannerSourceWorkStats {
                 source: "lifecycle".to_string(),
                 checked: 11,
@@ -577,9 +517,80 @@ mod tests {
                 result: "error".to_string(),
                 count: 2,
             }],
+            stats: ScannerStats {
+                bucket_scans_finished: 100,
+                bucket_scans_started: 100,
+                bucket_scans_failed: 2,
+                directories_scanned: 50000,
+                objects_scanned: 1000000,
+                versions_scanned: 1500000,
+                last_activity_seconds: 30,
+                active_paths: 4,
+                oldest_active_path_age_seconds: 17,
+                current_set_scan_concurrency_limit: 3,
+                current_set_scans_queued: 5,
+                current_set_scans_active: 2,
+                current_disk_scan_concurrency_limit: 6,
+                current_disk_bucket_scans_queued: 18,
+                current_disk_bucket_scans_active: 4,
+                throttle_idle_mode_enabled: true,
+                throttle_sleep_factor: 10.0,
+                throttle_max_sleep_seconds: 15.0,
+                yield_every_n_objects: 128,
+                cycle_interval_seconds: 3600.0,
+                cycle_max_duration_seconds: 1800.0,
+                cycle_max_objects: 1_000_000,
+                cycle_max_directories: 100_000,
+                bitrot_cycle_enabled: true,
+                bitrot_cycle_seconds: 86400.0,
+                current_cycle: 12,
+                completed_cycles: 11,
+                current_cycle_age_seconds: 90,
+                current_cycle_objects_scanned: 250,
+                current_cycle_directories_scanned: 20,
+                current_cycle_bucket_drive_scans: 2,
+                current_cycle_bucket_drive_failures: 1,
+                current_cycle_objects_per_second: 12.5,
+                current_cycle_directories_per_second: 1.0,
+                current_cycle_bucket_drive_scans_per_second: 0.1,
+                current_cycle_yield_events: 8,
+                current_cycle_yield_duration_seconds: 1.25,
+                current_cycle_throttle_sleep_events: 4,
+                current_cycle_throttle_sleep_duration_seconds: 2.5,
+                current_cycle_ilm_actions: 6,
+                current_cycle_heal_objects: 2,
+                current_cycle_replication_checks: 5,
+                current_cycle_usage_saves: 3,
+                current_scan_mode: 2,
+                last_cycle_result: 1,
+                last_cycle_partial_reason: 3,
+                last_cycle_duration_seconds: 42.5,
+                last_cycle_objects_scanned: 900,
+                last_cycle_directories_scanned: 80,
+                last_cycle_bucket_drive_scans: 6,
+                last_cycle_bucket_drive_failures: 2,
+                last_cycle_objects_per_second: 18.0,
+                last_cycle_directories_per_second: 1.6,
+                last_cycle_bucket_drive_scans_per_second: 0.12,
+                last_cycle_yield_events: 30,
+                last_cycle_yield_duration_seconds: 9.5,
+                last_cycle_throttle_sleep_events: 12,
+                last_cycle_throttle_sleep_duration_seconds: 6.75,
+                last_cycle_ilm_actions: 44,
+                last_cycle_heal_objects: 7,
+                last_cycle_replication_checks: 12,
+                last_cycle_usage_saves: 9,
+                failed_cycles: 3,
+                superseded_cycles: 5,
+                partial_cycles: 10,
+                partial_cycles_unknown: 1,
+                partial_cycles_runtime: 2,
+                partial_cycles_objects: 3,
+                partial_cycles_directories: 4,
+            },
         };
 
-        let metrics = collect_scanner_metrics(&stats);
+        let metrics = collect_scanner_runtime_metrics(&stats);
         report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 90);

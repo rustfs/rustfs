@@ -18,9 +18,9 @@ use std::time::Duration;
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
 use rustfs_ecstore::api::bucket::replication::{
-    DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBucketBacklogObservability, RuntimeReplicationTargetBacklog,
-    durable_mrf_backlog_summary_snapshot, durable_mrf_target_backlog_snapshot, get_global_replication_stats,
-    mrf_backlog_observability_snapshot,
+    BucketReplicationStats as SourceBucketReplicationStats, DurableMrfBucketBacklog, DurableMrfTargetBacklog,
+    MrfBucketBacklogObservability, RuntimeReplicationTargetBacklog, durable_mrf_backlog_summary_snapshot,
+    durable_mrf_target_backlog_snapshot, get_global_replication_stats, mrf_backlog_observability_snapshot,
 };
 pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
@@ -179,6 +179,73 @@ fn replication_backlog_count(failed_counts: impl Iterator<Item = i64>, queued_co
     let failed_backlog = failed_counts.map(i64_to_u64_floor_zero).sum::<u64>();
 
     failed_backlog.saturating_add(i64_to_u64_floor_zero(queued_count))
+}
+
+fn bucket_replication_runtime_snapshot_from_source(
+    bucket_stats: Option<&SourceBucketReplicationStats>,
+) -> ObsBucketReplicationRuntimeSnapshot {
+    let mut runtime = ObsBucketReplicationRuntimeSnapshot {
+        targets: Vec::with_capacity(bucket_stats.map(|stats| stats.stats.len()).unwrap_or(0)),
+        ..Default::default()
+    };
+
+    if let Some(bucket_stats) = bucket_stats {
+        for (target_arn, target_stats) in &bucket_stats.stats {
+            runtime.total_failed_bytes = runtime
+                .total_failed_bytes
+                .saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
+            runtime.total_failed_count = runtime
+                .total_failed_count
+                .saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
+
+            let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
+            runtime.last_min_failed_bytes = runtime
+                .last_min_failed_bytes
+                .saturating_add(i64_to_u64_floor_zero(last_min.size));
+            runtime.last_min_failed_count = runtime
+                .last_min_failed_count
+                .saturating_add(i64_to_u64_floor_zero(last_min.count));
+
+            let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
+            runtime.last_hour_failed_bytes = runtime
+                .last_hour_failed_bytes
+                .saturating_add(i64_to_u64_floor_zero(last_hour.size));
+            runtime.last_hour_failed_count = runtime
+                .last_hour_failed_count
+                .saturating_add(i64_to_u64_floor_zero(last_hour.count));
+
+            runtime.sent_bytes = runtime
+                .sent_bytes
+                .saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
+            runtime.sent_count = runtime
+                .sent_count
+                .saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
+
+            runtime.targets.push(ObsBucketReplicationTargetStatsSnapshot {
+                target_arn: target_arn.clone(),
+                bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
+                current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
+                latency_ms: target_stats.latency.curr,
+                sent_bytes: i64_to_u64_floor_zero(target_stats.replicated_size),
+                sent_count: i64_to_u64_floor_zero(target_stats.replicated_count),
+                total_failed_bytes: i64_to_u64_floor_zero(target_stats.fail_stats.size),
+                total_failed_count: i64_to_u64_floor_zero(target_stats.fail_stats.count),
+                last_min_failed_bytes: i64_to_u64_floor_zero(last_min.size),
+                last_min_failed_count: i64_to_u64_floor_zero(last_min.count),
+                last_hour_failed_bytes: i64_to_u64_floor_zero(last_hour.size),
+                last_hour_failed_count: i64_to_u64_floor_zero(last_hour.count),
+            });
+        }
+        runtime.resync_started_count = i64_to_u64_floor_zero(bucket_stats.resync_started_count);
+        runtime.resync_completed_count = i64_to_u64_floor_zero(bucket_stats.resync_completed_count);
+        runtime.resync_failed_count = i64_to_u64_floor_zero(bucket_stats.resync_failed_count);
+        runtime.resync_canceled_count = i64_to_u64_floor_zero(bucket_stats.resync_canceled_count);
+        runtime.resync_duration_ms = i64_to_u64_floor_zero(bucket_stats.resync_duration_ms);
+        runtime.current_backlog_count = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count);
+        runtime.current_backlog_bytes = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes);
+    }
+
+    runtime
 }
 
 fn bucket_replication_stats_snapshot_from_parts(
@@ -365,66 +432,7 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             proxied_delete_tagging_requests_total: i64_to_u64_floor_zero(proxy.delete_tag_total),
             proxied_delete_tagging_requests_failures: i64_to_u64_floor_zero(proxy.delete_tag_failed),
         };
-        let mut runtime = ObsBucketReplicationRuntimeSnapshot {
-            targets: Vec::with_capacity(bucket_stats.map(|stats| stats.stats.len()).unwrap_or(0)),
-            ..Default::default()
-        };
-
-        if let Some(bucket_stats) = bucket_stats {
-            for (target_arn, target_stats) in &bucket_stats.stats {
-                runtime.total_failed_bytes = runtime
-                    .total_failed_bytes
-                    .saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
-                runtime.total_failed_count = runtime
-                    .total_failed_count
-                    .saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
-
-                let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
-                runtime.last_min_failed_bytes = runtime
-                    .last_min_failed_bytes
-                    .saturating_add(i64_to_u64_floor_zero(last_min.size));
-                runtime.last_min_failed_count = runtime
-                    .last_min_failed_count
-                    .saturating_add(i64_to_u64_floor_zero(last_min.count));
-
-                let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
-                runtime.last_hour_failed_bytes = runtime
-                    .last_hour_failed_bytes
-                    .saturating_add(i64_to_u64_floor_zero(last_hour.size));
-                runtime.last_hour_failed_count = runtime
-                    .last_hour_failed_count
-                    .saturating_add(i64_to_u64_floor_zero(last_hour.count));
-
-                runtime.sent_bytes = runtime
-                    .sent_bytes
-                    .saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
-                runtime.sent_count = runtime
-                    .sent_count
-                    .saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
-
-                runtime.targets.push(ObsBucketReplicationTargetStatsSnapshot {
-                    target_arn: target_arn.clone(),
-                    bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
-                    current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
-                    latency_ms: target_stats.latency.curr,
-                    sent_bytes: i64_to_u64_floor_zero(target_stats.replicated_size),
-                    sent_count: i64_to_u64_floor_zero(target_stats.replicated_count),
-                    total_failed_bytes: i64_to_u64_floor_zero(target_stats.fail_stats.size),
-                    total_failed_count: i64_to_u64_floor_zero(target_stats.fail_stats.count),
-                    last_min_failed_bytes: i64_to_u64_floor_zero(last_min.size),
-                    last_min_failed_count: i64_to_u64_floor_zero(last_min.count),
-                    last_hour_failed_bytes: i64_to_u64_floor_zero(last_hour.size),
-                    last_hour_failed_count: i64_to_u64_floor_zero(last_hour.count),
-                });
-            }
-            runtime.resync_started_count = i64_to_u64_floor_zero(bucket_stats.resync_started_count);
-            runtime.resync_completed_count = i64_to_u64_floor_zero(bucket_stats.resync_completed_count);
-            runtime.resync_failed_count = i64_to_u64_floor_zero(bucket_stats.resync_failed_count);
-            runtime.resync_canceled_count = i64_to_u64_floor_zero(bucket_stats.resync_canceled_count);
-            runtime.resync_duration_ms = i64_to_u64_floor_zero(bucket_stats.resync_duration_ms);
-            runtime.current_backlog_count = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.count);
-            runtime.current_backlog_bytes = i64_to_u64_floor_zero(bucket_stats.q_stat.curr.bytes);
-        }
+        let runtime = bucket_replication_runtime_snapshot_from_source(bucket_stats);
         let durable_bucket = durable_buckets.get(&bucket).cloned().unwrap_or_default();
         let runtime_targets = runtime_targets_by_bucket.remove(&bucket).unwrap_or_default();
         let durable_targets = durable_targets_by_bucket.remove(&bucket).unwrap_or_default();
@@ -514,6 +522,47 @@ mod tests {
     #[test]
     fn replication_backlog_count_keeps_legacy_failed_backlog_semantics() {
         assert_eq!(replication_backlog_count([9].into_iter(), 0), 9);
+    }
+
+    #[test]
+    fn bucket_replication_runtime_snapshot_maps_target_flow_fields_from_source() {
+        let mut source = SourceBucketReplicationStats::new();
+        let target = source.stats.entry("arn:rustfs:replication:target-a".to_string()).or_default();
+        target.fail_stats.add_size::<()>(100, None);
+        target.fail_stats.add_size::<()>(200, None);
+        target.fail_stats.count = 7;
+        target.fail_stats.size = 900;
+        target.replicated_size = 1234;
+        target.replicated_count = 12;
+        target.bandwidth_limit_bytes_per_sec = 4096;
+        target.current_bandwidth_bytes_per_sec = 512.5;
+        target.latency.curr = 45.0;
+
+        let snapshot = bucket_replication_runtime_snapshot_from_source(Some(&source));
+
+        assert_eq!(snapshot.sent_bytes, 1234);
+        assert_eq!(snapshot.sent_count, 12);
+        assert_eq!(snapshot.total_failed_bytes, 900);
+        assert_eq!(snapshot.total_failed_count, 7);
+        assert_eq!(snapshot.last_min_failed_bytes, 300);
+        assert_eq!(snapshot.last_min_failed_count, 2);
+        assert_eq!(snapshot.last_hour_failed_bytes, 300);
+        assert_eq!(snapshot.last_hour_failed_count, 2);
+
+        assert_eq!(snapshot.targets.len(), 1);
+        let target = &snapshot.targets[0];
+        assert_eq!(target.target_arn, "arn:rustfs:replication:target-a");
+        assert_eq!(target.bandwidth_limit_bytes_per_sec, 4096);
+        assert_eq!(target.current_bandwidth_bytes_per_sec, 512.5);
+        assert_eq!(target.latency_ms, 45.0);
+        assert_eq!(target.sent_bytes, 1234);
+        assert_eq!(target.sent_count, 12);
+        assert_eq!(target.total_failed_bytes, 900);
+        assert_eq!(target.total_failed_count, 7);
+        assert_eq!(target.last_min_failed_bytes, 300);
+        assert_eq!(target.last_min_failed_count, 2);
+        assert_eq!(target.last_hour_failed_bytes, 300);
+        assert_eq!(target.last_hour_failed_count, 2);
     }
 
     #[test]

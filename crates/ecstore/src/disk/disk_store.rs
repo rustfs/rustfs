@@ -1242,6 +1242,9 @@ impl LocalDiskWrapper {
         if timeout_duration == Duration::ZERO {
             let result = operation().await;
             self.health.record_operation_latency(op, started.elapsed());
+            if matches!(result.as_ref(), Err(DiskError::Timeout)) {
+                self.health.record_timeout_error();
+            }
             if result.is_ok() {
                 self.health.record_operation_success(&self.endpoint(), "operation_success");
             }
@@ -1253,6 +1256,9 @@ impl LocalDiskWrapper {
         match result {
             Ok(operation_result) => {
                 self.health.record_operation_latency(op, started.elapsed());
+                if matches!(operation_result.as_ref(), Err(DiskError::Timeout)) {
+                    self.health.record_timeout_error();
+                }
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.record_operation_success(&self.endpoint(), "operation_success");
@@ -2565,6 +2571,7 @@ mod tests {
             assert_eq!(walk_err, DiskError::Timeout);
             assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
             assert!(!wrapper.health.is_faulty());
+            assert_eq!(wrapper.health.metrics_snapshot().total_errors_timeout, 1);
 
             let info = wrapper
                 .stat_volume(bucket)

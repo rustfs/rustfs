@@ -24,11 +24,12 @@
 //! - Host network I/O metrics
 
 use crate::metrics::collectors::{
+    AuditTargetRuntimeStats,
     AuditTargetStats,
     BucketReplicationBacklogStats,
     BucketReplicationBandwidthStats,
-    BucketReplicationStats,
-    DriveDetailedStats,
+    BucketReplicationRuntimeStats,
+    DriveRuntimeDetailedStats,
     NotificationStats,
     NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
@@ -36,12 +37,12 @@ use crate::metrics::collectors::{
     ProcessCpuStats,
     ProcessDiskStats,
     ProcessMemoryStats,
-    ScannerStats,
-    collect_audit_metrics,
+    ScannerRuntimeStats,
+    collect_audit_runtime_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_backlog_metrics,
     collect_bucket_replication_bandwidth_metrics,
-    collect_bucket_replication_metrics,
+    collect_bucket_replication_runtime_metrics,
     collect_bucket_usage_metrics,
     collect_cluster_config_metrics,
     collect_cluster_health_metrics,
@@ -51,11 +52,11 @@ use crate::metrics::collectors::{
     collect_cpu_metrics,
     collect_current_dial9_metrics,
     collect_drive_count_metrics,
-    collect_drive_detailed_metrics,
+    collect_drive_runtime_detailed_metrics,
     collect_erasure_set_metrics,
     collect_host_network_metrics,
     collect_iam_metrics,
-    collect_ilm_metrics,
+    collect_ilm_runtime_metrics,
     collect_memory_metrics,
     collect_network_metrics,
     collect_node_metrics,
@@ -67,8 +68,9 @@ use crate::metrics::collectors::{
     collect_process_memory_metrics,
     collect_process_metrics,
     collect_replication_metrics,
+    collect_request_metrics,
     collect_resource_metrics,
-    collect_scanner_metrics,
+    collect_scanner_runtime_metrics,
 };
 use crate::metrics::config::{
     DEFAULT_AUDIT_METRICS_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
@@ -123,12 +125,12 @@ use crate::metrics::schema::system_drive::{
 };
 use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
-    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_stats_bundle,
-    collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
-    collect_compression_cluster_stats, collect_disk_and_system_drive_stats, collect_erasure_set_stats,
-    collect_host_network_stats, collect_iam_stats, collect_ilm_metric_stats, collect_internode_network_stats,
-    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_metric_stats,
-    collect_system_cpu_and_memory_stats_with,
+    ProcessMetricBundle, collect_api_request_stats, collect_bucket_replication_bandwidth_stats,
+    collect_bucket_replication_stats_bundle, collect_bucket_stats, collect_cluster_and_health_stats,
+    collect_cluster_config_stats, collect_cluster_usage_metric_stats, collect_compression_cluster_stats,
+    collect_disk_and_system_drive_runtime_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
+    collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_process_metric_bundle_with,
+    collect_replication_stats, collect_scanner_runtime_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
 use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
 use crate::telemetry::retire_metric_series;
@@ -174,7 +176,7 @@ const DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES: u8 = 3;
 /// Env var that overrides the zero-emission tombstone cycles for removed replication bandwidth series.
 const ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES: &str = "RUSTFS_METRICS_REPL_BW_ZERO_TOMBSTONE_CYCLES";
 const METRICS_RUNTIME_SERVICE_NAME: &str = "metrics_runtime";
-const METRICS_RUNTIME_BASE_COLLECTOR_TASKS: u8 = 10;
+const METRICS_RUNTIME_BASE_COLLECTOR_TASKS: u8 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -189,7 +191,8 @@ enum MetricsCollectorTaskId {
     BackgroundWorkflowStats = 7,
     ProcessMetrics = 8,
     InternodeNetworkStats = 9,
-    CompressionClusterStats = 10,
+    RequestStats = 10,
+    CompressionClusterStats = 11,
 }
 
 const BASE_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLLECTOR_TASKS as usize] = [
@@ -203,6 +206,7 @@ const BASE_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COL
     MetricsCollectorTaskId::BackgroundWorkflowStats,
     MetricsCollectorTaskId::ProcessMetrics,
     MetricsCollectorTaskId::InternodeNetworkStats,
+    MetricsCollectorTaskId::RequestStats,
 ];
 
 const ALL_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLLECTOR_TASKS as usize + 1] = [
@@ -216,6 +220,7 @@ const ALL_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLL
     MetricsCollectorTaskId::BackgroundWorkflowStats,
     MetricsCollectorTaskId::ProcessMetrics,
     MetricsCollectorTaskId::InternodeNetworkStats,
+    MetricsCollectorTaskId::RequestStats,
     MetricsCollectorTaskId::CompressionClusterStats,
 ];
 
@@ -296,15 +301,15 @@ type NotificationTargetKey = (String, String, String); // (server, target_id, ta
 type DriveInfoKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, disk_id)
 type ScannerBucketDriveResultKey = (String, String, String, String); // (server, bucket, drive, result)
 
-fn drive_info_live_keys(stats: &[DriveDetailedStats]) -> HashSet<DriveInfoKey> {
+fn drive_info_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveInfoKey> {
     stats.iter().filter_map(drive_info_key).collect()
 }
 
-fn drive_info_key(stat: &DriveDetailedStats) -> Option<DriveInfoKey> {
+fn drive_info_key(stat: &DriveRuntimeDetailedStats) -> Option<DriveInfoKey> {
     let disk_id = stat.disk_id.as_ref().filter(|disk_id| !disk_id.is_empty())?;
     Some((
-        stat.server.clone(),
-        stat.drive.clone(),
+        stat.stats.server.clone(),
+        stat.stats.drive.clone(),
         stat.pool_index.as_ref()?.clone(),
         stat.set_index.as_ref()?.clone(),
         stat.drive_index.as_ref()?.clone(),
@@ -324,7 +329,7 @@ fn retire_drive_info_metric_series(key: &DriveInfoKey) -> usize {
     retire_metric_series(&DRIVE_INFO_MD.get_full_metric_name(), &labels)
 }
 
-fn scanner_last_bucket_drive_result_live_keys(stats: &ScannerStats) -> HashSet<ScannerBucketDriveResultKey> {
+fn scanner_last_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerBucketDriveResultKey> {
     stats
         .last_cycle_bucket_drive_results
         .iter()
@@ -718,19 +723,19 @@ fn repl_backlog_target_live_keys(stats: &[BucketReplicationBacklogStats]) -> Has
         .collect()
 }
 
-fn repl_flow_live_keys(stats: &[BucketReplicationStats]) -> HashSet<ReplBwKey> {
+fn repl_flow_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<ReplBwKey> {
     stats
         .iter()
         .flat_map(|stat| {
-            stat.targets
+            stat.target_flows
                 .iter()
-                .map(|target| (stat.bucket.clone(), target.target_arn.clone()))
+                .map(|target| (stat.stats.bucket.clone(), target.target_arn.clone()))
         })
         .collect()
 }
 
-fn repl_proxy_bucket_live_keys(stats: &[BucketReplicationStats]) -> HashSet<BucketKey> {
-    stats.iter().map(|stat| stat.bucket.clone()).collect()
+fn repl_proxy_bucket_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.stats.bucket.clone()).collect()
 }
 
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
@@ -985,15 +990,15 @@ fn retire_bucket_usage_distribution_series(metric_name: String, bucket: &str, ra
     retire_metric_series(&metric_name, &labels)
 }
 
-fn audit_target_live_keys(stats: &[AuditTargetStats]) -> HashSet<AuditTargetKey> {
+fn audit_target_live_keys(stats: &[AuditTargetRuntimeStats]) -> HashSet<AuditTargetKey> {
     stats
         .iter()
-        .map(|stat| (stat.server.clone(), stat.target_id.clone()))
+        .map(|stat| (stat.server.clone(), stat.target.target_id.clone()))
         .collect()
 }
 
-fn audit_legacy_target_live_keys(stats: &[AuditTargetStats]) -> HashSet<AuditLegacyTargetKey> {
-    stats.iter().map(|stat| stat.target_id.clone()).collect()
+fn audit_legacy_target_live_keys(stats: &[AuditTargetRuntimeStats]) -> HashSet<AuditLegacyTargetKey> {
+    stats.iter().map(|stat| stat.target.target_id.clone()).collect()
 }
 
 fn collect_audit_legacy_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditLegacyTargetKey, u8>) -> Vec<PrometheusMetric> {
@@ -1721,7 +1726,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::NodeDiskStats, "node_disk_stats", async {
-                        let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
+                        let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_runtime_stats().await;
                         let current_drive_info_keys = drive_info_live_keys(&drive_stats);
                         let retire_drive_info_keys = if has_seen_drive_info_snapshot {
                             prev_drive_info_keys.difference(&current_drive_info_keys).cloned().collect::<Vec<_>>()
@@ -1731,7 +1736,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         prev_drive_info_keys = current_drive_info_keys;
                         has_seen_drive_info_snapshot = true;
                         let mut metrics = collect_node_metrics(&disk_stats);
-                        metrics.extend(collect_drive_detailed_metrics(&drive_stats));
+                        metrics.extend(collect_drive_runtime_detailed_metrics(&drive_stats));
                         metrics.extend(collect_drive_count_metrics(&drive_counts));
                         report_metrics(&metrics);
                         for key in retire_drive_info_keys {
@@ -1827,7 +1832,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                     repl_bw_zero_tombstone_cycles,
                                 );
                             }
-                            metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
+                            metrics.extend(collect_bucket_replication_runtime_metrics(&bucket_replication));
                             update_series_zero_tombstones(
                                 &mut has_seen_valid_flow_snapshot,
                                 &mut prev_flow_live_keys,
@@ -1891,13 +1896,15 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         let server = current_local_node_identity();
                         let stats = audit_target_metrics().await
                             .into_iter()
-                            .map(|snapshot| AuditTargetStats {
-                                failed_messages: snapshot.failed_messages,
-                                failed_store_length: snapshot.failed_store_length,
-                                queue_length: snapshot.queue_length,
+                            .map(|snapshot| AuditTargetRuntimeStats {
                                 server: server.clone(),
-                                target_id: snapshot.target_id,
-                                total_messages: snapshot.total_messages,
+                                target: AuditTargetStats {
+                                    failed_messages: snapshot.failed_messages,
+                                    failed_store_length: snapshot.failed_store_length,
+                                    queue_length: snapshot.queue_length,
+                                    target_id: snapshot.target_id,
+                                    total_messages: snapshot.total_messages,
+                                },
                             })
                             .collect::<Vec<_>>();
                         update_series_zero_tombstones(
@@ -1914,7 +1921,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             audit_legacy_target_live_keys(&stats),
                             tombstone_cycles,
                         );
-                        let mut metrics = collect_audit_metrics(&stats);
+                        let mut metrics = collect_audit_runtime_metrics(&stats);
                         metrics.extend(collect_audit_legacy_zero_tombstone_metrics(&audit_legacy_zero_tombstones));
                         metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
                         report_metrics(&metrics);
@@ -2024,12 +2031,12 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         async {
                             let mut metrics = Vec::new();
 
-                            if let Some(stats) = collect_ilm_metric_stats().await {
-                                metrics.extend(collect_ilm_metrics(&stats));
+                            if let Some(stats) = collect_ilm_runtime_metric_stats().await {
+                                metrics.extend(collect_ilm_runtime_metrics(&stats));
                             }
 
                             let mut retire_scanner_last_bucket_drive_result_keys = Vec::new();
-                            if let Some(stats) = collect_scanner_metric_stats().await {
+                            if let Some(stats) = collect_scanner_runtime_metric_stats().await {
                                 let current_keys = scanner_last_bucket_drive_result_live_keys(&stats);
                                 if has_seen_scanner_snapshot {
                                     retire_scanner_last_bucket_drive_result_keys = prev_scanner_last_bucket_drive_result_keys
@@ -2039,7 +2046,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 }
                                 prev_scanner_last_bucket_drive_result_keys = current_keys;
                                 has_seen_scanner_snapshot = true;
-                                metrics.extend(collect_scanner_metrics(&stats));
+                                metrics.extend(collect_scanner_runtime_metrics(&stats));
                             }
 
                             if !metrics.is_empty() {
@@ -2053,6 +2060,28 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "background_workflow_stats", state = "cancelled", "metrics runtime state changed");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn task for API request metrics.
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let mut interval = metrics_interval(resource_interval, stagger_duration(resource_interval, 1, 2));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::RequestStats, "request_stats", async {
+                        let metrics = collect_request_metrics(&collect_api_request_stats());
+                        if !metrics.is_empty() {
+                            report_metrics(&metrics);
+                        }
+                    }).await;
+                }
+                _ = token_clone.cancelled() => {
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "request_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -2362,20 +2391,23 @@ mod tests {
         (server.to_string(), target_id.to_string(), target_type.to_string())
     }
 
-    fn drive_info_stat(disk_id: &str) -> DriveDetailedStats {
-        DriveDetailedStats {
-            server: "server-a".to_string(),
-            drive: "/data1".to_string(),
+    fn drive_info_stat(disk_id: &str) -> DriveRuntimeDetailedStats {
+        DriveRuntimeDetailedStats {
             pool_index: Some("0".to_string()),
             set_index: Some("1".to_string()),
             drive_index: Some("2".to_string()),
             disk_id: Some(disk_id.to_string()),
+            stats: crate::metrics::DriveDetailedStats {
+                server: "server-a".to_string(),
+                drive: "/data1".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
 
-    fn scanner_stats_with_last_result(bucket: &str) -> ScannerStats {
-        ScannerStats {
+    fn scanner_stats_with_last_result(bucket: &str) -> ScannerRuntimeStats {
+        ScannerRuntimeStats {
             server: "server-a".to_string(),
             last_cycle_bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
                 bucket: bucket.to_string(),
@@ -2423,12 +2455,18 @@ mod tests {
 
     #[test]
     fn replication_proxy_bucket_keys_detect_removed_buckets() {
-        let previous = repl_proxy_bucket_live_keys(&[BucketReplicationStats {
-            bucket: "photos".to_string(),
+        let previous = repl_proxy_bucket_live_keys(&[BucketReplicationRuntimeStats {
+            stats: crate::metrics::BucketReplicationStats {
+                bucket: "photos".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         }]);
-        let current = repl_proxy_bucket_live_keys(&[BucketReplicationStats {
-            bucket: "logs".to_string(),
+        let current = repl_proxy_bucket_live_keys(&[BucketReplicationRuntimeStats {
+            stats: crate::metrics::BucketReplicationStats {
+                bucket: "logs".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         }]);
         let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
@@ -2648,10 +2686,12 @@ mod tests {
         let mut has_seen_snapshot = true;
         let mut prev_live_keys = HashSet::from(["audit-webhook".to_string()]);
         let mut zero_tombstones = HashMap::new();
-        let stats = vec![AuditTargetStats {
+        let stats = vec![AuditTargetRuntimeStats {
             server: "node2:9000".to_string(),
-            target_id: "audit-webhook".to_string(),
-            ..Default::default()
+            target: AuditTargetStats {
+                target_id: "audit-webhook".to_string(),
+                ..Default::default()
+            },
         }];
 
         update_series_zero_tombstones(

@@ -14,7 +14,8 @@
 
 use std::{collections::HashMap, time::SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 use time::OffsetDateTime;
 
 use crate::metrics::TimedAction;
@@ -61,7 +62,7 @@ impl ItemState {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DiskMetrics {
     #[serde(rename = "lastMinute", alias = "last_minute")]
     pub last_minute: HashMap<String, TimedAction>,
@@ -77,6 +78,34 @@ pub struct DiskMetrics {
     pub total_writes: u64,
     #[serde(rename = "totalDeletes", alias = "total_deletes")]
     pub total_deletes: u64,
+}
+
+impl Serialize for DiskMetrics {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let human_readable = serializer.is_human_readable();
+        let mut state = serializer.serialize_struct("DiskMetrics", 7)?;
+        if human_readable {
+            state.serialize_field("lastMinute", &self.last_minute)?;
+            state.serialize_field("apiCalls", &self.api_calls)?;
+            state.serialize_field("totalWaiting", &self.total_waiting)?;
+            state.serialize_field("totalErrsAvailability", &self.total_errors_availability)?;
+            state.serialize_field("totalErrsTimeout", &self.total_errors_timeout)?;
+            state.serialize_field("totalWrites", &self.total_writes)?;
+            state.serialize_field("totalDeletes", &self.total_deletes)?;
+        } else {
+            state.serialize_field("last_minute", &self.last_minute)?;
+            state.serialize_field("api_calls", &self.api_calls)?;
+            state.serialize_field("total_waiting", &self.total_waiting)?;
+            state.serialize_field("total_errors_availability", &self.total_errors_availability)?;
+            state.serialize_field("total_errors_timeout", &self.total_errors_timeout)?;
+            state.serialize_field("total_writes", &self.total_writes)?;
+            state.serialize_field("total_deletes", &self.total_deletes)?;
+        }
+        state.end()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -439,6 +468,17 @@ mod tests {
         disk_index: i32,
     }
 
+    #[derive(Deserialize)]
+    struct LegacyDiskMetricsCompat {
+        last_minute: HashMap<String, TimedAction>,
+        api_calls: HashMap<String, u64>,
+        total_waiting: u32,
+        total_errors_availability: u64,
+        total_errors_timeout: u64,
+        total_writes: u64,
+        total_deletes: u64,
+    }
+
     #[test]
     fn test_item_state_to_string() {
         assert_eq!(ItemState::Offline.to_string(), ITEM_OFFLINE);
@@ -524,6 +564,32 @@ mod tests {
         assert_eq!(json["totalDeletes"], serde_json::json!(50));
         assert!(json.get("last_minute").is_none());
         assert!(json.get("total_errors_timeout").is_none());
+    }
+
+    #[test]
+    fn test_disk_metrics_msgpack_uses_internode_legacy_fields() {
+        let metrics = DiskMetrics {
+            total_waiting: 5,
+            total_errors_availability: 2,
+            total_errors_timeout: 1,
+            total_writes: 1000,
+            total_deletes: 50,
+            ..Default::default()
+        };
+
+        let mut encoded = Vec::new();
+        metrics
+            .serialize(&mut Serializer::new(&mut encoded).with_struct_map())
+            .expect("disk metrics should encode as named msgpack");
+
+        let decoded: LegacyDiskMetricsCompat = rmp_serde::from_slice(&encoded).expect("legacy disk metrics should decode");
+        assert!(decoded.last_minute.is_empty());
+        assert!(decoded.api_calls.is_empty());
+        assert_eq!(decoded.total_waiting, 5);
+        assert_eq!(decoded.total_errors_availability, 2);
+        assert_eq!(decoded.total_errors_timeout, 1);
+        assert_eq!(decoded.total_writes, 1000);
+        assert_eq!(decoded.total_deletes, 50);
     }
 
     #[test]

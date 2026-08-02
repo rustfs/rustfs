@@ -41,7 +41,7 @@ use crate::metrics::schema::bucket_replication::{
 use std::borrow::Cow;
 
 const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 37;
-const BUCKET_REPLICATION_FLOW_METRICS_PER_TARGET: usize = 9;
+const BUCKET_REPLICATION_RUNTIME_FLOW_METRICS_PER_TARGET: usize = 8;
 const BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET: usize = 11;
 const BUCKET_REPLICATION_BACKLOG_METRICS_PER_TARGET: usize = 4;
 
@@ -51,6 +51,11 @@ pub struct BucketReplicationTargetStats {
     pub bandwidth_limit_bytes_per_sec: u64,
     pub current_bandwidth_bytes_per_sec: f64,
     pub latency_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BucketReplicationTargetFlowStats {
+    pub(crate) target_arn: String,
     pub sent_bytes: u64,
     pub sent_count: u64,
     pub total_failed_bytes: u64,
@@ -98,6 +103,12 @@ pub struct BucketReplicationStats {
     pub resync_canceled_count: u64,
     pub resync_duration_ms: u64,
     pub targets: Vec<BucketReplicationTargetStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BucketReplicationRuntimeStats {
+    pub(crate) stats: BucketReplicationStats,
+    pub(crate) target_flows: Vec<BucketReplicationTargetFlowStats>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -178,7 +189,7 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
 
     let metric_count = stats
         .iter()
-        .map(|stat| BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET + stat.targets.len() * BUCKET_REPLICATION_FLOW_METRICS_PER_TARGET)
+        .map(|stat| BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET + stat.targets.len())
         .sum();
     let mut metrics = Vec::with_capacity(metric_count);
     for stat in stats {
@@ -359,6 +370,36 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
         for target in &stat.targets {
             let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
             metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
+                    .with_label(RANGE_L, Cow::Borrowed("all"))
+                    .with_label(TARGET_ARN_L, target_label),
+            );
+        }
+    }
+
+    metrics
+}
+
+pub(crate) fn collect_bucket_replication_runtime_metrics(stats: &[BucketReplicationRuntimeStats]) -> Vec<PrometheusMetric> {
+    if stats.is_empty() {
+        return Vec::new();
+    }
+
+    let legacy_stats = stats.iter().map(|stat| stat.stats.clone()).collect::<Vec<_>>();
+    let mut metrics = collect_bucket_replication_metrics(&legacy_stats);
+    let flow_count = stats
+        .iter()
+        .map(|stat| stat.target_flows.len() * BUCKET_REPLICATION_RUNTIME_FLOW_METRICS_PER_TARGET)
+        .sum();
+    metrics.reserve(flow_count);
+
+    for stat in stats {
+        let bucket_label: Cow<'static, str> = Cow::Owned(stat.stats.bucket.clone());
+        for target in &stat.target_flows {
+            let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
+            metrics.push(
                 PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_SENT_BYTES_MD, target.sent_bytes as f64)
                     .with_label(BUCKET_L, bucket_label.clone())
                     .with_label(TARGET_ARN_L, target_label.clone()),
@@ -409,13 +450,6 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
                 )
                 .with_label(BUCKET_L, bucket_label.clone())
                 .with_label(TARGET_ARN_L, target_label.clone()),
-            );
-            metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
-                    .with_label(RANGE_L, Cow::Borrowed("all"))
-                    .with_label(TARGET_ARN_L, target_label),
             );
         }
     }
@@ -537,38 +571,43 @@ mod tests {
 
     #[test]
     fn test_collect_bucket_replication_metrics() {
-        let stats = vec![BucketReplicationStats {
-            bucket: "b1".to_string(),
-            total_failed_bytes: 64,
-            total_failed_count: 2,
-            last_min_failed_bytes: 32,
-            last_min_failed_count: 1,
-            last_hour_failed_bytes: 64,
-            last_hour_failed_count: 2,
-            sent_bytes: 1024,
-            sent_count: 8,
-            proxied_get_requests_total: 5,
-            proxied_get_requests_failures: 1,
-            proxied_head_requests_total: 4,
-            proxied_head_requests_failures: 0,
-            proxied_put_requests_total: 6,
-            proxied_put_requests_failures: 2,
-            proxied_put_tagging_requests_total: 3,
-            proxied_put_tagging_requests_failures: 1,
-            proxied_get_tagging_requests_total: 2,
-            proxied_get_tagging_requests_failures: 0,
-            proxied_delete_tagging_requests_total: 1,
-            proxied_delete_tagging_requests_failures: 1,
-            resync_started_count: 2,
-            resync_completed_count: 1,
-            resync_failed_count: 1,
-            resync_canceled_count: 0,
-            resync_duration_ms: 1500,
-            targets: vec![BucketReplicationTargetStats {
+        let stats = vec![BucketReplicationRuntimeStats {
+            stats: BucketReplicationStats {
+                bucket: "b1".to_string(),
+                total_failed_bytes: 64,
+                total_failed_count: 2,
+                last_min_failed_bytes: 32,
+                last_min_failed_count: 1,
+                last_hour_failed_bytes: 64,
+                last_hour_failed_count: 2,
+                sent_bytes: 1024,
+                sent_count: 8,
+                proxied_get_requests_total: 5,
+                proxied_get_requests_failures: 1,
+                proxied_head_requests_total: 4,
+                proxied_head_requests_failures: 0,
+                proxied_put_requests_total: 6,
+                proxied_put_requests_failures: 2,
+                proxied_put_tagging_requests_total: 3,
+                proxied_put_tagging_requests_failures: 1,
+                proxied_get_tagging_requests_total: 2,
+                proxied_get_tagging_requests_failures: 0,
+                proxied_delete_tagging_requests_total: 1,
+                proxied_delete_tagging_requests_failures: 1,
+                resync_started_count: 2,
+                resync_completed_count: 1,
+                resync_failed_count: 1,
+                resync_canceled_count: 0,
+                resync_duration_ms: 1500,
+                targets: vec![BucketReplicationTargetStats {
+                    target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
+                    bandwidth_limit_bytes_per_sec: 2048,
+                    current_bandwidth_bytes_per_sec: 1024.0,
+                    latency_ms: 15.0,
+                }],
+            },
+            target_flows: vec![BucketReplicationTargetFlowStats {
                 target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
-                bandwidth_limit_bytes_per_sec: 2048,
-                current_bandwidth_bytes_per_sec: 1024.0,
-                latency_ms: 15.0,
                 sent_bytes: 512,
                 sent_count: 4,
                 total_failed_bytes: 96,
@@ -580,7 +619,7 @@ mod tests {
             }],
         }];
 
-        let metrics = collect_bucket_replication_metrics(&stats);
+        let metrics = collect_bucket_replication_runtime_metrics(&stats);
         assert_eq!(metrics.len(), 46);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();

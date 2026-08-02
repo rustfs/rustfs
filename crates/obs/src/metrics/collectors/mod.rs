@@ -40,10 +40,12 @@ pub mod system_network;
 pub mod system_network_host;
 pub mod system_process;
 
+pub(crate) use audit::{AuditTargetRuntimeStats, collect_audit_runtime_metrics};
 pub use audit::{AuditTargetStats, collect_audit_metrics};
 pub use bucket::{BucketStats, collect_bucket_metrics};
 pub(crate) use bucket_replication::{
-    BucketReplicationBacklogStats, BucketReplicationTargetBacklogStats, collect_bucket_replication_backlog_metrics,
+    BucketReplicationBacklogStats, BucketReplicationRuntimeStats, BucketReplicationTargetBacklogStats,
+    BucketReplicationTargetFlowStats, collect_bucket_replication_backlog_metrics, collect_bucket_replication_runtime_metrics,
 };
 pub use bucket_replication::{
     BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats,
@@ -57,18 +59,22 @@ pub use cluster_iam::{IamStats, collect_iam_metrics};
 pub use cluster_usage::{BucketUsageStats, ClusterUsageStats, collect_bucket_usage_metrics, collect_cluster_usage_metrics};
 pub use compression::{CompressionClusterStats, collect_compression_cluster_metrics};
 pub use dial9::{Dial9Stats, collect_current_dial9_metrics, collect_dial9_metrics, is_dial9_enabled};
+pub(crate) use ilm::{IlmActionTaskStats, IlmRuntimeStats, collect_ilm_runtime_metrics};
 pub use ilm::{IlmStats, collect_ilm_metrics};
 pub use node::{DiskStats, collect_node_metrics};
 pub use notification::{NotificationStats, collect_notification_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
 pub use replication::{ReplicationStats, collect_replication_metrics};
+pub(crate) use request::{ApiRequestStats, collect_request_metrics};
 pub use resource::{ResourceStats, collect_resource_metrics};
+pub(crate) use scanner::{ScannerRuntimeStats, collect_scanner_runtime_metrics};
 pub use scanner::{ScannerStats, collect_scanner_metrics};
 pub use system_cpu::{CpuStats, ProcessCpuStats, collect_cpu_metrics, collect_process_cpu_metrics};
 pub use system_drive::{
     DriveCountStats, DriveDetailedStats, ProcessDiskStats, collect_drive_count_metrics, collect_drive_detailed_metrics,
     collect_process_disk_metrics,
 };
+pub(crate) use system_drive::{DriveRuntimeDetailedStats, collect_drive_runtime_detailed_metrics};
 #[cfg(feature = "gpu")]
 pub use system_gpu::{GpuCollector, GpuError, GpuStats, collect_gpu_metrics};
 pub use system_memory::{MemoryStats, ProcessMemoryStats, collect_memory_metrics, collect_process_memory_metrics};

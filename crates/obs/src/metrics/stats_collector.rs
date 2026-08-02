@@ -20,14 +20,14 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
-use crate::metrics::collectors::ilm::IlmActionTaskStats;
 use crate::metrics::collectors::scanner::{ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
-    BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetBacklogStats,
-    BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
-    ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, ErasureSetStats,
-    HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats,
-    ResourceStats, ScannerStats,
+    ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationRuntimeStats,
+    BucketReplicationStats, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats, BucketReplicationTargetStats,
+    BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats,
+    CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, DriveRuntimeDetailedStats,
+    ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmRuntimeStats, IlmStats, MemoryStats, NetworkStats,
+    ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerRuntimeStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -42,8 +42,8 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{
-    ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource_and_system,
-    snapshot_process_resource_and_system_with,
+    ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, s3_op_metrics_snapshot,
+    snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -195,7 +195,7 @@ async fn obs_ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
     ilm_runtime_snapshot().await
 }
 
-async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, Vec<BucketReplicationBacklogStats>) {
+async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationRuntimeStats>, Vec<BucketReplicationBacklogStats>) {
     let snapshots = obs_bucket_replication_stats_snapshot().await;
     let mut detail_stats = Vec::with_capacity(snapshots.len());
     let mut backlog_stats = Vec::with_capacity(snapshots.len());
@@ -232,52 +232,65 @@ async fn obs_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, 
     (detail_stats, backlog_stats)
 }
 
-fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnapshot) -> BucketReplicationStats {
-    BucketReplicationStats {
-        bucket: stats.bucket,
-        total_failed_bytes: stats.total_failed_bytes,
-        total_failed_count: stats.total_failed_count,
-        last_min_failed_bytes: stats.last_min_failed_bytes,
-        last_min_failed_count: stats.last_min_failed_count,
-        last_hour_failed_bytes: stats.last_hour_failed_bytes,
-        last_hour_failed_count: stats.last_hour_failed_count,
-        sent_bytes: stats.sent_bytes,
-        sent_count: stats.sent_count,
-        proxied_get_requests_total: stats.proxied_get_requests_total,
-        proxied_get_requests_failures: stats.proxied_get_requests_failures,
-        proxied_head_requests_total: stats.proxied_head_requests_total,
-        proxied_head_requests_failures: stats.proxied_head_requests_failures,
-        proxied_put_requests_total: stats.proxied_put_requests_total,
-        proxied_put_requests_failures: stats.proxied_put_requests_failures,
-        proxied_put_tagging_requests_total: stats.proxied_put_tagging_requests_total,
-        proxied_put_tagging_requests_failures: stats.proxied_put_tagging_requests_failures,
-        proxied_get_tagging_requests_total: stats.proxied_get_tagging_requests_total,
-        proxied_get_tagging_requests_failures: stats.proxied_get_tagging_requests_failures,
-        proxied_delete_tagging_requests_total: stats.proxied_delete_tagging_requests_total,
-        proxied_delete_tagging_requests_failures: stats.proxied_delete_tagging_requests_failures,
-        resync_started_count: stats.resync_started_count,
-        resync_completed_count: stats.resync_completed_count,
-        resync_failed_count: stats.resync_failed_count,
-        resync_canceled_count: stats.resync_canceled_count,
-        resync_duration_ms: stats.resync_duration_ms,
-        targets: stats
-            .targets
-            .into_iter()
-            .map(|target| BucketReplicationTargetStats {
-                target_arn: target.target_arn,
-                bandwidth_limit_bytes_per_sec: target.bandwidth_limit_bytes_per_sec,
-                current_bandwidth_bytes_per_sec: target.current_bandwidth_bytes_per_sec,
-                latency_ms: target.latency_ms,
-                sent_bytes: target.sent_bytes,
-                sent_count: target.sent_count,
-                total_failed_bytes: target.total_failed_bytes,
-                total_failed_count: target.total_failed_count,
-                last_min_failed_bytes: target.last_min_failed_bytes,
-                last_min_failed_count: target.last_min_failed_count,
-                last_hour_failed_bytes: target.last_hour_failed_bytes,
-                last_hour_failed_count: target.last_hour_failed_count,
-            })
-            .collect(),
+fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnapshot) -> BucketReplicationRuntimeStats {
+    let bucket = stats.bucket;
+    let (targets, target_flows): (Vec<_>, Vec<_>) = stats
+        .targets
+        .into_iter()
+        .map(|target| {
+            (
+                BucketReplicationTargetStats {
+                    target_arn: target.target_arn.clone(),
+                    bandwidth_limit_bytes_per_sec: target.bandwidth_limit_bytes_per_sec,
+                    current_bandwidth_bytes_per_sec: target.current_bandwidth_bytes_per_sec,
+                    latency_ms: target.latency_ms,
+                },
+                BucketReplicationTargetFlowStats {
+                    target_arn: target.target_arn,
+                    sent_bytes: target.sent_bytes,
+                    sent_count: target.sent_count,
+                    total_failed_bytes: target.total_failed_bytes,
+                    total_failed_count: target.total_failed_count,
+                    last_min_failed_bytes: target.last_min_failed_bytes,
+                    last_min_failed_count: target.last_min_failed_count,
+                    last_hour_failed_bytes: target.last_hour_failed_bytes,
+                    last_hour_failed_count: target.last_hour_failed_count,
+                },
+            )
+        })
+        .unzip();
+
+    BucketReplicationRuntimeStats {
+        target_flows,
+        stats: BucketReplicationStats {
+            bucket,
+            total_failed_bytes: stats.total_failed_bytes,
+            total_failed_count: stats.total_failed_count,
+            last_min_failed_bytes: stats.last_min_failed_bytes,
+            last_min_failed_count: stats.last_min_failed_count,
+            last_hour_failed_bytes: stats.last_hour_failed_bytes,
+            last_hour_failed_count: stats.last_hour_failed_count,
+            sent_bytes: stats.sent_bytes,
+            sent_count: stats.sent_count,
+            proxied_get_requests_total: stats.proxied_get_requests_total,
+            proxied_get_requests_failures: stats.proxied_get_requests_failures,
+            proxied_head_requests_total: stats.proxied_head_requests_total,
+            proxied_head_requests_failures: stats.proxied_head_requests_failures,
+            proxied_put_requests_total: stats.proxied_put_requests_total,
+            proxied_put_requests_failures: stats.proxied_put_requests_failures,
+            proxied_put_tagging_requests_total: stats.proxied_put_tagging_requests_total,
+            proxied_put_tagging_requests_failures: stats.proxied_put_tagging_requests_failures,
+            proxied_get_tagging_requests_total: stats.proxied_get_tagging_requests_total,
+            proxied_get_tagging_requests_failures: stats.proxied_get_tagging_requests_failures,
+            proxied_delete_tagging_requests_total: stats.proxied_delete_tagging_requests_total,
+            proxied_delete_tagging_requests_failures: stats.proxied_delete_tagging_requests_failures,
+            resync_started_count: stats.resync_started_count,
+            resync_completed_count: stats.resync_completed_count,
+            resync_failed_count: stats.resync_failed_count,
+            resync_canceled_count: stats.resync_canceled_count,
+            resync_duration_ms: stats.resync_duration_ms,
+            targets,
+        },
     }
 }
 
@@ -621,18 +634,33 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
     obs_bucket_replication_stats_snapshot()
         .await
         .into_iter()
-        .map(bucket_replication_detail_from_snapshot)
+        .map(|snapshot| bucket_replication_detail_from_snapshot(snapshot).stats)
         .collect()
 }
 
-pub(crate) async fn collect_bucket_replication_stats_bundle() -> (Vec<BucketReplicationStats>, Vec<BucketReplicationBacklogStats>)
-{
+pub(crate) async fn collect_bucket_replication_stats_bundle()
+-> (Vec<BucketReplicationRuntimeStats>, Vec<BucketReplicationBacklogStats>) {
     obs_bucket_replication_stats_bundle().await
 }
 
 /// Collect site-level replication stats from the global replication runtime.
 pub async fn collect_replication_stats() -> ReplicationStats {
     obs_site_replication_stats().await
+}
+
+/// Collect S3 API request totals from the in-process operation recorder.
+pub(crate) fn collect_api_request_stats() -> Vec<ApiRequestStats> {
+    let server = current_local_node_identity();
+    s3_op_metrics_snapshot()
+        .into_iter()
+        .map(|snapshot| ApiRequestStats {
+            server: server.clone(),
+            name: snapshot.op.to_string(),
+            req_type: "s3".to_string(),
+            total: snapshot.total,
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Collect disk statistics from the storage layer.
@@ -704,6 +732,12 @@ pub fn collect_system_memory_stats() -> MemoryStats {
 
 /// Collect node disk stats and drive stats from a single storage snapshot.
 pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
+    let (disk_stats, drive_stats, drive_count_stats) = collect_disk_and_system_drive_runtime_stats().await;
+    (disk_stats, drive_stats.into_iter().map(|stat| stat.stats).collect(), drive_count_stats)
+}
+
+pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
+-> (Vec<DiskStats>, Vec<DriveRuntimeDetailedStats>, DriveCountStats) {
     let Some(store) = resolve_obs_object_store_handle() else {
         return (Vec::new(), Vec::new(), DriveCountStats::default());
     };
@@ -739,9 +773,7 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
             }
             let (used_inodes, free_inodes, total_inodes) = drive_inode_stats(disk.used_inodes, disk.free_inodes);
 
-            DriveDetailedStats {
-                server: disk.endpoint.clone(),
-                drive: disk.drive_path.clone(),
+            DriveRuntimeDetailedStats {
                 pool_index: disk_topology_label(disk.pool_index),
                 set_index: disk_topology_label(disk.set_index),
                 drive_index: disk_topology_label(disk.disk_index),
@@ -750,29 +782,6 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                 healing: disk.healing,
                 scanning: disk.scanning,
                 offline_duration_seconds: disk.offline_duration_seconds,
-                total_bytes: disk.total_space,
-                used_bytes: disk.used_space,
-                free_bytes: disk.available_space,
-                capacity_observation_state,
-                capacity_observation_age_seconds,
-                used_inodes,
-                free_inodes,
-                total_inodes,
-                timeout_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_timeout),
-                io_errors_total: None,
-                availability_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_availability),
-                waiting_io: disk.metrics.as_ref().map(|metrics| u64::from(metrics.total_waiting)),
-                api_latency_micros: disk.metrics.as_ref().and_then(|metrics| {
-                    drive_api_latency_micros(metrics.last_minute.values().map(|action| (action.count, action.acc_time)))
-                }),
-                health: if is_online { 1 } else { 0 },
-                reads_per_sec: None,
-                reads_kb_per_sec: None,
-                reads_await: None,
-                writes_per_sec: None,
-                writes_kb_per_sec: None,
-                writes_await: None,
-                perc_util: None,
                 api_calls: disk
                     .metrics
                     .as_ref()
@@ -790,6 +799,33 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                         )
                     })
                     .unwrap_or_default(),
+                stats: DriveDetailedStats {
+                    server: disk.endpoint.clone(),
+                    drive: disk.drive_path.clone(),
+                    total_bytes: disk.total_space,
+                    used_bytes: disk.used_space,
+                    free_bytes: disk.available_space,
+                    capacity_observation_state,
+                    capacity_observation_age_seconds,
+                    used_inodes,
+                    free_inodes,
+                    total_inodes,
+                    timeout_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_timeout),
+                    io_errors_total: None,
+                    availability_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_availability),
+                    waiting_io: disk.metrics.as_ref().map(|metrics| u64::from(metrics.total_waiting)),
+                    api_latency_micros: disk.metrics.as_ref().and_then(|metrics| {
+                        drive_api_latency_micros(metrics.last_minute.values().map(|action| (action.count, action.acc_time)))
+                    }),
+                    health: if is_online { 1 } else { 0 },
+                    reads_per_sec: None,
+                    reads_kb_per_sec: None,
+                    reads_await: None,
+                    writes_per_sec: None,
+                    writes_kb_per_sec: None,
+                    writes_await: None,
+                    perc_util: None,
+                },
             }
         })
         .collect();
@@ -1223,22 +1259,28 @@ fn ilm_action_task_stats(ilm: &ObsIlmRuntimeSnapshot) -> Vec<IlmActionTaskStats>
 
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
+    collect_ilm_runtime_metric_stats().await.map(|stats| stats.stats)
+}
+
+pub(crate) async fn collect_ilm_runtime_metric_stats() -> Option<IlmRuntimeStats> {
     let ilm = obs_ilm_runtime_snapshot().await;
     let metrics = global_metrics().report().await;
     let versions_scanned = scanner_lifecycle_checked_versions(&metrics);
 
-    Some(IlmStats {
+    Some(IlmRuntimeStats {
         server: current_local_node_identity(),
-        expiry_pending_tasks: ilm.expiry_pending_tasks,
-        transition_active_tasks: ilm.transition_active_tasks,
-        transition_pending_tasks: ilm.transition_pending_tasks,
-        transition_missed_immediate_tasks: ilm.transition_missed_immediate_tasks,
-        transition_queue_full_tasks: ilm.transition_queue_full_tasks,
-        transition_queue_send_timeout_tasks: ilm.transition_queue_send_timeout_tasks,
-        transition_compensation_scheduled_tasks: ilm.transition_compensation_scheduled_tasks,
-        transition_compensation_running_tasks: ilm.transition_compensation_running_tasks,
-        versions_scanned,
         action_tasks: ilm_action_task_stats(&ilm),
+        stats: IlmStats {
+            expiry_pending_tasks: ilm.expiry_pending_tasks,
+            transition_active_tasks: ilm.transition_active_tasks,
+            transition_pending_tasks: ilm.transition_pending_tasks,
+            transition_missed_immediate_tasks: ilm.transition_missed_immediate_tasks,
+            transition_queue_full_tasks: ilm.transition_queue_full_tasks,
+            transition_queue_send_timeout_tasks: ilm.transition_queue_send_timeout_tasks,
+            transition_compensation_scheduled_tasks: ilm.transition_compensation_scheduled_tasks,
+            transition_compensation_running_tasks: ilm.transition_compensation_running_tasks,
+            versions_scanned,
+        },
     })
 }
 
@@ -1318,6 +1360,10 @@ fn scanner_bucket_drive_result_stats(results: &[ScannerBucketDriveResultSnapshot
 }
 
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
+    collect_scanner_runtime_metric_stats().await.map(|stats| stats.stats)
+}
+
+pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRuntimeStats> {
     let metrics = global_metrics().report().await;
     let now = Utc::now();
     let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
@@ -1344,95 +1390,100 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let current_cycle_age = current_cycle_age_seconds as f64;
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
 
-    Some(ScannerStats {
+    Some(ScannerRuntimeStats {
         server: current_local_node_identity(),
-        bucket_scans_finished,
-        bucket_scans_started,
-        bucket_scans_failed,
-        directories_scanned,
-        objects_scanned,
-        versions_scanned,
-        last_activity_seconds,
-        active_paths,
-        oldest_active_path_age_seconds: metrics.oldest_active_path_age_seconds,
-        current_set_scan_concurrency_limit: metrics.current_set_scan_concurrency_limit,
-        current_set_scans_queued: metrics.current_set_scans_queued,
-        current_set_scans_active: metrics.current_set_scans_active,
-        current_disk_scan_concurrency_limit: metrics.current_disk_scan_concurrency_limit,
-        current_disk_bucket_scans_queued: metrics.current_disk_bucket_scans_queued,
-        current_disk_bucket_scans_active: metrics.current_disk_bucket_scans_active,
-        throttle_idle_mode_enabled: metrics.throttle_idle_mode_enabled,
-        throttle_sleep_factor: metrics.throttle_sleep_factor,
-        throttle_max_sleep_seconds: metrics.throttle_max_sleep_seconds,
-        yield_every_n_objects: metrics.yield_every_n_objects,
-        cycle_interval_seconds: metrics.cycle_interval_seconds,
-        cycle_max_duration_seconds: metrics.cycle_max_duration_seconds,
-        cycle_max_objects: metrics.cycle_max_objects,
-        cycle_max_directories: metrics.cycle_max_directories,
-        bitrot_cycle_enabled: metrics.bitrot_cycle_enabled,
-        bitrot_cycle_seconds: metrics.bitrot_cycle_seconds,
-        current_cycle: metrics.current_cycle,
-        completed_cycles,
-        current_cycle_age_seconds,
-        current_cycle_objects_scanned: metrics.current_cycle_objects_scanned,
-        current_cycle_directories_scanned: metrics.current_cycle_directories_scanned,
-        current_cycle_bucket_drive_scans: metrics.current_cycle_bucket_drive_scans,
-        current_cycle_bucket_drive_failures: metrics.current_cycle_bucket_drive_failures,
-        current_cycle_objects_per_second: scanner_work_rate_per_second(metrics.current_cycle_objects_scanned, current_cycle_age),
-        current_cycle_directories_per_second: scanner_work_rate_per_second(
-            metrics.current_cycle_directories_scanned,
-            current_cycle_age,
-        ),
-        current_cycle_bucket_drive_scans_per_second: scanner_work_rate_per_second(
-            metrics.current_cycle_bucket_drive_scans,
-            current_cycle_age,
-        ),
-        current_cycle_yield_events: metrics.current_cycle_yield_events,
-        current_cycle_yield_duration_seconds: metrics.current_cycle_yield_duration_seconds,
-        current_cycle_throttle_sleep_events: metrics.current_cycle_throttle_sleep_events,
-        current_cycle_throttle_sleep_duration_seconds: metrics.current_cycle_throttle_sleep_duration_seconds,
-        current_cycle_ilm_actions: metrics.current_cycle_ilm_actions,
-        current_cycle_heal_objects: metrics.current_cycle_heal_objects,
-        current_cycle_replication_checks: metrics.current_cycle_replication_checks,
-        current_cycle_usage_saves: metrics.current_cycle_usage_saves,
-        current_scan_mode,
-        last_cycle_result: metrics.last_cycle_result_code,
-        last_cycle_partial_reason: metrics.last_cycle_partial_reason_code,
-        last_cycle_duration_seconds: metrics.last_cycle_duration_seconds,
-        last_cycle_objects_scanned: metrics.last_cycle_objects_scanned,
-        last_cycle_directories_scanned: metrics.last_cycle_directories_scanned,
-        last_cycle_bucket_drive_scans: metrics.last_cycle_bucket_drive_scans,
-        last_cycle_bucket_drive_failures: metrics.last_cycle_bucket_drive_failures,
-        last_cycle_objects_per_second: scanner_work_rate_per_second(metrics.last_cycle_objects_scanned, last_cycle_duration),
-        last_cycle_directories_per_second: scanner_work_rate_per_second(
-            metrics.last_cycle_directories_scanned,
-            last_cycle_duration,
-        ),
-        last_cycle_bucket_drive_scans_per_second: scanner_work_rate_per_second(
-            metrics.last_cycle_bucket_drive_scans,
-            last_cycle_duration,
-        ),
-        last_cycle_yield_events: metrics.last_cycle_yield_events,
-        last_cycle_yield_duration_seconds: metrics.last_cycle_yield_duration_seconds,
-        last_cycle_throttle_sleep_events: metrics.last_cycle_throttle_sleep_events,
-        last_cycle_throttle_sleep_duration_seconds: metrics.last_cycle_throttle_sleep_duration_seconds,
-        last_cycle_ilm_actions: metrics.last_cycle_ilm_actions,
-        last_cycle_heal_objects: metrics.last_cycle_heal_objects,
-        last_cycle_replication_checks: metrics.last_cycle_replication_checks,
-        last_cycle_usage_saves: metrics.last_cycle_usage_saves,
-        failed_cycles: metrics.failed_cycles,
-        superseded_cycles: metrics.superseded_cycles,
-        partial_cycles: metrics.partial_cycles,
-        partial_cycles_unknown: metrics.partial_cycles_unknown,
-        partial_cycles_runtime: metrics.partial_cycles_runtime,
-        partial_cycles_objects: metrics.partial_cycles_objects,
-        partial_cycles_directories: metrics.partial_cycles_directories,
         source_work: scanner_source_work_stats(&metrics.source_work),
         current_cycle_source_work: scanner_current_cycle_source_work_stats(&metrics),
         last_cycle_source_work: scanner_source_work_stats(&metrics.last_cycle_source_work),
         bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.bucket_drive_results),
         current_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.current_cycle_bucket_drive_results),
         last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&metrics.last_cycle_bucket_drive_results),
+        stats: ScannerStats {
+            bucket_scans_finished,
+            bucket_scans_started,
+            bucket_scans_failed,
+            directories_scanned,
+            objects_scanned,
+            versions_scanned,
+            last_activity_seconds,
+            active_paths,
+            oldest_active_path_age_seconds: metrics.oldest_active_path_age_seconds,
+            current_set_scan_concurrency_limit: metrics.current_set_scan_concurrency_limit,
+            current_set_scans_queued: metrics.current_set_scans_queued,
+            current_set_scans_active: metrics.current_set_scans_active,
+            current_disk_scan_concurrency_limit: metrics.current_disk_scan_concurrency_limit,
+            current_disk_bucket_scans_queued: metrics.current_disk_bucket_scans_queued,
+            current_disk_bucket_scans_active: metrics.current_disk_bucket_scans_active,
+            throttle_idle_mode_enabled: metrics.throttle_idle_mode_enabled,
+            throttle_sleep_factor: metrics.throttle_sleep_factor,
+            throttle_max_sleep_seconds: metrics.throttle_max_sleep_seconds,
+            yield_every_n_objects: metrics.yield_every_n_objects,
+            cycle_interval_seconds: metrics.cycle_interval_seconds,
+            cycle_max_duration_seconds: metrics.cycle_max_duration_seconds,
+            cycle_max_objects: metrics.cycle_max_objects,
+            cycle_max_directories: metrics.cycle_max_directories,
+            bitrot_cycle_enabled: metrics.bitrot_cycle_enabled,
+            bitrot_cycle_seconds: metrics.bitrot_cycle_seconds,
+            current_cycle: metrics.current_cycle,
+            completed_cycles,
+            current_cycle_age_seconds,
+            current_cycle_objects_scanned: metrics.current_cycle_objects_scanned,
+            current_cycle_directories_scanned: metrics.current_cycle_directories_scanned,
+            current_cycle_bucket_drive_scans: metrics.current_cycle_bucket_drive_scans,
+            current_cycle_bucket_drive_failures: metrics.current_cycle_bucket_drive_failures,
+            current_cycle_objects_per_second: scanner_work_rate_per_second(
+                metrics.current_cycle_objects_scanned,
+                current_cycle_age,
+            ),
+            current_cycle_directories_per_second: scanner_work_rate_per_second(
+                metrics.current_cycle_directories_scanned,
+                current_cycle_age,
+            ),
+            current_cycle_bucket_drive_scans_per_second: scanner_work_rate_per_second(
+                metrics.current_cycle_bucket_drive_scans,
+                current_cycle_age,
+            ),
+            current_cycle_yield_events: metrics.current_cycle_yield_events,
+            current_cycle_yield_duration_seconds: metrics.current_cycle_yield_duration_seconds,
+            current_cycle_throttle_sleep_events: metrics.current_cycle_throttle_sleep_events,
+            current_cycle_throttle_sleep_duration_seconds: metrics.current_cycle_throttle_sleep_duration_seconds,
+            current_cycle_ilm_actions: metrics.current_cycle_ilm_actions,
+            current_cycle_heal_objects: metrics.current_cycle_heal_objects,
+            current_cycle_replication_checks: metrics.current_cycle_replication_checks,
+            current_cycle_usage_saves: metrics.current_cycle_usage_saves,
+            current_scan_mode,
+            last_cycle_result: metrics.last_cycle_result_code,
+            last_cycle_partial_reason: metrics.last_cycle_partial_reason_code,
+            last_cycle_duration_seconds: metrics.last_cycle_duration_seconds,
+            last_cycle_objects_scanned: metrics.last_cycle_objects_scanned,
+            last_cycle_directories_scanned: metrics.last_cycle_directories_scanned,
+            last_cycle_bucket_drive_scans: metrics.last_cycle_bucket_drive_scans,
+            last_cycle_bucket_drive_failures: metrics.last_cycle_bucket_drive_failures,
+            last_cycle_objects_per_second: scanner_work_rate_per_second(metrics.last_cycle_objects_scanned, last_cycle_duration),
+            last_cycle_directories_per_second: scanner_work_rate_per_second(
+                metrics.last_cycle_directories_scanned,
+                last_cycle_duration,
+            ),
+            last_cycle_bucket_drive_scans_per_second: scanner_work_rate_per_second(
+                metrics.last_cycle_bucket_drive_scans,
+                last_cycle_duration,
+            ),
+            last_cycle_yield_events: metrics.last_cycle_yield_events,
+            last_cycle_yield_duration_seconds: metrics.last_cycle_yield_duration_seconds,
+            last_cycle_throttle_sleep_events: metrics.last_cycle_throttle_sleep_events,
+            last_cycle_throttle_sleep_duration_seconds: metrics.last_cycle_throttle_sleep_duration_seconds,
+            last_cycle_ilm_actions: metrics.last_cycle_ilm_actions,
+            last_cycle_heal_objects: metrics.last_cycle_heal_objects,
+            last_cycle_replication_checks: metrics.last_cycle_replication_checks,
+            last_cycle_usage_saves: metrics.last_cycle_usage_saves,
+            failed_cycles: metrics.failed_cycles,
+            superseded_cycles: metrics.superseded_cycles,
+            partial_cycles: metrics.partial_cycles,
+            partial_cycles_unknown: metrics.partial_cycles_unknown,
+            partial_cycles_runtime: metrics.partial_cycles_runtime,
+            partial_cycles_objects: metrics.partial_cycles_objects,
+            partial_cycles_directories: metrics.partial_cycles_directories,
+        },
     })
 }
 
