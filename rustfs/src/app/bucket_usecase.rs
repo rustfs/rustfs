@@ -3106,7 +3106,10 @@ mod tests {
     #[test]
     fn validate_replication_config_capabilities_names_unsupported_field() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
-        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration::default());
+        let destination_key_id = "arn:aws:kms:us-east-1:123456789012:key/opaque-key-id";
+        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration {
+            replica_kms_key_id: Some(destination_key_id.to_string()),
+        });
         let config = ReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
@@ -3120,6 +3123,7 @@ mod tests {
             err.to_string()
                 .contains("Destination.EncryptionConfiguration is not supported")
         );
+        assert!(!err.to_string().contains(destination_key_id));
     }
 
     #[test]

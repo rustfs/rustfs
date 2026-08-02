@@ -24,10 +24,11 @@ use rustfs_replication::{
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-    AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, HeaderExt as _,
-    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
-    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map, is_internal_key,
+    AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+    AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE,
+    HeaderExt as _, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map,
+    is_internal_key,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -79,6 +80,48 @@ static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
 ];
 
 const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
+const ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED: &str = "replication source contains unsupported encryption metadata";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationSourceEncryption {
+    Plaintext,
+    SseS3,
+    SseKms,
+    SseC,
+    Unsupported,
+}
+
+fn metadata_value<'a>(metadata: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    metadata
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn classify_replication_source_encryption(metadata: &HashMap<String, String>) -> ReplicationSourceEncryption {
+    let is_ssec = replication_object_is_ssec_encrypted(metadata);
+    let sse = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION);
+    let kms_key_id = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
+    let kms_context = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT);
+
+    if is_ssec {
+        return if sse.is_some() || kms_key_id.is_some() || kms_context.is_some() {
+            ReplicationSourceEncryption::Unsupported
+        } else {
+            ReplicationSourceEncryption::SseC
+        };
+    }
+
+    match sse.map(str::trim) {
+        None if kms_key_id.is_none() && kms_context.is_none() => ReplicationSourceEncryption::Plaintext,
+        Some(value) if value.eq_ignore_ascii_case("AES256") && kms_key_id.is_none() && kms_context.is_none() => {
+            ReplicationSourceEncryption::SseS3
+        }
+        Some(value) if value.eq_ignore_ascii_case("aws:kms") => ReplicationSourceEncryption::SseKms,
+        _ if kms_key_id.is_some() => ReplicationSourceEncryption::SseKms,
+        _ => ReplicationSourceEncryption::Unsupported,
+    }
+}
 
 pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
     rustfs_replication::is_ssec_encrypted(user_defined)
@@ -109,7 +152,18 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
     use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT};
 
     let mut meta = HashMap::new();
-    let is_ssec = replication_object_is_ssec_encrypted(&object_info.user_defined);
+    let source_encryption = classify_replication_source_encryption(&object_info.user_defined);
+    let is_ssec = matches!(source_encryption, ReplicationSourceEncryption::SseC);
+
+    match source_encryption {
+        ReplicationSourceEncryption::Plaintext | ReplicationSourceEncryption::SseC => {}
+        ReplicationSourceEncryption::SseS3 | ReplicationSourceEncryption::SseKms => {
+            return Err(Error::other(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
+        }
+        ReplicationSourceEncryption::Unsupported => {
+            return Err(Error::other(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
+        }
+    }
 
     for (key, value) in object_info.user_defined.iter() {
         let has_valid_sse_header = valid_sse_replication_header(key).is_some();
@@ -233,20 +287,6 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             } else {
                 object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
             };
-    }
-
-    let has_sse_s3 = object_info
-        .user_defined
-        .get(AMZ_SERVER_SIDE_ENCRYPTION)
-        .is_some_and(|value| value.eq_ignore_ascii_case("AES256"));
-    let has_sse_kms = object_info
-        .user_defined
-        .get(AMZ_SERVER_SIDE_ENCRYPTION)
-        .is_some_and(|value| value.eq_ignore_ascii_case("aws:kms"))
-        || object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
-
-    if has_sse_s3 || has_sse_kms {
-        return Err(Error::other(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
 
     Ok((put_options, is_multipart))
@@ -587,6 +627,46 @@ mod tests {
     }
 
     #[test]
+    fn replication_source_encryption_classification_is_explicit_and_fail_closed() {
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::new()),
+            ReplicationSourceEncryption::Plaintext
+        );
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([(
+                "x-amz-server-side-encryption".to_string(),
+                "AES256".to_string()
+            )])),
+            ReplicationSourceEncryption::SseS3
+        );
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([(
+                "x-amz-server-side-encryption".to_string(),
+                "AWS:KMS".to_string()
+            )])),
+            ReplicationSourceEncryption::SseKms
+        );
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())])),
+            ReplicationSourceEncryption::SseC
+        );
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([(
+                "x-amz-server-side-encryption".to_string(),
+                "unsupported-algorithm".to_string(),
+            )])),
+            ReplicationSourceEncryption::Unsupported
+        );
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([(
+                AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT.to_string(),
+                "opaque-context".to_string(),
+            )])),
+            ReplicationSourceEncryption::Unsupported
+        );
+    }
+
+    #[test]
     fn replication_put_options_rejects_sse_s3_until_target_encryption_is_supported() {
         let object_info = ObjectInfo {
             user_defined: Arc::new(HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())])),
@@ -617,6 +697,22 @@ mod tests {
         };
 
         assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
+    }
+
+    #[test]
+    fn replication_put_options_rejects_unknown_encryption_without_echoing_metadata() {
+        let secret_like_value = "opaque-context-that-must-not-be-logged";
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "unsupported-algorithm".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT.to_string(), secret_like_value.to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let err = replication_put_object_options("", &object_info).expect_err("unknown encryption must fail closed");
+        assert!(err.to_string().contains(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
+        assert!(!err.to_string().contains(secret_like_value));
     }
 
     // T3 (#1264): the outbound replication path forwards a stored object checksum into
