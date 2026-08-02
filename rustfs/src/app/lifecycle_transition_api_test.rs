@@ -1495,6 +1495,8 @@ async fn cancelled_transition_waiting_for_prepared_reader_cleans_remote() {
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
+    use super::storage_api::test::ReqInfo;
+
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -1531,6 +1533,11 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         Method::DELETE,
     );
     insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
 
     Box::pin(usecase.execute_delete_object(req))
         .await
@@ -1735,6 +1742,8 @@ async fn compensation_driven_complete_multipart_upload_still_transitions() {
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
+    use super::storage_api::test::ReqInfo;
+
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -1771,6 +1780,11 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
         Method::DELETE,
     );
     insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
 
     Box::pin(usecase.execute_delete_object(req))
         .await
