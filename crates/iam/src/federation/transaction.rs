@@ -140,29 +140,51 @@ mod tests {
     };
     use crate::oidc::{OidcProviderConfig, OidcProviderSummary};
     use rustfs_credentials::Credentials;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProviderFailure {
+        None,
+        Exchange,
+        Verification,
+        Logout,
+    }
 
     struct TestProvider {
         with_policy: bool,
+        with_group: bool,
+        browser_provider_id: &'static str,
+        web_provider_id: &'static str,
+        failure: ProviderFailure,
         events: Arc<Mutex<Vec<&'static str>>>,
+        expected_logout: (&'static str, &'static str),
     }
 
     impl TestProvider {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                with_policy: true,
+                with_group: false,
+                browser_provider_id: "default",
+                web_provider_id: "default",
+                failure: ProviderFailure::None,
+                events,
+                expected_logout: ("default", "id-token"),
+            }
+        }
+
         fn record(&self, event: &'static str) {
             self.events.lock().expect("event log should not be poisoned").push(event);
         }
 
-        fn authorization(&self) -> FederatedAuthorization {
+        fn authorization(&self, provider_id: &str) -> FederatedAuthorization {
             FederatedAuthorization {
-                provider_id: "default".to_string(),
+                provider_id: provider_id.to_string(),
                 claims: FederatedClaims {
                     sub: "subject".to_string(),
                     email: String::new(),
                     username: "user".to_string(),
-                    groups: Vec::new(),
+                    groups: vec!["source-group".to_string()],
                     raw: Default::default(),
                 },
                 policies: if self.with_policy {
@@ -170,7 +192,11 @@ mod tests {
                 } else {
                     Vec::new()
                 },
-                groups: Vec::new(),
+                groups: if self.with_group {
+                    vec!["developers".to_string()]
+                } else {
+                    Vec::new()
+                },
                 roles_claim_key: None,
                 roles: Vec::new(),
             }
@@ -206,8 +232,11 @@ mod tests {
 
         async fn exchange_code(&self, _state: &str, _code: &str, _redirect_uri: &str) -> Result<FederatedCodeExchange> {
             self.record("exchange");
+            if self.failure == ProviderFailure::Exchange {
+                return Err(FederationError::CodeExchange("exchange failed".to_string()));
+            }
             Ok(FederatedCodeExchange {
-                authorization: self.authorization(),
+                authorization: self.authorization(self.browser_provider_id),
                 redirect_after: Some("/browser".to_string()),
                 id_token: "id-token".to_string(),
             })
@@ -215,11 +244,18 @@ mod tests {
 
         async fn verify_web_identity_token(&self, _jwt: &str) -> Result<FederatedAuthorization> {
             self.record("verify");
-            Ok(self.authorization())
+            if self.failure == ProviderFailure::Verification {
+                return Err(FederationError::TokenVerification("verification failed".to_string()));
+            }
+            Ok(self.authorization(self.web_provider_id))
         }
 
-        async fn create_logout_token(&self, _provider_id: &str, _id_token: &str) -> Result<String> {
+        async fn create_logout_token(&self, provider_id: &str, id_token: &str) -> Result<String> {
             self.record("logout");
+            assert_eq!((provider_id, id_token), self.expected_logout);
+            if self.failure == ProviderFailure::Logout {
+                return Err(FederationError::Logout("logout failed".to_string()));
+            }
             Ok("logout-token".to_string())
         }
 
@@ -228,19 +264,37 @@ mod tests {
         }
     }
 
-    struct CountingBinding {
-        calls: AtomicUsize,
+    struct RecordingBinding {
+        fail: bool,
         events: Arc<Mutex<Vec<&'static str>>>,
+        transactions: Mutex<Vec<(String, usize, Option<String>)>>,
+    }
+
+    impl RecordingBinding {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                fail: false,
+                events,
+                transactions: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
-    impl FederatedSessionBinding for CountingBinding {
+    impl FederatedSessionBinding for RecordingBinding {
         async fn bind(
             &self,
             transaction: &FederatedSessionTransaction,
         ) -> core::result::Result<Credentials, FederatedSessionBindingError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
             self.events.lock().expect("event log should not be poisoned").push("bind");
+            self.transactions.lock().expect("transactions should not be poisoned").push((
+                transaction.authorization.provider_id.clone(),
+                transaction.duration_seconds,
+                transaction.session_policy.clone(),
+            ));
+            if self.fail {
+                return Err(FederatedSessionBindingError::Internal("binding failed".to_string()));
+            }
             Ok(Credentials {
                 access_key: transaction.authorization.claims.session_identity(),
                 ..Default::default()
@@ -249,16 +303,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_and_web_identity_share_session_binding() {
+    async fn callback_and_web_identity_preserve_provider_and_transaction_boundaries() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let provider = Arc::new(TestProvider {
-            with_policy: true,
-            events: events.clone(),
-        });
-        let binding = Arc::new(CountingBinding {
-            calls: AtomicUsize::new(0),
-            events: events.clone(),
-        });
+        let mut provider = TestProvider::new(events.clone());
+        provider.browser_provider_id = "corp";
+        provider.web_provider_id = "partner";
+        provider.expected_logout = ("corp", "id-token");
+        let provider = Arc::new(provider);
+        let binding = Arc::new(RecordingBinding::new(events.clone()));
         let service = FederatedIdentityService::new(FederatedIdentityRegistry::new(provider));
 
         let login = service
@@ -266,6 +318,7 @@ mod tests {
             .await
             .expect("callback flow should complete");
         assert_eq!(login.session.credentials.access_key, "user");
+        assert_eq!(login.session.authorization.provider_id, "corp");
         assert_eq!(login.redirect_after.as_deref(), Some("/browser"));
         assert_eq!(login.logout_token, "logout-token");
         assert_eq!(
@@ -275,25 +328,32 @@ mod tests {
         events.lock().expect("event log should not be poisoned").clear();
 
         let web_identity = service
-            .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+            .assume_role_with_web_identity("jwt", 7200, Some("session-policy".to_string()), binding.as_ref())
             .await
             .expect("web identity flow should complete");
         assert_eq!(web_identity.credentials.access_key, "user");
-        assert_eq!(binding.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(web_identity.authorization.provider_id, "partner");
         assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify", "bind"]);
+        assert_eq!(
+            binding
+                .transactions
+                .lock()
+                .expect("transactions should not be poisoned")
+                .as_slice(),
+            [
+                ("corp".to_string(), 3600, None),
+                ("partner".to_string(), 7200, Some("session-policy".to_string())),
+            ]
+        );
     }
 
     #[tokio::test]
     async fn web_identity_without_policy_or_group_is_not_bound() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let provider = Arc::new(TestProvider {
-            with_policy: false,
-            events: events.clone(),
-        });
-        let binding = Arc::new(CountingBinding {
-            calls: AtomicUsize::new(0),
-            events,
-        });
+        let mut provider = TestProvider::new(events.clone());
+        provider.with_policy = false;
+        let provider = Arc::new(provider);
+        let binding = Arc::new(RecordingBinding::new(events.clone()));
         let service = FederatedIdentityService::new(FederatedIdentityRegistry::new(provider));
 
         let error = service
@@ -302,6 +362,102 @@ mod tests {
             .expect_err("authorization context is required");
 
         assert!(matches!(error, FederationError::NoAuthorizationContext));
-        assert_eq!(binding.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify"]);
+    }
+
+    #[tokio::test]
+    async fn web_identity_group_only_authorization_is_bound_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TestProvider::new(events.clone());
+        provider.with_policy = false;
+        provider.with_group = true;
+        let provider = Arc::new(provider);
+        let binding = Arc::new(RecordingBinding::new(events.clone()));
+        let service = FederatedIdentityService::new(FederatedIdentityRegistry::new(provider));
+
+        let session = service
+            .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+            .await
+            .expect("a mapped group is an authorization context");
+
+        assert!(session.authorization.policies.is_empty());
+        assert_eq!(session.authorization.groups, ["developers"]);
+        assert_eq!(events.lock().expect("event log should not be poisoned").as_slice(), ["verify", "bind"]);
+    }
+
+    #[tokio::test]
+    async fn callback_failures_preserve_existing_side_effect_order() {
+        for (provider_failure, binding_failure, expected_events) in [
+            (ProviderFailure::Exchange, false, vec!["exchange"]),
+            (ProviderFailure::None, true, vec!["exchange", "bind"]),
+            (ProviderFailure::Logout, false, vec!["exchange", "bind", "logout"]),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut provider = TestProvider::new(events.clone());
+            provider.failure = provider_failure;
+            let mut binding = RecordingBinding::new(events.clone());
+            binding.fail = binding_failure;
+            let binding = Arc::new(binding);
+            let service = FederatedIdentityService::new(FederatedIdentityRegistry::new(Arc::new(provider)));
+
+            let error = service
+                .complete_authorization_code("state", "code", "https://console.example/callback", 3600, binding.as_ref())
+                .await
+                .expect_err("the configured failure should be returned");
+
+            if provider_failure == ProviderFailure::Exchange {
+                assert!(matches!(error, FederationError::CodeExchange(ref message) if message == "exchange failed"));
+            } else if binding_failure {
+                assert!(matches!(
+                    error,
+                    FederationError::Binding(FederatedSessionBindingError::Internal(ref message))
+                        if message == "binding failed"
+                ));
+            } else {
+                assert!(matches!(error, FederationError::Logout(ref message) if message == "logout failed"));
+            }
+
+            assert_eq!(
+                events.lock().expect("event log should not be poisoned").as_slice(),
+                expected_events,
+                "later callback steps must not run after a failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn web_identity_failures_preserve_existing_side_effect_order() {
+        for (provider_failure, binding_failure, expected_events) in [
+            (ProviderFailure::Verification, false, vec!["verify"]),
+            (ProviderFailure::None, true, vec!["verify", "bind"]),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut provider = TestProvider::new(events.clone());
+            provider.failure = provider_failure;
+            let mut binding = RecordingBinding::new(events.clone());
+            binding.fail = binding_failure;
+            let binding = Arc::new(binding);
+            let service = FederatedIdentityService::new(FederatedIdentityRegistry::new(Arc::new(provider)));
+
+            let error = service
+                .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+                .await
+                .expect_err("the configured failure should be returned");
+
+            if provider_failure == ProviderFailure::Verification {
+                assert!(matches!(error, FederationError::TokenVerification(_)));
+            } else {
+                assert!(matches!(
+                    error,
+                    FederationError::Binding(FederatedSessionBindingError::Internal(ref message))
+                        if message == "binding failed"
+                ));
+            }
+            assert_eq!(
+                events.lock().expect("event log should not be poisoned").as_slice(),
+                expected_events,
+                "later web identity steps must not run after a failure"
+            );
+        }
     }
 }
