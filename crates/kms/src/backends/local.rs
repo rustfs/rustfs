@@ -3052,12 +3052,14 @@ mod tests {
                 Ok(_) => panic!("{name}: a missing salt must not be papered over"),
                 Err(error) => error,
             };
+            // Asserted first: publishing a replacement salt is the
+            // irreversible step, and it happens before any error is produced.
+            assert!(!salt_path.exists(), "{name}: a replacement salt must never be generated");
             assert!(
                 matches!(error, KmsError::ConfigurationError { .. }),
                 "{name}: expected a salt-specific configuration error, got {error:?}"
             );
             assert!(error.to_string().contains("salt"), "{name}: error must point at the salt: {error}");
-            assert!(!salt_path.exists(), "{name}: a replacement salt must never be generated");
             assert_eq!(
                 sorted_dir_file_names(temp_dir.path()).await,
                 vec!["sealed-key.key".to_string()],
