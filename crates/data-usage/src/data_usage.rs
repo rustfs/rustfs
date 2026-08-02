@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeMap as _};
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
@@ -51,24 +51,36 @@ pub fn usage_last_update_is_untrusted_future(existing_last_update: SystemTime, n
     existing_last_update > now + USAGE_LAST_UPDATE_FUTURE_TOLERANCE
 }
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TierStats {
     pub total_size: u64,
-    pub num_versions: i32,
-    pub num_objects: i32,
+    pub num_versions: u64,
+    pub num_objects: u64,
 }
 
 impl TierStats {
     pub fn add(&self, u: &TierStats) -> TierStats {
         TierStats {
-            total_size: self.total_size + u.total_size,
-            num_versions: self.num_versions + u.num_versions,
-            num_objects: self.num_objects + u.num_objects,
+            total_size: self.total_size.saturating_add(u.total_size),
+            num_versions: self.num_versions.saturating_add(u.num_versions),
+            num_objects: self.num_objects.saturating_add(u.num_objects),
         }
+    }
+
+    /// True when [`TierStats::add`] would report the exact sum instead of saturating.
+    pub fn fits_add(&self, u: &TierStats) -> bool {
+        self.total_size.checked_add(u.total_size).is_some()
+            && self.num_versions.checked_add(u.num_versions).is_some()
+            && self.num_objects.checked_add(u.num_objects).is_some()
+    }
+
+    /// True when this tier contributed nothing, i.e. merging it is a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.total_size == 0 && self.num_versions == 0 && self.num_objects == 0
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllTierStats {
     pub tiers: HashMap<String, TierStats>,
 }
@@ -78,31 +90,35 @@ impl AllTierStats {
         Self { tiers: HashMap::new() }
     }
 
-    pub fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
+    pub fn is_empty(&self) -> bool {
+        self.tiers.is_empty()
+    }
+
+    /// Folds a scan summary's per-tier map in.
+    ///
+    /// Scanners seed the map with a zeroed entry for every configured tier, so
+    /// empty contributions are skipped to keep the persisted cache from growing
+    /// one key per tier on every folder that never held tiered data.
+    pub fn add_sizes(&mut self, tiers: &HashMap<String, TierStats>) {
         for (tier, st) in tiers {
-            self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
+            if st.is_empty() {
+                continue;
+            }
+            let entry = self.tiers.entry(tier.clone()).or_default();
+            *entry = entry.add(st);
         }
     }
 
-    pub fn merge(&mut self, other: AllTierStats) {
-        for (tier, st) in other.tiers {
-            self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
-        }
+    pub fn merge(&mut self, other: &AllTierStats) {
+        self.add_sizes(&other.tiers);
     }
 
-    pub fn populate_stats(&self, stats: &mut HashMap<String, TierStats>) {
-        for (tier, st) in &self.tiers {
-            stats.insert(
-                tier.clone(),
-                TierStats {
-                    total_size: st.total_size,
-                    num_versions: st.num_versions,
-                    num_objects: st.num_objects,
-                },
-            );
-        }
+    /// True when [`AllTierStats::merge`] would report exact sums for every tier.
+    pub fn fits_merge(&self, other: &AllTierStats) -> bool {
+        other
+            .tiers
+            .iter()
+            .all(|(tier, right)| self.tiers.get(tier).is_none_or(|left| left.fits_add(right)))
     }
 }
 
@@ -183,6 +199,14 @@ pub struct DataUsageInfo {
     pub objects_total_size: u64,
     /// Replication info across all buckets
     pub replication_info: HashMap<String, BucketTargetUsageInfo>,
+    /// Usage per storage class and remote tier across all buckets.
+    ///
+    /// Absent on snapshots written before per-tier accounting was published,
+    /// and on clusters with no remote tier configured: the scanner classifies
+    /// objects by tier (including `STANDARD`/`REDUCED_REDUNDANCY`) only once a
+    /// tier exists, so an absent value means "not accounted", never "zero".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_stats: Option<AllTierStats>,
 
     /// Total number of buckets in this cluster
     pub buckets_count: u64,
@@ -562,7 +586,7 @@ impl ReplicationAllStats {
 }
 
 /// Data usage cache entry
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageEntry {
     pub children: DataUsageHashMap,
     // These fields do not include any children.
@@ -577,6 +601,34 @@ pub struct DataUsageEntry {
     /// Number of objects that failed to scan (e.g., IO errors)
     #[serde(default)]
     pub failed_objects: usize,
+    /// Per-tier usage contributed by this entry, present only once a scan
+    /// observed tier-classified objects.
+    #[serde(default)]
+    pub all_tier_stats: Option<AllTierStats>,
+}
+
+impl Serialize for DataUsageEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Keep entries map-encoded so older readers can ignore fields appended
+        // by newer scanner versions during rolling upgrades. The derived
+        // (array) encoding made any appended field a decode error for them.
+        let mut state = serializer.serialize_map(Some(11))?;
+        state.serialize_entry("children", &self.children)?;
+        state.serialize_entry("size", &self.size)?;
+        state.serialize_entry("objects", &self.objects)?;
+        state.serialize_entry("versions", &self.versions)?;
+        state.serialize_entry("delete_markers", &self.delete_markers)?;
+        state.serialize_entry("obj_sizes", &self.obj_sizes)?;
+        state.serialize_entry("obj_versions", &self.obj_versions)?;
+        state.serialize_entry("replication_stats", &self.replication_stats)?;
+        state.serialize_entry("compacted", &self.compacted)?;
+        state.serialize_entry("failed_objects", &self.failed_objects)?;
+        state.serialize_entry("all_tier_stats", &self.all_tier_stats)?;
+        state.end()
+    }
 }
 
 impl DataUsageEntry {
@@ -635,8 +687,20 @@ impl DataUsageEntry {
             }
         }
 
+        if let Some(o_tiers) = other.all_tier_stats.as_ref().filter(|tiers| !tiers.is_empty()) {
+            self.all_tier_stats.get_or_insert_with(AllTierStats::new).merge(o_tiers);
+        }
+
         self.obj_sizes.merge_from(&other.obj_sizes);
         self.obj_versions.merge_from(&other.obj_versions);
+    }
+
+    /// Folds a scan summary's per-tier map into this entry.
+    pub fn add_tier_sizes(&mut self, tiers: &HashMap<String, TierStats>) {
+        if tiers.values().all(TierStats::is_empty) {
+            return;
+        }
+        self.all_tier_stats.get_or_insert_with(AllTierStats::new).add_sizes(tiers);
     }
 
     pub fn checked_merge(&mut self, other: &DataUsageEntry) -> bool {
@@ -698,7 +762,12 @@ impl DataUsageEntry {
             }
         };
 
-        if !scalar_counts_fit || !histograms_fit || !replication_fits {
+        let tier_stats_fit = match (&self.all_tier_stats, &other.all_tier_stats) {
+            (_, None) | (None, Some(_)) => true,
+            (Some(left), Some(right)) => left.fits_merge(right),
+        };
+
+        if !scalar_counts_fit || !histograms_fit || !replication_fits || !tier_stats_fit {
             return false;
         }
         self.merge(other);
@@ -1038,6 +1107,7 @@ impl DataUsageCache {
             versions_total_count: flat.versions as u64,
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
+            tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             usage_snapshot_complete: self.info.snapshot_complete,
@@ -1525,6 +1595,172 @@ mod tests {
         buckets_count: u64,
     }
 
+    fn tier_entry(tier: &str, stats: TierStats) -> DataUsageEntry {
+        let mut entry = DataUsageEntry::default();
+        entry.add_tier_sizes(&HashMap::from([(tier.to_string(), stats)]));
+        entry
+    }
+
+    #[test]
+    fn tier_stats_survive_entry_merge() {
+        let mut left = tier_entry(
+            "WARM",
+            TierStats {
+                total_size: 10,
+                num_versions: 2,
+                num_objects: 1,
+            },
+        );
+        let mut right = tier_entry(
+            "WARM",
+            TierStats {
+                total_size: 5,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+        right.add_tier_sizes(&HashMap::from([(
+            "COLD".to_string(),
+            TierStats {
+                total_size: 7,
+                num_versions: 1,
+                num_objects: 0,
+            },
+        )]));
+
+        assert!(left.checked_merge(&right), "merging exact tier totals must be accepted");
+
+        let tiers = &left.all_tier_stats.expect("merged entry keeps tier stats").tiers;
+        assert_eq!(
+            tiers.get("WARM"),
+            Some(&TierStats {
+                total_size: 15,
+                num_versions: 3,
+                num_objects: 2,
+            })
+        );
+        assert_eq!(
+            tiers.get("COLD"),
+            Some(&TierStats {
+                total_size: 7,
+                num_versions: 1,
+                num_objects: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tier_stats_merge_into_an_untiered_entry() {
+        let mut left = DataUsageEntry::default();
+        let right = tier_entry(
+            "WARM",
+            TierStats {
+                total_size: 10,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+
+        assert!(left.checked_merge(&right));
+
+        assert_eq!(
+            left.all_tier_stats.expect("tier stats adopted from the merged entry").tiers["WARM"],
+            TierStats {
+                total_size: 10,
+                num_versions: 1,
+                num_objects: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn checked_merge_rejects_overflowing_tier_totals() {
+        let mut left = tier_entry(
+            "WARM",
+            TierStats {
+                total_size: u64::MAX,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+        let right = tier_entry(
+            "WARM",
+            TierStats {
+                total_size: 1,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+
+        assert!(!left.checked_merge(&right), "saturating tier totals must not be published");
+        assert_eq!(left.all_tier_stats.expect("left is untouched").tiers["WARM"].total_size, u64::MAX);
+    }
+
+    /// Entry shape released before per-tier accounting, using the derived
+    /// (array) encoding those writers produced.
+    #[derive(Serialize, Deserialize)]
+    struct LegacyEntry {
+        children: DataUsageHashMap,
+        size: usize,
+        objects: usize,
+        versions: usize,
+        delete_markers: usize,
+        obj_sizes: SizeHistogram,
+        obj_versions: VersionsHistogram,
+        replication_stats: Option<ReplicationAllStats>,
+        compacted: bool,
+        #[serde(default)]
+        failed_objects: usize,
+    }
+
+    #[test]
+    fn entries_are_map_encoded_so_appended_fields_stay_readable() {
+        // A derived (array) encoding turns every appended field into a decode
+        // error for readers built before it existed, which would cost a mixed
+        // -version cluster its whole scan cache. Entries must stay map-encoded.
+        let current = tier_entry(
+            "WARM",
+            TierStats {
+                total_size: 3,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+        let mut encoded = Vec::new();
+        current
+            .serialize(&mut rmp_serde::Serializer::new(&mut encoded))
+            .expect("encode current entry");
+
+        let legacy: LegacyEntry = rmp_serde::from_slice(&encoded).expect("legacy reader should ignore the appended field");
+        assert_eq!(legacy.objects, 0);
+    }
+
+    #[test]
+    fn legacy_array_encoded_entries_still_load() {
+        let legacy = LegacyEntry {
+            children: DataUsageHashMap::default(),
+            size: 12,
+            objects: 3,
+            versions: 4,
+            delete_markers: 1,
+            obj_sizes: SizeHistogram::default(),
+            obj_versions: VersionsHistogram::default(),
+            replication_stats: None,
+            compacted: false,
+            failed_objects: 2,
+        };
+        let mut encoded = Vec::new();
+        legacy
+            .serialize(&mut rmp_serde::Serializer::new(&mut encoded))
+            .expect("encode legacy entry");
+
+        let decoded: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("current reader should default the missing field");
+
+        assert_eq!(decoded.size, 12);
+        assert_eq!(decoded.failed_objects, 2);
+        assert!(decoded.all_tier_stats.is_none());
+    }
+
     #[test]
     fn hash_path_uses_portable_slash_semantics() {
         for (input, expected) in [
@@ -1901,6 +2137,44 @@ mod tests {
         assert_eq!(info.buckets_count, 2);
         assert!(info.buckets_usage.is_empty());
         assert_eq!(info.objects_total_count, 3);
+        assert!(info.tier_stats.is_none());
+    }
+
+    #[test]
+    fn test_dui_reports_tier_usage_from_the_flattened_tree() {
+        let root_hash = hash_path("root");
+        let bucket_hash = hash_path("bucket-a");
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "root".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &bucket_hash,
+            &Some(root_hash),
+            &tier_entry(
+                "WARM",
+                TierStats {
+                    total_size: 40,
+                    num_versions: 2,
+                    num_objects: 2,
+                },
+            ),
+        );
+
+        let info = cache.dui("root", &["bucket-a".to_string()]);
+
+        assert_eq!(
+            info.tier_stats.expect("child tier usage should roll up to the root").tiers["WARM"],
+            TierStats {
+                total_size: 40,
+                num_versions: 2,
+                num_objects: 2,
+            }
+        );
     }
 
     #[test]

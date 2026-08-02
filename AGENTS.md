@@ -347,6 +347,11 @@ cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
   absent, empty, and nil all mean "no value", never `Uuid::nil()`.
 - A remote-tier version of `None`/`""` means the tier bucket is unversioned:
   send **no** `versionId` on tier GET/DELETE.
+- Structs persisted in the scanner data-usage cache (`DataUsageCacheInfo`,
+  `DataUsageEntry`) carry a hand-written map-encoded `Serialize`. MessagePack
+  encodes derived structs as arrays, where an appended field makes the whole
+  cache a decode error for older readers — keep new fields `#[serde(default)]`
+  and keep the map encoding rather than reverting to `derive(Serialize)`.
 
 ## Naming Conventions
 
