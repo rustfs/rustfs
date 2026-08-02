@@ -21,6 +21,8 @@ use std::sync::LazyLock;
 pub const BUCKET_L: &str = "bucket";
 /// Replication operation
 pub const OPERATION_L: &str = "operation";
+/// Replication proxy result
+pub const RESULT_L: &str = "result";
 /// Replication target ARN
 pub const TARGET_ARN_L: &str = "target_arn";
 /// Replication range
@@ -514,6 +516,15 @@ pub static BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD: LazyLock<Met
         MetricName::ProxiedDeleteTaggingRequestFailures,
         "Number of failures in DELETE tagging requests proxied to replication target",
         &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("proxy_requests_total".to_string()),
+        "Total number of bucket replication proxy requests by operation and result",
+        &[BUCKET_L, OPERATION_L, RESULT_L],
         subsystems::BUCKET_REPLICATION,
     )
 });

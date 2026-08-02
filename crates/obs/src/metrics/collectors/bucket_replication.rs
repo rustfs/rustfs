@@ -30,16 +30,17 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD,
     BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD,
     BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD,
-    BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD, BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD,
-    BUCKET_REPL_RESYNC_FAILED_TOTAL_MD, BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD,
-    BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
-    BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD,
-    BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
-    BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
+    BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD, BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD, BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD,
+    BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD, BUCKET_REPL_RESYNC_FAILED_TOTAL_MD, BUCKET_REPL_RESYNC_STARTED_TOTAL_MD,
+    BUCKET_REPL_SENT_BYTES_MD, BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD,
+    BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD,
+    BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD, BUCKET_REPL_TARGET_SENT_COUNT_MD,
+    BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD,
+    BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, RESULT_L, TARGET_ARN_L,
 };
 use std::borrow::Cow;
 
-const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 25;
+const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 37;
 const BUCKET_REPLICATION_FLOW_METRICS_PER_TARGET: usize = 9;
 const BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET: usize = 11;
 const BUCKET_REPLICATION_BACKLOG_METRICS_PER_TARGET: usize = 4;
@@ -149,6 +150,25 @@ pub fn collect_bucket_replication_bandwidth_metrics(stats: &[BucketReplicationBa
     }
 
     metrics
+}
+
+fn push_proxy_request_result_metrics(
+    metrics: &mut Vec<PrometheusMetric>,
+    bucket_label: Cow<'static, str>,
+    operation: &'static str,
+    total: u64,
+    failures: u64,
+) {
+    let failure_count = failures.min(total);
+    let success_count = total.saturating_sub(failure_count);
+    for (result, value) in [("success", success_count), ("failure", failure_count)] {
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD, value as f64)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(OPERATION_L, operation)
+                .with_label(RESULT_L, result),
+        );
+    }
 }
 
 pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> Vec<PrometheusMetric> {
@@ -273,6 +293,48 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
                 stat.proxied_delete_tagging_requests_failures as f64,
             )
             .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        push_proxy_request_result_metrics(
+            &mut metrics,
+            bucket_label.clone(),
+            "get",
+            stat.proxied_get_requests_total,
+            stat.proxied_get_requests_failures,
+        );
+        push_proxy_request_result_metrics(
+            &mut metrics,
+            bucket_label.clone(),
+            "head",
+            stat.proxied_head_requests_total,
+            stat.proxied_head_requests_failures,
+        );
+        push_proxy_request_result_metrics(
+            &mut metrics,
+            bucket_label.clone(),
+            "put",
+            stat.proxied_put_requests_total,
+            stat.proxied_put_requests_failures,
+        );
+        push_proxy_request_result_metrics(
+            &mut metrics,
+            bucket_label.clone(),
+            "put_tagging",
+            stat.proxied_put_tagging_requests_total,
+            stat.proxied_put_tagging_requests_failures,
+        );
+        push_proxy_request_result_metrics(
+            &mut metrics,
+            bucket_label.clone(),
+            "get_tagging",
+            stat.proxied_get_tagging_requests_total,
+            stat.proxied_get_tagging_requests_failures,
+        );
+        push_proxy_request_result_metrics(
+            &mut metrics,
+            bucket_label.clone(),
+            "delete_tagging",
+            stat.proxied_delete_tagging_requests_total,
+            stat.proxied_delete_tagging_requests_failures,
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, stat.resync_started_count as f64)
@@ -519,7 +581,7 @@ mod tests {
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 34);
+        assert_eq!(metrics.len(), 46);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
@@ -540,6 +602,28 @@ mod tests {
             metric.name == put_failures_name
                 && metric.value == 2.0
                 && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let proxy_requests_name = BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == proxy_requests_name
+                && metric.value == 4.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+                && metric.labels.iter().any(|(key, value)| *key == OPERATION_L && value == "put")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == RESULT_L && value == "success")
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == proxy_requests_name
+                && metric.value == 2.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+                && metric.labels.iter().any(|(key, value)| *key == OPERATION_L && value == "put")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == RESULT_L && value == "failure")
         }));
 
         let latency_name = BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name();
