@@ -20,7 +20,7 @@ use crate::backends::vault_credentials::{
 };
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, empty_key_page, ensure_key_state_permits,
-    ensure_key_status_permits, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
+    ensure_key_status_permits, ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
 };
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -38,6 +38,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vaultrs::{api::kv2::requests::SetSecretRequestOptions, error::ClientError, kv2};
+use zeroize::Zeroize as _;
 
 /// Vault KMS client implementation
 pub struct VaultKmsClient {
@@ -893,6 +894,134 @@ impl VaultKmsClient {
         Ok(plaintext)
     }
 
+    /// Report which master key version wraps an envelope, and whether that is
+    /// the key's current version.
+    ///
+    /// Reads the key record only; it never unwraps anything, so it works on keys
+    /// whose state forbids new cryptographic use — which is exactly the
+    /// population a retirement inventory has to cover.
+    pub(crate) async fn describe_data_key_wrapping(
+        &self,
+        request: &DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+        ensure_rewrap_context_matches(&envelope.encryption_context, &request.encryption_context)?;
+
+        let key_data = self.get_key_data(&envelope.master_key_id).await?;
+        let current_version = key_data.version;
+
+        Ok(DescribeDataKeyWrappingResponse {
+            key_id: envelope.master_key_id,
+            key_version: Some(resolve_envelope_master_key_version(
+                envelope.master_key_version,
+                key_data.baseline_version,
+                current_version,
+            )),
+            current_key_version: Some(current_version),
+            // Deliberately not `key_version == current_version`. A
+            // pre-versioning envelope resolves to the current version while
+            // saying nothing, and `rewrap_data_key` rewrites exactly those to
+            // stamp the version — so reporting them as current here would leave
+            // the sweep and the scan permanently disagreeing.
+            is_current: envelope.master_key_version == Some(current_version),
+        })
+    }
+
+    /// Re-wrap an existing envelope with the key's current master key version.
+    ///
+    /// The plaintext data key is unwrapped with the version that actually
+    /// wrapped it and immediately re-wrapped with the current material. It is
+    /// zeroized before this returns, never persisted, never logged and never
+    /// handed to the caller: the whole point of rewrap is that the data key is
+    /// re-protected without anyone above this layer holding it.
+    ///
+    /// Everything except the wrapping is carried over verbatim — the data key's
+    /// own id, its spec, its encryption context and its creation time — so the
+    /// result is the same data key under new wrapping. That keeps the DEK's
+    /// recorded age honest and makes the operation invisible to every consumer
+    /// of the envelope other than the version stamp.
+    ///
+    /// A pre-versioning envelope (no `master_key_version`) is rewrapped even
+    /// when it resolves to the current version and its bytes would be unwrapped
+    /// with the very material they are about to be re-wrapped with. That is not
+    /// wasted work: the version stamp is the only evidence a retirement scan can
+    /// read, and an envelope that does not state its version can never be
+    /// counted as migrated.
+    pub(crate) async fn rewrap_data_key(&self, request: &RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+        ensure_rewrap_context_matches(&envelope.encryption_context, &request.encryption_context)?;
+
+        // Single read of the key record: the version that unwraps, the material
+        // that re-wraps and the version stamped into the result must all come
+        // from one snapshot. Reading them separately would let a concurrent
+        // rotation produce an envelope stamped with a version whose material
+        // never wrapped it — an envelope that then fails to decrypt forever.
+        let key_data = self.get_key_data(&envelope.master_key_id).await?;
+        ensure_key_status_permits(&envelope.master_key_id, &key_data.status, StateGatedOperation::Encrypt)?;
+        let current_version = key_data.version;
+
+        if envelope.master_key_version == Some(current_version) {
+            // Already on the current version and saying so. Hand the input back
+            // untouched rather than producing an equivalent envelope with a
+            // fresh nonce: a re-run of a sweep must converge to zero writes, and
+            // the storage layer keys its write decision off these bytes.
+            return Ok(RewrapDataKeyResponse {
+                ciphertext: request.ciphertext.clone(),
+                key_id: envelope.master_key_id,
+                source_key_version: Some(current_version),
+                destination_key_version: Some(current_version),
+                rewrapped: false,
+            });
+        }
+
+        let source_version =
+            resolve_envelope_master_key_version(envelope.master_key_version, key_data.baseline_version, current_version);
+        let source_material = self
+            .get_key_material_for_version(&envelope.master_key_id, &key_data, source_version)
+            .await?;
+        let mut plaintext_key = match self
+            .dek_crypto
+            .decrypt(&source_material, &envelope.encrypted_key, &envelope.nonce)
+            .await
+        {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                return Err(self
+                    .explain_unwrap_failure(&envelope.master_key_id, &key_data, envelope.master_key_version, error)
+                    .await);
+            }
+        };
+
+        let destination_material = decode_stored_key_material(&envelope.master_key_id, &key_data.encrypted_key_material)
+            .inspect_err(|error| warn!(key_id = %envelope.master_key_id, %error, "Vault KMS key material failed validation"))?;
+        let rewrapped = self.dek_crypto.encrypt(&destination_material, &plaintext_key).await;
+        plaintext_key.zeroize();
+        let (encrypted_key, nonce) = rewrapped?;
+
+        let rewrapped_envelope = DataKeyEnvelope {
+            key_id: envelope.key_id,
+            master_key_id: envelope.master_key_id,
+            key_spec: envelope.key_spec,
+            encrypted_key,
+            nonce,
+            encryption_context: envelope.encryption_context,
+            created_at: envelope.created_at,
+            master_key_version: Some(current_version),
+        };
+        let ciphertext = serde_json::to_vec(&rewrapped_envelope)?;
+
+        debug!(key_id = %rewrapped_envelope.master_key_id, source_version, current_version, "Vault KMS data key rewrapped");
+        Ok(RewrapDataKeyResponse {
+            ciphertext,
+            key_id: rewrapped_envelope.master_key_id,
+            source_key_version: Some(source_version),
+            destination_key_version: Some(current_version),
+            rewrapped: true,
+        })
+    }
+
     /// Re-report a failure to unwrap a data key as the lost-baseline diagnosis
     /// when that is what the key record shows.
     ///
@@ -1449,6 +1578,17 @@ impl KmsBackend for VaultKmsBackend {
         })
     }
 
+    async fn rewrap_data_key(&self, request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        self.client.rewrap_data_key(&request).await
+    }
+
+    async fn describe_data_key_wrapping(
+        &self,
+        request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        self.client.describe_data_key_wrapping(&request).await
+    }
+
     async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
         let generate_request = GenerateKeyRequest {
             master_key_id: request.key_id.clone(),
@@ -1658,7 +1798,9 @@ impl KmsBackend for VaultKmsBackend {
         // Rotation freezes the outgoing material as an immutable version
         // record before switching the current pointer, and envelopes resolve
         // their wrapping version on decrypt, so every historical version
-        // stays decryptable after a rotation.
+        // stays decryptable after a rotation. Those same immutable records are
+        // what lets an envelope be unwrapped with the version that wrapped it
+        // and re-wrapped onto the current one.
         BackendCapabilities::minimal()
             .with_rotate(true)
             .with_enable_disable(true)
@@ -1666,6 +1808,7 @@ impl KmsBackend for VaultKmsBackend {
             .with_versioning(true)
             .with_physical_delete(true)
             .with_update_key_metadata(true)
+            .with_rewrap(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
@@ -3987,5 +4130,251 @@ mod tests {
                 "the decrypt must resolve the version that wrapped it: {requests:?}"
             );
         }
+    }
+
+    /// Rewrap against a scripted Vault serving `state`, scripting the key record
+    /// plus every version record the state holds, so the implementation — not
+    /// the harness — decides which of them it needs. Returns the response
+    /// together with the requests the rewrap made.
+    async fn rewrap_scripted(state: &KeyState, ciphertext: &[u8]) -> (RewrapDataKeyResponse, Vec<String>) {
+        let mut responses = vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))];
+        responses.extend(
+            state
+                .version_records
+                .iter()
+                .map(|record| ScriptedResponse::ok(kv2_read_version_record_data(record))),
+        );
+        let (vault, client) = scripted_client(responses).await;
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: ciphertext.to_vec(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("rewrap must produce an envelope on the current version");
+        (response, vault.requests())
+    }
+
+    /// Describe the wrapping of `ciphertext` against a scripted Vault serving
+    /// `state`.
+    async fn describe_wrapping_scripted(state: &KeyState, ciphertext: &[u8]) -> DescribeDataKeyWrappingResponse {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: ciphertext.to_vec(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("describing an envelope's wrapping must succeed")
+    }
+
+    /// The whole point of the primitive: an envelope wrapped by a superseded
+    /// master key version comes back wrapped by the current one, carrying the
+    /// same data key.
+    ///
+    /// Two independent things pin that the *old* material did the unwrapping.
+    /// The frozen version-1 record is read — an implementation that reached for
+    /// the current material would never ask for it — and the wrapping is
+    /// AES-256-GCM, so unwrapping with the wrong material cannot yield the
+    /// original data key at all, only an authentication failure. The closing
+    /// decrypt then shows the result is genuinely bound to version 2: it
+    /// resolves on the key record alone, with no version record in sight.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_moves_an_old_envelope_onto_the_current_version() {
+        const PLAINTEXT: &[u8] = b"data-key-material-that-must-survive";
+
+        let state_v1 = KeyState::new(healthy_key_data());
+        let encrypted_v1 = encrypt_scripted(&state_v1, PLAINTEXT).await;
+        let state_v2 = rotate_scripted(&state_v1).await;
+        assert_ne!(
+            state_v2.key_data.encrypted_key_material, state_v1.key_data.encrypted_key_material,
+            "the rotation must have replaced the current material, or this test proves nothing"
+        );
+
+        let before = describe_wrapping_scripted(&state_v2, &encrypted_v1.ciphertext).await;
+        assert_eq!(before.key_version, Some(1));
+        assert_eq!(before.current_key_version, Some(2));
+        assert!(!before.is_current, "a version-1 envelope on a version-2 key is not current");
+
+        let (response, requests) = rewrap_scripted(&state_v2, &encrypted_v1.ciphertext).await;
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(2));
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key/versions/1".to_string(),
+            ],
+            "the unwrap must resolve the frozen version-1 material: {requests:?}"
+        );
+
+        let original: DataKeyEnvelope = serde_json::from_slice(&encrypted_v1.ciphertext).expect("envelope must parse");
+        let rewrapped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("rewrapped envelope must parse");
+        assert_eq!(rewrapped.master_key_version, Some(2), "the result must name the current version");
+        assert_ne!(rewrapped.encrypted_key, original.encrypted_key, "the wrapping must actually change");
+        // Everything but the wrapping is carried over, so the data key keeps its
+        // identity and its recorded age.
+        assert_eq!(rewrapped.key_id, original.key_id);
+        assert_eq!(rewrapped.key_spec, original.key_spec);
+        assert_eq!(rewrapped.encryption_context, original.encryption_context);
+        assert_eq!(rewrapped.created_at, original.created_at);
+
+        let (plaintext, decrypt_requests) = decrypt_scripted(&state_v2, &response.ciphertext).await;
+        assert_eq!(
+            plaintext, PLAINTEXT,
+            "the rewrapped envelope must yield the original data key byte for byte"
+        );
+        assert_eq!(
+            decrypt_requests.len(),
+            1,
+            "the rewrapped envelope must resolve on the current record alone: {decrypt_requests:?}"
+        );
+
+        let after = describe_wrapping_scripted(&state_v2, &response.ciphertext).await;
+        assert!(after.is_current, "the scan must agree the envelope no longer needs rewrapping");
+    }
+
+    /// Re-running a sweep must converge. An envelope already on the current
+    /// version comes back byte for byte with nothing to persist, rather than as
+    /// an equivalent envelope with a fresh nonce that would make every pass
+    /// rewrite every object's metadata forever.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_of_a_current_envelope_is_a_no_op() {
+        let state_v1 = KeyState::new(healthy_key_data());
+        let state_v2 = rotate_scripted(&state_v1).await;
+        let encrypted_v2 = encrypt_scripted(&state_v2, b"written-after-the-rotation").await;
+
+        let described = describe_wrapping_scripted(&state_v2, &encrypted_v2.ciphertext).await;
+        assert!(described.is_current);
+
+        let (response, requests) = rewrap_scripted(&state_v2, &encrypted_v2.ciphertext).await;
+        assert!(!response.rewrapped, "an already-current envelope has nothing to rewrap");
+        assert_eq!(
+            response.ciphertext, encrypted_v2.ciphertext,
+            "a no-op rewrap must hand the input back unchanged"
+        );
+        assert_eq!(response.source_key_version, Some(2));
+        assert_eq!(response.destination_key_version, Some(2));
+        assert_eq!(
+            requests.len(),
+            1,
+            "a no-op must not reach for any version record: {requests:?}"
+        );
+
+        // Idempotence in the literal sense: feeding the result back in changes
+        // nothing again.
+        let (again, _) = rewrap_scripted(&state_v2, &response.ciphertext).await;
+        assert!(!again.rewrapped);
+        assert_eq!(again.ciphertext, encrypted_v2.ciphertext);
+    }
+
+    /// A pre-versioning envelope carries no version at all, so it can never
+    /// satisfy a retirement scan however current its material happens to be.
+    /// Rewrap therefore rewrites it to stamp the version — including on a
+    /// never-rotated key, where the material it is unwrapped with and the
+    /// material it is re-wrapped with are the same bytes.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_stamps_a_pre_versioning_envelope() {
+        const PLAINTEXT: &[u8] = b"written-before-versioning-existed";
+
+        let state_v1 = KeyState::new(healthy_key_data());
+        let encrypted_v1 = encrypt_scripted(&state_v1, PLAINTEXT).await;
+        let legacy = strip_master_key_version(&encrypted_v1.ciphertext);
+        let legacy_envelope: DataKeyEnvelope = serde_json::from_slice(&legacy).expect("legacy envelope must parse");
+        assert_eq!(legacy_envelope.master_key_version, None);
+
+        // Never rotated: the resolved version is already the current one, and
+        // the envelope is still rewritten purely to record it.
+        let described = describe_wrapping_scripted(&state_v1, &legacy).await;
+        assert_eq!(described.key_version, Some(1));
+        assert_eq!(described.current_key_version, Some(1));
+        assert!(
+            !described.is_current,
+            "an envelope that does not state its version can never count as migrated"
+        );
+
+        let (response, requests) = rewrap_scripted(&state_v1, &legacy).await;
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(1));
+        assert_eq!(requests.len(), 1, "a never-rotated key has no version record to read: {requests:?}");
+        let stamped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("stamped envelope must parse");
+        assert_eq!(stamped.master_key_version, Some(1));
+        let (plaintext, _) = decrypt_scripted(&state_v1, &response.ciphertext).await;
+        assert_eq!(plaintext, PLAINTEXT);
+
+        // After a rotation the same legacy envelope resolves through the frozen
+        // baseline instead, and lands on the rotated version.
+        let state_v2 = rotate_scripted(&state_v1).await;
+        assert_eq!(state_v2.key_data.baseline_version, Some(1));
+        let (rotated_response, rotated_requests) = rewrap_scripted(&state_v2, &legacy).await;
+        assert_eq!(rotated_response.source_key_version, Some(1), "the baseline is what wrapped it");
+        assert_eq!(rotated_response.destination_key_version, Some(2));
+        assert!(
+            rotated_requests[1].ends_with("/versions/1"),
+            "the unwrap must resolve the baseline material: {rotated_requests:?}"
+        );
+        let (rotated_plaintext, _) = decrypt_scripted(&state_v2, &rotated_response.ciphertext).await;
+        assert_eq!(rotated_plaintext, PLAINTEXT);
+    }
+
+    /// Drop the `master_key_version` field to produce the envelope shape a
+    /// pre-versioning build wrote.
+    fn strip_master_key_version(ciphertext: &[u8]) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(ciphertext).expect("envelope must parse");
+        value
+            .as_object_mut()
+            .expect("envelope is a JSON object")
+            .remove("master_key_version");
+        serde_json::to_vec(&value).expect("serialize legacy envelope")
+    }
+
+    /// The encryption context binds an envelope to one object. A caller that
+    /// cannot reproduce it is refused before any Vault read, so rewrap cannot be
+    /// used to launder an envelope onto a fresh wrapping.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_rejects_a_tampered_encryption_context() {
+        let context = HashMap::from([("bucket".to_string(), "photos/cat.jpg".to_string())]);
+        let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&healthy_key_data()))]).await;
+
+        let encrypted = client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: b"bound-to-one-object".to_vec(),
+                    encryption_context: context.clone(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("encrypt must produce an envelope");
+
+        let error = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: encrypted.ciphertext.clone(),
+                encryption_context: HashMap::from([("bucket".to_string(), "photos/other.jpg".to_string())]),
+            })
+            .await
+            .expect_err("a context that does not match the envelope must be refused");
+        assert!(matches!(error, KmsError::ContextMismatch { .. }), "got {error:?}");
+
+        let error = client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: encrypted.ciphertext,
+                encryption_context: HashMap::from([("bucket".to_string(), "photos/other.jpg".to_string())]),
+            })
+            .await
+            .expect_err("the read-only accessor must apply the same guard");
+        assert!(matches!(error, KmsError::ContextMismatch { .. }), "got {error:?}");
+
+        assert_eq!(
+            vault.requests().len(),
+            1,
+            "the context guard must run before any Vault read: {:?}",
+            vault.requests()
+        );
     }
 }

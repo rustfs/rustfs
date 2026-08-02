@@ -126,6 +126,39 @@ pub(crate) fn ensure_tag_keys_are_mutable<'a>(tag_keys: impl IntoIterator<Item =
     Ok(())
 }
 
+/// Reject a rewrap whose caller cannot reproduce the envelope's encryption
+/// context.
+///
+/// Deliberately the same rule the decrypt paths apply — every context entry the
+/// envelope carries must be matched, and an entirely empty request context is
+/// accepted for envelopes written before contexts were recorded. Rewrap must
+/// never be *stricter* than decrypt: a retirement sweep has to be able to
+/// rewrap every envelope that still reads, or the old master key version it is
+/// trying to retire stays referenced forever by objects that are perfectly
+/// readable.
+///
+/// It must not be *laxer* either. The context binds an envelope to one
+/// bucket/object pair, and a rewrap that skipped the check would let a caller
+/// launder an envelope it has no claim on into a freshly wrapped one.
+pub(crate) fn ensure_rewrap_context_matches(
+    envelope_context: &HashMap<String, String>,
+    request_context: &HashMap<String, String>,
+) -> Result<()> {
+    for (key, expected_value) in envelope_context {
+        match request_context.get(key) {
+            Some(actual_value) if actual_value == expected_value => {}
+            Some(actual_value) => {
+                return Err(KmsError::context_mismatch(format!(
+                    "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
+                )));
+            }
+            None if request_context.is_empty() => {}
+            None => return Err(KmsError::context_mismatch(format!("Missing context key '{key}'"))),
+        }
+    }
+    Ok(())
+}
+
 /// Page size used when a [`ListKeysRequest`] does not ask for one.
 pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = 100;
 
@@ -271,6 +304,75 @@ pub trait KmsBackend: Send + Sync {
         Err(KmsError::unsupported_capability("backend without rotation support", "rotate_key"))
     }
 
+    /// Re-wrap an existing data key envelope under the key's current version,
+    /// returning an envelope that protects the same data key.
+    ///
+    /// This is the primitive that makes retiring an old master key version
+    /// possible at all: until every envelope a version wrapped has been moved
+    /// onto the current version, destroying that version's material orphans
+    /// every object whose data key it wrapped. Rotation alone does not shrink
+    /// the blast radius of a leaked master key version, because envelopes
+    /// written before it stay decryptable under the leaked material forever.
+    ///
+    /// Contract for implementations:
+    ///
+    /// - The plaintext data key must not be persisted, logged, or returned. It
+    ///   is either never materialized at all (backends with a native rewrap) or
+    ///   held only for the length of the re-wrap.
+    /// - The destination version is always the key's *current* version. Wrapping
+    ///   to any older version would create objects that nodes which resolve
+    ///   envelopes to the current version cannot read.
+    /// - Everything except the wrapping is carried over verbatim, encryption
+    ///   context included, so the result is the same data key rewrapped and not
+    ///   a new one. An envelope must never be moved between objects.
+    /// - Idempotence: an envelope already wrapped by the current version comes
+    ///   back byte for byte with [`RewrapDataKeyResponse::rewrapped`] false, so
+    ///   re-running a sweep converges and performs no metadata writes.
+    ///
+    /// Only backends that advertise [`BackendCapabilities::rewrap`] may override
+    /// this method; the default rejects the operation. A backend without
+    /// retained version history has nothing to rewrap *to*, so it reports the
+    /// capability gap rather than performing a re-wrap that changes no version
+    /// and buys no security.
+    async fn rewrap_data_key(&self, _request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        Err(KmsError::unsupported_capability(
+            "backend without versioned key material to rewrap onto",
+            "rewrap_data_key",
+        ))
+    }
+
+    /// Report which master key version wraps an existing data key envelope, and
+    /// whether that is the key's current version.
+    ///
+    /// The read-only counterpart of [`Self::rewrap_data_key`], and the only
+    /// supported way to ask the question: each rotating backend records the
+    /// version somewhere else, so every caller that parsed envelopes itself
+    /// would carry its own copy of that knowledge outside the KMS boundary.
+    ///
+    /// [`DescribeDataKeyWrappingResponse::is_current`] must be the exact
+    /// negation of what [`RewrapDataKeyResponse::rewrapped`] would report for
+    /// the same envelope. The two answers drive a single loop — scan to find
+    /// work, rewrap to do it, scan again to prove it is done — and a
+    /// disagreement would make that loop either never terminate or declare
+    /// success while envelopes still reference a version somebody is about to
+    /// destroy.
+    ///
+    /// Deliberately not gated on key state: an inventory has to be able to
+    /// count envelopes under keys that are disabled or already scheduled for
+    /// deletion, which are precisely the keys whose retirement is in question.
+    ///
+    /// Gated by the same [`BackendCapabilities::rewrap`] flag, because a backend
+    /// that cannot rewrap has no version to report progress against.
+    async fn describe_data_key_wrapping(
+        &self,
+        _request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        Err(KmsError::unsupported_capability(
+            "backend without versioned key material to rewrap onto",
+            "describe_data_key_wrapping",
+        ))
+    }
+
     /// Replace a key's free-form description; `None` clears it.
     ///
     /// Backends that advertise [`BackendCapabilities::update_key_metadata`]
@@ -387,6 +489,8 @@ pub struct BackendCapabilities {
     pub physical_delete: bool,
     /// Updating a key's description and tags after creation
     pub update_key_metadata: bool,
+    /// Re-wrapping an existing data key envelope onto the key's current version
+    pub rewrap: bool,
 }
 
 impl BackendCapabilities {
@@ -404,6 +508,7 @@ impl BackendCapabilities {
             versioning: false,
             physical_delete: false,
             update_key_metadata: false,
+            rewrap: false,
         }
     }
 
@@ -458,6 +563,12 @@ impl BackendCapabilities {
     /// Set whether description and tag updates are supported
     pub const fn with_update_key_metadata(mut self, update_key_metadata: bool) -> Self {
         self.update_key_metadata = update_key_metadata;
+        self
+    }
+
+    /// Set whether envelope rewrap onto the current key version is supported
+    pub const fn with_rewrap(mut self, rewrap: bool) -> Self {
+        self.rewrap = rewrap;
         self
     }
 }
@@ -539,6 +650,7 @@ mod tests {
         assert!(!capabilities.versioning);
         assert!(!capabilities.physical_delete);
         assert!(!capabilities.update_key_metadata);
+        assert!(!capabilities.rewrap);
     }
 
     #[tokio::test]
@@ -553,6 +665,26 @@ mod tests {
             ),
             ("tag_key", MinimalBackend.tag_key("any-key", &HashMap::new()).await),
             ("untag_key", MinimalBackend.untag_key("any-key", &[]).await),
+            (
+                "rewrap_data_key",
+                MinimalBackend
+                    .rewrap_data_key(RewrapDataKeyRequest {
+                        ciphertext: b"{}".to_vec(),
+                        encryption_context: HashMap::new(),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "describe_data_key_wrapping",
+                MinimalBackend
+                    .describe_data_key_wrapping(DescribeDataKeyWrappingRequest {
+                        ciphertext: b"{}".to_vec(),
+                        encryption_context: HashMap::new(),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err("backends must opt in to lifecycle operations by overriding them");
             assert!(
@@ -571,6 +703,40 @@ mod tests {
         assert!(
             matches!(error, KmsError::UnsupportedCapability { .. }),
             "expected UnsupportedCapability, got {error:?}"
+        );
+    }
+
+    /// The rewrap context guard has to sit exactly where the decrypt guard
+    /// sits: strict enough that an envelope cannot be laundered under a
+    /// different context, lax enough that everything decrypt accepts can still
+    /// be rewrapped — otherwise a retirement sweep stalls on readable objects.
+    #[test]
+    fn rewrap_context_guard_matches_the_decrypt_rule() {
+        let envelope = HashMap::from([
+            ("bucket".to_string(), "b/o".to_string()),
+            ("tenant".to_string(), "acme".to_string()),
+        ]);
+
+        ensure_rewrap_context_matches(&envelope, &envelope).expect("an exact context must be accepted");
+        // An empty request context is the pre-context-recording compatibility
+        // case decrypt allows; rewrap must not be stricter.
+        ensure_rewrap_context_matches(&envelope, &HashMap::new()).expect("an empty request context must stay accepted");
+        // Extra entries the envelope does not carry are ignored, as on decrypt.
+        let mut superset = envelope.clone();
+        superset.insert("extra".to_string(), "ignored".to_string());
+        ensure_rewrap_context_matches(&envelope, &superset).expect("extra request context entries must be ignored");
+
+        let mut tampered = envelope.clone();
+        tampered.insert("bucket".to_string(), "other/o".to_string());
+        assert!(
+            matches!(ensure_rewrap_context_matches(&envelope, &tampered), Err(KmsError::ContextMismatch { .. })),
+            "a tampered context value must be rejected"
+        );
+
+        let partial = HashMap::from([("tenant".to_string(), "acme".to_string())]);
+        assert!(
+            matches!(ensure_rewrap_context_matches(&envelope, &partial), Err(KmsError::ContextMismatch { .. })),
+            "a non-empty context missing an envelope entry must be rejected"
         );
     }
 
