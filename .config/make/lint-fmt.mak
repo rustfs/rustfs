@@ -60,6 +60,11 @@ body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fai
 	@echo "🧱 Checking body-cache whitelist guard..."
 	./scripts/check_body_cache_whitelist.sh
 
+.PHONY: fips-wording-check
+fips-wording-check: ## Check outward docs do not make unsupported FIPS claims
+	@echo "📣 Checking FIPS wording guard..."
+	./scripts/check_fips_wording.sh
+
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source
 	@echo "🩺 Checking log-analyzer rule anchors..."
