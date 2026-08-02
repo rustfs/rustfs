@@ -32,12 +32,16 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD,
     BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD, BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD,
     BUCKET_REPL_RESYNC_FAILED_TOTAL_MD, BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD,
-    BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L,
-    TARGET_ARN_L,
+    BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
+    BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD,
+    BUCKET_REPL_TARGET_SENT_BYTES_MD, BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD,
+    BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD,
+    OPERATION_L, RANGE_L, TARGET_ARN_L,
 };
 use std::borrow::Cow;
 
 const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 25;
+const BUCKET_REPLICATION_FLOW_METRICS_PER_TARGET: usize = 9;
 const BASE_BUCKET_REPLICATION_BACKLOG_METRICS_PER_BUCKET: usize = 11;
 const BUCKET_REPLICATION_BACKLOG_METRICS_PER_TARGET: usize = 4;
 
@@ -47,6 +51,14 @@ pub struct BucketReplicationTargetStats {
     pub bandwidth_limit_bytes_per_sec: u64,
     pub current_bandwidth_bytes_per_sec: f64,
     pub latency_ms: f64,
+    pub sent_bytes: u64,
+    pub sent_count: u64,
+    pub total_failed_bytes: u64,
+    pub total_failed_count: u64,
+    pub last_min_failed_bytes: u64,
+    pub last_min_failed_count: u64,
+    pub last_hour_failed_bytes: u64,
+    pub last_hour_failed_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,7 +159,7 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
 
     let metric_count = stats
         .iter()
-        .map(|stat| BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET + stat.targets.len())
+        .map(|stat| BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET + stat.targets.len() * BUCKET_REPLICATION_FLOW_METRICS_PER_TARGET)
         .sum();
     let mut metrics = Vec::with_capacity(metric_count);
     for stat in stats {
@@ -285,6 +297,46 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
         );
         for target in &stat.targets {
             let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_SENT_BYTES_MD, target.sent_bytes as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_SENT_COUNT_MD, target.sent_count as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, target.total_failed_bytes as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD, target.total_failed_count as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, target.last_min_failed_bytes as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, target.last_min_failed_count as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, target.last_hour_failed_bytes as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD, target.last_hour_failed_count as f64)
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(TARGET_ARN_L, target_label.clone()),
+            );
             metrics.push(
                 PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)
                     .with_label(BUCKET_L, bucket_label.clone())
@@ -444,11 +496,19 @@ mod tests {
                 bandwidth_limit_bytes_per_sec: 2048,
                 current_bandwidth_bytes_per_sec: 1024.0,
                 latency_ms: 15.0,
+                sent_bytes: 512,
+                sent_count: 4,
+                total_failed_bytes: 96,
+                total_failed_count: 3,
+                last_min_failed_bytes: 32,
+                last_min_failed_count: 1,
+                last_hour_failed_bytes: 64,
+                last_hour_failed_count: 2,
             }],
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 26);
+        assert_eq!(metrics.len(), 34);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
@@ -475,6 +535,27 @@ mod tests {
         assert!(metrics.iter().any(|metric| {
             metric.name == latency_name
                 && metric.value == 15.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == TARGET_ARN_L && value == "arn:rustfs:replication:us-east-1:1:target")
+        }));
+
+        let target_sent_name = BUCKET_REPL_TARGET_SENT_COUNT_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == target_sent_name
+                && metric.value == 4.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == TARGET_ARN_L && value == "arn:rustfs:replication:us-east-1:1:target")
+        }));
+
+        let target_last_min_failed_name = BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == target_last_min_failed_name
+                && metric.value == 32.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
                 && metric
                     .labels
                     .iter()

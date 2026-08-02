@@ -43,6 +43,14 @@ pub(crate) struct ObsBucketReplicationTargetStatsSnapshot {
     pub(crate) bandwidth_limit_bytes_per_sec: u64,
     pub(crate) current_bandwidth_bytes_per_sec: f64,
     pub(crate) latency_ms: f64,
+    pub(crate) sent_bytes: u64,
+    pub(crate) sent_count: u64,
+    pub(crate) total_failed_bytes: u64,
+    pub(crate) total_failed_count: u64,
+    pub(crate) last_min_failed_bytes: u64,
+    pub(crate) last_min_failed_count: u64,
+    pub(crate) last_hour_failed_bytes: u64,
+    pub(crate) last_hour_failed_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -399,6 +407,14 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
                     bandwidth_limit_bytes_per_sec: i64_to_u64_floor_zero(target_stats.bandwidth_limit_bytes_per_sec),
                     current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
                     latency_ms: target_stats.latency.curr,
+                    sent_bytes: i64_to_u64_floor_zero(target_stats.replicated_size),
+                    sent_count: i64_to_u64_floor_zero(target_stats.replicated_count),
+                    total_failed_bytes: i64_to_u64_floor_zero(target_stats.fail_stats.size),
+                    total_failed_count: i64_to_u64_floor_zero(target_stats.fail_stats.count),
+                    last_min_failed_bytes: i64_to_u64_floor_zero(last_min.size),
+                    last_min_failed_count: i64_to_u64_floor_zero(last_min.count),
+                    last_hour_failed_bytes: i64_to_u64_floor_zero(last_hour.size),
+                    last_hour_failed_count: i64_to_u64_floor_zero(last_hour.count),
                 });
             }
             runtime.resync_started_count = i64_to_u64_floor_zero(bucket_stats.resync_started_count);

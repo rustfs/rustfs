@@ -268,6 +268,14 @@ fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnaps
                 bandwidth_limit_bytes_per_sec: target.bandwidth_limit_bytes_per_sec,
                 current_bandwidth_bytes_per_sec: target.current_bandwidth_bytes_per_sec,
                 latency_ms: target.latency_ms,
+                sent_bytes: target.sent_bytes,
+                sent_count: target.sent_count,
+                total_failed_bytes: target.total_failed_bytes,
+                total_failed_count: target.total_failed_count,
+                last_min_failed_bytes: target.last_min_failed_bytes,
+                last_min_failed_count: target.last_min_failed_count,
+                last_hour_failed_bytes: target.last_hour_failed_bytes,
+                last_hour_failed_count: target.last_hour_failed_count,
             })
             .collect(),
     }
