@@ -212,6 +212,17 @@ default-filter = """
 """
 fail-fast = false
 
+[profile.e2e-smoke.junit]
+path = "junit.xml"
+
+# The pagination boundary cases can stall when a server/listing regression
+# prevents the continuation request from completing. Keep the timeout scoped
+# to those known failure modes so legitimate lifecycle/tiering waits retain
+# their test-level timing budget.
+[[profile.e2e-smoke.overrides]]
+filter = 'package(e2e_test) & test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/)'
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
+
 # ---------------------------------------------------------------------------
 # e2e-repl-nightly profile — scheduled full replication e2e lane (repl-1)
 # ---------------------------------------------------------------------------
