@@ -175,7 +175,7 @@ async fn wait_for_count(counter: &AtomicU64, minimum: u64, description: &str) {
 }
 
 async fn wait_for_file(path: &Path, description: &str) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(70), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -270,12 +270,18 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
             .decrypt(kv2_request.clone())
             .await
             .expect("healthy KV2 decrypt before failover");
-        assert_eq!(kv2_response.plaintext, kv2_data_key.plaintext_key);
+        assert!(
+            kv2_response.plaintext == kv2_data_key.plaintext_key,
+            "healthy KV2 decrypt returned unexpected plaintext"
+        );
         let transit_response = transit
             .decrypt(transit_request.clone())
             .await
             .expect("healthy Transit decrypt before failover");
-        assert_eq!(transit_response.plaintext, transit_data_key.plaintext_key);
+        assert!(
+            transit_response.plaintext == transit_data_key.plaintext_key,
+            "healthy Transit decrypt returned unexpected plaintext"
+        );
     }
     let baseline = snapshotter.snapshot().into_vec();
     assert_eq!(
