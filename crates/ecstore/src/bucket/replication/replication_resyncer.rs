@@ -3861,15 +3861,13 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
 #[cfg(test)]
 mod tests {
-    use super::super::replication_filemeta_boundary::{ReplicateTargetDecision, ReplicationState};
-    use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
+    use super::super::replication_filemeta_boundary::{ReplicateTargetDecision, ReplicationState, ReplicationWorkerOperation};
+    use super::super::replication_storage_boundary::StorageNamespaceLocking as _;
+    use super::super::replication_target_boundary::{ArnTarget, BucketTarget, BucketTargets, TargetRegistry};
     use super::*;
-    use crate::bucket::bucket_target_sys::{ArnTarget, BucketTargetSys};
     use crate::layout::endpoint::Endpoint;
     use crate::layout::format::FormatV3;
     use crate::set_disk::SetDisks;
-    use crate::storage_api_contracts::namespace::NamespaceLocking as _;
-    use rustfs_replication::ReplicationWorkerOperation;
     use s3s::dto::{
         BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ExcludedPrefix, ReplicationRule,
         ReplicationRuleStatus, VersioningConfiguration,
@@ -4285,7 +4283,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4318,8 +4316,8 @@ mod tests {
             .await
             .expect("target RPCs should finish before the post-check pause")
             .expect("test S3 server should not panic");
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4328,7 +4326,7 @@ mod tests {
             blocked_marker_creation_server("opaque-target-version".to_string()).await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4363,8 +4361,8 @@ mod tests {
             .await
             .expect("test S3 server should finish")
             .expect("test S3 server should not panic");
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4398,7 +4396,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4424,8 +4422,8 @@ mod tests {
             .await
             .expect("test S3 server should receive all requests")
             .expect("test S3 server should not panic");
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
 
         assert_eq!(requests.len(), 4);
         let create = requests[1].lines().next().expect("marker create request line should exist");
@@ -4455,7 +4453,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4484,8 +4482,8 @@ mod tests {
                     .contains(&format!("versionId={target_version_id}"))
             );
         }
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4505,7 +4503,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4531,8 +4529,8 @@ mod tests {
             .await
             .expect("only the initial target marker creation should run")
             .expect("test S3 server should not panic");
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
         assert_eq!(requests.len(), 2, "source verification errors must not trigger destructive compensation");
         let batches = retry_capture.batches();
         assert_eq!(batches.len(), 1);
@@ -4547,7 +4545,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4578,8 +4576,8 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[0][0].target_arn, target_arn);
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4611,7 +4609,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4651,8 +4649,8 @@ mod tests {
             .await
             .expect("test S3 server should receive both purge attempts")
             .expect("test S3 server should not panic");
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
         assert_eq!(requests.len(), 4);
         for request in [&requests[1], &requests[3]] {
             let request_line = request.lines().next().expect("purge request line should exist");
@@ -4680,7 +4678,7 @@ mod tests {
             assert!(result.is_err());
             let requests = server.await.expect("test S3 server should not panic");
             assert_eq!(requests.len(), 1, "an unverified 405 must not be followed by DELETE");
-            BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+            TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
         }
     }
 
@@ -4706,7 +4704,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4734,8 +4732,8 @@ mod tests {
 
         let requests = server.await.expect("test S3 server should not panic");
         assert_eq!(requests.len(), 3);
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4775,9 +4773,9 @@ mod tests {
 
         let requests = server.await.expect("test S3 server should not panic");
         assert_eq!(requests.len(), 6);
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().target_h_mutex.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().target_h_mutex.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4831,9 +4829,9 @@ mod tests {
             .await
             .expect("test S3 server should receive the retry sequence")
             .expect("test S3 server should not panic");
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().target_h_mutex.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().target_h_mutex.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_endpoint);
         assert_eq!(requests.len(), 4);
         assert!(
             requests[0]
@@ -4898,7 +4896,7 @@ mod tests {
         .await;
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4916,8 +4914,8 @@ mod tests {
         let compensation = requests[5].lines().next().expect("compensation request line should exist");
         assert!(compensation.contains(&format!("versionId={new_target_version_id}")));
         assert!(!compensation.contains(old_target_version_id));
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4926,7 +4924,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4952,8 +4950,8 @@ mod tests {
                 .is_err(),
             "conflicting target IDs must not issue a target request"
         );
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -4962,7 +4960,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -4992,8 +4990,8 @@ mod tests {
         assert!(batches[0][0].blocked_delete_marker_version_state);
         assert_eq!(batches[0][0].target_delete_marker_version_id.as_deref(), Some("mrf-target-version"));
         assert!(batches[0][0].to_mrf_entry().blocked_delete_marker_version_state());
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[tokio::test]
@@ -5002,7 +5000,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
         let target_client = test_target_client(endpoint);
         let target_arn = target_client.arn.clone();
-        BucketTargetSys::get()
+        TargetRegistry::get()
             .arn_remotes_map
             .write()
             .await
@@ -5026,8 +5024,8 @@ mod tests {
                 .is_err(),
             "corrupt target version metadata must remain non-destructive across retries"
         );
-        BucketTargetSys::get().arn_remotes_map.write().await.remove(&target_arn);
-        BucketTargetSys::get().h_mutex.write().await.remove(&target_client.endpoint);
+        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
+        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[test]

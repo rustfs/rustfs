@@ -26,6 +26,9 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use crate::storage::request_context::RequestContext;
+use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
+use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use http::HeaderMap;
 use metrics::counter;
@@ -35,7 +38,6 @@ use rustfs_policy::policy::{
     Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
     bucket_policy_uses_existing_object_tag_conditions,
 };
-use rustfs_storage_api::{BUCKET_LIFECYCLE_LOCK_OBJECT, NamespaceLocking as _};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
@@ -111,11 +113,7 @@ pub(crate) struct BucketConfigMutationSnapshot {
 
 pub(crate) fn bucket_config_mutation_incarnation<T>(req: &S3Request<T>, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
     let Some(snapshot) = req.extensions.get::<BucketConfigMutationSnapshot>() else {
-        if req
-            .extensions
-            .get::<std::sync::Arc<crate::storage::runtime_sources::ServerContextSlot>>()
-            .is_some()
-        {
+        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "bucket config mutation snapshot is missing"));
         }
         return Ok(None);
@@ -282,11 +280,7 @@ pub(crate) fn apply_bucket_generation_guard<T>(req: &S3Request<T>, bucket: &str,
         None => req.extensions.get::<BucketGenerationGuard>(),
     };
     let Some(guard) = guard else {
-        if req
-            .extensions
-            .get::<std::sync::Arc<crate::storage::runtime_sources::ServerContextSlot>>()
-            .is_some()
-        {
+        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "bucket generation guard is missing"));
         }
         return Ok(());
@@ -304,11 +298,7 @@ pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
     opts: &mut ObjectOptions,
 ) -> S3Result<()> {
     let Some(guard) = req.extensions.get::<CopySourceBucketGenerationGuard>() else {
-        if req
-            .extensions
-            .get::<std::sync::Arc<crate::storage::runtime_sources::ServerContextSlot>>()
-            .is_some()
-        {
+        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "copy source bucket generation guard is missing"));
         }
         return Ok(());
@@ -2522,16 +2512,15 @@ mod tests {
         table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
-    use crate::storage::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
+    use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+    use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
+    use crate::storage::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
     use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
-    use rustfs_storage_api::{
-        BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
-        ObjectOperations as _,
-    };
     use s3s::{S3ErrorCode, S3Request, dto::*};
     use serial_test::serial;
     use std::collections::HashMap;

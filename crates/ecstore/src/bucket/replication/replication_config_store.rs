@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use super::replication_error_boundary::{Error, Result};
-use super::replication_storage_boundary::ReplicationObjectIO;
+use super::replication_storage_boundary::{HTTPPreconditions, ObjectOptions, ReplicationObjectIO};
 use crate::config::{com, storageclass};
-use crate::storage_api_contracts::object::HTTPPreconditions;
 use rustfs_lock::distributed_lock::LockLostSignal;
 use std::sync::Arc;
 
@@ -68,7 +67,7 @@ impl ReplicationConfigStore {
     where
         S: ReplicationObjectIO,
     {
-        let mut opts = crate::object_api::ObjectOptions {
+        let mut opts = ObjectOptions {
             max_parity: true,
             http_preconditions: Some(match expected_etag {
                 Some(etag) => HTTPPreconditions {

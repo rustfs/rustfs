@@ -25,7 +25,7 @@ pub(crate) use crate::storage_api_contracts::list::{
 };
 pub(crate) use crate::storage_api_contracts::namespace::NamespaceLocking as StorageNamespaceLocking;
 pub(crate) use crate::storage_api_contracts::object::{
-    DeletedObject, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete,
+    DeletedObject, EcstoreObjectOperations, HTTPPreconditions, ObjectIO, ObjectOperations, ObjectToDelete,
 };
 pub(crate) use crate::storage_api_contracts::range::HTTPRangeSpec;
 pub(crate) use rustfs_replication::{DeletedObject as ReplicationDeletedObject, ObjectToDelete as ReplicationObjectToDelete};

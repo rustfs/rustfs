@@ -20,10 +20,9 @@ use crate::bucket::{
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::storage_api_contracts::bucket::SRBucketDeleteOp;
+use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
-use rustfs_storage_api::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use std::collections::BTreeMap;
 use std::future::Future;
 

@@ -13793,7 +13793,7 @@ mod tests {
         }
         let ambient = current_app_context().expect("self-copy lock-order test requires an AppContext");
         let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
-        let server_ctx = crate::app::context::ServerContextSlot::new();
+        let server_ctx = crate::app::runtime_sources::ServerContextSlot::new();
         assert!(server_ctx.install(Arc::clone(&context)));
         let fs = FS::with_server_ctx(server_ctx);
 

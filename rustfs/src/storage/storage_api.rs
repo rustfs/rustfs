@@ -49,8 +49,12 @@ pub(crate) mod contract {
 
     pub(crate) mod bucket {
         pub(crate) use super::super::storage_contracts::{
-            BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+            BUCKET_LIFECYCLE_LOCK_OBJECT, BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
         };
+    }
+
+    pub(crate) mod namespace {
+        pub(crate) use super::super::storage_contracts::NamespaceLocking;
     }
 
     pub(crate) mod list {
@@ -61,7 +65,7 @@ pub(crate) mod contract {
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{MultipartInfo, PartInfo};
+        pub(crate) use super::super::storage_contracts::{MultipartInfo, MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -256,7 +260,10 @@ pub(crate) mod rpc_consumer {
 pub(crate) mod runtime_sources_consumer {
     pub(crate) type ECStore = super::ECStore;
     pub(crate) type EndpointServerPools = super::EndpointServerPools;
+    pub(crate) type ServerContextSlot = super::ServerContextSlot;
     pub(crate) use crate::storage::runtime_sources;
+    #[cfg(test)]
+    pub(crate) use crate::storage::runtime_sources::{AppContext, IamInterface, KmsInterface};
 }
 
 pub(crate) mod heal_control_startup_consumer {

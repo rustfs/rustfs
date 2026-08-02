@@ -37,6 +37,8 @@ pub(crate) use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
 #[cfg(test)]
+pub(crate) use crate::bucket::bucket_target_sys::{ArnTarget, BucketTargetSys as TargetRegistry};
+#[cfg(test)]
 pub(crate) use crate::bucket::target::BucketTarget;
 pub(crate) use crate::bucket::target::BucketTargets;
 
