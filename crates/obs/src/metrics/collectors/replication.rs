@@ -82,8 +82,6 @@ pub fn collect_replication_metrics(stats: &ReplicationStats) -> Vec<PrometheusMe
             .with_label_owned(SERVER_LABEL, stats.server.clone()),
         PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_COUNT_BY_SERVER_MD, stats.average_queued_count as f64)
             .with_label_owned(SERVER_LABEL, stats.server.clone()),
-        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_DATA_TRANSFER_RATE_BY_SERVER_MD, stats.average_data_transfer_rate)
-            .with_label_owned(SERVER_LABEL, stats.server.clone()),
         PrometheusMetric::from_descriptor(&REPLICATION_CURRENT_ACTIVE_WORKERS_BY_SERVER_MD, stats.active_workers as f64)
             .with_label_owned(SERVER_LABEL, stats.server.clone()),
         PrometheusMetric::from_descriptor(&REPLICATION_CURRENT_DATA_TRANSFER_RATE_BY_SERVER_MD, stats.current_data_transfer_rate)
@@ -103,8 +101,6 @@ pub fn collect_replication_metrics(stats: &ReplicationStats) -> Vec<PrometheusMe
         PrometheusMetric::from_descriptor(&REPLICATION_MAX_QUEUED_BYTES_BY_SERVER_MD, stats.max_queued_bytes as f64)
             .with_label_owned(SERVER_LABEL, stats.server.clone()),
         PrometheusMetric::from_descriptor(&REPLICATION_MAX_QUEUED_COUNT_BY_SERVER_MD, stats.max_queued_count as f64)
-            .with_label_owned(SERVER_LABEL, stats.server.clone()),
-        PrometheusMetric::from_descriptor(&REPLICATION_MAX_DATA_TRANSFER_RATE_BY_SERVER_MD, stats.max_data_transfer_rate)
             .with_label_owned(SERVER_LABEL, stats.server.clone()),
         PrometheusMetric::from_descriptor(&REPLICATION_RECENT_BACKLOG_COUNT_BY_SERVER_MD, stats.recent_backlog_count as f64)
             .with_label_owned(SERVER_LABEL, stats.server.clone()),
@@ -140,7 +136,7 @@ mod tests {
         let metrics = collect_replication_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 26);
+        assert_eq!(metrics.len(), 24);
 
         // Verify active workers
         let active_name = REPLICATION_CURRENT_ACTIVE_WORKERS_MD.get_full_metric_name();
@@ -161,6 +157,16 @@ mod tests {
                 .map(|(_, value)| value.as_ref()),
             Some("node-a:9000")
         );
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.name != REPLICATION_AVERAGE_DATA_TRANSFER_RATE_BY_SERVER_MD.get_full_metric_name())
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.name != REPLICATION_MAX_DATA_TRANSFER_RATE_BY_SERVER_MD.get_full_metric_name())
+        );
     }
 
     #[test]
@@ -168,7 +174,7 @@ mod tests {
         let stats = ReplicationStats::default();
         let metrics = collect_replication_metrics(&stats);
 
-        assert_eq!(metrics.len(), 26);
+        assert_eq!(metrics.len(), 24);
         for metric in metrics.iter().filter(|metric| !metric.name.ends_with("_by_server")) {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());

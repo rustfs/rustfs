@@ -60,6 +60,10 @@ pub struct IlmActionTaskStats {
     pub value: u64,
 }
 
+fn is_live_action_task_state(state: &str) -> bool {
+    matches!(state, "pending" | "active" | "compensation_running")
+}
+
 /// Collects ILM metrics from the given stats.
 ///
 /// Uses the metric descriptors from `metrics_type::ilm` module.
@@ -89,12 +93,18 @@ pub fn collect_ilm_metrics(stats: &IlmStats) -> Vec<PrometheusMetric> {
         PrometheusMetric::from_descriptor(&ILM_VERSIONS_SCANNED_MD, stats.versions_scanned as f64),
     ];
 
-    metrics.extend(stats.action_tasks.iter().map(|task| {
-        PrometheusMetric::from_descriptor(&ILM_ACTION_TASKS_MD, task.value as f64)
-            .with_label_owned(SERVER_LABEL, stats.server.clone())
-            .with_label_owned(ACTION_LABEL, task.action.clone())
-            .with_label_owned(STATE_LABEL, task.state.clone())
-    }));
+    metrics.extend(
+        stats
+            .action_tasks
+            .iter()
+            .filter(|task| is_live_action_task_state(&task.state))
+            .map(|task| {
+                PrometheusMetric::from_descriptor(&ILM_ACTION_TASKS_MD, task.value as f64)
+                    .with_label_owned(SERVER_LABEL, stats.server.clone())
+                    .with_label_owned(ACTION_LABEL, task.action.clone())
+                    .with_label_owned(STATE_LABEL, task.state.clone())
+            }),
+    );
 
     metrics
 }
@@ -127,6 +137,11 @@ mod tests {
                     state: "queue_send_timeout".to_string(),
                     value: 3,
                 },
+                IlmActionTaskStats {
+                    action: "transition".to_string(),
+                    state: "active".to_string(),
+                    value: 5,
+                },
             ],
         };
 
@@ -152,7 +167,18 @@ mod tests {
                     .iter()
                     .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "queue_send_timeout")
         });
-        assert_eq!(transition_timeout.map(|m| m.value), Some(3.0));
+        assert!(transition_timeout.is_none());
+
+        let transition_active = metrics.iter().find(|m| {
+            m.name == ILM_ACTION_TASKS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "active")
+        });
+        assert_eq!(transition_active.map(|m| m.value), Some(5.0));
     }
 
     #[test]

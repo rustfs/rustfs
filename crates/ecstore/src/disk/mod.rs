@@ -606,6 +606,13 @@ impl Disk {
         }
     }
 
+    pub fn metrics_snapshot(&self) -> Option<DiskMetrics> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.metrics_snapshot()),
+            Disk::Remote(_) => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn health_check_enabled_for_test(&self) -> bool {
         match self {

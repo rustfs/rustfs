@@ -4404,12 +4404,14 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                         let mut disk_info = rustfs_madmin::Disk {
                             state: err.to_string(),
                             endpoint: eps[i].to_string(),
+                            drive_path: eps[i].get_file_path(),
                             local: eps[i].is_local,
                             pool_index: eps[i].pool_idx,
                             set_index: eps[i].set_idx,
                             disk_index: eps[i].disk_idx,
                             runtime_state: Some(runtime_state.as_str().to_string()),
                             offline_duration_seconds,
+                            metrics: disk.metrics_snapshot(),
                             ..Default::default()
                         };
                         if let Some((total, used, free, _)) = capacity_snapshot {
@@ -4428,16 +4430,15 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     }
                 }
             } else {
-                ret.push(build_runtime_snapshot_disk(
-                    &eps[i],
-                    runtime_state,
-                    offline_duration_seconds,
-                    capacity_snapshot,
-                ));
+                let mut disk_info =
+                    build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds, capacity_snapshot);
+                disk_info.metrics = disk.metrics_snapshot();
+                ret.push(disk_info);
             }
         } else {
             ret.push(rustfs_madmin::Disk {
                 endpoint: eps[i].to_string(),
+                drive_path: eps[i].get_file_path(),
                 local: eps[i].is_local,
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
@@ -4463,6 +4464,7 @@ fn build_runtime_snapshot_disk(
 ) -> rustfs_madmin::Disk {
     let mut disk = rustfs_madmin::Disk {
         endpoint: endpoint.to_string(),
+        drive_path: endpoint.get_file_path(),
         local: endpoint.is_local,
         pool_index: endpoint.pool_idx,
         set_index: endpoint.set_idx,
@@ -7743,8 +7745,15 @@ mod tests {
 
         assert_eq!(info[2].state, "offline");
         assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));
-        assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
-        assert!(info[2].metrics.is_none(), "offline runtime fallback should not invent disk metrics");
+        assert_eq!(
+            info[2].drive_path,
+            endpoints[2].get_file_path(),
+            "offline disk should keep stable endpoint path"
+        );
+        assert!(
+            info[2].metrics.is_some(),
+            "offline runtime fallback should preserve disk metrics snapshot"
+        );
     }
 
     #[tokio::test]

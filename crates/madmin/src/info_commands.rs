@@ -63,12 +63,19 @@ impl ItemState {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskMetrics {
+    #[serde(rename = "lastMinute", alias = "last_minute")]
     pub last_minute: HashMap<String, TimedAction>,
+    #[serde(rename = "apiCalls", alias = "api_calls")]
     pub api_calls: HashMap<String, u64>,
+    #[serde(rename = "totalWaiting", alias = "total_waiting")]
     pub total_waiting: u32,
+    #[serde(rename = "totalErrsAvailability", alias = "total_errors_availability")]
     pub total_errors_availability: u64,
+    #[serde(rename = "totalErrsTimeout", alias = "total_errors_timeout")]
     pub total_errors_timeout: u64,
+    #[serde(rename = "totalWrites", alias = "total_writes")]
     pub total_writes: u64,
+    #[serde(rename = "totalDeletes", alias = "total_deletes")]
     pub total_deletes: u64,
 }
 
@@ -493,6 +500,30 @@ mod tests {
         assert_eq!(metrics.total_waiting, 5);
         assert_eq!(metrics.total_writes, 1000);
         assert_eq!(metrics.total_deletes, 50);
+    }
+
+    #[test]
+    fn test_disk_metrics_json_uses_admin_contract_fields() {
+        let metrics = DiskMetrics {
+            total_waiting: 5,
+            total_errors_availability: 2,
+            total_errors_timeout: 1,
+            total_writes: 1000,
+            total_deletes: 50,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(metrics).expect("disk metrics should serialize");
+
+        assert!(json.get("lastMinute").is_some());
+        assert!(json.get("apiCalls").is_some());
+        assert_eq!(json["totalWaiting"], serde_json::json!(5));
+        assert_eq!(json["totalErrsAvailability"], serde_json::json!(2));
+        assert_eq!(json["totalErrsTimeout"], serde_json::json!(1));
+        assert_eq!(json["totalWrites"], serde_json::json!(1000));
+        assert_eq!(json["totalDeletes"], serde_json::json!(50));
+        assert!(json.get("last_minute").is_none());
+        assert!(json.get("total_errors_timeout").is_none());
     }
 
     #[test]

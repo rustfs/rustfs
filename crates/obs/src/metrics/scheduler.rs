@@ -36,6 +36,7 @@ use crate::metrics::collectors::{
     ProcessCpuStats,
     ProcessDiskStats,
     ProcessMemoryStats,
+    ScannerStats,
     collect_audit_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_backlog_metrics,
@@ -91,10 +92,11 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD,
     BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_LATENCY_MS_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD,
     BUCKET_REPL_MRF_FLUSH_FAILURES_MD, BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD, BUCKET_REPL_MRF_MISSED_COUNT_MD,
-    BUCKET_REPL_MRF_PENDING_BYTES_MD, BUCKET_REPL_MRF_PENDING_COUNT_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD,
-    BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD,
-    BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD, BUCKET_REPL_TARGET_SENT_COUNT_MD,
-    BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
+    BUCKET_REPL_MRF_PENDING_BYTES_MD, BUCKET_REPL_MRF_PENDING_COUNT_MD, BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
+    BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD,
+    BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
+    OPERATION_L, RANGE_L, RESULT_L, TARGET_ARN_L,
 };
 use crate::metrics::schema::cluster::{CLUSTER_BUCKETS_TOTAL_MD, CLUSTER_OBJECTS_TOTAL_MD};
 use crate::metrics::schema::cluster_usage::{
@@ -111,6 +113,10 @@ use crate::metrics::schema::notification_target::{
     NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
     NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER as NOTIFICATION_SERVER_LABEL,
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
+};
+use crate::metrics::schema::scanner::{
+    BUCKET_LABEL as SCANNER_BUCKET_LABEL, CYCLE_SCOPE_LABEL as SCANNER_CYCLE_SCOPE_LABEL, DRIVE_LABEL as SCANNER_DRIVE_LABEL,
+    RESULT_LABEL as SCANNER_RESULT_LABEL, SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
 };
 use crate::metrics::schema::system_drive::{
     DISK_ID_LABEL, DRIVE_INDEX_LABEL, DRIVE_INFO_MD, DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL,
@@ -288,6 +294,7 @@ type AuditTargetKey = (String, String); // (server, target_id)
 type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
 type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
 type DriveInfoKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, disk_id)
+type ScannerBucketDriveResultKey = (String, String, String, String); // (server, bucket, drive, result)
 
 fn drive_info_live_keys(stats: &[DriveDetailedStats]) -> HashSet<DriveInfoKey> {
     stats.iter().filter_map(drive_info_key).collect()
@@ -315,6 +322,25 @@ fn retire_drive_info_metric_series(key: &DriveInfoKey) -> usize {
         (DISK_ID_LABEL, Cow::Owned(key.5.clone())),
     ];
     retire_metric_series(&DRIVE_INFO_MD.get_full_metric_name(), &labels)
+}
+
+fn scanner_last_bucket_drive_result_live_keys(stats: &ScannerStats) -> HashSet<ScannerBucketDriveResultKey> {
+    stats
+        .last_cycle_bucket_drive_results
+        .iter()
+        .map(|result| (stats.server.clone(), result.bucket.clone(), result.drive.clone(), result.result.clone()))
+        .collect()
+}
+
+fn retire_scanner_last_bucket_drive_result_metric_series(key: &ScannerBucketDriveResultKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (SCANNER_CYCLE_SCOPE_LABEL, Cow::Borrowed("last")),
+        (SCANNER_BUCKET_LABEL, Cow::Owned(key.1.clone())),
+        (SCANNER_DRIVE_LABEL, Cow::Owned(key.2.clone())),
+        (SCANNER_RESULT_LABEL, Cow::Owned(key.3.clone())),
+    ];
+    retire_metric_series(&SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD.get_full_metric_name(), &labels)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -701,6 +727,10 @@ fn repl_flow_live_keys(stats: &[BucketReplicationStats]) -> HashSet<ReplBwKey> {
                 .map(|target| (stat.bucket.clone(), target.target_arn.clone()))
         })
         .collect()
+}
+
+fn repl_proxy_bucket_live_keys(stats: &[BucketReplicationStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.bucket.clone()).collect()
 }
 
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
@@ -1383,6 +1413,22 @@ fn retire_repl_backlog_metric_series(bucket: &str) -> usize {
     .sum()
 }
 
+fn retire_bucket_replication_proxy_request_metric_series(bucket: &str) -> usize {
+    const PROXY_OPERATIONS: [&str; 6] = ["get", "head", "put", "put_tagging", "get_tagging", "delete_tagging"];
+    let mut retired = 0;
+    for operation in PROXY_OPERATIONS {
+        for result in ["success", "failure"] {
+            let labels = [
+                (BUCKET_L, Cow::Owned(bucket.to_string())),
+                (OPERATION_L, Cow::Borrowed(operation)),
+                (RESULT_L, Cow::Borrowed(result)),
+            ];
+            retired += retire_metric_series(&BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD.get_full_metric_name(), &labels);
+        }
+    }
+    retired
+}
+
 fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> usize {
     let labels = [
         (BUCKET_L, Cow::Owned(bucket.to_string())),
@@ -1734,6 +1780,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut prev_flow_live_keys: HashSet<ReplBwKey> = HashSet::new();
         let mut flow_zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
         let mut has_seen_valid_flow_snapshot = false;
+        let mut prev_proxy_bucket_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_proxy_bucket_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1764,6 +1812,17 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
 
                             let (bucket_replication, bucket_replication_backlog) = collect_bucket_replication_stats_bundle().await;
+                            let current_proxy_bucket_live_keys = repl_proxy_bucket_live_keys(&bucket_replication);
+                            let retire_proxy_buckets = if has_seen_proxy_bucket_snapshot {
+                                prev_proxy_bucket_live_keys
+                                    .difference(&current_proxy_bucket_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_proxy_bucket_live_keys = current_proxy_bucket_live_keys;
+                            has_seen_proxy_bucket_snapshot = true;
                             let durable_mrf_available = bucket_replication_backlog.iter().any(|stat| stat.durable_mrf_available);
                             let backlog_target_metrics_available =
                                 durable_mrf_available || monitor_available || !bucket_replication_backlog.is_empty();
@@ -1815,6 +1874,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             }
                             for (bucket, target_arn) in expire_series_zero_tombstones(&mut flow_zero_tombstones) {
                                 let _ = retire_repl_flow_metric_series(&bucket, &target_arn);
+                            }
+                            for bucket in retire_proxy_buckets {
+                                let _ = retire_bucket_replication_proxy_request_metric_series(&bucket);
                             }
                         },
                     ).await;
@@ -1966,6 +2028,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 2, 3));
+        let mut has_seen_scanner_snapshot = false;
+        let mut prev_scanner_last_bucket_drive_result_keys: HashSet<ScannerBucketDriveResultKey> = HashSet::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1980,12 +2044,25 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 metrics.extend(collect_ilm_metrics(&stats));
                             }
 
+                            let mut retire_scanner_last_bucket_drive_result_keys = Vec::new();
                             if let Some(stats) = collect_scanner_metric_stats().await {
+                                let current_keys = scanner_last_bucket_drive_result_live_keys(&stats);
+                                if has_seen_scanner_snapshot {
+                                    retire_scanner_last_bucket_drive_result_keys = prev_scanner_last_bucket_drive_result_keys
+                                        .difference(&current_keys)
+                                        .cloned()
+                                        .collect();
+                                }
+                                prev_scanner_last_bucket_drive_result_keys = current_keys;
+                                has_seen_scanner_snapshot = true;
                                 metrics.extend(collect_scanner_metrics(&stats));
                             }
 
                             if !metrics.is_empty() {
                                 report_metrics(&metrics);
+                            }
+                            for key in retire_scanner_last_bucket_drive_result_keys {
+                                let _ = retire_scanner_last_bucket_drive_result_metric_series(&key);
                             }
                         },
                     ).await;
@@ -2313,6 +2390,19 @@ mod tests {
         }
     }
 
+    fn scanner_stats_with_last_result(bucket: &str) -> ScannerStats {
+        ScannerStats {
+            server: "server-a".to_string(),
+            last_cycle_bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
+                bucket: bucket.to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn drive_info_live_keys_detect_disk_identity_replacement() {
         let previous = drive_info_live_keys(&[drive_info_stat("disk-old")]);
@@ -2335,6 +2425,32 @@ mod tests {
             "2".to_string(),
             "disk-old".to_string(),
         )));
+    }
+
+    #[test]
+    fn scanner_last_bucket_drive_result_keys_detect_superseded_cycle_results() {
+        let previous = scanner_last_bucket_drive_result_live_keys(&scanner_stats_with_last_result("photos"));
+        let current = scanner_last_bucket_drive_result_live_keys(&scanner_stats_with_last_result("logs"));
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&("server-a".to_string(), "photos".to_string(), "/data1".to_string(), "success".to_string(),)));
+        assert!(current.contains(&("server-a".to_string(), "logs".to_string(), "/data1".to_string(), "success".to_string(),)));
+    }
+
+    #[test]
+    fn replication_proxy_bucket_keys_detect_removed_buckets() {
+        let previous = repl_proxy_bucket_live_keys(&[BucketReplicationStats {
+            bucket: "photos".to_string(),
+            ..Default::default()
+        }]);
+        let current = repl_proxy_bucket_live_keys(&[BucketReplicationStats {
+            bucket: "logs".to_string(),
+            ..Default::default()
+        }]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["photos"]));
+        assert_eq!(current, bucket_keys(&["logs"]));
     }
 
     #[test]

@@ -1157,6 +1157,10 @@ impl LocalDiskWrapper {
         *self.disk_id.write().await = id;
     }
 
+    pub(crate) fn metrics_snapshot(&self) -> DiskMetrics {
+        self.health.metrics_snapshot()
+    }
+
     /// Get the current disk ID
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
