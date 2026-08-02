@@ -685,15 +685,50 @@ pub(crate) mod bucket {
             status: ReplicationStatusType,
             opts: crate::storage::storage_api::StorageObjectOptions,
         ) -> ReplicateDecision {
-            #[cfg(test)]
-            MUST_REPLICATE_OBJECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mopts = ReplicationObjectBridge::must_replicate_options(
+            must_replicate_with_type(
+                bucket,
+                object,
                 user_defined,
                 user_tags,
                 status,
-                replication_contracts::ReplicationType::Object,
                 opts,
-            );
+                replication_contracts::ReplicationType::Object,
+            )
+            .await
+        }
+
+        pub(crate) async fn must_replicate_metadata(
+            bucket: &str,
+            object: &str,
+            user_defined: &HashMap<String, String>,
+            user_tags: String,
+            status: ReplicationStatusType,
+            opts: crate::storage::storage_api::StorageObjectOptions,
+        ) -> ReplicateDecision {
+            must_replicate_with_type(
+                bucket,
+                object,
+                user_defined,
+                user_tags,
+                status,
+                opts,
+                replication_contracts::ReplicationType::Metadata,
+            )
+            .await
+        }
+
+        async fn must_replicate_with_type(
+            bucket: &str,
+            object: &str,
+            user_defined: &HashMap<String, String>,
+            user_tags: String,
+            status: ReplicationStatusType,
+            opts: crate::storage::storage_api::StorageObjectOptions,
+            op_type: replication_contracts::ReplicationType,
+        ) -> ReplicateDecision {
+            #[cfg(test)]
+            MUST_REPLICATE_OBJECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mopts = ReplicationObjectBridge::must_replicate_options(user_defined, user_tags, status, op_type, opts);
             ReplicationObjectBridge::must_replicate(bucket, object, mopts).await
         }
 
@@ -703,6 +738,14 @@ pub(crate) mod bucket {
             dsc: ReplicateDecision,
         ) {
             ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Object).await;
+        }
+
+        pub(crate) async fn schedule_metadata_replication(
+            oi: crate::storage::storage_api::StorageObjectInfo,
+            store: Arc<crate::storage::storage_api::ECStore>,
+            dsc: ReplicateDecision,
+        ) {
+            ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Metadata).await;
         }
 
         pub(crate) async fn schedule_replication_delete(

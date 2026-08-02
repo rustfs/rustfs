@@ -22,7 +22,8 @@ use super::replication_filemeta_boundary::{
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
-use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
+use super::replication_object_config::{ReplicationConfig, check_replicate_delete, must_replicate};
+use super::replication_object_decision_boundary::MustReplicateOptions;
 use super::replication_queue_boundary::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
     ReplicationBatchAdmission, ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes,
@@ -1061,6 +1062,28 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
                         queued_count += 1;
                     }
+                    MrfOpKind::Metadata => {
+                        let opts = ObjectOptions {
+                            version_id: entry.version_id.map(|u| u.to_string()),
+                            ..Default::default()
+                        };
+                        let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
+                            Ok(oi) => oi,
+                            Err(e) => {
+                                debug!(
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                    bucket = %entry.bucket,
+                                    object = %entry.object,
+                                    error = %e,
+                                    "MRF metadata recovery: object not found, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        queue_replication_metadata(&entry.bucket, oi, entry.retry_count as u32).await;
+                        queued_count += 1;
+                    }
                 }
             }
 
@@ -1993,6 +2016,26 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
 
     let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
     queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count).await;
+}
+
+pub async fn queue_replication_metadata(bucket: &str, oi: ObjectInfo, retry_count: u32) {
+    let dsc = must_replicate(
+        bucket,
+        &oi.name,
+        MustReplicateOptions::new(&oi.user_defined, (*oi.user_tags).clone(), ReplicationType::Metadata, false)
+            .with_replication_status(oi.replication_status.clone()),
+    )
+    .await;
+
+    if !dsc.replicate_any() {
+        return;
+    }
+
+    let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata);
+    roi.retry_count = retry_count;
+    if let Some(pool) = runtime_sources::replication_pool() {
+        let _ = pool.queue_replica_task(roi).await;
+    }
 }
 
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
