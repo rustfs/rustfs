@@ -27,6 +27,7 @@ use crate::metrics::collectors::{
     HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats,
     ResourceStats, ScannerStats,
 };
+use crate::metrics::collectors::ilm::IlmActionTaskStats;
 use crate::metrics::collectors::scanner::ScannerSourceWorkStats;
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -1171,6 +1172,51 @@ async fn collect_cluster_usage_metric_stats_from_data_usage(
     ))
 }
 
+fn ilm_action_task_stats(ilm: &ObsIlmRuntimeSnapshot) -> Vec<IlmActionTaskStats> {
+    vec![
+        IlmActionTaskStats {
+            action: "expiry".to_string(),
+            state: "pending".to_string(),
+            value: ilm.expiry_pending_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "active".to_string(),
+            value: ilm.transition_active_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "pending".to_string(),
+            value: ilm.transition_pending_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "missed_immediate".to_string(),
+            value: ilm.transition_missed_immediate_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "queue_full".to_string(),
+            value: ilm.transition_queue_full_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "queue_send_timeout".to_string(),
+            value: ilm.transition_queue_send_timeout_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "compensation_scheduled".to_string(),
+            value: ilm.transition_compensation_scheduled_tasks,
+        },
+        IlmActionTaskStats {
+            action: "transition".to_string(),
+            state: "compensation_running".to_string(),
+            value: ilm.transition_compensation_running_tasks,
+        },
+    ]
+}
+
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     let ilm = obs_ilm_runtime_snapshot().await;
@@ -1178,6 +1224,7 @@ pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     let versions_scanned = scanner_lifecycle_checked_versions(&metrics);
 
     Some(IlmStats {
+        server: current_local_node_identity(),
         expiry_pending_tasks: ilm.expiry_pending_tasks,
         transition_active_tasks: ilm.transition_active_tasks,
         transition_pending_tasks: ilm.transition_pending_tasks,
@@ -1187,6 +1234,7 @@ pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
         transition_compensation_scheduled_tasks: ilm.transition_compensation_scheduled_tasks,
         transition_compensation_running_tasks: ilm.transition_compensation_running_tasks,
         versions_scanned,
+        action_tasks: ilm_action_task_stats(&ilm),
     })
 }
 
@@ -1716,6 +1764,31 @@ mod tests {
         let life_time_ops = HashMap::new();
 
         assert_eq!(scanner_bucket_scans_started(&life_time_ops, 5), 5);
+    }
+
+    #[test]
+    fn ilm_action_task_stats_maps_runtime_states() {
+        let stats = ilm_action_task_stats(&ObsIlmRuntimeSnapshot {
+            expiry_pending_tasks: 1,
+            transition_active_tasks: 2,
+            transition_pending_tasks: 3,
+            transition_missed_immediate_tasks: 4,
+            transition_queue_full_tasks: 5,
+            transition_queue_send_timeout_tasks: 6,
+            transition_compensation_scheduled_tasks: 7,
+            transition_compensation_running_tasks: 8,
+        });
+
+        assert_eq!(stats.len(), 8);
+        assert_eq!(stats[0].action, "expiry");
+        assert_eq!(stats[0].state, "pending");
+        assert_eq!(stats[0].value, 1);
+        assert!(stats.iter().any(|task| {
+            task.action == "transition" && task.state == "queue_send_timeout" && task.value == 6
+        }));
+        assert!(stats.iter().any(|task| {
+            task.action == "transition" && task.state == "compensation_running" && task.value == 8
+        }));
     }
 
     #[test]
