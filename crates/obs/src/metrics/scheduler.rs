@@ -1325,26 +1325,10 @@ fn collect_repl_flow_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey,
         return Vec::new();
     }
 
-    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 9);
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len());
     for (bucket, target_arn) in zero_tombstones.keys() {
         let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
         let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
-        for descriptor in [
-            &BUCKET_REPL_TARGET_SENT_BYTES_MD,
-            &BUCKET_REPL_TARGET_SENT_COUNT_MD,
-            &BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD,
-            &BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
-            &BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD,
-            &BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD,
-            &BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD,
-            &BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
-        ] {
-            zero_metrics.push(
-                PrometheusMetric::from_descriptor(descriptor, 0.0)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(TARGET_ARN_L, target_arn_label.clone()),
-            );
-        }
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, 0.0)
                 .with_label(BUCKET_L, bucket_label)
@@ -2615,22 +2599,14 @@ mod tests {
     }
 
     #[test]
-    fn repl_flow_tombstones_zero_removed_target_series() {
+    fn repl_flow_tombstones_zero_latency_and_retire_target_counters() {
         let zero_tombstones = HashMap::from([(repl_bw_key("photos", "arn:rustfs:replication:target-a"), 2)]);
 
         let metrics = collect_repl_flow_zero_tombstone_metrics(&zero_tombstones);
 
-        assert_eq!(metrics.len(), 9);
+        assert_eq!(metrics.len(), 1);
         assert!(metrics.iter().all(|metric| metric.value == 0.0));
         let names = metrics.iter().map(|metric| metric.name.to_string()).collect::<HashSet<_>>();
-        assert!(names.contains(&BUCKET_REPL_TARGET_SENT_BYTES_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_SENT_COUNT_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD.get_full_metric_name()));
-        assert!(names.contains(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD.get_full_metric_name()));
         assert!(names.contains(&BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name()));
         for metric in metrics {
             let labels = metric

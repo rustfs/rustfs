@@ -365,10 +365,12 @@ impl Default for DiskOperationMetrics {
 }
 
 impl DiskOperationMetrics {
-    fn record(&mut self, now_sec: u64, elapsed: Duration) {
-        let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    fn record_call(&mut self) {
         self.lifetime_calls = self.lifetime_calls.saturating_add(1);
+    }
 
+    fn record_latency(&mut self, now_sec: u64, elapsed: Duration) {
+        let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let slot = &mut self.last_minute[(now_sec % 60) as usize];
         if slot.unix_sec != now_sec {
             slot.unix_sec = now_sec;
@@ -376,6 +378,11 @@ impl DiskOperationMetrics {
         }
         slot.action.count = slot.action.count.saturating_add(1);
         slot.action.acc_time = slot.action.acc_time.saturating_add(elapsed_nanos);
+    }
+
+    fn record(&mut self, now_sec: u64, elapsed: Duration) {
+        self.record_call();
+        self.record_latency(now_sec, elapsed);
     }
 
     fn last_minute_snapshot(&self, now_sec: u64) -> TimedAction {
@@ -438,10 +445,15 @@ impl DiskHealthTracker {
             .store(current_unix_secs() as i64, Ordering::Release);
     }
 
-    fn record_operation_metrics(&self, op: &'static str, elapsed: Duration) {
+    fn record_operation_call(&self, op: &'static str) {
+        let mut metrics = self.operation_metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics.entry(op).or_default().record_call();
+    }
+
+    fn record_operation_latency(&self, op: &'static str, elapsed: Duration) {
         let now_sec = current_unix_secs();
         let mut metrics = self.operation_metrics.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        metrics.entry(op).or_default().record(now_sec, elapsed);
+        metrics.entry(op).or_default().record_latency(now_sec, elapsed);
     }
 
     fn record_availability_error(&self) {
@@ -1224,11 +1236,12 @@ impl LocalDiskWrapper {
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         let _waiting_guard = self.health.waiting_guard();
+        self.health.record_operation_call(op);
         let started = Instant::now();
 
         if timeout_duration == Duration::ZERO {
             let result = operation().await;
-            self.health.record_operation_metrics(op, started.elapsed());
+            self.health.record_operation_latency(op, started.elapsed());
             if result.is_ok() {
                 self.health.record_operation_success(&self.endpoint(), "operation_success");
             }
@@ -1239,7 +1252,7 @@ impl LocalDiskWrapper {
 
         match result {
             Ok(operation_result) => {
-                self.health.record_operation_metrics(op, started.elapsed());
+                self.health.record_operation_latency(op, started.elapsed());
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.record_operation_success(&self.endpoint(), "operation_success");
@@ -1247,7 +1260,7 @@ impl LocalDiskWrapper {
                 operation_result
             }
             Err(_) => {
-                self.health.record_operation_metrics(op, started.elapsed());
+                self.health.record_operation_latency(op, started.elapsed());
                 self.health.record_timeout_error();
                 // Timeout occurred, mark disk as potentially faulty.
                 if timeout_health_action == TimeoutHealthAction::MarkFailure
@@ -1353,12 +1366,14 @@ impl DiskAPI for LocalDiskWrapper {
                 ..Default::default()
             };
             if self.health.is_faulty() {
+                self.health.record_availability_error();
                 return Err(DiskError::FaultyDisk);
             }
             return Ok(info);
         }
 
         if self.health.is_faulty() {
+            self.health.record_availability_error();
             return Err(DiskError::FaultyDisk);
         }
 
@@ -1479,11 +1494,12 @@ impl DiskAPI for LocalDiskWrapper {
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         self.health.increment_waiting();
+        self.health.record_operation_call("delete_versions");
         let started = Instant::now();
 
         // Execute the operation
         let result = self.disk.delete_versions(volume, versions, opts).await;
-        self.health.record_operation_metrics("delete_versions", started.elapsed());
+        self.health.record_operation_latency("delete_versions", started.elapsed());
 
         self.health.decrement_waiting();
         let has_err = result.iter().any(|e| e.is_some());
@@ -1807,7 +1823,8 @@ mod tests {
     #[test]
     fn disk_health_metrics_snapshot_exports_waiting_errors_and_operation_windows() {
         let health = DiskHealthTracker::new();
-        health.record_operation_metrics("read_all", Duration::from_micros(13));
+        health.record_operation_call("read_all");
+        health.record_operation_latency("read_all", Duration::from_micros(13));
         health.record_availability_error();
         health.record_timeout_error();
         {
@@ -1847,7 +1864,8 @@ mod tests {
         }));
 
         assert!(panic_result.is_err());
-        health.record_operation_metrics("read_all", Duration::from_micros(13));
+        health.record_operation_call("read_all");
+        health.record_operation_latency("read_all", Duration::from_micros(13));
         let snapshot = health.metrics_snapshot();
 
         assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
@@ -1878,6 +1896,7 @@ mod tests {
         let _ = task.await;
 
         assert_eq!(wrapper.health.waiting_count(), 0);
+        assert_eq!(wrapper.health.metrics_snapshot().api_calls.get("test_pending"), Some(&1));
     }
 
     #[tokio::test]
@@ -1895,6 +1914,28 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result.first(), Some(Some(DiskError::FaultyDisk))));
+        assert_eq!(wrapper.health.metrics_snapshot().total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn disk_info_counts_faulty_noop_metrics_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let err = wrapper
+            .disk_info(&DiskInfoOptions {
+                noop: true,
+                metrics: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("faulty disk_info should be rejected");
+
+        assert_eq!(err, DiskError::FaultyDisk);
         assert_eq!(wrapper.health.metrics_snapshot().total_errors_availability, 1);
     }
 
