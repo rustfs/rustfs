@@ -136,5 +136,14 @@ mod tests {
             BackupError::incomplete_bundle("manifest has no completeness marker").to_string(),
             "backup bundle is incomplete (manifest has no completeness marker); incomplete bundles must never be restored"
         );
+
+        let unsupported_record = BackupError::UnsupportedRecordVersion {
+            key_id: "alpha".to_string(),
+            version: "post-quantum-v2".to_string(),
+        };
+        assert_eq!(
+            unsupported_record.to_string(),
+            "bundled key record 'alpha' declares unsupported at-rest protection \"post-quantum-v2\"; this build cannot restore it"
+        );
     }
 }
