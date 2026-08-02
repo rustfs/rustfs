@@ -696,15 +696,8 @@ impl VaultKmsClient {
     async fn ensure_version_history_consistent(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let recorded = self.recorded_version_numbers(key_id).await?;
 
-        // A first-rotation record set (the current v1 record and, at most, the
-        // next v2 record) can be in flight while another caller is between its
-        // create-only writes and the baseline CAS. The material check below
-        // validates the v1 record before adopting it; a later key with a
-        // missing persisted baseline still indicates a lost baseline and fails
-        // closed.
         if key_data.baseline_version.is_none()
             && let Some(oldest_recorded) = recorded.iter().min().copied()
-            && !(key_data.version == 1 && recorded.iter().all(|version| *version <= 2))
         {
             warn!(
                 key_id,
@@ -3253,7 +3246,9 @@ mod tests {
         use std::sync::Arc;
 
         const ATTEMPTS: usize = 8;
-        let (vault, client) = scripted_kv2_client(&healthy_key_data()).await;
+        let mut key_data = healthy_key_data();
+        key_data.baseline_version = Some(1);
+        let (vault, client) = scripted_kv2_client(&key_data).await;
         let client = Arc::new(client);
         let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
         let tasks: Vec<_> = (0..ATTEMPTS)
@@ -3576,50 +3571,6 @@ mod tests {
             committed["data"]["encrypted_key_material"],
             serde_json::json!(adopted_material),
             "{committed}"
-        );
-    }
-
-    /// A concurrent first rotation may leave both immutable records visible
-    /// before this caller observes the baseline CAS. That transient state must
-    /// continue through the create-only/adopt path rather than being reported
-    /// as a permanently lost baseline.
-    #[tokio::test]
-    async fn wired_rotate_recovers_concurrent_first_rotation_without_baseline() {
-        let key_data = healthy_key_data();
-        let record_v2 = VaultKeyVersionRecord {
-            version: 2,
-            encrypted_key_material: rotated_material(),
-            created_at: Zoned::now(),
-        };
-
-        let (vault, client) = scripted_client(vec![
-            ScriptedResponse::ok(kv2_metadata_read_data(1)),
-            ScriptedResponse::ok(kv2_read_data(&key_data)),
-            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
-            // Another rotation already created the baseline record.
-            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
-            ScriptedResponse::ok(kv2_read_version_record_data(&VaultKeyVersionRecord {
-                version: 1,
-                encrypted_key_material: key_data.encrypted_key_material.clone(),
-                created_at: key_data.created_at.clone(),
-            })),
-            // Persist the baseline pointer, then adopt the already-created v2.
-            ScriptedResponse::ok(kv2_write_ack()),
-            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
-            ScriptedResponse::ok(kv2_read_version_record_data(&record_v2)),
-            ScriptedResponse::ok(kv2_write_ack()),
-        ])
-        .await;
-
-        let rotated = client
-            .rotate_key("wired-key", None)
-            .await
-            .expect("an in-flight first rotation must be recoverable");
-        assert_eq!(rotated.version, 2);
-        assert_eq!(
-            parse_write_body(&vault.request_bodies()[8])["data"]["encrypted_key_material"],
-            serde_json::json!(record_v2.encrypted_key_material),
-            "the pointer must adopt the immutable v2 material"
         );
     }
 

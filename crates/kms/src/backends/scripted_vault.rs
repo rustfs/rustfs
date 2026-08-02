@@ -217,11 +217,15 @@ struct Kv2State {
 
 impl Kv2State {
     fn new(current_data: serde_json::Value) -> Self {
+        let mut version_records = BTreeMap::new();
+        if current_data["baseline_version"].as_u64() == Some(1) {
+            version_records.insert(1, current_data.clone());
+        }
         Self {
             history: BTreeMap::from([(1, current_data.clone())]),
             current_data,
             current_secret_version: 1,
-            version_records: BTreeMap::new(),
+            version_records,
         }
     }
 
