@@ -21,7 +21,7 @@ use crate::config::{
     redacted_secret, redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
-use crate::types::{KeyMetadata, KeyUsage};
+use crate::types::KeyMetadata;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -1300,49 +1300,6 @@ mod tests {
 // Key Management API Types
 // ========================================
 
-/// Request to create a new key with optional custom name
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateKeyRequest {
-    /// Custom key name (optional, will auto-generate UUID if not provided)
-    pub key_name: Option<String>,
-    /// Key usage type
-    pub key_usage: KeyUsage,
-    /// Key description
-    pub description: Option<String>,
-    /// Key policy JSON string
-    pub policy: Option<String>,
-    /// Tags for the key
-    pub tags: HashMap<String, String>,
-    /// Origin of the key
-    pub origin: Option<String>,
-}
-
-impl Default for CreateKeyRequest {
-    fn default() -> Self {
-        Self {
-            key_name: None,
-            key_usage: KeyUsage::EncryptDecrypt,
-            description: None,
-            policy: None,
-            tags: HashMap::new(),
-            origin: None,
-        }
-    }
-}
-
-/// Response from create key operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateKeyResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Created key ID (either custom name or auto-generated UUID)
-    pub key_id: String,
-    /// Key metadata
-    pub key_metadata: KeyMetadata,
-}
-
 /// JSON shape returned by the admin delete-key endpoint.
 ///
 /// The delete *request* shape lives in [`crate::types::DeleteKeyRequest`] —
@@ -1360,15 +1317,6 @@ pub struct DeleteKeyResponse {
     pub deletion_date: Option<String>,
 }
 
-/// Request to list all keys
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListKeysRequest {
-    /// Maximum number of keys to return (1-1000)
-    pub limit: Option<u32>,
-    /// Pagination marker
-    pub marker: Option<String>,
-}
-
 /// Response from list keys operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListKeysResponse {
@@ -1384,13 +1332,6 @@ pub struct ListKeysResponse {
     pub next_marker: Option<String>,
 }
 
-/// Request to describe a key
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DescribeKeyRequest {
-    /// Key ID to describe
-    pub key_id: String,
-}
-
 /// Response from describe key operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeKeyResponse {
@@ -1400,13 +1341,6 @@ pub struct DescribeKeyResponse {
     pub message: String,
     /// Key metadata
     pub key_metadata: Option<KeyMetadata>,
-}
-
-/// Request to cancel key deletion
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelKeyDeletionRequest {
-    /// Key ID to cancel deletion for
-    pub key_id: String,
 }
 
 /// Response from cancel key deletion operation
