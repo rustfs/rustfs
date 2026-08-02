@@ -2008,6 +2008,42 @@ fn claim_value_type_for_log(value: Option<&serde_json::Value>) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
+    let configs = configs.into_iter().map(|config| (config.id.clone(), config)).collect();
+    OidcSys {
+        configs,
+        provider_states: RwLock::new(HashMap::new()),
+        state_store: OidcStateStore::new(),
+        http_client: ReqwestHttpClient::new().expect("failed to initialize OIDC HTTP clients"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_config(id: &str) -> OidcProviderConfig {
+    OidcProviderConfig {
+        id: id.to_string(),
+        enabled: true,
+        config_url: format!("https://example.com/{id}/.well-known/openid-configuration"),
+        issuer: None,
+        client_id: "client-id".to_string(),
+        client_secret: None,
+        scopes: vec!["openid".to_string()],
+        other_audiences: vec![],
+        redirect_uri: None,
+        redirect_uri_dynamic: true,
+        claim_name: "groups".to_string(),
+        claim_prefix: String::new(),
+        role_policy: String::new(),
+        display_name: id.to_string(),
+        groups_claim: "groups".to_string(),
+        roles_claim: String::new(),
+        email_claim: "email".to_string(),
+        username_claim: "preferred_username".to_string(),
+        hide_from_ui: false,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2956,44 +2992,6 @@ mod tests {
             "unexpected error: {err}"
         );
         handle.join().expect("mock body server thread should exit");
-    }
-
-    /// Helper to create an OidcSys with configs only (no provider states needed).
-    fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
-        let mut config_map = HashMap::new();
-        for c in configs {
-            config_map.insert(c.id.clone(), c);
-        }
-        OidcSys {
-            configs: config_map,
-            provider_states: RwLock::new(HashMap::new()),
-            state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient::new().expect("failed to initialize OIDC HTTP clients"),
-        }
-    }
-
-    fn test_config(id: &str) -> OidcProviderConfig {
-        OidcProviderConfig {
-            id: id.to_string(),
-            enabled: true,
-            config_url: format!("https://example.com/{id}/.well-known/openid-configuration"),
-            issuer: None,
-            client_id: "client-id".to_string(),
-            client_secret: None,
-            scopes: vec!["openid".to_string()],
-            other_audiences: vec![],
-            redirect_uri: None,
-            redirect_uri_dynamic: true,
-            claim_name: "groups".to_string(),
-            claim_prefix: "".to_string(),
-            role_policy: "".to_string(),
-            display_name: id.to_string(),
-            groups_claim: "groups".to_string(),
-            roles_claim: String::new(),
-            email_claim: "email".to_string(),
-            username_claim: "preferred_username".to_string(),
-            hide_from_ui: false,
-        }
     }
 
     #[test]

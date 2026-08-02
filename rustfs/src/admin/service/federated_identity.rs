@@ -311,11 +311,17 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
 mod tests {
     use super::*;
     use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+    use hmac::{Hmac, KeyInit, Mac};
     use rustfs_iam::federation::{FederatedAuthorization, FederatedClaims};
     use rustfs_iam::store::{Store, UserType, object::IAM_CONFIG_PREFIX};
     use rustfs_kms::KmsServiceManager;
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+    use rustfs_policy::policy::{
+        Args,
+        action::{Action, S3Action},
+    };
     use serial_test::serial;
+    use sha2::Sha512;
     use std::sync::Arc;
 
     fn transaction() -> FederatedSessionTransaction {
@@ -327,7 +333,10 @@ mod tests {
                     email: "user@example.com".to_string(),
                     username: "user".to_string(),
                     groups: vec!["source-group".to_string()],
-                    raw: HashMap::from([("iss".to_string(), serde_json::json!("https://idp.example.test"))]),
+                    raw: HashMap::from([
+                        ("iss".to_string(), serde_json::json!("https://idp.example.test")),
+                        ("raw_poison".to_string(), serde_json::json!("must-not-leak")),
+                    ]),
                 },
                 policies: vec!["readwrite".to_string()],
                 groups: vec!["devs".to_string()],
@@ -339,74 +348,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn token_claims_preserve_existing_oidc_shape() {
-        let transaction = transaction();
-
-        let claims = build_oidc_token_claims(&transaction);
-        assert_eq!(claims.get("sub"), Some(&serde_json::json!("subject")));
-        assert_eq!(claims.get("iss"), Some(&serde_json::json!("rustfs-oidc")));
-        assert_eq!(claims.get("oidc_provider"), Some(&serde_json::json!("default")));
-        assert_eq!(claims.get("email"), Some(&serde_json::json!("user@example.com")));
-        assert_eq!(claims.get("preferred_username"), Some(&serde_json::json!("user")));
-        assert_eq!(claims.get("groups"), Some(&serde_json::json!(["devs"])));
-        assert_eq!(claims.get("roles"), Some(&serde_json::json!(["admin", "reader"])));
-    }
-
-    #[test]
-    fn issued_credentials_and_replication_item_use_minio_parent_shape() {
-        let transaction = transaction();
-        let secret = "federated-session-test-signing-secret";
-        let selected_policy_names = vec!["readonly".to_string()];
-
-        let credentials =
-            issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
-        assert_eq!(credentials.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
-        assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
-
-        let claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, secret)
-            .expect("issued session token should verify");
-        assert_eq!(claims.get("iss"), Some(&serde_json::json!("rustfs-oidc")));
-        assert_eq!(claims.get("oidc_provider"), Some(&serde_json::json!("default")));
-        assert_eq!(
-            claims.get("parent"),
-            Some(&serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"))
-        );
-        assert_eq!(
-            claims.get(OIDC_VIRTUAL_PARENT_CLAIM),
-            Some(&serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"))
-        );
-        assert_eq!(claims.get("policy"), Some(&serde_json::json!("readonly")));
-        assert_eq!(claims.get("groups"), Some(&serde_json::json!(["devs"])));
-        assert_eq!(claims.get("roles"), Some(&serde_json::json!(["admin", "reader"])));
-        assert!(!claims.contains_key("oidc_issuer"));
-
-        let updated_at = OffsetDateTime::UNIX_EPOCH;
-        let item = site_replication_item(&credentials, updated_at);
-        assert_eq!(item.r#type, "sts-credential");
-        assert_eq!(item.updated_at, Some(updated_at));
-        assert_eq!(item.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
-        let replicated = item.sts_credential.expect("replication item should contain STS credentials");
-        assert_eq!(replicated.access_key, credentials.access_key);
-        assert_eq!(replicated.secret_key, credentials.secret_key);
-        assert_eq!(replicated.session_token, credentials.session_token);
-        assert_eq!(replicated.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
-        assert_eq!(replicated.parent_policy_mapping, OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY);
-        assert!(replicated.parent_policy_mapping.trim().is_empty());
-        assert!(MappedPolicy::new(&replicated.parent_policy_mapping).to_slice().is_empty());
-        assert_eq!(replicated.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn binding_uses_sts_policy_when_regular_mapping_collides() {
+    async fn ready_test_iam() -> Arc<IamSys<ObjectStore>> {
         let _ = rustfs_credentials::init_global_action_credentials(
             Some("TESTROOTACCESSKEY".to_string()),
             Some("TESTROOTSECRET123".to_string()),
         );
         if current_ready_iam_handle().is_err() {
             let env = rustfs_test_utils::TestECStoreEnv::builder()
-                .prefix("federated_binding_sts_policy")
+                .prefix("federated_identity")
                 .disk_count(1)
                 .init_bucket_metadata(false)
                 .build()
@@ -424,8 +373,146 @@ mod tests {
                 Arc::new(KmsServiceManager::new()),
             )));
         }
+        current_ready_iam_handle().expect("test IAM should be ready")
+    }
 
-        let iam = current_ready_iam_handle().expect("test IAM should be ready");
+    // Keep this fixture independent of the production JWT encoder so writer and reader changes cannot drift together.
+    fn markerless_legacy_session_token(signing_key: &str) -> String {
+        const HEADER: &str = r#"{"alg":"HS512","typ":"JWT"}"#;
+        const PAYLOAD: &str = r#"{"iss":"rustfs-oidc","oidc_provider":"default","sub":"legacy-subject","parent":"legacy-markerless-oidc-parent","policy":"readonly","exp":4102444800}"#;
+        let header = base64_simd::URL_SAFE_NO_PAD.encode_to_string(HEADER.as_bytes());
+        let payload = base64_simd::URL_SAFE_NO_PAD.encode_to_string(PAYLOAD.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac =
+            <Hmac<Sha512> as KeyInit>::new_from_slice(signing_key.as_bytes()).expect("HMAC-SHA512 accepts the test signing key");
+        mac.update(signing_input.as_bytes());
+        let signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(mac.finalize().into_bytes().as_slice());
+        format!("{signing_input}.{signature}")
+    }
+
+    #[test]
+    fn token_claims_preserve_existing_oidc_shape() {
+        let transaction = transaction();
+
+        let claims = build_oidc_token_claims(&transaction);
+        assert_eq!(
+            claims,
+            HashMap::from([
+                ("sub".to_string(), serde_json::json!("subject")),
+                ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), serde_json::json!("default")),
+                ("email".to_string(), serde_json::json!("user@example.com")),
+                ("preferred_username".to_string(), serde_json::json!("user")),
+                ("groups".to_string(), serde_json::json!(["devs"])),
+                ("roles".to_string(), serde_json::json!(["admin", "reader"])),
+            ])
+        );
+    }
+
+    #[test]
+    fn token_claims_omit_empty_optional_oidc_fields() {
+        let mut transaction = transaction();
+        transaction.authorization.claims.email.clear();
+        transaction.authorization.claims.username.clear();
+        transaction.authorization.groups.clear();
+        transaction.authorization.roles.clear();
+
+        assert_eq!(
+            build_oidc_token_claims(&transaction),
+            HashMap::from([
+                ("sub".to_string(), serde_json::json!("subject")),
+                ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), serde_json::json!("default")),
+            ])
+        );
+    }
+
+    #[test]
+    fn issued_credentials_and_replication_item_use_minio_parent_shape() {
+        let transaction = transaction();
+        let secret = "federated-session-test-signing-secret";
+        let selected_policy_names = vec!["readonly".to_string()];
+
+        let credentials =
+            issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
+        assert_eq!(credentials.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
+        assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
+        assert_eq!(credentials.status, "on");
+        assert!(!credentials.access_key.is_empty());
+        assert!(!credentials.secret_key.is_empty());
+        assert!(!credentials.session_token.is_empty());
+        assert!(credentials.claims.is_none());
+        assert!(credentials.name.is_none());
+        assert!(credentials.description.is_none());
+
+        let mut claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, secret)
+            .expect("issued session token should verify");
+        let expires_at = claims
+            .remove("exp")
+            .and_then(|value| value.as_i64())
+            .expect("issued token should contain an integer expiration");
+        assert_eq!(
+            credentials
+                .expiration
+                .expect("issued credentials should contain an expiration")
+                .unix_timestamp(),
+            expires_at
+        );
+        assert_eq!(
+            claims,
+            HashMap::from([
+                ("sub".to_string(), serde_json::json!("subject")),
+                ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), serde_json::json!("default")),
+                ("email".to_string(), serde_json::json!("user@example.com")),
+                ("preferred_username".to_string(), serde_json::json!("user")),
+                ("groups".to_string(), serde_json::json!(["devs"])),
+                ("roles".to_string(), serde_json::json!(["admin", "reader"])),
+                ("parent".to_string(), serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA")),
+                (
+                    OIDC_VIRTUAL_PARENT_CLAIM.to_string(),
+                    serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"),
+                ),
+                ("policy".to_string(), serde_json::json!("readonly")),
+            ])
+        );
+
+        let updated_at = OffsetDateTime::UNIX_EPOCH;
+        let mut item = site_replication_item(&credentials, updated_at);
+        let replicated = item
+            .sts_credential
+            .as_mut()
+            .expect("replication item should contain STS credentials");
+        assert_eq!(replicated.access_key, credentials.access_key);
+        assert!(crate::auth::constant_time_eq(&replicated.secret_key, &credentials.secret_key));
+        assert!(crate::auth::constant_time_eq(&replicated.session_token, &credentials.session_token));
+        assert!(MappedPolicy::new(&replicated.parent_policy_mapping).to_slice().is_empty());
+        replicated.access_key = "<access-key>".to_string();
+        replicated.secret_key = "<secret-key>".to_string();
+        replicated.session_token = "<session-token>".to_string();
+        assert_eq!(
+            serde_json::to_value(item).expect("replication item should serialize"),
+            serde_json::json!({
+                "type": "sts-credential",
+                "name": "",
+                "stsCredential": {
+                    "accessKey": "<access-key>",
+                    "secretKey": "<secret-key>",
+                    "sessionToken": "<session-token>",
+                    "parentUser": "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA",
+                    "parentPolicyMapping": OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY,
+                    "apiVersion": SITE_REPL_API_VERSION,
+                },
+                "updatedAt": "1970-01-01T00:00:00Z",
+                "apiVersion": SITE_REPL_API_VERSION,
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_uses_sts_policy_when_regular_mapping_collides() {
+        let iam = ready_test_iam().await;
         let mut transaction = transaction();
         transaction.authorization.claims.sub = "binding-sts-policy-subject".to_string();
         transaction.authorization.policies = vec!["readwrite".to_string()];
@@ -459,6 +546,82 @@ mod tests {
             .expect("issued session token should verify");
 
         assert_eq!(claims.get("policy"), Some(&serde_json::json!("writeonly")));
+
+        let groups = credentials.groups.clone();
+        let conditions = HashMap::new();
+        for (action, allowed) in [(S3Action::PutObjectAction, true), (S3Action::GetObjectAction, false)] {
+            let args = Args {
+                account: &credentials.access_key,
+                groups: &groups,
+                action: Action::S3Action(action),
+                bucket: "federated-binding-bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "object.txt",
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(
+                iam.is_allowed(&args).await,
+                allowed,
+                "the credential persisted by the production binding must use the selected STS policy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn markerless_legacy_oidc_session_crosses_auth_and_iam_deletion_boundaries() {
+        let iam = ready_test_iam().await;
+        let signing_key = current_token_signing_key().expect("test signing key should be initialized");
+        let legacy_parent = "legacy-markerless-oidc-parent";
+        let legacy_claims = HashMap::from([
+            ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+            ("oidc_provider".to_string(), serde_json::json!("default")),
+            ("sub".to_string(), serde_json::json!("legacy-subject")),
+            ("parent".to_string(), serde_json::json!(legacy_parent)),
+            ("policy".to_string(), serde_json::json!("readonly")),
+            ("exp".to_string(), serde_json::json!(4_102_444_800_i64)),
+        ]);
+        let legacy = rustfs_credentials::Credentials {
+            access_key: "LEGACYMARKERLESS0001".to_string(),
+            secret_key: "legacy-markerless-secret-0001".to_string(),
+            session_token: markerless_legacy_session_token(&signing_key),
+            parent_user: legacy_parent.to_string(),
+            status: "on".to_string(),
+            expiration: Some(OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("legacy expiration should be valid")),
+            ..Default::default()
+        };
+        iam.set_temp_user(&legacy.access_key, &legacy, None)
+            .await
+            .expect("markerless legacy session should be stored");
+
+        let (authenticated, owner) = crate::auth::check_key_valid(&legacy.session_token, &legacy.access_key)
+            .await
+            .expect("markerless legacy session should pass the request authentication boundary");
+        assert_eq!(authenticated.claims, Some(legacy_claims));
+        assert!(!owner);
+        let listed = iam
+            .list_sts_accounts(legacy_parent)
+            .await
+            .expect("markerless legacy session should be listable");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].access_key, legacy.access_key);
+
+        iam.delete_temp_account(&legacy.access_key, false)
+            .await
+            .expect("markerless legacy session should be deleted through IAM");
+        assert!(
+            iam.list_sts_accounts(legacy_parent)
+                .await
+                .expect("legacy session list after deletion")
+                .is_empty()
+        );
+        assert!(
+            crate::auth::check_key_valid(&legacy.session_token, &legacy.access_key)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

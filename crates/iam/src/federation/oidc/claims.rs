@@ -62,6 +62,7 @@ pub(super) fn authorization(oidc: &OidcSys, provider_id: String, claims: OidcCla
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oidc::{make_test_sys, test_config};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -98,5 +99,44 @@ mod tests {
             ..Default::default()
         };
         assert!(string_list_claim(&ambiguous, "roles").is_empty());
+    }
+
+    #[test]
+    fn authorization_preserves_verified_claims_and_keeps_source_groups_distinct() {
+        let mut config = test_config("corp");
+        config.claim_prefix = "mapped-".to_string();
+        config.roles_claim = "roles".to_string();
+        let oidc = make_test_sys(vec![config]);
+        let raw = HashMap::from([
+            ("iss".to_string(), json!("https://corp.example.test")),
+            ("department".to_string(), json!("engineering")),
+            ("roles".to_string(), json!(["reader", "admin"])),
+        ]);
+        let authorization = authorization(
+            &oidc,
+            "corp".to_string(),
+            OidcClaims {
+                sub: " subject-123 ".to_string(),
+                email: " user@example.test ".to_string(),
+                username: " user ".to_string(),
+                groups: vec![
+                    "source-ops".to_string(),
+                    "source-developers".to_string(),
+                    "source-ops".to_string(),
+                ],
+                raw: raw.clone(),
+            },
+        );
+
+        assert_eq!(authorization.provider_id, "corp");
+        assert_eq!(authorization.claims.sub, " subject-123 ");
+        assert_eq!(authorization.claims.email, " user@example.test ");
+        assert_eq!(authorization.claims.username, " user ");
+        assert_eq!(authorization.claims.groups, ["source-ops", "source-developers", "source-ops"]);
+        assert_eq!(authorization.claims.raw, raw);
+        assert_eq!(authorization.policies, ["mapped-source-developers", "mapped-source-ops"]);
+        assert_eq!(authorization.groups, ["source-developers", "source-ops"]);
+        assert_eq!(authorization.roles_claim_key.as_deref(), Some("roles"));
+        assert_eq!(authorization.roles, ["reader", "admin"]);
     }
 }
