@@ -800,6 +800,10 @@ pub struct LocalDiskWrapper {
 impl LocalDiskWrapper {
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
+        Self::new_with_health(disk, health_check, Arc::new(DiskHealthTracker::new()))
+    }
+
+    pub(crate) fn new_with_health(disk: Arc<LocalDisk>, health_check: bool, health: Arc<DiskHealthTracker>) -> Self {
         // Check environment variable for health check override.
         // Only enable if both param and env are true.
         let env_health_check =
@@ -807,7 +811,7 @@ impl LocalDiskWrapper {
 
         let wrapper = Self {
             disk,
-            health: Arc::new(DiskHealthTracker::new()),
+            health,
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
@@ -815,6 +819,10 @@ impl LocalDiskWrapper {
         };
         record_drive_runtime_state(&wrapper.disk.endpoint(), RuntimeDriveHealthState::Online);
         wrapper
+    }
+
+    pub(crate) fn health_tracker_for_reconnect(&self) -> Arc<DiskHealthTracker> {
+        self.health.clone()
     }
 
     pub fn get_disk(&self) -> Arc<LocalDisk> {

@@ -142,6 +142,13 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.set_disk_id(id).await,
         }
     }
+
+    pub(crate) fn local_health_tracker_for_reconnect(&self) -> Option<Arc<disk_store::DiskHealthTracker>> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.health_tracker_for_reconnect()),
+            Disk::Remote(_) => None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -671,9 +678,22 @@ impl Disk {
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
+    new_disk_with_health_tracker(ep, opt, None).await
+}
+
+pub(crate) async fn new_disk_with_health_tracker(
+    ep: &Endpoint,
+    opt: &DiskOption,
+    health: Option<Arc<disk_store::DiskHealthTracker>>,
+) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
+        let health = health.unwrap_or_else(|| Arc::new(disk_store::DiskHealthTracker::new()));
+        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new_with_health(
+            Arc::new(s),
+            opt.health_check,
+            health,
+        )))))
     } else {
         let data_transport = build_internode_data_transport_from_env();
         let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;

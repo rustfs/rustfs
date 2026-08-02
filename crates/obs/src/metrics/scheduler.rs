@@ -2556,8 +2556,14 @@ mod tests {
 
     #[test]
     fn metrics_runtime_collector_tasks_expand_when_compression_enabled() {
-        assert_eq!(metrics_runtime_collector_tasks(false), 10);
-        assert_eq!(metrics_runtime_collector_tasks(true), 11);
+        assert_eq!(
+            metrics_runtime_collector_tasks(false),
+            u8::try_from(BASE_COLLECTOR_TASK_IDS.len()).expect("base collector count fits in u8")
+        );
+        assert_eq!(
+            metrics_runtime_collector_tasks(true),
+            u8::try_from(ALL_COLLECTOR_TASK_IDS.len()).expect("all collector count fits in u8")
+        );
     }
 
     #[tokio::test]

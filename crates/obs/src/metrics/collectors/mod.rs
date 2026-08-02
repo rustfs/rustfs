@@ -65,7 +65,7 @@ pub use node::{DiskStats, collect_node_metrics};
 pub use notification::{NotificationStats, collect_notification_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
 pub use replication::{ReplicationStats, collect_replication_metrics};
-pub(crate) use request::{ApiRequestStats, collect_request_metrics};
+pub(crate) use request::{ApiRequestMetricSupport, ApiRequestStats, collect_request_metrics};
 pub use resource::{ResourceStats, collect_resource_metrics};
 pub(crate) use scanner::{ScannerRuntimeStats, collect_scanner_runtime_metrics};
 pub use scanner::{ScannerStats, collect_scanner_metrics};

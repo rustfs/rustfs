@@ -22,12 +22,13 @@
 
 use crate::metrics::collectors::scanner::{ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
-    ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationRuntimeStats,
-    BucketReplicationStats, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats, BucketReplicationTargetStats,
-    BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats,
-    CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, DriveRuntimeDetailedStats,
-    ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmRuntimeStats, IlmStats, MemoryStats, NetworkStats,
-    ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerRuntimeStats, ScannerStats,
+    ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
+    BucketReplicationRuntimeStats, BucketReplicationStats, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats,
+    BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
+    ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
+    DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmRuntimeStats, IlmStats,
+    MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerRuntimeStats,
+    ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -423,7 +424,7 @@ fn drive_api_latency_micros(actions: impl Iterator<Item = (u64, u64)>) -> Option
 
 fn drive_api_latency_by_api_micros<'a>(actions: impl Iterator<Item = (&'a String, u64, u64)>) -> Vec<(String, u64)> {
     let mut values = actions
-        .map(|(api, count, acc_time)| (api.clone(), acc_time.checked_div(count).unwrap_or_default() / 1_000))
+        .filter_map(|(api, count, acc_time)| Some((api.clone(), acc_time.checked_div(count)? / 1_000)))
         .collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
@@ -433,6 +434,16 @@ fn drive_api_calls<'a>(api_calls: impl Iterator<Item = (&'a String, &'a u64)>) -
     let mut values = api_calls.map(|(api, calls)| (api.clone(), *calls)).collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
+}
+
+fn drive_server_label(endpoint: &str, local_server: &str) -> String {
+    endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .filter(|authority| !authority.is_empty())
+        .unwrap_or(local_server)
+        .to_string()
 }
 
 fn derive_erasure_set_quorum_shape(set_drive_count: usize, parity: usize) -> ErasureSetQuorumShape {
@@ -658,6 +669,7 @@ pub(crate) fn collect_api_request_stats() -> Vec<ApiRequestStats> {
             name: snapshot.op.to_string(),
             req_type: "s3".to_string(),
             total: snapshot.total,
+            supported_metrics: ApiRequestMetricSupport::TOTALS_ONLY,
             ..Default::default()
         })
         .collect()
@@ -743,11 +755,12 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
     };
 
     let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+    let local_server = current_local_node_identity();
     let disk_stats = storage_info
         .disks
         .iter()
         .map(|disk| DiskStats {
-            server: disk.endpoint.clone(),
+            server: drive_server_label(&disk.endpoint, &local_server),
             drive: disk.drive_path.clone(),
             total_bytes: disk.total_space,
             used_bytes: disk.used_space,
@@ -800,7 +813,7 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
                     })
                     .unwrap_or_default(),
                 stats: DriveDetailedStats {
-                    server: disk.endpoint.clone(),
+                    server: drive_server_label(&disk.endpoint, &local_server),
                     drive: disk.drive_path.clone(),
                     total_bytes: disk.total_space,
                     used_bytes: disk.used_space,
@@ -1748,6 +1761,13 @@ mod tests {
     }
 
     #[test]
+    fn drive_server_label_uses_node_identity_for_urls_and_local_paths() {
+        assert_eq!(drive_server_label("http://node1:9000/data", "local:9000"), "node1:9000");
+        assert_eq!(drive_server_label("https://node2:9443/export/d1", "local:9000"), "node2:9443");
+        assert_eq!(drive_server_label("/mnt/data1", "local:9000"), "local:9000");
+    }
+
+    #[test]
     fn drive_inode_stats_skip_unknown_zero_inode_totals() {
         assert_eq!(drive_inode_stats(0, 0), (None, None, None));
         assert_eq!(drive_inode_stats(2, 3), (Some(2), Some(3), Some(5)));
@@ -1777,7 +1797,7 @@ mod tests {
         assert_eq!(drive_api_latency_micros(last_minute.values().copied()), Some(0));
         assert_eq!(
             drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time))),
-            vec![("zero".to_string(), 0)]
+            Vec::<(String, u64)>::new()
         );
         assert_eq!(drive_api_latency_micros([].into_iter()), None);
     }

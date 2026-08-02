@@ -322,7 +322,16 @@ impl SetDisks {
     pub async fn renew_disk(&self, ep: &Endpoint) {
         debug!("renew_disk: start {:?}", ep);
 
-        let (new_disk, fm) = match Self::connect_endpoint(ep).await {
+        let previous_health = {
+            let disks = self.disks.read().await;
+            disks
+                .iter()
+                .filter_map(|disk| disk.as_ref())
+                .find(|disk| disk.endpoint() == *ep)
+                .and_then(|disk| disk.local_health_tracker_for_reconnect())
+        };
+
+        let (new_disk, fm) = match Self::connect_endpoint(ep, previous_health).await {
             Ok(res) => res,
             Err(e) => {
                 warn!("renew_disk: connect_endpoint err {:?}", &e);
@@ -400,13 +409,17 @@ impl SetDisks {
         Err(Error::other("DriveID: not found"))
     }
 
-    pub(in crate::set_disk) async fn connect_endpoint(ep: &Endpoint) -> disk::error::Result<(DiskStore, FormatV3)> {
-        let disk = new_disk(
+    pub(in crate::set_disk) async fn connect_endpoint(
+        ep: &Endpoint,
+        health: Option<std::sync::Arc<disk::disk_store::DiskHealthTracker>>,
+    ) -> disk::error::Result<(DiskStore, FormatV3)> {
+        let disk = crate::disk::new_disk_with_health_tracker(
             ep,
             &DiskOption {
                 cleanup: false,
                 health_check: true,
             },
+            health,
         )
         .await?;
 
@@ -713,6 +726,24 @@ mod tests {
         assert!(
             renewed_disk.health_check_enabled_for_test(),
             "renewed disks must keep health monitoring enabled so later faulty marks can recover"
+        );
+        renewed_disk
+            .disk_info(&DiskInfoOptions::default())
+            .await
+            .expect("renewed disk_info should record a drive API metric");
+
+        set_disks.renew_disk(&endpoints[0]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        let renewed_again = disks[0]
+            .as_ref()
+            .expect("second renew_disk should keep the recovered disk attached");
+        assert_eq!(
+            renewed_again
+                .metrics_snapshot()
+                .and_then(|metrics| metrics.api_calls.get("disk_info").copied()),
+            Some(1),
+            "disk reconnect must preserve the local drive metrics tracker epoch"
         );
 
         drop(temp_dirs);
