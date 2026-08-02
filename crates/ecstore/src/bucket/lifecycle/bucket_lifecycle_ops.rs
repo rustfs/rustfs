@@ -1764,10 +1764,7 @@ impl TransitionState {
 
     pub fn add_lastday_stats(&self, tier: &str, ts: TierStats) {
         let mut tier_stats = self.lock_last_day_stats();
-        tier_stats
-            .entry(tier.to_string())
-            .and_modify(|e| e.add_stats(ts))
-            .or_default();
+        tier_stats.entry(tier.to_string()).or_default().add_stats(ts);
     }
 
     pub fn get_daily_all_tier_stats(&self) -> DailyAllTierStats {
@@ -7275,6 +7272,48 @@ mod tests {
         let stats = state.get_daily_all_tier_stats();
         assert!(!stats.contains_key("stale"), "possibly partial statistics must be discarded");
         assert!(stats.contains_key("fresh"), "statistics must accept new samples after recovery");
+    }
+
+    #[test]
+    fn first_tier_sample_is_not_dropped() {
+        // The first completed transition to a tier both creates the map entry
+        // and carries a sample. Creating the entry must not discard that
+        // sample, or the admin GetTierInfo response undercounts every tier by
+        // its first transition while reporting later ones correctly.
+        let state = TransitionState::new_with_capacity(1);
+
+        state.add_lastday_stats(
+            "warm",
+            TierStats {
+                total_size: 10,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+
+        let stats = state.get_daily_all_tier_stats();
+        let total = stats.get("warm").expect("first sample must create the tier entry").total();
+        assert_eq!(total.total_size, 10, "first sample size must be counted");
+        assert_eq!(total.num_versions, 1, "first sample version must be counted");
+        assert_eq!(total.num_objects, 1, "first sample object must be counted");
+
+        // Later samples must accumulate onto the existing entry rather than
+        // replace it; `LastDayTierStats::add_stats` coverage alone does not
+        // reach this path, because it never goes through the tier map.
+        state.add_lastday_stats(
+            "warm",
+            TierStats {
+                total_size: 20,
+                num_versions: 2,
+                num_objects: 1,
+            },
+        );
+
+        let stats = state.get_daily_all_tier_stats();
+        let total = stats.get("warm").expect("tier entry must survive later samples").total();
+        assert_eq!(total.total_size, 30, "later sample size must accumulate");
+        assert_eq!(total.num_versions, 3, "later sample versions must accumulate");
+        assert_eq!(total.num_objects, 2, "later sample objects must accumulate");
     }
 
     #[tokio::test(flavor = "current_thread")]
