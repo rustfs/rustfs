@@ -364,6 +364,46 @@ fn disk_capacity_observation_state(source: Option<&str>, age_seconds: Option<u64
     }
 }
 
+fn disk_topology_label(index: i32) -> Option<String> {
+    if index >= 0 { Some(index.to_string()) } else { None }
+}
+
+fn non_empty_disk_id(uuid: &str) -> Option<String> {
+    let uuid = uuid.trim();
+    if uuid.is_empty() { None } else { Some(uuid.to_string()) }
+}
+
+fn drive_api_latency_micros(actions: impl Iterator<Item = (u64, u64)>) -> Option<u64> {
+    let mut count = 0u64;
+    let mut acc_time_ns = 0u64;
+    for (action_count, action_acc_time_ns) in actions {
+        count = count.saturating_add(action_count);
+        acc_time_ns = acc_time_ns.saturating_add(action_acc_time_ns);
+    }
+
+    if count == 0 { None } else { Some(acc_time_ns / count / 1_000) }
+}
+
+fn drive_api_latency_by_api_micros<'a>(actions: impl Iterator<Item = (&'a String, u64, u64)>) -> Vec<(String, u64)> {
+    let mut values = actions
+        .filter_map(|(api, count, acc_time)| {
+            if count == 0 {
+                None
+            } else {
+                Some((api.clone(), acc_time / count / 1_000))
+            }
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.0.cmp(&right.0));
+    values
+}
+
+fn drive_api_calls<'a>(api_calls: impl Iterator<Item = (&'a String, &'a u64)>) -> Vec<(String, u64)> {
+    let mut values = api_calls.map(|(api, calls)| (api.clone(), *calls)).collect::<Vec<_>>();
+    values.sort_by(|left, right| left.0.cmp(&right.0));
+    values
+}
+
 fn derive_erasure_set_quorum_shape(set_drive_count: usize, parity: usize) -> ErasureSetQuorumShape {
     let data_shards = set_drive_count.saturating_sub(parity);
     let read_quorum = data_shards.max(1);
@@ -683,19 +723,29 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
             DriveDetailedStats {
                 server: disk.endpoint.clone(),
                 drive: disk.drive_path.clone(),
+                pool_index: disk_topology_label(disk.pool_index),
+                set_index: disk_topology_label(disk.set_index),
+                drive_index: disk_topology_label(disk.disk_index),
+                disk_id: non_empty_disk_id(&disk.uuid),
+                runtime_state: Some(disk.runtime_state.as_deref().unwrap_or("unknown").to_ascii_lowercase()),
+                healing: disk.healing,
+                scanning: disk.scanning,
+                offline_duration_seconds: disk.offline_duration_seconds,
                 total_bytes: disk.total_space,
                 used_bytes: disk.used_space,
                 free_bytes: disk.available_space,
                 capacity_observation_state,
                 capacity_observation_age_seconds,
-                used_inodes: None,
-                free_inodes: None,
-                total_inodes: None,
-                timeout_errors_total: None,
+                used_inodes: Some(disk.used_inodes),
+                free_inodes: Some(disk.free_inodes),
+                total_inodes: Some(disk.used_inodes.saturating_add(disk.free_inodes)),
+                timeout_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_timeout),
                 io_errors_total: None,
-                availability_errors_total: None,
-                waiting_io: None,
-                api_latency_micros: None,
+                availability_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_availability),
+                waiting_io: disk.metrics.as_ref().map(|metrics| u64::from(metrics.total_waiting)),
+                api_latency_micros: disk.metrics.as_ref().and_then(|metrics| {
+                    drive_api_latency_micros(metrics.last_minute.values().map(|action| (action.count, action.acc_time)))
+                }),
                 health: if is_online { 1 } else { 0 },
                 reads_per_sec: None,
                 reads_kb_per_sec: None,
@@ -704,6 +754,23 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                 writes_kb_per_sec: None,
                 writes_await: None,
                 perc_util: None,
+                api_calls: disk
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| drive_api_calls(metrics.api_calls.iter()))
+                    .unwrap_or_default(),
+                api_latency_by_api_micros: disk
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| {
+                        drive_api_latency_by_api_micros(
+                            metrics
+                                .last_minute
+                                .iter()
+                                .map(|(api, action)| (api, action.count, action.acc_time)),
+                        )
+                    })
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -1478,6 +1545,31 @@ mod tests {
     #[test]
     fn disk_is_online_for_metrics_rejects_offline_runtime_state() {
         assert!(!disk_is_online_for_metrics(DRIVE_STATE_OK, Some("offline")));
+    }
+
+    #[test]
+    fn disk_topology_label_rejects_unknown_negative_index() {
+        assert_eq!(disk_topology_label(-1), None);
+        assert_eq!(disk_topology_label(3), Some("3".to_string()));
+    }
+
+    #[test]
+    fn non_empty_disk_id_rejects_blank_uuid() {
+        assert_eq!(non_empty_disk_id("  "), None);
+        assert_eq!(non_empty_disk_id("disk-1"), Some("disk-1".to_string()));
+    }
+
+    #[test]
+    fn drive_api_metrics_are_sorted_and_average_latency() {
+        let last_minute = HashMap::from([("write".to_string(), (2, 6_000)), ("read".to_string(), (1, 3_000))]);
+        let api_calls = HashMap::from([("write".to_string(), 9), ("read".to_string(), 4)]);
+
+        assert_eq!(drive_api_latency_micros(last_minute.values().copied()), Some(3));
+        assert_eq!(
+            drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time))),
+            vec![("read".to_string(), 3), ("write".to_string(), 3)]
+        );
+        assert_eq!(drive_api_calls(api_calls.iter()), vec![("read".to_string(), 4), ("write".to_string(), 9)]);
     }
 
     #[test]
