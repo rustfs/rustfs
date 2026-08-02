@@ -593,8 +593,16 @@ impl<'de> Deserialize<'de> for StoredMasterKey {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        for field in wire.unknown_fields.keys() {
-            tracing::warn!(key_id = %wire.key_id, field = %field, "Local KMS key record contains an unknown field");
+        if let Some(field) = wire.unknown_fields.keys().min() {
+            static WARN_UNKNOWN_FIELDS: std::sync::Once = std::sync::Once::new();
+            WARN_UNKNOWN_FIELDS.call_once(|| {
+                tracing::warn!(
+                    key_id = %wire.key_id,
+                    field = %field,
+                    field_count = wire.unknown_fields.len(),
+                    "Local KMS key record contains unknown fields"
+                );
+            });
         }
 
         Ok(Self {
@@ -884,6 +892,23 @@ impl LocalKmsClient {
                     path.display()
                 ))
             })?;
+            let format_version = stored_master_key_format_version(&content).map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} is not interpretable by this build ({error}); \
+                     refusing to generate a replacement salt — restore the salt file from backup, or run a build that \
+                     understands the record",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
+            if format_version > STORED_MASTER_KEY_FORMAT_VERSION {
+                return Err(KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} declares unsupported format version {format_version}; \
+                     refusing to generate a replacement salt",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                )));
+            }
             let probe = serde_json::from_slice::<ProtectionProbe>(&content).map_err(|error| {
                 KmsError::configuration_error(format!(
                     "Local KMS master key salt at {} is missing and key record {} is not interpretable by this build ({error}); \
@@ -2604,7 +2629,8 @@ mod tests {
         let key_path = client.master_key_path("unknown-field-key").expect("valid key id");
         let mut record: serde_json::Value =
             serde_json::from_slice(&fs::read(&key_path).await.expect("read key record")).expect("decode key record");
-        record["future_field"] = serde_json::json!("field value must not be logged");
+        record["alpha_extension"] = serde_json::json!("field value must not be logged");
+        record["zeta_extension"] = serde_json::json!("another value must not be logged");
         fs::write(
             &key_path,
             serde_json::to_vec_pretty(&record).expect("encode key record with unknown field"),
@@ -2620,14 +2646,22 @@ mod tests {
             .finish();
         let record = fs::read(&key_path).await.expect("read key record");
         let stored: StoredMasterKey = tracing::subscriber::with_default(subscriber, || {
-            serde_json::from_slice(&record).expect("unknown fields must remain forward-compatible")
+            let stored = serde_json::from_slice(&record).expect("unknown fields must remain forward-compatible");
+            let _: StoredMasterKey =
+                serde_json::from_slice(&record).expect("repeated unknown fields must remain forward-compatible");
+            stored
         });
         assert_eq!(stored.key_id, "unknown-field-key");
 
         let output = logs.output();
-        assert!(output.contains("Local KMS key record contains an unknown field"));
-        assert!(output.contains("future_field"));
+        assert!(output.contains("WARN"));
+        assert_eq!(output.matches("Local KMS key record contains unknown fields").count(), 1);
+        assert!(output.contains("alpha_extension"));
+        assert!(!output.contains("zeta_extension"));
+        assert!(output.contains("field_count=2"));
+        assert!(output.contains("key_id=unknown-field-key"));
         assert!(!output.contains(UNKNOWN_FIELD_VALUE));
+        assert!(!output.contains("another value must not be logged"));
     }
 
     #[tokio::test]
@@ -3238,14 +3272,22 @@ mod tests {
         let mut newer_build_record = pristine.clone();
         newer_build_record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
         let newer_build_record = serde_json::to_vec_pretty(&newer_build_record).expect("encode record");
+        let mut future_format_record = pristine.clone();
+        future_format_record["format_version"] = serde_json::json!(99);
+        let future_format_record = serde_json::to_vec_pretty(&future_format_record).expect("encode record");
         let truncated = {
             let bytes = serde_json::to_vec_pretty(&pristine).expect("encode record");
             bytes[..bytes.len() / 2].to_vec()
         };
 
-        for (name, content) in [
-            ("record from a newer build", newer_build_record),
-            ("record that does not decode", truncated),
+        for (name, content, expected_error) in [
+            ("record from a newer build", newer_build_record, None),
+            (
+                "record with a future format version",
+                future_format_record,
+                Some("unsupported format version 99"),
+            ),
+            ("record that does not decode", truncated, None),
         ] {
             fs::write(&key_path, &content).await.expect("write record");
             fs::remove_file(&salt_path).await.ok();
@@ -3262,6 +3304,12 @@ mod tests {
                 "{name}: expected a salt-specific configuration error, got {error:?}"
             );
             assert!(error.to_string().contains("salt"), "{name}: error must point at the salt: {error}");
+            if let Some(expected_error) = expected_error {
+                assert!(
+                    error.to_string().contains(expected_error),
+                    "{name}: error must explain the incompatibility: {error}"
+                );
+            }
             assert_eq!(
                 sorted_dir_file_names(temp_dir.path()).await,
                 vec!["sealed-key.key".to_string()],

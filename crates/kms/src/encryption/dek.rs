@@ -76,8 +76,15 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        for field in wire.unknown_fields.keys() {
-            tracing::warn!(field = %field, "KMS data-key envelope contains an unknown field");
+        if let Some(field) = wire.unknown_fields.keys().min() {
+            static WARN_UNKNOWN_FIELDS: std::sync::Once = std::sync::Once::new();
+            WARN_UNKNOWN_FIELDS.call_once(|| {
+                tracing::warn!(
+                    field = %field,
+                    field_count = wire.unknown_fields.len(),
+                    "KMS data-key envelope contains unknown fields"
+                );
+            });
         }
 
         Ok(Self {
@@ -418,7 +425,8 @@ mod tests {
             "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             "encryption_context": {"bucket": "test-bucket"},
             "created_at": "2024-01-01T00:00:00+00:00[UTC]",
-            "future_field": "field value must not be logged"
+            "alpha_extension": "field value must not be logged",
+            "zeta_extension": "another value must not be logged"
         }"#;
 
         let logs = crate::test_support::CapturedLogs::default();
@@ -428,15 +436,21 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let deserialized: DataKeyEnvelope = tracing::subscriber::with_default(subscriber, || {
-            serde_json::from_str(envelope_json).expect("unknown fields must remain readable")
+            let envelope = serde_json::from_str(envelope_json).expect("unknown fields must remain readable");
+            let _: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("repeated unknown fields must remain readable");
+            envelope
         });
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_version, None);
 
         let output = logs.output();
-        assert!(output.contains("KMS data-key envelope contains an unknown field"));
-        assert!(output.contains("future_field"));
+        assert!(output.contains("WARN"));
+        assert_eq!(output.matches("KMS data-key envelope contains unknown fields").count(), 1);
+        assert!(output.contains("alpha_extension"));
+        assert!(!output.contains("zeta_extension"));
+        assert!(output.contains("field_count=2"));
         assert!(!output.contains(UNKNOWN_FIELD_VALUE));
+        assert!(!output.contains("another value must not be logged"));
     }
 
     #[test]
