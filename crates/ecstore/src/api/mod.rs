@@ -180,7 +180,9 @@ pub mod bucket {
         pub use crate::bucket::replication::{
             BucketReplicationResyncStatus, BucketStats, DeleteReplicationConfigSnapshot, DeletedObjectReplicationInfo,
             DurableMrfBacklog, DynReplicationPool, MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts,
-            REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
+            REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+            REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+            REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
             ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource,
             ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait,
             ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge, ReplicationState, ReplicationStats,

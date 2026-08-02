@@ -45,7 +45,9 @@ mod runtime_boundary;
 
 pub use datatypes::ResyncStatusType;
 pub use replication_config_boundary::{
-    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, invalid_replication_config_status_field,
+    ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    ReplicationConfigurationExt, ReplicationTargetValidationError, invalid_replication_config_status_field,
     replication_target_arns, should_remove_replication_target, unsupported_replication_config_field,
     validate_replication_config_target_arns,
 };
