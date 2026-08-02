@@ -31,12 +31,14 @@ use crate::metrics::collectors::{
     BucketReplicationRuntimeStats,
     DriveRuntimeDetailedStats,
     NotificationStats,
+    NotificationTargetRuntimeStats,
     NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
     ProcessAttributeError,
     ProcessCpuStats,
     ProcessDiskStats,
     ProcessMemoryStats,
+    ReplicationRuntimeStats,
     ScannerRuntimeStats,
     collect_audit_runtime_metrics,
     collect_bucket_metrics,
@@ -61,13 +63,13 @@ use crate::metrics::collectors::{
     collect_network_metrics,
     collect_node_metrics,
     collect_notification_metrics,
-    collect_notification_target_metrics,
+    collect_notification_target_runtime_metrics,
     collect_process_attributes,
     collect_process_cpu_metrics,
     collect_process_disk_metrics,
     collect_process_memory_metrics,
     collect_process_metrics,
-    collect_replication_metrics,
+    collect_replication_runtime_metrics,
     collect_request_metrics,
     collect_resource_metrics,
     collect_scanner_runtime_metrics,
@@ -1099,17 +1101,17 @@ fn retire_audit_target_metric_series(server: &str, target_id: &str) -> usize {
         + retire_metric_series(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
 }
 
-fn notification_target_live_keys(stats: &[NotificationTargetStats]) -> HashSet<NotificationTargetKey> {
+fn notification_target_live_keys(stats: &[NotificationTargetRuntimeStats]) -> HashSet<NotificationTargetKey> {
     stats
         .iter()
-        .map(|stat| (stat.server.clone(), stat.target_id.clone(), stat.target_type.clone()))
+        .map(|stat| (stat.server.clone(), stat.target.target_id.clone(), stat.target.target_type.clone()))
         .collect()
 }
 
-fn notification_legacy_target_live_keys(stats: &[NotificationTargetStats]) -> HashSet<NotificationLegacyTargetKey> {
+fn notification_legacy_target_live_keys(stats: &[NotificationTargetRuntimeStats]) -> HashSet<NotificationLegacyTargetKey> {
     stats
         .iter()
-        .map(|stat| (stat.target_id.clone(), stat.target_type.clone()))
+        .map(|stat| (stat.target.target_id.clone(), stat.target.target_type.clone()))
         .collect()
 }
 
@@ -1862,7 +1864,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             metrics.extend(collect_repl_backlog_target_zero_tombstone_metrics(&backlog_target_zero_tombstones));
                             metrics.extend(collect_repl_flow_zero_tombstone_metrics(&flow_zero_tombstones));
                             let replication = collect_replication_stats().await;
-                            metrics.extend(collect_replication_metrics(&replication));
+                            metrics.extend(collect_replication_runtime_metrics(&ReplicationRuntimeStats {
+                                server: current_local_node_identity(),
+                                stats: replication,
+                            }));
                             report_metrics(&metrics);
 
                             // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
@@ -1984,14 +1989,16 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         let server = current_local_node_identity();
                         let target_stats = notification_target_metrics().await
                             .into_iter()
-                            .map(|snapshot| NotificationTargetStats {
-                                failed_messages: snapshot.failed_messages,
-                                failed_store_length: snapshot.failed_store_length,
-                                queue_length: snapshot.queue_length,
+                            .map(|snapshot| NotificationTargetRuntimeStats {
                                 server: server.clone(),
-                                target_id: snapshot.target_id,
-                                target_type: snapshot.target_type,
-                                total_messages: snapshot.total_messages,
+                                target: NotificationTargetStats {
+                                    failed_messages: snapshot.failed_messages,
+                                    failed_store_length: snapshot.failed_store_length,
+                                    queue_length: snapshot.queue_length,
+                                    target_id: snapshot.target_id,
+                                    target_type: snapshot.target_type,
+                                    total_messages: snapshot.total_messages,
+                                },
                             })
                             .collect::<Vec<_>>();
                         update_series_zero_tombstones(
@@ -2008,7 +2015,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             notification_legacy_target_live_keys(&target_stats),
                             tombstone_cycles,
                         );
-                        metrics.extend(collect_notification_target_metrics(&target_stats));
+                        metrics.extend(collect_notification_target_runtime_metrics(&target_stats));
                         metrics.extend(collect_notification_legacy_target_zero_tombstone_metrics(
                             &notification_legacy_target_zero_tombstones,
                         ));
@@ -2810,11 +2817,13 @@ mod tests {
         let mut has_seen_snapshot = true;
         let mut prev_live_keys = HashSet::from([("primary:webhook".to_string(), "webhook".to_string())]);
         let mut zero_tombstones = HashMap::new();
-        let stats = vec![NotificationTargetStats {
+        let stats = vec![NotificationTargetRuntimeStats {
             server: "node2:9000".to_string(),
-            target_id: "primary:webhook".to_string(),
-            target_type: "webhook".to_string(),
-            ..Default::default()
+            target: NotificationTargetStats {
+                target_id: "primary:webhook".to_string(),
+                target_type: "webhook".to_string(),
+                ..Default::default()
+            },
         }];
 
         update_series_zero_tombstones(

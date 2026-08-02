@@ -28,10 +28,15 @@ pub struct NotificationTargetStats {
     pub failed_messages: u64,
     pub failed_store_length: u64,
     pub queue_length: u64,
-    pub server: String,
     pub target_id: String,
     pub target_type: String,
     pub total_messages: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NotificationTargetRuntimeStats {
+    pub(crate) server: String,
+    pub(crate) target: NotificationTargetStats,
 }
 
 pub fn collect_notification_target_metrics(stats: &[NotificationTargetStats]) -> Vec<PrometheusMetric> {
@@ -64,40 +69,57 @@ pub fn collect_notification_target_metrics(stats: &[NotificationTargetStats]) ->
                 .with_label(TARGET_ID, target_id)
                 .with_label(TARGET_TYPE, target_type),
         );
+    }
 
-        if !stat.server.is_empty() {
-            let server: Cow<'static, str> = Cow::Owned(stat.server.clone());
-            let target_id: Cow<'static, str> = Cow::Owned(stat.target_id.clone());
-            let target_type: Cow<'static, str> = Cow::Owned(stat.target_type.clone());
+    metrics
+}
 
-            metrics.push(
-                PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, stat.failed_messages as f64)
-                    .with_label(SERVER, server.clone())
-                    .with_label(TARGET_ID, target_id.clone())
-                    .with_label(TARGET_TYPE, target_type.clone()),
-            );
-            metrics.push(
-                PrometheusMetric::from_descriptor(
-                    &NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD,
-                    stat.failed_store_length as f64,
-                )
+pub(crate) fn collect_notification_target_runtime_metrics(stats: &[NotificationTargetRuntimeStats]) -> Vec<PrometheusMetric> {
+    if stats.is_empty() {
+        return Vec::new();
+    }
+
+    let legacy_stats = stats.iter().map(|stat| stat.target.clone()).collect::<Vec<_>>();
+    let mut metrics = collect_notification_target_metrics(&legacy_stats);
+    metrics.reserve(stats.len() * 4);
+    for stat in stats {
+        let server: Cow<'static, str> = Cow::Owned(stat.server.clone());
+        let target_id: Cow<'static, str> = Cow::Owned(stat.target.target_id.clone());
+        let target_type: Cow<'static, str> = Cow::Owned(stat.target.target_type.clone());
+
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD,
+                stat.target.failed_messages as f64,
+            )
+            .with_label(SERVER, server.clone())
+            .with_label(TARGET_ID, target_id.clone())
+            .with_label(TARGET_TYPE, target_type.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD,
+                stat.target.failed_store_length as f64,
+            )
+            .with_label(SERVER, server.clone())
+            .with_label(TARGET_ID, target_id.clone())
+            .with_label(TARGET_TYPE, target_type.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, stat.target.queue_length as f64)
                 .with_label(SERVER, server.clone())
                 .with_label(TARGET_ID, target_id.clone())
                 .with_label(TARGET_TYPE, target_type.clone()),
-            );
-            metrics.push(
-                PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, stat.queue_length as f64)
-                    .with_label(SERVER, server.clone())
-                    .with_label(TARGET_ID, target_id.clone())
-                    .with_label(TARGET_TYPE, target_type.clone()),
-            );
-            metrics.push(
-                PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, stat.total_messages as f64)
-                    .with_label(SERVER, server)
-                    .with_label(TARGET_ID, target_id)
-                    .with_label(TARGET_TYPE, target_type),
-            );
-        }
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD,
+                stat.target.total_messages as f64,
+            )
+            .with_label(SERVER, server)
+            .with_label(TARGET_ID, target_id)
+            .with_label(TARGET_TYPE, target_type),
+        );
     }
 
     metrics
@@ -110,17 +132,19 @@ mod tests {
 
     #[test]
     fn test_collect_notification_target_metrics() {
-        let stats = vec![NotificationTargetStats {
+        let stats = [NotificationTargetStats {
             failed_messages: 2,
             failed_store_length: 3,
             queue_length: 4,
-            server: "node1:9000".to_string(),
             target_id: "primary:webhook".to_string(),
             target_type: "webhook".to_string(),
             total_messages: 42,
         }];
 
-        let metrics = collect_notification_target_metrics(&stats);
+        let metrics = collect_notification_target_runtime_metrics(&[NotificationTargetRuntimeStats {
+            server: "node1:9000".to_string(),
+            target: stats[0].clone(),
+        }]);
 
         assert_eq!(metrics.len(), 8);
         assert!(metrics.iter().any(|metric| {
@@ -166,5 +190,19 @@ mod tests {
         assert_eq!(NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.metric_type, MetricType::Gauge);
         assert_eq!(NOTIFICATION_TARGET_QUEUE_LENGTH_MD.metric_type, MetricType::Gauge);
         assert_eq!(NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.metric_type, MetricType::Gauge);
+    }
+
+    #[test]
+    fn notification_target_stats_struct_literal_keeps_legacy_fields() {
+        let stats = vec![NotificationTargetStats {
+            failed_messages: 2,
+            failed_store_length: 3,
+            queue_length: 4,
+            target_id: "primary:webhook".to_string(),
+            target_type: "webhook".to_string(),
+            total_messages: 42,
+        }];
+
+        assert_eq!(collect_notification_target_metrics(&stats).len(), 4);
     }
 }

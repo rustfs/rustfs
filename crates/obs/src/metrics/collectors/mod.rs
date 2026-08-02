@@ -63,7 +63,9 @@ pub(crate) use ilm::{IlmActionTaskStats, IlmRuntimeStats, collect_ilm_runtime_me
 pub use ilm::{IlmStats, collect_ilm_metrics};
 pub use node::{DiskStats, collect_node_metrics};
 pub use notification::{NotificationStats, collect_notification_metrics};
+pub(crate) use notification_target::{NotificationTargetRuntimeStats, collect_notification_target_runtime_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
+pub(crate) use replication::{ReplicationRuntimeStats, collect_replication_runtime_metrics};
 pub use replication::{ReplicationStats, collect_replication_metrics};
 pub(crate) use request::{ApiRequestMetricSupport, ApiRequestStats, collect_request_metrics};
 pub use resource::{ResourceStats, collect_resource_metrics};

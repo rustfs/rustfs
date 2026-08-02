@@ -85,25 +85,14 @@ impl Serialize for DiskMetrics {
     where
         S: Serializer,
     {
-        let human_readable = serializer.is_human_readable();
         let mut state = serializer.serialize_struct("DiskMetrics", 7)?;
-        if human_readable {
-            state.serialize_field("lastMinute", &self.last_minute)?;
-            state.serialize_field("apiCalls", &self.api_calls)?;
-            state.serialize_field("totalWaiting", &self.total_waiting)?;
-            state.serialize_field("totalErrsAvailability", &self.total_errors_availability)?;
-            state.serialize_field("totalErrsTimeout", &self.total_errors_timeout)?;
-            state.serialize_field("totalWrites", &self.total_writes)?;
-            state.serialize_field("totalDeletes", &self.total_deletes)?;
-        } else {
-            state.serialize_field("last_minute", &self.last_minute)?;
-            state.serialize_field("api_calls", &self.api_calls)?;
-            state.serialize_field("total_waiting", &self.total_waiting)?;
-            state.serialize_field("total_errors_availability", &self.total_errors_availability)?;
-            state.serialize_field("total_errors_timeout", &self.total_errors_timeout)?;
-            state.serialize_field("total_writes", &self.total_writes)?;
-            state.serialize_field("total_deletes", &self.total_deletes)?;
-        }
+        state.serialize_field("last_minute", &self.last_minute)?;
+        state.serialize_field("api_calls", &self.api_calls)?;
+        state.serialize_field("total_waiting", &self.total_waiting)?;
+        state.serialize_field("total_errors_availability", &self.total_errors_availability)?;
+        state.serialize_field("total_errors_timeout", &self.total_errors_timeout)?;
+        state.serialize_field("total_writes", &self.total_writes)?;
+        state.serialize_field("total_deletes", &self.total_deletes)?;
         state.end()
     }
 }
@@ -543,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_metrics_json_uses_admin_contract_fields() {
+    fn test_disk_metrics_json_preserves_internode_legacy_fields() {
         let metrics = DiskMetrics {
             total_waiting: 5,
             total_errors_availability: 2,
@@ -555,15 +544,15 @@ mod tests {
 
         let json = serde_json::to_value(metrics).expect("disk metrics should serialize");
 
-        assert!(json.get("lastMinute").is_some());
-        assert!(json.get("apiCalls").is_some());
-        assert_eq!(json["totalWaiting"], serde_json::json!(5));
-        assert_eq!(json["totalErrsAvailability"], serde_json::json!(2));
-        assert_eq!(json["totalErrsTimeout"], serde_json::json!(1));
-        assert_eq!(json["totalWrites"], serde_json::json!(1000));
-        assert_eq!(json["totalDeletes"], serde_json::json!(50));
-        assert!(json.get("last_minute").is_none());
-        assert!(json.get("total_errors_timeout").is_none());
+        assert!(json.get("last_minute").is_some());
+        assert!(json.get("api_calls").is_some());
+        assert_eq!(json["total_waiting"], serde_json::json!(5));
+        assert_eq!(json["total_errors_availability"], serde_json::json!(2));
+        assert_eq!(json["total_errors_timeout"], serde_json::json!(1));
+        assert_eq!(json["total_writes"], serde_json::json!(1000));
+        assert_eq!(json["total_deletes"], serde_json::json!(50));
+        assert!(json.get("lastMinute").is_none());
+        assert!(json.get("totalErrsTimeout").is_none());
     }
 
     #[test]

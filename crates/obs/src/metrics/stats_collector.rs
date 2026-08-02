@@ -304,7 +304,6 @@ async fn obs_site_replication_stats() -> ReplicationStats {
     let stats = obs_replication_site_stats_snapshot(current_data_transfer_rate).await;
 
     ReplicationStats {
-        server: current_local_node_identity(),
         average_active_workers: stats.average_active_workers,
         average_queued_bytes: stats.average_queued_bytes,
         average_queued_count: stats.average_queued_count,
