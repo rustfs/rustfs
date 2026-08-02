@@ -34,6 +34,7 @@ use rustfs_targets::{
     manifest::builtin_target_manifest,
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
+use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy};
 use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -705,6 +706,18 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
             ));
         }
     }
+    let outbound_policy =
+        OutboundPolicy::from_env_cached().map_err(|e| s3_error!(InvalidArgument, "invalid outbound policy: {}", e))?;
+    outbound_policy.validate_url(&parsed_endpoint).map_err(|e| {
+        s3_error!(
+            InvalidArgument,
+            "endpoint is not allowed by the outbound policy: {}; review {}; private origins must be listed as exact origins such as {}={} and RustFS restarted (metadata and link-local destinations remain blocked)",
+            e,
+            ENV_OUTBOUND_ALLOW_ORIGINS,
+            ENV_OUTBOUND_ALLOW_ORIGINS,
+            parsed_endpoint.origin().ascii_serialization()
+        )
+    })?;
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -952,4 +965,35 @@ fn to_kvs(kv_map: &HashMap<String, String>) -> rustfs_config::server_config::KVS
         kvs.insert(key.clone(), value.clone());
     }
     kvs
+}
+
+#[cfg(test)]
+mod webhook_request_tests {
+    use super::validate_webhook_request;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn private_webhook_request_is_rejected_with_operator_action() {
+        let config = HashMap::from([("endpoint".to_string(), "http://127.0.0.1:49173/webhook/rustfs".to_string())]);
+
+        let err = validate_webhook_request(&config)
+            .await
+            .expect_err("a loopback webhook must require an explicit outbound allowlist");
+        let message = err
+            .message()
+            .expect("the validation error should explain the operator action");
+
+        assert!(message.contains("RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://127.0.0.1:49173"));
+        assert!(message.contains("RustFS restarted"), "unexpected message: {message}");
+        assert!(!message.contains("/webhook/rustfs"));
+    }
+
+    #[tokio::test]
+    async fn public_webhook_still_passes_outbound_preflight() {
+        let config = HashMap::from([("endpoint".to_string(), "https://hooks.example/webhook".to_string())]);
+
+        validate_webhook_request(&config)
+            .await
+            .expect("a public HTTPS webhook should pass outbound preflight");
+    }
 }
