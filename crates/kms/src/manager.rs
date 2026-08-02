@@ -23,8 +23,10 @@ use crate::error::{KmsError, Result};
 use crate::types::{
     CancelKeyDeletionRequest, CancelKeyDeletionResponse, CreateKeyRequest, CreateKeyResponse,
     DEFAULT_PENDING_DELETION_WINDOW_DAYS, DecryptRequest, DecryptResponse, DeleteKeyRequest, DeleteKeyResponse,
-    DescribeKeyRequest, DescribeKeyResponse, EncryptRequest, EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse,
-    ListKeysRequest, ListKeysResponse, MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext,
+    DescribeDataKeyWrappingRequest, DescribeDataKeyWrappingResponse, DescribeKeyRequest, DescribeKeyResponse, EncryptRequest,
+    EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse, ListKeysRequest, ListKeysResponse,
+    MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext, RewrapDataKeyRequest,
+    RewrapDataKeyResponse,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -165,6 +167,29 @@ impl KmsManager {
     #[hotpath::measure]
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
         self.backend.generate_data_key(request).await
+    }
+
+    /// Re-wrap an existing data key envelope onto the master key's current
+    /// version, leaving the data key — and therefore every object body it
+    /// protects — untouched.
+    ///
+    /// Backends without retained version history reject this with
+    /// [`KmsError::UnsupportedCapability`]; check
+    /// [`Self::backend_capabilities`] before offering it.
+    pub async fn rewrap_data_key(&self, request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        self.backend.rewrap_data_key(request).await
+    }
+
+    /// Report which master key version wraps an existing data key envelope.
+    ///
+    /// The read-only side of [`Self::rewrap_data_key`], and the supported way to
+    /// ask that question: where the version is recorded differs per backend, so
+    /// callers must not inspect envelopes themselves.
+    pub async fn describe_data_key_wrapping(
+        &self,
+        request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        self.backend.describe_data_key_wrapping(request).await
     }
 
     /// Describe a key

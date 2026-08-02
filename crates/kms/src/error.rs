@@ -154,6 +154,15 @@ pub enum KmsError {
         .references.join(", ")
     )]
     KeyStillReferenced { key_id: String, references: Vec<String> },
+
+    /// The only available way to rewrap this envelope would pull the plaintext
+    /// data key into the RustFS process. Refused rather than performed: the
+    /// point of a backend-side rewrap is that the data key stays inside the
+    /// backend, so silently falling back to unwrap-then-rewrap would hand back
+    /// a correct envelope while quietly dropping the property that justified
+    /// the operation.
+    #[error("Cannot rewrap a data key of key {key_id} without exposing its plaintext: {reason}")]
+    RewrapWouldExposePlaintext { key_id: String, reason: String },
 }
 
 impl KmsError {
@@ -326,6 +335,14 @@ impl KmsError {
         Self::BaselineVersionLost {
             key_id: key_id.into(),
             oldest_version,
+        }
+    }
+
+    /// Create a rewrap-would-expose-plaintext error
+    pub fn rewrap_would_expose_plaintext<S1: Into<String>, S2: Into<String>>(key_id: S1, reason: S2) -> Self {
+        Self::RewrapWouldExposePlaintext {
+            key_id: key_id.into(),
+            reason: reason.into(),
         }
     }
 }

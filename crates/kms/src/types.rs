@@ -959,3 +959,80 @@ impl Drop for DataKeyInfo {
         self.clear_plaintext();
     }
 }
+
+/// Request to rewrap an existing data key envelope under the current version of
+/// the master key that already wraps it.
+///
+/// Rewrap changes only the wrapping. The data key inside is never replaced, so
+/// object ciphertext, IV derivation and ETags are untouched — which is what
+/// makes it possible to retire an old master key version without rewriting a
+/// single object body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewrapDataKeyRequest {
+    /// The existing wrapped data key, exactly as it was persisted
+    pub ciphertext: Vec<u8>,
+    /// Encryption context the envelope was created with; the backend rejects
+    /// the request when the envelope's own context is not reproduced here, so a
+    /// caller cannot rewrap an envelope it could not have decrypted
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Request to report where an existing data key envelope sits relative to its
+/// master key's current version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeDataKeyWrappingRequest {
+    /// The existing wrapped data key, exactly as it was persisted
+    pub ciphertext: Vec<u8>,
+    /// Encryption context the envelope was created with, checked exactly as
+    /// [`RewrapDataKeyRequest`] checks it
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Where an existing wrapped data key sits relative to its master key's current
+/// version.
+///
+/// This is the only supported way to ask that question. The answer lives in a
+/// different place for every backend that rotates — a JSON field on the envelope
+/// for Vault KV2, the `vault:vN:` prefix of the ciphertext for Vault Transit,
+/// nowhere at all for backends that do not rotate — and a caller that reached
+/// into the envelope itself would be re-implementing that table, on the wrong
+/// side of the KMS boundary, once per call site.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeDataKeyWrappingResponse {
+    /// Master key wrapping the data key
+    pub key_id: String,
+    /// Version that wrapped the data key, when the backend can name it
+    pub key_version: Option<u32>,
+    /// The master key's current version, when the backend can name it
+    pub current_key_version: Option<u32>,
+    /// Whether the envelope is already wrapped by the current version, which is
+    /// exactly the condition under which a rewrap would be a no-op.
+    ///
+    /// Callers must read this rather than compare the two version fields. A
+    /// backend may leave either version unset while still knowing the answer,
+    /// and the two must never disagree: this flag is what a retirement scan
+    /// counts, and a rewrap sweep that rewrote envelopes the scan already
+    /// considered done would never converge.
+    pub is_current: bool,
+}
+
+/// Result of [`RewrapDataKeyRequest`].
+///
+/// The plaintext data key is deliberately absent: rewrap exists so that the
+/// data key can be re-wrapped without the caller ever holding it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewrapDataKeyResponse {
+    /// The wrapped data key to persist in place of the request's ciphertext.
+    /// Byte-identical to the request when `rewrapped` is false.
+    pub ciphertext: Vec<u8>,
+    /// Master key that wraps the data key; unchanged by a rewrap
+    pub key_id: String,
+    /// Master key version that wrapped the input, when the backend can name it
+    pub source_key_version: Option<u32>,
+    /// Master key version that wraps `ciphertext`, when the backend can name it
+    pub destination_key_version: Option<u32>,
+    /// Whether the wrapping actually changed. False means the input was already
+    /// wrapped by the current version and callers must not persist anything —
+    /// re-running a rewrap sweep has to converge without further writes.
+    pub rewrapped: bool,
+}
