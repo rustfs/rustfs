@@ -48,7 +48,7 @@
 //! published. A crash at any earlier point leaves a bundle without a
 //! manifest, which decodes as an incomplete bundle and can never be restored.
 
-use crate::backends::local::{LocalKmsClient, StoredKeyProtection};
+use crate::backends::local::{LocalKmsClient, StoredKeyProtection, unknown_protection_marker};
 use crate::backup::capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
 use crate::backup::error::BackupError;
 use crate::backup::manifest::{
@@ -376,7 +376,16 @@ async fn collect_snapshot(client: &LocalKmsClient) -> Result<CollectedSnapshot> 
 
         let raw = Zeroizing::new(fs::read(&path).await?);
         // Any unreadable record aborts the export: a bundle silently missing
-        // one key is worse than no bundle at all.
+        // one key is worse than no bundle at all. The protection marker is
+        // classified first so a record from a newer build keeps its own
+        // verdict — an operator who reads "material corrupt" starts a
+        // disaster recovery for what is only a version mismatch.
+        let unknown_marker = unknown_protection_marker(&raw).map_err(|error| {
+            KmsError::material_corrupt(&stem, format!("stored key record is not a readable JSON object: {error}"))
+        })?;
+        if let Some(version) = unknown_marker {
+            return Err(KmsError::unsupported_format_version(&stem, version));
+        }
         let probe: StoredRecordProbe = serde_json::from_slice(&raw)
             .map_err(|error| KmsError::material_corrupt(&stem, format!("stored key record does not deserialize: {error}")))?;
         if probe.key_id != stem {
@@ -1114,5 +1123,31 @@ mod tests {
             .await
             .expect_err("identity mismatch must abort the export");
         assert!(matches!(error, KmsError::InvalidKey { .. }), "got {error:?}");
+    }
+
+    /// A record written by a newer build must abort the export as an
+    /// unsupported format, not as corrupt material: the two verdicts send the
+    /// operator down completely different runbooks, and only one of them is
+    /// true here.
+    #[tokio::test]
+    async fn record_from_a_newer_build_aborts_export_as_unsupported_format() {
+        let (client, _key_dir) = encrypted_client().await;
+        client.create_key("alpha", "AES_256", None).await.expect("create key");
+
+        let record_path = client.key_directory().join("alpha.key");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode record")).expect("write record");
+
+        let bundle = TempDir::new().expect("bundle dir");
+        let error = export_local_backup(&client, &test_kek(), &export_request(bundle.path().join("bundle")))
+            .await
+            .expect_err("an uninterpretable record must abort the export");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "alpha" && version == "post-quantum-v2"),
+            "got {error:?}"
+        );
     }
 }

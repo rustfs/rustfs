@@ -480,6 +480,36 @@ pub(crate) enum StoredKeyProtection {
     PlaintextDevOnly,
 }
 
+/// The record's `at_rest_protection` value when this build cannot interpret
+/// it, rendered for diagnostics. `Ok(None)` means the marker is absent
+/// (pre-beta.9 records) or names a protection mode this build implements.
+///
+/// Every reader of a stored key record must consult this before its own
+/// schema parse. Letting a strict [`StoredKeyProtection`] field fail inside a
+/// larger struct collapses "written by a newer build" into "corrupt", and an
+/// operator who reads corruption starts a disaster recovery instead of a
+/// version rollback. The probe deliberately ignores every other field, so the
+/// verdict is available even for records whose schema this build cannot
+/// satisfy, and no key material is copied out of the caller's buffer.
+///
+/// `Err` carries the JSON error so callers can keep their own classification
+/// for bytes that are not a record at all.
+pub(crate) fn unknown_protection_marker(record: &[u8]) -> serde_json::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct MarkerProbe {
+        #[serde(default)]
+        at_rest_protection: Option<serde_json::Value>,
+    }
+
+    let Some(marker) = serde_json::from_slice::<MarkerProbe>(record)?.at_rest_protection else {
+        return Ok(None);
+    };
+    if serde_json::from_value::<StoredKeyProtection>(marker.clone()).is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(marker.as_str().map(str::to_owned).unwrap_or_else(|| marker.to_string())))
+}
+
 /// Serializable representation of a master key stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMasterKey {
@@ -741,10 +771,18 @@ impl LocalKmsClient {
     /// real problem (restore the salt file or the whole directory) instead of
     /// a generic decrypt failure.
     ///
-    /// Files that do not parse are ignored here — startup key validation
-    /// reports them with their own errors right after. Legacy pre-marker files
-    /// are also ignored: pre-beta.9 directories legitimately have no salt file
-    /// yet, and an empty directory must keep initializing as before.
+    /// A record this build cannot read or cannot interpret blocks generation
+    /// just as hard. Skipping it would publish a fresh salt over a directory
+    /// whose protection state is unknown, and that publication is
+    /// irreversible in the only way that matters: the next startup finds a
+    /// salt file, never re-enters this guard, and the evidence that the real
+    /// salt was missing is gone. Every record this rejects also fails startup
+    /// key validation a few lines later, so no directory that initializes
+    /// today stops initializing — the salt is simply no longer written first.
+    ///
+    /// Legacy pre-marker files stay allowed: they parse here, pre-beta.9
+    /// directories legitimately have no salt file yet, and an empty directory
+    /// must keep initializing as before.
     async fn ensure_missing_salt_can_be_generated(config: &LocalConfig) -> Result<()> {
         #[derive(Deserialize)]
         struct ProtectionProbe {
@@ -758,12 +796,23 @@ impl LocalKmsClient {
             if path.extension().is_none_or(|extension| extension != "key") {
                 continue;
             }
-            let Ok(content) = fs::read(&path).await else {
-                continue;
-            };
-            let Ok(probe) = serde_json::from_slice::<ProtectionProbe>(&content) else {
-                continue;
-            };
+            let content = fs::read(&path).await.map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} cannot be read ({error}); \
+                     refusing to generate a replacement salt while a record's protection state is unknown",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
+            let probe = serde_json::from_slice::<ProtectionProbe>(&content).map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} is not interpretable by this build ({error}); \
+                     refusing to generate a replacement salt — restore the salt file from backup, or run a build that \
+                     understands the record",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
             if probe.at_rest_protection == StoredKeyProtection::EncryptedMasterKey {
                 return Err(KmsError::configuration_error(format!(
                     "Local KMS master key salt at {} is missing but {} is marked encrypted-master-key; \
@@ -805,15 +854,12 @@ impl LocalKmsClient {
         // Two-stage parse so an unrecognised protection marker is reported as an
         // unsupported format (a newer build may still read the key) instead of being
         // folded into generic corruption with every other malformed record.
-        let raw: serde_json::Value = serde_json::from_slice(&content)
-            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not valid JSON: {e}")))?;
-        if let Some(marker) = raw.get("at_rest_protection")
-            && serde_json::from_value::<StoredKeyProtection>(marker.clone()).is_err()
-        {
-            let version = marker.as_str().map(str::to_owned).unwrap_or_else(|| marker.to_string());
+        let unknown_marker = unknown_protection_marker(&content)
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not a readable JSON object: {e}")))?;
+        if let Some(version) = unknown_marker {
             return Err(KmsError::unsupported_format_version(key_id, version));
         }
-        let stored_key: StoredMasterKey = serde_json::from_value(raw)
+        let stored_key: StoredMasterKey = serde_json::from_slice(&content)
             .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record does not deserialize: {e}")))?;
         if stored_key.key_id != key_id {
             return Err(KmsError::invalid_key(format!(
@@ -1254,16 +1300,21 @@ impl LocalKmsClient {
         // by the requested limit rather than by the size of the key set.
         let mut keys = Vec::with_capacity(page.items.len());
         for key_id in page.items {
-            // A key that vanished or cannot be decoded is dropped from the page
-            // instead of failing it: concurrent removal is normal, and the
-            // cursor is derived from the identifier list, so the listing still
-            // advances past it.
             let key_info = match self.describe_key(key_id, None).await {
                 Ok(key_info) => key_info,
-                Err(error) => {
-                    debug!(key_id, %error, "skipping unreadable key while listing");
+                // A key that vanished between the scan and the read is dropped
+                // from the page: concurrent removal is normal, and the cursor
+                // is derived from the identifier list, so the listing still
+                // advances past it.
+                Err(KmsError::KeyNotFound { .. }) => {
+                    debug!(key_id, "skipping key removed while listing");
                     continue;
                 }
+                // Anything else means the record is still there and this build
+                // cannot interpret it. Dropping it would answer "these are
+                // your keys" with a set that silently omits one, and the
+                // deletion sweep would count a census it never fully saw.
+                Err(error) => return Err(error),
             };
 
             if let Some(ref status_filter) = request.status_filter
@@ -2960,6 +3011,129 @@ mod tests {
             vec!["sealed-key.key".to_string()],
             "the failed startup must not modify the key directory"
         );
+    }
+
+    /// The salt guard must fail closed on every record it cannot interpret,
+    /// not just on the ones that spell out `encrypted-master-key`.
+    ///
+    /// Skipping such a record publishes a fresh salt, and that write is the
+    /// irreversible step: the next startup sees a salt file, never re-enters
+    /// the guard, and the only signal that the real salt was lost is gone.
+    /// Every input below also fails startup key validation, so this rejects
+    /// nothing that used to initialize — it only stops the salt from being
+    /// written before that failure.
+    #[tokio::test]
+    async fn missing_salt_with_uninterpretable_key_records_fails_closed_without_generating_a_salt() {
+        let (client, temp_dir) = create_test_client().await;
+        client.create_key("sealed-key", "AES_256", None).await.expect("create key");
+        let config = client.config.clone();
+        let key_path = client.master_key_path("sealed-key").expect("valid key id");
+        let salt_path = LocalKmsClient::master_key_salt_path(&config);
+        let pristine: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key file")).expect("decode record");
+        drop(client);
+
+        let mut newer_build_record = pristine.clone();
+        newer_build_record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        let newer_build_record = serde_json::to_vec_pretty(&newer_build_record).expect("encode record");
+        let truncated = {
+            let bytes = serde_json::to_vec_pretty(&pristine).expect("encode record");
+            bytes[..bytes.len() / 2].to_vec()
+        };
+
+        for (name, content) in [
+            ("record from a newer build", newer_build_record),
+            ("record that does not decode", truncated),
+        ] {
+            fs::write(&key_path, &content).await.expect("write record");
+            fs::remove_file(&salt_path).await.ok();
+
+            let error = match LocalKmsClient::new(config.clone()).await {
+                Ok(_) => panic!("{name}: a missing salt must not be papered over"),
+                Err(error) => error,
+            };
+            // Asserted first: publishing a replacement salt is the
+            // irreversible step, and it happens before any error is produced.
+            assert!(!salt_path.exists(), "{name}: a replacement salt must never be generated");
+            assert!(
+                matches!(error, KmsError::ConfigurationError { .. }),
+                "{name}: expected a salt-specific configuration error, got {error:?}"
+            );
+            assert!(error.to_string().contains("salt"), "{name}: error must point at the salt: {error}");
+            assert_eq!(
+                sorted_dir_file_names(temp_dir.path()).await,
+                vec!["sealed-key.key".to_string()],
+                "{name}: the failed startup must not modify the key directory"
+            );
+        }
+    }
+
+    /// Compatibility floor for the guard above: a record written before the
+    /// protection marker existed carries no marker at all, and such a
+    /// directory legitimately has no salt yet. It must keep initializing.
+    /// A record this build cannot interpret must not be edited out of a
+    /// listing. The page would claim to describe the key set while omitting a
+    /// key that is still on disk, and the deletion sweep — which counts the
+    /// lifecycle gauges out of the pages it lists — would report a census it
+    /// never fully saw as complete.
+    #[tokio::test]
+    async fn list_keys_fails_closed_on_a_record_it_cannot_interpret() {
+        let (client, _temp_dir) = create_test_client().await;
+        client.create_key("alpha", "AES_256", None).await.expect("create alpha");
+        client.create_key("beta", "AES_256", None).await.expect("create beta");
+
+        let key_path = client.master_key_path("beta").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a listing must not quietly omit a key it cannot read");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "beta" && version == "post-quantum-v2"),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_salt_with_pre_marker_key_records_still_initializes() {
+        let (dev_client, temp_dir) = create_dev_mode_client().await;
+        dev_client
+            .create_key("pre-marker-key", "AES_256", None)
+            .await
+            .expect("create key");
+        let key_path = dev_client.master_key_path("pre-marker-key").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key file")).expect("decode record");
+        drop(dev_client);
+
+        // Pre-beta.9 records carry no protection marker at all, and their
+        // directories legitimately hold no salt file yet.
+        record
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("at_rest_protection");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        let client = LocalKmsClient::new(test_config(temp_dir.path()))
+            .await
+            .expect("a pre-marker directory must keep initializing");
+        assert!(
+            LocalKmsClient::master_key_salt_path(&client.config).exists(),
+            "first-time salt creation must still happen"
+        );
+        client
+            .describe_key("pre-marker-key", None)
+            .await
+            .expect("the pre-marker record must stay readable");
     }
 
     #[tokio::test]
