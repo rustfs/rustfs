@@ -43,17 +43,43 @@ Two consequences follow, and both are contract requirements:
 - **The resume cursor is a performance optimization, not a correctness dependency.** Losing a checkpoint may cause a rescan and a higher skip count, never a wrong result. This is what makes crash recovery cheap: checkpoints may be throttled rather than written per object, following the `PersistThrottle` policy in `crates/heal/src/heal/resume.rs`, which flushes after a bounded number of buffered mutations or a bounded interval, whichever comes first. That module states the same reasoning for heal: because the operation is idempotent, a crash re-does at most one throttle window.
 - **The job is at-least-once with target-state idempotency, never exactly-once.** No design may introduce exactly-once machinery for work units.
 
-### The KEK version witness is missing today
+### Reading the wrapping KEK version
 
-The self-evidencing property above holds only when the target state is observable. Today it is not, for the common case.
+The self-evidencing property above holds only when the wrapping KEK version is observable. It is, for every backend that actually rotates, but not from a dedicated metadata field and not by the same mechanism on each backend.
 
-Object metadata records the key **id** (`x-rustfs-encryption-key-id` in `rustfs/src/storage/sse.rs`, defaulting to `default`) and the sealed key blob, but there is no key **version** field: no metadata key naming a KEK version exists anywhere in the tree. The unwrap path cannot recover it either — `EncryptResponse` in `crates/kms/src/types.rs` carries `key_version`, but `DecryptResponse` does not.
+There is no key-version metadata key: object metadata carries the key **id** (`x-rustfs-encryption-key-id` in `rustfs/src/storage/sse.rs`, defaulting to `default`) and the sealed blob under `x-rustfs-encryption-key`, and nothing else names a version. `DecryptResponse` in `crates/kms/src/types.rs` does not report one either, though `EncryptResponse` does.
 
-So for a rekey that moves objects to a newer version of the **same** key id, which is the ordinary rotation case, the metadata before and after the re-wrap is indistinguishable in every field a scanner can read. Only a rekey that changes the key id is self-evidencing today.
+The version is nonetheless recoverable, because the sealed blob is structured. `x-rustfs-encryption-key` stores the base64 of the backend ciphertext, and for every backend that builds one that ciphertext is the JSON of `DataKeyEnvelope` (`crates/kms/src/encryption/dek.rs`). Reading it needs no new metadata: base64-decode the value, then parse the JSON. The read path in `rustfs/src/storage/sse.rs` already does exactly this discrimination, calling `is_data_key_envelope` on the decoded blob to pick a provider, so this is an established in-tree pattern rather than a new capability.
 
-This does not make the job unsafe: re-wrapping an already-current envelope is harmless and converges. What it breaks is everything that depends on *recognizing* the target state — a second run cannot skip completed work and cannot reach zero metadata writes, a dry run cannot report which KEK versions are in scope, and no job can produce evidence that it finished.
+Where the version sits inside that structure is backend-specific:
 
-Therefore this contract places one requirement on the re-wrap primitive, and it is the only interface both sides must agree on: **the primitive must record the KEK version it sealed under as a durable, readable part of the envelope, and must be able to report "already at target state" as a distinct outcome from "re-wrapped".** A rekey job built on a primitive that cannot do this satisfies neither idempotent-skip nor completion-evidence, and must not be built.
+| Backend | Rotates | Where the wrapping version lives | Recoverable by a scan |
+|---|---|---|---|
+| Vault KV2 (`crates/kms/src/backends/vault.rs`) | Yes | `DataKeyEnvelope::master_key_version`, populated from the key record's version | Yes, from the envelope JSON |
+| Vault Transit (`crates/kms/src/backends/vault_transit.rs`) | Yes | The `vault:vN:` prefix of the ciphertext held in the envelope's `encrypted_key`; the envelope's own version field is deliberately `None` because Transit ciphertext self-describes | Yes, by parsing that prefix |
+| Local (`crates/kms/src/backends/local.rs`) | No — rotation is rejected | Nowhere; the version field is hardcoded `None` because a key has exactly one material | Moot while rotation is rejected |
+| Static (`crates/kms/src/backends/static_kms.rs`) | No — single fixed key | Nowhere; hardcoded `None` | Moot |
+| AWS (`crates/kms/src/backends/aws.rs`) | AWS-managed | Inside the opaque `CiphertextBlob`; no `DataKeyEnvelope` is built at all | **No** |
+
+Two traps follow, and both are contract rules.
+
+**`None` does not mean one thing.** On Vault KV2 it means a pre-versioning envelope, and `resolve_envelope_master_key_version` resolves it to the key's recorded baseline version, or to the current version for a key that was never rotated — never implicitly to whatever is current now. On Transit it is permanent and expected, and the version must be read from the ciphertext prefix instead. On Local and Static it is unconditional. A scan that reads `None` as a single condition will misclassify three different situations, so version extraction must be dispatched by backend, never inferred from the field alone.
+
+**Local's `None` is coupled to the blocker below.** The Local backend omits the version specifically because rotation is rejected there. When [`rustfs/backlog#1565`](https://github.com/rustfs/backlog/issues/1565) gives Local a rotation history, that construction must begin recording the wrapping version in the same change, or Local silently becomes a second unreadable backend and loses idempotent skip along with it. This coupling is not obvious from either issue and must not be discovered later.
+
+The requirement this places on the re-wrap primitive is therefore narrower than "record a version", most of which the tree already satisfies:
+
+- The primitive must expose the wrapping version through **one backend-dispatched accessor**. The knowledge is currently split between an envelope field and a ciphertext-prefix convention documented only in a comment and pinned by backend tests. A rekey job driving this from ecstore must not reimplement per-backend parsing, which would also put KMS format knowledge on the wrong side of the crate boundary.
+- The primitive must report **"already at target state" as an outcome distinct from "re-wrapped"**, so the job counts a skip instead of inferring one.
+- For AWS, neither is achievable by inspection, and the contract must say so rather than pretend otherwise (see below).
+
+### The cost of recognizing the target state
+
+Skipping already-current objects is achievable, and it is not free. Every scanned work unit costs a base64 decode plus a JSON parse of its envelope, and on Transit an additional prefix parse. That is CPU and allocation per object version, not extra I/O: the metadata is already being read by the scan, and no KMS round trip is involved. Envelopes are small, so the cost is bounded per object, but at bulk scale it is the dominant cost of a dry run and of the skip check in a re-run, and it belongs in the rate and admission budget rather than being treated as free.
+
+This cost buys three things, all of which the contract requires and none of which are available without it: a re-run that skips completed work and performs zero metadata writes, a dry run that reports which KEK versions are actually in scope, and the per-object half of completion evidence.
+
+**AWS is the exception, and it is a scoping exception rather than a cost.** Its ciphertext is opaque to RustFS, so no inspection can tell a current envelope from a stale one. A rekey scope on an AWS-backed key therefore cannot skip, cannot report version composition in a dry run, and cannot self-evidence completion; a re-run would re-wrap every object again. AWS also rotates backing key material transparently on decrypt, so the operational need that motivates this job is weaker there to begin with. Until there is a reason to do otherwise, AWS-backed keys are out of scope for bulk rekey, and a job must refuse such a scope at admission rather than start one whose re-runs silently rewrite everything.
 
 ## Failure Semantics
 
@@ -138,7 +164,7 @@ Rekey must inherit that discipline. An empty result means nothing was found in t
 
 **Hard blocker — no execution path may be implemented until this closes.** [`rustfs/backlog#1565`](https://github.com/rustfs/backlog/issues/1565), specifically the absence of rotation history in the Local backend. `crates/kms/src/backup/local_restore.rs` records this in its own out-of-scope note: remapping stable key ids would require proving that object envelopes migrate in lockstep, bulk rekey is a non-goal there, and Local has no rotation history. If superseded versions are not retained, a rekey interrupted halfway leaves every unprocessed object permanently unreadable after rotation, which falsifies the partial-completion guarantee this entire contract is built on.
 
-**Hard blocker — the job has nothing to drive without it.** The single-object re-wrap primitive does not exist. The tree's only re-wrap today is the backup KEK re-wrap in `crates/kms/src/backup/local_export.rs`, which is unrelated. The primitive must be callable per `(bucket, object, versionId)`, must be idempotent, must distinguish "already at target state", and must satisfy the KEK version witness requirement stated above.
+**Hard blocker — the job has nothing to drive without it.** The single-object re-wrap primitive does not exist. The tree's only re-wrap today is the backup KEK re-wrap in `crates/kms/src/backup/local_export.rs`, which is unrelated. The primitive must be callable per `(bucket, object, versionId)`, must be idempotent, must distinguish "already at target state", and must expose the wrapping KEK version through the single backend-dispatched accessor described above.
 
 **Affects acceptance, not start.** Key usage inventory coverage over object envelopes, without which completion cannot be proven. KMS key list pagination, which a job enumerating keys would hit. And [`rustfs/backlog#1619`](https://github.com/rustfs/backlog/issues/1619), which decides replica propagation.
 
@@ -146,4 +172,4 @@ Rekey must inherit that discipline. An empty result means nothing was found in t
 
 For this docs-only contract, the architecture guard scripts must pass and no Rust source, Cargo metadata, CI workflow, Makefile, or runtime config may change.
 
-Implementation work under this contract must be able to demonstrate, at minimum: that dry run performs zero storage writes; that non-rekeyable objects are excluded and counted rather than failing the job; that an immediate second run skips every object and writes no metadata; that deleting the checkpoint changes only the skip count, not the outcome; that a killed and recovered job reaches a terminal state while every object remains readable throughout; that a concurrent writer causes a conflict-and-skip rather than an overwrite; that ETag, part layout, and storage usage are unchanged at the `xl.meta` level; that each version of a multi-version object is processed independently with its `versionId` intact; that superseded key versions still exist and still decrypt afterward; and that success, skip, exclusion, conflict, and failure counts sum to the number of work units scanned.
+Implementation work under this contract must be able to demonstrate, at minimum: that dry run performs zero storage writes; that non-rekeyable objects are excluded and counted rather than failing the job; that an immediate second run skips every object and writes no metadata, on both a KV2-backed and a Transit-backed scope, since the two recover the wrapping version by different mechanisms; that a scope on an AWS-backed key is refused at admission rather than accepted as a job whose re-runs rewrite everything; that an envelope with no recorded version is classified by backend rather than by the bare `None`; that deleting the checkpoint changes only the skip count, not the outcome; that a killed and recovered job reaches a terminal state while every object remains readable throughout; that a concurrent writer causes a conflict-and-skip rather than an overwrite; that ETag, part layout, and storage usage are unchanged at the `xl.meta` level; that each version of a multi-version object is processed independently with its `versionId` intact; that superseded key versions still exist and still decrypt afterward; and that success, skip, exclusion, conflict, and failure counts sum to the number of work units scanned.
