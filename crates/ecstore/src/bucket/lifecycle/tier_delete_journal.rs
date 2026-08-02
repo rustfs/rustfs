@@ -345,6 +345,30 @@ where
     remove_tier_delete_journal_entry(api, je).await
 }
 
+pub async fn abort_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
+    let name = tier_delete_journal_object_name(je);
+    let (data, metadata) = match config_boundary::read_config_with_metadata(api.clone(), &name, &ObjectOptions::default()).await {
+        Ok(result) => result,
+        Err(Error::ConfigNotFound) | Err(Error::FileNotFound) => return Ok(()),
+        Err(err) => return Err(std::io::Error::other(err)),
+    };
+    let current = decode_tier_delete_journal_entry(&data).map_err(std::io::Error::other)?;
+    if current.state != TierDeleteJournalState::Prepared {
+        return Ok(());
+    }
+    let etag = metadata
+        .etag
+        .ok_or_else(|| std::io::Error::other("prepared tier delete journal has no entity tag"))?;
+    match config_boundary::delete_config_if_match(api, &name, &etag).await {
+        Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
+        Err(Error::PreconditionFailed) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "prepared tier delete journal changed before abort",
+        )),
+        Err(err) => Err(std::io::Error::other(err)),
+    }
+}
+
 pub(crate) async fn enqueue_committed_tier_delete_journal_entry(je: &Jentry) -> std::io::Result<()> {
     let expiry_state = runtime_boundary::expiry_state_handle();
     expiry_state.write().await.enqueue_tier_journal_entry(je)

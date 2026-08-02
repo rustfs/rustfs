@@ -15,10 +15,13 @@
 use super::*;
 use crate::bucket::lifecycle::{
     tier_delete_journal::{
-        abort_tier_delete_journal_entry, commit_tier_delete_journal_entry, enqueue_committed_tier_delete_journal_entry,
-        persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
+        abort_prepared_tier_delete_journal_entry as abort_prepared_journal_entry_if_current, commit_tier_delete_journal_entry,
+        enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
+        record_tier_delete_journal_backend_identity,
     },
-    tier_sweeper::{Jentry, transitioned_delete_journal_entry_for_source},
+    tier_sweeper::{
+        Jentry, attach_tier_delete_source, transitioned_delete_journal_entry_for_source, transitioned_force_delete_journal_entry,
+    },
 };
 use crate::bucket::replication::ReplicationObjectBridge;
 use crate::disk::OldCurrentSize;
@@ -40,6 +43,8 @@ use std::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 
+const FORCE_DELETE_LIST_PAGE_SIZE: i32 = 1_000;
+
 fn build_tier_delete_journal_entry(
     bucket: &str,
     object: &str,
@@ -48,14 +53,21 @@ fn build_tier_delete_journal_entry(
 ) -> Result<Option<Jentry>> {
     let version_id = opts.version_id.as_deref().map(Uuid::parse_str).transpose()?;
     let source_object = decode_dir_object(object);
-    let Some(mut je) = transitioned_delete_journal_entry_for_source(
-        version_id,
-        opts.versioned,
-        opts.version_suspended,
-        bucket,
-        source_object.as_str(),
-        source,
-    ) else {
+    let Some(mut je) = (if opts.delete_prefix {
+        transitioned_force_delete_journal_entry(&source.transitioned_object, source.transition_version_state).map(|mut je| {
+            attach_tier_delete_source(&mut je, bucket, source_object.as_str(), source, opts.versioned, opts.version_suspended);
+            je
+        })
+    } else {
+        transitioned_delete_journal_entry_for_source(
+            version_id,
+            opts.versioned,
+            opts.version_suspended,
+            bucket,
+            source_object.as_str(),
+            source,
+        )
+    }) else {
         return Ok(None);
     };
     record_tier_delete_journal_backend_identity(&mut je, &source.user_defined).map_err(Error::other)?;
@@ -79,13 +91,19 @@ async fn prepare_tier_delete_journal_entry(
 }
 
 async fn abort_prepared_tier_delete_journal_entry(api: &Arc<ECStore>, je: &Jentry) {
-    if let Err(err) = abort_tier_delete_journal_entry(Arc::clone(api), je).await {
+    if let Err(err) = abort_prepared_journal_entry_if_current(Arc::clone(api), je).await {
         warn!(
             object = %je.obj_name,
             tier = %je.tier_name,
             error = ?err,
             "failed to remove aborted tier delete journal"
         );
+    }
+}
+
+async fn abort_prepared_tier_delete_journal_entries(api: &Arc<ECStore>, entries: &[Jentry]) {
+    for entry in entries {
+        abort_prepared_tier_delete_journal_entry(api, entry).await;
     }
 }
 
@@ -108,6 +126,96 @@ async fn commit_prepared_tier_delete_journal_entry(api: &Arc<ECStore>, je: &Jent
             error = ?err,
             "tier delete journal committed but could not be queued; recovery will retry"
         );
+    }
+}
+
+async fn commit_prepared_tier_delete_journal_entries(api: &Arc<ECStore>, entries: &[Jentry]) {
+    for entry in entries {
+        commit_prepared_tier_delete_journal_entry(api, entry).await;
+    }
+}
+
+async fn prepare_prefix_tier_delete_journal_entries(
+    api: &Arc<ECStore>,
+    bucket: &str,
+    prefix: &str,
+    opts: &ObjectOptions,
+) -> Result<Vec<Jentry>> {
+    let mut marker = None;
+    let mut version_marker = None;
+    let mut entries = Vec::new();
+
+    loop {
+        let page = Arc::clone(api)
+            .list_object_versions_for_lifecycle(
+                bucket,
+                prefix,
+                marker.clone(),
+                version_marker.clone(),
+                None,
+                FORCE_DELETE_LIST_PAGE_SIZE,
+            )
+            .await?;
+
+        for source in page.objects {
+            if let Some(entry) = build_tier_delete_journal_entry(bucket, &source.name, opts, &source)? {
+                entries.push(entry);
+            }
+        }
+
+        if !page.is_truncated {
+            break;
+        }
+
+        let next_marker = page
+            .next_marker
+            .ok_or_else(|| Error::other("truncated force delete listing has no next marker"))?;
+        let next_version_marker = page.next_version_idmarker;
+        if marker.as_deref() == Some(next_marker.as_str()) && version_marker == next_version_marker {
+            return Err(Error::other("force delete listing marker did not advance"));
+        }
+        marker = Some(next_marker);
+        version_marker = next_version_marker;
+    }
+
+    let mut persisted = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Err(err) = persist_tier_delete_journal_entry(Arc::clone(api), &entry).await {
+            abort_prepared_tier_delete_journal_entries(api, &persisted).await;
+            return Err(Error::other(err));
+        }
+        persisted.push(entry);
+    }
+    Ok(persisted)
+}
+
+async fn delete_prefix_with_tier_delete_journal(
+    store: &ECStore,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    tier_journal_api: Option<&Arc<ECStore>>,
+) -> Result<()> {
+    let journal_entry = if let Some(api) = tier_journal_api {
+        Some(prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?)
+    } else {
+        None
+    };
+
+    let result = store.delete_prefix(bucket, object, opts).await;
+    match result {
+        Ok(()) => {
+            if let (Some(api), Some(entries)) = (tier_journal_api, journal_entry.as_ref()) {
+                commit_prepared_tier_delete_journal_entries(api, entries).await;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let (Some(api), Some(entries)) = (tier_journal_api, journal_entry.as_ref()) {
+                abort_prepared_tier_delete_journal_entries(api, entries).await;
+            }
+            Err(err)
+        }
     }
 }
 
@@ -1227,7 +1335,7 @@ impl ECStore {
         if opts.delete_prefix && !opts.delete_prefix_object {
             // Prefix deletes cover multiple object keys; an exact lock on the prefix string
             // would not protect child objects.
-            self.delete_prefix(bucket, object, &opts).await?;
+            delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
 
@@ -1239,7 +1347,7 @@ impl ECStore {
         };
 
         if opts.delete_prefix {
-            self.delete_prefix(bucket, object, &opts).await?;
+            delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
 
