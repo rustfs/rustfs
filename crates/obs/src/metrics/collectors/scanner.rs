@@ -20,38 +20,13 @@
 //! directory scans, and object scans.
 
 use crate::metrics::report::PrometheusMetric;
-use crate::metrics::schema::scanner::{
-    SCANNER_ACTIVE_PATHS_MD, SCANNER_BITROT_CYCLE_ENABLED_MD, SCANNER_BITROT_CYCLE_SECONDS_MD, SCANNER_BUCKET_SCANS_FAILED_MD,
-    SCANNER_BUCKET_SCANS_FINISHED_MD, SCANNER_BUCKET_SCANS_STARTED_MD, SCANNER_COMPLETED_CYCLES_MD,
-    SCANNER_CURRENT_CYCLE_AGE_SECONDS_MD, SCANNER_CURRENT_CYCLE_BUCKET_DRIVE_FAILURES_MD,
-    SCANNER_CURRENT_CYCLE_BUCKET_DRIVE_SCANS_MD, SCANNER_CURRENT_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD,
-    SCANNER_CURRENT_CYCLE_DIRECTORIES_PER_SECOND_MD, SCANNER_CURRENT_CYCLE_DIRECTORIES_SCANNED_MD,
-    SCANNER_CURRENT_CYCLE_HEAL_OBJECTS_MD, SCANNER_CURRENT_CYCLE_ILM_ACTIONS_MD, SCANNER_CURRENT_CYCLE_MD,
-    SCANNER_CURRENT_CYCLE_OBJECTS_PER_SECOND_MD, SCANNER_CURRENT_CYCLE_OBJECTS_SCANNED_MD,
-    SCANNER_CURRENT_CYCLE_REPLICATION_CHECKS_MD, SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD,
-    SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_EVENTS_MD, SCANNER_CURRENT_CYCLE_USAGE_SAVES_MD,
-    SCANNER_CURRENT_CYCLE_YIELD_DURATION_SECONDS_MD, SCANNER_CURRENT_CYCLE_YIELD_EVENTS_MD,
-    SCANNER_CURRENT_DISK_BUCKET_SCANS_ACTIVE_MD, SCANNER_CURRENT_DISK_BUCKET_SCANS_QUEUED_MD,
-    SCANNER_CURRENT_DISK_SCAN_CONCURRENCY_LIMIT_MD, SCANNER_CURRENT_SCAN_MODE_MD, SCANNER_CURRENT_SET_SCAN_CONCURRENCY_LIMIT_MD,
-    SCANNER_CURRENT_SET_SCANS_ACTIVE_MD, SCANNER_CURRENT_SET_SCANS_QUEUED_MD, SCANNER_CYCLE_INTERVAL_SECONDS_MD,
-    SCANNER_CYCLE_MAX_DIRECTORIES_MD, SCANNER_CYCLE_MAX_DURATION_SECONDS_MD, SCANNER_CYCLE_MAX_OBJECTS_MD,
-    SCANNER_DIRECTORIES_SCANNED_MD, SCANNER_FAILED_CYCLES_MD, SCANNER_LAST_ACTIVITY_SECONDS_MD,
-    SCANNER_LAST_CYCLE_BUCKET_DRIVE_FAILURES_MD, SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_MD,
-    SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD, SCANNER_LAST_CYCLE_DIRECTORIES_PER_SECOND_MD,
-    SCANNER_LAST_CYCLE_DIRECTORIES_SCANNED_MD, SCANNER_LAST_CYCLE_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_HEAL_OBJECTS_MD,
-    SCANNER_LAST_CYCLE_ILM_ACTIONS_MD, SCANNER_LAST_CYCLE_OBJECTS_PER_SECOND_MD, SCANNER_LAST_CYCLE_OBJECTS_SCANNED_MD,
-    SCANNER_LAST_CYCLE_PARTIAL_REASON_MD, SCANNER_LAST_CYCLE_REPLICATION_CHECKS_MD, SCANNER_LAST_CYCLE_RESULT_MD,
-    SCANNER_LAST_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_THROTTLE_SLEEP_EVENTS_MD,
-    SCANNER_LAST_CYCLE_USAGE_SAVES_MD, SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_YIELD_EVENTS_MD,
-    SCANNER_OBJECTS_SCANNED_MD, SCANNER_OLDEST_ACTIVE_PATH_AGE_SECONDS_MD, SCANNER_PARTIAL_CYCLES_BY_REASON_MD,
-    SCANNER_PARTIAL_CYCLES_MD, SCANNER_SUPERSEDED_CYCLES_MD, SCANNER_THROTTLE_IDLE_MODE_ENABLED_MD,
-    SCANNER_THROTTLE_MAX_SLEEP_SECONDS_MD, SCANNER_THROTTLE_SLEEP_FACTOR_MD, SCANNER_VERSIONS_SCANNED_MD,
-    SCANNER_YIELD_EVERY_N_OBJECTS_MD,
-};
+use crate::metrics::schema::scanner::*;
 
 /// Scanner statistics.
 #[derive(Debug, Clone, Default)]
 pub struct ScannerStats {
+    /// Server identifier
+    pub server: String,
     /// Number of bucket-drive scans finished
     pub bucket_scans_finished: u64,
     /// Number of bucket-drive scans started
@@ -190,6 +165,24 @@ pub struct ScannerStats {
     pub partial_cycles_objects: u64,
     /// Number of scanner cycles stopped by directory budget
     pub partial_cycles_directories: u64,
+    /// Lifetime source work snapshots
+    pub source_work: Vec<ScannerSourceWorkStats>,
+    /// Current cycle source work snapshots
+    pub current_cycle_source_work: Vec<ScannerSourceWorkStats>,
+    /// Last cycle source work snapshots
+    pub last_cycle_source_work: Vec<ScannerSourceWorkStats>,
+}
+
+/// Scanner source-work metrics for a source.
+#[derive(Debug, Clone, Default)]
+pub struct ScannerSourceWorkStats {
+    pub source: String,
+    pub checked: u64,
+    pub queued: u64,
+    pub executed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub missed: u64,
 }
 
 /// Collects scanner metrics from the given stats.
@@ -197,7 +190,43 @@ pub struct ScannerStats {
 /// Uses the metric descriptors from `metrics_type::scanner` module.
 /// Returns a vector of Prometheus metrics for scanner statistics.
 pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
-    vec![
+    fn push_source_work_metric(
+        metrics: &mut Vec<PrometheusMetric>,
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        server: &str,
+        source: &str,
+        state: &str,
+        value: u64,
+        cycle_scope: Option<&str>,
+    ) {
+        let mut metric = PrometheusMetric::from_descriptor(descriptor, value as f64).with_label_owned(SERVER_LABEL, server.to_string());
+        if let Some(cycle_scope) = cycle_scope {
+            metric = metric.with_label_owned(CYCLE_SCOPE_LABEL, cycle_scope.to_string());
+        }
+        metric = metric
+            .with_label_owned(SOURCE_LABEL, source.to_string())
+            .with_label_owned(STATE_LABEL, state.to_string());
+        metrics.push(metric);
+    }
+
+    fn push_source_work_metrics(
+        metrics: &mut Vec<PrometheusMetric>,
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        server: &str,
+        source_work: &[ScannerSourceWorkStats],
+        cycle_scope: Option<&str>,
+    ) {
+        for work in source_work {
+            push_source_work_metric(metrics, descriptor, server, &work.source, "checked", work.checked, cycle_scope);
+            push_source_work_metric(metrics, descriptor, server, &work.source, "queued", work.queued, cycle_scope);
+            push_source_work_metric(metrics, descriptor, server, &work.source, "executed", work.executed, cycle_scope);
+            push_source_work_metric(metrics, descriptor, server, &work.source, "failed", work.failed, cycle_scope);
+            push_source_work_metric(metrics, descriptor, server, &work.source, "skipped", work.skipped, cycle_scope);
+            push_source_work_metric(metrics, descriptor, server, &work.source, "missed", work.missed, cycle_scope);
+        }
+    }
+
+    let mut metrics = vec![
         PrometheusMetric::from_descriptor(&SCANNER_BUCKET_SCANS_FINISHED_MD, stats.bucket_scans_finished as f64),
         PrometheusMetric::from_descriptor(&SCANNER_BUCKET_SCANS_STARTED_MD, stats.bucket_scans_started as f64),
         PrometheusMetric::from_descriptor(&SCANNER_BUCKET_SCANS_FAILED_MD, stats.bucket_scans_failed as f64),
@@ -331,7 +360,25 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
             .with_label("reason", "objects"),
         PrometheusMetric::from_descriptor(&SCANNER_PARTIAL_CYCLES_BY_REASON_MD, stats.partial_cycles_directories as f64)
             .with_label("reason", "directories"),
-    ]
+    ];
+
+    push_source_work_metrics(&mut metrics, &SCANNER_SOURCE_WORK_TOTAL_MD, &stats.server, &stats.source_work, None);
+    push_source_work_metrics(
+        &mut metrics,
+        &SCANNER_CYCLE_SOURCE_WORK_MD,
+        &stats.server,
+        &stats.current_cycle_source_work,
+        Some("current"),
+    );
+    push_source_work_metrics(
+        &mut metrics,
+        &SCANNER_CYCLE_SOURCE_WORK_MD,
+        &stats.server,
+        &stats.last_cycle_source_work,
+        Some("last"),
+    );
+
+    metrics
 }
 
 fn bool_metric_value(enabled: bool) -> f64 {
@@ -346,6 +393,7 @@ mod tests {
     #[test]
     fn test_collect_scanner_metrics() {
         let stats = ScannerStats {
+            server: "node1:9000".to_string(),
             bucket_scans_finished: 100,
             bucket_scans_started: 100,
             bucket_scans_failed: 2,
@@ -415,12 +463,39 @@ mod tests {
             partial_cycles_runtime: 2,
             partial_cycles_objects: 3,
             partial_cycles_directories: 4,
+            source_work: vec![ScannerSourceWorkStats {
+                source: "lifecycle".to_string(),
+                checked: 11,
+                queued: 2,
+                executed: 3,
+                failed: 4,
+                skipped: 5,
+                missed: 6,
+            }],
+            current_cycle_source_work: vec![ScannerSourceWorkStats {
+                source: "usage".to_string(),
+                checked: 21,
+                queued: 7,
+                executed: 8,
+                failed: 9,
+                skipped: 10,
+                missed: 11,
+            }],
+            last_cycle_source_work: vec![ScannerSourceWorkStats {
+                source: "heal".to_string(),
+                checked: 31,
+                queued: 12,
+                executed: 13,
+                failed: 14,
+                skipped: 15,
+                missed: 16,
+            }],
         };
 
         let metrics = collect_scanner_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 69);
+        assert_eq!(metrics.len(), 87);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -432,6 +507,7 @@ mod tests {
             .iter()
             .find(|m| m.name == SCANNER_ACTIVE_PATHS_MD.get_full_metric_name());
         assert_eq!(active_paths.map(|m| m.value), Some(4.0));
+        assert_eq!(active_paths.map(|m| m.labels.len()), Some(0));
 
         let oldest_active_path_age = metrics
             .iter()
@@ -746,6 +822,25 @@ mod tests {
                     .any(|(name, value)| *name == "reason" && value.as_ref() == "directories")
         });
         assert_eq!(partial_cycles_directories.map(|m| m.value), Some(4.0));
+
+        let lifecycle_failed = metrics.iter().find(|m| {
+            m.name == SCANNER_SOURCE_WORK_TOTAL_MD.get_full_metric_name()
+                && m.labels.iter().any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels.iter().any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "lifecycle")
+                && m.labels.iter().any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "failed")
+        });
+        assert_eq!(lifecycle_failed.map(|m| m.value), Some(4.0));
+
+        let current_usage_executed = metrics.iter().find(|m| {
+            m.name == SCANNER_CYCLE_SOURCE_WORK_MD.get_full_metric_name()
+                && m.labels.iter().any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == CYCLE_SCOPE_LABEL && value.as_ref() == "current")
+                && m.labels.iter().any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "usage")
+                && m.labels.iter().any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "executed")
+        });
+        assert_eq!(current_usage_executed.map(|m| m.value), Some(8.0));
     }
 
     #[test]

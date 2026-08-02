@@ -27,6 +27,7 @@ use crate::metrics::collectors::{
     HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats,
     ResourceStats, ScannerStats,
 };
+use crate::metrics::collectors::scanner::ScannerSourceWorkStats;
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
     BucketOperations, BucketOptions, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore, StorageAdminApi,
@@ -37,7 +38,7 @@ use crate::metrics::{
 use crate::node_identity::current_local_node_identity;
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
+use rustfs_common::metrics::{ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource_and_system,
@@ -1200,6 +1201,24 @@ fn scanner_bucket_scans_started(life_time_ops: &HashMap<String, u64>, bucket_sca
         .unwrap_or(bucket_scans_finished)
 }
 
+fn scanner_source_work_stats(source_work: &[ScannerSourceWorkSnapshot]) -> Vec<ScannerSourceWorkStats> {
+    let mut stats = source_work
+        .iter()
+        .filter(|work| !work.source.is_empty())
+        .map(|work| ScannerSourceWorkStats {
+            source: work.source.clone(),
+            checked: work.checked,
+            queued: work.queued,
+            executed: work.executed,
+            failed: work.failed,
+            skipped: work.skipped,
+            missed: work.missed,
+        })
+        .collect::<Vec<_>>();
+    stats.sort_by(|left, right| left.source.cmp(&right.source));
+    stats
+}
+
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let metrics = global_metrics().report().await;
     let now = Utc::now();
@@ -1228,6 +1247,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let last_cycle_duration = metrics.last_cycle_duration_seconds;
 
     Some(ScannerStats {
+        server: current_local_node_identity(),
         bucket_scans_finished,
         bucket_scans_started,
         bucket_scans_failed,
@@ -1309,6 +1329,9 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
         partial_cycles_runtime: metrics.partial_cycles_runtime,
         partial_cycles_objects: metrics.partial_cycles_objects,
         partial_cycles_directories: metrics.partial_cycles_directories,
+        source_work: scanner_source_work_stats(&metrics.source_work),
+        current_cycle_source_work: scanner_source_work_stats(&metrics.current_cycle_source_work),
+        last_cycle_source_work: scanner_source_work_stats(&metrics.last_cycle_source_work),
     })
 }
 
@@ -1715,6 +1738,46 @@ mod tests {
         };
 
         assert_eq!(scanner_lifecycle_checked_versions(&report), 37);
+    }
+
+    #[test]
+    fn scanner_source_work_stats_sorts_and_skips_empty_source() {
+        let stats = scanner_source_work_stats(&[
+            ScannerSourceWorkSnapshot {
+                source: "usage".to_string(),
+                checked: 11,
+                queued: 2,
+                executed: 3,
+                failed: 4,
+                skipped: 5,
+                missed: 6,
+            },
+            ScannerSourceWorkSnapshot {
+                checked: 99,
+                queued: 99,
+                executed: 99,
+                failed: 99,
+                skipped: 99,
+                missed: 99,
+                ..Default::default()
+            },
+            ScannerSourceWorkSnapshot {
+                source: "lifecycle".to_string(),
+                checked: 21,
+                queued: 7,
+                executed: 8,
+                failed: 9,
+                skipped: 10,
+                missed: 12,
+            },
+        ]);
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].source, "lifecycle");
+        assert_eq!(stats[0].checked, 21);
+        assert_eq!(stats[0].missed, 12);
+        assert_eq!(stats[1].source, "usage");
+        assert_eq!(stats[1].failed, 4);
     }
 
     #[test]
