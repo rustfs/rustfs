@@ -44,6 +44,7 @@ use aws_smithy_runtime_api::client::http::{
 use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_types::body::SdkBody;
+use futures::{StreamExt, stream};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
@@ -68,6 +69,7 @@ use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
@@ -79,6 +81,7 @@ use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
+const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
@@ -255,6 +258,16 @@ fn endpoint_health_key(url: &Url) -> String {
     }
 }
 
+fn target_health(target: &TargetClient) -> EpHealth {
+    let url = target.to_url();
+    EpHealth {
+        endpoint: endpoint_health_key(&url),
+        scheme: url.scheme().to_string(),
+        online: true,
+        ..Default::default()
+    }
+}
+
 fn update_endpoint_health(health: &mut EpHealth, online: bool, latency: Duration, now: OffsetDateTime) {
     let prev_online = health.online;
     health.online = online;
@@ -272,14 +285,26 @@ fn update_endpoint_health(health: &mut EpHealth, online: bool, latency: Duration
     health.offline_duration += latency;
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct TargetClientBuildProbe {
+    arn: String,
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
 #[derive(Debug, Default)]
 pub struct BucketTargetSys {
     pub arn_remotes_map: Arc<RwLock<HashMap<String, ArnTarget>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
+    target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     pub hc_client: Arc<HttpClient>,
     pub a_mutex: Arc<Mutex<HashMap<String, ArnErrs>>>,
     pub arn_errs_map: Arc<RwLock<HashMap<String, ArnErrs>>>,
+    target_update_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    #[cfg(test)]
+    target_client_build_probe: Arc<Mutex<Option<TargetClientBuildProbe>>>,
     heartbeat_started: OnceLock<()>,
 }
 
@@ -293,9 +318,13 @@ impl BucketTargetSys {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
+            target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
             hc_client: Arc::new(HttpClient::new()),
             a_mutex: Arc::new(Mutex::new(HashMap::new())),
             arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
+            target_update_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            target_client_build_probe: Arc::new(Mutex::new(None)),
             heartbeat_started: OnceLock::new(),
         }
     }
@@ -310,6 +339,17 @@ impl BucketTargetSys {
         });
     }
 
+    async fn target_update_mutex(&self, bucket: &str) -> Arc<Mutex<()>> {
+        let mut mutexes = self.target_update_mutexes.lock().await;
+        mutexes.retain(|_, mutex| mutex.strong_count() > 0);
+        if let Some(mutex) = mutexes.get(bucket).and_then(Weak::upgrade) {
+            return mutex;
+        }
+        let mutex = Arc::new(Mutex::new(()));
+        mutexes.insert(bucket.to_string(), Arc::downgrade(&mutex));
+        mutex
+    }
+
     pub async fn is_offline(&self, url: &Url) -> bool {
         let key = endpoint_health_key(url);
         {
@@ -318,7 +358,6 @@ impl BucketTargetSys {
                 return !health.online;
             }
         }
-        // Initialize health check if not exists
         self.init_hc(url).await;
         false
     }
@@ -345,42 +384,121 @@ impl BucketTargetSys {
         );
     }
 
+    pub(crate) async fn is_target_offline(&self, target: &Arc<TargetClient>) -> bool {
+        // Lock order: arn_remotes_map, then target_h_mutex. A stale client must not
+        // read or initialize the health state of its replacement.
+        let remotes = self.arn_remotes_map.read().await;
+        let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
+            return true;
+        };
+        if !Arc::ptr_eq(current, target) {
+            return true;
+        }
+        {
+            let health_map = self.target_h_mutex.read().await;
+            if let Some(health) = health_map.get(&target.arn) {
+                return !health.online;
+            }
+        }
+        let mut health_map = self.target_h_mutex.write().await;
+        let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
+        !health.online
+    }
+
+    pub(crate) async fn mark_target_offline(&self, target: &Arc<TargetClient>) {
+        // Lock order: arn_remotes_map, then target_h_mutex. Ignore failures reported
+        // by a client that has already been replaced.
+        let remotes = self.arn_remotes_map.read().await;
+        let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, target) {
+            return;
+        }
+        let mut health_map = self.target_h_mutex.write().await;
+        let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
+        update_endpoint_health(health, false, Duration::from_secs(0), OffsetDateTime::now_utc());
+    }
+
+    #[cfg(test)]
+    async fn init_target_health(&self, target: &TargetClient) {
+        let mut health_map = self.target_h_mutex.write().await;
+        health_map.insert(target.arn.clone(), target_health(target));
+        drop(health_map);
+        self.init_hc(&target.to_url()).await;
+    }
+
     pub async fn heartbeat(&self) {
         // Probe interval: `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS` (default 5000ms,
         // clamped to >=10ms), read once when the heartbeat task starts.
         let mut interval = tokio::time::interval(crate::bucket::replication::replication_timing::health_check_interval());
         loop {
             interval.tick().await;
-
-            let endpoints = {
-                let health_map = self.h_mutex.read().await;
-                health_map
-                    .iter()
-                    .map(|(endpoint, health)| (endpoint.clone(), health.scheme.clone()))
-                    .collect::<Vec<_>>()
-            };
-
-            for (endpoint, scheme) in endpoints {
-                // Perform health check
-                let start = Instant::now();
-                let online = self.check_endpoint_health(&endpoint, &scheme).await;
-                let duration = start.elapsed();
-
-                {
-                    let mut health_map = self.h_mutex.write().await;
-                    if let Some(health) = health_map.get_mut(&endpoint) {
-                        update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
-                    }
-                }
-            }
+            self.heartbeat_once().await;
         }
     }
 
-    async fn check_endpoint_health(&self, endpoint: &str, scheme: &str) -> bool {
-        let scheme = if scheme.is_empty() { "https" } else { scheme };
-        let url = format!("{scheme}://{endpoint}/");
-        match self.hc_client.get(url).timeout(Duration::from_secs(3)).send().await {
-            Ok(response) => response.status().as_u16() < 500,
+    async fn heartbeat_once(&self) {
+        let targets = {
+            let remotes = self.arn_remotes_map.read().await;
+            remotes
+                .values()
+                .filter_map(|target| target.client.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let checks = stream::iter(targets.into_iter().map(|target| async move {
+            let start = Instant::now();
+            let online = Self::check_endpoint_health(&target).await;
+            (target, online, start.elapsed())
+        }));
+        let mut checks = checks.buffer_unordered(MAX_CONCURRENT_TARGET_HEALTH_CHECKS);
+        let mut endpoint_checks = HashMap::<String, (String, bool, Duration)>::new();
+
+        while let Some((target, online, duration)) = checks.next().await {
+            let url = target.to_url();
+
+            {
+                // Lock order: arn_remotes_map, then target_h_mutex. Keeping the remote
+                // read guard prevents a replaced client from receiving stale health.
+                let remotes = self.arn_remotes_map.read().await;
+                let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(current, &target) {
+                    continue;
+                }
+                let mut health_map = self.target_h_mutex.write().await;
+                let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(&target));
+                update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
+            }
+
+            let endpoint = endpoint_health_key(&url);
+            endpoint_checks
+                .entry(endpoint)
+                .and_modify(|(_, endpoint_online, endpoint_duration)| {
+                    *endpoint_online |= online;
+                    *endpoint_duration = (*endpoint_duration).max(duration);
+                })
+                .or_insert_with(|| (url.scheme().to_string(), online, duration));
+        }
+
+        let mut health_map = self.h_mutex.write().await;
+        for (endpoint, (scheme, online, duration)) in endpoint_checks {
+            let health = health_map.entry(endpoint.clone()).or_insert_with(|| EpHealth {
+                endpoint,
+                scheme,
+                online: true,
+                ..Default::default()
+            });
+            update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
+        }
+    }
+
+    async fn check_endpoint_health(target: &TargetClient) -> bool {
+        match tokio::time::timeout(Duration::from_secs(3), target.client.head_bucket().bucket(&target.bucket).send()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => err.raw_response().is_some_and(|response| response.status().as_u16() < 500),
             Err(_) => false,
         }
     }
@@ -390,15 +508,20 @@ impl BucketTargetSys {
         health_map.clone()
     }
 
+    async fn target_health_stats(&self) -> HashMap<String, EpHealth> {
+        let health_map = self.target_h_mutex.read().await;
+        health_map.clone()
+    }
+
     pub async fn list_targets(&self, bucket: &str, arn_type: &str) -> Vec<BucketTarget> {
-        let health_stats = self.health_stats().await;
+        let health_stats = self.target_health_stats().await;
         let mut targets = Vec::new();
 
         if !bucket.is_empty() {
             if let Ok(bucket_targets) = self.list_bucket_targets(bucket).await {
                 for mut target in bucket_targets.targets {
                     if arn_type.is_empty() || target.target_type.to_string() == arn_type {
-                        if let Some(health) = health_stats.get(&target.endpoint) {
+                        if let Some(health) = health_stats.get(&target.arn) {
                             target.total_downtime = health.offline_duration;
                             target.online = health.online;
                             target.last_online = health.last_online;
@@ -420,7 +543,7 @@ impl BucketTargetSys {
         for bucket_targets in targets_map.values() {
             for mut target in bucket_targets.iter().cloned() {
                 if arn_type.is_empty() || target.target_type.to_string() == arn_type {
-                    if let Some(health) = health_stats.get(&target.endpoint) {
+                    if let Some(health) = health_stats.get(&target.arn) {
                         target.total_downtime = health.offline_duration;
                         target.online = health.online;
                         target.last_online = health.last_online;
@@ -453,12 +576,18 @@ impl BucketTargetSys {
     }
 
     pub async fn delete(&self, bucket: &str) {
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let _update_guard = update_mutex.lock().await;
+
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
+        let mut health_map = self.target_h_mutex.write().await;
 
         if let Some(targets) = targets_map.remove(bucket) {
             for target in targets {
                 arn_remotes_map.remove(&target.arn);
+                health_map.remove(&target.arn);
             }
         }
     }
@@ -690,6 +819,22 @@ impl BucketTargetSys {
     }
 
     pub async fn get_remote_target_client_internal(&self, target: &BucketTarget) -> Result<TargetClient, BucketTargetError> {
+        #[cfg(test)]
+        {
+            let probe = self.target_client_build_probe.lock().await.clone();
+            if let Some(probe) = probe
+                && probe.arn == target.arn
+            {
+                probe.started.add_permits(1);
+                probe
+                    .release
+                    .acquire()
+                    .await
+                    .expect("test probe semaphore should remain open")
+                    .forget();
+            }
+        }
+
         let Some(credentials) = &target.credentials else {
             return Err(BucketTargetError::BucketRemoteTargetNotFound {
                 bucket: target.target_bucket.clone(),
@@ -792,12 +937,25 @@ impl BucketTargetSys {
     }
 
     pub async fn update_all_targets(&self, bucket: &str, targets: Option<&BucketTargets>) {
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let _update_guard = update_mutex.lock().await;
+
+        let mut clients = Vec::new();
+        if let Some(new_targets) = targets {
+            for target in &new_targets.targets {
+                clients.push((target, self.get_remote_target_client_internal(target).await.map(Arc::new)));
+            }
+        }
+
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
+        let mut health_map = self.target_h_mutex.write().await;
         // Remove existing targets
         if let Some(existing_targets) = targets_map.remove(bucket) {
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
+                health_map.remove(&target.arn);
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
@@ -806,16 +964,17 @@ impl BucketTargetSys {
         if let Some(new_targets) = targets
             && !new_targets.is_empty()
         {
-            for target in &new_targets.targets {
-                match self.get_remote_target_client_internal(target).await {
+            for (target, client) in clients {
+                match client {
                     Ok(client) => {
                         arn_remotes_map.insert(
                             target.arn.clone(),
                             ArnTarget {
-                                client: Some(Arc::new(client)),
+                                client: Some(client.clone()),
                                 last_refresh: OffsetDateTime::now_utc(),
                             },
                         );
+                        health_map.insert(client.arn.clone(), target_health(&client));
                         self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
                     }
                     // The target stays in `targets_map`, so it keeps showing up in
@@ -845,25 +1004,7 @@ impl BucketTargetSys {
             return;
         }
 
-        for target in config.targets.iter() {
-            let cli = match self.get_remote_target_client_internal(target).await {
-                Ok(cli) => cli,
-                Err(e) => {
-                    warn!("get_remote_target_client_internal error:{}", e);
-                    continue;
-                }
-            };
-
-            {
-                let arn_target = ArnTarget::with_client(Arc::new(cli));
-                let mut arn_remotes_map = self.arn_remotes_map.write().await;
-                arn_remotes_map.insert(target.arn.clone(), arn_target);
-            }
-            self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
-        }
-
-        let mut targets_map = self.targets_map.write().await;
-        targets_map.insert(bucket.to_string(), config.targets.clone());
+        self.update_all_targets(bucket, Some(config)).await;
     }
 
     // getRemoteARN gets existing ARN for an endpoint or generates a new one.
@@ -2019,7 +2160,7 @@ mod tests {
             request_uris: Arc::clone(&request_uris),
         });
         let http_client = http_client_fn(move |_settings, _components| connector.clone());
-        let client = s3_client_with_http_client(443, http_client);
+        let client = s3_client_for_test(443, Some(http_client));
         (
             TargetClient {
                 endpoint: "https://localhost:443".to_string(),
@@ -2038,7 +2179,7 @@ mod tests {
         )
     }
 
-    fn spawn_single_request_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>) -> (u16, std::thread::JoinHandle<()>) {
+    fn spawn_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>, requests: usize) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
 
         ensure_rustls_crypto_provider();
@@ -2057,42 +2198,116 @@ mod tests {
             .expect("test TLS server config should build");
 
         let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("test TLS client should connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("test TLS read timeout should configure");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(10)))
-                .expect("test TLS write timeout should configure");
-            let connection = rustls::ServerConnection::new(Arc::new(server_config)).expect("test TLS connection should build");
-            let mut stream = rustls::StreamOwned::new(connection, stream);
-            let mut request = [0_u8; 8192];
-            let _ = stream.read(&mut request).expect("test TLS request should be readable");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("test TLS response should be written");
-            stream.flush().expect("test TLS response should flush");
+            let server_config = Arc::new(server_config);
+            for _ in 0..requests {
+                let (stream, _) = listener.accept().expect("test TLS client should connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("test TLS read timeout should configure");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .expect("test TLS write timeout should configure");
+                let connection = rustls::ServerConnection::new(server_config.clone()).expect("test TLS connection should build");
+                let mut stream = rustls::StreamOwned::new(connection, stream);
+                let mut request = [0_u8; 8192];
+                if stream.read(&mut request).is_err() {
+                    continue;
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .expect("test TLS response should be written");
+                stream.flush().expect("test TLS response should flush");
+            }
         });
 
         (port, handle)
     }
 
-    fn s3_client_with_http_client(port: u16, http_client: SharedHttpClient) -> S3Client {
+    fn spawn_http_status_server(status: u16) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address")
+            .port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+            let mut request = [0_u8; 8192];
+            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+            assert!(bytes_read > 0, "test HTTP request should not be empty");
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test HTTP response should be written");
+        });
+        (port, handle)
+    }
+
+    fn spawn_delayed_http_server() -> (
+        u16,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address")
+            .port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+            let mut request = [0_u8; 8192];
+            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+            assert!(bytes_read > 0, "test HTTP request should not be empty");
+            accepted_tx.send(()).expect("test should wait for request");
+            release_rx.recv().expect("test should release response");
+            stream
+                .write_all(b"HTTP/1.1 500 Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test HTTP response should be written");
+        });
+        (port, accepted_rx, release_tx, handle)
+    }
+
+    fn s3_client_for_test(port: u16, http_client: Option<SharedHttpClient>) -> S3Client {
+        s3_client_for_endpoint_test(format!("https://localhost:{port}"), http_client)
+    }
+
+    fn s3_client_for_endpoint_test(endpoint: String, http_client: Option<SharedHttpClient>) -> S3Client {
         let credentials = SdkCredentials::builder()
             .access_key_id("test-access")
             .secret_access_key("test-secret")
             .provider_name("bucket_target_tls_test")
             .build();
-        let config = S3Config::builder()
-            .endpoint_url(format!("https://localhost:{port}"))
+        let mut config = S3Config::builder()
+            .endpoint_url(endpoint)
             .credentials_provider(SharedCredentialsProvider::new(credentials))
             .region(SdkRegion::new("us-east-1"))
             .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .http_client(http_client)
-            .build();
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+        if let Some(http_client) = http_client {
+            config = config.http_client(http_client);
+        }
 
-        S3Client::from_conf(config)
+        S3Client::from_conf(config.build())
+    }
+
+    fn target_client_for_test(arn: &str, endpoint: String, client: S3Client) -> Arc<TargetClient> {
+        Arc::new(TargetClient {
+            endpoint,
+            credentials: None,
+            bucket: "target-bucket".to_string(),
+            storage_class: String::new(),
+            disable_proxy: false,
+            arn: arn.to_string(),
+            reset_id: String::new(),
+            secure: true,
+            health_check_duration: Duration::from_secs(5),
+            replicate_sync: false,
+            client: Arc::new(client),
+        })
     }
 
     #[test]
@@ -2212,17 +2427,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_targets_applies_health_stats_for_endpoint_with_port() {
+    async fn list_targets_applies_health_stats_by_arn_and_preserves_endpoint_port() {
         let sys = BucketTargetSys::default();
-        let url = Url::parse("https://remote.example:9443").expect("url should parse");
-        sys.init_hc(&url).await;
-        sys.mark_offline(&url).await;
+        let arn = "arn:rustfs:replication:us-east-1:bucket:id";
+        let endpoint = "https://remote.example:9443".to_string();
+        let client = target_client_for_test(
+            arn,
+            endpoint.clone(),
+            S3Client::from_conf(
+                S3Config::builder()
+                    .endpoint_url(endpoint)
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(arn.to_string(), ArnTarget::with_client(client.clone()));
+        sys.init_target_health(&client).await;
+        sys.mark_target_offline(&client).await;
 
         sys.targets_map.write().await.insert(
             "bucket".to_string(),
             vec![BucketTarget {
                 endpoint: "remote.example:9443".to_string(),
-                arn: "arn:rustfs:replication:us-east-1:bucket:id".to_string(),
+                arn: arn.to_string(),
                 target_type: BucketTargetType::ReplicationService,
                 ..Default::default()
             }],
@@ -2233,6 +2463,97 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].online);
         assert_eq!(targets[0].offline_count, 1);
+        assert_eq!(sys.target_health_stats().await[arn].endpoint, "remote.example:9443");
+    }
+
+    #[tokio::test]
+    async fn target_health_is_isolated_by_arn_for_shared_endpoint() {
+        let sys = BucketTargetSys::default();
+        let endpoint = "https://shared.example:9443".to_string();
+        let config = || {
+            S3Config::builder()
+                .endpoint_url(endpoint.clone())
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build()
+        };
+        let first = target_client_for_test("arn:first", endpoint.clone(), S3Client::from_conf(config()));
+        let second = target_client_for_test("arn:second", endpoint.clone(), S3Client::from_conf(config()));
+
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(first.arn.clone(), ArnTarget::with_client(first.clone()));
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(second.arn.clone(), ArnTarget::with_client(second.clone()));
+        sys.init_target_health(&first).await;
+        sys.init_target_health(&second).await;
+        sys.mark_target_offline(&first).await;
+
+        assert!(sys.is_target_offline(&first).await);
+        assert!(!sys.is_target_offline(&second).await);
+    }
+
+    #[tokio::test]
+    async fn stale_client_cannot_change_replacement_health_for_same_arn() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:replacement";
+        let config = |endpoint: &str| {
+            S3Config::builder()
+                .endpoint_url(endpoint)
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build()
+        };
+        let stale = target_client_for_test(
+            arn,
+            "https://stale.example:9443".to_string(),
+            S3Client::from_conf(config("https://stale.example:9443")),
+        );
+        let current = target_client_for_test(
+            arn,
+            "https://current.example:9443".to_string(),
+            S3Client::from_conf(config("https://current.example:9443")),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(arn.to_string(), ArnTarget::with_client(current.clone()));
+        sys.init_target_health(&current).await;
+
+        sys.mark_target_offline(&stale).await;
+
+        assert!(sys.is_target_offline(&stale).await);
+        assert!(!sys.is_target_offline(&current).await);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_target_health_by_arn() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:delete";
+        let endpoint = "https://delete.example:9443".to_string();
+        let client = target_client_for_test(
+            arn,
+            endpoint.clone(),
+            S3Client::from_conf(
+                S3Config::builder()
+                    .endpoint_url(endpoint)
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+        );
+        sys.targets_map.write().await.insert(
+            "bucket".to_string(),
+            vec![BucketTarget {
+                arn: arn.to_string(),
+                ..Default::default()
+            }],
+        );
+        sys.init_target_health(&client).await;
+
+        sys.delete("bucket").await;
+
+        assert!(!sys.target_health_stats().await.contains_key(arn));
     }
 
     #[test]
@@ -2445,6 +2766,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_health_check_rejects_untrusted_self_signed_certificate() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let target =
+            target_client_for_test("arn:default-tls", format!("https://localhost:{port}"), s3_client_for_test(port, None));
+
+        assert!(!BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_honors_skip_tls_verify_client() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let target = target_client_for_test(
+            "arn:skip-tls",
+            format!("https://localhost:{port}"),
+            s3_client_for_test(port, Some(build_insecure_aws_s3_http_client())),
+        );
+
+        assert!(BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_honors_custom_ca_client() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let http_client = build_aws_s3_http_client_from_target_ca_pem(&cert.cert.pem())
+            .await
+            .expect("custom CA client should build");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let target = target_client_for_test(
+            "arn:custom-ca",
+            format!("https://localhost:{port}"),
+            s3_client_for_test(port, Some(http_client)),
+        );
+
+        assert!(BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_treats_client_errors_as_online_and_server_errors_as_offline() {
+        for (status, expected_online) in [(403, true), (500, false)] {
+            let (port, server) = spawn_http_status_server(status);
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let target = target_client_for_test(
+                &format!("arn:http-{status}"),
+                endpoint.clone(),
+                s3_client_for_endpoint_test(endpoint, None),
+            );
+
+            assert_eq!(BucketTargetSys::check_endpoint_health(&target).await, expected_online);
+            server.join().expect("test HTTP server should stop");
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_tls_health_isolated_by_arn_for_shared_endpoint() {
+        let sys = BucketTargetSys::default();
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 2);
+        let endpoint = format!("https://localhost:{port}");
+        let strict = target_client_for_test("arn:strict", endpoint.clone(), s3_client_for_test(port, None));
+        let insecure = target_client_for_test(
+            "arn:insecure",
+            endpoint,
+            s3_client_for_test(port, Some(build_insecure_aws_s3_http_client())),
+        );
+        {
+            let mut remotes = sys.arn_remotes_map.write().await;
+            remotes.insert(strict.arn.clone(), ArnTarget::with_client(strict.clone()));
+            remotes.insert(insecure.arn.clone(), ArnTarget::with_client(insecure.clone()));
+        }
+
+        sys.heartbeat_once().await;
+
+        assert!(sys.is_target_offline(&strict).await);
+        assert!(!sys.is_target_offline(&insecure).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_discards_result_from_replaced_client_with_same_arn() {
+        let sys = Arc::new(BucketTargetSys::default());
+        let (port, accepted, release, server) = spawn_delayed_http_server();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let stale = target_client_for_test("arn:replacement", endpoint.clone(), s3_client_for_endpoint_test(endpoint, None));
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(stale.arn.clone(), ArnTarget::with_client(stale));
+        let heartbeat_sys = sys.clone();
+        let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
+        accepted.await.expect("heartbeat request should reach test server");
+
+        let replacement_endpoint = "https://replacement.example:9443".to_string();
+        let replacement = target_client_for_test(
+            "arn:replacement",
+            replacement_endpoint.clone(),
+            S3Client::from_conf(
+                S3Config::builder()
+                    .endpoint_url(replacement_endpoint)
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(replacement.arn.clone(), ArnTarget::with_client(replacement.clone()));
+        sys.init_target_health(&replacement).await;
+        release.send(()).expect("stale heartbeat response should be released");
+        heartbeat.await.expect("heartbeat should finish");
+
+        assert!(!sys.is_target_offline(&replacement).await);
+        server.join().expect("test HTTP server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_update_mutex_reuses_live_lock_and_reclaims_dead_entries() {
+        let sys = BucketTargetSys::default();
+        let first = sys.target_update_mutex("first").await;
+        let same = sys.target_update_mutex("first").await;
+        assert!(Arc::ptr_eq(&first, &same));
+        drop(first);
+        drop(same);
+
+        let _second = sys.target_update_mutex("second").await;
+        let mutexes = sys.target_update_mutexes.lock().await;
+        assert!(!mutexes.contains_key("first"));
+        assert!(mutexes.contains_key("second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn target_updates_serialize_client_build_through_publication_per_bucket() {
+        let sys = Arc::new(BucketTargetSys::default());
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
+            arn: "arn:first".to_string(),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let target = |arn: &str| BucketTarget {
+            arn: arn.to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+        let first_targets = BucketTargets {
+            targets: vec![target("arn:first")],
+        };
+        let second_targets = BucketTargets {
+            targets: vec![target("arn:second")],
+        };
+        let first_sys = sys.clone();
+        let first = tokio::spawn(async move {
+            first_sys.update_all_targets("bucket", Some(&first_targets)).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.acquire())
+            .await
+            .expect("first client build should start")
+            .expect("first started semaphore should remain open")
+            .forget();
+        let second_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let second_release = Arc::new(tokio::sync::Semaphore::new(0));
+        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
+            arn: "arn:second".to_string(),
+            started: second_started.clone(),
+            release: second_release.clone(),
+        });
+        let second_sys = sys.clone();
+        let second = tokio::spawn(async move {
+            second_sys.update_all_targets("bucket", Some(&second_targets)).await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_started.acquire())
+                .await
+                .is_err()
+        );
+        assert!(!sys.targets_map.read().await.contains_key("bucket"));
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first target update should not stall")
+            .expect("first target update should finish");
+        tokio::time::timeout(Duration::from_secs(1), second_started.acquire())
+            .await
+            .expect("second client build should start after first update publishes")
+            .expect("second started semaphore should remain open")
+            .forget();
+        second_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second target update should not stall")
+            .expect("second target update should finish");
+        let targets = sys.targets_map.read().await;
+        assert_eq!(targets["bucket"][0].arn, "arn:second");
+    }
+
+    #[tokio::test]
     async fn replication_trust_store_composes_system_global_and_target_roots_for_real_tls() {
         let tls_dir = tempfile::tempdir().expect("temporary TLS directory should be created");
         let global_ca =
@@ -2465,8 +2996,8 @@ mod tests {
         );
         let http_client = build_aws_s3_http_client_with_trust_store(trust_store).expect("composed TLS client should build");
 
-        let (global_port, global_server) = spawn_single_request_https_server(&global_ca);
-        s3_client_with_http_client(global_port, http_client.clone())
+        let (global_port, global_server) = spawn_https_server(&global_ca, 1);
+        s3_client_for_test(global_port, Some(http_client.clone()))
             .head_bucket()
             .bucket("test-bucket")
             .send()
@@ -2474,8 +3005,8 @@ mod tests {
             .expect("global RUSTFS_TLS_PATH CA should authenticate its TLS server");
         global_server.join().expect("global CA TLS server should finish");
 
-        let (target_port, target_server) = spawn_single_request_https_server(&target_ca);
-        s3_client_with_http_client(target_port, http_client)
+        let (target_port, target_server) = spawn_https_server(&target_ca, 1);
+        s3_client_for_test(target_port, Some(http_client))
             .head_bucket()
             .bucket("test-bucket")
             .send()

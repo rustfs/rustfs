@@ -95,12 +95,20 @@ impl ReplicationTargetStore {
         BucketTargetSys::get().get_remote_target_client(bucket, arn).await
     }
 
-    pub(crate) async fn target_is_offline(target_client: &TargetClient) -> bool {
-        BucketTargetSys::get().is_offline(&target_client.to_url()).await
+    pub(crate) async fn target_is_offline(target_client: &Arc<TargetClient>) -> bool {
+        BucketTargetSys::get().is_target_offline(target_client).await
     }
 
-    pub(crate) async fn mark_target_offline(target_client: &TargetClient) {
-        BucketTargetSys::get().mark_offline(&target_client.to_url()).await
+    pub(crate) async fn mark_target_offline(target_client: &Arc<TargetClient>) {
+        BucketTargetSys::get().mark_target_offline(target_client).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn register_test_target(target_client: &Arc<TargetClient>) {
+        BucketTargetSys::get().arn_remotes_map.write().await.insert(
+            target_client.arn.clone(),
+            crate::bucket::bucket_target_sys::ArnTarget::with_client(target_client.clone()),
+        );
     }
 }
 

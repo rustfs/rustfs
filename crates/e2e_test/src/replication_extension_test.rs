@@ -1945,6 +1945,28 @@ async fn wait_for_remote_target_arn(env: &RustFSTestEnvironment, bucket: &str) -
     Err(format!("site replication did not configure a remote target for bucket {bucket} in time").into())
 }
 
+async fn wait_for_remote_target_health_check(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    arn: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for _ in 0..40 {
+        let response = list_replication_targets_request(env, Some(bucket)).await?;
+        if response.status() == StatusCode::OK {
+            let targets: Vec<serde_json::Value> = response.json().await?;
+            if targets.iter().any(|target| {
+                target.get("arn").and_then(|value| value.as_str()) == Some(arn)
+                    && target.get("lastOnline").is_some_and(|value| !value.is_null())
+            }) {
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("replication target {arn} did not complete a successful health check in time").into())
+}
+
 async fn site_replication_add(
     env: &RustFSTestEnvironment,
     sites: &[PeerSite],
@@ -2912,6 +2934,8 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
     let target_bucket = "replication-self-signed-ok-dst";
     let object_key = "self-signed-replication.txt";
     let body = "replication over self-signed https should succeed";
+    let post_health_check_key = "self-signed-replication-after-health-check.txt";
+    let post_health_check_body = "replication should remain available after the target health check";
 
     let source_client = source_env.create_s3_client();
     source_client
@@ -2959,6 +2983,24 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
         .await?;
 
     wait_for_replicated_object_over_https(&https_client, &target_env, target_bucket, object_key, body).await?;
+
+    wait_for_remote_target_health_check(&source_env, source_bucket, &target_arn).await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(post_health_check_key)
+        .body(ByteStream::from(post_health_check_body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object_over_https(
+        &https_client,
+        &target_env,
+        target_bucket,
+        post_health_check_key,
+        post_health_check_body,
+    )
+    .await?;
 
     Ok(())
 }
