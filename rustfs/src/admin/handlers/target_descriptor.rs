@@ -28,13 +28,13 @@ use rustfs_targets::{
     check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
         TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, build_amqp_args, build_kafka_args, build_mysql_args,
-        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, try_normalize_target_plugin_instances,
-        validate_redis_config,
+        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, format_outbound_http_url_error,
+        try_normalize_target_plugin_instances, validate_redis_config,
     },
     manifest::builtin_target_manifest,
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
-use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy};
+use rustfs_utils::egress::OutboundPolicy;
 use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -708,16 +708,9 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
     }
     let outbound_policy =
         OutboundPolicy::from_env_cached().map_err(|e| s3_error!(InvalidArgument, "invalid outbound policy: {}", e))?;
-    outbound_policy.validate_url(&parsed_endpoint).map_err(|e| {
-        s3_error!(
-            InvalidArgument,
-            "endpoint is not allowed by the outbound policy: {}; review {}; private origins must be listed as exact origins such as {}={} and RustFS restarted (metadata and link-local destinations remain blocked)",
-            e,
-            ENV_OUTBOUND_ALLOW_ORIGINS,
-            ENV_OUTBOUND_ALLOW_ORIGINS,
-            parsed_endpoint.origin().ascii_serialization()
-        )
-    })?;
+    outbound_policy
+        .validate_url(&parsed_endpoint)
+        .map_err(|err| s3_error!(InvalidArgument, "{}", format_outbound_http_url_error("endpoint", &parsed_endpoint, &err)))?;
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -970,22 +963,40 @@ fn to_kvs(kv_map: &HashMap<String, String>) -> rustfs_config::server_config::KVS
 #[cfg(test)]
 mod webhook_request_tests {
     use super::validate_webhook_request;
+    use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
     use std::collections::HashMap;
 
     #[tokio::test]
     async fn private_webhook_request_is_rejected_with_operator_action() {
-        let config = HashMap::from([("endpoint".to_string(), "http://127.0.0.1:49173/webhook/rustfs".to_string())]);
+        let config = HashMap::from([("endpoint".to_string(), "http://192.168.1.2:1880/webhook/rustfs".to_string())]);
 
         let err = validate_webhook_request(&config)
             .await
-            .expect_err("a loopback webhook must require an explicit outbound allowlist");
+            .expect_err("a private webhook must require an explicit outbound allowlist");
         let message = err
             .message()
             .expect("the validation error should explain the operator action");
 
-        assert!(message.contains("RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://127.0.0.1:49173"));
-        assert!(message.contains("RustFS restarted"), "unexpected message: {message}");
+        assert!(message.contains(&format!(
+            "add http://192.168.1.2:1880 to {ENV_OUTBOUND_ALLOW_ORIGINS}"
+        )));
+        assert!(message.contains("private address"));
+        assert!(message.contains("comma-separated"));
+        assert!(message.contains("restart RustFS"), "unexpected message: {message}");
         assert!(!message.contains("/webhook/rustfs"));
+    }
+
+    #[tokio::test]
+    async fn metadata_webhook_request_does_not_offer_allowlist_override() {
+        let config = HashMap::from([("endpoint".to_string(), "http://169.254.169.254/latest/meta-data".to_string())]);
+
+        let err = validate_webhook_request(&config)
+            .await
+            .expect_err("the metadata endpoint must remain permanently blocked");
+        let message = err.message().expect("the validation error should explain the rejection");
+
+        assert!(message.contains("metadata endpoint"));
+        assert!(!message.contains(ENV_OUTBOUND_ALLOW_ORIGINS));
     }
 
     #[tokio::test]
