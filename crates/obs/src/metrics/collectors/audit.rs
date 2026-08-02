@@ -58,19 +58,19 @@ pub fn collect_audit_metrics(stats: &[AuditTargetStats]) -> Vec<PrometheusMetric
 
         metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_MD, stat.failed_messages as f64)
-                .with_label("target_id", target_id_label.clone()),
+                .with_label(TARGET_ID, target_id_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_MD, stat.failed_store_length as f64)
-                .with_label("target_id", target_id_label.clone()),
+                .with_label(TARGET_ID, target_id_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_TARGET_QUEUE_LENGTH_MD, stat.queue_length as f64)
-                .with_label("target_id", target_id_label.clone()),
+                .with_label(TARGET_ID, target_id_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, stat.total_messages as f64)
-                .with_label("target_id", target_id_label),
+                .with_label(TARGET_ID, target_id_label),
         );
 
         if !stat.server.is_empty() {
