@@ -206,6 +206,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             bucket: snapshot.bucket,
             object: snapshot.object,
             version_id: snapshot.version_id,
+            replication_request_authorized: false,
             region: current_region(),
             request_context: None,
         }
@@ -1424,6 +1425,7 @@ mod tests {
             bucket: Some("photos".to_string()),
             object: None,
             version_id: None,
+            replication_request_authorized: false,
             region: current_region(),
             request_context: None,
         }

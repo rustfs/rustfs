@@ -1146,6 +1146,7 @@ fn completed_data_usage_info(
         versions_total_count: u64::try_from(total.versions).ok()?,
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
         objects_total_size: u64::try_from(total.size).ok()?,
+        tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
         buckets_count: u64::try_from(all_buckets.len()).ok()?,
         bucket_sizes,
         buckets_usage,
@@ -1248,6 +1249,57 @@ mod publish_gate_tests {
     ) -> Option<(DataUsageInfo, SystemTime)> {
         let expected_sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
         completed_data_usage_info(results, &expected_sources, all_buckets, true, budget_elapsed, cancelled)
+    }
+
+    #[test]
+    fn completed_data_usage_info_publishes_tier_stats_across_sets() {
+        let all_buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let warm = |total_size, num_versions, num_objects| {
+            HashMap::from([(
+                "WARM".to_string(),
+                TierStats {
+                    total_size,
+                    num_versions,
+                    num_objects,
+                },
+            )])
+        };
+
+        let mut first_set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+        let mut tiered = DataUsageEntry::default();
+        tiered.add_tier_sizes(&warm(100, 2, 1));
+        first_set.replace("bucket-b", DATA_USAGE_ROOT, tiered);
+
+        let mut second_set = completed_root_cache("bucket-b", 2, 20, DataUsageCacheSource::new(1, 0));
+        let mut tiered = DataUsageEntry::default();
+        tiered.add_tier_sizes(&warm(50, 1, 1));
+        second_set.replace("bucket-a", DATA_USAGE_ROOT, tiered);
+
+        let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
+            .expect("completed sets should publish a snapshot");
+
+        assert_eq!(
+            data_usage_info
+                .tier_stats
+                .expect("tier usage should reach the snapshot")
+                .tiers["WARM"],
+            TierStats {
+                total_size: 150,
+                num_versions: 3,
+                num_objects: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn completed_data_usage_info_omits_tier_stats_without_tiered_objects() {
+        let all_buckets = vec!["bucket-a".to_string()];
+        let set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+
+        let (data_usage_info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false, false)
+            .expect("completed set should publish a snapshot");
+
+        assert!(data_usage_info.tier_stats.is_none());
     }
 
     #[test]

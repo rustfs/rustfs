@@ -1,0 +1,22 @@
+---
+source: rustfs/src/admin/handlers/kms_keys.rs
+expression: "stable_json_value(CreateKmsKeyResponse\n{\n    success: true, message: \"key created successfully\".to_string(), key_id:\n    \"key-a\".to_string(), key_metadata: Some(snapshot_key_metadata()),\n})"
+---
+{
+  "key_id": "key-a",
+  "key_metadata": {
+    "creation_date": "2026-01-01T00:00:00+00:00[UTC]",
+    "deletion_date": "2026-02-01T00:00:00+00:00[UTC]",
+    "description": "snapshot key",
+    "key_id": "key-a",
+    "key_manager": "RUSTFS",
+    "key_state": "Enabled",
+    "key_usage": "EncryptDecrypt",
+    "origin": "RUSTFS_KMS",
+    "tags": {
+      "name": "key-a"
+    }
+  },
+  "message": "key created successfully",
+  "success": true
+}

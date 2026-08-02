@@ -1,0 +1,11 @@
+---
+source: rustfs/src/admin/handlers/kms_keys.rs
+expression: "stable_json_value(DeleteKmsKeyResponse\n{\n    success: false, message: \"key not found\".to_string(), key_id:\n    \"key-a\".to_string(), deletion_date: None, impact: None,\n})"
+---
+{
+  "deletion_date": null,
+  "impact": null,
+  "key_id": "key-a",
+  "message": "key not found",
+  "success": false
+}

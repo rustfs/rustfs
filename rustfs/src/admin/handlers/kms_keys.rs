@@ -438,17 +438,46 @@ impl Operation for DescribeKeyHandler {
     }
 }
 
+/// Serialize a KMS admin response into a snapshot-stable JSON value.
+///
+/// Response bodies carry `HashMap` tags and metadata, whose iteration order
+/// varies per run; sorting every object by key is what makes a snapshot of
+/// them reproducible. Shared with [`super::kms_key_metadata`], which pins its
+/// own response shape the same way.
+#[cfg(test)]
+pub(super) fn stable_json_value(value: impl serde::Serialize) -> serde_json::Value {
+    fn sorted(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => serde_json::Value::Array(values.into_iter().map(sorted).collect()),
+            serde_json::Value::Object(map) => {
+                let mut entries = map.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                serde_json::Value::Object(entries.into_iter().map(|(key, value)| (key, sorted(value))).collect())
+            }
+            value => value,
+        }
+    }
+
+    sorted(serde_json::to_value(value).expect("admin KMS response should serialize"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, DeleteKmsKeyResponse,
-        DescribeKmsKeyResponse, GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id,
-        extract_query_params, key_impact_if_requested, key_list_filters, kms_create_key_actions, kms_delete_key_actions,
-        kms_describe_key_actions, kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, wants_key_impact,
+        CancelKmsKeyDeletionRequest, CancelKmsKeyDeletionResponse, CreateKeyApiRequest, CreateKeyApiResponse,
+        CreateKmsKeyRequest, CreateKmsKeyResponse, DeleteKmsKeyRequest, DeleteKmsKeyResponse, DescribeKeyApiResponse,
+        DescribeKmsKeyResponse, GenerateDataKeyApiRequest, GenerateDataKeyApiResponse, ListKeysApiResponse, ListKmsKeysResponse,
+        delete_key_error_status, delete_request_from_query, extract_key_id, extract_query_params, key_impact_if_requested,
+        key_list_filters, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
+        kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, stable_json_value, wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
-    use rustfs_kms::{KeyImpactReport, KeyReference, KeyReferenceKind, KeyStatus, KeyUsage, KmsError, ReferenceScope};
+    use jiff::Zoned;
+    use rustfs_kms::{
+        KeyImpactReport, KeyInfo, KeyMetadata, KeyReference, KeyReferenceKind, KeyState, KeyStatus, KeyUsage, KmsError,
+        ReferenceScope,
+    };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use rustfs_policy::policy::{Args, Policy};
     use std::collections::HashMap;
@@ -883,6 +912,149 @@ mod tests {
             detail: "bucket default encryption names this key".to_string(),
         });
         impact
+    }
+
+    fn fixed_zoned(value: &str) -> Zoned {
+        value.parse().expect("snapshot timestamp should parse")
+    }
+
+    fn snapshot_key_metadata() -> KeyMetadata {
+        KeyMetadata {
+            key_id: "key-a".to_string(),
+            key_state: KeyState::Enabled,
+            key_usage: KeyUsage::EncryptDecrypt,
+            description: Some("snapshot key".to_string()),
+            creation_date: fixed_zoned("2026-01-01T00:00:00Z[UTC]"),
+            deletion_date: Some(fixed_zoned("2026-02-01T00:00:00Z[UTC]")),
+            origin: "RUSTFS_KMS".to_string(),
+            key_manager: "RUSTFS".to_string(),
+            tags: HashMap::from([("name".to_string(), "key-a".to_string())]),
+        }
+    }
+
+    fn snapshot_key_info() -> KeyInfo {
+        KeyInfo {
+            key_id: "key-a".to_string(),
+            description: Some("snapshot key".to_string()),
+            algorithm: "AES_256".to_string(),
+            usage: KeyUsage::EncryptDecrypt,
+            status: KeyStatus::Active,
+            version: 1,
+            metadata: HashMap::from([("origin".to_string(), "RUSTFS_KMS".to_string())]),
+            tags: HashMap::from([("name".to_string(), "key-a".to_string())]),
+            created_at: fixed_zoned("2026-01-01T00:00:00Z[UTC]"),
+            rotated_at: Some(fixed_zoned("2026-01-15T00:00:00Z[UTC]")),
+            created_by: Some("admin".to_string()),
+        }
+    }
+
+    /// Every JSON body this module serves, pinned where it is served from.
+    ///
+    /// `rustfs-kms` owns look-alike response types with the same operation
+    /// names and different fields. A snapshot over there cannot fail when one
+    /// of the types below changes, so pinning the admin wire contract has to
+    /// happen in this crate, next to the types that are actually serialized.
+    ///
+    /// `Option` fields are covered in both states: none of these types skip a
+    /// `None`, and a consumer that reads `impact` or `key_metadata` as
+    /// explicit `null` breaks if one later starts being omitted instead.
+    #[test]
+    fn kms_key_admin_responses_have_stable_json_shapes() {
+        insta::assert_json_snapshot!(
+            "kms_admin_create_key_response",
+            stable_json_value(CreateKmsKeyResponse {
+                success: true,
+                message: "key created successfully".to_string(),
+                key_id: "key-a".to_string(),
+                key_metadata: Some(snapshot_key_metadata()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_create_key_api_response",
+            stable_json_value(CreateKeyApiResponse {
+                key_id: "key-a".to_string(),
+                key_metadata: snapshot_key_metadata(),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_describe_key_api_response",
+            stable_json_value(DescribeKeyApiResponse {
+                key_metadata: snapshot_key_metadata(),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_list_keys_api_response",
+            stable_json_value(ListKeysApiResponse {
+                keys: vec![snapshot_key_info()],
+                truncated: true,
+                next_marker: Some("key-b".to_string()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_generate_data_key_api_response",
+            stable_json_value(GenerateDataKeyApiResponse {
+                key_id: "key-a".to_string(),
+                plaintext_key: "cGxhaW50ZXh0LXBsYWNlaG9sZGVy".to_string(),
+                ciphertext_blob: "Y2lwaGVydGV4dC1wbGFjZWhvbGRlcg==".to_string(),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_delete_key_response",
+            stable_json_value(DeleteKmsKeyResponse {
+                success: true,
+                message: "key scheduled for deletion".to_string(),
+                key_id: "key-a".to_string(),
+                deletion_date: Some("2026-02-01T00:00:00Z".to_string()),
+                impact: Some(referenced_impact()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_delete_key_response_without_impact",
+            stable_json_value(DeleteKmsKeyResponse {
+                success: false,
+                message: "key not found".to_string(),
+                key_id: "key-a".to_string(),
+                deletion_date: None,
+                impact: None,
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_cancel_key_deletion_response",
+            stable_json_value(CancelKmsKeyDeletionResponse {
+                success: true,
+                message: "key deletion canceled".to_string(),
+                key_id: "key-a".to_string(),
+                key_metadata: Some(snapshot_key_metadata()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_list_keys_response",
+            stable_json_value(ListKmsKeysResponse {
+                success: true,
+                message: "keys listed".to_string(),
+                keys: vec![snapshot_key_info()],
+                truncated: true,
+                next_marker: Some("key-b".to_string()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_describe_key_response",
+            stable_json_value(DescribeKmsKeyResponse {
+                success: true,
+                message: "key described successfully".to_string(),
+                key_metadata: Some(snapshot_key_metadata()),
+                impact: Some(referenced_impact()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_admin_describe_key_response_missing",
+            stable_json_value(DescribeKmsKeyResponse {
+                success: false,
+                message: "key not found".to_string(),
+                key_metadata: None,
+                impact: None,
+            })
+        );
     }
 
     /// Scheduling a deletion for a key that bucket configuration still points

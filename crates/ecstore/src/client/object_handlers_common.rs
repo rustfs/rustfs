@@ -21,17 +21,15 @@ const EVENT_LIFECYCLE_CLEANUP_SKIPPED: &str = "lifecycle_cleanup_skipped";
 const EVENT_LIFECYCLE_CLEANUP_FAILED: &str = "lifecycle_cleanup_failed";
 
 use crate::bucket::lifecycle::lifecycle;
-use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationState, replication_state_to_filemeta};
-use crate::bucket::versioning::VersioningApi;
-use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationObjectBridge};
 use crate::object_api::ObjectOptions;
 use crate::storage_api_contracts::object::{ObjectOperations as _, ObjectToDelete};
 use crate::store::ECStore;
 use rustfs_lock::MAX_DELETE_LIST;
 
 pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
-    let version_suspended = match BucketVersioningSys::get(bucket).await {
-        Ok(vc) => vc.suspended(),
+    let delete_config_snapshot = match ReplicationObjectBridge::delete_request_config(api, bucket).await {
+        Ok(snapshot) => Arc::new(snapshot),
         Err(err) => {
             debug!(
                 event = EVENT_LIFECYCLE_CLEANUP_SKIPPED,
@@ -39,7 +37,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 bucket,
                 error = ?err,
-                reason = "versioning_config_unavailable",
+                reason = "delete_config_snapshot_unavailable",
                 "Skipped lifecycle noncurrent version cleanup"
             );
             return;
@@ -55,45 +53,12 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             remaining = &[];
         }
 
-        let mut replication_candidates: Vec<Option<ReplicationState>> = Vec::with_capacity(to_del.len());
-        for object in to_del.iter() {
-            let version_id = object.version_id.map(|vid| vid.to_string());
-            let opts = ObjectOptions {
-                version_id: version_id.clone(),
-                versioned: true,
-                version_suspended,
-                ..Default::default()
-            };
-            let candidate = match api.get_object_info(bucket, &object.object_name, &opts).await {
-                Ok(info) => {
-                    let dsc = ReplicationLifecycleBridge::check_delete_replication(bucket, object, &info, &opts).await;
-                    dsc.replicate_any()
-                        .then(|| ReplicationLifecycleBridge::version_delete_replication_state(&dsc))
-                }
-                Err(err) => {
-                    debug!(
-                        event = EVENT_LIFECYCLE_CLEANUP_SKIPPED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        bucket,
-                        object = %object.object_name,
-                        version_id = ?version_id,
-                        error = ?err,
-                        reason = "object_info_unavailable",
-                        "Skipped lifecycle delete replication scheduling"
-                    );
-                    None
-                }
-            };
-            replication_candidates.push(candidate);
-        }
-
         let (mut deleted_objs, errors) = api
             .delete_objects(
                 bucket,
                 to_del.to_vec(),
                 ObjectOptions {
-                    version_suspended,
+                    delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
                     ..Default::default()
                 },
             )
@@ -108,10 +73,9 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             if let Some(target) = to_del.get(i) {
                 crate::object_api::notify_object_mutation(bucket, &target.object_name).await;
             }
-            let Some(replication_state) = replication_candidates.get(i).and_then(|c| c.clone()) else {
+            if deleted_obj.replication_state.is_none() {
                 continue;
-            };
-            deleted_obj.replication_state = Some(replication_state_to_filemeta(&replication_state));
+            }
             ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
         }
 
