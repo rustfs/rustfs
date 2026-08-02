@@ -54,8 +54,8 @@
 
 use crate::backends::local::{
     LOCAL_KMS_MASTER_KEY_SALT_FILE, LOCAL_KMS_MASTER_KEY_SALT_LEN, LOCAL_RESTORE_COMMIT_MARKER_FILE, LocalKmsClient,
-    STORED_MASTER_KEY_FORMAT_VERSION, StoredKeyProtection, durable_file, is_orphan_commit_temp_name,
-    stored_master_key_format_version, unknown_protection_marker, validate_key_id,
+    STORED_MASTER_KEY_FORMAT_VERSION, StoredKeyProtection, UNKNOWN_STORED_KEY_PROTECTION, durable_file,
+    has_unknown_protection_marker, is_orphan_commit_temp_name, stored_master_key_format_version, validate_key_id,
 };
 use crate::backup::capability::AtRestProtection;
 use crate::backup::dry_run::{
@@ -618,10 +618,14 @@ fn decode_key_record(
         }
         .into());
     }
-    let unknown_marker = unknown_protection_marker(&plaintext)
+    let has_unknown_marker = has_unknown_protection_marker(&plaintext)
         .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' is not a readable JSON object: {error}")))?;
-    if let Some(version) = unknown_marker {
-        return Err(BackupError::UnsupportedRecordVersion { key_id: stem, version }.into());
+    if has_unknown_marker {
+        return Err(BackupError::UnsupportedRecordVersion {
+            key_id: stem,
+            version: UNKNOWN_STORED_KEY_PROTECTION.to_owned(),
+        }
+        .into());
     }
     let probe: RestoredRecordProbe = serde_json::from_slice(&plaintext)
         .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' does not deserialize: {error}")))?;
@@ -2084,7 +2088,7 @@ mod tests {
     fn bundled_record_from_a_newer_build_is_not_reported_as_corruption() {
         let record = serde_json::json!({
             "key_id": "alpha",
-            "at_rest_protection": "post-quantum-v2",
+            "at_rest_protection": "secret-marker-value-must-not-leak",
             "encrypted_key_material": "AAAAAAAAAAAAAAAAAAAAAA==",
             "nonce": vec![0u8; 12],
         });
@@ -2102,9 +2106,10 @@ mod tests {
         };
         assert!(
             matches!(inner, BackupError::UnsupportedRecordVersion { key_id, version }
-                if key_id == "alpha" && version == "post-quantum-v2"),
+                if key_id == "alpha" && version == UNKNOWN_STORED_KEY_PROTECTION),
             "got {inner:?}"
         );
+        assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
         assert_eq!(
             RestoreBlocker::from(inner).code,
             RestoreBlockerCode::UnknownFormatVersion,
