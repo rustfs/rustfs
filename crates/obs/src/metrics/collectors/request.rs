@@ -245,7 +245,9 @@ mod tests {
         let by_server_total_name = API_REQUESTS_TOTAL_BY_SERVER_MD.get_full_metric_name();
         let by_server_total = metrics.iter().find(|m| {
             m.name == by_server_total_name
-                && m.labels.iter().any(|(key, value)| *key == SERVER_LABEL && value == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(key, value)| *key == SERVER_LABEL && value == "node1:9000")
                 && m.labels.iter().any(|(key, value)| *key == NAME_LABEL && value == "GetObject")
                 && m.labels.iter().any(|(key, value)| *key == TYPE_LABEL && value == "s3")
         });
@@ -254,7 +256,9 @@ mod tests {
         let by_server_sent_name = API_TRAFFIC_SENT_BYTES_BY_SERVER_MD.get_full_metric_name();
         let by_server_sent = metrics.iter().find(|m| {
             m.name == by_server_sent_name
-                && m.labels.iter().any(|(key, value)| *key == SERVER_LABEL && value == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(key, value)| *key == SERVER_LABEL && value == "node1:9000")
                 && m.labels.iter().any(|(key, value)| *key == TYPE_LABEL && value == "s3")
         });
         assert_eq!(by_server_sent.map(|m| m.value), Some((1024 * 1024 * 500) as f64));

@@ -33,10 +33,9 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD, BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD,
     BUCKET_REPL_RESYNC_FAILED_TOTAL_MD, BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD,
     BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
-    BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD,
-    BUCKET_REPL_TARGET_SENT_BYTES_MD, BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD,
-    BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD,
-    OPERATION_L, RANGE_L, TARGET_ARN_L,
+    BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD,
+    BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
+    BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
 };
 use std::borrow::Cow;
 
@@ -318,24 +317,36 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
                     .with_label(TARGET_ARN_L, target_label.clone()),
             );
             metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, target.last_min_failed_bytes as f64)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(TARGET_ARN_L, target_label.clone()),
+                PrometheusMetric::from_descriptor(
+                    &BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD,
+                    target.last_min_failed_bytes as f64,
+                )
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_label.clone()),
             );
             metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, target.last_min_failed_count as f64)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(TARGET_ARN_L, target_label.clone()),
+                PrometheusMetric::from_descriptor(
+                    &BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD,
+                    target.last_min_failed_count as f64,
+                )
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_label.clone()),
             );
             metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, target.last_hour_failed_bytes as f64)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(TARGET_ARN_L, target_label.clone()),
+                PrometheusMetric::from_descriptor(
+                    &BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD,
+                    target.last_hour_failed_bytes as f64,
+                )
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_label.clone()),
             );
             metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD, target.last_hour_failed_count as f64)
-                    .with_label(BUCKET_L, bucket_label.clone())
-                    .with_label(TARGET_ARN_L, target_label.clone()),
+                PrometheusMetric::from_descriptor(
+                    &BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
+                    target.last_hour_failed_count as f64,
+                )
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_label.clone()),
             );
             metrics.push(
                 PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)

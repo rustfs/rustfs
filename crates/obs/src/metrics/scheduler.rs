@@ -934,7 +934,8 @@ fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey
                 .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
         );
         zero_metrics.push(
-            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0).with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
         );
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
@@ -1060,7 +1061,10 @@ fn retire_notification_target_metric_series(server: &str, target_id: &str, targe
         + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
-        + retire_metric_series(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(
+            &NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(),
+            &server_labels,
+        )
         + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
         + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
 }

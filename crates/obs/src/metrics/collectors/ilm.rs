@@ -142,8 +142,12 @@ mod tests {
 
         let transition_timeout = metrics.iter().find(|m| {
             m.name == ILM_ACTION_TASKS_MD.get_full_metric_name()
-                && m.labels.iter().any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
-                && m.labels.iter().any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
                 && m.labels
                     .iter()
                     .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "queue_send_timeout")

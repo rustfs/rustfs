@@ -199,7 +199,8 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
         value: u64,
         cycle_scope: Option<&str>,
     ) {
-        let mut metric = PrometheusMetric::from_descriptor(descriptor, value as f64).with_label_owned(SERVER_LABEL, server.to_string());
+        let mut metric =
+            PrometheusMetric::from_descriptor(descriptor, value as f64).with_label_owned(SERVER_LABEL, server.to_string());
         if let Some(cycle_scope) = cycle_scope {
             metric = metric.with_label_owned(CYCLE_SCOPE_LABEL, cycle_scope.to_string());
         }
@@ -825,20 +826,32 @@ mod tests {
 
         let lifecycle_failed = metrics.iter().find(|m| {
             m.name == SCANNER_SOURCE_WORK_TOTAL_MD.get_full_metric_name()
-                && m.labels.iter().any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
-                && m.labels.iter().any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "lifecycle")
-                && m.labels.iter().any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "failed")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "lifecycle")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "failed")
         });
         assert_eq!(lifecycle_failed.map(|m| m.value), Some(4.0));
 
         let current_usage_executed = metrics.iter().find(|m| {
             m.name == SCANNER_CYCLE_SOURCE_WORK_MD.get_full_metric_name()
-                && m.labels.iter().any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
                 && m.labels
                     .iter()
                     .any(|(name, value)| *name == CYCLE_SCOPE_LABEL && value.as_ref() == "current")
-                && m.labels.iter().any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "usage")
-                && m.labels.iter().any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "executed")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "usage")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "executed")
         });
         assert_eq!(current_usage_executed.map(|m| m.value), Some(8.0));
     }

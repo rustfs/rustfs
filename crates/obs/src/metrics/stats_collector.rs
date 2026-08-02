@@ -20,6 +20,8 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
+use crate::metrics::collectors::ilm::IlmActionTaskStats;
+use crate::metrics::collectors::scanner::ScannerSourceWorkStats;
 use crate::metrics::collectors::{
     BucketReplicationBacklogStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetBacklogStats,
     BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
@@ -27,8 +29,6 @@ use crate::metrics::collectors::{
     HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats,
     ResourceStats, ScannerStats,
 };
-use crate::metrics::collectors::ilm::IlmActionTaskStats;
-use crate::metrics::collectors::scanner::ScannerSourceWorkStats;
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
     BucketOperations, BucketOptions, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore, StorageAdminApi,
@@ -1791,12 +1791,16 @@ mod tests {
         assert_eq!(stats[0].action, "expiry");
         assert_eq!(stats[0].state, "pending");
         assert_eq!(stats[0].value, 1);
-        assert!(stats.iter().any(|task| {
-            task.action == "transition" && task.state == "queue_send_timeout" && task.value == 6
-        }));
-        assert!(stats.iter().any(|task| {
-            task.action == "transition" && task.state == "compensation_running" && task.value == 8
-        }));
+        assert!(
+            stats
+                .iter()
+                .any(|task| { task.action == "transition" && task.state == "queue_send_timeout" && task.value == 6 })
+        );
+        assert!(
+            stats
+                .iter()
+                .any(|task| { task.action == "transition" && task.state == "compensation_running" && task.value == 8 })
+        );
     }
 
     #[test]

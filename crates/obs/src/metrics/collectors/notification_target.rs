@@ -16,9 +16,9 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::notification_target::{
-    NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD,
-    NOTIFICATION_TARGET_FAILED_MESSAGES_MD, NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
-    NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD,
+    NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_MESSAGES_MD,
+    NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD,
+    NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
     NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER, TARGET_ID, TARGET_TYPE,
 };
 use std::borrow::Cow;
@@ -145,7 +145,10 @@ mod tests {
         assert!(metrics.iter().any(|metric| {
             metric.value == 4.0
                 && metric.name == NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
-                && metric.labels.iter().any(|(key, value)| *key == SERVER && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == SERVER && value == "node1:9000")
                 && metric
                     .labels
                     .iter()
