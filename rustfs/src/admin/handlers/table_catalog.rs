@@ -36,9 +36,11 @@ use rustfs_policy::{
         action::{Action, AdminAction},
     },
 };
+use rustfs_utils::crypto::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad, hex_sha256};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -60,6 +62,12 @@ const ICEBERG_ERROR_NO_SUCH_RESOURCE: &str = "NoSuchResourceException";
 const ICEBERG_ERROR_NO_SUCH_TABLE: &str = "NoSuchTableException";
 const ICEBERG_ERROR_NO_SUCH_VIEW: &str = "NoSuchViewException";
 const ICEBERG_ERROR_REST: &str = "RESTException";
+const REST_PAGE_TOKEN_VERSION: u8 = 1;
+const REST_PAGE_TOKEN_MAX_LENGTH: usize = 16 * 1024;
+const REST_DEFAULT_PAGE_SIZE: usize = 1000;
+const REST_MAX_PAGE_SIZE: usize = 1000;
+const REST_PAGE_TOKEN_QUERY_PARAMETER: &str = "pageToken";
+const REST_PAGE_SIZE_QUERY_PARAMETER: &str = "pageSize";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CATALOG_BACKING_CONFIG_KEY: &str = "rustfs.catalog-backing";
@@ -603,6 +611,8 @@ struct RestNamespaceResponse {
 #[derive(Debug, Serialize)]
 struct RestListNamespacesResponse {
     namespaces: Vec<Vec<String>>,
+    #[serde(rename = "next-page-token")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -614,11 +624,56 @@ struct RestTableIdentifier {
 #[derive(Debug, Serialize)]
 struct RestListTablesResponse {
     identifiers: Vec<RestTableIdentifier>,
+    #[serde(rename = "next-page-token")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestPageToken {
+    version: u8,
+    context: String,
+    cursor: String,
+}
+
+#[derive(Debug)]
+enum RestPagination {
+    Unpaginated,
+    Paginated {
+        cursor: Option<String>,
+        limit: NonZeroUsize,
+        context: String,
+    },
+}
+
+impl RestPagination {
+    fn page_request(&self) -> Option<(Option<&str>, NonZeroUsize)> {
+        match self {
+            Self::Unpaginated => None,
+            Self::Paginated { cursor, limit, .. } => Some((cursor.as_deref(), *limit)),
+        }
+    }
+
+    fn next_page_token(&self, cursor: Option<String>) -> S3Result<Option<String>> {
+        match (self, cursor) {
+            (Self::Unpaginated, _) | (_, None) => Ok(None),
+            (Self::Paginated { context, .. }, Some(cursor)) => encode_rest_page_token(&cursor, context).map(Some),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RestPageContext<'a> {
+    resource: &'static str,
+    warehouse: &'a str,
+    namespace: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
 struct RestListViewsResponse {
     identifiers: Vec<RestTableIdentifier>,
+    #[serde(rename = "next-page-token")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1327,6 +1382,142 @@ fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
     Ok(warehouse)
 }
 
+fn rest_pagination_from_query(uri: &http::Uri, context: RestPageContext<'_>) -> S3Result<RestPagination> {
+    let mut page_token = None;
+    let mut page_token_seen = false;
+    let mut page_size = None;
+
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                REST_PAGE_TOKEN_QUERY_PARAMETER => {
+                    if page_token_seen {
+                        return Err(iceberg_rest_error(
+                            ICEBERG_ERROR_BAD_REQUEST,
+                            StatusCode::BAD_REQUEST,
+                            "pageToken query parameter must not be repeated",
+                        ));
+                    }
+                    page_token_seen = true;
+                    page_token = Some(value.into_owned());
+                }
+                REST_PAGE_SIZE_QUERY_PARAMETER => {
+                    if page_size.is_some() {
+                        return Err(iceberg_rest_error(
+                            ICEBERG_ERROR_BAD_REQUEST,
+                            StatusCode::BAD_REQUEST,
+                            "pageSize query parameter must not be repeated",
+                        ));
+                    }
+                    let value = value.parse::<usize>().map_err(|_| {
+                        iceberg_rest_error(
+                            ICEBERG_ERROR_BAD_REQUEST,
+                            StatusCode::BAD_REQUEST,
+                            "pageSize query parameter must be a positive integer",
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(iceberg_rest_error(
+                            ICEBERG_ERROR_BAD_REQUEST,
+                            StatusCode::BAD_REQUEST,
+                            "pageSize query parameter must be greater than zero",
+                        ));
+                    }
+                    page_size = Some(value.min(REST_MAX_PAGE_SIZE));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !page_token_seen && page_size.is_none() {
+        return Ok(RestPagination::Unpaginated);
+    }
+
+    let context = rest_page_context_fingerprint(context);
+    let cursor = match page_token.as_deref() {
+        None | Some("") => None,
+        Some(encoded) => Some(decode_rest_page_token(encoded, &context)?),
+    };
+    let limit = NonZeroUsize::new(page_size.unwrap_or(REST_DEFAULT_PAGE_SIZE)).ok_or_else(|| {
+        iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "REST page size must be greater than zero",
+        )
+    })?;
+    Ok(RestPagination::Paginated { cursor, limit, context })
+}
+
+fn rest_page_context_fingerprint(context: RestPageContext<'_>) -> String {
+    let mut data =
+        Vec::with_capacity(context.resource.len() + context.warehouse.len() + context.namespace.map_or(0, str::len) + 2);
+    data.extend_from_slice(context.resource.as_bytes());
+    data.push(0);
+    data.extend_from_slice(context.warehouse.as_bytes());
+    data.push(0);
+    if let Some(namespace) = context.namespace {
+        data.extend_from_slice(namespace.as_bytes());
+    }
+    hex_sha256(&data, str::to_string)
+}
+
+fn decode_rest_page_token(encoded: &str, expected_context: &str) -> S3Result<String> {
+    if encoded.len() > REST_PAGE_TOKEN_MAX_LENGTH {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            "pageToken query parameter is too large",
+        ));
+    }
+    let data = base64_decode_url_safe_no_pad(encoded.as_bytes()).map_err(|_| {
+        iceberg_rest_error(
+            ICEBERG_ERROR_BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            "pageToken query parameter is malformed",
+        )
+    })?;
+    let token = serde_json::from_slice::<RestPageToken>(&data).map_err(|_| {
+        iceberg_rest_error(
+            ICEBERG_ERROR_BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            "pageToken query parameter is malformed",
+        )
+    })?;
+    if token.version != REST_PAGE_TOKEN_VERSION || token.context != expected_context || token.cursor.is_empty() {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            "pageToken query parameter does not match this list operation",
+        ));
+    }
+    Ok(token.cursor)
+}
+
+fn encode_rest_page_token(cursor: &str, context: &str) -> S3Result<String> {
+    let token = RestPageToken {
+        version: REST_PAGE_TOKEN_VERSION,
+        context: context.to_string(),
+        cursor: cursor.to_string(),
+    };
+    let data = serde_json::to_vec(&token).map_err(|err| {
+        iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize REST page token: {err}"),
+        )
+    })?;
+    let encoded = base64_encode_url_safe_no_pad(&data);
+    if encoded.len() > REST_PAGE_TOKEN_MAX_LENGTH {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "REST page token exceeds the supported size",
+        ));
+    }
+    Ok(encoded)
+}
+
 fn namespace_from_params(params: &Params<'_, '_>) -> S3Result<crate::table_catalog::Namespace> {
     let namespace = params.get("namespace").unwrap_or("");
     crate::table_catalog::Namespace::parse(namespace).map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
@@ -1514,6 +1705,7 @@ fn namespace_response_from_entry(entry: crate::table_catalog::NamespaceEntry) ->
 
 fn list_namespaces_response_from_entries(
     entries: Vec<crate::table_catalog::NamespaceEntry>,
+    next_page_token: Option<String>,
 ) -> S3Result<RestListNamespacesResponse> {
     let namespaces = entries
         .into_iter()
@@ -1523,10 +1715,16 @@ fn list_namespaces_response_from_entries(
             Ok(namespace_segments(&namespace))
         })
         .collect::<S3Result<Vec<_>>>()?;
-    Ok(RestListNamespacesResponse { namespaces })
+    Ok(RestListNamespacesResponse {
+        namespaces,
+        next_page_token,
+    })
 }
 
-fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEntry>) -> S3Result<RestListTablesResponse> {
+fn list_tables_response_from_entries(
+    entries: Vec<crate::table_catalog::TableEntry>,
+    next_page_token: Option<String>,
+) -> S3Result<RestListTablesResponse> {
     let identifiers = entries
         .into_iter()
         .map(|entry| {
@@ -1538,10 +1736,16 @@ fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEnt
             })
         })
         .collect::<S3Result<Vec<_>>>()?;
-    Ok(RestListTablesResponse { identifiers })
+    Ok(RestListTablesResponse {
+        identifiers,
+        next_page_token,
+    })
 }
 
-fn list_views_response_from_entries(entries: Vec<crate::table_catalog::ViewEntry>) -> S3Result<RestListViewsResponse> {
+fn list_views_response_from_entries(
+    entries: Vec<crate::table_catalog::ViewEntry>,
+    next_page_token: Option<String>,
+) -> S3Result<RestListViewsResponse> {
     let identifiers = entries
         .into_iter()
         .map(|entry| {
@@ -1553,7 +1757,10 @@ fn list_views_response_from_entries(entries: Vec<crate::table_catalog::ViewEntry
             })
         })
         .collect::<S3Result<Vec<_>>>()?;
-    Ok(RestListViewsResponse { identifiers })
+    Ok(RestListViewsResponse {
+        identifiers,
+        next_page_token,
+    })
 }
 
 fn table_credential_vending_enabled() -> bool {
@@ -3605,12 +3812,28 @@ where
     namespace_response_from_entry(entry)
 }
 
-async fn list_namespaces_response<S>(store: &S, bucket: &str) -> S3Result<RestListNamespacesResponse>
+async fn list_namespaces_response<S>(store: &S, bucket: &str, uri: &http::Uri) -> S3Result<RestListNamespacesResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let entries = store.list_namespaces(bucket).await.map_err(catalog_store_error)?;
-    list_namespaces_response_from_entries(entries)
+    let context = RestPageContext {
+        resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
+        warehouse: bucket,
+        namespace: None,
+    };
+    let pagination = rest_pagination_from_query(uri, context)?;
+    let page = match pagination.page_request() {
+        Some((cursor, limit)) => store
+            .list_namespaces_page(bucket, cursor, limit)
+            .await
+            .map_err(catalog_store_error)?,
+        None => crate::table_catalog::TableCatalogListPage {
+            entries: store.list_namespaces(bucket).await.map_err(catalog_store_error)?,
+            next_cursor: None,
+        },
+    };
+    let next_page_token = pagination.next_page_token(page.next_cursor)?;
+    list_namespaces_response_from_entries(page.entries, next_page_token)
 }
 
 async fn get_namespace_response<S>(
@@ -3766,15 +3989,30 @@ async fn list_tables_response<S>(
     store: &S,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
+    uri: &http::Uri,
 ) -> S3Result<RestListTablesResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let entries = store
-        .list_tables(bucket, &namespace.public_name())
-        .await
-        .map_err(catalog_store_error)?;
-    list_tables_response_from_entries(entries)
+    let namespace = namespace.public_name();
+    let context = RestPageContext {
+        resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
+        warehouse: bucket,
+        namespace: Some(&namespace),
+    };
+    let pagination = rest_pagination_from_query(uri, context)?;
+    let page = match pagination.page_request() {
+        Some((cursor, limit)) => store
+            .list_tables_page(bucket, &namespace, cursor, limit)
+            .await
+            .map_err(catalog_store_error)?,
+        None => crate::table_catalog::TableCatalogListPage {
+            entries: store.list_tables(bucket, &namespace).await.map_err(catalog_store_error)?,
+            next_cursor: None,
+        },
+    };
+    let next_page_token = pagination.next_page_token(page.next_cursor)?;
+    list_tables_response_from_entries(page.entries, next_page_token)
 }
 
 async fn load_table_response<S>(
@@ -3802,15 +4040,30 @@ async fn list_views_response<S>(
     store: &S,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
+    uri: &http::Uri,
 ) -> S3Result<RestListViewsResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let entries = store
-        .list_views(bucket, &namespace.public_name())
-        .await
-        .map_err(catalog_store_error)?;
-    list_views_response_from_entries(entries)
+    let namespace = namespace.public_name();
+    let context = RestPageContext {
+        resource: TABLE_CATALOG_VIEW_RESOURCE_ROOT,
+        warehouse: bucket,
+        namespace: Some(&namespace),
+    };
+    let pagination = rest_pagination_from_query(uri, context)?;
+    let page = match pagination.page_request() {
+        Some((cursor, limit)) => store
+            .list_views_page(bucket, &namespace, cursor, limit)
+            .await
+            .map_err(catalog_store_error)?,
+        None => crate::table_catalog::TableCatalogListPage {
+            entries: store.list_views(bucket, &namespace).await.map_err(catalog_store_error)?,
+            next_cursor: None,
+        },
+    };
+    let next_page_token = pagination.next_page_token(page.next_cursor)?;
+    list_views_response_from_entries(page.entries, next_page_token)
 }
 
 async fn load_view_response<S>(
@@ -5077,7 +5330,7 @@ impl Operation for RestListNamespacesHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
-        let response = list_namespaces_response(&store, &warehouse).await?;
+        let response = list_namespaces_response(&store, &warehouse, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -5156,7 +5409,7 @@ impl Operation for RestListTablesHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
-        let response = list_tables_response(&store, &warehouse, &namespace).await?;
+        let response = list_tables_response(&store, &warehouse, &namespace, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -5210,7 +5463,7 @@ impl Operation for RestListViewsHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
-        let response = list_views_response(&store, &warehouse, &namespace).await?;
+        let response = list_views_response(&store, &warehouse, &namespace, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -6232,6 +6485,31 @@ mod tests {
     }
 
     #[test]
+    fn table_catalog_list_handlers_parse_standard_pagination() {
+        let src = include_str!("table_catalog.rs");
+        for (handler, helper_call) in [
+            (
+                "RestListNamespacesHandler",
+                "list_namespaces_response(&store, &warehouse, &req.uri).await?",
+            ),
+            (
+                "RestListTablesHandler",
+                "list_tables_response(&store, &warehouse, &namespace, &req.uri).await?",
+            ),
+            (
+                "RestListViewsHandler",
+                "list_views_response(&store, &warehouse, &namespace, &req.uri).await?",
+            ),
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains(helper_call),
+                "{handler} should pass the request URI to its paginated list helper"
+            );
+        }
+    }
+
+    #[test]
     fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_state() {
         let src = include_str!("table_catalog.rs");
 
@@ -6709,26 +6987,29 @@ mod tests {
     #[test]
     fn list_tables_response_uses_rest_identifier_shape() {
         let namespace = crate::table_catalog::Namespace::parse("analytics.daily_events").expect("namespace should parse");
-        let response = list_tables_response_from_entries(vec![crate::table_catalog::TableEntry {
-            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
-            table_bucket: "warehouse".to_string(),
-            namespace: namespace.public_name(),
-            table: "events".to_string(),
-            table_id: "table-id".to_string(),
-            table_uuid: "table-uuid".to_string(),
-            format: "ICEBERG".to_string(),
-            format_version: 2,
-            warehouse_location: "s3://warehouse/tables/table-id".to_string(),
-            metadata_location:
-                ".rustfs-table/warehouses/default/namespaces/analytics/daily_events/tables/events/metadata/00001.metadata.json"
-                    .to_string(),
-            version_token: "token-v1".to_string(),
-            generation: 1,
-            state: crate::table_catalog::TableCatalogEntryState::Active,
-            properties: BTreeMap::new(),
-            created_at: None,
-            updated_at: None,
-        }])
+        let response = list_tables_response_from_entries(
+            vec![crate::table_catalog::TableEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: "warehouse".to_string(),
+                namespace: namespace.public_name(),
+                table: "events".to_string(),
+                table_id: "table-id".to_string(),
+                table_uuid: "table-uuid".to_string(),
+                format: "ICEBERG".to_string(),
+                format_version: 2,
+                warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+                metadata_location:
+                    ".rustfs-table/warehouses/default/namespaces/analytics/daily_events/tables/events/metadata/00001.metadata.json"
+                        .to_string(),
+                version_token: "token-v1".to_string(),
+                generation: 1,
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            }],
+            None,
+        )
         .expect("table list response should build");
 
         assert_eq!(
@@ -6736,6 +7017,308 @@ mod tests {
             vec!["analytics".to_string(), "daily_events".to_string()]
         );
         assert_eq!(response.identifiers[0].name, "events");
+        assert!(response.next_page_token.is_none());
+    }
+
+    #[test]
+    fn rest_pagination_round_trips_context_bound_tokens() {
+        let context = RestPageContext {
+            resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
+            warehouse: "warehouse",
+            namespace: Some("analytics"),
+        };
+        let first_request = "/?pageSize=2".parse::<http::Uri>().expect("first page URI should parse");
+        let first_pagination = rest_pagination_from_query(&first_request, context).expect("pageSize should start pagination");
+        let (cursor, limit) = first_pagination.page_request().expect("pageSize should enable pagination");
+        assert_eq!(cursor, None);
+        assert_eq!(limit.get(), 2);
+        let next_page_token = first_pagination
+            .next_page_token(Some("strong:beta".to_string()))
+            .expect("page token should encode")
+            .expect("page token should be present");
+        let second_request = format!("/?pageSize=2&pageToken={next_page_token}")
+            .parse::<http::Uri>()
+            .expect("second page URI should parse");
+        let second_pagination = rest_pagination_from_query(&second_request, context).expect("continuation token should decode");
+        let (cursor, limit) = second_pagination
+            .page_request()
+            .expect("continuation should remain paginated");
+        assert_eq!(cursor, Some("strong:beta"));
+        assert_eq!(limit.get(), 2);
+        assert!(
+            second_pagination
+                .next_page_token(None)
+                .expect("terminal token should build")
+                .is_none()
+        );
+
+        let default_size_request = format!("/?pageToken={next_page_token}")
+            .parse::<http::Uri>()
+            .expect("continuation URI should parse without pageSize");
+        let default_size_pagination =
+            rest_pagination_from_query(&default_size_request, context).expect("continuation should use the default page size");
+        let (cursor, limit) = default_size_pagination
+            .page_request()
+            .expect("continuation should remain paginated");
+        assert_eq!(cursor, Some("strong:beta"));
+        assert_eq!(limit.get(), REST_DEFAULT_PAGE_SIZE);
+
+        for other_context in [
+            RestPageContext {
+                resource: TABLE_CATALOG_VIEW_RESOURCE_ROOT,
+                warehouse: "warehouse",
+                namespace: Some("analytics"),
+            },
+            RestPageContext {
+                resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
+                warehouse: "other-warehouse",
+                namespace: Some("analytics"),
+            },
+            RestPageContext {
+                resource: TABLE_CATALOG_TABLE_RESOURCE_ROOT,
+                warehouse: "warehouse",
+                namespace: Some("other-namespace"),
+            },
+        ] {
+            let expected_context = rest_page_context_fingerprint(other_context);
+            let error = decode_rest_page_token(&next_page_token, &expected_context).expect_err("cross-context token should fail");
+            assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+        }
+    }
+
+    #[test]
+    fn rest_pagination_rejects_invalid_query_parameters() {
+        let context = RestPageContext {
+            resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
+            warehouse: "warehouse",
+            namespace: None,
+        };
+        for uri in [
+            "/?pageSize=0",
+            "/?pageSize=one",
+            "/?pageSize=1&pageSize=2",
+            "/?pageToken=first&pageToken=second",
+        ] {
+            let uri = uri.parse::<http::Uri>().expect("invalid pagination URI should still parse");
+            let error = rest_pagination_from_query(&uri, context).expect_err("invalid pagination query should fail");
+            assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()), "{uri}");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST), "{uri}");
+        }
+
+        let oversized_token = "a".repeat(REST_PAGE_TOKEN_MAX_LENGTH + 1);
+        let oversized_uri = format!("/?pageToken={oversized_token}")
+            .parse::<http::Uri>()
+            .expect("oversized token URI should parse");
+        let error = rest_pagination_from_query(&oversized_uri, context).expect_err("oversized token should fail");
+        assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+        assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+
+        let empty_token = "/?pageToken=".parse::<http::Uri>().expect("empty token URI should parse");
+        let pagination = rest_pagination_from_query(&empty_token, context).expect("empty token should start the first page");
+        let (cursor, limit) = pagination.page_request().expect("empty token should enable pagination");
+        assert_eq!(cursor, None);
+        assert_eq!(limit.get(), REST_DEFAULT_PAGE_SIZE);
+
+        let capped_size = "/?pageSize=5000"
+            .parse::<http::Uri>()
+            .expect("large page size URI should parse");
+        let pagination = rest_pagination_from_query(&capped_size, context).expect("large page size should be capped");
+        let (cursor, limit) = pagination.page_request().expect("pageSize alone should enable pagination");
+        assert_eq!(cursor, None);
+        assert_eq!(limit.get(), REST_MAX_PAGE_SIZE);
+
+        let unpaginated = rest_pagination_from_query(&"/".parse().expect("URI should parse"), context)
+            .expect("request without pagination should parse");
+        assert!(unpaginated.page_request().is_none());
+    }
+
+    #[test]
+    fn rest_pagination_rejects_malformed_token_payloads() {
+        let context = RestPageContext {
+            resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
+            warehouse: "warehouse",
+            namespace: None,
+        };
+        let context_fingerprint = rest_page_context_fingerprint(context);
+        let encoded_json = |value: serde_json::Value| {
+            base64_encode_url_safe_no_pad(&serde_json::to_vec(&value).expect("test token should encode"))
+        };
+        let malformed_tokens = [
+            "*".to_string(),
+            base64_encode_url_safe_no_pad(b"not-json"),
+            encoded_json(serde_json::json!({
+                "version": REST_PAGE_TOKEN_VERSION,
+                "context": context_fingerprint.clone(),
+                "cursor": "strong:alpha",
+                "unknown": true
+            })),
+            encoded_json(serde_json::json!({
+                "version": REST_PAGE_TOKEN_VERSION + 1,
+                "context": context_fingerprint.clone(),
+                "cursor": "strong:alpha"
+            })),
+            encoded_json(serde_json::json!({
+                "version": REST_PAGE_TOKEN_VERSION,
+                "context": context_fingerprint.clone(),
+                "cursor": ""
+            })),
+        ];
+
+        for token in malformed_tokens {
+            let uri = format!(
+                "/?pageToken={}",
+                url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>()
+            )
+            .parse::<http::Uri>()
+            .expect("malformed token URI should parse");
+            let error = rest_pagination_from_query(&uri, context).expect_err("malformed token should fail");
+            assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_list_pagination_covers_namespaces_tables_and_views() {
+        let store = TestTableCatalogStore::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        for name in ["beta", "alpha"] {
+            store.namespaces.lock().await.push(crate::table_catalog::NamespaceEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: "warehouse".to_string(),
+                namespace: name.to_string(),
+                namespace_id: name.to_string(),
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            });
+            store.tables.lock().await.push(crate::table_catalog::TableEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: "warehouse".to_string(),
+                namespace: namespace.public_name(),
+                table: name.to_string(),
+                table_id: format!("table-{name}"),
+                table_uuid: format!("table-uuid-{name}"),
+                format: "ICEBERG".to_string(),
+                format_version: 2,
+                warehouse_location: format!("s3://warehouse/tables/table-{name}"),
+                metadata_location: format!("s3://warehouse/tables/table-{name}/metadata/00001.metadata.json"),
+                version_token: "token-v1".to_string(),
+                generation: 1,
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            });
+            store.views.lock().await.push(crate::table_catalog::ViewEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: "warehouse".to_string(),
+                namespace: namespace.public_name(),
+                view: name.to_string(),
+                view_id: format!("view-{name}"),
+                view_uuid: format!("view-uuid-{name}"),
+                format: "ICEBERG_VIEW".to_string(),
+                format_version: 1,
+                warehouse_location: format!("s3://warehouse/views/view-{name}"),
+                metadata_location: format!("s3://warehouse/views/view-{name}/metadata/00001.view.json"),
+                version_token: "token-v1".to_string(),
+                generation: 1,
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            });
+        }
+
+        let first_uri = "/?pageSize=1".parse::<http::Uri>().expect("first page URI should parse");
+        let namespaces = list_namespaces_response(&store, "warehouse", &first_uri)
+            .await
+            .expect("namespace first page should load");
+        assert_eq!(namespaces.namespaces, vec![vec!["alpha".to_string()]]);
+        let namespace_token = namespaces.next_page_token.expect("namespace continuation should exist");
+        let namespace_uri = format!("/?pageSize=1&pageToken={namespace_token}")
+            .parse::<http::Uri>()
+            .expect("namespace continuation URI should parse");
+        let namespaces = list_namespaces_response(&store, "warehouse", &namespace_uri)
+            .await
+            .expect("namespace second page should load");
+        assert_eq!(namespaces.namespaces, vec![vec!["beta".to_string()]]);
+        assert!(namespaces.next_page_token.is_none());
+
+        let tables = list_tables_response(&store, "warehouse", &namespace, &first_uri)
+            .await
+            .expect("table first page should load");
+        assert_eq!(tables.identifiers.len(), 1);
+        assert_eq!(tables.identifiers[0].name, "alpha");
+        let table_token = tables.next_page_token.expect("table continuation should exist");
+        let table_uri = format!("/?pageSize=1&pageToken={table_token}")
+            .parse::<http::Uri>()
+            .expect("table continuation URI should parse");
+        let tables = list_tables_response(&store, "warehouse", &namespace, &table_uri)
+            .await
+            .expect("table second page should load");
+        assert_eq!(tables.identifiers.len(), 1);
+        assert_eq!(tables.identifiers[0].name, "beta");
+        assert!(tables.next_page_token.is_none());
+
+        let views = list_views_response(&store, "warehouse", &namespace, &first_uri)
+            .await
+            .expect("view first page should load");
+        assert_eq!(views.identifiers.len(), 1);
+        assert_eq!(views.identifiers[0].name, "alpha");
+        let view_token = views.next_page_token.expect("view continuation should exist");
+        let view_uri = format!("/?pageSize=1&pageToken={view_token}")
+            .parse::<http::Uri>()
+            .expect("view continuation URI should parse");
+        let views = list_views_response(&store, "warehouse", &namespace, &view_uri)
+            .await
+            .expect("view second page should load");
+        assert_eq!(views.identifiers.len(), 1);
+        assert_eq!(views.identifiers[0].name, "beta");
+        assert!(views.next_page_token.is_none());
+
+        for uri in ["/", "/?pageSize=2"] {
+            let uri = uri.parse::<http::Uri>().expect("list URI should parse");
+            let namespaces = list_namespaces_response(&store, "warehouse", &uri)
+                .await
+                .expect("namespace exact page should load");
+            let tables = list_tables_response(&store, "warehouse", &namespace, &uri)
+                .await
+                .expect("table exact page should load");
+            let views = list_views_response(&store, "warehouse", &namespace, &uri)
+                .await
+                .expect("view exact page should load");
+            assert_eq!(namespaces.namespaces.len(), 2);
+            assert!(namespaces.next_page_token.is_none());
+            assert_eq!(tables.identifiers.len(), 2);
+            assert!(tables.next_page_token.is_none());
+            assert_eq!(views.identifiers.len(), 2);
+            assert!(views.next_page_token.is_none());
+        }
+    }
+
+    #[test]
+    fn list_responses_expose_null_next_page_token_at_end() {
+        for value in [
+            serde_json::to_value(RestListNamespacesResponse {
+                namespaces: vec![vec!["analytics".to_string()]],
+                next_page_token: None,
+            })
+            .expect("namespace response should serialize"),
+            serde_json::to_value(RestListTablesResponse {
+                identifiers: Vec::new(),
+                next_page_token: None,
+            })
+            .expect("table response should serialize"),
+            serde_json::to_value(RestListViewsResponse {
+                identifiers: Vec::new(),
+                next_page_token: None,
+            })
+            .expect("view response should serialize"),
+        ] {
+            assert!(value.get("next-page-token").is_some_and(serde_json::Value::is_null));
+        }
     }
 
     #[tokio::test]
@@ -9835,7 +10418,8 @@ mod tests {
                 .expect("view metadata object lookup should succeed")
         );
 
-        let listed = list_views_response(&store, "warehouse", &namespace)
+        let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let listed = list_views_response(&store, "warehouse", &namespace, &unpaginated_uri)
             .await
             .expect("views should list");
         assert_eq!(listed.identifiers.len(), 1);
@@ -9890,7 +10474,7 @@ mod tests {
         drop_view_in_store(&store, "warehouse", &namespace, "recent_events")
             .await
             .expect("view should drop");
-        let listed = list_views_response(&store, "warehouse", &namespace)
+        let listed = list_views_response(&store, "warehouse", &namespace, &unpaginated_uri)
             .await
             .expect("views should list after drop");
         assert!(listed.identifiers.is_empty());
@@ -11379,7 +11963,8 @@ mod tests {
         assert_eq!(create.namespace, vec!["analytics".to_string()]);
         assert_eq!(create.properties.get("owner").map(String::as_str), Some("lakehouse"));
 
-        let list = list_namespaces_response(&store, "warehouse")
+        let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let list = list_namespaces_response(&store, "warehouse", &unpaginated_uri)
             .await
             .expect("namespace list should load");
         assert_eq!(list.namespaces, vec![vec!["analytics".to_string()]]);
@@ -11387,7 +11972,7 @@ mod tests {
         drop_namespace_in_store(&store, "warehouse", "analytics")
             .await
             .expect("namespace should drop");
-        let list = list_namespaces_response(&store, "warehouse")
+        let list = list_namespaces_response(&store, "warehouse", &unpaginated_uri)
             .await
             .expect("namespace list should load after drop");
         assert!(list.namespaces.is_empty());
@@ -11445,7 +12030,8 @@ mod tests {
         assert_eq!(register.metadata_location, client_metadata_location);
         assert_eq!(register.metadata["format-version"], 2);
 
-        let list = list_tables_response(&store, "warehouse", &namespace)
+        let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
+        let list = list_tables_response(&store, "warehouse", &namespace, &unpaginated_uri)
             .await
             .expect("table list should load");
         assert_eq!(list.identifiers[0].name, "events");
