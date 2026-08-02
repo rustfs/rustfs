@@ -31,6 +31,7 @@ services:
       - RUSTFS_ACCESS_KEY=rustfsadmin # CHANGEME
       - RUSTFS_SECRET_KEY=rustfsadmin # CHANGEME
       - RUSTFS_OBS_LOGGER_LEVEL=info
+      - RUSTFS_OBS_LOG_DIRECTORY=/app/logs
       # Optional TLS:
       # - mount your cert directory to /opt/tls
       # - set RUSTFS_TLS_PATH=/opt/tls
