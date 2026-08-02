@@ -409,7 +409,7 @@ pub async fn persist_force_delete_intent<S: ReplicationStorage>(
         .await?;
     let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
 
-    let mut entries = match crate::config::com::read_config_no_lock(storage.clone(), file).await {
+    let mut entries = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
         Ok(data) => decode_mrf_file(&data)?,
         Err(EcstoreError::ConfigNotFound) => Vec::new(),
         Err(err) => return Err(err),
@@ -424,7 +424,7 @@ pub async fn persist_force_delete_intent<S: ReplicationStorage>(
 
     entries.push(entry);
     let data = encode_mrf_file(&entries)?;
-    crate::config::com::save_config_no_lock(storage, file, data).await
+    ReplicationConfigStore::save_no_lock(storage, file, data).await
 }
 
 pub async fn commit_force_delete_intent<S: ReplicationStorage>(
@@ -437,7 +437,7 @@ pub async fn commit_force_delete_intent<S: ReplicationStorage>(
         .await?;
     let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
 
-    let data = crate::config::com::read_config_no_lock(storage.clone(), file).await?;
+    let data = ReplicationConfigStore::read_no_lock(storage.clone(), file).await?;
     let mut entries = decode_mrf_file(&data)?;
     let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
         return Err(EcstoreError::ConfigNotFound);
@@ -446,7 +446,7 @@ pub async fn commit_force_delete_intent<S: ReplicationStorage>(
         return Ok(());
     }
     entry.force_delete_local_commit = true;
-    crate::config::com::save_config_no_lock(storage, file, encode_mrf_file(&entries)?).await
+    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
 }
 
 pub async fn complete_force_delete_intent<S: ReplicationStorage>(
@@ -459,7 +459,7 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
         .await?;
     let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
 
-    let data = match crate::config::com::read_config_no_lock(storage.clone(), file).await {
+    let data = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
         Ok(data) => data,
         Err(EcstoreError::ConfigNotFound) => return Ok(()),
         Err(err) => return Err(err),
@@ -471,7 +471,7 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
         return Ok(());
     }
 
-    crate::config::com::save_config_no_lock(storage, file, encode_mrf_file(&entries)?).await
+    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
 }
 
 #[derive(Debug, thiserror::Error)]
