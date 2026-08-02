@@ -17,7 +17,7 @@ pub use rustfs_replication::{MrfOpKind, MrfReplicateEntry};
 pub(crate) use rustfs_replication::{
     REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL_DELETE, ReplicateTargetDecision, ReplicatedInfos,
     ReplicatedTargetInfo, ReplicationAction, ReplicationWorkerOperation, ResyncDecision, get_replication_state,
-    parse_replicate_decision, target_reset_header, version_purge_statuses_map,
+    parse_replicate_decision, replicate_decision_for_admitted_targets, target_reset_header, version_purge_statuses_map,
 };
 pub use rustfs_replication::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState, ReplicationStatusType, ReplicationType,

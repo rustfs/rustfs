@@ -16,8 +16,8 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
-    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replicate_decision_for_admitted_targets,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
@@ -993,21 +993,25 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             delete_marker: entry.delete_marker,
                             ..Default::default()
                         };
-                        let dsc = check_replicate_delete(
-                            &entry.bucket,
-                            &ObjectToDelete {
-                                object_name: entry.object.clone(),
-                                version_id: entry.version_id,
-                                ..Default::default()
-                            },
-                            &oi,
-                            &ObjectOptions {
-                                versioned,
-                                ..Default::default()
-                            },
-                            None,
-                        )
-                        .await;
+                        let dsc = if entry.target_arns.is_empty() {
+                            check_replicate_delete(
+                                &entry.bucket,
+                                &ObjectToDelete {
+                                    object_name: entry.object.clone(),
+                                    version_id: entry.version_id,
+                                    ..Default::default()
+                                },
+                                &oi,
+                                &ObjectOptions {
+                                    versioned,
+                                    ..Default::default()
+                                },
+                                None,
+                            )
+                            .await
+                        } else {
+                            replicate_decision_for_admitted_targets(&entry.target_arns)
+                        };
                         let mut rstate = oi.replication_state();
                         rstate.replicate_decision_str = dsc.to_string();
 
@@ -1038,7 +1042,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         schedule_replication_delete(dv).await;
                         queued_count += 1;
                     }
-                    MrfOpKind::Object => {
+                    MrfOpKind::Object | MrfOpKind::Heal | MrfOpKind::ExistingObject => {
                         let opts = ObjectOptions {
                             version_id: entry.version_id.map(|u| u.to_string()),
                             ..Default::default()
@@ -1057,9 +1061,16 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 continue;
                             }
                         };
-                        // Route through queue_replication_heal so the replication decision (dsc)
-                        // is computed from the live config — required for replicate_object.
-                        queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
+                        if entry.target_arns.is_empty() {
+                            // Legacy entries predate target admission persistence. They cannot
+                            // be safely attributed, so retain the old live-config fallback.
+                            queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
+                        } else if let Some(pool) = runtime_sources::replication_pool() {
+                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+                            let mut roi = replicate_object_info_from_object_info(oi, dsc, entry.op.replication_type());
+                            roi.retry_count = entry.retry_count.max(0) as u32;
+                            let _ = pool.queue_replica_task(roi).await;
+                        }
                         queued_count += 1;
                     }
                     MrfOpKind::Metadata => {
