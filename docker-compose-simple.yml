@@ -17,6 +17,8 @@ services:
   rustfs:
     image: rustfs/rustfs:latest
     container_name: rustfs-server
+    depends_on:
+      - volume-permission-helper
     security_opt:
       - "no-new-privileges:true"
     ports:
