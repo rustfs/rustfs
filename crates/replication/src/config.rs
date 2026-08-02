@@ -870,7 +870,9 @@ mod tests {
         );
 
         config.rules[0].source_selection_criteria = None;
-        config.rules[0].destination.encryption_configuration = Some(EncryptionConfiguration::default());
+        config.rules[0].destination.encryption_configuration = Some(EncryptionConfiguration {
+            replica_kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/opaque-key-id".to_string()),
+        });
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.EncryptionConfiguration"));
 
         config.rules[0].destination.encryption_configuration = None;
