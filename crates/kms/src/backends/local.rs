@@ -3069,6 +3069,36 @@ mod tests {
     /// Compatibility floor for the guard above: a record written before the
     /// protection marker existed carries no marker at all, and such a
     /// directory legitimately has no salt yet. It must keep initializing.
+    /// A record this build cannot interpret must not be edited out of a
+    /// listing. The page would claim to describe the key set while omitting a
+    /// key that is still on disk, and the deletion sweep — which counts the
+    /// lifecycle gauges out of the pages it lists — would report a census it
+    /// never fully saw as complete.
+    #[tokio::test]
+    async fn list_keys_fails_closed_on_a_record_it_cannot_interpret() {
+        let (client, _temp_dir) = create_test_client().await;
+        client.create_key("alpha", "AES_256", None).await.expect("create alpha");
+        client.create_key("beta", "AES_256", None).await.expect("create beta");
+
+        let key_path = client.master_key_path("beta").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a listing must not quietly omit a key it cannot read");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "beta" && version == "post-quantum-v2"),
+            "got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn missing_salt_with_pre_marker_key_records_still_initializes() {
         let (dev_client, temp_dir) = create_dev_mode_client().await;

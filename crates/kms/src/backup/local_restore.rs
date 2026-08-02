@@ -2064,4 +2064,82 @@ mod tests {
             .find(|blocker| blocker.code == RestoreBlockerCode::BundleCorrupted)
             .expect("a tampered config artifact must be reported as corruption");
     }
+
+    /// A bundled record from a newer build is not a damaged bundle: the bytes
+    /// are intact and the build that wrote them reads them back. Reporting it
+    /// as corruption sends the operator into a disaster recovery for what a
+    /// version change fixes, so the verdict must stay separate all the way
+    /// out to the dry-run blocker code.
+    #[test]
+    fn bundled_record_from_a_newer_build_is_not_reported_as_corruption() {
+        let record = serde_json::json!({
+            "key_id": "alpha",
+            "at_rest_protection": "post-quantum-v2",
+            "encrypted_key_material": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "nonce": vec![0u8; 12],
+        });
+        let error = match decode_key_record(
+            "artifacts/keys/alpha.key.enc",
+            Zeroizing::new(serde_json::to_vec(&record).expect("encode record")),
+            &[AtRestProtection::EncryptedMasterKey],
+        ) {
+            Ok(_) => panic!("a record this build cannot interpret must be rejected"),
+            Err(error) => error,
+        };
+
+        let KmsError::Backup(inner) = &error else {
+            panic!("expected a backup error, got {error:?}");
+        };
+        assert!(
+            matches!(inner, BackupError::UnsupportedRecordVersion { key_id, version }
+                if key_id == "alpha" && version == "post-quantum-v2"),
+            "got {inner:?}"
+        );
+        assert_eq!(
+            RestoreBlocker::from(inner).code,
+            RestoreBlockerCode::UnknownFormatVersion,
+            "a dry run must report a version blocker, not a corruption blocker"
+        );
+    }
+
+    /// The commit marker's format-version branch, symmetric with the Vault
+    /// restore marker's: an unknown version is refused outright everywhere the
+    /// marker is read, and the backend refuses to start while it is present.
+    #[tokio::test]
+    async fn restore_commit_marker_from_a_newer_build_is_refused() {
+        let mut marker = serde_json::to_value(RestoreCommitMarker {
+            format_version: RESTORE_MARKER_FORMAT_VERSION,
+            backup_id: BACKUP_ID.to_string(),
+            manifest_digest: ContentDigest::sha256_of(b"manifest"),
+            files: vec![LOCAL_KMS_MASTER_KEY_SALT_FILE.to_string()],
+        })
+        .expect("marker json");
+        marker["format_version"] = serde_json::json!(99);
+        let marker = serde_json::to_vec_pretty(&marker).expect("marker bytes");
+
+        let error = RestoreCommitMarker::decode(&marker).expect_err("an unknown marker version must be refused");
+        assert!(error.to_string().contains("unknown format version 99"), "got {error}");
+
+        // Reachable from the restore entry point, not just from the decoder.
+        let (client, _source_dir) = source_with_keys(Some(TEST_MASTER_KEY), &["alpha"]).await;
+        let work = TempDir::new().expect("work dir");
+        let (bundle, _manifest) = export_bundle(&client, work.path()).await;
+        let target = TempDir::new().expect("target dir");
+        fs::write(target.path().join(LOCAL_RESTORE_COMMIT_MARKER_FILE), &marker)
+            .await
+            .expect("seed marker");
+        let before = snapshot_tree(target.path());
+        let error = restore_local_backup(&test_kek(), &restore_request(&bundle, target.path()))
+            .await
+            .expect_err("an unknown marker version must block the restore");
+        assert!(error.to_string().contains("unknown format version 99"), "got {error}");
+        assert_eq!(snapshot_tree(target.path()), before, "the refused restore must not write");
+
+        // And the backend itself refuses to start on any marker at all.
+        let error = match LocalKmsClient::new(local_config(target.path(), Some(TEST_MASTER_KEY))).await {
+            Ok(_) => panic!("a restore marker must block startup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unfinished restore"), "got {error}");
+    }
 }
