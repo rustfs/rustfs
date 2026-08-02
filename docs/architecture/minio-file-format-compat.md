@@ -252,9 +252,11 @@ The primitives match — RustFS implements the same DARE V2 stream format and th
 
 ### How it fails
 
-Seams 1 and 3 both `return Ok(None)`, which the resolver maps to "this object has no encryption material" (`rustfs/src/storage/sse.rs:1356`). The read is therefore treated as a plaintext read and the stored ciphertext is served, rather than the request failing. **Do not rely on a GET error to tell you an object did not migrate** — validate a sample of encrypted objects by content (checksum against the source) before decommissioning the MinIO side.
+The read fails closed: ciphertext is never served as plaintext. Seams 1 and 3 return `Ok(None)`, but that value does not reach the data path. `is_object_encryption_marker` matches the whole `x-minio-internal-server-side-encryption-` prefix (`crates/utils/src/http/header_compat.rs:50-67`), so `ObjectInfo::is_encrypted()` is true for these objects, and `crates/ecstore/src/object_api/readers.rs:559-568` turns the `Ok(None)` into `encrypted object metadata is incomplete` while constructing the reader. GET, CopyObject, replication and multipart sources all build the reader through that path. The inline fast path and the body cache both exclude encrypted objects explicitly, so neither bypasses it.
 
-Seam 2 does surface an error, but only for objects that got past seam 1.
+What migrates badly is the *diagnosis*, not the data. That error is not recognised by `map_get_object_reader_error` (`rustfs/src/storage/sse.rs:667`), so it surfaces as a 500 `InternalError` — which reads as a RustFS fault rather than "this object was encrypted by another implementation". List and HEAD still succeed, because `xl.meta` itself parses normally, so the object looks healthy until something reads it.
+
+Seam 2 surfaces its own error, but only for objects that got past seam 1.
 
 ### The `rio-v2` feature does not change this
 

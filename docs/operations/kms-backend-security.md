@@ -19,12 +19,12 @@ For how the Vault backends authenticate (static token, AppRole, Vault Agent toke
 > **Warning: RustFS does not currently support reading objects that MinIO encrypted.**
 > This applies to SSE-S3, SSE-KMS, and SSE-C, in every released binary and container image, and it holds regardless of which KMS backend you configure. Configuring the `Static` backend with the same key material MinIO used does **not** make those objects readable — MinIO wraps data keys in a different envelope format that no RustFS backend produces or accepts (`crates/kms/src/config.rs:304-308`). Plan for this **before** moving data. Tracked in rustfs/backlog#1638.
 
-Two properties of the failure make it easy to discover too late:
+The read does fail closed — ciphertext is never served as plaintext. MinIO's internal encryption headers mark the object as encrypted (`crates/utils/src/http/header_compat.rs:50-67`), so the read path demands encryption material and refuses when none resolves (`crates/ecstore/src/object_api/readers.rs:559-568`). Two properties still make the problem easy to discover late:
 
-- **It does not fail closed.** The read path treats a MinIO-encrypted object as unencrypted and returns the stored ciphertext instead of raising an error. A GET that returns 200 is not evidence that an object migrated correctly.
-- **Surrounding metadata migrates fine.** The object's `xl.meta` parses, so encrypted objects list and HEAD normally and report plausible sizes. Only the payload is wrong.
+- **The error does not say what happened.** It surfaces as a 500 `InternalError`, which reads as a RustFS fault rather than "another implementation encrypted this object".
+- **Surrounding metadata migrates fine.** The object's `xl.meta` parses, so encrypted objects list and HEAD normally and report plausible sizes. The failure appears only when something reads the payload.
 
-Verify by content, not by status code: checksum a sample of encrypted objects against the source before decommissioning the MinIO deployment.
+Read a sample of encrypted objects, not just their listings, before decommissioning the MinIO deployment.
 
 Current options for a migration whose source contains encrypted objects:
 
