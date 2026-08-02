@@ -710,7 +710,10 @@ mod tests {
             ..Default::default()
         };
 
-        let err = replication_put_object_options("", &object_info).expect_err("unknown encryption must fail closed");
+        let err = match replication_put_object_options("", &object_info) {
+            Ok(_) => panic!("unknown encryption must fail closed"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
         assert!(!err.to_string().contains(secret_like_value));
     }
