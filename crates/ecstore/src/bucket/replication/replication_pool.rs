@@ -297,6 +297,7 @@ where
             retry_count: 0,
             size: entry_size,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -837,11 +838,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica delete task
     pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
-        let target_arns = if doi.target_arn.is_empty() {
-            Vec::new()
-        } else {
-            vec![doi.target_arn.clone()]
-        };
+        let target_arns = doi.admitted_target_arns();
         let ch = self
             .worker_queue_channel(&doi.op_type, &doi.bucket, &doi.delete_object.object_name, 0)
             .await;
@@ -1027,6 +1024,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 delete_marker_version_id: entry.delete_marker_version_id,
                                 delete_marker: entry.delete_marker,
                                 delete_marker_mtime,
+                                force_delete: entry.force_delete,
                                 replication_state: Some(rstate),
                                 ..Default::default()
                             },
@@ -1627,18 +1625,13 @@ impl ReplicationBacklogGuard {
     }
 
     fn for_delete(stats: Arc<ReplicationStats>, delete: &DeletedObjectReplicationInfo) -> Self {
-        let target_arns = if delete.target_arn.is_empty() {
-            Vec::new()
-        } else {
-            vec![delete.target_arn.clone()]
-        };
         Self {
             stats,
             bucket: delete.bucket.clone(),
             size: 0,
             is_delete_marker: true,
             op_type: delete.op_type,
-            target_arns,
+            target_arns: delete.admitted_target_arns(),
         }
     }
 }
@@ -1958,18 +1951,24 @@ pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo
         let _ = pool.queue_replica_delete_task(dv.clone()).await;
     }
 
-    if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, runtime_sources::replication_stats()) {
-        for k in rs.targets.keys() {
-            let ri = ReplicatedTargetInfo {
-                arn: k.clone(),
-                size: 0,
-                duration: Duration::default(),
-                op_type: ReplicationType::Delete,
-                ..Default::default()
-            };
-            stats
-                .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
-                .await;
+    if let Some(stats) = runtime_sources::replication_stats() {
+        let target_arns = dv.admitted_target_arns();
+        if let Some(rs) = dv.delete_object.replication_state.as_ref() {
+            for k in target_arns
+                .iter()
+                .filter(|target_arn| rs.targets.contains_key(*target_arn) || rs.purge_targets.contains_key(*target_arn))
+            {
+                let ri = ReplicatedTargetInfo {
+                    arn: k.clone(),
+                    size: 0,
+                    duration: Duration::default(),
+                    op_type: ReplicationType::Delete,
+                    ..Default::default()
+                };
+                stats
+                    .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
+                    .await;
+            }
         }
     }
 }
@@ -3089,6 +3088,7 @@ mod tests {
             retry_count: 1,
             size: 1,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3186,6 +3186,7 @@ mod tests {
                 retry_count: 1,
                 size: 1,
                 op: MrfOpKind::Object,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -3217,6 +3218,7 @@ mod tests {
             retry_count: 1,
             size: 2048,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3271,6 +3273,7 @@ mod tests {
             retry_count: 1,
             size: 1024,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3293,6 +3296,7 @@ mod tests {
             retry_count: 1,
             size: 1024,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3405,6 +3409,7 @@ mod tests {
             retry_count: 3,
             size: 1024,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3439,6 +3444,7 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: Some(dm_vid),
             delete_marker: true,
             delete_marker_mtime: Some(mtime_nanos),
@@ -3473,6 +3479,7 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3502,6 +3509,7 @@ mod tests {
                 retry_count: 1,
                 size: 512,
                 op: MrfOpKind::Object,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -3514,6 +3522,7 @@ mod tests {
                 retry_count: 0,
                 size: 0,
                 op: MrfOpKind::Delete,
+                force_delete: false,
                 delete_marker_version_id: Some(del_dm_vid),
                 delete_marker: true,
                 delete_marker_mtime: None,
@@ -3544,6 +3553,7 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3559,6 +3569,7 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
             delete_marker_mtime: None,
@@ -3575,6 +3586,7 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::default(),
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3640,6 +3652,7 @@ mod tests {
             retry_count: 1,
             size: 512,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -3687,6 +3700,7 @@ mod tests {
                 retry_count: 0,
                 size: 1024,
                 op: MrfOpKind::Object,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -3699,6 +3713,7 @@ mod tests {
                 retry_count: 0,
                 size: 512,
                 op: MrfOpKind::Object,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -3711,6 +3726,7 @@ mod tests {
                 retry_count: 0,
                 size: 256,
                 op: MrfOpKind::Object,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -3765,6 +3781,7 @@ mod tests {
             retry_count: 0,
             size: -1,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,

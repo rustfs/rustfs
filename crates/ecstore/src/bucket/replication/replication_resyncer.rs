@@ -1383,6 +1383,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
     let mut join_set = JoinSet::new();
 
     // Process each target
+    let target_arns = dobj.admitted_target_arns();
     for tgt_entry in dsc.targets_map.values() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
@@ -1390,7 +1391,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
 
         // If dobj.TargetArn is not empty string, this is a case of specific target being re-synced.
-        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+        if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
             continue;
         }
 
@@ -1617,7 +1618,8 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
         if !tgt_entry.replicate {
             continue;
         }
-        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+        let target_arns = dobj.admitted_target_arns();
+        if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
             continue;
         }
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
@@ -1747,13 +1749,16 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         }
     };
 
-    let tgt_arns = if !dobj.target_arn.is_empty() {
-        vec![dobj.target_arn.clone()]
-    } else {
-        rcfg.filter_target_arns(&ObjectOpts {
-            name: object_name.clone(),
-            ..Default::default()
-        })
+    let tgt_arns = {
+        let admitted = dobj.admitted_target_arns();
+        if admitted.is_empty() {
+            rcfg.filter_target_arns(&ObjectOpts {
+                name: object_name.clone(),
+                ..Default::default()
+            })
+        } else {
+            admitted
+        }
     };
 
     let mut join_set = JoinSet::new();

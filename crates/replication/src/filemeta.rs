@@ -579,6 +579,11 @@ pub struct MrfReplicateEntry {
     #[serde(rename = "op", default)]
     pub op: MrfOpKind,
 
+    // For delete entries: whether the source operation was a force-delete. Old files lack
+    // this key; default=false preserves the pre-existing replay contract.
+    #[serde(rename = "forceDelete", default)]
+    pub force_delete: bool,
+
     // For delete entries: the delete-marker version id (distinct from version_id, which is
     // the version being purged). Old files lack this; default=None is correct.
     #[serde(rename = "deleteMarkerVersionID", skip_serializing_if = "Option::is_none", default)]
@@ -838,6 +843,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             } else {
                 MrfOpKind::Object
             },
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
@@ -897,6 +903,7 @@ impl ReplicateObjectInfo {
             } else {
                 MrfOpKind::Object
             },
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
