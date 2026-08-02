@@ -2558,4 +2558,242 @@ mod tests {
             "the pre-rotation ciphertext must reach Vault unchanged: {decrypt_body}"
         );
     }
+
+    /// Transit read-key payload for a key that has been rotated up to `latest`.
+    fn transit_key_read_data_up_to(key_id: &str, latest: u32) -> serde_json::Value {
+        let mut response: serde_json::Value = transit_key_read_data(key_id);
+        let keys: serde_json::Map<String, serde_json::Value> = (1..=latest)
+            .map(|version| (version.to_string(), serde_json::json!(1_700_000_000_u64 + u64::from(version))))
+            .collect();
+        response["keys"] = serde_json::Value::Object(keys);
+        response
+    }
+
+    fn wired_key_request(context: HashMap<String, String>) -> GenerateKeyRequest {
+        GenerateKeyRequest {
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            key_length: Some(32),
+            encryption_context: context,
+            grant_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transit_ciphertext_version_reads_only_a_well_formed_prefix() {
+        assert_eq!(transit_ciphertext_version("vault:v1:abc"), Some(1));
+        assert_eq!(transit_ciphertext_version("vault:v27:abc"), Some(27));
+        // Anything else leaves the version unknown rather than guessing one; an
+        // invented version is what would let a still-referenced key version be
+        // reported as retired.
+        assert_eq!(transit_ciphertext_version("vault:v:abc"), None);
+        assert_eq!(transit_ciphertext_version("vault:vx:abc"), None);
+        assert_eq!(transit_ciphertext_version("vault:v1"), None);
+        assert_eq!(transit_ciphertext_version("v1:abc"), None);
+        assert_eq!(transit_ciphertext_version(""), None);
+    }
+
+    /// The property that justifies having a Transit-specific rewrap at all: the
+    /// data key is re-encrypted by Vault, so no `transit/decrypt` is issued and
+    /// no plaintext data key ever exists inside this process.
+    #[tokio::test]
+    async fn wired_transit_rewrap_uses_the_native_endpoint_and_never_decrypts() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            // generate_data_key: metadata state gate, then the transit encrypt.
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // rewrap: the state gate hits the metadata cache, so the only call
+            // is the native rewrap.
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v3:rewrapped" })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(HashMap::new()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+        let original: DataKeyEnvelope = serde_json::from_slice(&data_key.ciphertext).expect("envelope must parse");
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("rewrap must move the ciphertext onto the latest version");
+
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(3));
+
+        let rewrapped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("rewrapped envelope must parse");
+        assert_eq!(rewrapped.encrypted_key, b"vault:v3:rewrapped".to_vec());
+        assert_eq!(
+            rewrapped.master_key_version, None,
+            "Transit ciphertext self-describes its version, so the envelope field must stay absent"
+        );
+        assert_eq!(rewrapped.key_id, original.key_id);
+        assert_eq!(rewrapped.created_at, original.created_at);
+        assert_eq!(rewrapped.encryption_context, original.encryption_context);
+
+        let requests = vault.requests();
+        assert!(
+            requests.contains(&"POST /v1/transit/rewrap/wired-key".to_string()),
+            "the native rewrap endpoint must be used: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/decrypt/")),
+            "no decrypt may be issued: the plaintext data key must never enter this process: {requests:?}"
+        );
+
+        // The ciphertext Vault was asked to rewrap is the one that was stored,
+        // byte for byte.
+        let bodies = vault.request_bodies();
+        let rewrap_index = requests
+            .iter()
+            .position(|request| request == "POST /v1/transit/rewrap/wired-key")
+            .expect("the rewrap request must be recorded");
+        let body: serde_json::Value = serde_json::from_str(&bodies[rewrap_index]).expect("rewrap body must be JSON");
+        assert_eq!(body["ciphertext"], serde_json::json!("vault:v1:scripted"), "{body}");
+    }
+
+    /// Vault re-encrypts unconditionally, so an already-latest ciphertext comes
+    /// back different but no newer. That must report as "nothing to persist", or
+    /// every sweep pass would rewrite every object's metadata forever.
+    #[tokio::test]
+    async fn wired_transit_rewrap_of_a_current_ciphertext_is_a_no_op() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (_vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Same version back, different bytes.
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:re-encrypted" })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(HashMap::new()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("rewrap must succeed");
+
+        assert!(!response.rewrapped, "a ciphertext already on the latest version is a no-op");
+        assert_eq!(
+            response.ciphertext, data_key.ciphertext,
+            "a no-op must hand the stored envelope back unchanged, not Vault's fresh re-encryption"
+        );
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(1));
+    }
+
+    /// Vault's `transit/rewrap` endpoint takes no `associated_data` parameter,
+    /// and this backend binds the encryption context as exactly that. The only
+    /// remaining route would decrypt the data key inside RustFS, so the request
+    /// is refused rather than silently downgraded — and refused without any call
+    /// to Vault at all.
+    #[tokio::test]
+    async fn wired_transit_rewrap_refuses_an_aad_bound_envelope() {
+        let context = HashMap::from([("bucket".to_string(), "photos/cat.jpg".to_string())]);
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Only the read-only accessor below is allowed to consume this.
+            ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 2)),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(context.clone()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let error = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: context.clone(),
+            })
+            .await
+            .expect_err("an AAD-bound envelope must not be rewrapped by decrypting it here");
+        assert!(
+            matches!(&error, KmsError::RewrapWouldExposePlaintext { key_id, .. } if key_id == "wired-key"),
+            "got {error:?}"
+        );
+
+        // The stuck envelope must still be countable, or an inventory could not
+        // report how much of the key version is unmigratable.
+        let described = client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: context,
+            })
+            .await
+            .expect("describing the wrapping must work even when rewrapping it cannot");
+        assert_eq!(described.key_version, Some(1));
+        assert_eq!(described.current_key_version, Some(2));
+        assert!(!described.is_current);
+
+        let requests = vault.requests();
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/rewrap/")),
+            "the refusal must happen before any rewrap call: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/decrypt/")),
+            "and above all before any decrypt: {requests:?}"
+        );
+    }
+
+    /// The current version comes from Vault's own key record rather than from
+    /// the RustFS metadata counter, which only advances on rotations this
+    /// process performed.
+    #[tokio::test]
+    async fn wired_transit_describe_wrapping_reads_vaults_latest_version() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        assert_eq!(metadata.current_version, 1, "the RustFS counter still says version 1");
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Vault has been rotated behind RustFS's back.
+            ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 4)),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(HashMap::new()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let described = client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("describing the wrapping must succeed");
+
+        assert_eq!(described.key_id, "wired-key");
+        assert_eq!(described.key_version, Some(1));
+        assert_eq!(
+            described.current_key_version,
+            Some(4),
+            "the latest version must come from Vault, not from the RustFS metadata counter"
+        );
+        assert!(!described.is_current);
+
+        let requests = vault.requests();
+        assert!(
+            requests.contains(&"GET /v1/transit/keys/wired-key".to_string()),
+            "the latest version must be read from the transit key record: {requests:?}"
+        );
+    }
 }

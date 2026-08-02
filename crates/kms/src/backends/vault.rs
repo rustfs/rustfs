@@ -4257,11 +4257,7 @@ mod tests {
         );
         assert_eq!(response.source_key_version, Some(2));
         assert_eq!(response.destination_key_version, Some(2));
-        assert_eq!(
-            requests.len(),
-            1,
-            "a no-op must not reach for any version record: {requests:?}"
-        );
+        assert_eq!(requests.len(), 1, "a no-op must not reach for any version record: {requests:?}");
 
         // Idempotence in the literal sense: feeding the result back in changes
         // nothing again.
