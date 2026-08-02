@@ -3298,6 +3298,13 @@ mod tests {
         }
     }
 
+    fn filtered_page_request(limit: u32, marker: Option<&str>, status: KeyStatus) -> ListKeysRequest {
+        ListKeysRequest {
+            status_filter: Some(status),
+            ..page_request(limit, marker)
+        }
+    }
+
     async fn create_keys(client: &LocalKmsClient, key_ids: &[String]) {
         for key_id in key_ids {
             client
@@ -3396,6 +3403,69 @@ mod tests {
         assert!(response.keys.is_empty());
         assert!(!response.truncated);
         assert!(response.next_marker.is_none());
+    }
+
+    /// A filter narrows a page after it has been cut, so a page can come back
+    /// empty while keys still remain. The traversal has to continue on
+    /// `truncated` rather than on a short page, and the cursor has to advance
+    /// across the keys the filter removed — otherwise a filtered listing ends
+    /// at the first run of non-matching keys and reports a partial key set as
+    /// the whole one.
+    #[tokio::test]
+    async fn filtered_paging_crosses_a_page_that_matches_nothing() {
+        let (client, _temp_dir) = create_test_client().await;
+        let key_ids: Vec<String> = (0..12).map(|index| format!("filter-key-{index:02}")).collect();
+        create_keys(&client, &key_ids).await;
+        // A page worth of adjacent keys is excluded, so one page of the
+        // traversal matches nothing at all.
+        for key_id in &key_ids[3..6] {
+            client.disable_key(key_id, None).await.expect("key should be disabled");
+        }
+        let still_active: Vec<String> = key_ids
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !(3..6).contains(index))
+            .map(|(_, key_id)| key_id.clone())
+            .collect();
+
+        let mut seen = Vec::new();
+        let mut pages_without_a_match = 0;
+        let mut marker: Option<String> = None;
+        // Bounded so a listing that cannot advance fails the assertions below
+        // instead of hanging the test run.
+        for _ in 0..key_ids.len() + 1 {
+            let response = client
+                .list_keys(&filtered_page_request(3, marker.as_deref(), KeyStatus::Active), None)
+                .await
+                .expect("list should succeed");
+            assert!(response.keys.len() <= 3, "a page must not exceed the requested limit");
+            assert!(
+                response.keys.iter().all(|key| key.status == KeyStatus::Active),
+                "a filtered page must carry matches only"
+            );
+            if response.keys.is_empty() {
+                pages_without_a_match += 1;
+            }
+            seen.extend(response.keys.iter().map(|key| key.key_id.clone()));
+            if !response.truncated {
+                assert!(response.next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(response.next_marker.expect("a truncated page must offer a cursor"));
+        }
+
+        assert_eq!(seen, still_active, "filtered paging must visit every match exactly once");
+        assert_eq!(pages_without_a_match, 1, "the excluded run must produce a page with no match");
+
+        // The keys the first filter excluded are exactly the ones the opposite
+        // filter lists, so nothing fell out of the key set on the way.
+        let response = client
+            .list_keys(&filtered_page_request(key_ids.len() as u32, None, KeyStatus::Disabled), None)
+            .await
+            .expect("list should succeed");
+        let listed: Vec<&str> = response.keys.iter().map(|key| key.key_id.as_str()).collect();
+        assert_eq!(listed, key_ids[3..6].iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!response.truncated, "a page covering the whole key set is complete");
     }
 
     /// A limit past the end of the key set returns everything, once.
