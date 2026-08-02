@@ -19,7 +19,7 @@ use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
     NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos,
-    ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
+    ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
@@ -2001,61 +2001,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo
 }
 
-pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) {
+pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) -> ReplicationState {
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
-    let cfg = match get_replication_config(&bucket).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            debug!(
-                event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_missing",
-                "Skipping replication object because replication config is missing"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: roi.to_object_info(),
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return;
-        }
-        Err(err) => {
-            error!(
-                event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_lookup_failed",
-                error = %err,
-                "Failed to look up replication config for object replication"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: roi.to_object_info(),
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return;
-        }
-    };
-
-    let tgt_arns = cfg.filter_target_arns(&ObjectOpts {
-        name: object.clone(),
-        user_tags: roi.user_tags.clone(),
-        ssec: roi.ssec,
-        op_type: roi.op_type,
-        // ExistingObject ops must respect per-rule ExistingObjectReplicationStatus.
-        // Heal ops intentionally bypass it (repairing a past failure is not an initial sync).
-        existing_object: roi.op_type == ReplicationType::ExistingObject,
-        ..Default::default()
-    });
+    // The admission decision is the target-granular contract. Re-evaluating the
+    // live config here could fan a synchronous request out to targets that were
+    // not admitted, or promote an async target after a mixed-mode split.
+    let tgt_arns = roi.dsc.replicate_target_arns();
 
     // Acquire a per-object namespace lock so that at most one worker (across all cluster
     // nodes and MRF retry goroutines) replicates this object version at a time.
@@ -2080,7 +2033,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return roi.replication_state.unwrap_or_default();
         }
     };
     let _obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
@@ -2103,7 +2056,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return roi.replication_state.unwrap_or_default();
         }
     };
 
@@ -2179,8 +2132,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         }
     }
 
-    let replication_status = rinfos.replication_status();
-    let new_replication_internal = rinfos.replication_status_internal();
+    let previous_state = roi.replication_state.clone().unwrap_or_default();
+    let merged_state = get_replication_state(&rinfos, &previous_state, roi.version_id.map(|v| v.to_string()));
+    let replication_status = merged_state.composite_replication_status();
+    let new_replication_internal = merged_state.replication_status_internal.clone();
     let mut object_info = roi.to_object_info();
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
@@ -2249,6 +2204,8 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             }
         }
     }
+
+    merged_state
 }
 
 trait ReplicateObjectInfoExt {
