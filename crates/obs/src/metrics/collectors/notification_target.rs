@@ -16,8 +16,10 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::notification_target::{
+    NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD,
     NOTIFICATION_TARGET_FAILED_MESSAGES_MD, NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
-    NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, TARGET_ID, TARGET_TYPE,
+    NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD,
+    NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER, TARGET_ID, TARGET_TYPE,
 };
 use std::borrow::Cow;
 
@@ -26,6 +28,7 @@ pub struct NotificationTargetStats {
     pub failed_messages: u64,
     pub failed_store_length: u64,
     pub queue_length: u64,
+    pub server: String,
     pub target_id: String,
     pub target_type: String,
     pub total_messages: u64,
@@ -36,7 +39,7 @@ pub fn collect_notification_target_metrics(stats: &[NotificationTargetStats]) ->
         return Vec::new();
     }
 
-    let mut metrics = Vec::with_capacity(stats.len() * 4);
+    let mut metrics = Vec::with_capacity(stats.len() * 8);
     for stat in stats {
         let target_id: Cow<'static, str> = Cow::Owned(stat.target_id.clone());
         let target_type: Cow<'static, str> = Cow::Owned(stat.target_type.clone());
@@ -61,6 +64,40 @@ pub fn collect_notification_target_metrics(stats: &[NotificationTargetStats]) ->
                 .with_label(TARGET_ID, target_id)
                 .with_label(TARGET_TYPE, target_type),
         );
+
+        if !stat.server.is_empty() {
+            let server: Cow<'static, str> = Cow::Owned(stat.server.clone());
+            let target_id: Cow<'static, str> = Cow::Owned(stat.target_id.clone());
+            let target_type: Cow<'static, str> = Cow::Owned(stat.target_type.clone());
+
+            metrics.push(
+                PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, stat.failed_messages as f64)
+                    .with_label(SERVER, server.clone())
+                    .with_label(TARGET_ID, target_id.clone())
+                    .with_label(TARGET_TYPE, target_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(
+                    &NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD,
+                    stat.failed_store_length as f64,
+                )
+                .with_label(SERVER, server.clone())
+                .with_label(TARGET_ID, target_id.clone())
+                .with_label(TARGET_TYPE, target_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, stat.queue_length as f64)
+                    .with_label(SERVER, server.clone())
+                    .with_label(TARGET_ID, target_id.clone())
+                    .with_label(TARGET_TYPE, target_type.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, stat.total_messages as f64)
+                    .with_label(SERVER, server)
+                    .with_label(TARGET_ID, target_id)
+                    .with_label(TARGET_TYPE, target_type),
+            );
+        }
     }
 
     metrics
@@ -77,6 +114,7 @@ mod tests {
             failed_messages: 2,
             failed_store_length: 3,
             queue_length: 4,
+            server: "node1:9000".to_string(),
             target_id: "primary:webhook".to_string(),
             target_type: "webhook".to_string(),
             total_messages: 42,
@@ -84,7 +122,7 @@ mod tests {
 
         let metrics = collect_notification_target_metrics(&stats);
 
-        assert_eq!(metrics.len(), 4);
+        assert_eq!(metrics.len(), 8);
         assert!(metrics.iter().any(|metric| {
             metric.value == 3.0
                 && metric.name == NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name()
@@ -95,6 +133,19 @@ mod tests {
         }));
         assert!(metrics.iter().any(|metric| {
             metric.value == 42.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == TARGET_ID && value == "primary:webhook")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(key, value)| *key == TARGET_TYPE && value == "webhook")
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.value == 4.0
+                && metric.name == NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
+                && metric.labels.iter().any(|(key, value)| *key == SERVER && value == "node1:9000")
                 && metric
                     .labels
                     .iter()

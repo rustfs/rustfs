@@ -29,6 +29,8 @@ use std::borrow::Cow;
 /// Audit target statistics for metrics collection.
 #[derive(Debug, Clone, Default)]
 pub struct AuditTargetStats {
+    /// Server identifier
+    pub server: String,
     /// Target identifier
     pub target_id: String,
     /// Number of messages that failed to send
@@ -50,7 +52,7 @@ pub fn collect_audit_metrics(stats: &[AuditTargetStats]) -> Vec<PrometheusMetric
         return Vec::new();
     }
 
-    let mut metrics = Vec::with_capacity(stats.len() * 4);
+    let mut metrics = Vec::with_capacity(stats.len() * 8);
     for stat in stats {
         let target_id_label: Cow<'static, str> = Cow::Owned(stat.target_id.clone());
 
@@ -70,6 +72,32 @@ pub fn collect_audit_metrics(stats: &[AuditTargetStats]) -> Vec<PrometheusMetric
             PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, stat.total_messages as f64)
                 .with_label("target_id", target_id_label),
         );
+
+        if !stat.server.is_empty() {
+            let server_label: Cow<'static, str> = Cow::Owned(stat.server.clone());
+            let target_id_label: Cow<'static, str> = Cow::Owned(stat.target_id.clone());
+
+            metrics.push(
+                PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD, stat.failed_messages as f64)
+                    .with_label(SERVER, server_label.clone())
+                    .with_label(TARGET_ID, target_id_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD, stat.failed_store_length as f64)
+                    .with_label(SERVER, server_label.clone())
+                    .with_label(TARGET_ID, target_id_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD, stat.queue_length as f64)
+                    .with_label(SERVER, server_label.clone())
+                    .with_label(TARGET_ID, target_id_label.clone()),
+            );
+            metrics.push(
+                PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD, stat.total_messages as f64)
+                    .with_label(SERVER, server_label)
+                    .with_label(TARGET_ID, target_id_label),
+            );
+        }
     }
 
     metrics
@@ -84,6 +112,7 @@ mod tests {
     fn test_collect_audit_metrics() {
         let stats = vec![
             AuditTargetStats {
+                server: "node1:9000".to_string(),
                 target_id: "target-1".to_string(),
                 failed_messages: 5,
                 failed_store_length: 3,
@@ -91,6 +120,7 @@ mod tests {
                 total_messages: 1000,
             },
             AuditTargetStats {
+                server: "node2:9000".to_string(),
                 target_id: "target-2".to_string(),
                 failed_messages: 2,
                 failed_store_length: 1,
@@ -101,7 +131,7 @@ mod tests {
 
         let metrics = collect_audit_metrics(&stats);
 
-        assert_eq!(metrics.len(), 8); // 2 targets * 4 metrics each
+        assert_eq!(metrics.len(), 16);
 
         let failed = metrics
             .iter()
@@ -114,6 +144,14 @@ mod tests {
                 && m.labels.iter().any(|(k, v)| *k == "target_id" && v == "target-1")
         });
         assert!(failed_store.is_some());
+
+        let server_queue = metrics.iter().find(|m| {
+            m.value == 10.0
+                && m.name == AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
+                && m.labels.iter().any(|(k, v)| *k == SERVER && v == "node1:9000")
+                && m.labels.iter().any(|(k, v)| *k == TARGET_ID && v == "target-1")
+        });
+        assert!(server_queue.is_some());
     }
 
     #[test]

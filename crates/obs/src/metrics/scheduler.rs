@@ -77,7 +77,11 @@ use crate::metrics::config::{
 use crate::metrics::obs_is_disk_compression_enabled;
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::runtime_sources::bucket_monitor_available;
-use crate::metrics::schema::audit::{AUDIT_FAILED_MESSAGES_MD, AUDIT_TARGET_QUEUE_LENGTH_MD, AUDIT_TOTAL_MESSAGES_MD};
+use crate::metrics::schema::audit::{
+    AUDIT_FAILED_MESSAGES_BY_SERVER_MD, AUDIT_FAILED_MESSAGES_MD, AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD,
+    AUDIT_FAILED_STORE_LENGTH_MD, AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD, AUDIT_TARGET_QUEUE_LENGTH_MD,
+    AUDIT_TOTAL_MESSAGES_BY_SERVER_MD, AUDIT_TOTAL_MESSAGES_MD, SERVER as AUDIT_SERVER_LABEL,
+};
 use crate::metrics::schema::bucket_replication::{
     BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD,
     BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD,
@@ -97,7 +101,10 @@ use crate::metrics::schema::cluster_usage::{
 };
 use crate::metrics::schema::node_bucket::{BUCKET_OBJECTS_TOTAL_MD, BUCKET_QUOTA_BYTES_MD, BUCKET_USAGE_BYTES_MD};
 use crate::metrics::schema::notification_target::{
-    NOTIFICATION_TARGET_FAILED_MESSAGES_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD,
+    NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_MESSAGES_MD,
+    NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD,
+    NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
+    NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER as NOTIFICATION_SERVER_LABEL,
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
 };
 use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
@@ -268,8 +275,8 @@ static METRICS_RUNTIME_COLLECTOR_HEALTH: OnceLock<MetricsRuntimeCollectorHealth>
 type ReplBwKey = (String, String); // (bucket, target_arn)
 type BucketKey = String;
 type BucketRangeKey = (String, String); // (bucket, range)
-type AuditTargetKey = String;
-type NotificationTargetKey = (String, String); // (target_id, target_type)
+type AuditTargetKey = (String, String); // (server, target_id)
+type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub struct MetricsRuntimeCollectorHealthSnapshot {
@@ -899,7 +906,10 @@ fn retire_bucket_usage_distribution_series(metric_name: String, bucket: &str, ra
 }
 
 fn audit_target_live_keys(stats: &[AuditTargetStats]) -> HashSet<AuditTargetKey> {
-    stats.iter().map(|stat| stat.target_id.clone()).collect()
+    stats
+        .iter()
+        .map(|stat| (stat.server.clone(), stat.target_id.clone()))
+        .collect()
 }
 
 fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey, u8>) -> Vec<PrometheusMetric> {
@@ -907,11 +917,16 @@ fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey
         return Vec::new();
     }
 
-    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 3);
-    for target_id in zero_tombstones.keys() {
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 8);
+    for (server, target_id) in zero_tombstones.keys() {
+        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
         let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_MD, 0.0)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_MD, 0.0)
                 .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
         );
         zero_metrics.push(
@@ -919,24 +934,53 @@ fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey
                 .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
         );
         zero_metrics.push(
-            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0).with_label(AUDIT_TARGET_ID_LABEL, target_id_label),
+            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0).with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label.clone())
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label.clone())
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label.clone())
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label),
         );
     }
 
     zero_metrics
 }
 
-fn retire_audit_target_metric_series(target_id: &str) -> usize {
+fn retire_audit_target_metric_series(server: &str, target_id: &str) -> usize {
     let labels = [(AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string()))];
+    let server_labels = [
+        (AUDIT_SERVER_LABEL, Cow::Owned(server.to_string())),
+        (AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+    ];
     retire_metric_series(&AUDIT_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&AUDIT_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
 }
 
 fn notification_target_live_keys(stats: &[NotificationTargetStats]) -> HashSet<NotificationTargetKey> {
     stats
         .iter()
-        .map(|stat| (stat.target_id.clone(), stat.target_type.clone()))
+        .map(|stat| (stat.server.clone(), stat.target_id.clone(), stat.target_type.clone()))
         .collect()
 }
 
@@ -947,12 +991,18 @@ fn collect_notification_target_zero_tombstone_metrics(
         return Vec::new();
     }
 
-    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 3);
-    for (target_id, target_type) in zero_tombstones.keys() {
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 8);
+    for (server, target_id, target_type) in zero_tombstones.keys() {
+        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
         let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
         let target_type_label: Cow<'static, str> = Cow::Owned(target_type.clone());
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_MD, 0.0)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD, 0.0)
                 .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
                 .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
         );
@@ -963,6 +1013,30 @@ fn collect_notification_target_zero_tombstone_metrics(
         );
         zero_metrics.push(
             PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, 0.0)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label)
                 .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label)
                 .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label),
         );
@@ -971,14 +1045,24 @@ fn collect_notification_target_zero_tombstone_metrics(
     zero_metrics
 }
 
-fn retire_notification_target_metric_series(target_id: &str, target_type: &str) -> usize {
+fn retire_notification_target_metric_series(server: &str, target_id: &str, target_type: &str) -> usize {
     let labels = [
         (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
         (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
     ];
+    let server_labels = [
+        (NOTIFICATION_SERVER_LABEL, Cow::Owned(server.to_string())),
+        (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+        (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
+    ];
     retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
 }
 
 fn update_repl_bw_zero_tombstones(
@@ -1565,12 +1649,14 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::AuditTargetStats, "audit_target_stats", async {
+                        let server = current_local_node_identity();
                         let stats = audit_target_metrics().await
                             .into_iter()
                             .map(|snapshot| AuditTargetStats {
                                 failed_messages: snapshot.failed_messages,
                                 failed_store_length: snapshot.failed_store_length,
                                 queue_length: snapshot.queue_length,
+                                server: server.clone(),
                                 target_id: snapshot.target_id,
                                 total_messages: snapshot.total_messages,
                             })
@@ -1585,8 +1671,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         let mut metrics = collect_audit_metrics(&stats);
                         metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
                         report_metrics(&metrics);
-                        for target_id in expire_series_zero_tombstones(&mut audit_zero_tombstones) {
-                            let _ = retire_audit_target_metric_series(&target_id);
+                        for (server, target_id) in expire_series_zero_tombstones(&mut audit_zero_tombstones) {
+                            let _ = retire_audit_target_metric_series(&server, &target_id);
                         }
                     }).await;
                 }
@@ -1618,12 +1704,14 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             events_skipped_total: snapshot.events_skipped_total,
                         });
 
+                        let server = current_local_node_identity();
                         let target_stats = notification_target_metrics().await
                             .into_iter()
                             .map(|snapshot| NotificationTargetStats {
                                 failed_messages: snapshot.failed_messages,
                                 failed_store_length: snapshot.failed_store_length,
                                 queue_length: snapshot.queue_length,
+                                server: server.clone(),
                                 target_id: snapshot.target_id,
                                 target_type: snapshot.target_type,
                                 total_messages: snapshot.total_messages,
@@ -1641,8 +1729,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             &notification_target_zero_tombstones,
                         ));
                         report_metrics(&metrics);
-                        for (target_id, target_type) in expire_series_zero_tombstones(&mut notification_target_zero_tombstones) {
-                            let _ = retire_notification_target_metric_series(&target_id, &target_type);
+                        for (server, target_id, target_type) in expire_series_zero_tombstones(&mut notification_target_zero_tombstones) {
+                            let _ = retire_notification_target_metric_series(&server, &target_id, &target_type);
                         }
                     }).await;
                 }
@@ -1985,6 +2073,14 @@ mod tests {
         keys.iter().map(|bucket| bucket_key(bucket)).collect()
     }
 
+    fn audit_target_key(server: &str, target_id: &str) -> AuditTargetKey {
+        (server.to_string(), target_id.to_string())
+    }
+
+    fn notification_target_key(server: &str, target_id: &str, target_type: &str) -> NotificationTargetKey {
+        (server.to_string(), target_id.to_string(), target_type.to_string())
+    }
+
     #[test]
     fn metrics_runtime_status_reports_disabled_state() {
         let snapshot = build_metrics_runtime_status_snapshot(false, false, fixed_metrics_runtime_config(), false);
@@ -2144,6 +2240,70 @@ mod tests {
         let expired = expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
         assert_eq!(expired, vec![key]);
         assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn audit_target_tombstones_include_server_detail_metrics() {
+        let zero_tombstones = HashMap::from([(audit_target_key("node1:9000", "audit-webhook"), 2)]);
+        let metrics = collect_audit_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 8);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == AUDIT_TARGET_ID_LABEL && value == "audit-webhook")
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == AUDIT_SERVER_LABEL && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == AUDIT_TARGET_ID_LABEL && value == "audit-webhook")
+        }));
+    }
+
+    #[test]
+    fn notification_target_tombstones_include_server_detail_metrics() {
+        let zero_tombstones = HashMap::from([(notification_target_key("node1:9000", "primary:webhook", "webhook"), 2)]);
+        let metrics = collect_notification_target_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 8);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "primary:webhook")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_TYPE_LABEL && value == "webhook")
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_SERVER_LABEL && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "primary:webhook")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_TYPE_LABEL && value == "webhook")
+        }));
     }
 
     #[test]
