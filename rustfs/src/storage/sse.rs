@@ -3144,12 +3144,14 @@ pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
 /// Encryption metadata describes the physical source representation and must never be
 /// inherited by a plaintext destination or by a destination using a different key.
 pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>) {
-    const KEYS: [&str; 19] = [
+    const KEYS: [&str; 21] = [
         "x-amz-server-side-encryption",
         "x-amz-server-side-encryption-aws-kms-key-id",
         "x-amz-server-side-encryption-customer-algorithm",
         "x-amz-server-side-encryption-customer-key-md5",
         SSEC_ORIGINAL_SIZE_HEADER,
+        INTERNAL_ENCRYPTION_KEY_ID_HEADER,
+        INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
         INTERNAL_ENCRYPTION_IV_HEADER,
         "x-rustfs-encryption-tag",
         INTERNAL_ENCRYPTION_KEY_HEADER,
@@ -4546,6 +4548,38 @@ mod tests {
         assert!(!metadata.contains_key(SSEC_ORIGINAL_SIZE_HEADER));
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER));
+        assert!(metadata.contains_key("content-type"));
+    }
+
+    /// A copy destination must not inherit any key that `is_object_encryption_marker`
+    /// accepts as proof the payload is encrypted.
+    ///
+    /// Guards this chain: `ObjectInfo::is_encrypted` is keyed on that predicate, so a
+    /// single leftover marker makes a plaintext destination report itself encrypted.
+    /// `object_api::readers` then takes its encrypted branch and demands read material,
+    /// but the material itself was stripped, so `sse_decryption` reports no encryption
+    /// and the read fails with "encrypted object metadata is incomplete" — a destination
+    /// that CopyObject wrote successfully becomes permanently unreadable.
+    #[test]
+    fn test_strip_managed_encryption_metadata_clears_encryption_markers() {
+        let mut metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "source-key".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "source-key".to_string()),
+            (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "wrapped-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "base-nonce".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ]);
+
+        strip_managed_encryption_metadata(&mut metadata);
+
+        let inherited: Vec<&str> = metadata
+            .keys()
+            .filter(|key| rustfs_utils::http::is_object_encryption_marker(key))
+            .map(String::as_str)
+            .collect();
+        assert!(inherited.is_empty(), "copy destination inherited encryption markers: {inherited:?}");
         assert!(metadata.contains_key("content-type"));
     }
 
