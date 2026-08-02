@@ -423,7 +423,7 @@ fn drive_api_latency_micros(actions: impl Iterator<Item = (u64, u64)>) -> Option
 
 fn drive_api_latency_by_api_micros<'a>(actions: impl Iterator<Item = (&'a String, u64, u64)>) -> Vec<(String, u64)> {
     let mut values = actions
-        .filter_map(|(api, count, acc_time)| Some((api.clone(), acc_time.checked_div(count)? / 1_000)))
+        .map(|(api, count, acc_time)| (api.clone(), acc_time.checked_div(count).unwrap_or_default() / 1_000))
         .collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
@@ -1376,8 +1376,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
 }
 
 pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRuntimeStats> {
-    let metrics = global_metrics().report().await;
-    let runtime_details = global_metrics().scanner_runtime_details_report();
+    let (metrics, runtime_details) = global_metrics().report_with_runtime_details().await;
     let now = Utc::now();
     let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
     let bucket_scans_started = scanner_bucket_scans_started(&metrics.life_time_ops, bucket_scans_finished);
@@ -1787,7 +1786,7 @@ mod tests {
         assert_eq!(drive_api_latency_micros(last_minute.values().copied()), Some(3));
         assert_eq!(
             drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time))),
-            vec![("read".to_string(), 3), ("write".to_string(), 3)]
+            vec![("read".to_string(), 3), ("write".to_string(), 3), ("zero".to_string(), 0)]
         );
         assert_eq!(drive_api_calls(api_calls.iter()), vec![("read".to_string(), 4), ("write".to_string(), 9)]);
     }
@@ -1799,7 +1798,7 @@ mod tests {
         assert_eq!(drive_api_latency_micros(last_minute.values().copied()), Some(0));
         assert_eq!(
             drive_api_latency_by_api_micros(last_minute.iter().map(|(api, (count, acc_time))| (api, *count, *acc_time))),
-            Vec::<(String, u64)>::new()
+            vec![("zero".to_string(), 0)]
         );
         assert_eq!(drive_api_latency_micros([].into_iter()), None);
     }

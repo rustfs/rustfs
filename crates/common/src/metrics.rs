@@ -738,6 +738,12 @@ impl ScannerBucketDriveResultKey {
 
 const MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS: usize = 4096;
 
+#[derive(Clone, Copy, Debug)]
+struct ScannerBucketDriveResultValue {
+    count: u64,
+    last_seen: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -769,7 +775,8 @@ pub struct Metrics {
     scanner_set_scans_queued: AtomicU64,
     scanner_set_scans_active: AtomicU64,
     scanner_disk_bucket_scan_states: Mutex<HashMap<ScannerDiskBucketScanKey, ScannerDiskBucketScanState>>,
-    scanner_bucket_drive_results: Mutex<HashMap<ScannerBucketDriveResultKey, u64>>,
+    scanner_bucket_drive_results: Mutex<HashMap<ScannerBucketDriveResultKey, ScannerBucketDriveResultValue>>,
+    scanner_bucket_drive_result_clock: AtomicU64,
     current_scan_cycle_bucket_drive_results_start: Mutex<HashMap<ScannerBucketDriveResultKey, u64>>,
     last_scan_cycle_bucket_drive_results: Mutex<Vec<ScannerBucketDriveResultSnapshot>>,
     scanner_leader_lock_state: RwLock<String>,
@@ -1779,6 +1786,7 @@ impl Metrics {
             scanner_set_scans_active: AtomicU64::new(0),
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
             scanner_bucket_drive_results: Mutex::new(HashMap::new()),
+            scanner_bucket_drive_result_clock: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_results_start: Mutex::new(HashMap::new()),
             last_scan_cycle_bucket_drive_results: Mutex::new(Vec::new()),
             scanner_leader_lock_state: RwLock::new("unknown".to_string()),
@@ -2377,15 +2385,32 @@ impl Metrics {
             .scanner_bucket_drive_results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let has_new_key_capacity = results.len() < MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS;
+        let last_seen = self.scanner_bucket_drive_result_clock.fetch_add(1, Ordering::Relaxed);
+        if !results.contains_key(&key)
+            && results.len() >= MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS
+            && let Some(stale_key) = results
+                .iter()
+                .min_by(|left, right| {
+                    left.1
+                        .last_seen
+                        .cmp(&right.1.last_seen)
+                        .then_with(|| left.0.bucket.cmp(&right.0.bucket))
+                        .then_with(|| left.0.drive.cmp(&right.0.drive))
+                        .then_with(|| left.0.result.cmp(&right.0.result))
+                })
+                .map(|(key, _)| key.clone())
+        {
+            results.remove(&stale_key);
+        }
         match results.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                *entry.get_mut() = entry.get().saturating_add(1);
+                let value = entry.get_mut();
+                value.count = value.count.saturating_add(1);
+                value.last_seen = last_seen;
             }
-            std::collections::hash_map::Entry::Vacant(entry) if has_new_key_capacity => {
-                entry.insert(1);
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(ScannerBucketDriveResultValue { count: 1, last_seen });
             }
-            std::collections::hash_map::Entry::Vacant(_) => {}
         }
     }
 
@@ -2669,7 +2694,9 @@ impl Metrics {
         self.scanner_bucket_drive_results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.count))
+            .collect()
     }
 
     fn scanner_bucket_drive_result_snapshots(
@@ -2712,7 +2739,11 @@ impl Metrics {
     }
 
     pub fn scanner_runtime_details_report(&self) -> ScannerRuntimeDetailsReport {
-        let current_cycle_bucket_drive_results = if self.current_scan_cycle_work_active.load(Ordering::Acquire) {
+        self.scanner_runtime_details_report_for_active(self.current_scan_cycle_work_active.load(Ordering::Acquire))
+    }
+
+    fn scanner_runtime_details_report_for_active(&self, current_cycle_active: bool) -> ScannerRuntimeDetailsReport {
+        let current_cycle_bucket_drive_results = if current_cycle_active {
             self.current_cycle_bucket_drive_result_snapshots()
         } else {
             Vec::new()
@@ -2942,7 +2973,12 @@ impl Metrics {
 
     /// Build a full metrics report snapshot.
     pub async fn report(&self) -> ScannerMetricsReport {
+        self.report_with_runtime_details().await.0
+    }
+
+    pub async fn report_with_runtime_details(&self) -> (ScannerMetricsReport, ScannerRuntimeDetailsReport) {
         let mut m = ScannerMetricsReport::default();
+        let runtime_details;
 
         let has_cycle = {
             let cycle = self.cycle_info.read().await;
@@ -2979,6 +3015,7 @@ impl Metrics {
                 m.current_cycle_replication_repair =
                     self.scanner_replication_repair_work_snapshots(&current_replication_repair_work);
             }
+            runtime_details = self.scanner_runtime_details_report_for_active(m.current_cycle_active);
             has_cycle
         };
 
@@ -3181,7 +3218,7 @@ impl Metrics {
         m.pacing_pressure = scanner_pacing_pressure(&m);
         m.maintenance_control = scanner_maintenance_control(&m);
 
-        m
+        (m, runtime_details)
     }
 }
 
@@ -4345,7 +4382,13 @@ mod tests {
             report
                 .bucket_drive_results
                 .iter()
-                .all(|snapshot| snapshot.bucket != "overflow")
+                .any(|snapshot| snapshot.bucket == "overflow")
+        );
+        assert!(
+            report
+                .bucket_drive_results
+                .iter()
+                .all(|snapshot| snapshot.bucket != "bucket-0")
         );
     }
 
@@ -4517,7 +4560,7 @@ mod tests {
         metrics.record_scanner_bucket_drive_result("cycle-ten", "/data1", "partial");
 
         let paths = metrics.current_paths.write().await;
-        let mut report = Box::pin(metrics.report());
+        let mut report = Box::pin(metrics.report_with_runtime_details());
         let waker = std::task::Waker::noop();
         let mut context = std::task::Context::from_waker(waker);
         assert!(report.as_mut().poll(&mut context).is_pending());
@@ -4537,10 +4580,19 @@ mod tests {
         metrics.record_scanner_bucket_drive_result("cycle-eleven", "/data1", "partial");
 
         drop(paths);
-        let snapshot = report.await;
+        let (snapshot, runtime_details) = report.await;
 
         assert_eq!(snapshot.current_cycle, 10);
         assert_eq!(snapshot.current_cycle_objects_scanned, 1);
+        assert_eq!(
+            runtime_details.current_cycle_bucket_drive_results,
+            vec![ScannerBucketDriveResultSnapshot {
+                bucket: "cycle-ten".to_string(),
+                drive: "/data1".to_string(),
+                result: "partial".to_string(),
+                count: 1,
+            }]
+        );
 
         metrics
             .finish_scan_cycle_work_with_cycle(cycle_eleven_start, CurrentCycle::default())
