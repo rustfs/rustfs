@@ -978,9 +978,15 @@ impl VaultKmsClient {
 
         let source_version =
             resolve_envelope_master_key_version(envelope.master_key_version, key_data.baseline_version, current_version);
+        // Both materials are resolved before anything is unwrapped, so no
+        // fallible step sits between the plaintext data key coming into
+        // existence and the zeroize that removes it again.
         let source_material = self
             .get_key_material_for_version(&envelope.master_key_id, &key_data, source_version)
             .await?;
+        let destination_material = decode_stored_key_material(&envelope.master_key_id, &key_data.encrypted_key_material)
+            .inspect_err(|error| warn!(key_id = %envelope.master_key_id, %error, "Vault KMS key material failed validation"))?;
+
         let mut plaintext_key = match self
             .dek_crypto
             .decrypt(&source_material, &envelope.encrypted_key, &envelope.nonce)
@@ -993,9 +999,6 @@ impl VaultKmsClient {
                     .await);
             }
         };
-
-        let destination_material = decode_stored_key_material(&envelope.master_key_id, &key_data.encrypted_key_material)
-            .inspect_err(|error| warn!(key_id = %envelope.master_key_id, %error, "Vault KMS key material failed validation"))?;
         let rewrapped = self.dek_crypto.encrypt(&destination_material, &plaintext_key).await;
         plaintext_key.zeroize();
         let (encrypted_key, nonce) = rewrapped?;
