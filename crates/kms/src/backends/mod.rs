@@ -160,7 +160,7 @@ pub(crate) fn ensure_rewrap_context_matches(
 }
 
 /// Page size used when a [`ListKeysRequest`] does not ask for one.
-pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = 100;
+pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = DEFAULT_LIST_KEYS_LIMIT;
 
 /// One page of a key set the backend has to slice itself.
 pub(crate) struct KeyPage<'a, T> {
@@ -231,7 +231,7 @@ pub(crate) fn paginate_keys<'a, T>(sorted: &'a [T], request: &ListKeysRequest, k
 pub(crate) fn list_keys_page_size(limit: Option<u32>) -> Option<usize> {
     match limit.unwrap_or(DEFAULT_LIST_KEYS_PAGE_SIZE) {
         0 => None,
-        size => Some(size as usize),
+        size => Some(size.min(MAX_LIST_KEYS_LIMIT) as usize),
     }
 }
 
@@ -858,6 +858,21 @@ mod tests {
         let keys = key_ids(3);
         assert_eq!(page_of(&keys, Some(u32::MAX), None), (keys.clone(), None, false));
         assert_eq!(page_of(&keys, Some(u32::MAX), Some("key-01")), (vec![keys[2].clone()], None, false));
+    }
+
+    #[test]
+    fn list_limit_is_bounded_at_the_contract_maximum() {
+        assert_eq!(list_keys_page_size(Some(MAX_LIST_KEYS_LIMIT)), Some(MAX_LIST_KEYS_LIMIT as usize));
+        assert_eq!(
+            list_keys_page_size(Some(MAX_LIST_KEYS_LIMIT + 1)),
+            Some(MAX_LIST_KEYS_LIMIT as usize),
+            "one past the maximum must not expand a backend page"
+        );
+        assert_eq!(
+            list_keys_page_size(Some(u32::MAX)),
+            Some(MAX_LIST_KEYS_LIMIT as usize),
+            "the largest wire value must use the same bounded page"
+        );
     }
 
     /// The cursor is an identifier, so a marker naming a key that no longer

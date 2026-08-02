@@ -415,7 +415,15 @@ impl DecryptRequest {
     }
 }
 
-/// Request to list keys
+/// Default page size used when a request omits `limit`.
+pub const DEFAULT_LIST_KEYS_LIMIT: u32 = 100;
+/// Maximum page size accepted by KMS list implementations.
+pub const MAX_LIST_KEYS_LIMIT: u32 = 1000;
+
+/// Request to list keys.
+///
+/// List pages default to [`DEFAULT_LIST_KEYS_LIMIT`] entries and are capped at
+/// [`MAX_LIST_KEYS_LIMIT`]. A zero limit is a valid request for an empty page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListKeysRequest {
     /// Maximum number of keys to return
@@ -431,7 +439,7 @@ pub struct ListKeysRequest {
 impl Default for ListKeysRequest {
     fn default() -> Self {
         Self {
-            limit: Some(100),
+            limit: Some(DEFAULT_LIST_KEYS_LIMIT),
             marker: None,
             usage_filter: None,
             status_filter: None,

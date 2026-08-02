@@ -180,6 +180,21 @@ fn key_list_filters(query_params: &HashMap<String, String>) -> Result<KeyListFil
     })
 }
 
+/// Parse the optional page size without turning malformed input into a
+/// different request. Values above the backend contract maximum are bounded
+/// so a client cannot make one list request describe an unbounded number of
+/// keys.
+fn key_list_limit(query_params: &HashMap<String, String>) -> Result<u32, String> {
+    let Some(value) = query_params.get("limit") else {
+        return Ok(DEFAULT_LIST_KEYS_LIMIT);
+    };
+
+    value
+        .parse::<u32>()
+        .map(|limit| limit.min(MAX_LIST_KEYS_LIMIT))
+        .map_err(|_| format!("invalid value for 'limit': expected an unsigned integer, got '{value}'"))
+}
+
 fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
     let query_params = extract_query_params(uri);
     ["keyId", "key-id", "key"]
@@ -443,12 +458,16 @@ mod tests {
     use super::{
         CancelKmsKeyDeletionRequest, CreateKeyApiRequest, CreateKmsKeyRequest, DeleteKmsKeyRequest, DeleteKmsKeyResponse,
         DescribeKmsKeyResponse, GenerateDataKeyApiRequest, delete_key_error_status, delete_request_from_query, extract_key_id,
-        extract_query_params, key_impact_if_requested, key_list_filters, kms_create_key_actions, kms_delete_key_actions,
-        kms_describe_key_actions, kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, wants_key_impact,
+        extract_query_params, key_impact_if_requested, key_list_filters, key_list_limit, kms_create_key_actions,
+        kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id,
+        wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
-    use rustfs_kms::{KeyImpactReport, KeyReference, KeyReferenceKind, KeyStatus, KeyUsage, KmsError, ReferenceScope};
+    use rustfs_kms::{
+        DEFAULT_LIST_KEYS_LIMIT, KeyImpactReport, KeyReference, KeyReferenceKind, KeyStatus, KeyUsage, KmsError,
+        MAX_LIST_KEYS_LIMIT, ReferenceScope,
+    };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use rustfs_policy::policy::{Args, Policy};
     use std::collections::HashMap;
@@ -996,6 +1015,42 @@ mod tests {
         key_list_filters(&extract_query_params(&uri)).map(|filters| (filters.status, filters.usage))
     }
 
+    fn list_limit(query: &str) -> Result<u32, String> {
+        let uri: Uri = format!("/rustfs/admin/v3/kms/keys{query}").parse().expect("uri should parse");
+        key_list_limit(&extract_query_params(&uri))
+    }
+
+    #[test]
+    fn a_key_listing_limit_is_bounded_and_malformed_values_are_refused() {
+        assert_eq!(list_limit(""), Ok(DEFAULT_LIST_KEYS_LIMIT));
+        assert_eq!(list_limit("?limit=0"), Ok(0));
+        assert_eq!(list_limit(&format!("?limit={MAX_LIST_KEYS_LIMIT}")), Ok(MAX_LIST_KEYS_LIMIT));
+        assert_eq!(
+            list_limit(&format!("?limit={}", MAX_LIST_KEYS_LIMIT + 1)),
+            Ok(MAX_LIST_KEYS_LIMIT),
+            "one past the maximum must be clamped"
+        );
+        assert_eq!(list_limit("?limit=4294967295"), Ok(MAX_LIST_KEYS_LIMIT));
+
+        for query in ["?limit=abc", "?limit=-1", "?limit="] {
+            let error = list_limit(query).expect_err("malformed limits must not fall back to the default");
+            assert!(error.contains("invalid value for 'limit'"), "unhelpful error for {query}: {error}");
+        }
+    }
+
+    #[test]
+    fn both_list_handlers_validate_the_requested_limit() {
+        let src = include_str!("kms_keys.rs");
+
+        for handler in ["ListKeysHandler", "ListKmsKeysHandler"] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("key_list_limit(&query_params)"),
+                "{handler} must reject malformed limits before reaching the KMS"
+            );
+        }
+    }
+
     /// A filter is either applied or refused. Answering a narrowed listing with
     /// the unfiltered key set looks, from the response alone, exactly like a key
     /// set in which everything matches — the caller cannot tell that its
@@ -1138,7 +1193,7 @@ impl Operation for ListKeysHandler {
         )?;
 
         let query_params = extract_query_params(&req.uri);
-        let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+        let limit = key_list_limit(&query_params).map_err(|message| s3_error!(InvalidArgument, "{}", message))?;
         let marker = query_params.get("marker").cloned();
         // Validated before the listing runs, so a filter the service cannot
         // apply fails as the input error it is instead of returning the whole
@@ -1878,7 +1933,23 @@ impl Operation for ListKmsKeysHandler {
         )?;
 
         let query_params = extract_query_params(&req.uri);
-        let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+        let limit = match key_list_limit(&query_params) {
+            Ok(limit) => limit,
+            Err(message) => {
+                let response = ListKmsKeysResponse {
+                    success: false,
+                    message,
+                    keys: vec![],
+                    truncated: false,
+                    next_marker: None,
+                };
+                let data =
+                    serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
+                return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
+            }
+        };
         let marker = query_params.get("marker").cloned();
         // Validated before the listing runs, so a filter the service cannot
         // apply fails as the input error it is instead of returning the whole

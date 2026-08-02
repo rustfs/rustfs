@@ -3102,6 +3102,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_keys_fails_closed_on_a_corrupt_record() {
+        let (client, _temp_dir) = create_test_client().await;
+        client.create_key("corrupt", "AES_256", None).await.expect("create key");
+
+        let key_path = client.master_key_path("corrupt").expect("valid key id");
+        fs::write(&key_path, b"{\"key_id\":\"corrupt\"")
+            .await
+            .expect("write corrupt record");
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a corrupt record must not disappear from a listing");
+        assert!(
+            matches!(error, KmsError::MaterialCorrupt { key_id, .. } if key_id == "corrupt"),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_salt_with_pre_marker_key_records_still_initializes() {
         let (dev_client, temp_dir) = create_dev_mode_client().await;
         dev_client

@@ -59,6 +59,12 @@ pub struct StaticKmsBackend {
     key_id: String,
     /// The raw 32-byte AES-256 key material (zeroed on drop).
     key: Zeroizing<[u8; KEY_SIZE]>,
+    /// The time this configured key became visible to the backend.
+    ///
+    /// Static KMS has no persisted key record, so this startup timestamp is
+    /// the only stable creation date it can report across list and describe
+    /// calls. It must not be regenerated for every response.
+    created_at: Zoned,
 }
 
 impl StaticKmsBackend {
@@ -82,6 +88,7 @@ impl StaticKmsBackend {
         Ok(Self {
             key_id: static_config.key_id.clone(),
             key: key.into(),
+            created_at: Zoned::now(),
         })
     }
 
@@ -92,7 +99,7 @@ impl StaticKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: Some("Static single-key KMS backend".to_string()),
-            creation_date: Zoned::now(),
+            creation_date: self.created_at.clone(),
             deletion_date: None,
             origin: "EXTERNAL".to_string(),
             key_manager: "STATIC".to_string(),
@@ -281,7 +288,7 @@ impl StaticKmsBackend {
             version: 1,
             metadata: HashMap::new(),
             tags: HashMap::new(),
-            created_at: Zoned::now(),
+            created_at: self.created_at.clone(),
             rotated_at: None,
             created_by: None,
         };
@@ -675,6 +682,23 @@ mod tests {
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.keys[0].key_id, key_id);
         assert!(!response.truncated);
+    }
+
+    #[tokio::test]
+    async fn list_key_creation_date_is_stable_for_the_backend_lifetime() {
+        let (backend, key_id, _key) = create_test_backend().await;
+
+        let first = backend
+            .list_configured_key(&ListKeysRequest::default())
+            .expect("first list should succeed");
+        tokio::task::yield_now().await;
+        let second = backend
+            .list_configured_key(&ListKeysRequest::default())
+            .expect("second list should succeed");
+        let described = backend.configured_key_info(&key_id).expect("describe should succeed");
+
+        assert_eq!(first.keys[0].created_at, second.keys[0].created_at);
+        assert_eq!(first.keys[0].created_at, described.created_at);
     }
 
     /// A zero limit means zero keys, even for a backend whose whole key set is

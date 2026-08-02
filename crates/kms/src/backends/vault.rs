@@ -1213,8 +1213,13 @@ impl VaultKmsClient {
             // A key that disappeared between the listing and the read is
             // dropped from the page rather than failing it; the cursor comes
             // from the identifier list, so the listing still advances past it.
-            let Ok(key_info) = self.describe_key(key_id, None).await else {
-                continue;
+            // Any other read error means the record is present but this build
+            // cannot interpret it. Hiding that entry would make the listing
+            // claim a complete key set while silently omitting corrupt data.
+            let key_info = match self.describe_key(key_id, None).await {
+                Ok(key_info) => key_info,
+                Err(KmsError::KeyNotFound { .. }) => continue,
+                Err(error) => return Err(error),
             };
             if request
                 .status_filter
@@ -1953,6 +1958,32 @@ mod tests {
             "a request for no keys must not reach Vault: {:?}",
             vault.requests()
         );
+    }
+
+    #[tokio::test]
+    async fn list_keys_fails_closed_on_an_unreadable_kv2_record() {
+        let malformed_record = serde_json::json!({
+            "data": {"algorithm": "AES_256"},
+            "metadata": {
+                "created_time": "2026-01-01T00:00:00Z",
+                "deletion_time": "",
+                "custom_metadata": null,
+                "destroyed": false,
+                "version": 1
+            }
+        });
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["poisoned"] })),
+            ScriptedResponse::ok(malformed_record),
+        ])
+        .await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a malformed KV2 record must not disappear from a listing");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+        assert_eq!(vault.requests().len(), 2, "listing must read the listed record before failing");
     }
 
     #[tokio::test]
