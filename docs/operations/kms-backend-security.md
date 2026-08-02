@@ -2,7 +2,7 @@
 
 RustFS ships several KMS backends. They differ not only in deployment effort but in **where master key material lives and who can read it**. Pick a backend based on the confidentiality boundary you need, not on the name alone.
 
-For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md). For what may be claimed about the cryptographic implementations themselves, see [Cryptographic compliance positioning](kms-cryptographic-compliance.md). For which RustFS identities may manage or use a given key, see [Per-key KMS authorization](kms-per-key-authorization.md).
+For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md). For what may be claimed about the cryptographic implementations themselves, see [Cryptographic compliance positioning](kms-cryptographic-compliance.md). For which RustFS identities may manage or use a given key, see [Per-key KMS authorization](kms-per-key-authorization.md). If you are migrating from MinIO, read [Migrating from MinIO: encrypted objects do not carry over](#migrating-from-minio-encrypted-objects-do-not-carry-over) first.
 
 ## Backend comparison
 
@@ -13,6 +13,28 @@ For how the Vault backends authenticate (static token, AppRole, Vault Agent toke
 | Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Versioned retention (immutable per-version records + current pointer) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
 | AWS KMS | `AWS` (alias `AwsKms`) | Key material never leaves AWS KMS; RustFS mirrors no key state | AWS KMS (cryptographic isolation) + IAM | Delegated to AWS | On-demand `RotateKeyOnDemand`; prior backing keys stay usable for decryption | Deployments already rooted in AWS IAM that want AWS as the cryptographic root — read [AWS KMS: deviations from the shared backend contract](#aws-kms-deviations-from-the-shared-backend-contract) first |
+
+## Migrating from MinIO: encrypted objects do not carry over
+
+> **Warning: RustFS does not currently support reading objects that MinIO encrypted.**
+> This applies to SSE-S3, SSE-KMS, and SSE-C, in every released binary and container image, and it holds regardless of which KMS backend you configure. Configuring the `Static` backend with the same key material MinIO used does **not** make those objects readable — MinIO wraps data keys in a different envelope format that no RustFS backend produces or accepts (`crates/kms/src/config.rs:304-308`). Plan for this **before** moving data. Tracked in rustfs/backlog#1638.
+
+The read does fail closed — ciphertext is never served as plaintext. MinIO's internal encryption headers mark the object as encrypted (`crates/utils/src/http/header_compat.rs:50-67`), so the read path demands encryption material and refuses when none resolves (`crates/ecstore/src/object_api/readers.rs:559-568`). Two properties still make the problem easy to discover late:
+
+- **The error does not say what happened.** It surfaces as a 500 `InternalError`, which reads as a RustFS fault rather than "another implementation encrypted this object".
+- **Surrounding metadata migrates fine.** The object's `xl.meta` parses, so encrypted objects list and HEAD normally and report plausible sizes. The failure appears only when something reads the payload.
+
+Read a sample of encrypted objects, not just their listings, before decommissioning the MinIO deployment.
+
+Current options for a migration whose source contains encrypted objects:
+
+- Decrypt on the MinIO side first, migrate plaintext, then let RustFS re-encrypt with its own KMS.
+- Copy through the S3 API rather than moving drives — MinIO decrypts on read, and RustFS encrypts on write. This re-encrypts rather than preserving ciphertext and costs a full data transfer.
+- Leave encrypted objects on MinIO and migrate only unencrypted data.
+
+Inventory the source before choosing: bucket default-encryption settings mean objects can be encrypted without any client having sent SSE headers.
+
+The same limitation applies in reverse — objects RustFS encrypts are not readable by MinIO. For the code-level breakdown of which seams block each SSE mode, see [MinIO file-format interoperability, Part C](../architecture/minio-file-format-compat.md#part-c--server-side-encryption-sse).
 
 ## Vault KV2: what the backend does and does not do
 
