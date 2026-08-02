@@ -545,7 +545,7 @@ impl VaultCredentialPolicy {
         endpoint: &str,
         namespace: Option<&str>,
     ) -> Self {
-        let retry = RetryPolicy::for_backend(config, backend, endpoint, namespace, "credentials-login");
+        let retry = RetryPolicy::for_credentials(config, backend, endpoint, namespace, "credentials-login");
         let safety_window = match auth_method {
             VaultAuthMethod::AppRole {
                 refresh_safety_window_secs: Some(secs),
@@ -559,7 +559,7 @@ impl VaultCredentialPolicy {
         };
         Self {
             retry,
-            renew_retry: RetryPolicy::for_backend(config, backend, endpoint, namespace, "credentials-renew"),
+            renew_retry: RetryPolicy::for_credentials(config, backend, endpoint, namespace, "credentials-renew"),
             safety_window,
             retry_interval: DEFAULT_REFRESH_RETRY_INTERVAL,
         }
@@ -897,6 +897,34 @@ mod tests {
             safety_window,
             retry_interval,
         }
+    }
+
+    #[test]
+    fn configured_login_and_renewal_use_reserved_credential_capacity() {
+        let config = KmsConfig::default();
+        let auth_method = VaultAuthMethod::Token {
+            token: TEST_TOKEN.to_string(),
+        };
+        let credentials = VaultCredentialPolicy::from_kms_config(
+            &config,
+            &auth_method,
+            "vault-kv2",
+            "https://credential-policy.example.invalid",
+            Some("team-namespace"),
+        );
+        let operations = RetryPolicy::for_backend(
+            &config,
+            "vault-kv2",
+            "https://credential-policy.example.invalid",
+            Some("team-namespace"),
+            "operations",
+        );
+
+        assert!(credentials.retry.uses_credential_reserve());
+        assert!(credentials.renew_retry.uses_credential_reserve());
+        assert!(!operations.uses_credential_reserve());
+        assert!(credentials.retry.shares_active_capacity_with(&credentials.renew_retry));
+        assert!(credentials.retry.shares_active_capacity_with(&operations));
     }
 
     /// Shared observable state of a [`ScriptedSource`].

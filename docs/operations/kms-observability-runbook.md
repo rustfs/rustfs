@@ -26,7 +26,7 @@ Label values:
 - `error_class`: `retryable_conn` (connection-level failure: dial, TLS, broken connection), `retryable_status` (retryable backend status, e.g. Vault 5xx or a sealed Vault's 503), `attempt_timeout` (the per-attempt timeout cut the attempt off; retried like a connection failure because the server may still have processed the request), `fatal` (non-retryable: authentication, permissions, malformed request, missing key or version).
 - `operation`: static per-call-site names, e.g. `vault_kv2_read_key_version`, `vault_kv2_cas_write_key`, `vault_transit_encrypt`, `vault_transit_decrypt`, `vault_login`, `vault_token_renew`.
 
-Admission sharing follows two different boundaries. Active backend capacity is shared by backend identity, so separate policy scopes cannot bypass the concurrency cap. The bounded wait queue and circuit breaker are shared only by backend identity plus policy scope, so data operations, login, and renewal do not trip or fill one another's scope-local breaker and queue.
+Admission sharing follows two different boundaries. Total active backend capacity is shared by backend identity and capped at 64; ordinary operations are limited to 63 so login and renewal always retain one reserved slot without exceeding the total cap. Each backend configuration generation owns fresh bounded queues and circuit breakers for its policy scopes, so a failed reconfiguration candidate cannot inherit or mutate the running generation's admission state.
 
 Instrumentation boundary: the Local and Static backends do not flow through the choke point and emit no operation metrics; bringing them under the same instrumentation is tracked separately (rustfs/backlog#1569). Absence of these six series on a cluster using those backends is expected, not an outage. The families below sit above the backend layer and are emitted regardless.
 
@@ -127,7 +127,7 @@ Investigation:
 1. Break the failures down by outcome: `sum by (outcome) (rate(rustfs_kms_backend_operations_total{outcome!~"success|cancelled"}[5m]))`.
 2. If `fatal` dominates, follow [KmsBackendFatalErrors](#kmsbackendfatalerrors).
 3. If `budget_exhausted` or `deadline_exceeded` dominates, follow [KmsBackendRetryBudgetExhausted](#kmsbackendretrybudgetexhausted) — the backend is unavailable or too slow for longer than the retry policy can bridge.
-4. If `backpressure_timeout` or `backpressure_rejected` dominates, compare `rustfs_kms_backend_in_flight` by `backend` and `scope`; active capacity is shared by backend identity, while each identity-and-scope pair has its own bounded queue.
+4. If `backpressure_timeout` or `backpressure_rejected` dominates, compare `rustfs_kms_backend_in_flight` by `backend` and `scope`; total active capacity is shared by backend identity, one slot is reserved for credential refresh, and each configuration generation has fresh scope-local bounded queues.
 5. If `circuit_open` dominates, follow [KmsBackendCircuitOpen](#kmsbackendcircuitopen).
 6. Correlate with client impact: encrypted-object PUT/GET failures and S3 error rates on buckets with encryption configured.
 
@@ -186,7 +186,7 @@ Investigation:
 2. Break recent rejections down by operation: `sum by (operation) (rate(rustfs_kms_backend_operations_total{outcome="circuit_open"}[5m]))`.
 3. Check `sum by (error_class) (rate(rustfs_kms_backend_attempt_failures_total{error_class=~"retryable_conn|retryable_status|attempt_timeout"}[5m]))` to distinguish transport failures, retryable backend responses such as a sealed Vault, and attempt timeouts. An attempt timeout counts toward the breaker as a retryable connection failure.
 4. After the open interval, the next eligible operation is the only half-open probe. A success or non-retryable failure closes the circuit; a retryable failure reopens it. A non-retryable probe still fails as `fatal`, so follow [KmsBackendFatalErrors](#kmsbackendfatalerrors) even after the circuit gauge clears. Do not restart RustFS just to clear the state.
-5. Remember the sharing boundary: breaker and queue state are per backend identity plus scope, while active capacity is shared by backend identity. Check other scopes for capacity pressure even when their circuits remain closed.
+5. Remember the sharing boundary: each configuration generation has fresh scope-local breaker and queue state, while total active capacity is shared by backend identity with one slot reserved for credential refresh. Check other scopes for capacity pressure even when their circuits remain closed.
 
 Related signals: `circuit_open`, `backpressure_timeout`, and `backpressure_rejected` on the "Backend Operation Rate by Outcome" panel; `rustfs_kms_backend_in_flight`; Vault availability and seal status.
 
