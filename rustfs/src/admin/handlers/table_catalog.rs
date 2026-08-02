@@ -7149,18 +7149,18 @@ mod tests {
             base64_encode_url_safe_no_pad(b"not-json"),
             encoded_json(serde_json::json!({
                 "version": REST_PAGE_TOKEN_VERSION,
-                "context": context_fingerprint.clone(),
+                "context": context_fingerprint,
                 "cursor": "strong:alpha",
                 "unknown": true
             })),
             encoded_json(serde_json::json!({
                 "version": REST_PAGE_TOKEN_VERSION + 1,
-                "context": context_fingerprint.clone(),
+                "context": context_fingerprint,
                 "cursor": "strong:alpha"
             })),
             encoded_json(serde_json::json!({
                 "version": REST_PAGE_TOKEN_VERSION,
-                "context": context_fingerprint.clone(),
+                "context": context_fingerprint,
                 "cursor": ""
             })),
         ];
