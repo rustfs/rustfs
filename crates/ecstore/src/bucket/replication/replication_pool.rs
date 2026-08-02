@@ -25,10 +25,11 @@ use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
 use super::replication_queue_boundary::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
-    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
-    ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, WORKER_MAX_LIMIT,
-    initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count, replication_backpressure_recommendation,
-    replication_heal_queue_action, resized_worker_counts, should_queue_large_object, worker_queue_for_replication_type,
+    ReplicationBatchAdmission, ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes,
+    ReplicationOperation, ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue,
+    WORKER_MAX_LIMIT, initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count,
+    replication_backpressure_recommendation, replication_heal_queue_action, resized_worker_counts, should_queue_large_object,
+    worker_queue_for_replication_type,
 };
 use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
@@ -45,6 +46,8 @@ use super::replication_storage_boundary::{
 use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
+use futures_util::stream::{self, StreamExt};
+use metrics::{counter, histogram};
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -72,6 +75,9 @@ const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
+const DELETE_BATCH_ADMISSION_CONCURRENCY: usize = 16;
+const METRIC_DELETE_BATCH_ITEMS_TOTAL: &str = "rustfs_replication_delete_batch_items_total";
+const METRIC_DELETE_BATCH_SIZE: &str = "rustfs_replication_delete_batch_size";
 
 #[derive(Debug, Default)]
 pub struct DurableMrfBacklog {
@@ -857,6 +863,40 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             .await;
 
         admission
+    }
+
+    /// Queues a DeleteObjects replication tail with a fixed concurrency window.
+    /// Each item retains the existing regular-worker to MRF fallback contract.
+    pub async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission {
+        let mut summary = ReplicationBatchAdmission::default();
+        let mut admissions = stream::iter(
+            deletes
+                .iter()
+                .cloned()
+                .map(|delete| async move { self.queue_replica_delete_task(delete).await }),
+        )
+        .buffer_unordered(DELETE_BATCH_ADMISSION_CONCURRENCY);
+
+        while let Some(admission) = admissions.next().await {
+            summary.record(admission);
+        }
+
+        let outcome = summary.outcome();
+        let total = u64::try_from(summary.total).unwrap_or(u64::MAX);
+        let queued = u64::try_from(summary.queued).unwrap_or(u64::MAX);
+        let missed = u64::try_from(summary.missed).unwrap_or(u64::MAX);
+        histogram!(METRIC_DELETE_BATCH_SIZE).record(total as f64);
+        counter!(METRIC_DELETE_BATCH_ITEMS_TOTAL, "outcome" => outcome, "state" => "queued").increment(queued);
+        counter!(METRIC_DELETE_BATCH_ITEMS_TOTAL, "outcome" => outcome, "state" => "missed").increment(missed);
+        debug!(
+            event = "replication_delete_batch_admission",
+            batch_size = summary.total,
+            queued = summary.queued,
+            missed = summary.missed,
+            outcome,
+            "Admitted DeleteObjects replication batch"
+        );
+        summary
     }
 
     /// Queues an MRF save operation
@@ -1712,6 +1752,7 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     fn active_lrg_workers(&self) -> i32;
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission;
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission;
+    async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission;
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
@@ -1746,6 +1787,10 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
         self.queue_replica_delete_task(ri).await
+    }
+
+    async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission {
+        self.queue_replica_delete_batch(deletes).await
     }
 
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize) {
@@ -3034,6 +3079,53 @@ mod tests {
             .await
             .expect("second MRF entry should be queued after capacity opens");
         assert_eq!(received.object, "second");
+    }
+
+    #[tokio::test]
+    async fn delete_batch_admission_reports_mrf_fallback_items() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (worker_tx, worker_rx) = mpsc::channel(1);
+        worker_tx
+            .try_send(ReplicationOperation::Delete(Box::new(DeletedObjectReplicationInfo {
+                bucket: "batch-backpressure".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "already-queued".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })))
+            .expect("test worker channel should be full");
+        pool.workers.write().await.push(worker_tx);
+
+        let mut mrf_rx = pool
+            .mrf_save_rx
+            .lock()
+            .await
+            .take()
+            .expect("test should own the MRF save receiver");
+        let deletes = (0..1)
+            .map(|index| DeletedObjectReplicationInfo {
+                bucket: "batch-backpressure".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: format!("object-{index}"),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let summary = pool.queue_replica_delete_batch(&deletes).await;
+        let entry = mrf_rx
+            .recv()
+            .await
+            .expect("MRF fallback entry should be queued after batch admission");
+        assert_eq!(entry.object, "object-0");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.queued, 1);
+        assert_eq!(summary.missed, 0);
+        assert_eq!(summary.outcome(), "all_queued");
+        drop(worker_rx);
     }
 
     #[tokio::test]

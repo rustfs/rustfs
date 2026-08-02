@@ -718,6 +718,19 @@ pub(crate) mod bucket {
             ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type).await;
         }
 
+        pub(crate) async fn schedule_replication_deletes(
+            delete_objects: Vec<crate::storage::storage_api::StorageDeletedObject>,
+            bucket: String,
+            event_type: String,
+        ) {
+            #[cfg(test)]
+            SCHEDULED_REPLICATION_DELETES
+                .lock()
+                .expect("scheduled replication delete lock should not be poisoned")
+                .extend(delete_objects.iter().cloned());
+            ReplicationObjectBridge::schedule_storage_deletes(delete_objects, bucket, event_type).await;
+        }
+
         pub(crate) fn set_deleted_object_replication_state(
             delete_object: &mut crate::storage::storage_api::StorageDeletedObject,
             state: &replication_contracts::ReplicationState,
