@@ -62,9 +62,9 @@ pub use operation::{
     should_use_existing_delete_replication_source,
 };
 pub use queue::{
-    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
-    ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, mrf_save_admission, replication_heal_queue_action,
-    worker_queue_for_replication_type,
+    ReplicationBatchAdmission, ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes,
+    ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, mrf_save_admission,
+    replication_heal_queue_action, worker_queue_for_replication_type,
 };
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,

@@ -104,11 +104,20 @@ pub fn unsupported_replication_config_field(config: &ReplicationConfiguration) -
         if rule.destination.encryption_configuration.is_some() {
             return Some("Destination.EncryptionConfiguration");
         }
+        if rule.destination.access_control_translation.is_some() {
+            return Some("Destination.AccessControlTranslation");
+        }
+        if rule.destination.account.is_some() {
+            return Some("Destination.Account");
+        }
         if rule.destination.metrics.is_some() {
             return Some("Destination.Metrics");
         }
         if rule.destination.replication_time.is_some() {
             return Some("Destination.ReplicationTime");
+        }
+        if rule.destination.storage_class.is_some() {
+            return Some("Destination.StorageClass");
         }
     }
     None
@@ -422,6 +431,7 @@ mod tests {
         MetricsStatus, ReplicaModifications, ReplicationRule, ReplicationTime, ReplicationTimeStatus, ReplicationTimeValue,
         SourceSelectionCriteria, SseKmsEncryptedObjects, SseKmsEncryptedObjectsStatus,
     };
+    use s3s::xml::{Deserializer, Serializer};
 
     fn replication_rule(id: &str, arn: &str) -> ReplicationRule {
         ReplicationRule {
@@ -819,6 +829,19 @@ mod tests {
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.EncryptionConfiguration"));
 
         config.rules[0].destination.encryption_configuration = None;
+        config.rules[0].destination.access_control_translation = Some(s3s::dto::AccessControlTranslation {
+            owner: s3s::dto::OwnerOverride::from_static(s3s::dto::OwnerOverride::DESTINATION),
+        });
+        assert_eq!(
+            unsupported_replication_config_field(&config),
+            Some("Destination.AccessControlTranslation")
+        );
+
+        config.rules[0].destination.access_control_translation = None;
+        config.rules[0].destination.account = Some("123456789012".to_string());
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.Account"));
+
+        config.rules[0].destination.account = None;
         config.rules[0].destination.metrics = Some(Metrics {
             event_threshold: None,
             status: MetricsStatus::from_static(MetricsStatus::ENABLED),
@@ -831,6 +854,72 @@ mod tests {
             time: ReplicationTimeValue { minutes: Some(15) },
         });
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.ReplicationTime"));
+
+        config.rules[0].destination.replication_time = None;
+        config.rules[0].destination.storage_class =
+            Some(s3s::dto::StorageClass::from_static(s3s::dto::StorageClass::STANDARD_IA));
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.StorageClass"));
+    }
+
+    #[test]
+    fn historical_destination_fields_survive_the_s3_xml_round_trip() {
+        let xml = br#"
+            <ReplicationConfiguration>
+              <Role></Role>
+              <Rule>
+                <ID>historical</ID>
+                <Status>Enabled</Status>
+                <Destination>
+                  <Bucket>arn:aws:s3:::destination</Bucket>
+                  <Account>123456789012</Account>
+                  <AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>
+                  <StorageClass>STANDARD_IA</StorageClass>
+                </Destination>
+              </Rule>
+            </ReplicationConfiguration>
+        "#;
+        let mut deserializer = Deserializer::new(xml);
+        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
+            .expect("historical config should parse");
+        deserializer
+            .expect_eof()
+            .expect("historical config should consume the whole body");
+
+        let mut encoded = Vec::new();
+        <ReplicationConfiguration as s3s::xml::Serialize>::serialize(&config, &mut Serializer::new(&mut encoded))
+            .expect("historical config should serialize");
+        let encoded = String::from_utf8(encoded).expect("serialized XML should be UTF-8");
+        for field in [
+            "<Account>123456789012</Account>",
+            "<Owner>Destination</Owner>",
+            "<StorageClass>STANDARD_IA</StorageClass>",
+        ] {
+            assert!(encoded.contains(field), "historical field {field} was lost: {encoded}");
+        }
+    }
+
+    #[test]
+    fn s3_xml_parser_discards_unknown_replication_elements_before_validation() {
+        let xml = br#"
+            <ReplicationConfiguration>
+              <Role></Role>
+              <FutureTopLevel>future</FutureTopLevel>
+              <Rule>
+                <ID>unknown</ID>
+                <Status>Enabled</Status>
+                <Destination>
+                  <Bucket>arn:aws:s3:::destination</Bucket>
+                </Destination>
+              </Rule>
+            </ReplicationConfiguration>
+        "#;
+        let mut deserializer = Deserializer::new(xml);
+        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
+            .expect("s3s should accept unknown elements");
+        deserializer.expect_eof().expect("unknown elements should still be consumed");
+
+        assert!(config.rules[0].destination.encryption_configuration.is_none());
+        assert_eq!(unsupported_replication_config_field(&config), None);
     }
 
     #[test]

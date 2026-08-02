@@ -47,6 +47,7 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, insert_str};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{debug, error, instrument, warn};
@@ -58,7 +59,7 @@ const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 use crate::app::storage_api::object_usecase::bucket::replication::{
-    ReplicateDecision, must_replicate_object, schedule_object_replication,
+    ReplicateDecision, must_replicate_metadata, schedule_metadata_replication,
 };
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
@@ -431,15 +432,29 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let version_id_for_parse = version_id.clone();
-        let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id_for_parse)?.map(Into::into),
-            ..Default::default()
-        };
+        let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        let existing_object_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
+        let dsc = must_replicate_metadata(
+            &bucket,
+            &object,
+            &existing_object_info.user_defined,
+            String::new(),
+            existing_object_info.replication_status.clone(),
+            opts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            opts.eval_metadata = Some(eval_metadata);
+        }
 
         let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
         Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
-        delete_tags_result.map_err(|e| {
+        let object_info = delete_tags_result.map_err(|e| {
             error!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -452,19 +467,10 @@ impl S3 for FS {
             ApiError::from(e)
         })?;
 
-        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?version_id,
-                    error = %err,
-                    "failed to load object info for delete-object-tagging notification; falling back to request context"
-                );
-                None
-            }
-        };
+        let event_object_info = Some(object_info.clone());
+        if dsc.replicate_any() {
+            schedule_metadata_replication(object_info, store.clone(), dsc).await;
+        }
 
         counter!("rustfs_delete_object_tagging_success").increment(1);
 
@@ -1302,7 +1308,7 @@ impl S3 for FS {
         // to re-drive. Scheduling without that marker would lose the task silently.
         let dsc = match store.get_object_info(&bucket, &key, &opts).await.ok() {
             Some(info) => {
-                must_replicate_object(
+                must_replicate_metadata(
                     &bucket,
                     &key,
                     &info.user_defined,
@@ -1327,10 +1333,9 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        // This replicates the whole object, not just the changed metadata: metadata-only
-        // replication is not implemented yet, so the lock change triggers a full re-upload.
+        // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_object_replication(info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(info.clone(), store.clone(), dsc).await;
         }
 
         let output = PutObjectLegalHoldOutput {
@@ -1508,7 +1513,7 @@ impl S3 for FS {
         // to re-drive. Scheduling without that marker would lose the task silently.
         let dsc = match existing_obj_info.as_ref() {
             Some(info) => {
-                must_replicate_object(
+                must_replicate_metadata(
                     &bucket,
                     &key,
                     &info.user_defined,
@@ -1533,10 +1538,9 @@ impl S3 for FS {
             S3Error::from(ApiError::from(e))
         })?;
 
-        // This replicates the whole object, not just the changed metadata: metadata-only
-        // replication is not implemented yet, so the lock change triggers a full re-upload.
+        // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_object_replication(object_info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(object_info.clone(), store.clone(), dsc).await;
         }
 
         let output = PutObjectRetentionOutput {
@@ -1576,32 +1580,38 @@ impl S3 for FS {
         debug!("Encoded tags: {}", tags);
 
         let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
+        let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        let existing_object_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
+        let dsc = must_replicate_metadata(
+            &bucket,
+            &object,
+            &existing_object_info.user_defined,
+            tags.clone(),
+            existing_object_info.replication_status.clone(),
+            opts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            opts.eval_metadata = Some(eval_metadata);
+        }
 
         let put_tags_result = store.put_object_tags(&bucket, &object, &tags, &opts).await;
         Self::record_replication_tagging_metric(&bucket, &object, "PutObjectTagging", put_tags_result.is_err()).await;
-        put_tags_result.map_err(|e| {
+        let object_info = put_tags_result.map_err(|e| {
             error!("Failed to put object tags: {}", e);
             counter!("rustfs_put_object_tagging_failure").increment(1);
             ApiError::from(e)
         })?;
 
-        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?req.input.version_id,
-                    error = %err,
-                    "failed to load object info for put-object-tagging notification; falling back to request context"
-                );
-                None
-            }
-        };
+        let event_object_info = Some(object_info.clone());
+        if dsc.replicate_any() {
+            schedule_metadata_replication(object_info, store.clone(), dsc).await;
+        }
 
         counter!("rustfs_put_object_tagging_success").increment(1);
 

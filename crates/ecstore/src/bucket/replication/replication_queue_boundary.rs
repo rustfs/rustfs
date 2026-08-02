@@ -13,8 +13,8 @@
 // limitations under the License.
 
 pub use rustfs_replication::{
-    DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,
-    ReplicationQueueAdmission,
+    DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,
+    ReplicationPriority, ReplicationQueueAdmission,
 };
 pub(crate) use rustfs_replication::{
     LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState, ReplicationHealQueueAction,

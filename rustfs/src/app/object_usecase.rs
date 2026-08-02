@@ -20,8 +20,8 @@ use rustfs_io_metrics::buffered_write;
 use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized, req_info_mut,
-    req_info_ref,
+    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
+    replication_request_authorized, req_info_mut, req_info_ref,
 };
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 #[cfg(test)]
@@ -45,7 +45,8 @@ use super::storage_api::object_usecase::bucket::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, delete_replication_state_from_config,
         delete_replication_version_id, deleted_object_has_pending_replication_delete, has_active_delete_rule,
         load_delete_config_snapshot, must_replicate_object, schedule_object_replication, schedule_replication_delete,
-        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        schedule_replication_deletes, set_deleted_object_replication_state, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -81,9 +82,10 @@ use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cac
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
-    copy_dst_opts, copy_src_opts, del_opts_with_versioning, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
-    normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
+    copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
+    extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
+    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, put_opts_with_replication_authorization,
+    validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -4923,9 +4925,16 @@ impl DefaultObjectUsecase {
         )?;
         apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
 
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
-            .await
-            .map_err(ApiError::from)?;
+        let mut opts: ObjectOptions = put_opts_with_replication_authorization(
+            &bucket,
+            &key,
+            version_id.clone(),
+            &req.headers,
+            metadata.clone(),
+            replication_request_authorized(&req),
+        )
+        .await
+        .map_err(ApiError::from)?;
         apply_put_request_object_lock_opts(
             &bucket,
             object_lock_legal_hold_status,
@@ -6194,9 +6203,16 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let mut dst_opts = copy_dst_opts(&bucket, &key, dest_version_id.clone(), &req.headers, HashMap::new())
-            .await
-            .map_err(ApiError::from)?;
+        let mut dst_opts = copy_dst_opts_with_replication_authorization(
+            &bucket,
+            &key,
+            dest_version_id.clone(),
+            &req.headers,
+            HashMap::new(),
+            replication_request_authorized(&req),
+        )
+        .await
+        .map_err(ApiError::from)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
         let expected_current_version_id = expected_current_version_id(&req.headers)?;
@@ -6344,7 +6360,35 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() {
+        // A same-name copy is normally serviced as a metadata-only update: the store layer
+        // rewrites xl.meta in place and leaves the data blocks alone. That shortcut is only sound
+        // when the destination's physical bytes are identical to the source's, and encryption
+        // breaks exactly that. The destination metadata is rebuilt from scratch below —
+        // `strip_managed_encryption_metadata` drops the source DEK and `sse_encryption` mints a
+        // fresh one — so reusing the stored ciphertext would leave a new DEK sitting beside bytes
+        // it cannot decrypt, permanently destroying the object (GET fails with an AEAD tag
+        // mismatch). The mirror case is worse because it is silent: an encrypted source copied
+        // without any destination SSE keeps its ciphertext while losing the key metadata, so GET
+        // hands back raw ciphertext as if it were plaintext. So whenever either side is
+        // encrypted, leave metadata_only = false and let the store layer do a full read/write
+        // rewrite through put_object, the same resolution the versioned historical-restore path
+        // uses (issue #4238, crates/ecstore/src/store/object.rs).
+        //
+        // This mirrors MinIO's `isSourceEncrypted || isTargetEncrypted -> metadataOnly = false`
+        // in CopyObjectHandler, with one deliberate difference: MinIO decides "target encrypted"
+        // from request headers alone, while `effective_sse` here also resolves the bucket default
+        // encryption rule. `sse_encryption` mints a DEK from that resolved value, so a
+        // header-only check would miss a self-copy under a bucket default rule. The source half
+        // deliberately reuses `ObjectInfo::is_encrypted` rather than naming individual headers,
+        // so a future encryption flavour is covered here the moment it is recognised there.
+        //
+        // The zero-copy shortcut is only recoverable for encrypted objects by *preserving* the
+        // DEK that sealed the bytes and re-wrapping it under a new master key (MinIO's
+        // `rotateKey` + `keyRotation` flag, which is why it may keep metadataOnly = true). RustFS
+        // has no such rewrap primitive today; adding one is backlog#1637, and it would enter here
+        // as an explicit exception rather than by relaxing this guard.
+        let copy_changes_encryption = src_info.is_encrypted() || effective_sse.is_some() || has_explicit_ssec;
+        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() && !copy_changes_encryption {
             src_info.metadata_only = true;
         }
 
@@ -7003,14 +7047,26 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        for result in &delete_results {
-            if let Some(dobj) = &result.delete_object
-                && replicate_deletes
-                && deleted_object_has_pending_replication_delete(dobj)
-            {
+        let replication_deletes = if replicate_deletes {
+            delete_results
+                .iter()
+                .filter_map(|result| result.delete_object.as_ref())
+                .filter(|dobj| deleted_object_has_pending_replication_delete(dobj))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !replication_deletes.is_empty() {
+            let bucket_for_replication = bucket.clone();
+            let replication_task = tokio::spawn(async move {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-                schedule_replication_delete(dobj.clone(), bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
-            }
+                schedule_replication_deletes(replication_deletes, bucket_for_replication, REPLICATE_INCOMING_DELETE.to_string())
+                    .await;
+            });
+            // The spawned task owns every locally committed delete. Dropping the
+            // join handle on request cancellation therefore cannot lose the tail.
+            let _ = replication_task.await;
         }
 
         let req_headers = req.headers.clone();
@@ -7950,6 +8006,7 @@ impl DefaultObjectUsecase {
         if is_sse_kms_requested(&req.input, &req.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
+        let replication_authorized = replication_request_authorized(&req);
         let input = req.input;
 
         let PutObjectInput {
@@ -8221,9 +8278,16 @@ impl DefaultObjectUsecase {
                 storage_class.clone(),
             )?;
             apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
-            let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
-                .await
-                .map_err(ApiError::from)?;
+            let mut opts = put_opts_with_replication_authorization(
+                &bucket,
+                &fpath,
+                None,
+                &req.headers,
+                metadata.clone(),
+                replication_authorized,
+            )
+            .await
+            .map_err(ApiError::from)?;
             apply_extract_entry_pax_extensions(&mut f, &mut metadata, &mut opts).await?;
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
