@@ -734,15 +734,19 @@ async fn get_bucket_replication(
 }
 
 async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    set_bucket_versioning(env, bucket, BucketVersioningStatus::Enabled).await
+}
+
+async fn set_bucket_versioning(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = env.create_s3_client();
     client
         .put_bucket_versioning()
         .bucket(bucket)
-        .versioning_configuration(
-            VersioningConfiguration::builder()
-                .status(BucketVersioningStatus::Enabled)
-                .build(),
-        )
+        .versioning_configuration(VersioningConfiguration::builder().status(status).build())
         .send()
         .await?;
     Ok(())
@@ -1264,6 +1268,48 @@ async fn assert_replication_converged(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("replication did not converge in time; source={source:?}, target={target:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_replication_state<F>(
+    client: &Client,
+    bucket: &str,
+    description: &str,
+    predicate: F,
+) -> Result<Vec<ReplicatedVersion>, Box<dyn Error + Send + Sync>>
+where
+    F: Fn(&[ReplicatedVersion]) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = list_replication_state(client, bucket).await?;
+        if predicate(&state) {
+            return Ok(state);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{description}; last target state: {state:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn assert_replication_key_absent(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    observation: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + observation;
+    loop {
+        let state = list_replication_state(client, bucket).await?;
+        assert!(
+            state.iter().all(|entry| entry.key != key),
+            "unexpected replicated key {bucket}/{key}: {state:?}"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -3578,6 +3624,326 @@ async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> 
         .send()
         .await?;
     assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    Ok(())
+}
+
+/// Bounded executable slice for backlog#1620. It deliberately uses real
+/// source and target RustFS processes and leaves the full MinIO
+/// interoperability profile for a runner that provisions MinIO credentials
+/// and a reachable endpoint.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env_a = RustFSTestEnvironment::new().await?;
+    target_env_a
+        .start_rustfs_server_without_cleanup_with_env(&source_env_vars)
+        .await?;
+    let mut target_env_b = RustFSTestEnvironment::new().await?;
+    target_env_b
+        .start_rustfs_server_without_cleanup_with_env(&source_env_vars)
+        .await?;
+
+    let source_bucket = "replication-acceptance-src";
+    let target_bucket_a = "replication-acceptance-dst-a";
+    let target_bucket_b = "replication-acceptance-dst-b";
+    let source_client = source_env.create_s3_client();
+    let target_client_a = target_env_a.create_s3_client();
+    let target_client_b = target_env_b.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client_a.create_bucket().bucket(target_bucket_a).send().await?;
+    target_client_b.create_bucket().bucket(target_bucket_b).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env_a, target_bucket_a).await?;
+    enable_bucket_versioning(&target_env_b, target_bucket_b).await?;
+
+    let target_a_arn = set_replication_target(&source_env, source_bucket, &target_env_a, target_bucket_a).await?;
+    let target_b_arn = set_replication_target(&source_env, source_bucket, &target_env_b, target_bucket_b).await?;
+    let body = format!(
+        r#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role></Role>
+  <Rule>
+    <ID>matrix-prefix</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>prefix/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-both-prefix</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>both/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-tag</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Tag><Key>route</Key><Value>tagged</Value></Tag></Filter>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_b_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-disabled</ID>
+    <Priority>100</Priority>
+    <Status>Disabled</Status>
+    <Filter><Prefix>disabled/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_b_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-priority-high</ID>
+    <Priority>200</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>priority/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-priority-low</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>priority/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+</ReplicationConfiguration>"#
+    );
+    let url = format!("{}/{source_bucket}?replication", source_env.url);
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &source_env.access_key,
+        &source_env.secret_key,
+        Some(body.into_bytes()),
+        Some("application/xml"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("put replication acceptance matrix failed: {status} {body}").into());
+    }
+
+    let saved_config = get_bucket_replication(&source_env, source_bucket).await?.text().await?;
+    for expected in [
+        "matrix-prefix",
+        "matrix-tag",
+        "matrix-disabled",
+        "matrix-priority-high",
+        "Priority>200",
+        "<Status>Disabled</Status>",
+        "<Key>route</Key>",
+    ] {
+        assert!(saved_config.contains(expected), "replication config omitted {expected}: {saved_config}");
+    }
+
+    let version_one = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .body(ByteStream::from_static(b"version-one"))
+        .send()
+        .await?;
+    let version_one_id = version_one
+        .version_id()
+        .ok_or("first matrix PUT omitted version ID")?
+        .to_string();
+    let version_two = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .body(ByteStream::from_static(b"version-two"))
+        .send()
+        .await?;
+    let version_two_id = version_two
+        .version_id()
+        .ok_or("second matrix PUT omitted version ID")?
+        .to_string();
+    wait_for_replication_state(&target_client_a, target_bucket_a, "prefix object did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/versions.txt" && entry.version_id == version_two_id)
+    })
+    .await?;
+
+    let delete_marker = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .send()
+        .await?;
+    let delete_marker_id = delete_marker
+        .version_id()
+        .ok_or("matrix DELETE omitted marker version ID")?
+        .to_string();
+    wait_for_replication_state(&target_client_a, target_bucket_a, "enabled delete marker did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/versions.txt" && entry.delete_marker && entry.version_id == delete_marker_id)
+    })
+    .await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .version_id(&version_one_id)
+        .send()
+        .await?;
+    wait_for_replication_state(&target_client_a, target_bucket_a, "enabled version purge did not replicate", |state| {
+        state.iter().all(|entry| entry.version_id != version_one_id)
+    })
+    .await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("priority/object.txt")
+        .body(ByteStream::from_static(b"priority winner"))
+        .send()
+        .await?;
+    wait_for_user_get_object(&target_client_a, target_bucket_a, "priority/object.txt").await?;
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("priority/object.txt")
+        .send()
+        .await?;
+    sleep(Duration::from_secs(3)).await;
+    let priority_state = list_replication_state(&target_client_a, target_bucket_a).await?;
+    assert!(
+        priority_state
+            .iter()
+            .any(|entry| entry.key == "priority/object.txt" && !entry.delete_marker),
+        "priority rule did not retain the object version: {priority_state:?}"
+    );
+    assert!(
+        priority_state
+            .iter()
+            .all(|entry| !(entry.key == "priority/object.txt" && entry.delete_marker)),
+        "lower-priority delete-marker rule overrode the higher-priority disabled rule: {priority_state:?}"
+    );
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("tagged/object.txt")
+        .tagging("route=tagged")
+        .body(ByteStream::from_static(b"tag filter"))
+        .send()
+        .await?;
+    wait_for_user_get_object(&target_client_b, target_bucket_b, "tagged/object.txt").await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("tagged/no-match.txt")
+        .body(ByteStream::from_static(b"not tagged"))
+        .send()
+        .await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("both/object.txt")
+        .tagging("route=tagged")
+        .body(ByteStream::from_static(b"mixed targets"))
+        .send()
+        .await?;
+    tokio::try_join!(
+        wait_for_user_get_object(&target_client_a, target_bucket_a, "both/object.txt"),
+        wait_for_user_get_object(&target_client_b, target_bucket_b, "both/object.txt"),
+    )?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("disabled/object.txt")
+        .body(ByteStream::from_static(b"disabled"))
+        .send()
+        .await?;
+    assert_replication_key_absent(&target_client_a, target_bucket_a, "disabled/object.txt", Duration::from_secs(3)).await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "disabled/object.txt", Duration::from_secs(3)).await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("tagged/object.txt")
+        .send()
+        .await?;
+    sleep(Duration::from_secs(3)).await;
+    let tagged_state = list_replication_state(&target_client_b, target_bucket_b).await?;
+    assert!(
+        tagged_state
+            .iter()
+            .any(|entry| entry.key == "tagged/object.txt" && !entry.delete_marker),
+        "tag rule should retain the replicated data version: {tagged_state:?}"
+    );
+    assert!(
+        tagged_state
+            .iter()
+            .all(|entry| !(entry.key == "tagged/object.txt" && entry.delete_marker)),
+        "tag rule with disabled delete-marker replication created a marker: {tagged_state:?}"
+    );
+
+    set_bucket_versioning(&source_env, source_bucket, BucketVersioningStatus::Suspended).await?;
+    set_bucket_versioning(&target_env_a, target_bucket_a, BucketVersioningStatus::Suspended).await?;
+    let null_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("prefix/null.txt")
+        .body(ByteStream::from_static(b"null version"))
+        .send()
+        .await?;
+    assert!(null_put.version_id().is_none(), "suspended source PUT must create a null version");
+    wait_for_replication_state(&target_client_a, target_bucket_a, "null version did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && !entry.delete_marker)
+    })
+    .await?;
+    let null_delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("prefix/null.txt")
+        .send()
+        .await?;
+    assert!(
+        null_delete.version_id().is_none(),
+        "suspended source DELETE must create a null delete marker"
+    );
+    wait_for_replication_state(&target_client_a, target_bucket_a, "null delete marker did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && entry.delete_marker)
+    })
+    .await?;
 
     Ok(())
 }
