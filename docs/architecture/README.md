@@ -38,6 +38,7 @@ Two rules keep this directory healthy:
 - [config-model-boundary-adr.md](config-model-boundary-adr.md)
 - [ecstore-layout-boundary.md](ecstore-layout-boundary.md)
 - [decommission-compatibility.md](decommission-compatibility.md)
+- [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) — object-side DEK re-wrap job: work unit, idempotency model, exclusion rules, and the never-destroy-old-key-versions constraint
 
 ## Support matrices (release-facing, keep current)
 
