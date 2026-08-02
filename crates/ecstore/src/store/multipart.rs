@@ -21,6 +21,16 @@ use std::collections::HashSet;
 
 const MULTIPART_LIST_SET_CONCURRENCY: usize = 4;
 
+#[derive(Clone, Debug)]
+pub(super) struct MultipartUploadListRequest {
+    pub(super) prefix: String,
+    pub(super) key_marker: Option<String>,
+    pub(super) upload_id_marker: Option<String>,
+    pub(super) delimiter: Option<String>,
+    pub(super) max_uploads: usize,
+    pub(super) expected_incarnation_id: Option<Uuid>,
+}
+
 fn map_multipart_namespace_lock_error(
     bucket: &str,
     object: &str,
@@ -56,32 +66,24 @@ fn ensure_multipart_bucket_lifecycle_guard_held(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn list_pool_multipart_uploads_for_incarnation(
     pool: &crate::core::sets::Sets,
     bucket: &str,
-    prefix: &str,
-    key_marker: Option<String>,
-    upload_id_marker: Option<String>,
-    delimiter: Option<String>,
-    max_uploads: usize,
-    expected_incarnation_id: Option<Uuid>,
+    request: &MultipartUploadListRequest,
 ) -> Result<ListMultipartsInfo> {
-    let per_set_limit = max_uploads.saturating_add(1);
+    let per_set_limit = request.max_uploads.saturating_add(1);
     let results = stream::iter(pool.disk_set.iter().cloned())
         .map(|set| {
-            let key_marker = key_marker.clone();
-            let upload_id_marker = upload_id_marker.clone();
-            let delimiter = delimiter.clone();
+            let request = request.clone();
             async move {
                 set.list_multipart_uploads_for_incarnation(
                     bucket,
-                    prefix,
-                    key_marker,
-                    upload_id_marker,
-                    delimiter,
+                    &request.prefix,
+                    request.key_marker,
+                    request.upload_id_marker,
+                    request.delimiter,
                     per_set_limit,
-                    expected_incarnation_id,
+                    request.expected_incarnation_id,
                 )
                 .await
             }
@@ -103,23 +105,23 @@ async fn list_pool_multipart_uploads_for_incarnation(
     let page = paginate_multipart_listing(
         uploads,
         common_prefixes.into_iter().collect(),
-        key_marker.as_deref(),
-        key_marker.as_ref().and(upload_id_marker.as_deref()),
-        max_uploads,
+        request.key_marker.as_deref(),
+        request.key_marker.as_ref().and(request.upload_id_marker.as_deref()),
+        request.max_uploads,
         source_truncated,
     );
 
     Ok(ListMultipartsInfo {
-        key_marker,
-        upload_id_marker,
+        key_marker: request.key_marker.clone(),
+        upload_id_marker: request.upload_id_marker.clone(),
         next_key_marker: page.next_key_marker,
         next_upload_id_marker: page.next_upload_id_marker,
-        max_uploads,
+        max_uploads: request.max_uploads,
         is_truncated: page.is_truncated,
         uploads: page.uploads,
         common_prefixes: page.common_prefixes,
-        prefix: prefix.to_owned(),
-        delimiter,
+        prefix: request.prefix.clone(),
+        delimiter: request.delimiter.clone(),
     })
 }
 
@@ -137,12 +139,14 @@ impl ECStore {
     ) -> Result<ListMultipartsInfo> {
         self.handle_list_multipart_uploads(
             bucket,
-            prefix,
-            key_marker,
-            upload_id_marker,
-            delimiter,
-            max_uploads,
-            Some(expected_incarnation_id),
+            MultipartUploadListRequest {
+                prefix: prefix.to_string(),
+                key_marker,
+                upload_id_marker,
+                delimiter,
+                max_uploads,
+                expected_incarnation_id: Some(expected_incarnation_id),
+            },
         )
         .await
     }
@@ -238,26 +242,26 @@ impl ECStore {
     }
 
     #[instrument(skip(self))]
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_list_multipart_uploads(
         &self,
         bucket: &str,
-        prefix: &str,
-        key_marker: Option<String>,
-        upload_id_marker: Option<String>,
-        delimiter: Option<String>,
-        max_uploads: usize,
-        expected_incarnation_id: Option<Uuid>,
+        request: MultipartUploadListRequest,
     ) -> Result<ListMultipartsInfo> {
-        check_list_multipart_args(bucket, prefix, &key_marker, &upload_id_marker, &delimiter)?;
+        check_list_multipart_args(
+            bucket,
+            &request.prefix,
+            &request.key_marker,
+            &request.upload_id_marker,
+            &request.delimiter,
+        )?;
         let guard_opts = ObjectOptions {
-            expected_bucket_incarnation_id: expected_incarnation_id,
+            expected_bucket_incarnation_id: request.expected_incarnation_id,
             ..Default::default()
         };
         let (opts, bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, &guard_opts).await?;
         let expected_incarnation_id = opts.expected_bucket_incarnation_id;
 
-        if prefix.is_empty() {
+        if request.prefix.is_empty() {
             // TODO: return from cache
         }
 
@@ -265,15 +269,13 @@ impl ECStore {
             let result = list_pool_multipart_uploads_for_incarnation(
                 &self.pools[0],
                 bucket,
-                prefix,
-                key_marker,
-                upload_id_marker,
-                delimiter,
-                max_uploads,
-                expected_incarnation_id,
+                &MultipartUploadListRequest {
+                    expected_incarnation_id,
+                    ..request.clone()
+                },
             )
             .await;
-            ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, prefix)?;
+            ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, &request.prefix)?;
             return result;
         }
 
@@ -288,12 +290,10 @@ impl ECStore {
             let res = list_pool_multipart_uploads_for_incarnation(
                 pool,
                 bucket,
-                prefix,
-                key_marker.clone(),
-                upload_id_marker.clone(),
-                delimiter.clone(),
-                max_uploads,
-                expected_incarnation_id,
+                &MultipartUploadListRequest {
+                    expected_incarnation_id,
+                    ..request.clone()
+                },
             )
             .await?;
             uploads.extend(res.uploads);
@@ -305,20 +305,21 @@ impl ECStore {
         // unordered across pools and may exceed the global cap. Re-sort, re-cap,
         // and derive the truncation markers so a bucket whose uploads span pools
         // pages correctly instead of being silently reported complete.
-        let page = merge_multipart_upload_pages(uploads, common_prefixes.into_iter().collect(), max_uploads, source_truncated);
-        ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, prefix)?;
+        let page =
+            merge_multipart_upload_pages(uploads, common_prefixes.into_iter().collect(), request.max_uploads, source_truncated);
+        ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, &request.prefix)?;
 
         Ok(ListMultipartsInfo {
-            key_marker,
-            upload_id_marker,
+            key_marker: request.key_marker,
+            upload_id_marker: request.upload_id_marker,
             next_key_marker: page.next_key_marker,
             next_upload_id_marker: page.next_upload_id_marker,
-            max_uploads,
+            max_uploads: request.max_uploads,
             is_truncated: page.is_truncated,
             uploads: page.uploads,
             common_prefixes: page.common_prefixes,
-            prefix: prefix.to_owned(),
-            delimiter: delimiter.to_owned(),
+            prefix: request.prefix,
+            delimiter: request.delimiter,
         })
     }
 
@@ -358,12 +359,14 @@ impl ECStore {
             let res = list_pool_multipart_uploads_for_incarnation(
                 pool,
                 bucket,
-                object,
-                None,
-                None,
-                None,
-                MAX_UPLOADS_LIST,
-                opts.expected_bucket_incarnation_id,
+                &MultipartUploadListRequest {
+                    prefix: object.to_string(),
+                    key_marker: None,
+                    upload_id_marker: None,
+                    delimiter: None,
+                    max_uploads: MAX_UPLOADS_LIST,
+                    expected_incarnation_id: opts.expected_bucket_incarnation_id,
+                },
             )
             .await?;
 

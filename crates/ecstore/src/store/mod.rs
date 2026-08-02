@@ -656,8 +656,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        self.handle_list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads, None)
-            .await
+        self.handle_list_multipart_uploads(
+            bucket,
+            multipart::MultipartUploadListRequest {
+                prefix: prefix.to_string(),
+                key_marker,
+                upload_id_marker,
+                delimiter,
+                max_uploads,
+                expected_incarnation_id: None,
+            },
+        )
+        .await
     }
 
     #[instrument(skip(self))]
