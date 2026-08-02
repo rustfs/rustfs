@@ -63,8 +63,8 @@ catalog extension.
 |---|---|---|
 | Catalog config | Supported | `GET /v1/config` advertises RustFS catalog defaults and route capabilities. |
 | Table bucket discovery | Supported | `PUT` and `GET /v1/buckets/{warehouse}` enable and inspect table bucket state. |
-| Namespaces | Supported | Create, list, load, existence check, and drop namespace routes are registered on both catalog prefixes. |
-| Tables | Supported | Create, register, list, load, existence check, commit, metadata-location get/update, and drop table routes are registered on both catalog prefixes. |
+| Namespaces | Supported | Create, list, load, existence check, and drop namespace routes are registered on both catalog prefixes. List responses support Iceberg REST `pageSize`/`pageToken` pagination with context-bound tokens and bounded catalog-store reads. Namespace identifiers are limited to 512 ASCII characters so persisted paths and stateless continuation tokens remain bounded. |
+| Tables | Supported | Create, register, list, load, existence check, commit, metadata-location get/update, and drop table routes are registered on both catalog prefixes. Table and view listings support Iceberg REST `pageSize`/`pageToken` pagination with context-bound tokens and bounded catalog-store reads. |
 | Commit CAS | Supported | Single-table commits validate base metadata, expected version token, referenced object existence, warehouse scope, and Iceberg commit requirements before advancing the current metadata pointer. |
 | Commit recovery | Supported | Commit log, idempotency lookup, diagnostics, and recovery routes expose staged/finalization gaps and repair safe idempotency gaps without moving the table pointer. |
 | Snapshot refs | Supported | Refs can be listed, created or replaced, and deleted through catalog commits. `main` is protected and refs with explicit retention require forced delete. |

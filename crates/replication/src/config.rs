@@ -26,6 +26,53 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+pub const REPLICATION_CAPABILITY_CONTRACT_VERSION: u32 = 1;
+
+pub const REPLICATION_WRITABLE_FIELDS: &[&str] = &[
+    "Role",
+    "Rule.ID",
+    "Rule.Status",
+    "Rule.Priority",
+    "Rule.Filter.Prefix",
+    "Rule.Filter.Tag",
+    "Rule.Filter.And",
+    "Rule.Destination.Bucket",
+    "Rule.ExistingObjectReplication.Status",
+    "Rule.DeleteMarkerReplication.Status",
+    "Rule.DeleteReplication.Status",
+    "Rule.SourceSelectionCriteria.ReplicaModifications.Status",
+];
+
+pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
+    "SourceSelectionCriteria.SseKmsEncryptedObjects",
+    "Destination.EncryptionConfiguration",
+    "Destination.Metrics",
+    "Destination.ReplicationTime",
+];
+
+pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 1;
+
+pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
+    "sourcebucket",
+    "endpoint",
+    "credentials.accessKey",
+    "credentials.secretKey",
+    "targetbucket",
+    "secure",
+    "path",
+    "api",
+    "arn",
+    "type",
+    "region",
+    "bandwidth",
+    "replicationSync",
+    "storage_class",
+    "skipTlsVerify",
+    "caCertPem",
+];
+
+pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["disableProxy", "healthCheckDuration", "edge", "edgeSyncBeforeExpiry"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectOpts {
     pub name: String,
@@ -823,7 +870,9 @@ mod tests {
         );
 
         config.rules[0].source_selection_criteria = None;
-        config.rules[0].destination.encryption_configuration = Some(EncryptionConfiguration::default());
+        config.rules[0].destination.encryption_configuration = Some(EncryptionConfiguration {
+            replica_kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/opaque-key-id".to_string()),
+        });
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.EncryptionConfiguration"));
 
         config.rules[0].destination.encryption_configuration = None;
@@ -918,6 +967,34 @@ mod tests {
 
         assert!(config.rules[0].destination.encryption_configuration.is_none());
         assert_eq!(unsupported_replication_config_field(&config), None);
+    }
+
+    #[test]
+    fn capability_fields_match_validator_rejections() {
+        let rejected_fields = [
+            "SourceSelectionCriteria.SseKmsEncryptedObjects",
+            "Destination.EncryptionConfiguration",
+            "Destination.Metrics",
+            "Destination.ReplicationTime",
+        ];
+
+        for field in rejected_fields {
+            assert!(
+                REPLICATION_READ_ONLY_HISTORICAL_FIELDS.contains(&field),
+                "rejected field {field} must be advertised as readable historical data"
+            );
+            assert!(
+                !REPLICATION_WRITABLE_FIELDS.contains(&field),
+                "rejected field {field} must not be advertised as writable"
+            );
+        }
+
+        for field in REPLICATION_WRITABLE_FIELDS {
+            assert!(
+                !REPLICATION_READ_ONLY_HISTORICAL_FIELDS.contains(field),
+                "field {field} cannot be both writable and historical-only"
+            );
+        }
     }
 
     #[test]

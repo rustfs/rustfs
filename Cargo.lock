@@ -1740,9 +1740,9 @@ dependencies = [
 
 [[package]]
 name = "bytesize"
-version = "2.6.0"
+version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "351a3e803ee3c6eaeee6b00076b767514b37c32a73d326c3ec7abddb7d6c3493"
+checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "bytestring"

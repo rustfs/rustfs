@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +39,7 @@ SENSITIVE_COMMAND_FLAGS = {
 }
 TABLE_MAINTENANCE_CONFIG_VERSION = 1
 IDENTIFIER_SEGMENT_MAX_LEN = 64
+MAX_PAGINATION_PROBE_PAGES = 16
 
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "rustfs": {
@@ -51,7 +53,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "catalog_uri_shape": "{endpoint}/iceberg",
         "warehouse_shape": "{bucket}",
         "namespace_model": "single-level",
-        "pagination_model": "rustfs",
+        "pagination_model": "iceberg-rest",
         "not_claimed": [],
     },
     "rustfs-compat": {
@@ -65,7 +67,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "catalog_uri_shape": "{endpoint}/_iceberg",
         "warehouse_shape": "{bucket}",
         "namespace_model": "single-level",
-        "pagination_model": "rustfs",
+        "pagination_model": "iceberg-rest",
         "not_claimed": ["full MinIO AIStor private extension parity"],
     },
     CATALOG_VENDED_PROFILE: {
@@ -79,7 +81,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "catalog_uri_shape": "{endpoint}/iceberg",
         "warehouse_shape": "{bucket}",
         "namespace_model": "single-level",
-        "pagination_model": "rustfs",
+        "pagination_model": "iceberg-rest",
         "not_claimed": ["no-long-term-data-credential bootstrap"],
     },
     "aws-s3tables": {
@@ -148,7 +150,7 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     {
         "client": "PyIceberg",
         "status": "automated",
-        "coverage": "create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
+        "coverage": "create namespace, create table, append, reload, scan, metadata-location, refs, paginated views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
         "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
     },
     {
@@ -633,13 +635,66 @@ def table_ref_endpoint_path(args: argparse.Namespace, ref_name: str | None = Non
     return f"{path}/{urllib.parse.quote(ref_name, safe='')}"
 
 
-def view_endpoint_path(args: argparse.Namespace, view_name: str | None = None) -> str:
+def namespace_endpoint_path(args: argparse.Namespace, namespace: str | None = None) -> str:
     encoded_bucket = urllib.parse.quote(args.bucket, safe="")
-    encoded_namespace = urllib.parse.quote(args.namespace, safe="")
-    path = f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/views"
+    path = f"{args.rest_path}/v1/{encoded_bucket}/namespaces"
+    if namespace is None:
+        return path
+    return f"{path}/{urllib.parse.quote(namespace, safe='')}"
+
+
+def view_endpoint_path(
+    args: argparse.Namespace,
+    view_name: str | None = None,
+    namespace: str | None = None,
+) -> str:
+    encoded_namespace = urllib.parse.quote(namespace or args.namespace, safe="")
+    path = f"{namespace_endpoint_path(args)}/{encoded_namespace}/views"
     if view_name is None:
         return path
     return f"{path}/{urllib.parse.quote(view_name, safe='')}"
+
+
+def paginated_identifier_names(
+    args: argparse.Namespace,
+    deps: RuntimeDeps,
+    path: str,
+    page_size: int,
+) -> list[str]:
+    page_token: str | None = None
+    seen_names: set[str] = set()
+    seen_tokens: set[str] = set()
+    names: list[str] = []
+    for _ in range(MAX_PAGINATION_PROBE_PAGES):
+        query_parameters: dict[str, str | int] = {"pageSize": page_size}
+        if page_token is not None:
+            query_parameters["pageToken"] = page_token
+        query = urllib.parse.urlencode(query_parameters)
+        response = signed_rest_request(args, deps, "GET", f"{path}?{query}")
+        identifiers = response.get("identifiers")
+        if not isinstance(identifiers, list):
+            raise RuntimeError("paginated list response did not include identifiers")
+        if len(identifiers) > page_size:
+            raise RuntimeError("paginated list response exceeded pageSize")
+        for identifier in identifiers:
+            name = identifier.get("name") if isinstance(identifier, dict) else None
+            if not isinstance(name, str) or not name:
+                raise RuntimeError("paginated list response included an invalid identifier")
+            if name in seen_names:
+                raise RuntimeError("paginated list response included a duplicate identifier")
+            seen_names.add(name)
+            names.append(name)
+
+        if "next-page-token" not in response:
+            raise RuntimeError("paginated list response omitted next-page-token")
+        next_page_token = response["next-page-token"]
+        if next_page_token is None:
+            return names
+        if not isinstance(next_page_token, str) or not next_page_token or next_page_token in seen_tokens:
+            raise RuntimeError("paginated list response included an invalid next-page-token")
+        seen_tokens.add(next_page_token)
+        page_token = next_page_token
+    raise RuntimeError("paginated list response exceeded the smoke page limit")
 
 
 def default_maintenance_config() -> dict[str, Any]:
@@ -1165,24 +1220,78 @@ def smoke_view_request(args: argparse.Namespace, view_name: str, version_id: int
 
 
 def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
-    view_name = f"{args.table}_smoke_view"
-    create_body = smoke_view_request(args, view_name, 1, f"SELECT id, payload FROM {args.namespace}.{args.table}")
-    signed_rest_request(args, deps, "POST", view_endpoint_path(args), create_body)
+    namespace_suffix = f"-views-{uuid.uuid4().hex[:8]}"
+    namespace_prefix = safe_ref_segment(args.namespace, args.table)[: IDENTIFIER_SEGMENT_MAX_LEN - len(namespace_suffix)].rstrip("-_")
+    probe_namespace = f"{namespace_prefix}{namespace_suffix}"
+    view_names = ["view-a", "view-b"]
+    cleanup_views: list[str] = []
+    cleanup_namespace = False
     try:
-        views = signed_rest_request(args, deps, "GET", view_endpoint_path(args))
+        cleanup_namespace = True
+        try:
+            signed_rest_request(
+                args,
+                deps,
+                "POST",
+                namespace_endpoint_path(args),
+                {"namespace": [probe_namespace], "properties": {"rustfs.smoke": "true"}},
+            )
+        except RestRequestError as error:
+            if error.status_code == 409:
+                cleanup_namespace = False
+            raise
+
+        view_path = view_endpoint_path(args, namespace=probe_namespace)
+        for view_name in view_names:
+            cleanup_views.append(view_name)
+            create_body = smoke_view_request(
+                args,
+                view_name,
+                1,
+                f"SELECT id, payload FROM {args.namespace}.{args.table}",
+            )
+            signed_rest_request(args, deps, "POST", view_path, create_body)
+
+        views = signed_rest_request(args, deps, "GET", view_path)
+        if "next-page-token" not in views or views["next-page-token"] is not None:
+            raise RuntimeError("unpaginated listViews response did not terminate with a null next-page-token")
         identifiers = views.get("identifiers", [])
-        if not any(identifier.get("name") == view_name for identifier in identifiers if isinstance(identifier, dict)):
-            raise RuntimeError("listViews response did not include the smoke view")
-        loaded = signed_rest_request(args, deps, "GET", view_endpoint_path(args, view_name))
+        listed_names = {identifier.get("name") for identifier in identifiers if isinstance(identifier, dict)}
+        if listed_names != set(view_names):
+            raise RuntimeError("listViews response did not include exactly the smoke views")
+
+        paginated_names = paginated_identifier_names(args, deps, view_path, page_size=1)
+        if sorted(paginated_names) != sorted(view_names):
+            raise RuntimeError("paginated listViews response did not return both smoke views exactly once")
+
+        loaded = signed_rest_request(args, deps, "GET", view_endpoint_path(args, view_names[0], probe_namespace))
         metadata_location = loaded.get("metadata-location")
         if not isinstance(metadata_location, str) or not metadata_location:
             raise RuntimeError("loadView response did not include metadata-location")
     finally:
-        try:
-            signed_rest_request(args, deps, "DELETE", view_endpoint_path(args, view_name))
-        except RestRequestError as error:
-            if error.status_code != 404:
-                raise
+        probe_failed = sys.exc_info()[0] is not None
+        cleanup_errors: list[Exception] = []
+        for view_name in reversed(cleanup_views):
+            try:
+                signed_rest_request(args, deps, "DELETE", view_endpoint_path(args, view_name, probe_namespace))
+            except RestRequestError as error:
+                if error.status_code != 404:
+                    cleanup_errors.append(error)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_namespace:
+            try:
+                signed_rest_request(args, deps, "DELETE", namespace_endpoint_path(args, probe_namespace))
+            except RestRequestError as error:
+                if error.status_code != 404:
+                    cleanup_errors.append(error)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            if not probe_failed:
+                raise cleanup_errors[0]
+            for error in cleanup_errors:
+                print(f"warning: failed to clean up view pagination probe: {error}", file=sys.stderr)
 
 
 def maintenance_job_id(job: object) -> str | None:
