@@ -17,9 +17,9 @@
 # =============================================================================
 #
 # Metric source: the KMS operation-policy choke point in
-# crates/kms/src/policy.rs. All label values are static enum strings
-# (operation, op_class, outcome, error_class); key identifiers, key material,
-# and tokens never appear in labels.
+# crates/kms/src/policy.rs. All label values are bounded static strings
+# (operation, op_class, outcome, error_class, backend, scope); key identifiers,
+# key material, and tokens never appear in labels.
 #
 # Response procedures: docs/operations/kms-observability-runbook.md
 #
@@ -70,8 +70,9 @@ groups:
       # ------------------------------------------------------------------
       # 2. KmsBackendHighErrorRate
       #    Sustained share of operations terminating without success
-      #    (fatal, budget_exhausted, deadline_exceeded). The cancelled
-      #    outcome is excluded because shutdowns legitimately produce it.
+      #    (fatal, budget/deadline exhaustion, admission backpressure,
+      #    or an open circuit). The cancelled outcome is excluded because
+      #    shutdowns legitimately produce it.
       #    The traffic guard keeps a single failure on a near-idle
       #    cluster from firing the alert.
       #    Threshold: 5% for 10m — conservative default, calibrate
@@ -94,9 +95,11 @@ groups:
           summary: "KMS backend non-success ratio above 5% for 10m"
           description: >-
             {{ $value | humanizePercentage }} of KMS backend operations
-            are terminating in fatal, budget_exhausted, or
-            deadline_exceeded. Object encryption and decryption paths
-            depending on the KMS are degraded or failing.
+            are terminating in fatal, budget_exhausted,
+            deadline_exceeded, backpressure_timeout,
+            backpressure_rejected, or circuit_open. Object encryption
+            and decryption paths depending on the KMS are degraded or
+            failing.
           runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendhigherrorrate"
 
   # ==========================================================================
@@ -186,3 +189,26 @@ groups:
             Retryable failures are outlasting the retry budget, so
             callers are seeing hard failures.
           runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendretrybudgetexhausted"
+
+      # ------------------------------------------------------------------
+      # 6. KmsBackendCircuitOpen
+      #    Direct circuit-state signal, independent of operation traffic.
+      #    A transient open can recover on its first half-open probe; alert
+      #    only when the circuit remains open or half-open for one minute.
+      # ------------------------------------------------------------------
+      - alert: KmsBackendCircuitOpen
+        expr: |
+          rustfs_kms_backend_circuit_open > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: kms
+        annotations:
+          summary: "KMS backend circuit open ({{ $labels.backend }}/{{ $labels.scope }})"
+          description: >-
+            The KMS backend circuit for {{ $labels.backend }} scope
+            {{ $labels.scope }} has remained open or half-open for one
+            minute. Operations in this scope can terminate as
+            circuit_open until the half-open probe succeeds or returns
+            a non-retryable failure.
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendcircuitopen"
