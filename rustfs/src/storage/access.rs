@@ -1577,6 +1577,16 @@ impl S3Access for FS {
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        // Preserve DeleteObject's established NoSuchBucket response instead of
+        // letting policy lookup turn a missing bucket into AccessDenied.
+        if let Err(err) = &bucket_generation
+            && err.code() == &S3ErrorCode::NoSuchBucket
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NoSuchBucket,
+                err.message().unwrap_or("The specified bucket does not exist").to_string(),
+            ));
+        }
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());

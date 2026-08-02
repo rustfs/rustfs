@@ -595,6 +595,19 @@ pub(crate) mod bucket {
         }
 
         pub(crate) mod objectlock_sys {
+            pub(crate) async fn check_object_lock_for_deletion(
+                bucket: &str,
+                obj_info: &crate::storage::storage_api::ObjectInfo,
+                bypass_governance: bool,
+            ) -> Option<crate::storage::storage_api::ObjectLockBlockReason> {
+                crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::check_object_lock_for_deletion(
+                    bucket,
+                    obj_info,
+                    bypass_governance,
+                )
+                .await
+            }
+
             pub(crate) fn is_retention_active(mode: &str, retain_until_date: Option<&s3s::dto::Date>) -> bool {
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::is_retention_active(
                     mode,

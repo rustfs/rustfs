@@ -38,7 +38,7 @@ use super::storage_api::object_usecase::bucket::{
     metadata_sys,
     object_lock::{
         objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::is_retention_active,
+        objectlock_sys::{check_object_lock_for_deletion, is_retention_active},
     },
     predict_lifecycle_expiration,
     quota::{QuotaCheckResult, QuotaError, QuotaOperation},
@@ -2946,6 +2946,7 @@ where
         }
     }
 
+    let has_replica_status = pax_headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS);
     if let Some(value) = pax_headers.get(AMZ_BUCKET_REPLICATION_STATUS) {
         let status = value
             .to_str()
@@ -2990,6 +2991,13 @@ where
     opts.version_id = pax_version_id;
 
     extract_metadata_from_mime_with_object_name(&pax_headers, metadata, false, Some(object_name));
+    if has_replica_status {
+        metadata.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+        metadata.insert(
+            AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+            ReplicationStatusType::Replica.as_str().to_string(),
+        );
+    }
     if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
         bucket,
         object_lock_config_state,
@@ -6437,6 +6445,21 @@ impl DefaultObjectUsecase {
         }
         dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
 
+        // Bucket metadata uses the bucket name as its namespace-lock key. Load
+        // every copy-time bucket snapshot before a same-object key can collide
+        // with that key (for example, copying `bucket/bucket` onto itself).
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        if cp_src_dst_same && key == bucket && expected_current_version_id.is_none() {
+            dst_opts.object_lock_config_snapshot =
+                Some(store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?);
+        }
+        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
+
         let _self_copy_lock_guard = if cp_src_dst_same && expected_current_version_id.is_none() {
             let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
             src_opts.no_lock = true;
@@ -6451,11 +6474,6 @@ impl DefaultObjectUsecase {
         }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
-        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
         if _self_copy_lock_guard.is_some() {
             current_opts.no_lock = true;
         }
@@ -6480,7 +6498,6 @@ impl DefaultObjectUsecase {
             }
         };
 
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
             if has_explicit_ssec {
                 return None;
@@ -6678,7 +6695,6 @@ impl DefaultObjectUsecase {
         src_info.user_tags = Arc::new(effective_tags);
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
-        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         remove_object_lock_metadata_for_copy(&mut user_defined);
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
@@ -6767,6 +6783,7 @@ impl DefaultObjectUsecase {
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
             .map_err(ApiError::from)?;
+        drop(_self_copy_lock_guard);
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
         let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
@@ -7427,6 +7444,18 @@ impl DefaultObjectUsecase {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                         let (result, _helper) = complete_delete_noop(helper, bucket, key, version_id_clone);
                         return result;
+                    }
+
+                    if matches!(&err, StorageError::PrefixAccessDenied(_, _))
+                        && let Some(existing_object_info) = existing_object_info.as_ref()
+                        && let Some(reason) = check_object_lock_for_deletion(
+                            &bucket,
+                            existing_object_info,
+                            has_bypass_governance_header(&req.headers),
+                        )
+                        .await
+                    {
+                        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, reason.error_message()));
                     }
 
                     return Err(ApiError::from(err).into());

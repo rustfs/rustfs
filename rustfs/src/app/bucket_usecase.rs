@@ -3334,7 +3334,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_create_bucket(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_create_bucket(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

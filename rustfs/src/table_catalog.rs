@@ -20837,17 +20837,27 @@ mod tests {
     #[test]
     fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         let source = include_str!("app/object_usecase.rs");
+        let delete_object = source
+            .split_once("pub async fn execute_delete_object")
+            .and_then(|(_, remainder)| remainder.split_once("pub async fn execute_head_object"))
+            .map(|(delete_object, _)| delete_object)
+            .expect("delete object entrypoint should remain in the object usecase");
+
         for expected in [
             "validate_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
             "validate_object_key(&key, \"COPY (dest)\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
             "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await",
-            "validate_object_key(&key, \"DELETE\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
             "validate_table_catalog_object_mutation(&bucket, &object).await?;",
             "validate_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
             "validate_table_catalog_object_mutation(&bucket, &fpath).await?;",
         ] {
             assert!(source.contains(expected), "missing object mutation guard: {expected}");
         }
+        assert!(
+            delete_object.contains("validate_object_key(&key, \"DELETE\")?;")
+                && delete_object.contains("validate_table_catalog_object_mutation(&bucket, &key).await?;"),
+            "delete object entrypoint must validate the object key and reserved catalog prefix"
+        );
     }
 
     #[test]
