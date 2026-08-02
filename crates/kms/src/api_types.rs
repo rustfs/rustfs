@@ -1343,18 +1343,11 @@ pub struct CreateKeyResponse {
     pub key_metadata: KeyMetadata,
 }
 
-/// Request to delete a key
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteKeyRequest {
-    /// Key ID to delete
-    pub key_id: String,
-    /// Number of days to wait before deletion (7-30 days, optional)
-    pub pending_window_in_days: Option<u32>,
-    /// Force immediate deletion (for development/testing only)
-    pub force_immediate: Option<bool>,
-}
-
-/// Response from delete key operation
+/// JSON shape returned by the admin delete-key endpoint.
+///
+/// The delete *request* shape lives in [`crate::types::DeleteKeyRequest`] —
+/// there is deliberately no copy here, because the immediate-deletion gate
+/// (`force_immediate` + `confirm_key_id`) must have exactly one definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteKeyResponse {
     /// Success flag
