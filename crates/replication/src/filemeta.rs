@@ -660,6 +660,27 @@ impl ReplicateDecision {
         self.targets_map.values().any(|t| t.synchronous)
     }
 
+    /// Split admitted targets by their configured delivery mode.
+    ///
+    /// Non-replicating entries are intentionally omitted from both decisions.
+    /// Callers must not promote an async target merely because another target is
+    /// synchronous, and unsupported operation paths can keep both partitions
+    /// empty or explicitly async.
+    pub fn partition_by_sync(&self) -> (Self, Self) {
+        let mut synchronous = Self::new();
+        let mut asynchronous = Self::new();
+
+        for target in self.targets_map.values().filter(|target| target.replicate) {
+            if target.synchronous {
+                synchronous.set(target.clone());
+            } else {
+                asynchronous.set(target.clone());
+            }
+        }
+
+        (synchronous, asynchronous)
+    }
+
     /// Updates ReplicateDecision with target's replication decision
     pub fn set(&mut self, target: ReplicateTargetDecision) {
         self.targets_map.insert(target.arn.clone(), target);
@@ -1065,6 +1086,32 @@ mod tests {
         let entry = info.to_mrf_entry();
 
         assert_eq!(entry.target_arns, vec!["arn:target-a".to_string()]);
+    }
+
+    #[test]
+    fn partition_by_sync_keeps_mixed_targets_independent() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision::new("arn:sync".to_string(), true, true));
+        decision.set(ReplicateTargetDecision::new("arn:async".to_string(), true, false));
+        decision.set(ReplicateTargetDecision::new("arn:disabled".to_string(), false, true));
+
+        let (synchronous, asynchronous) = decision.partition_by_sync();
+
+        assert_eq!(synchronous.replicate_target_arns(), vec!["arn:sync".to_string()]);
+        assert_eq!(asynchronous.replicate_target_arns(), vec!["arn:async".to_string()]);
+        assert!(synchronous.is_synchronous());
+        assert!(!asynchronous.is_synchronous());
+    }
+
+    #[test]
+    fn partition_by_sync_does_not_promote_async_targets() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision::new("arn:async".to_string(), true, false));
+
+        let (synchronous, asynchronous) = decision.partition_by_sync();
+
+        assert!(!synchronous.replicate_any());
+        assert_eq!(asynchronous.replicate_target_arns(), vec!["arn:async".to_string()]);
     }
 
     #[test]
