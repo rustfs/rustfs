@@ -51,7 +51,7 @@ Suggested boilerplate when the topic cannot be avoided:
 
 ### Guard
 
-There is currently no FIPS-related wording anywhere in the repository's Markdown; that clean baseline is what a grep anchor test protects. Any future occurrence of the banned strings in shipped documentation should be treated as a defect and either removed or brought under the qualifier rule above.
+`README.md` and `CHANGELOG.md` currently contain no FIPS-related wording; `scripts/check_fips_wording.sh` is the grep guard for that public baseline. Any future occurrence of the banned strings in either file should be treated as a defect and either removed or brought under the qualifier rule above. This document intentionally contains the terminology needed to define the policy and is not part of that narrow outward-material scan.
 
 ## The `rustfs-crypto` `fips` feature: what it actually does
 
