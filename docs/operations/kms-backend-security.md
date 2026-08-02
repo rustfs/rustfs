@@ -36,6 +36,8 @@ Inventory the source before choosing: bucket default-encryption settings mean ob
 
 The same limitation applies in reverse — objects RustFS encrypts are not readable by MinIO. For the code-level breakdown of which seams block each SSE mode, see [MinIO file-format interoperability, Part C](../architecture/minio-file-format-compat.md#part-c--server-side-encryption-sse).
 
+The migration warning is not a wire-protocol promise: the **AWS KMS wire protocol** and **MinIO KES wire protocol** are explicit non-targets for this document. The AWS backend uses the AWS SDK client path (`crates/kms/src/backends/aws.rs:830`), and KES remains outside the MinIO on-disk interop scope. Track those ecosystem evaluations and the MinIO/RustFS SSE compatibility matrix in the [#1562 Production Ready exit gate](https://github.com/rustfs/backlog/issues/1562); #1638 alone does not satisfy that gate.
+
 ## Vault KV2: what the backend does and does not do
 
 The Vault KV2 backend uses Vault purely as a **secure storage** service:
@@ -202,6 +204,8 @@ AWS owns key state, backing-key rotation, and the deletion window, and this back
 | Creating a key under a caller-chosen name | The requested name becomes the key id | **Refused.** AWS assigns identifiers and this backend does not manage aliases, so a named create would produce a key unreachable by that name |
 
 Two consequences follow from that last row: **SSE-S3 key auto-creation and the synthetic KMS probe are unavailable on this backend**, because both address a key by a name they choose. Pre-create keys in AWS and reference them by AWS key id or ARN.
+
+The AWS backend is intentionally exempt from `backends::contract_tests::assert_state_machine_contract`. That shared driver assumes that disabled and pending-deletion keys still decrypt, that cancelling deletion returns a key to `Enabled`, and that creation accepts a caller-assigned key name. AWS rejects decryption for the first case, leaves a cancelled key `Disabled`, and assigns key identifiers itself, so running the driver would encode the wrong behavior. The exemption is pinned by the offline `aws_backend_shared_contract_exemption_is_pinned` test in `crates/kms/src/backends/aws.rs`; if AWS changes any of these semantics, integrate the backend into the shared driver and remove this exemption rather than weakening the shared assertions.
 
 Key versions are opaque. AWS addresses backing keys internally and picks the right one to decrypt with, so RustFS reports `key_version` as 1 and cannot enumerate versions. Rotation uses `RotateKeyOnDemand`, which retains prior backing keys for decryption; AWS's separate automatic yearly rotation is neither enabled nor reported on by RustFS.
 

@@ -372,6 +372,10 @@ pub(crate) mod quota {
 }
 
 pub(crate) mod replication {
+    pub(crate) use super::ecstore_bucket::replication::{
+        REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+        REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
     pub(crate) type ReplicationStatusType = super::ecstore_bucket::replication::ReplicationStatusType;

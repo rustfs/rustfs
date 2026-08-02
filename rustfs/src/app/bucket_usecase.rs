@@ -580,8 +580,6 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
         ));
     }
 
-    validate_replication_config_capabilities(config)?;
-
     let targets = metadata_sys::get_bucket_targets_config(bucket)
         .await
         .map_err(|err| match err {
@@ -2379,6 +2377,8 @@ impl DefaultBucketUsecase {
         } = req.input;
         info!(bucket = %bucket, "updating bucket replication config");
 
+        validate_replication_config_capabilities(&replication_configuration)?;
+
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -3106,7 +3106,10 @@ mod tests {
     #[test]
     fn validate_replication_config_capabilities_names_unsupported_field() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
-        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration::default());
+        let destination_key_id = "arn:aws:kms:us-east-1:123456789012:key/opaque-key-id";
+        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration {
+            replica_kms_key_id: Some(destination_key_id.to_string()),
+        });
         let config = ReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
@@ -3120,6 +3123,7 @@ mod tests {
             err.to_string()
                 .contains("Destination.EncryptionConfiguration is not supported")
         );
+        assert!(!err.to_string().contains(destination_key_id));
     }
 
     #[test]
@@ -4389,6 +4393,31 @@ mod tests {
 
         let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_replication_rejects_unsupported_fields_before_store_or_metadata_write() {
+        let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        rule.destination.account = Some("123456789012".to_string());
+        let input = PutBucketReplicationInput::builder()
+            .bucket("test-bucket".to_string())
+            .replication_configuration(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![rule],
+            })
+            .build()
+            .unwrap();
+
+        let err = DefaultBucketUsecase::without_context()
+            .execute_put_bucket_replication(build_request(input, Method::PUT))
+            .await
+            .expect_err("unsupported fields must be rejected before store access");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message(),
+            Some("replication field Destination.Account is not supported by this RustFS version")
+        );
     }
 
     #[tokio::test]

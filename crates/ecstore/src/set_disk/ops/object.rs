@@ -2768,6 +2768,11 @@ impl SetDisks {
         let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
+        if let Some(eval_metadata) = &opts.eval_metadata {
+            for (key, value) in eval_metadata {
+                fi.metadata.insert(key.clone(), value.clone());
+            }
+        }
 
         #[cfg(test)]
         pause_object_tagging_commit(bucket, object).await;

@@ -138,6 +138,8 @@ impl Default for OidcStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
 
     #[tokio::test]
     async fn test_state_store_insert_and_take() {
@@ -195,6 +197,41 @@ mod tests {
         for i in 0..5 {
             assert!(store.take(&format!("state_{i}")).await.is_none());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_state_is_consumed_once_under_concurrent_take() {
+        let store = OidcStateStore::new();
+        store
+            .insert(
+                "state_once".to_string(),
+                OidcAuthSession {
+                    provider_id: "corp".to_string(),
+                    pkce_verifier: "verifier".to_string(),
+                    nonce: "nonce".to_string(),
+                    redirect_after: None,
+                },
+            )
+            .await;
+
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let barrier = Arc::new(Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first = tokio::spawn(async move {
+            first_barrier.wait().await;
+            first_store.take("state_once").await
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second = tokio::spawn(async move {
+            second_barrier.wait().await;
+            second_store.take("state_once").await
+        });
+        barrier.wait().await;
+        let first = first.await.expect("first state consumer should finish");
+        let second = second.await.expect("second state consumer should finish");
+
+        assert_eq!(first.is_some() as usize + second.is_some() as usize, 1);
     }
 
     #[tokio::test]

@@ -168,6 +168,7 @@ impl ProtocolStorageClient {
             bucket: params.bucket,
             object: params.object,
             version_id: None,
+            replication_request_authorized: false,
             region: None,
             request_context: Some(RequestContext::fallback()),
         });

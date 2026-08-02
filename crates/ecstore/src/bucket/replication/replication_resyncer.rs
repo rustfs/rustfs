@@ -19,7 +19,7 @@ use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
     NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos,
-    ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
+    ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
@@ -96,7 +96,6 @@ const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_s
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
-const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
 const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
     "dispatch failure",
     "timeouterror",
@@ -210,7 +209,7 @@ fn is_replication_target_offline_error(err: &(impl Display + ?Sized)) -> bool {
         .any(|marker| message.contains(marker))
 }
 
-async fn mark_replication_target_offline_if_needed(target_client: &TargetClient, err: &(impl Display + ?Sized)) {
+async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetClient>, err: &(impl Display + ?Sized)) {
     if is_replication_target_offline_error(err) {
         ReplicationTargetStore::mark_target_offline(target_client).await;
     }
@@ -2001,61 +2000,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo
 }
 
-pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) {
+pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) -> ReplicationState {
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
-    let cfg = match get_replication_config(&bucket).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            debug!(
-                event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_missing",
-                "Skipping replication object because replication config is missing"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: roi.to_object_info(),
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return;
-        }
-        Err(err) => {
-            error!(
-                event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_lookup_failed",
-                error = %err,
-                "Failed to look up replication config for object replication"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: roi.to_object_info(),
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return;
-        }
-    };
-
-    let tgt_arns = cfg.filter_target_arns(&ObjectOpts {
-        name: object.clone(),
-        user_tags: roi.user_tags.clone(),
-        ssec: roi.ssec,
-        op_type: roi.op_type,
-        // ExistingObject ops must respect per-rule ExistingObjectReplicationStatus.
-        // Heal ops intentionally bypass it (repairing a past failure is not an initial sync).
-        existing_object: roi.op_type == ReplicationType::ExistingObject,
-        ..Default::default()
-    });
+    // The admission decision is the target-granular contract. Re-evaluating the
+    // live config here could fan a synchronous request out to targets that were
+    // not admitted, or promote an async target after a mixed-mode split.
+    let tgt_arns = roi.dsc.replicate_target_arns();
 
     // Acquire a per-object namespace lock so that at most one worker (across all cluster
     // nodes and MRF retry goroutines) replicates this object version at a time.
@@ -2080,7 +2032,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return roi.replication_state.unwrap_or_default();
         }
     };
     let _obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
@@ -2103,7 +2055,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return roi.replication_state.unwrap_or_default();
         }
     };
 
@@ -2179,8 +2131,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         }
     }
 
-    let replication_status = rinfos.replication_status();
-    let new_replication_internal = rinfos.replication_status_internal();
+    let previous_state = roi.replication_state.clone().unwrap_or_default();
+    let merged_state = get_replication_state(&rinfos, &previous_state, roi.version_id.map(|v| v.to_string()));
+    let replication_status = merged_state.composite_replication_status();
+    let new_replication_internal = merged_state.replication_status_internal.clone();
     let mut object_info = roi.to_object_info();
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
@@ -2249,6 +2203,8 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             }
         }
     }
+
+    merged_state
 }
 
 trait ReplicateObjectInfoExt {
@@ -2860,7 +2816,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             // The target already holds a matching object (reached here only via
             // the version-id fallback ETag match above) — there is nothing to
             // copy. Record it as synced and return, instead of falling into the
-            // metadata-unsupported failure branch below, which previously left
+            // metadata propagation path below, which previously left
             // AWS-style targets permanently FAILED and never converging
             // (backlog#860 / #799 B11).
             if self.op_type == ReplicationType::ExistingObject && !tgt_client.reset_id.is_empty() {
@@ -2877,10 +2833,71 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        // action == Metadata: metadata-only replication is not implemented.
-        if replication_action != ReplicationAction::All {
+        // The target client has no metadata-only operation. Reuse the existing
+        // object transport so metadata changes carry tags and object-lock state
+        // atomically with the source version.
+        let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
+            Ok((put_opts, is_mp)) => (put_opts, is_mp),
+            Err(e) => {
+                rinfo.error = Some(e.to_string());
+                warn!(
+                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    arn = %tgt_client.arn,
+                    operation = "build_put_options",
+                    error = %e,
+                    "Replication target operation failed"
+                );
+                send_local_event(EventArgs {
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                    bucket_name: bucket.clone(),
+                    object: object_info,
+                    user_agent: "Internal: [Replication]".to_string(),
+                    ..Default::default()
+                });
+
+                rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                return rinfo;
+            }
+        };
+
+        let has_tagging_replication = !put_opts.user_tags.is_empty();
+        if let Some(err) = if is_multipart {
+            drop(gr);
+            let result = replicate_object_with_multipart(MultipartReplicationContext {
+                storage: storage.clone(),
+                cli: tgt_client.clone(),
+                src_bucket: &bucket,
+                dst_bucket: &tgt_client.bucket,
+                object: &object,
+                object_info: &object_info,
+                obj_opts: &obj_opts,
+                arn: &rinfo.arn,
+                put_opts,
+            })
+            .await;
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
+        } else {
+            gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
+            let byte_stream = async_read_to_bytestream(gr.stream);
+            let result = tgt_client
+                .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()));
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
+        } {
             rinfo.replication_status = ReplicationStatusType::Failed;
-            rinfo.error = Some(ERR_REPLICATION_METADATA_COPY_UNSUPPORTED.to_string());
+            rinfo.error = Some(err.to_string());
             warn!(
                 event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2888,98 +2905,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 bucket = %bucket,
                 arn = %tgt_client.arn,
                 object = %object,
-                operation = "copy_object_metadata",
-                error = ERR_REPLICATION_METADATA_COPY_UNSUPPORTED,
+                operation = "put_object",
+                error = ?err,
                 "Replication target operation failed"
             );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: object_info,
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+
+            mark_replication_target_offline_if_needed(&tgt_client, &err).await;
             return rinfo;
-        } else {
-            let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
-                Ok((put_opts, is_mp)) => (put_opts, is_mp),
-                Err(e) => {
-                    rinfo.error = Some(e.to_string());
-                    warn!(
-                        event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                        bucket = %bucket,
-                        arn = %tgt_client.arn,
-                        operation = "build_put_options",
-                        error = %e,
-                        "Replication target operation failed"
-                    );
-                    send_local_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                        bucket_name: bucket.clone(),
-                        object: object_info,
-                        user_agent: "Internal: [Replication]".to_string(),
-                        ..Default::default()
-                    });
-
-                    rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
-                    return rinfo;
-                }
-            };
-
-            let has_tagging_replication = !put_opts.user_tags.is_empty();
-            if let Some(err) = if is_multipart {
-                drop(gr);
-                let result = replicate_object_with_multipart(MultipartReplicationContext {
-                    storage: storage.clone(),
-                    cli: tgt_client.clone(),
-                    src_bucket: &bucket,
-                    dst_bucket: &tgt_client.bucket,
-                    object: &object,
-                    object_info: &object_info,
-                    obj_opts: &obj_opts,
-                    arn: &rinfo.arn,
-                    put_opts,
-                })
-                .await;
-                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
-                if has_tagging_replication {
-                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
-                }
-                result.err()
-            } else {
-                gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
-                let byte_stream = async_read_to_bytestream(gr.stream);
-                let result = tgt_client
-                    .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()));
-                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
-                if has_tagging_replication {
-                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
-                }
-                result.err()
-            } {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some(err.to_string());
-                warn!(
-                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    bucket = %bucket,
-                    arn = %tgt_client.arn,
-                    object = %object,
-                    operation = "put_object",
-                    error = ?err,
-                    "Replication target operation failed"
-                );
-                rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
-
-                mark_replication_target_offline_if_needed(&tgt_client, &err).await;
-                return rinfo;
-            }
         }
 
         rinfo
@@ -3165,7 +3098,7 @@ mod tests {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    fn test_target_client(endpoint: String) -> TargetClient {
+    fn test_target_client(endpoint: String) -> Arc<TargetClient> {
         let config = aws_sdk_s3::Config::builder()
             .endpoint_url(endpoint.clone())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -3175,7 +3108,7 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .build();
 
-        TargetClient {
+        Arc::new(TargetClient {
             endpoint,
             credentials: None,
             bucket: "target-bucket".to_string(),
@@ -3187,7 +3120,11 @@ mod tests {
             health_check_duration: std::time::Duration::from_secs(5),
             replicate_sync: false,
             client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
-        }
+        })
+    }
+
+    async fn register_test_target(target: &Arc<TargetClient>) {
+        ReplicationTargetStore::register_test_target(target).await;
     }
 
     #[test]
@@ -3203,6 +3140,7 @@ mod tests {
     async fn replication_target_network_failure_marks_target_offline() {
         let endpoint = format!("http://network-failure-{}.example:9000", Uuid::new_v4());
         let target_client = test_target_client(endpoint);
+        register_test_target(&target_client).await;
 
         assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
 
@@ -3216,6 +3154,7 @@ mod tests {
     async fn replication_target_service_failure_keeps_target_online() {
         let endpoint = format!("http://service-failure-{}.example:9000", Uuid::new_v4());
         let target_client = test_target_client(endpoint);
+        register_test_target(&target_client).await;
 
         assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
 

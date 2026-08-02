@@ -15,7 +15,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::replication_error_boundary::Result;
-use super::replication_filemeta_boundary::{ReplicateDecision, ReplicationStatusType, ReplicationType};
+use super::replication_filemeta_boundary::{ReplicateDecision, ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use super::replication_metadata_boundary::ReplicationInstanceContext;
 use super::replication_object_config::{
     DeleteReplicationConfigSnapshot, check_replicate_delete, check_replicate_delete_strict, check_replicate_delete_with_snapshot,
@@ -112,6 +112,31 @@ impl ReplicationObjectBridge {
         schedule_replication_delete(delete_object).await;
     }
 
+    pub async fn schedule_deletes(delete_objects: &[DeletedObjectReplicationInfo]) {
+        if let Some(pool) = super::runtime_boundary::replication_pool() {
+            let _ = pool.queue_replica_delete_batch(delete_objects).await;
+        }
+
+        if let Some(stats) = super::runtime_boundary::replication_stats() {
+            for delete_object in delete_objects {
+                if let Some(rs) = &delete_object.delete_object.replication_state {
+                    for k in rs.targets.keys() {
+                        let ri = ReplicatedTargetInfo {
+                            arn: k.clone(),
+                            size: 0,
+                            duration: std::time::Duration::default(),
+                            op_type: ReplicationType::Delete,
+                            ..Default::default()
+                        };
+                        stats
+                            .update(&delete_object.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn schedule_storage_delete(delete_object: DeletedObject, bucket: String, event_type: String) {
         Self::schedule_delete(DeletedObjectReplicationInfo {
             delete_object: deleted_object_for_replication(delete_object),
@@ -120,6 +145,19 @@ impl ReplicationObjectBridge {
             ..Default::default()
         })
         .await;
+    }
+
+    pub async fn schedule_storage_deletes(delete_objects: Vec<DeletedObject>, bucket: String, event_type: String) {
+        let delete_objects = delete_objects
+            .into_iter()
+            .map(|delete_object| DeletedObjectReplicationInfo {
+                delete_object: deleted_object_for_replication(delete_object),
+                bucket: bucket.clone(),
+                event_type: event_type.clone(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        Self::schedule_deletes(&delete_objects).await;
     }
 }
 

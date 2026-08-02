@@ -57,10 +57,22 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn mrf_file_round_trips_object_and_delete_entries() {
+    fn mrf_file_round_trips_object_metadata_and_delete_entries() {
         let obj_vid = Uuid::new_v4();
         let del_vid = Uuid::new_v4();
         let entries = vec![
+            MrfReplicateEntry {
+                bucket: "bucket-a".to_string(),
+                object: "metadata-a".to_string(),
+                version_id: Some(obj_vid),
+                retry_count: 1,
+                size: 1024,
+                op: MrfOpKind::Metadata,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: vec!["arn:target-a".to_string()],
+            },
             MrfReplicateEntry {
                 bucket: "bucket-a".to_string(),
                 object: "object-a".to_string(),
@@ -90,17 +102,20 @@ mod tests {
         let encoded = encode_mrf_file(&entries).expect("mrf file should encode");
         let decoded = decode_mrf_file(&encoded).expect("mrf file should decode");
 
-        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0].version_id, Some(obj_vid));
-        assert_eq!(decoded[0].op, MrfOpKind::Object);
-        assert_eq!(decoded[0].target_arns, vec!["arn:target-a".to_string(), "arn:target-b".to_string()]);
+        assert_eq!(decoded[0].op, MrfOpKind::Metadata);
+        assert_eq!(decoded[0].target_arns, vec!["arn:target-a".to_string()]);
         assert_eq!(decoded[0].delete_marker_mtime, None);
-        assert_eq!(decoded[1].delete_marker_version_id, Some(del_vid));
-        assert_eq!(decoded[1].op, MrfOpKind::Delete);
-        assert_eq!(decoded[1].target_arns, vec!["arn:target-a".to_string()]);
-        assert!(decoded[1].delete_marker);
+        assert_eq!(decoded[1].op, MrfOpKind::Object);
+        assert_eq!(decoded[1].target_arns, vec!["arn:target-a".to_string(), "arn:target-b".to_string()]);
+        assert_eq!(decoded[1].delete_marker_mtime, None);
+        assert_eq!(decoded[2].delete_marker_version_id, Some(del_vid));
+        assert_eq!(decoded[2].op, MrfOpKind::Delete);
+        assert_eq!(decoded[2].target_arns, vec!["arn:target-a".to_string()]);
+        assert!(decoded[2].delete_marker);
         assert_eq!(
-            decoded[1].delete_marker_mtime,
+            decoded[2].delete_marker_mtime,
             Some(1_705_312_200_123_456_789),
             "delete-marker mtime must survive the MRF disk round-trip"
         );

@@ -218,7 +218,7 @@ pub(crate) mod runtime_sources {
 pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
-        req_info_mut, req_info_ref,
+        replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 
@@ -685,15 +685,50 @@ pub(crate) mod bucket {
             status: ReplicationStatusType,
             opts: crate::storage::storage_api::StorageObjectOptions,
         ) -> ReplicateDecision {
-            #[cfg(test)]
-            MUST_REPLICATE_OBJECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mopts = ReplicationObjectBridge::must_replicate_options(
+            must_replicate_with_type(
+                bucket,
+                object,
                 user_defined,
                 user_tags,
                 status,
-                replication_contracts::ReplicationType::Object,
                 opts,
-            );
+                replication_contracts::ReplicationType::Object,
+            )
+            .await
+        }
+
+        pub(crate) async fn must_replicate_metadata(
+            bucket: &str,
+            object: &str,
+            user_defined: &HashMap<String, String>,
+            user_tags: String,
+            status: ReplicationStatusType,
+            opts: crate::storage::storage_api::StorageObjectOptions,
+        ) -> ReplicateDecision {
+            must_replicate_with_type(
+                bucket,
+                object,
+                user_defined,
+                user_tags,
+                status,
+                opts,
+                replication_contracts::ReplicationType::Metadata,
+            )
+            .await
+        }
+
+        async fn must_replicate_with_type(
+            bucket: &str,
+            object: &str,
+            user_defined: &HashMap<String, String>,
+            user_tags: String,
+            status: ReplicationStatusType,
+            opts: crate::storage::storage_api::StorageObjectOptions,
+            op_type: replication_contracts::ReplicationType,
+        ) -> ReplicateDecision {
+            #[cfg(test)]
+            MUST_REPLICATE_OBJECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mopts = ReplicationObjectBridge::must_replicate_options(user_defined, user_tags, status, op_type, opts);
             ReplicationObjectBridge::must_replicate(bucket, object, mopts).await
         }
 
@@ -703,6 +738,14 @@ pub(crate) mod bucket {
             dsc: ReplicateDecision,
         ) {
             ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Object).await;
+        }
+
+        pub(crate) async fn schedule_metadata_replication(
+            oi: crate::storage::storage_api::StorageObjectInfo,
+            store: Arc<crate::storage::storage_api::ECStore>,
+            dsc: ReplicateDecision,
+        ) {
+            ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Metadata).await;
         }
 
         pub(crate) async fn schedule_replication_delete(
@@ -716,6 +759,19 @@ pub(crate) mod bucket {
                 .expect("scheduled replication delete lock should not be poisoned")
                 .push(delete_object.clone());
             ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type).await;
+        }
+
+        pub(crate) async fn schedule_replication_deletes(
+            delete_objects: Vec<crate::storage::storage_api::StorageDeletedObject>,
+            bucket: String,
+            event_type: String,
+        ) {
+            #[cfg(test)]
+            SCHEDULED_REPLICATION_DELETES
+                .lock()
+                .expect("scheduled replication delete lock should not be poisoned")
+                .extend(delete_objects.iter().cloned());
+            ReplicationObjectBridge::schedule_storage_deletes(delete_objects, bucket, event_type).await;
         }
 
         pub(crate) fn set_deleted_object_replication_state(
@@ -885,10 +941,11 @@ pub(crate) mod options {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::options_consumer::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use crate::storage::storage_api::options_consumer::{
-        copy_dst_opts, copy_src_opts, del_opts_with_versioning, extract_metadata, extract_metadata_from_mime,
-        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
-        parse_copy_source_range, put_opts, validate_archive_content_encoding,
+        copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
+        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
+        get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
+        namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
+        put_opts_with_replication_authorization, validate_archive_content_encoding,
     };
 }
 

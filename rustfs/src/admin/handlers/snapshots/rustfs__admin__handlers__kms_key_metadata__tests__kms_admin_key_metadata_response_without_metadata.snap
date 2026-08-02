@@ -1,0 +1,10 @@
+---
+source: rustfs/src/admin/handlers/kms_key_metadata.rs
+expression: "stable_json_value(KmsKeyMetadataResponse\n{\n    success: false, message: \"Failed to tag key: key not found\".to_string(),\n    key_id: \"key-a\".to_string(), key_metadata: None,\n})"
+---
+{
+  "key_id": "key-a",
+  "key_metadata": null,
+  "message": "Failed to tag key: key not found",
+  "success": false
+}

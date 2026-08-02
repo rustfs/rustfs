@@ -822,7 +822,7 @@ impl KmsBackend for AwsKmsBackend {
 mod tests {
     use super::*;
     use aws_sdk_kms::config::{BehaviorVersion, Credentials, Region};
-    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_http_client::test_util::{NeverClient, ReplayEvent, StaticReplayClient};
     use aws_smithy_types::body::SdkBody;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -1008,6 +1008,34 @@ mod tests {
         assert_eq!(http_client.actual_requests().count(), 3, "both throttled attempts should be replayed");
     }
 
+    /// A connector that never responds must be cut off by the backend's
+    /// per-attempt timeout rather than hanging the KMS operation indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_aws_request_is_cut_off_by_the_attempt_timeout() {
+        let never_client = NeverClient::new();
+        let sdk_config = aws_sdk_kms::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("AKIDTEST", "secret", None, None, "scripted"))
+            .http_client(never_client.clone())
+            .retry_config(aws_sdk_kms::config::retry::RetryConfig::disabled())
+            .build();
+        let mut kms_config = KmsConfig::aws(Some("us-east-1".to_string()));
+        kms_config.timeout = std::time::Duration::from_millis(5_000);
+        kms_config.retry_attempts = 1;
+        let backend = AwsKmsBackend::with_client(aws_sdk_kms::Client::from_conf(sdk_config), &kms_config);
+
+        let error = backend
+            .describe_key(DescribeKeyRequest {
+                key_id: "stalled-key".to_string(),
+            })
+            .await
+            .expect_err("a stalled AWS request must be cut off by the attempt timeout");
+
+        assert!(matches!(error, KmsError::OperationTimedOut { .. }), "unexpected error: {error:?}");
+        assert_eq!(never_client.num_calls(), 1, "one configured attempt must reach the connector");
+    }
+
     /// Access denial is deterministic: replaying it cannot help and would only
     /// multiply the audit trail of denied calls.
     #[tokio::test(start_paused = true)]
@@ -1118,6 +1146,58 @@ mod tests {
             .expect_err("a named create must be rejected");
         assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "unexpected error: {error:?}");
         assert_eq!(http_client.actual_requests().count(), 0, "no key may be created in AWS");
+    }
+
+    /// AWS intentionally does not use the shared lifecycle contract driver.
+    /// The driver requires disabled/pending keys to decrypt, expects cancelling
+    /// deletion to re-enable a key, and creates keys by caller-assigned name;
+    /// AWS rejects the decryption assumption, leaves a cancelled key
+    /// disabled, and cannot honour the third.
+    #[tokio::test]
+    async fn aws_backend_shared_contract_exemption_is_pinned() {
+        let (_http, backend) = scripted_backend(vec![error_event(400, "DisabledException", "key is disabled")]);
+        let error = backend
+            .decrypt(DecryptRequest {
+                ciphertext: b"blob".to_vec(),
+                encryption_context: HashMap::new(),
+                grant_tokens: Vec::new(),
+            })
+            .await
+            .expect_err("AWS must reject decrypt with a disabled key");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "unexpected error: {error:?}");
+
+        let (_http, backend) = scripted_backend(vec![error_event(400, "KMSInvalidStateException", "key is pending deletion")]);
+        let error = backend
+            .decrypt(DecryptRequest {
+                ciphertext: b"blob".to_vec(),
+                encryption_context: HashMap::new(),
+                grant_tokens: Vec::new(),
+            })
+            .await
+            .expect_err("AWS must reject decrypt with a pending-deletion key");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "unexpected error: {error:?}");
+
+        let (_http, backend) = scripted_backend(vec![
+            ok_event(serde_json::json!({})),
+            ok_event(key_metadata_json("test-key", "Disabled")),
+        ]);
+        let response = backend
+            .cancel_key_deletion(CancelKeyDeletionRequest {
+                key_id: "test-key".to_string(),
+            })
+            .await
+            .expect("AWS cancellation should complete");
+        assert_eq!(response.key_metadata.key_state, KeyState::Disabled);
+
+        let (_http, backend) = scripted_backend(Vec::new());
+        let error = backend
+            .create_key(CreateKeyRequest {
+                key_name: Some("contract-key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("AWS cannot create a key under a caller-assigned name");
+        assert!(matches!(error, KmsError::UnsupportedCapability { .. }), "unexpected error: {error:?}");
     }
 
     /// AWS rejects `Limit: 0` outright, so the request cannot be forwarded as

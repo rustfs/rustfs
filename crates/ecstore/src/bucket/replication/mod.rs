@@ -45,12 +45,12 @@ mod runtime_boundary;
 
 pub use datatypes::ResyncStatusType;
 pub use replication_config_boundary::{
-    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, invalid_replication_config_status_field,
+    ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    ReplicationConfigurationExt, ReplicationTargetValidationError, invalid_replication_config_status_field,
     replication_target_arns, should_remove_replication_target, unsupported_replication_config_field,
     validate_replication_config_target_arns,
 };
-#[cfg(test)]
-pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
 pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
 pub use replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState,
@@ -74,8 +74,8 @@ pub use replication_pool::{
     init_background_replication, read_durable_mrf_backlog, resync_start_conflict_id,
 };
 pub use replication_queue_boundary::{
-    DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,
-    ReplicationQueueAdmission,
+    DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,
+    ReplicationPriority, ReplicationQueueAdmission,
 };
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;

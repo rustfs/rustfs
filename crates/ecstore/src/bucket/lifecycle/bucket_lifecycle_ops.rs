@@ -33,8 +33,7 @@ use crate::bucket::lifecycle::manual_transition_job::{
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
-    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta,
-    replication_statuses_map, version_purge_statuses_map,
+    DeleteReplicationConfigSnapshot, ReplicationObjectBridge, ReplicationStatusType, replication_state_to_filemeta,
 };
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{
@@ -43,6 +42,7 @@ use crate::bucket::lifecycle::tier_free_version_recovery::{
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
 use crate::bucket::lifecycle::transition_transaction::run_transition_transaction_recovery_loop;
+use crate::bucket::versioning::VersioningApi as _;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -4079,12 +4079,12 @@ pub async fn expire_transitioned_object(
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
 ) -> Result<ObjectInfo, std::io::Error> {
-    let opts = transitioned_object_delete_opts(
-        oi,
-        lc_event.action,
-        BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-        BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
-    );
+    let snapshot = lifecycle_delete_config_snapshot(&api, oi)
+        .await
+        .map_err(std::io::Error::other)?;
+    let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
+    let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended);
+    opts.delete_replication_config_snapshot = Some(Arc::new(snapshot));
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action.delete_restored() {
         return match api.delete_object(&oi.bucket, &oi.name, opts).await {
@@ -4692,17 +4692,34 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
 ) -> bool {
+    let snapshot = match lifecycle_delete_config_snapshot(&api, oi).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            error!(
+                event = EVENT_LIFECYCLE_DELETE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "load_delete_config_snapshot",
+                error = ?err,
+                "Lifecycle delete admission failed"
+            );
+            return false;
+        }
+    };
+    let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
     let mut opts = ObjectOptions {
+        versioned,
+        version_suspended,
         expiration: ExpirationOptions { expire: true },
+        delete_replication_config_snapshot: Some(Arc::new(snapshot)),
         ..Default::default()
     };
 
     if lc_event.action.delete_versioned() {
         opts.version_id = oi.version_id.map(|v| v.to_string());
     }
-
-    opts.versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
-    opts.version_suspended = BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await;
 
     if lc_event.action.delete_all() {
         opts.delete_prefix = true;
@@ -4765,12 +4782,17 @@ pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &
 }
 
 fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject {
+    let replication_state = dobj.replication_state();
+    let replication_state = (!replication_state.targets.is_empty() || !replication_state.purge_targets.is_empty())
+        .then(|| replication_state_to_filemeta(&replication_state));
+
     if dobj.delete_marker {
         return DeletedObject {
             object_name: oi.name.clone(),
             delete_marker: true,
             delete_marker_version_id: dobj.version_id,
             delete_marker_mtime: dobj.mod_time.or(oi.mod_time),
+            replication_state,
             ..Default::default()
         };
     }
@@ -4781,6 +4803,7 @@ fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject
             delete_marker: false,
             delete_marker_version_id: oi.version_id,
             delete_marker_mtime: oi.mod_time,
+            replication_state,
             ..Default::default()
         };
     }
@@ -4790,106 +4813,21 @@ fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject
         delete_marker: false,
         version_id: oi.version_id,
         delete_marker_mtime: oi.mod_time,
+        replication_state,
         ..Default::default()
     }
 }
 
 async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo) {
-    let mut delete_object = lifecycle_deleted_object(oi, dobj);
-    let version_id = if delete_object.delete_marker {
-        None
-    } else if delete_object.delete_marker_version_id.is_some() {
-        delete_object.delete_marker_version_id
-    } else {
-        delete_object.version_id
-    };
-
-    let replication_state = lifecycle_delete_replication_state(oi, version_id).await;
-    if replication_state.is_none() {
+    let delete_object = lifecycle_deleted_object(oi, dobj);
+    if delete_object.replication_state.is_none() {
         return;
     }
-
-    delete_object.replication_state = replication_state.as_ref().map(replication_state_to_filemeta);
-
     replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
 }
 
-fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_delete: bool) -> bool {
-    let state = oi.replication_state();
-    if version_delete {
-        oi.version_purge_status == VersionPurgeStatusType::Pending && !state.purge_targets.is_empty()
-    } else {
-        oi.replication_status == ReplicationStatusType::Pending && !state.targets.is_empty()
-    }
-}
-
-fn lifecycle_version_purge_state_from_completed_targets(oi: &ObjectInfo) -> Option<ReplicationState> {
-    if oi.replication_status != ReplicationStatusType::Completed {
-        return None;
-    }
-
-    let targets = oi.replication_state().targets;
-    if targets.is_empty() {
-        return None;
-    }
-
-    let pending_status = targets.keys().map(|arn| format!("{arn}=PENDING;")).collect::<String>();
-
-    Some(ReplicationState {
-        replicate_decision_str: oi.replication_decision.clone(),
-        version_purge_status_internal: Some(pending_status.clone()),
-        purge_targets: version_purge_statuses_map(&pending_status),
-        ..Default::default()
-    })
-}
-
-async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<Uuid>) -> Option<ReplicationState> {
-    if should_reuse_lifecycle_delete_replication_state(oi, version_id.is_some()) {
-        return Some(oi.replication_state());
-    }
-
-    if version_id.is_some()
-        && let Some(state) = lifecycle_version_purge_state_from_completed_targets(oi)
-    {
-        return Some(state);
-    }
-
-    let dsc = replication_sink::check_delete_replication(
-        &oi.bucket,
-        ObjectToDelete {
-            object_name: oi.name.clone(),
-            version_id,
-            ..Default::default()
-        },
-        oi,
-        &ObjectOptions {
-            version_id: version_id.map(|v| v.to_string()),
-            versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-            ..Default::default()
-        },
-    )
-    .await;
-    if !dsc.replicate_any() {
-        return None;
-    }
-
-    Some(replication_state_for_delete(dsc, version_id.is_some()))
-}
-
-fn replication_state_for_delete(dsc: ReplicateDecision, version_delete: bool) -> ReplicationState {
-    let pending_status = dsc.pending_status();
-    let mut state = ReplicationState {
-        replicate_decision_str: dsc.to_string(),
-        ..Default::default()
-    };
-    if version_delete {
-        state.version_purge_status_internal = pending_status.clone();
-        state.purge_targets = version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
-    } else {
-        state.replication_status_internal = pending_status.clone();
-        state.targets = replication_statuses_map(pending_status.as_deref().unwrap_or_default());
-    }
-    state
+async fn lifecycle_delete_config_snapshot(api: &ECStore, oi: &ObjectInfo) -> Result<DeleteReplicationConfigSnapshot, Error> {
+    ReplicationObjectBridge::delete_request_config(api, &oi.bucket).await
 }
 
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
@@ -4925,16 +4863,14 @@ mod tests {
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
         jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink,
-        manual_transition_version_marker, manual_transition_worker_failure_reason,
+        lifecycle_rule_has_date_expiration, manual_transition_duration_elapsed, manual_transition_has_more_after_limit,
+        manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
         persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
-        recover_manual_transition_jobs, replication_state_for_delete, resolve_tier_free_version_recovery_enabled,
-        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
-        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
-        set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
-        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
+        recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity,
+        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
+        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
+        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
         transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
@@ -4958,9 +4894,7 @@ mod tests {
         save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
         save_manual_transition_task_if_absent, save_manual_transition_worker_result_if_absent,
     };
-    use crate::bucket::lifecycle::replication_sink::{
-        ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
-    };
+    use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_free_version_recovery::{
         FreeVersionRecoveryStats, RecoveryWalkTestAction, list_tier_free_versions, recover_tier_free_versions_with_cancel,
@@ -7687,6 +7621,46 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_deleted_object_hands_off_only_persisted_delete_admission_state() {
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            ..Default::default()
+        };
+        let marker_result = ObjectInfo {
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            replication_status_internal: Some("arn:target=PENDING;".to_string()),
+            replication_decision: "arn:target=true".to_string(),
+            ..Default::default()
+        };
+        let marker_delete = lifecycle_deleted_object(&source, &marker_result);
+        let marker_state = marker_delete
+            .replication_state
+            .expect("persisted marker admission must be handed off");
+        assert_eq!(marker_state.replication_status_internal.as_deref(), Some("arn:target=PENDING;"));
+        assert!(marker_state.version_purge_status_internal.is_none());
+
+        let version_result = ObjectInfo {
+            version_purge_status_internal: Some("arn:target=PENDING;".to_string()),
+            replication_decision: "arn:target=true".to_string(),
+            ..Default::default()
+        };
+        let version_delete = lifecycle_deleted_object(
+            &ObjectInfo {
+                version_id: Some(Uuid::new_v4()),
+                ..source
+            },
+            &version_result,
+        );
+        let version_state = version_delete
+            .replication_state
+            .expect("persisted version purge admission must be handed off");
+        assert!(version_state.replication_status_internal.is_none());
+        assert_eq!(version_state.version_purge_status_internal.as_deref(), Some("arn:target=PENDING;"));
+    }
+
+    #[test]
     fn lifecycle_deleted_object_uses_version_id_for_noncurrent_version_purge() {
         let version_id = Uuid::new_v4();
         let source = ObjectInfo {
@@ -7719,77 +7693,6 @@ mod tests {
         assert!(!deleted.delete_marker);
         assert_eq!(deleted.delete_marker_version_id, Some(version_id));
         assert_eq!(deleted.version_id, None);
-    }
-
-    #[test]
-    fn replication_state_for_delete_uses_replication_targets_for_current_delete() {
-        let arn = "arn:aws:s3:::target-bucket";
-        let mut dsc = ReplicateDecision::default();
-        dsc.set(ReplicateTargetDecision::new(arn.to_string(), true, false));
-
-        let state = replication_state_for_delete(dsc, false);
-
-        assert_eq!(state.replication_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
-        assert!(state.version_purge_status_internal.is_none());
-        assert!(state.targets.contains_key(arn));
-    }
-
-    #[test]
-    fn replication_state_for_delete_uses_purge_targets_for_version_delete() {
-        let arn = "arn:aws:s3:::target-bucket";
-        let mut dsc = ReplicateDecision::default();
-        dsc.set(ReplicateTargetDecision::new(arn.to_string(), true, false));
-
-        let state = replication_state_for_delete(dsc, true);
-
-        assert_eq!(state.version_purge_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
-        assert!(state.replication_status_internal.is_none());
-        assert!(state.purge_targets.contains_key(arn));
-    }
-
-    #[test]
-    fn lifecycle_delete_replication_state_reuses_only_pending_version_purge_state() {
-        let oi = ObjectInfo {
-            version_purge_status: VersionPurgeStatusType::Pending,
-            version_purge_status_internal: Some("arn:aws:s3:::target=PENDING;".to_string()),
-            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
-            ..Default::default()
-        };
-
-        assert!(should_reuse_lifecycle_delete_replication_state(&oi, true));
-        assert!(!should_reuse_lifecycle_delete_replication_state(&oi, false));
-    }
-
-    #[test]
-    fn lifecycle_delete_replication_state_does_not_reuse_put_replication_for_version_delete() {
-        let oi = ObjectInfo {
-            replication_status: ReplicationStatusType::Completed,
-            replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
-            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
-            ..Default::default()
-        };
-
-        assert!(
-            !should_reuse_lifecycle_delete_replication_state(&oi, true),
-            "version purges must not reuse plain object replication state from prior PUT/delete-marker replication"
-        );
-    }
-
-    #[test]
-    fn lifecycle_version_purge_state_from_completed_targets_derives_pending_purge_targets() {
-        let oi = ObjectInfo {
-            replication_status: ReplicationStatusType::Completed,
-            replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
-            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
-            ..Default::default()
-        };
-
-        let state = lifecycle_version_purge_state_from_completed_targets(&oi)
-            .expect("completed replication targets should be convertible into version-purge targets");
-
-        assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:aws:s3:::target=PENDING;"));
-        assert!(state.purge_targets.contains_key("arn:aws:s3:::target"));
-        assert_eq!(state.replicate_decision_str, oi.replication_decision);
     }
 
     fn expired_delete_marker_lifecycle() -> BucketLifecycleConfiguration {
