@@ -217,7 +217,8 @@ pub(crate) mod runtime_sources {
 
 pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,
+        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, recursive_force_delete_is_authorized,
+        req_info_mut, req_info_ref,
     };
 }
 

@@ -15,7 +15,8 @@
 use super::ECStore;
 use super::ecfs::FS;
 use super::{
-    PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
+    PolicySys, ReplicationStatusType, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config,
+    is_err_bucket_not_found,
 };
 use crate::auth::{
     check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
@@ -36,7 +37,7 @@ use rustfs_policy::policy::{
     bucket_policy_uses_existing_object_tag_conditions,
 };
 use rustfs_trusted_proxies::ClientInfo;
-use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_FORCE_DELETE, get_header};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
@@ -53,6 +54,12 @@ pub(crate) struct ReqInfo {
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
     pub request_context: Option<RequestContext>,
+}
+
+pub(crate) fn recursive_force_delete_is_authorized(headers: &HeaderMap, is_owner: bool, replica_request: bool) -> bool {
+    !get_header(headers, SUFFIX_FORCE_DELETE).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        || is_owner
+        || replica_request
 }
 
 #[derive(Clone, Debug)]
@@ -1310,8 +1317,21 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
+        let is_owner = req_info.is_owner;
 
         authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
+
+        let replica_request = req
+            .headers
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
+        if !recursive_force_delete_is_authorized(&req.headers, is_owner, replica_request) {
+            return Err(s3_error!(
+                AccessDenied,
+                "Recursive force-delete is restricted to internal or administrative requests"
+            ));
+        }
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
         if has_bypass_governance_header(&req.headers) {
