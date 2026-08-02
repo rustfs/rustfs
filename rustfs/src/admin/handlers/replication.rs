@@ -22,6 +22,9 @@ use crate::admin::runtime_sources::{
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
+use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
+#[cfg(test)]
+use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
 use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
 use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat};
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
@@ -207,12 +210,12 @@ impl RemoteTargetRequest {
             ));
         }
 
-        for (unsupported, configured) in [
-            ("disableProxy", self.disable_proxy),
-            ("healthCheckDuration", self.health_check_duration != 0),
-            ("edge", self.edge),
-            ("edgeSyncBeforeExpiry", self.edge_sync_before_expiry),
-        ] {
+        for (unsupported, configured) in REMOTE_TARGET_UNSUPPORTED_FIELDS.iter().copied().zip([
+            self.disable_proxy,
+            self.health_check_duration != 0,
+            self.edge,
+            self.edge_sync_before_expiry,
+        ]) {
             if configured {
                 return Err(s3_error!(
                     InvalidRequest,
@@ -1049,8 +1052,8 @@ impl Operation for ReplicationMrfHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteTargetRequest, SUPPORTED_REMOTE_TARGET_API, build_mrf_response, extract_query_params, unique_replication_peers,
-        validate_remote_target_tls_settings,
+        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetRequest, SUPPORTED_REMOTE_TARGET_API,
+        build_mrf_response, extract_query_params, unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::BucketTarget;
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -1409,6 +1412,16 @@ mod tests {
         assert!(message.contains("credentials.session_token"));
         assert!(!message.contains("session-token-must-not-leak"));
         assert!(!message.contains("secret"));
+    }
+
+    #[test]
+    fn remote_target_capability_fields_do_not_overlap() {
+        for field in REMOTE_TARGET_UNSUPPORTED_FIELDS {
+            assert!(
+                !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
+                "remote target field {field} cannot be both writable and unsupported"
+            );
+        }
     }
 
     #[test]
