@@ -373,10 +373,22 @@ fn non_empty_disk_id(uuid: &str) -> Option<String> {
     if uuid.is_empty() { None } else { Some(uuid.to_string()) }
 }
 
+fn drive_inode_stats(used_inodes: u64, free_inodes: u64) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let total_inodes = used_inodes.saturating_add(free_inodes);
+    if total_inodes == 0 {
+        (None, None, None)
+    } else {
+        (Some(used_inodes), Some(free_inodes), Some(total_inodes))
+    }
+}
+
 fn drive_api_latency_micros(actions: impl Iterator<Item = (u64, u64)>) -> Option<u64> {
     let mut count = 0u64;
     let mut acc_time_ns = 0u64;
     for (action_count, action_acc_time_ns) in actions {
+        if action_count == 0 {
+            continue;
+        }
         count = count.saturating_add(action_count);
         acc_time_ns = acc_time_ns.saturating_add(action_acc_time_ns);
     }
@@ -719,6 +731,7 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
             } else {
                 offline_count += 1;
             }
+            let (used_inodes, free_inodes, total_inodes) = drive_inode_stats(disk.used_inodes, disk.free_inodes);
 
             DriveDetailedStats {
                 server: disk.endpoint.clone(),
@@ -736,9 +749,9 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                 free_bytes: disk.available_space,
                 capacity_observation_state,
                 capacity_observation_age_seconds,
-                used_inodes: Some(disk.used_inodes),
-                free_inodes: Some(disk.free_inodes),
-                total_inodes: Some(disk.used_inodes.saturating_add(disk.free_inodes)),
+                used_inodes,
+                free_inodes,
+                total_inodes,
                 timeout_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_timeout),
                 io_errors_total: None,
                 availability_errors_total: disk.metrics.as_ref().map(|metrics| metrics.total_errors_availability),
@@ -1560,8 +1573,18 @@ mod tests {
     }
 
     #[test]
+    fn drive_inode_stats_skip_unknown_zero_inode_totals() {
+        assert_eq!(drive_inode_stats(0, 0), (None, None, None));
+        assert_eq!(drive_inode_stats(2, 3), (Some(2), Some(3), Some(5)));
+    }
+
+    #[test]
     fn drive_api_metrics_are_sorted_and_average_latency() {
-        let last_minute = HashMap::from([("write".to_string(), (2, 6_000)), ("read".to_string(), (1, 3_000))]);
+        let last_minute = HashMap::from([
+            ("write".to_string(), (2, 6_000)),
+            ("read".to_string(), (1, 3_000)),
+            ("zero".to_string(), (0, 9_000)),
+        ]);
         let api_calls = HashMap::from([("write".to_string(), 9), ("read".to_string(), 4)]);
 
         assert_eq!(drive_api_latency_micros(last_minute.values().copied()), Some(3));
