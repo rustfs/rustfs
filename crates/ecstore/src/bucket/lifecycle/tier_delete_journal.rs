@@ -20,8 +20,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::runtime_boundary;
 use crate::bucket::lifecycle::tier_sweeper::{
-    Jentry, delete_confirmed_transition_candidate_exact_with_manager_and_identity,
+    Jentry, TierDeleteJournalState, TierDeleteSourceIdentity,
+    delete_confirmed_transition_candidate_exact_with_manager_and_identity,
     delete_object_from_remote_tier_idempotent_with_manager_and_identity,
 };
 use crate::disk::RUSTFS_META_BUCKET;
@@ -30,7 +32,7 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader
 use crate::services::tier::tier::tier_destination_id_from_metadata;
 use crate::storage_api_contracts::{
     list::ListOperations as _,
-    object::{DeletedObject, ObjectIO, ObjectOperations, ObjectToDelete},
+    object::{DeletedObject, HTTPPreconditions, ObjectIO, ObjectOperations, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
@@ -46,6 +48,7 @@ const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
 const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
 const TIER_DELETE_JOURNAL_STATE_VERSION: u8 = 4;
+const TIER_DELETE_JOURNAL_TRANSACTION_VERSION: u8 = 5;
 pub(crate) const TIER_DELETE_JOURNAL_PREFIX: &str = "ilm/tier-delete-journal/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,13 +64,22 @@ struct PersistedTierDeleteJournalEntry {
     version_id_exact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     version_state: Option<rustfs_filemeta::TransitionVersionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<TierDeleteJournalState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<TierDeleteSourceIdentity>,
 }
 
 impl PersistedTierDeleteJournalEntry {
     fn from_jentry(je: &Jentry) -> Result<Self> {
         validate_version_state(je.version_state, &je.version_id, je.version_id_exact)?;
         let legacy_unknown = je.version_state == rustfs_filemeta::TransitionVersionState::Unknown;
-        let version = if legacy_unknown {
+        let version = if je.source.is_some() || je.state == TierDeleteJournalState::Prepared {
+            if je.backend_identity.is_none() {
+                return Err(Error::other("tier delete transaction is missing its backend identity"));
+            }
+            TIER_DELETE_JOURNAL_TRANSACTION_VERSION
+        } else if legacy_unknown {
             if je.backend_identity.is_some() {
                 TIER_DELETE_JOURNAL_VERSION
             } else {
@@ -87,6 +99,10 @@ impl PersistedTierDeleteJournalEntry {
             backend_identity: je.backend_identity,
             version_id_exact: je.version_id_exact.then_some(true),
             version_state: (!legacy_unknown).then_some(je.version_state),
+            state: (version == TIER_DELETE_JOURNAL_TRANSACTION_VERSION).then_some(je.state),
+            source: (version == TIER_DELETE_JOURNAL_TRANSACTION_VERSION)
+                .then(|| je.source.clone())
+                .flatten(),
         })
     }
 
@@ -101,14 +117,21 @@ impl PersistedTierDeleteJournalEntry {
         }
         if self.version != TIER_DELETE_JOURNAL_EXACT_VERSION
             && self.version != TIER_DELETE_JOURNAL_STATE_VERSION
+            && self.version != TIER_DELETE_JOURNAL_TRANSACTION_VERSION
             && self.version_id_exact.unwrap_or(false)
         {
             return Err(Error::other(
                 "legacy tier delete journal entry has an unsupported exact version constraint",
             ));
         }
-        let (backend_identity, version_id_exact, version_state) = match self.version {
-            1 => (None, false, rustfs_filemeta::TransitionVersionState::Unknown),
+        let (backend_identity, version_id_exact, version_state, state, source) = match self.version {
+            1 => (
+                None,
+                false,
+                rustfs_filemeta::TransitionVersionState::Unknown,
+                TierDeleteJournalState::Committed,
+                None,
+            ),
             TIER_DELETE_JOURNAL_VERSION => (
                 Some(
                     self.backend_identity
@@ -116,6 +139,8 @@ impl PersistedTierDeleteJournalEntry {
                 ),
                 false,
                 rustfs_filemeta::TransitionVersionState::Unknown,
+                TierDeleteJournalState::Committed,
+                None,
             ),
             TIER_DELETE_JOURNAL_EXACT_VERSION => {
                 if self.version_id.is_empty() || self.version_id_exact != Some(true) {
@@ -128,6 +153,8 @@ impl PersistedTierDeleteJournalEntry {
                     ),
                     true,
                     rustfs_filemeta::TransitionVersionState::Exact,
+                    TierDeleteJournalState::Committed,
+                    None,
                 )
             }
             TIER_DELETE_JOURNAL_STATE_VERSION => {
@@ -143,6 +170,31 @@ impl PersistedTierDeleteJournalEntry {
                     ),
                     exact,
                     state,
+                    TierDeleteJournalState::Committed,
+                    None,
+                )
+            }
+            TIER_DELETE_JOURNAL_TRANSACTION_VERSION => {
+                let state = self
+                    .state
+                    .ok_or_else(|| Error::other("tier delete journal v5 entry is missing its state"))?;
+                let source = self
+                    .source
+                    .ok_or_else(|| Error::other("tier delete journal v5 entry is missing its source identity"))?;
+                let exact = self.version_id_exact.unwrap_or(false);
+                let version_state = self
+                    .version_state
+                    .ok_or_else(|| Error::other("tier delete journal v5 entry is missing its version state"))?;
+                validate_version_state(version_state, &self.version_id, exact)?;
+                (
+                    Some(
+                        self.backend_identity
+                            .ok_or_else(|| Error::other("tier delete journal v5 entry is missing its backend identity"))?,
+                    ),
+                    exact,
+                    version_state,
+                    state,
+                    Some(source),
                 )
             }
             version => return Err(Error::other(format!("unsupported tier delete journal version {version}"))),
@@ -154,6 +206,8 @@ impl PersistedTierDeleteJournalEntry {
             backend_identity,
             version_id_exact,
             version_state,
+            state,
+            source,
         })
     }
 }
@@ -201,6 +255,20 @@ pub(crate) fn tier_delete_journal_object_name(je: &Jentry) -> String {
         hasher.update([0]);
         hasher.update(b"exact-version-id");
     }
+    if let Some(source) = &je.source {
+        hasher.update([0]);
+        hasher.update(source.bucket.as_bytes());
+        hasher.update([0]);
+        hasher.update(source.object.as_bytes());
+        hasher.update([0]);
+        hasher.update(source.version_id.as_deref().unwrap_or_default().as_bytes());
+        hasher.update([0]);
+        hasher.update(source.data_dir.as_deref().unwrap_or_default().as_bytes());
+        hasher.update([0]);
+        hasher.update(source.etag.as_deref().unwrap_or_default().as_bytes());
+        hasher.update([0]);
+        hasher.update(source.mod_time.as_deref().unwrap_or_default().as_bytes());
+    }
     format!(
         "{TIER_DELETE_JOURNAL_PREFIX}{}.json",
         rustfs_utils::crypto::hex(hasher.finalize().as_slice())
@@ -246,6 +314,42 @@ where
         .map_err(std::io::Error::other)
 }
 
+pub async fn commit_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = http::HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    let mut committed = je.clone();
+    committed.state = TierDeleteJournalState::Committed;
+    persist_tier_delete_journal_entry(api, &committed).await
+}
+
+pub async fn abort_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
+where
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
+    remove_tier_delete_journal_entry(api, je).await
+}
+
+pub(crate) async fn enqueue_committed_tier_delete_journal_entry(je: &Jentry) -> std::io::Result<()> {
+    let expiry_state = runtime_boundary::expiry_state_handle();
+    expiry_state.write().await.enqueue_tier_journal_entry(je)
+}
+
 pub async fn remove_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
 where
     S: ObjectOperations<
@@ -264,6 +368,13 @@ where
 }
 
 pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
+    if je.state == TierDeleteJournalState::Prepared {
+        return reconcile_prepared_tier_delete_journal_entry(api, je).await;
+    }
+    process_committed_tier_delete_journal_entry(api, je).await
+}
+
+async fn process_committed_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
     if je.version_state == rustfs_filemeta::TransitionVersionState::Unknown {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -294,6 +405,87 @@ pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -
         .await?;
     }
     remove_tier_delete_journal_entry(api, je).await
+}
+
+async fn reconcile_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
+    let (data, metadata) =
+        config_boundary::read_config_with_metadata(api.clone(), &tier_delete_journal_object_name(je), &ObjectOptions::default())
+            .await
+            .map_err(std::io::Error::other)?;
+    let current = decode_tier_delete_journal_entry(&data).map_err(std::io::Error::other)?;
+    if current.state != TierDeleteJournalState::Prepared {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "prepared tier delete journal changed before reconciliation",
+        ));
+    }
+    let Some(etag) = metadata.etag else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "prepared tier delete journal has no entity tag",
+        ));
+    };
+    let source = je
+        .source
+        .as_ref()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "prepared tier delete journal has no source"))?;
+    match api
+        .get_object_info(&source.bucket, &source.object, &source.lookup_options())
+        .await
+    {
+        Ok(info) if source.matches(&info) => {
+            match config_boundary::delete_config_if_match(api, &tier_delete_journal_object_name(&current), &etag).await {
+                Ok(()) => Ok(()),
+                Err(Error::PreconditionFailed) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "prepared tier delete journal changed before abort",
+                )),
+                Err(err) => Err(std::io::Error::other(err)),
+            }
+        }
+        Ok(_info) if source.has_stable_identity() => {
+            commit_prepared_tier_delete_journal_entry_if_current(api, current, etag).await
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "prepared tier delete journal source identity is not sufficient to confirm deletion",
+        )),
+        Err(Error::ObjectNotFound(_, _)) | Err(Error::FileNotFound) | Err(Error::FileVersionNotFound) => {
+            commit_prepared_tier_delete_journal_entry_if_current(api, current, etag).await
+        }
+        Err(err) => Err(std::io::Error::other(err)),
+    }
+}
+
+async fn commit_prepared_tier_delete_journal_entry_if_current(
+    api: Arc<ECStore>,
+    mut committed: Jentry,
+    etag: String,
+) -> std::io::Result<()> {
+    committed.state = TierDeleteJournalState::Committed;
+    let data = encode_tier_delete_journal_entry(&committed).map_err(std::io::Error::other)?;
+    match config_boundary::save_config_with_opts(
+        api.clone(),
+        &tier_delete_journal_object_name(&committed),
+        data,
+        &ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(etag),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(()) => process_committed_tier_delete_journal_entry(api, &committed).await,
+        Err(Error::PreconditionFailed) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "prepared tier delete journal changed before commit",
+        )),
+        Err(err) => Err(std::io::Error::other(err)),
+    }
 }
 
 pub async fn recover_tier_delete_journal_entries(
@@ -482,10 +674,13 @@ mod tests {
         decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
         tier_delete_journal_object_name,
     };
-    use crate::bucket::lifecycle::tier_sweeper::Jentry;
+    use crate::bucket::lifecycle::tier_sweeper::{Jentry, TierDeleteJournalState, TierDeleteSourceIdentity};
     use crate::error::Result;
+    use crate::object_api::ObjectInfo;
     use std::time::Duration;
+    use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     fn journal_entry() -> Jentry {
         Jentry {
@@ -495,6 +690,8 @@ mod tests {
             backend_identity: Some([7; 32]),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
         }
     }
 
@@ -511,6 +708,55 @@ mod tests {
         assert_eq!(decoded.backend_identity, je.backend_identity);
         assert_eq!(decoded.version_id_exact, je.version_id_exact);
         assert_eq!(decoded.version_state, je.version_state);
+    }
+
+    #[test]
+    fn tier_delete_transaction_roundtrips_prepared_source_identity() {
+        let mut je = journal_entry();
+        je.state = TierDeleteJournalState::Prepared;
+        je.source = Some(TierDeleteSourceIdentity {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: Some("version".to_string()),
+            versioned: true,
+            version_suspended: false,
+            data_dir: Some("data-dir".to_string()),
+            etag: Some("etag".to_string()),
+            mod_time: Some("mod-time".to_string()),
+        });
+
+        let encoded = encode_tier_delete_journal_entry(&je).expect("prepared transaction should encode");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("transaction should be JSON");
+        assert_eq!(value["version"], serde_json::json!(5));
+        assert_eq!(value["state"], serde_json::json!("Prepared"));
+        assert!(value["source"].is_object());
+
+        let decoded = decode_tier_delete_journal_entry(&encoded).expect("prepared transaction should decode");
+        assert_eq!(decoded.state, TierDeleteJournalState::Prepared);
+        assert_eq!(decoded.source, je.source);
+    }
+
+    #[test]
+    fn tier_delete_source_identity_rejects_recreated_object() {
+        let version_id = Uuid::from_u128(1);
+        let data_dir = Uuid::from_u128(2);
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        let info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        let source = TierDeleteSourceIdentity::from_object_info("bucket", "object", &info, true, false);
+        assert!(source.matches(&info));
+
+        let recreated = ObjectInfo {
+            data_dir: Some(Uuid::from_u128(3)),
+            ..info
+        };
+        assert!(!source.matches(&recreated));
     }
 
     #[test]

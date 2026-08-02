@@ -13,6 +13,13 @@
 // limitations under the License.
 
 use super::*;
+use crate::bucket::lifecycle::{
+    tier_delete_journal::{
+        abort_tier_delete_journal_entry, commit_tier_delete_journal_entry, enqueue_committed_tier_delete_journal_entry,
+        persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
+    },
+    tier_sweeper::{Jentry, transitioned_delete_journal_entry_for_source},
+};
 use crate::bucket::replication::ReplicationObjectBridge;
 use crate::disk::OldCurrentSize;
 use crate::object_api::DeleteLockFence;
@@ -32,6 +39,77 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, ReadBuf};
+
+fn build_tier_delete_journal_entry(
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    source: &ObjectInfo,
+) -> Result<Option<Jentry>> {
+    let version_id = opts.version_id.as_deref().map(Uuid::parse_str).transpose()?;
+    let source_object = decode_dir_object(object);
+    let Some(mut je) = transitioned_delete_journal_entry_for_source(
+        version_id,
+        opts.versioned,
+        opts.version_suspended,
+        bucket,
+        source_object.as_str(),
+        source,
+    ) else {
+        return Ok(None);
+    };
+    record_tier_delete_journal_backend_identity(&mut je, &source.user_defined).map_err(Error::other)?;
+    Ok(Some(je))
+}
+
+async fn prepare_tier_delete_journal_entry(
+    api: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    source: &ObjectInfo,
+) -> Result<Option<Jentry>> {
+    let Some(je) = build_tier_delete_journal_entry(bucket, object, opts, source)? else {
+        return Ok(None);
+    };
+    persist_tier_delete_journal_entry(Arc::clone(api), &je)
+        .await
+        .map_err(Error::other)?;
+    Ok(Some(je))
+}
+
+async fn abort_prepared_tier_delete_journal_entry(api: &Arc<ECStore>, je: &Jentry) {
+    if let Err(err) = abort_tier_delete_journal_entry(Arc::clone(api), je).await {
+        warn!(
+            object = %je.obj_name,
+            tier = %je.tier_name,
+            error = ?err,
+            "failed to remove aborted tier delete journal"
+        );
+    }
+}
+
+async fn commit_prepared_tier_delete_journal_entry(api: &Arc<ECStore>, je: &Jentry) {
+    if let Err(err) = commit_tier_delete_journal_entry(Arc::clone(api), je).await {
+        warn!(
+            object = %je.obj_name,
+            tier = %je.tier_name,
+            error = ?err,
+            "tier delete committed locally but journal commit failed; recovery will retry"
+        );
+        return;
+    }
+    let mut committed = je.clone();
+    committed.state = crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed;
+    if let Err(err) = enqueue_committed_tier_delete_journal_entry(&committed).await {
+        warn!(
+            object = %je.obj_name,
+            tier = %je.tier_name,
+            error = ?err,
+            "tier delete journal committed but could not be queued; recovery will retry"
+        );
+    }
+}
 
 /// A GET whose object identity has been resolved while its namespace read lock
 /// remains held, but whose body reader has not been constructed yet.
@@ -1092,8 +1170,49 @@ impl ECStore {
         purged
     }
 
+    pub async fn delete_object_with_tier_delete_journal(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let result = self
+            .handle_delete_object_with_journal(bucket, object, opts, Some(Arc::clone(self)))
+            .await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, bucket).await;
+        }
+        result
+    }
+
+    pub async fn delete_objects_with_tier_delete_journal(
+        self: &Arc<Self>,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        let result = self
+            .handle_delete_objects_with_journal(bucket, objects, opts, Some(Arc::clone(self)))
+            .await;
+        let success_count = result.1.iter().filter(|err| err.is_none()).count();
+        if success_count > 0 {
+            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
+        }
+        result
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        self.handle_delete_object_with_journal(bucket, object, opts, None).await
+    }
+
+    pub(super) async fn handle_delete_object_with_journal(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
@@ -1103,6 +1222,7 @@ impl ECStore {
         };
         let object = object.as_str();
         let mut opts = opts;
+        opts.tier_delete_journal_api = tier_journal_api.clone();
 
         if opts.delete_prefix && !opts.delete_prefix_object {
             // Prefix deletes cover multiple object keys; an exact lock on the prefix string
@@ -1215,8 +1335,25 @@ impl ECStore {
             ));
         }
 
+        let journal_entry = if let Some(api) = tier_journal_api.as_ref() {
+            prepare_tier_delete_journal_entry(api, bucket, object, &opts, &pinfo.object_info).await?
+        } else {
+            None
+        };
+
         if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
-            let mut obj = self.delete_object_from_all_pools(bucket, object, &opts, errs).await?;
+            let mut obj = match self.delete_object_from_all_pools(bucket, object, &opts, errs).await {
+                Ok(obj) => obj,
+                Err(err) => {
+                    if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
+                        abort_prepared_tier_delete_journal_entry(api, je).await;
+                    }
+                    return Err(err);
+                }
+            };
+            if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
+                commit_prepared_tier_delete_journal_entry(api, je).await;
+            }
             obj.name = decode_dir_object(object);
             return Ok(obj);
         }
@@ -1224,6 +1361,9 @@ impl ECStore {
         for pool in self.pools.iter() {
             match pool.delete_object(bucket, object, opts.clone()).await {
                 Ok(res) => {
+                    if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
+                        commit_prepared_tier_delete_journal_entry(api, je).await;
+                    }
                     let mut obj = res;
                     obj.name = decode_dir_object(object);
                     return Ok(obj);
@@ -1234,6 +1374,10 @@ impl ECStore {
                     }
                 }
             }
+        }
+
+        if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
+            abort_prepared_tier_delete_journal_entry(api, je).await;
         }
 
         if let Some(ver) = opts.version_id {
@@ -1249,6 +1393,16 @@ impl ECStore {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        self.handle_delete_objects_with_journal(bucket, objects, opts, None).await
+    }
+
+    pub(super) async fn handle_delete_objects_with_journal(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
@@ -1269,6 +1423,7 @@ impl ECStore {
         }
 
         let mut opts = opts;
+        opts.tier_delete_journal_api = tier_journal_api;
         if opts.delete_replication_config_snapshot.is_none() {
             match ReplicationObjectBridge::delete_request_config_in(&self.ctx, bucket).await {
                 Ok(snapshot) => opts.delete_replication_config_snapshot = Some(Arc::new(snapshot)),
@@ -1625,6 +1780,7 @@ impl ECStore {
 mod tests {
     use super::*;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
+    use crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState;
     use crate::bucket::replication::{
         ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta, replication_statuses_map,
         version_purge_statuses_map,
@@ -1640,6 +1796,7 @@ mod tests {
     };
     use crate::set_disk::SetDisks;
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use bytes::Bytes;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -1659,6 +1816,55 @@ mod tests {
     }
 
     struct BodyCacheHookGuard;
+
+    #[test]
+    fn tier_delete_entry_is_prepared_and_bound_to_source_generation() {
+        let identity = [9_u8; 32];
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+        let version_id = Uuid::from_u128(1);
+        let data_dir = Uuid::from_u128(2);
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            user_defined: Arc::new(metadata),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            ..Default::default()
+        };
+        let entry = build_tier_delete_journal_entry(
+            "bucket",
+            "object",
+            &ObjectOptions {
+                version_id: Some(version_id.to_string()),
+                versioned: true,
+                ..Default::default()
+            },
+            &source,
+        )
+        .expect("transition source should produce a journal entry")
+        .expect("completed transition should be journaled");
+
+        assert_eq!(entry.state, TierDeleteJournalState::Prepared);
+        assert_eq!(entry.backend_identity, Some(identity));
+        let data_dir_string = data_dir.to_string();
+        assert_eq!(
+            entry.source.as_ref().and_then(|source| source.data_dir.as_deref()),
+            Some(data_dir_string.as_str())
+        );
+    }
 
     impl Drop for BodyCacheHookGuard {
         fn drop(&mut self) {
