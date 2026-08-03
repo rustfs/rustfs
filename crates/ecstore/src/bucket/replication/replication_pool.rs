@@ -42,7 +42,8 @@ use super::replication_resyncer::{
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
-    ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+    HTTPPreconditions, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO,
+    ReplicationStorage,
 };
 use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
@@ -81,6 +82,7 @@ const DELETE_BATCH_ADMISSION_CONCURRENCY: usize = 16;
 const METRIC_DELETE_BATCH_ITEMS_TOTAL: &str = "rustfs_replication_delete_batch_items_total";
 const METRIC_DELETE_BATCH_SIZE: &str = "rustfs_replication_delete_batch_size";
 const MRF_CORRUPT_FILE_PREFIX: &str = "config/replication/mrf.corrupt";
+const JOURNAL_CAS_RETRIES: usize = 3;
 
 #[derive(Debug, Default)]
 pub struct DurableMrfBacklog {
@@ -403,75 +405,156 @@ pub async fn persist_force_delete_intent<S: ReplicationStorage>(
     mut entry: MrfReplicateEntry,
 ) -> Result<(), EcstoreError> {
     entry.force_delete_local_commit = false;
-    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await?;
-    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
-
-    let mut entries = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
-        Ok(data) => decode_mrf_file(&data)?,
-        Err(EcstoreError::ConfigNotFound) => Vec::new(),
-        Err(err) => return Err(err),
-    };
-
-    if entries
-        .iter()
-        .any(|existing| existing.force_delete_id == entry.force_delete_id)
-    {
-        return Ok(());
-    }
-
-    entries.push(entry);
-    let data = encode_mrf_file(&entries)?;
-    ReplicationConfigStore::save_no_lock(storage, file, data).await
+    update_force_delete_journal(storage, |entries| {
+        if entries
+            .iter()
+            .any(|existing| existing.force_delete_id == entry.force_delete_id)
+        {
+            return Ok(false);
+        }
+        entries.push(entry.clone());
+        Ok(true)
+    })
+    .await
 }
 
 pub async fn commit_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
-    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await?;
-    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
-
-    let data = ReplicationConfigStore::read_no_lock(storage.clone(), file).await?;
-    let mut entries = decode_mrf_file(&data)?;
-    let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
-        return Err(EcstoreError::ConfigNotFound);
-    };
-    if entry.force_delete_local_commit {
-        return Ok(());
-    }
-    entry.force_delete_local_commit = true;
-    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+    update_force_delete_journal(storage, |entries| {
+        let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
+            return Err(EcstoreError::ConfigNotFound);
+        };
+        if entry.force_delete_local_commit {
+            return Ok(false);
+        }
+        entry.force_delete_local_commit = true;
+        Ok(true)
+    })
+    .await
 }
 
 pub async fn complete_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
+    update_force_delete_journal(storage, |entries| {
+        let original_len = entries.len();
+        entries.retain(|entry| entry.force_delete_id != Some(operation_id));
+        Ok(entries.len() != original_len)
+    })
+    .await
+}
+
+async fn update_force_delete_journal<S, F>(storage: Arc<S>, mut update: F) -> Result<(), EcstoreError>
+where
+    S: ReplicationStorage,
+    F: FnMut(&mut Vec<MrfReplicateEntry>) -> Result<bool, EcstoreError>,
+{
     let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await?;
-    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+    for _attempt in 0..=JOURNAL_CAS_RETRIES {
+        let lock = storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+            .await?;
+        let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
 
-    let data = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
-        Ok(data) => data,
-        Err(EcstoreError::ConfigNotFound) => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    let mut entries = decode_mrf_file(&data)?;
-    let original_len = entries.len();
-    entries.retain(|entry| entry.force_delete_id != Some(operation_id));
-    if entries.len() == original_len {
-        return Ok(());
+        let (mut entries, etag) = match ReplicationConfigStore::read_with_metadata_no_lock(storage.clone(), file).await {
+            Ok((data, object_info)) => (decode_mrf_file(&data)?, object_info.etag),
+            Err(EcstoreError::ConfigNotFound) => (Vec::new(), None),
+            Err(err) => return Err(err),
+        };
+        if !update(&mut entries)? {
+            return Ok(());
+        }
+        if guard.is_lock_lost() {
+            return Err(EcstoreError::other("force-delete journal namespace lock was lost before commit"));
+        }
+
+        let preconditions = match etag.filter(|value| !value.trim().is_empty()) {
+            Some(etag) => HTTPPreconditions {
+                if_match: Some(etag),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+        };
+        match ReplicationConfigStore::save_no_lock_if_match(storage.clone(), file, encode_mrf_file(&entries)?, preconditions)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(EcstoreError::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
     }
+    Err(EcstoreError::PreconditionFailed)
+}
 
-    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+async fn write_mrf_journal_snapshot<S: ReplicationStorage>(
+    storage: Arc<S>,
+    desired: &[MrfReplicateEntry],
+) -> Result<(), EcstoreError> {
+    let file = ReplicationMetadataStore::MRF_REPLICATION_FILE;
+    let mut merged = desired.to_vec();
+    let mut saw_conflict = false;
+    for _attempt in 0..=JOURNAL_CAS_RETRIES {
+        let lock = storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+            .await?;
+        let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+        let current = ReplicationConfigStore::read_with_metadata_no_lock(storage.clone(), file).await;
+        let etag = match current {
+            Ok((data, object_info)) => {
+                if saw_conflict {
+                    let current = decode_mrf_file(&data)?;
+                    for entry in current {
+                        if !merged.iter().any(|existing| mrf_entries_same(existing, &entry)) {
+                            merged.push(entry);
+                        }
+                    }
+                }
+                object_info.etag
+            }
+            Err(EcstoreError::ConfigNotFound) => None,
+            Err(err) => return Err(err),
+        };
+        if guard.is_lock_lost() {
+            return Err(EcstoreError::other("MRF journal namespace lock was lost before commit"));
+        }
+        let preconditions = match etag.filter(|value| !value.trim().is_empty()) {
+            Some(etag) => HTTPPreconditions {
+                if_match: Some(etag),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+        };
+        let data = if merged.is_empty() {
+            Vec::new()
+        } else {
+            encode_mrf_file(&merged)?
+        };
+        match ReplicationConfigStore::save_no_lock_if_match(storage.clone(), file, data, preconditions).await {
+            Ok(()) => return Ok(()),
+            Err(EcstoreError::PreconditionFailed) => saw_conflict = true,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(EcstoreError::PreconditionFailed)
+}
+
+fn mrf_entries_same(left: &MrfReplicateEntry, right: &MrfReplicateEntry) -> bool {
+    left.bucket == right.bucket
+        && left.object == right.object
+        && left.version_id == right.version_id
+        && left.op == right.op
+        && left.target_arns == right.target_arns
+        && left.force_delete_id == right.force_delete_id
+        && left.delete_marker_version_id == right.delete_marker_version_id
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1995,9 +2078,7 @@ async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8
             // Clear the active path only after the quarantine copy succeeds. An empty
             // config is treated as absent, preventing the same corrupt bytes from being
             // quarantined again on every restart while preserving the forensic copy.
-            if let Err(error) =
-                ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, Vec::new()).await
-            {
+            if let Err(error) = write_mrf_journal_snapshot(storage.clone(), &[]).await {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -2031,41 +2112,26 @@ fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
 /// Returns the flush duration on success; on failure logs the error and returns `None`.
 /// Callers must NOT clear their in-memory buffer on `None` so the next tick
 /// can retry — otherwise a transient storage error permanently drops the batch.
-async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> Option<u64> {
+async fn flush_mrf_to_disk<S: ReplicationStorage>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> Option<u64> {
     let started = Instant::now();
-    match encode_mrf_file(entries) {
-        Ok(data) => {
-            if let Err(e) =
-                ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, data).await
-            {
-                let duration_millis = duration_millis_u64(started.elapsed());
-                observe_mrf_flush_failure(duration_millis);
-                warn!(
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    count = entries.len(),
-                    error = %e,
-                    "Failed to flush MRF entries to disk"
-                );
-                return None;
-            }
-            Some(duration_millis_u64(started.elapsed()))
-        }
+    match write_mrf_journal_snapshot(storage.clone(), entries).await {
+        Ok(()) => Some(duration_millis_u64(started.elapsed())),
         Err(e) => {
-            observe_mrf_flush_failure(0);
+            let duration_millis = duration_millis_u64(started.elapsed());
+            observe_mrf_flush_failure(duration_millis);
             warn!(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION,
                 count = entries.len(),
                 error = %e,
-                "Failed to encode MRF entries for disk flush"
+                "Failed to flush MRF entries to disk"
             );
             None
         }
     }
 }
 
-async fn append_mrf_entries_to_disk<S: ReplicationObjectIO>(
+async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
     entries_to_append: &[MrfReplicateEntry],
     storage: &Arc<S>,
 ) -> Option<u64> {
