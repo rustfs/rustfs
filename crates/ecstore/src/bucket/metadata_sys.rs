@@ -386,11 +386,28 @@ pub async fn update_if_incarnation(
     data: Vec<u8>,
     expected_incarnation_id: Uuid,
 ) -> Result<OffsetDateTime> {
-    update_with_sys_expected(get_bucket_metadata_sys()?, bucket, config_file, data, Some(expected_incarnation_id)).await
+    // Boxed for the same reason as [`update`]: this is the path an authorized
+    // bucket-config mutation actually takes once it carries an incarnation, so
+    // leaving it inlined puts the whole resolve/load/save chain back on the
+    // caller's stack (rustfs#5648).
+    Box::pin(update_with_sys_expected(
+        get_bucket_metadata_sys()?,
+        bucket,
+        config_file,
+        data,
+        Some(expected_incarnation_id),
+    ))
+    .await
 }
 
 pub async fn delete_if_incarnation(bucket: &str, config_file: &str, expected_incarnation_id: Uuid) -> Result<OffsetDateTime> {
-    delete_with_sys_expected(get_bucket_metadata_sys()?, bucket, config_file, Some(expected_incarnation_id)).await
+    Box::pin(delete_with_sys_expected(
+        get_bucket_metadata_sys()?,
+        bucket,
+        config_file,
+        Some(expected_incarnation_id),
+    ))
+    .await
 }
 
 pub async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<Uuid> {
