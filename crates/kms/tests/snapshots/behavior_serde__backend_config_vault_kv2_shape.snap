@@ -1,0 +1,14 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: shape_of(&vault_backend)
+---
+VaultKV2:
+  address: "<string>"
+  auth_method:
+    Token:
+      token: "<string>"
+  key_path_prefix: "<string>"
+  kv_mount: "<string>"
+  mount_path: "<string>"
+  namespace: "<null>"
+  tls: "<null>"

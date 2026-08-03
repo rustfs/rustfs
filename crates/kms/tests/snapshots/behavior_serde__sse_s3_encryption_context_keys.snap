@@ -1,0 +1,8 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: context_keys
+---
+- algorithm
+- bucket
+- object
+- object_key

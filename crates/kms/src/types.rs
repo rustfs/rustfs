@@ -636,6 +636,20 @@ pub struct EncryptionMetadata {
     pub original_size: u64,
     /// Encrypted data key
     pub encrypted_data_key: Vec<u8>,
+    /// The exact AAD bytes this object was sealed under.
+    ///
+    /// The AAD is the serialized encryption context, and the serialization is
+    /// what must be reproduced byte-for-byte — not the map. Objects written
+    /// before the context was canonicalized carry whichever `HashMap` order
+    /// happened to be in effect when they were sealed, and
+    /// `x-rustfs-encryption-context` preserves that exact byte sequence. It is
+    /// therefore recoverable, but only while it is never round-tripped through
+    /// a `HashMap` and re-serialized.
+    ///
+    /// `None` means "derive it from `encryption_context`", which is correct
+    /// only when no stored serialization exists to defer to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_aad: Option<Vec<u8>>,
 }
 
 /// Health status information
