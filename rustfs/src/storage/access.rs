@@ -867,6 +867,15 @@ fn put_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::PutBucketPolicyAction)
 }
 
+/// Both website-config handlers authorize through this one function so the
+/// write side and the delete side cannot drift apart. RustFS has no dedicated
+/// `s3:PutBucketWebsite` / `s3:DeleteBucketWebsite` action, so the bucket-config
+/// mutation convention applies (same as `put_bucket_request_payment` and
+/// `put_bucket_accelerate_configuration`).
+fn bucket_website_config_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutBucketPolicyAction)
+}
+
 fn post_object_authorize_action() -> Action {
     Action::S3Action(S3Action::PutObjectAction)
 }
@@ -1336,7 +1345,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        authorize_request(req, bucket_website_config_authorize_action()).await
     }
 
     /// Checks whether the DeleteObject request has accesses to the resources.
@@ -2035,7 +2044,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_request(req, bucket_website_config_authorize_action()).await
     }
 
     /// Checks whether the PutObject request has accesses to the resources.
@@ -2235,12 +2244,13 @@ mod tests {
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketPolicyArgs, BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, FS,
         ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access, StorageError,
-        bucket_policy_needs_existing_object_tag_from_hint, classify_bucket_policy_raw_load_error,
-        complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
-        legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
-        merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
-        post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested,
-        secondary_tag_hint_action, table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
+        bucket_policy_needs_existing_object_tag_from_hint, bucket_website_config_authorize_action,
+        classify_bucket_policy_raw_load_error, complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action,
+        has_write_offset_bytes_header, legal_hold_write_requested, list_parts_authorize_action,
+        load_bucket_policy_existing_object_tag_hint, merge_list_bucket_query_conditions, merge_request_object_tag_conditions,
+        owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
+        retention_write_requested, secondary_tag_hint_action, table_data_plane_admin_action,
+        validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
@@ -2299,6 +2309,17 @@ mod tests {
     #[test]
     fn put_bucket_policy_uses_put_bucket_policy_action() {
         assert_eq!(put_bucket_policy_authorize_action(), Action::S3Action(S3Action::PutBucketPolicyAction));
+    }
+
+    #[test]
+    fn bucket_website_config_never_authorizes_through_a_read_action() {
+        let action = bucket_website_config_authorize_action();
+
+        // The regression: DeleteBucketWebsite permanently removes the persisted
+        // website configuration but authorized through s3:GetBucketPolicy, so a
+        // read-only "may read my bucket policy" grant was enough to destroy it.
+        assert_ne!(action, Action::S3Action(S3Action::GetBucketPolicyAction));
+        assert_eq!(action, Action::S3Action(S3Action::PutBucketPolicyAction));
     }
 
     #[test]
