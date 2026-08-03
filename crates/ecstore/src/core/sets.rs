@@ -339,7 +339,9 @@ impl Sets {
             futures.push(set.delete_object(bucket, object, opt.clone()));
         }
 
-        let _results = join_all(futures).await;
+        if let Some(err) = join_all(futures).await.into_iter().find_map(Result::err) {
+            return Err(err);
+        }
 
         Ok(())
     }

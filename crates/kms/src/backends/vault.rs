@@ -227,7 +227,13 @@ impl VaultKmsClient {
             attempt_timeout: kms_config.effective_timeout(),
         };
         let source = token_source_for(&config.auth_method, &settings)?;
-        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &config.auth_method);
+        let policy = VaultCredentialPolicy::from_kms_config(
+            kms_config,
+            &config.auth_method,
+            "vault-kv2",
+            &config.address,
+            config.namespace.as_deref(),
+        );
         let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
 
         info!(address = %config.address, "Vault KMS backend connected");
@@ -237,7 +243,7 @@ impl VaultKmsClient {
             kv_mount: config.kv_mount.clone(),
             key_path_prefix: config.key_path_prefix.clone(),
             dek_crypto: AesDekCrypto::new(),
-            retry: RetryPolicy::from_config(kms_config),
+            retry: RetryPolicy::for_backend(kms_config, "vault-kv2", &config.address, config.namespace.as_deref(), "operations"),
             cancel: CancellationToken::new(),
         })
     }

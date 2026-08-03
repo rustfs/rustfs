@@ -552,8 +552,24 @@ pub enum MrfOpKind {
     Object,
     #[serde(rename = "metadata")]
     Metadata,
+    #[serde(rename = "heal")]
+    Heal,
+    #[serde(rename = "existingObject")]
+    ExistingObject,
     #[serde(rename = "delete")]
     Delete,
+}
+
+impl MrfOpKind {
+    pub fn replication_type(self) -> ReplicationType {
+        match self {
+            Self::Object => ReplicationType::Object,
+            Self::Metadata => ReplicationType::Metadata,
+            Self::Heal => ReplicationType::Heal,
+            Self::ExistingObject => ReplicationType::ExistingObject,
+            Self::Delete => ReplicationType::Delete,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -578,6 +594,11 @@ pub struct MrfReplicateEntry {
     // Operation kind. Old files lack this key; default=Object preserves existing behaviour.
     #[serde(rename = "op", default)]
     pub op: MrfOpKind,
+
+    // For delete entries: whether the source operation was a force-delete. Old files lack
+    // this key; default=false preserves the pre-existing replay contract.
+    #[serde(rename = "forceDelete", default)]
+    pub force_delete: bool,
 
     // For delete entries: the delete-marker version id (distinct from version_id, which is
     // the version being purged). Old files lack this; default=None is correct.
@@ -844,15 +865,17 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: retry_count_to_mrf(self.retry_count),
             size: self.size,
-            op: if self.op_type == ReplicationType::Metadata {
-                MrfOpKind::Metadata
-            } else {
-                MrfOpKind::Object
+            op: match self.op_type {
+                ReplicationType::Metadata => MrfOpKind::Metadata,
+                ReplicationType::Heal => MrfOpKind::Heal,
+                ReplicationType::ExistingObject => MrfOpKind::ExistingObject,
+                _ => MrfOpKind::Object,
             },
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
-            target_arns: self.dsc.replicate_target_arns(),
+            target_arns: self.admitted_target_arns(),
             ..Default::default()
         }
     }
@@ -884,6 +907,25 @@ static REPL_STATUS_REGEX: LazyLock<Regex> = LazyLock::new(|| match Regex::new(r"
 });
 
 impl ReplicateObjectInfo {
+    /// Returns the target set captured when this queued operation was admitted.
+    /// Resync decisions are more specific than the general heal decision and must
+    /// win for ExistingObject work.
+    pub fn admitted_target_arns(&self) -> Vec<String> {
+        if self.op_type == ReplicationType::ExistingObject && !self.existing_obj_resync.is_empty() {
+            let mut arns = self
+                .existing_obj_resync
+                .targets
+                .iter()
+                .filter(|(_, decision)| decision.replicate)
+                .map(|(arn, _)| arn.clone())
+                .collect::<Vec<_>>();
+            arns.sort();
+            arns.dedup();
+            return arns;
+        }
+        self.dsc.replicate_target_arns()
+    }
+
     /// Returns replication status of a target
     pub fn target_replication_status(&self, arn: &str) -> ReplicationStatusType {
         let binding = self.replication_status_internal.clone().unwrap_or_default();
@@ -904,18 +946,30 @@ impl ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: retry_count_to_mrf(self.retry_count),
             size: self.size,
-            op: if self.op_type == ReplicationType::Metadata {
-                MrfOpKind::Metadata
-            } else {
-                MrfOpKind::Object
+            op: match self.op_type {
+                ReplicationType::Metadata => MrfOpKind::Metadata,
+                ReplicationType::Heal => MrfOpKind::Heal,
+                ReplicationType::ExistingObject => MrfOpKind::ExistingObject,
+                _ => MrfOpKind::Object,
             },
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
-            target_arns: self.dsc.replicate_target_arns(),
+            target_arns: self.admitted_target_arns(),
             ..Default::default()
         }
     }
+}
+
+pub fn replicate_decision_for_admitted_targets(target_arns: &[String]) -> ReplicateDecision {
+    let mut decision = ReplicateDecision::new();
+    for arn in target_arns {
+        if !arn.is_empty() {
+            decision.set(ReplicateTargetDecision::new(arn.clone(), true, false));
+        }
+    }
+    decision
 }
 
 // constructs a replication status map from string representation
@@ -1147,6 +1201,36 @@ mod tests {
         };
 
         assert_eq!(info.to_mrf_entry().op, MrfOpKind::Metadata);
+    }
+
+    #[test]
+    fn admission_snapshot_prefers_resync_targets_for_existing_objects() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision::new("arn:live".to_string(), true, false));
+        let mut resync = ResyncDecision::new();
+        resync.targets.insert(
+            "arn:admitted".to_string(),
+            ResyncTargetDecision {
+                replicate: true,
+                reset_id: "reset-1".to_string(),
+                ..Default::default()
+            },
+        );
+        let info = ReplicateObjectInfo {
+            op_type: ReplicationType::ExistingObject,
+            dsc: decision,
+            existing_obj_resync: resync,
+            ..Default::default()
+        };
+
+        assert_eq!(info.admitted_target_arns(), vec!["arn:admitted".to_string()]);
+        assert_eq!(info.to_mrf_entry().op, MrfOpKind::ExistingObject);
+    }
+
+    #[test]
+    fn mrf_operation_kind_round_trips_heal_and_existing_object_intent() {
+        assert_eq!(MrfOpKind::Heal.replication_type(), ReplicationType::Heal);
+        assert_eq!(MrfOpKind::ExistingObject.replication_type(), ReplicationType::ExistingObject);
     }
 
     #[test]

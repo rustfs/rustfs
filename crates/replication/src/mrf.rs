@@ -71,6 +71,7 @@ mod tests {
                 force_delete_id: None,
                 force_delete_generation: None,
                 force_delete_local_commit: false,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -86,6 +87,7 @@ mod tests {
                 force_delete_id: None,
                 force_delete_generation: None,
                 force_delete_local_commit: false,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
@@ -101,6 +103,7 @@ mod tests {
                 force_delete_id: None,
                 force_delete_generation: None,
                 force_delete_local_commit: false,
+                force_delete: true,
                 delete_marker_version_id: Some(del_vid),
                 delete_marker: true,
                 delete_marker_mtime: Some(1_705_312_200_123_456_789),
@@ -116,11 +119,14 @@ mod tests {
         assert_eq!(decoded[0].op, MrfOpKind::Metadata);
         assert_eq!(decoded[0].target_arns, vec!["arn:target-a".to_string()]);
         assert_eq!(decoded[0].delete_marker_mtime, None);
+        assert!(!decoded[0].force_delete);
         assert_eq!(decoded[1].op, MrfOpKind::Object);
+        assert!(!decoded[1].force_delete);
         assert_eq!(decoded[1].target_arns, vec!["arn:target-a".to_string(), "arn:target-b".to_string()]);
         assert_eq!(decoded[1].delete_marker_mtime, None);
         assert_eq!(decoded[2].delete_marker_version_id, Some(del_vid));
         assert_eq!(decoded[2].op, MrfOpKind::Delete);
+        assert!(decoded[2].force_delete);
         assert_eq!(decoded[2].target_arns, vec!["arn:target-a".to_string()]);
         assert!(decoded[2].delete_marker);
         assert_eq!(
@@ -158,9 +164,37 @@ mod tests {
         assert_eq!(decoded[0].size, 100);
         assert_eq!(decoded[0].op, MrfOpKind::Object);
         assert!(decoded[0].target_arns.is_empty());
+        assert!(!decoded[0].force_delete);
         // Old files lack the deleteMarkerMtime key; it must default to None so replay keeps the
         // pre-#867 fallback to the current time.
         assert_eq!(decoded[0].delete_marker_mtime, None);
+    }
+
+    #[test]
+    fn mrf_file_defaults_missing_force_delete_to_false() {
+        let mut payload = Vec::new();
+        rmp::encode::write_array_len(&mut payload, 1).expect("array len should encode");
+        rmp::encode::write_map_len(&mut payload, 5).expect("map len should encode");
+        rmp::encode::write_str(&mut payload, "bucket").expect("bucket key should encode");
+        rmp::encode::write_str(&mut payload, "old-bucket").expect("bucket value should encode");
+        rmp::encode::write_str(&mut payload, "object").expect("object key should encode");
+        rmp::encode::write_str(&mut payload, "old-key").expect("object value should encode");
+        rmp::encode::write_str(&mut payload, "retryCount").expect("retry key should encode");
+        rmp::encode::write_i32(&mut payload, 1).expect("retry value should encode");
+        rmp::encode::write_str(&mut payload, "size").expect("size key should encode");
+        rmp::encode::write_i64(&mut payload, 0).expect("size value should encode");
+        rmp::encode::write_str(&mut payload, "op").expect("op key should encode");
+        rmp::encode::write_str(&mut payload, "delete").expect("op value should encode");
+
+        let mut data = Vec::with_capacity(4 + payload.len());
+        data.extend_from_slice(&MRF_META_FORMAT.to_le_bytes());
+        data.extend_from_slice(&MRF_META_VERSION.to_le_bytes());
+        data.extend_from_slice(&payload);
+
+        let decoded = decode_mrf_file(&data).expect("MRF payload should decode");
+
+        assert_eq!(decoded[0].op, MrfOpKind::Delete);
+        assert!(!decoded[0].force_delete);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 use std::any::Any;
 
 use crate::storage_api::DeletedObject;
-use crate::{MrfOpKind, MrfReplicateEntry, ReplicationType, ReplicationWorkerOperation};
+use crate::{MrfOpKind, MrfReplicateEntry, ReplicationState, ReplicationType, ReplicationWorkerOperation};
 
 #[derive(Debug, Clone, Default)]
 pub struct DeletedObjectReplicationInfo {
@@ -25,6 +25,27 @@ pub struct DeletedObjectReplicationInfo {
     pub op_type: ReplicationType,
     pub reset_id: String,
     pub target_arn: String,
+}
+
+impl DeletedObjectReplicationInfo {
+    pub fn admitted_target_arns(&self) -> Vec<String> {
+        if !self.target_arn.is_empty() {
+            return vec![self.target_arn.clone()];
+        }
+
+        let mut target_arns = if !self.delete_object.force_delete_target_arns.is_empty() {
+            self.delete_object.force_delete_target_arns.clone()
+        } else {
+            self.delete_object
+                .replication_state
+                .as_ref()
+                .map(admitted_target_arns_from_replication_state)
+                .unwrap_or_default()
+        };
+        target_arns.sort();
+        target_arns.dedup();
+        target_arns
+    }
 }
 
 impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
@@ -40,6 +61,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: self.delete_object.force_delete,
             delete_marker_version_id: self.delete_object.delete_marker_version_id,
             delete_marker: self.delete_object.delete_marker,
             // Persist the original delete-marker mtime as Unix nanoseconds so replay after a
@@ -49,11 +71,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
                 .delete_object
                 .delete_marker_mtime
                 .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
-            target_arns: if self.target_arn.is_empty() {
-                self.delete_object.force_delete_target_arns.clone()
-            } else {
-                vec![self.target_arn.clone()]
-            },
+            target_arns: self.admitted_target_arns(),
             force_delete_id: self.delete_object.force_delete_id,
             force_delete_generation: self.delete_object.force_delete_generation,
             force_delete_local_commit: self.delete_object.force_delete,
@@ -89,18 +107,28 @@ pub fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
     dobj.delete_marker_version_id.is_some()
 }
 
+fn admitted_target_arns_from_replication_state(state: &ReplicationState) -> Vec<String> {
+    let mut target_arns = state.targets.keys().cloned().collect::<Vec<_>>();
+    target_arns.extend(state.purge_targets.keys().cloned());
+    target_arns
+}
+
 pub fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
     !(is_not_found || matches!(code, Some("MethodNotAllowed" | "405")))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
         should_retry_delete_marker_purge,
     };
     use crate::storage_api::DeletedObject;
-    use crate::{MrfOpKind, ReplicationType, ReplicationWorkerOperation};
+    use crate::{
+        MrfOpKind, ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, VersionPurgeStatusType,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -128,6 +156,7 @@ mod tests {
         assert_eq!(entry.bucket, "bucket");
         assert_eq!(entry.object, "object");
         assert_eq!(entry.version_id, Some(version_id));
+        assert!(!entry.force_delete);
         assert_eq!(entry.delete_marker_version_id, Some(delete_marker_version_id));
         assert_eq!(entry.op, MrfOpKind::Delete);
         assert!(entry.delete_marker);
@@ -159,6 +188,82 @@ mod tests {
 
         assert_eq!(info.to_mrf_entry().delete_marker_mtime, None);
         assert!(info.to_mrf_entry().target_arns.is_empty());
+        assert!(!info.to_mrf_entry().force_delete);
+    }
+
+    #[test]
+    fn deleted_object_replication_info_uses_explicit_target_over_replay_state() {
+        let info = DeletedObjectReplicationInfo {
+            bucket: "bucket".to_string(),
+            delete_object: DeletedObject {
+                object_name: "object".to_string(),
+                replication_state: Some(ReplicationState {
+                    targets: HashMap::from([("arn:target-state".to_string(), ReplicationStatusType::Pending)]),
+                    purge_targets: HashMap::from([("arn:purge-state".to_string(), VersionPurgeStatusType::Pending)]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            target_arn: "arn:target-explicit".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(info.to_mrf_entry().target_arns, vec!["arn:target-explicit".to_string()]);
+    }
+
+    #[test]
+    fn deleted_object_replication_info_serializes_replay_targets_when_target_is_implicit() {
+        let info = DeletedObjectReplicationInfo {
+            bucket: "bucket".to_string(),
+            delete_object: DeletedObject {
+                object_name: "object".to_string(),
+                replication_state: Some(ReplicationState {
+                    targets: HashMap::from([("arn:target-b".to_string(), ReplicationStatusType::Pending)]),
+                    purge_targets: HashMap::from([
+                        ("arn:target-a".to_string(), VersionPurgeStatusType::Pending),
+                        ("arn:target-b".to_string(), VersionPurgeStatusType::Complete),
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            info.to_mrf_entry().target_arns,
+            vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
+            "MRF deletes must preserve the admitted target identities in stable order"
+        );
+    }
+
+    #[test]
+    fn deleted_object_replication_info_preserves_force_delete_handoff() {
+        let operation_id = Uuid::new_v4();
+        let info = DeletedObjectReplicationInfo {
+            bucket: "bucket".to_string(),
+            delete_object: DeletedObject {
+                object_name: "prefix/".to_string(),
+                force_delete: true,
+                force_delete_id: Some(operation_id),
+                force_delete_target_arns: vec![
+                    "arn:target-b".to_string(),
+                    "arn:target-a".to_string(),
+                    "arn:target-b".to_string(),
+                ],
+                force_delete_generation: Some(17),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let entry = info.to_mrf_entry();
+
+        assert!(entry.force_delete);
+        assert_eq!(entry.force_delete_id, Some(operation_id));
+        assert_eq!(entry.force_delete_generation, Some(17));
+        assert!(entry.force_delete_local_commit);
+        assert_eq!(entry.target_arns, vec!["arn:target-a", "arn:target-b"]);
     }
 
     #[test]

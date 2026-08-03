@@ -112,6 +112,9 @@ pub struct ObjectOptions {
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+    /// Storage-owned journal writer used by the atomic delete path. This is
+    /// populated only by the `ECStore` wrapper that holds the namespace locks.
+    pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
 impl ObjectOptions {

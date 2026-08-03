@@ -54,7 +54,8 @@
 
 use crate::backends::local::{
     LOCAL_KMS_MASTER_KEY_SALT_FILE, LOCAL_KMS_MASTER_KEY_SALT_LEN, LOCAL_RESTORE_COMMIT_MARKER_FILE, LocalKmsClient,
-    StoredKeyProtection, durable_file, is_orphan_commit_temp_name, unknown_protection_marker, validate_key_id,
+    STORED_MASTER_KEY_FORMAT_VERSION, StoredKeyProtection, UNKNOWN_STORED_KEY_PROTECTION, durable_file,
+    has_unknown_protection_marker, is_orphan_commit_temp_name, stored_master_key_format_version, validate_key_id,
 };
 use crate::backup::capability::AtRestProtection;
 use crate::backup::dry_run::{
@@ -608,10 +609,23 @@ fn decode_key_record(
     // Classify the protection marker before the schema parse: a record from a
     // newer build is not a damaged bundle, and reporting it as corruption
     // sends the operator into disaster recovery instead of a version change.
-    let unknown_marker = unknown_protection_marker(&plaintext)
+    let format_version = stored_master_key_format_version(&plaintext)
         .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' is not a readable JSON object: {error}")))?;
-    if let Some(version) = unknown_marker {
-        return Err(BackupError::UnsupportedRecordVersion { key_id: stem, version }.into());
+    if format_version > STORED_MASTER_KEY_FORMAT_VERSION {
+        return Err(BackupError::UnsupportedFormatVersion {
+            key_id: stem,
+            version: format_version.to_string(),
+        }
+        .into());
+    }
+    let has_unknown_marker = has_unknown_protection_marker(&plaintext)
+        .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' is not a readable JSON object: {error}")))?;
+    if has_unknown_marker {
+        return Err(BackupError::UnsupportedRecordVersion {
+            key_id: stem,
+            version: UNKNOWN_STORED_KEY_PROTECTION.to_owned(),
+        }
+        .into());
     }
     let probe: RestoredRecordProbe = serde_json::from_slice(&plaintext)
         .map_err(|error| BackupError::corrupted(format!("bundled key record '{stem}' does not deserialize: {error}")))?;
@@ -2074,7 +2088,7 @@ mod tests {
     fn bundled_record_from_a_newer_build_is_not_reported_as_corruption() {
         let record = serde_json::json!({
             "key_id": "alpha",
-            "at_rest_protection": "post-quantum-v2",
+            "at_rest_protection": "secret-marker-value-must-not-leak",
             "encrypted_key_material": "AAAAAAAAAAAAAAAAAAAAAA==",
             "nonce": vec![0u8; 12],
         });
@@ -2092,7 +2106,35 @@ mod tests {
         };
         assert!(
             matches!(inner, BackupError::UnsupportedRecordVersion { key_id, version }
-                if key_id == "alpha" && version == "post-quantum-v2"),
+                if key_id == "alpha" && version == UNKNOWN_STORED_KEY_PROTECTION),
+            "got {inner:?}"
+        );
+        assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
+        assert_eq!(
+            RestoreBlocker::from(inner).code,
+            RestoreBlockerCode::UnknownFormatVersion,
+            "a dry run must report a version blocker, not a corruption blocker"
+        );
+    }
+
+    #[test]
+    fn bundled_record_format_version_from_a_newer_build_is_not_reported_as_corruption() {
+        let record = serde_json::json!({"format_version": 99});
+        let error = match decode_key_record(
+            "artifacts/keys/alpha.key.enc",
+            Zeroizing::new(serde_json::to_vec(&record).expect("encode record")),
+            &[AtRestProtection::EncryptedMasterKey],
+        ) {
+            Ok(_) => panic!("a record this build cannot interpret must be rejected"),
+            Err(error) => error,
+        };
+
+        let KmsError::Backup(inner) = &error else {
+            panic!("expected a backup error, got {error:?}");
+        };
+        assert!(
+            matches!(inner, BackupError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "alpha" && version == "99"),
             "got {inner:?}"
         );
         assert_eq!(

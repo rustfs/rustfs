@@ -21,12 +21,35 @@
 #![allow(dead_code)] // Trait methods may be used by implementations
 
 use crate::error::{KmsError, Result};
+use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use async_trait::async_trait;
 use jiff::Zoned;
 use rand::Rng;
-use serde::de::IgnoredAny;
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+impl UnknownFieldSummary {
+    fn record_for_data_key_envelope(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("data-key-envelope") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: AtomicU64 = AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "KMS data-key envelope contains unknown fields"
+            );
+        }
+    }
+}
 
 /// Data key envelope for encrypting/decrypting data keys
 ///
@@ -36,7 +59,7 @@ use std::collections::HashMap;
 /// material. Envelopes written before versioning carry `None`; backends must resolve
 /// `None` to a deterministic baseline version recorded in key metadata, never
 /// implicitly to whatever version is current.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DataKeyEnvelope {
     pub key_id: String,
     pub master_key_id: String,
@@ -52,6 +75,140 @@ pub struct DataKeyEnvelope {
     /// byte-identical to the historical seven-field JSON shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_key_version: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for DataKeyEnvelope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        enum Field {
+            KeyId,
+            MasterKeyId,
+            KeySpec,
+            EncryptedKey,
+            Nonce,
+            EncryptionContext,
+            CreatedAt,
+            MasterKeyVersion,
+            Unknown(BoundedUnknownFieldName),
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a KMS data-key envelope field name")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(match value {
+                            "key_id" => Field::KeyId,
+                            "master_key_id" => Field::MasterKeyId,
+                            "key_spec" => Field::KeySpec,
+                            "encrypted_key" => Field::EncryptedKey,
+                            "nonce" => Field::Nonce,
+                            "encryption_context" => Field::EncryptionContext,
+                            "created_at" => Field::CreatedAt,
+                            "master_key_version" => Field::MasterKeyVersion,
+                            _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct ZonedValue(#[serde(with = "crate::time_serde::zoned")] Zoned);
+
+        struct DataKeyEnvelopeVisitor;
+
+        impl<'de> Visitor<'de> for DataKeyEnvelopeVisitor {
+            type Value = DataKeyEnvelope;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a KMS data-key envelope")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                macro_rules! read_field {
+                    ($slot:ident, $name:literal) => {{
+                        if $slot.is_some() {
+                            return Err(de::Error::duplicate_field($name));
+                        }
+                        $slot = Some(map.next_value()?);
+                    }};
+                }
+
+                let mut key_id = None;
+                let mut master_key_id = None;
+                let mut key_spec = None;
+                let mut encrypted_key = None;
+                let mut nonce = None;
+                let mut encryption_context = None;
+                let mut created_at: Option<ZonedValue> = None;
+                let mut master_key_version = None;
+                let mut unknown_fields = UnknownFieldSummary::default();
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::KeyId => read_field!(key_id, "key_id"),
+                        Field::MasterKeyId => read_field!(master_key_id, "master_key_id"),
+                        Field::KeySpec => read_field!(key_spec, "key_spec"),
+                        Field::EncryptedKey => read_field!(encrypted_key, "encrypted_key"),
+                        Field::Nonce => read_field!(nonce, "nonce"),
+                        Field::EncryptionContext => read_field!(encryption_context, "encryption_context"),
+                        Field::CreatedAt => read_field!(created_at, "created_at"),
+                        Field::MasterKeyVersion => read_field!(master_key_version, "master_key_version"),
+                        Field::Unknown(field) => {
+                            let _: IgnoredAny = map.next_value()?;
+                            unknown_fields.observe(field);
+                        }
+                    }
+                }
+
+                let envelope = DataKeyEnvelope {
+                    key_id: key_id.ok_or_else(|| de::Error::missing_field("key_id"))?,
+                    master_key_id: master_key_id.ok_or_else(|| de::Error::missing_field("master_key_id"))?,
+                    key_spec: key_spec.ok_or_else(|| de::Error::missing_field("key_spec"))?,
+                    encrypted_key: encrypted_key.ok_or_else(|| de::Error::missing_field("encrypted_key"))?,
+                    nonce: nonce.ok_or_else(|| de::Error::missing_field("nonce"))?,
+                    encryption_context: encryption_context.ok_or_else(|| de::Error::missing_field("encryption_context"))?,
+                    created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?.0,
+                    master_key_version: master_key_version.unwrap_or(None),
+                };
+                unknown_fields.record_for_data_key_envelope();
+                Ok(envelope)
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "key_id",
+            "master_key_id",
+            "key_spec",
+            "encrypted_key",
+            "nonce",
+            "encryption_context",
+            "created_at",
+            "master_key_version",
+        ];
+        deserializer.deserialize_struct("DataKeyEnvelope", FIELDS, DataKeyEnvelopeVisitor)
+    }
 }
 
 #[derive(Deserialize)]
@@ -237,6 +394,8 @@ pub fn generate_key_material(algorithm: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{deserialize_with_ignored_only_unknown, unknown_field_metric};
+    use metrics_util::debugging::DebuggingRecorder;
 
     #[tokio::test]
     async fn test_aes_dek_crypto_encrypt_decrypt() {
@@ -366,6 +525,76 @@ mod tests {
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
         assert_eq!(deserialized.master_key_version, None);
+    }
+
+    #[test]
+    fn test_data_key_envelope_unknown_fields_remain_readable() {
+        const UNKNOWN_FIELD_VALUE: &str = "field value must not be logged";
+        let envelope = serde_json::json!({
+            "key_id": "test-key-id",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {"bucket": "test-bucket"},
+            "created_at": "2024-01-01T00:00:00+00:00[UTC]"
+        });
+        let long_field = format!("{}界", "a".repeat(126));
+        let long_prefix = "a".repeat(126);
+        let injection_field = "b\n\u{1b}[31m";
+
+        let record_with_unknown = |field: &str| {
+            let mut record = envelope.clone();
+            let object = record.as_object_mut().expect("envelope is an object");
+            object.insert(field.to_owned(), serde_json::json!(UNKNOWN_FIELD_VALUE));
+            object.insert("zeta_extension".to_owned(), serde_json::json!("another value must not be logged"));
+            serde_json::to_vec(&record).expect("encode envelope with unknown fields")
+        };
+        let long_record = record_with_unknown(&long_field);
+        let injection_record = record_with_unknown(injection_field);
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let parse = |record: &[u8]| {
+            let recorder = DebuggingRecorder::new();
+            let envelope = metrics::with_local_recorder(&recorder, || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    serde_json::from_slice(record).expect("unknown fields must remain readable")
+                })
+            });
+            assert_eq!(unknown_field_metric(&recorder, "data-key-envelope"), 2);
+            envelope
+        };
+        let deserialized: DataKeyEnvelope = parse(&long_record);
+        let _: DataKeyEnvelope = parse(&long_record);
+        let _: DataKeyEnvelope = parse(&injection_record);
+        let _: DataKeyEnvelope = parse(&injection_record);
+        assert_eq!(deserialized.key_id, "test-key-id");
+        assert_eq!(deserialized.master_key_version, None);
+
+        let output = logs.output();
+        assert!(output.contains("WARN"));
+        assert_eq!(output.matches("KMS data-key envelope contains unknown fields").count(), 3);
+        assert!(output.contains(&long_prefix));
+        assert!(!output.contains(&long_field));
+        assert!(output.contains("field_name_truncated=true"));
+        assert!(output.contains(r#"\n\u{1b}[31m"#));
+        assert!(!output.contains("zeta_extension"));
+        assert!(output.contains("field_count=2"));
+        for observed_records in [1, 2, 4] {
+            assert!(output.contains(&format!("observed_records={observed_records}")));
+        }
+        assert!(!output.contains("observed_records=3"));
+        assert!(!output.contains(UNKNOWN_FIELD_VALUE));
+        assert!(!output.contains("another value must not be logged"));
+
+        let streamed: DataKeyEnvelope = deserialize_with_ignored_only_unknown(envelope, "stream_only_extension")
+            .expect("unknown values must be consumed through deserialize_ignored_any");
+        assert_eq!(streamed.key_id, "test-key-id");
     }
 
     #[test]

@@ -23,6 +23,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroUsize,
+    ops::Bound,
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
@@ -107,7 +109,9 @@ const MAINTENANCE_LATEST_JOB_FILE: &str = "latest.json";
 const MAINTENANCE_CURRENT_JOB_FILE: &str = "current.json";
 const MAINTENANCE_JOB_ALIAS_LATEST: &str = "latest";
 const MAINTENANCE_JOB_ALIAS_CURRENT: &str = "current";
-const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
+const TABLE_CATALOG_LIST_MAX_KEYS: usize = 1000;
+const OBJECT_CATALOG_LIST_CURSOR_PREFIX: &str = "object:";
+const STRONG_CATALOG_LIST_CURSOR_PREFIX: &str = "strong:";
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS: u64 = 15 * 60;
@@ -197,6 +201,7 @@ impl<T> TableCatalogStorage for T where
 pub enum CatalogIdentifierError {
     Empty,
     TooLong { max: usize },
+    NamespaceTooLong { max: usize },
     InvalidCharacter,
     InvalidBoundary,
     Ambiguous,
@@ -207,6 +212,7 @@ impl fmt::Display for CatalogIdentifierError {
         match self {
             Self::Empty => f.write_str("catalog identifier segment is empty"),
             Self::TooLong { max } => write!(f, "catalog identifier segment exceeds {max} characters"),
+            Self::NamespaceTooLong { max } => write!(f, "catalog namespace exceeds {max} characters"),
             Self::InvalidCharacter => f.write_str("catalog identifier segment contains invalid characters"),
             Self::InvalidBoundary => {
                 f.write_str("catalog identifier segment must start and end with a lowercase letter or digit")
@@ -1768,6 +1774,58 @@ where
     Ok(matched)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableCatalogListPage<T> {
+    pub entries: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+fn finish_catalog_list_page<T, F>(
+    mut entries: Vec<T>,
+    limit: NonZeroUsize,
+    cursor_prefix: &str,
+    key: F,
+) -> TableCatalogListPage<T>
+where
+    F: Fn(&T) -> &str,
+{
+    let next_cursor = if entries.len() > limit.get() {
+        entries.truncate(limit.get());
+        entries.last().map(|entry| format!("{cursor_prefix}{}", key(entry)))
+    } else {
+        None
+    };
+    TableCatalogListPage { entries, next_cursor }
+}
+
+fn catalog_list_page_from_entries<T, F>(
+    mut entries: Vec<T>,
+    cursor: Option<&str>,
+    limit: NonZeroUsize,
+    key: F,
+) -> TableCatalogListPage<T>
+where
+    F: Fn(&T) -> &str,
+{
+    entries.sort_by(|left, right| key(left).cmp(key(right)));
+    let start = cursor.map_or(0, |cursor| entries.partition_point(|entry| key(entry) <= cursor));
+    let entries = entries.into_iter().skip(start).take(limit.get().saturating_add(1)).collect();
+    finish_catalog_list_page(entries, limit, "", key)
+}
+
+fn catalog_list_cursor<'a>(cursor: Option<&'a str>, prefix: &str) -> TableCatalogStoreResult<Option<&'a str>> {
+    cursor
+        .map(|cursor| {
+            cursor
+                .strip_prefix(prefix)
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Invalid("page cursor does not match the active table catalog backing".to_string())
+                })
+        })
+        .transpose()
+}
+
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogStore: Send + Sync {
     async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>>;
@@ -1778,6 +1836,20 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>>;
 
+    async fn list_namespaces_page(
+        &self,
+        table_bucket: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        Ok(catalog_list_page_from_entries(
+            self.list_namespaces(table_bucket).await?,
+            cursor,
+            limit,
+            |entry| &entry.namespace,
+        ))
+    }
+
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>>;
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()>;
@@ -1787,6 +1859,21 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
+
+    async fn list_tables_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
+        Ok(catalog_list_page_from_entries(
+            self.list_tables(table_bucket, namespace).await?,
+            cursor,
+            limit,
+            |entry| &entry.table,
+        ))
+    }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>>;
 
@@ -1805,6 +1892,21 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()>;
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>>;
+
+    async fn list_views_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
+        Ok(catalog_list_page_from_entries(
+            self.list_views(table_bucket, namespace).await?,
+            cursor,
+            limit,
+            |entry| &entry.view,
+        ))
+    }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>>;
 
@@ -1838,6 +1940,12 @@ pub(crate) struct TableCatalogObject {
 pub(crate) struct TableCatalogObjectMetadata {
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableCatalogObjectListPage {
+    pub objects: Vec<String>,
+    pub is_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1892,6 +2000,26 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     }
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>>;
+
+    async fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
+        let mut objects = self.list_objects(bucket, prefix).await?;
+        objects.sort();
+        let start = start_after.map_or(0, |cursor| objects.partition_point(|object| object.as_str() <= cursor));
+        let mut objects = objects
+            .into_iter()
+            .skip(start)
+            .take(limit.get().saturating_add(1))
+            .collect::<Vec<_>>();
+        let is_truncated = objects.len() > limit.get();
+        objects.truncate(limit.get());
+        Ok(TableCatalogObjectListPage { objects, is_truncated })
+    }
 
     async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
         self.acquire_write_lock(bucket, object).await
@@ -3116,6 +3244,35 @@ where
         Ok(entries)
     }
 
+    async fn list_namespaces_page(
+        &self,
+        table_bucket: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        self.hydrate_state().await?;
+        let cursor = catalog_list_cursor(cursor, STRONG_CATALOG_LIST_CURSOR_PREFIX)?;
+        let cursor = cursor
+            .map(parse_namespace_for_store)
+            .transpose()?
+            .map(|namespace| namespace.public_name());
+        let start = match cursor {
+            Some(cursor) => Bound::Excluded((table_bucket.to_string(), cursor)),
+            None => Bound::Included((table_bucket.to_string(), String::new())),
+        };
+        let state = self.state.lock().await;
+        let entries = state
+            .namespaces
+            .range((start, Bound::Unbounded))
+            .take_while(|((bucket, _), _)| bucket == table_bucket)
+            .take(limit.get().saturating_add(1))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        Ok(finish_catalog_list_page(entries, limit, STRONG_CATALOG_LIST_CURSOR_PREFIX, |entry| {
+            &entry.namespace
+        }))
+    }
+
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;
@@ -3209,6 +3366,37 @@ where
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.table.cmp(&right.table));
         Ok(entries)
+    }
+
+    async fn list_tables_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
+        self.hydrate_state().await?;
+        let namespace = parse_namespace_for_store(namespace)?.public_name();
+        let cursor = catalog_list_cursor(cursor, STRONG_CATALOG_LIST_CURSOR_PREFIX)?;
+        let cursor = cursor
+            .map(parse_table_for_store)
+            .transpose()?
+            .map(|table| table.as_str().to_string());
+        let start = match cursor {
+            Some(cursor) => Bound::Excluded((table_bucket.to_string(), namespace.clone(), cursor)),
+            None => Bound::Included((table_bucket.to_string(), namespace.clone(), String::new())),
+        };
+        let state = self.state.lock().await;
+        let entries = state
+            .tables
+            .range((start, Bound::Unbounded))
+            .take_while(|((bucket, entry_namespace, _), _)| bucket == table_bucket && entry_namespace == &namespace)
+            .take(limit.get().saturating_add(1))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        Ok(finish_catalog_list_page(entries, limit, STRONG_CATALOG_LIST_CURSOR_PREFIX, |entry| {
+            &entry.table
+        }))
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
@@ -3425,6 +3613,37 @@ where
         Ok(entries)
     }
 
+    async fn list_views_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
+        self.hydrate_state().await?;
+        let namespace = parse_namespace_for_store(namespace)?.public_name();
+        let cursor = catalog_list_cursor(cursor, STRONG_CATALOG_LIST_CURSOR_PREFIX)?;
+        let cursor = cursor
+            .map(parse_table_for_store)
+            .transpose()?
+            .map(|view| view.as_str().to_string());
+        let start = match cursor {
+            Some(cursor) => Bound::Excluded((table_bucket.to_string(), namespace.clone(), cursor)),
+            None => Bound::Included((table_bucket.to_string(), namespace.clone(), String::new())),
+        };
+        let state = self.state.lock().await;
+        let entries = state
+            .views
+            .range((start, Bound::Unbounded))
+            .take_while(|((bucket, entry_namespace, _), _)| bucket == table_bucket && entry_namespace == &namespace)
+            .take(limit.get().saturating_add(1))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        Ok(finish_catalog_list_page(entries, limit, STRONG_CATALOG_LIST_CURSOR_PREFIX, |entry| {
+            &entry.view
+        }))
+    }
+
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;
@@ -3556,6 +3775,71 @@ where
 
     fn catalog_bucket(&self) -> &'static str {
         RUSTFS_META_BUCKET
+    }
+
+    async fn list_entry_page<T>(
+        &self,
+        prefix: &str,
+        entry_file: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let cursor = catalog_list_cursor(cursor, OBJECT_CATALOG_LIST_CURSOR_PREFIX)?;
+        if cursor.is_some_and(|cursor| !cursor.starts_with(prefix)) {
+            return Err(TableCatalogStoreError::Invalid(
+                "page cursor does not match this table catalog list operation".to_string(),
+            ));
+        }
+
+        let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
+        let mut entries = Vec::with_capacity(limit.get());
+        let mut last_entry_path = None;
+
+        let page = self
+            .backend
+            .list_objects_page(self.catalog_bucket(), prefix, cursor, scan_limit)
+            .await?;
+        let last_scanned_path = page.objects.last().cloned();
+        if page.is_truncated && last_scanned_path.is_none() {
+            return Err(TableCatalogStoreError::Internal("catalog object pagination made no progress".to_string()));
+        }
+        if cursor
+            .zip(last_scanned_path.as_deref())
+            .is_some_and(|(cursor, last)| last <= cursor)
+        {
+            return Err(TableCatalogStoreError::Internal("catalog object pagination did not advance".to_string()));
+        }
+
+        for object in page.objects {
+            if !object.ends_with(entry_file) {
+                continue;
+            }
+            if entries.len() == limit.get() {
+                let last_entry_path = last_entry_path.ok_or_else(|| {
+                    TableCatalogStoreError::Internal("catalog page cursor is missing its last entry".to_string())
+                })?;
+                return Ok(TableCatalogListPage {
+                    entries,
+                    next_cursor: Some(format!("{OBJECT_CATALOG_LIST_CURSOR_PREFIX}{last_entry_path}")),
+                });
+            }
+            let Some((entry, _)) = self.read_entry::<T>(self.catalog_bucket(), &object).await? else {
+                continue;
+            };
+            last_entry_path = Some(object);
+            entries.push(entry);
+        }
+
+        let next_cursor = if page.is_truncated {
+            last_scanned_path.map(|path| format!("{OBJECT_CATALOG_LIST_CURSOR_PREFIX}{path}"))
+        } else {
+            None
+        };
+        Ok(TableCatalogListPage { entries, next_cursor })
     }
 
     async fn read_backing_migration_fence(
@@ -7400,6 +7684,16 @@ where
         Ok(entries)
     }
 
+    async fn list_namespaces_page(
+        &self,
+        table_bucket: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        self.list_entry_page(&self.paths.namespace_entries_prefix(table_bucket), NAMESPACE_ENTRY_FILE, cursor, limit)
+            .await
+    }
+
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
         self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
@@ -7473,6 +7767,23 @@ where
         }
         entries.sort_by(|left, right| left.table.cmp(&right.table));
         Ok(entries)
+    }
+
+    async fn list_tables_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        self.list_entry_page(
+            &self.paths.table_entries_prefix(table_bucket, &namespace),
+            TABLE_ENTRY_FILE,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
@@ -7870,6 +8181,18 @@ where
         Ok(entries)
     }
 
+    async fn list_views_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        self.list_entry_page(&self.paths.view_entries_prefix(table_bucket, &namespace), VIEW_ENTRY_FILE, cursor, limit)
+            .await
+    }
+
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
         let view = parse_table_for_store(view)?;
@@ -8025,6 +8348,18 @@ where
         }
     }
 
+    async fn list_namespaces_page(
+        &self,
+        table_bucket: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_namespaces_page(table_bucket, cursor, limit).await,
+            Self::DurableStrong(store) => store.list_namespaces_page(table_bucket, cursor, limit).await,
+        }
+    }
+
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_namespace(table_bucket, namespace).await,
@@ -8057,6 +8392,19 @@ where
         match self {
             Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
             Self::DurableStrong(store) => store.list_tables(table_bucket, namespace).await,
+        }
+    }
+
+    async fn list_tables_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_tables_page(table_bucket, namespace, cursor, limit).await,
+            Self::DurableStrong(store) => store.list_tables_page(table_bucket, namespace, cursor, limit).await,
         }
     }
 
@@ -8103,6 +8451,19 @@ where
         match self {
             Self::ObjectBacked(store) => store.list_views(table_bucket, namespace).await,
             Self::DurableStrong(store) => store.list_views(table_bucket, namespace).await,
+        }
+    }
+
+    async fn list_views_page(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_views_page(table_bucket, namespace, cursor, limit).await,
+            Self::DurableStrong(store) => store.list_views_page(table_bucket, namespace, cursor, limit).await,
         }
     }
 
@@ -8474,12 +8835,14 @@ where
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {
         let mut continuation = None;
         let mut objects = BTreeSet::new();
+        let max_keys = i32::try_from(TABLE_CATALOG_LIST_MAX_KEYS)
+            .map_err(|_| TableCatalogStoreError::Internal("catalog list limit exceeds storage API range".to_string()))?;
 
         loop {
             let result = self
                 .store
                 .clone()
-                .list_objects_v2(bucket, prefix, continuation, None, TABLE_CATALOG_LIST_MAX_KEYS, false, None, false)
+                .list_objects_v2(bucket, prefix, continuation, None, max_keys, false, None, false)
                 .await
                 .map_err(|err| storage_error_to_catalog("list catalog objects", err))?;
 
@@ -8498,6 +8861,29 @@ where
         }
 
         Ok(objects.into_iter().collect())
+    }
+
+    async fn list_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
+        let max_keys = i32::try_from(limit.get())
+            .map_err(|_| TableCatalogStoreError::Invalid("catalog page size exceeds storage API range".to_string()))?;
+        let result = self
+            .store
+            .clone()
+            .list_objects_v2(bucket, prefix, None, None, max_keys, false, start_after.map(str::to_string), false)
+            .await
+            .map_err(|err| storage_error_to_catalog("list catalog object page", err))?;
+        let is_truncated = result.is_truncated;
+        let objects = result.objects.into_iter().map(|object| object.name).collect::<BTreeSet<_>>();
+        Ok(TableCatalogObjectListPage {
+            objects: objects.into_iter().collect(),
+            is_truncated,
+        })
     }
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
@@ -11671,9 +12057,14 @@ pub struct Namespace {
 }
 
 impl Namespace {
+    pub const MAX_LEN: usize = 512;
+
     pub fn parse(value: &str) -> Result<Self, CatalogIdentifierError> {
         if value.is_empty() {
             return Err(CatalogIdentifierError::Empty);
+        }
+        if value.len() > Self::MAX_LEN {
+            return Err(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN });
         }
 
         let mut segments = Vec::new();
@@ -13099,6 +13490,40 @@ mod tests {
         }
     }
 
+    async fn seed_catalog_list_entries<S>(store: &S, bucket: &str, namespace: &Namespace)
+    where
+        S: TableCatalogStore + ?Sized,
+    {
+        store
+            .put_table_bucket(test_bucket_entry(bucket))
+            .await
+            .expect("table bucket should be created");
+        for namespace in [
+            Namespace::parse("analytics").expect("namespace should parse"),
+            namespace.clone(),
+        ] {
+            store
+                .create_namespace(test_namespace_entry(bucket, &namespace))
+                .await
+                .expect("namespace should be created");
+        }
+        for name in ["alpha", "beta"] {
+            let identifier = IdentifierSegment::parse(name).expect("table and view name should parse");
+            let metadata_location = default_table_metadata_file_path(namespace, &identifier, "00001.metadata.json");
+            let mut table = test_table_entry(bucket, namespace, &identifier, metadata_location.clone());
+            table.table_id = format!("table-{name}");
+            table.table_uuid = format!("table-uuid-{name}");
+            table.warehouse_location = format!("s3://{bucket}/tables/table-{name}");
+            store.create_table(table).await.expect("table should be created");
+
+            let mut view = test_view_entry(bucket, namespace, &identifier, metadata_location);
+            view.view_id = format!("view-{name}");
+            view.view_uuid = format!("view-uuid-{name}");
+            view.warehouse_location = format!("s3://{bucket}/views/view-{name}");
+            store.create_view(view).await.expect("view should be created");
+        }
+    }
+
     async fn seed_table_for_metadata_maintenance(
         store: &ObjectTableCatalogStore<TestCatalogObjectBackend>,
         bucket: &str,
@@ -13643,6 +14068,119 @@ mod tests {
                 .expect("warehouse index lookup should succeed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn object_catalog_pagination_bounds_reads_and_covers_rest_resources() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let namespace_name = namespace.public_name();
+        let one = NonZeroUsize::new(1).expect("page size should be non-zero");
+
+        seed_catalog_list_entries(&store, bucket, &namespace).await;
+
+        let namespace_page = store
+            .list_namespaces_page(bucket, None, one)
+            .await
+            .expect("first namespace page should load");
+        assert_eq!(namespace_page.entries[0].namespace, "analytics");
+        assert!(
+            namespace_page
+                .next_cursor
+                .as_deref()
+                .is_some_and(|cursor| cursor.starts_with(OBJECT_CATALOG_LIST_CURSOR_PREFIX))
+        );
+        let namespace_page = store
+            .list_namespaces_page(bucket, namespace_page.next_cursor.as_deref(), one)
+            .await
+            .expect("second namespace page should load");
+        assert_eq!(namespace_page.entries[0].namespace, "sales");
+        assert!(namespace_page.next_cursor.is_none());
+
+        backend.reset_call_counts().await;
+        let table_page = store
+            .list_tables_page(bucket, &namespace_name, None, one)
+            .await
+            .expect("first table page should load");
+        assert_eq!(table_page.entries[0].table, "alpha");
+        assert_eq!(backend.read_call_count().await, 1);
+        let table_page = store
+            .list_tables_page(bucket, &namespace_name, table_page.next_cursor.as_deref(), one)
+            .await
+            .expect("second table page should load");
+        assert_eq!(table_page.entries[0].table, "beta");
+        assert!(table_page.next_cursor.is_none());
+
+        let view_page = store
+            .list_views_page(bucket, &namespace_name, None, one)
+            .await
+            .expect("first view page should load");
+        assert_eq!(view_page.entries[0].view, "alpha");
+        let view_page = store
+            .list_views_page(bucket, &namespace_name, view_page.next_cursor.as_deref(), one)
+            .await
+            .expect("second view page should load");
+        assert_eq!(view_page.entries[0].view, "beta");
+        assert!(view_page.next_cursor.is_none());
+
+        let exact_page = store
+            .list_tables_page(bucket, &namespace_name, None, NonZeroUsize::new(2).expect("page size should be non-zero"))
+            .await
+            .expect("exact table page should load");
+        assert_eq!(exact_page.entries.len(), 2);
+        assert!(exact_page.next_cursor.is_none());
+        assert!(matches!(
+            store
+                .list_tables_page(bucket, &namespace_name, Some("strong:alpha"), one)
+                .await,
+            Err(TableCatalogStoreError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_catalog_pagination_bounds_sparse_namespace_scans() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let prefix = store.paths.namespace_entries_prefix(bucket);
+
+        store
+            .put_table_bucket(test_bucket_entry(bucket))
+            .await
+            .expect("table bucket should be created");
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+        for index in 0..TABLE_CATALOG_LIST_MAX_KEYS {
+            backend
+                .seed_object(RUSTFS_META_BUCKET, &format!("{prefix}0000-spacer/{index:04}.json"), Vec::new())
+                .await;
+        }
+        backend.reset_call_counts().await;
+
+        let one = NonZeroUsize::new(1).expect("page size should be non-zero");
+        let first = store
+            .list_namespaces_page(bucket, None, one)
+            .await
+            .expect("sparse first page should load");
+        assert!(first.entries.is_empty());
+        assert_eq!(backend.list_call_count().await, 1);
+        let cursor = first.next_cursor.expect("truncated sparse page should have a cursor");
+        assert!(cursor.starts_with(OBJECT_CATALOG_LIST_CURSOR_PREFIX));
+        assert!(!cursor.ends_with(NAMESPACE_ENTRY_FILE));
+
+        let second = store
+            .list_namespaces_page(bucket, Some(&cursor), one)
+            .await
+            .expect("sparse continuation page should load");
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].namespace, namespace.public_name());
+        assert!(second.next_cursor.is_none());
+        assert_eq!(backend.list_call_count().await, 2);
     }
 
     #[tokio::test]
@@ -18560,6 +19098,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strong_catalog_pagination_uses_ordered_state_and_rejects_object_cursors() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = StrongTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let namespace_name = namespace.public_name();
+        let one = NonZeroUsize::new(1).expect("page size should be non-zero");
+
+        seed_catalog_list_entries(&store, bucket, &namespace).await;
+
+        let first = store
+            .list_namespaces_page(bucket, None, one)
+            .await
+            .expect("first strong namespace page should load");
+        assert_eq!(first.entries[0].namespace, "analytics");
+        let second = store
+            .list_namespaces_page(bucket, first.next_cursor.as_deref(), one)
+            .await
+            .expect("second strong namespace page should load");
+        assert_eq!(second.entries[0].namespace, "sales");
+        assert!(second.next_cursor.is_none());
+
+        let first = store
+            .list_tables_page(bucket, &namespace_name, None, one)
+            .await
+            .expect("first strong table page should load");
+        assert_eq!(first.entries[0].table, "alpha");
+        assert!(first.next_cursor.as_deref().is_some_and(|cursor| cursor == "strong:alpha"));
+        let second = store
+            .list_tables_page(bucket, &namespace_name, first.next_cursor.as_deref(), one)
+            .await
+            .expect("second strong table page should load");
+        assert_eq!(second.entries[0].table, "beta");
+        assert!(second.next_cursor.is_none());
+
+        let first = store
+            .list_views_page(bucket, &namespace_name, None, one)
+            .await
+            .expect("first strong view page should load");
+        assert_eq!(first.entries[0].view, "alpha");
+        let second = store
+            .list_views_page(bucket, &namespace_name, first.next_cursor.as_deref(), one)
+            .await
+            .expect("second strong view page should load");
+        assert_eq!(second.entries[0].view, "beta");
+        assert!(second.next_cursor.is_none());
+
+        let exact = NonZeroUsize::new(2).expect("exact page size should be non-zero");
+        assert!(
+            store
+                .list_namespaces_page(bucket, None, exact)
+                .await
+                .expect("exact strong namespace page should load")
+                .next_cursor
+                .is_none()
+        );
+        assert!(
+            store
+                .list_tables_page(bucket, &namespace_name, None, exact)
+                .await
+                .expect("exact strong table page should load")
+                .next_cursor
+                .is_none()
+        );
+        assert!(
+            store
+                .list_views_page(bucket, &namespace_name, None, exact)
+                .await
+                .expect("exact strong view page should load")
+                .next_cursor
+                .is_none()
+        );
+
+        assert!(matches!(
+            store
+                .list_tables_page(bucket, &namespace_name, Some("object:alpha"), one)
+                .await,
+            Err(TableCatalogStoreError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn strong_catalog_backing_replays_durable_commit_state_after_restart() {
         let backend = TestCatalogObjectBackend::default();
         let store = StrongTableCatalogStore::new(backend.clone());
@@ -20305,6 +20925,21 @@ mod tests {
 
         assert_eq!(namespace.segments().len(), 2);
         assert_eq!(namespace.storage_id(), "analytics/daily_events");
+    }
+
+    #[test]
+    fn namespace_length_is_bounded_for_catalog_paths_and_page_tokens() {
+        let mut segments = vec!["a".repeat(63); 8];
+        segments[0].push('a');
+        let max_length_namespace = segments.join(".");
+        assert_eq!(max_length_namespace.len(), Namespace::MAX_LEN);
+        Namespace::parse(&max_length_namespace).expect("namespace at the maximum length should parse");
+
+        let namespace = format!("{max_length_namespace}.a");
+        assert_eq!(
+            Namespace::parse(&namespace),
+            Err(CatalogIdentifierError::NamespaceTooLong { max: Namespace::MAX_LEN })
+        );
     }
 
     #[test]

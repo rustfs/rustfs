@@ -230,8 +230,16 @@ impl VaultTransitKmsClient {
             attempt_timeout: kms_config.effective_timeout(),
         };
         let source = token_source_for(&config.auth_method, &settings)?;
-        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &config.auth_method);
+        let policy = VaultCredentialPolicy::from_kms_config(
+            kms_config,
+            &config.auth_method,
+            "vault-transit",
+            &config.address,
+            config.namespace.as_deref(),
+        );
         let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
+        let retry =
+            RetryPolicy::for_backend(kms_config, "vault-transit", &config.address, config.namespace.as_deref(), "operations");
 
         Ok(Self {
             credentials,
@@ -242,7 +250,7 @@ impl VaultTransitKmsClient {
                 .max_capacity(METADATA_CACHE_CAPACITY)
                 .time_to_live(METADATA_CACHE_TTL)
                 .build(),
-            retry: RetryPolicy::from_config(kms_config),
+            retry,
             cancel: CancellationToken::new(),
         })
     }

@@ -792,6 +792,7 @@ impl ReplicationResyncer {
             let storage = storage.clone();
             let results_tx = results_tx.clone();
             let bucket_name = opts.bucket.clone();
+            let target_arn = opts.arn.clone();
 
             let f = tokio::spawn(async move {
                 while let Some(mut roi) = rx.recv().await {
@@ -819,6 +820,7 @@ impl ReplicationResyncer {
                             bucket: roi.bucket.clone(),
                             event_type: REPLICATE_EXISTING_DELETE.to_string(),
                             op_type: ReplicationType::ExistingObject,
+                            target_arn: target_arn.clone(),
                             ..Default::default()
                         };
                         replicate_delete(doi, storage.clone()).await;
@@ -1383,6 +1385,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
     let mut join_set = JoinSet::new();
 
     // Process each target
+    let target_arns = dobj.admitted_target_arns();
     for tgt_entry in dsc.targets_map.values() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
@@ -1390,7 +1393,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
 
         // If dobj.TargetArn is not empty string, this is a case of specific target being re-synced.
-        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+        if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
             continue;
         }
 
@@ -1617,7 +1620,8 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
         if !tgt_entry.replicate {
             continue;
         }
-        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+        let target_arns = dobj.admitted_target_arns();
+        if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
             continue;
         }
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
@@ -1638,8 +1642,9 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
 async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
+    let admitted_target_arns = dobj.admitted_target_arns();
 
-    let legacy_target_arns = if dobj.delete_object.force_delete_target_arns.is_empty() && dobj.target_arn.is_empty() {
+    let legacy_target_arns = if admitted_target_arns.is_empty() {
         match get_replication_config(bucket).await {
             Ok(Some(config)) => config.filter_target_arns(&ObjectOpts {
                 name: object_name.clone(),
@@ -1754,12 +1759,10 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         }
     };
 
-    let tgt_arns = if !dobj.target_arn.is_empty() {
-        vec![dobj.target_arn.clone()]
-    } else if !dobj.delete_object.force_delete_target_arns.is_empty() {
-        dobj.delete_object.force_delete_target_arns.clone()
-    } else {
+    let tgt_arns = if admitted_target_arns.is_empty() {
         legacy_target_arns
+    } else {
+        admitted_target_arns
     };
 
     let mut join_set = JoinSet::new();
@@ -2034,10 +2037,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
-    // The admission decision is the target-granular contract. Re-evaluating the
-    // live config here could fan a synchronous request out to targets that were
-    // not admitted, or promote an async target after a mixed-mode split.
-    let tgt_arns = roi.dsc.replicate_target_arns();
+    let tgt_arns = roi.admitted_target_arns();
 
     // Acquire a per-object namespace lock so that at most one worker (across all cluster
     // nodes and MRF retry goroutines) replicates this object version at a time.

@@ -78,6 +78,7 @@ of reaching across module boundaries.
 | `DRIVE_TIMEOUT_PROFILE_CACHE`, `DRIVE_TIMEOUT_HEALTH_POLICY_CACHE` | `crates/ecstore/src/disk/disk_store.rs` | Cache or constant / owner-local cache | Drive timeout environment caches stay local to the disk-store owner. |
 | `TIER_FREE_VERSION_RECOVERY_STARTED`, `TIER_DELETE_JOURNAL_RECOVERY_STARTED` | `crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs` | Cache or constant / owner-local static guard | Lifecycle recovery single-run guards stay local to lifecycle operations. |
 | `REMOTE_DELETE_INFLIGHT`, `REMOTE_DELETE_LIMITER`, `REMOTE_DELETE_BREAKER`, `REMOTE_TIER_DELETE_TEST_HOOK` | `crates/ecstore/src/bucket/lifecycle/tier_sweeper.rs` | Cache or constant / owner-local static guard | Remote tier delete concurrency, breaker, and test hook state stay local to the tier sweeper owner. |
+| `ACTIVE_REGISTRY`, `BackendCapacity` | `crates/kms/src/policy.rs` | Process-global owner-local admission capacity registry | KMS policy generations share only active semaphore capacity by backend identity; each generation owns fresh bounded queues and circuit breakers. Callers access this state only through `RetryPolicy`. |
 
 ## RustFS Owner-Local Static Inventory
 

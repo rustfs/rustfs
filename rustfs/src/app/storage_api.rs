@@ -210,7 +210,6 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod runtime_sources {
-    pub(crate) type ExpiryState = super::runtime::ExpiryState;
     #[cfg(test)]
     pub(crate) type TierConfigMgr = super::runtime::TierConfigMgr;
 }
@@ -373,57 +372,6 @@ pub(crate) mod bucket {
             }
         }
         pub(crate) use lifecycle_contract as lifecycle;
-
-        pub(crate) mod tier_delete_journal {
-            use std::sync::Arc;
-
-            pub(crate) fn record_tier_delete_journal_backend_identity(
-                je: &mut super::tier_sweeper::Jentry,
-                metadata: &std::collections::HashMap<String, String>,
-            ) -> std::io::Result<()> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_delete_journal::record_tier_delete_journal_backend_identity(je, metadata)
-            }
-
-            pub(crate) async fn persist_tier_delete_journal_entry(
-                api: Arc<crate::storage::storage_api::ECStore>,
-                je: &super::tier_sweeper::Jentry,
-            ) -> std::io::Result<()> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(
-                    api, je,
-                )
-                .await
-            }
-        }
-
-        pub(crate) mod tier_sweeper {
-            pub(crate) type Jentry = crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::Jentry;
-
-            pub(crate) fn transitioned_delete_journal_entry(
-                version_id: Option<uuid::Uuid>,
-                versioned: bool,
-                suspended: bool,
-                transitioned: &super::super::super::storage_contracts::TransitionedObject,
-                transition_version_state: rustfs_filemeta::TransitionVersionState,
-            ) -> Option<Jentry> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
-                    version_id,
-                    versioned,
-                    suspended,
-                    transitioned,
-                    transition_version_state,
-                )
-            }
-
-            pub(crate) fn transitioned_force_delete_journal_entry(
-                transitioned: &super::super::super::storage_contracts::TransitionedObject,
-                transition_version_state: rustfs_filemeta::TransitionVersionState,
-            ) -> Option<Jentry> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
-                    transitioned,
-                    transition_version_state,
-                )
-            }
-        }
     }
 
     pub(crate) mod metadata {
@@ -646,6 +594,7 @@ pub(crate) mod bucket {
                     retry_count: 0,
                     size: 0,
                     op: replication_contracts::MrfOpKind::Delete,
+                    force_delete: true,
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,

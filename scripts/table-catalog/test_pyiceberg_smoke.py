@@ -67,6 +67,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn("minio-aistor", profiles)
         self.assertIn("cloudflare-r2-data-catalog", profiles)
         self.assertIn("oss-tables", profiles)
+        self.assertEqual(profiles["rustfs"]["pagination_model"], "iceberg-rest")
         self.assertEqual(
             profiles["rustfs-vended-credentials"]["credential_mode"],
             "catalog-vended-temporary-credentials",
@@ -287,7 +288,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
 
     def test_view_probe_drops_smoke_view_after_load_failure(self) -> None:
         args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
-        view_path = pyiceberg_smoke.view_endpoint_path(args)
+        probe_namespace = "smoke-sales-orders-views-12345678"
+        namespace_path = pyiceberg_smoke.namespace_endpoint_path(args)
+        view_path = pyiceberg_smoke.view_endpoint_path(args, namespace=probe_namespace)
         calls: list[tuple[str, str, object]] = []
 
         def fake_signed_request(
@@ -298,21 +301,144 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             body: object = None,
         ) -> dict[str, object]:
             calls.append((method, path, body))
+            if (method, path) == ("POST", namespace_path):
+                return {}
             if (method, path) == ("POST", view_path):
                 return {}
             if (method, path) == ("GET", view_path):
-                return {"identifiers": [{"name": "orders_smoke_view"}]}
-            if (method, path) == ("GET", f"{view_path}/orders_smoke_view"):
+                return {
+                    "identifiers": [
+                        {"name": "view-a"},
+                        {"name": "view-b"},
+                    ],
+                    "next-page-token": None,
+                }
+            if (method, path) == ("GET", f"{view_path}/view-a"):
                 return {}
-            if (method, path) == ("DELETE", f"{view_path}/orders_smoke_view"):
+            if method == "DELETE" and path.startswith(f"{view_path}/view-"):
+                return {}
+            if (method, path) == ("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace)):
                 return {}
             raise AssertionError(f"unexpected REST request: {method} {path}")
 
-        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
-            with self.assertRaisesRegex(RuntimeError, "metadata-location"):
-                pyiceberg_smoke.run_view_probe(args, mock.Mock())
+        with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="1234567890abcdef")):
+            with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
+                with mock.patch.object(pyiceberg_smoke, "paginated_identifier_names", return_value=["view-a", "view-b"]):
+                    with self.assertRaisesRegex(RuntimeError, "metadata-location"):
+                        pyiceberg_smoke.run_view_probe(args, mock.Mock())
 
-        self.assertIn(("DELETE", f"{view_path}/orders_smoke_view", None), calls)
+        self.assertIn(("DELETE", f"{view_path}/view-a", None), calls)
+        self.assertIn(("DELETE", f"{view_path}/view-b", None), calls)
+        self.assertIn(("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace), None), calls)
+
+    def test_view_probe_cleans_candidate_after_create_timeout(self) -> None:
+        args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
+        probe_namespace = "smoke-sales-orders-views-12345678"
+        namespace_path = pyiceberg_smoke.namespace_endpoint_path(args)
+        view_path = pyiceberg_smoke.view_endpoint_path(args, namespace=probe_namespace)
+        calls: list[tuple[str, str, object]] = []
+
+        def fake_signed_request(
+            _args: object,
+            _deps: object,
+            method: str,
+            path: str,
+            body: object = None,
+        ) -> dict[str, object]:
+            calls.append((method, path, body))
+            if (method, path) == ("POST", namespace_path):
+                return {}
+            if (method, path) == ("POST", view_path):
+                raise RuntimeError("timed out after commit")
+            if (method, path) == ("DELETE", f"{view_path}/view-a"):
+                return {}
+            if (method, path) == ("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace)):
+                return {}
+            raise AssertionError(f"unexpected REST request: {method} {path}")
+
+        with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="1234567890abcdef")):
+            with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
+                with self.assertRaisesRegex(RuntimeError, "timed out after commit"):
+                    pyiceberg_smoke.run_view_probe(args, mock.Mock())
+
+        self.assertIn(("DELETE", f"{view_path}/view-a", None), calls)
+        self.assertIn(("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace), None), calls)
+
+    def test_view_probe_continues_cleanup_after_delete_failure(self) -> None:
+        args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
+        probe_namespace = "smoke-sales-orders-views-12345678"
+        namespace_path = pyiceberg_smoke.namespace_endpoint_path(args)
+        view_path = pyiceberg_smoke.view_endpoint_path(args, namespace=probe_namespace)
+        calls: list[tuple[str, str, object]] = []
+
+        def fake_signed_request(
+            _args: object,
+            _deps: object,
+            method: str,
+            path: str,
+            body: object = None,
+        ) -> dict[str, object]:
+            calls.append((method, path, body))
+            if (method, path) == ("POST", namespace_path) or (method, path) == ("POST", view_path):
+                return {}
+            if (method, path) == ("GET", view_path):
+                return {"identifiers": [{"name": "view-a"}, {"name": "view-b"}], "next-page-token": None}
+            if (method, path) == ("GET", f"{view_path}/view-a"):
+                return {"metadata-location": "s3://lake/views/view-a/metadata/v1.json"}
+            if (method, path) == ("DELETE", f"{view_path}/view-b"):
+                raise pyiceberg_smoke.RestRequestError(method, path, 500, "delete failed")
+            if (method, path) == ("DELETE", f"{view_path}/view-a"):
+                return {}
+            if (method, path) == ("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace)):
+                return {}
+            raise AssertionError(f"unexpected REST request: {method} {path}")
+
+        with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="1234567890abcdef")):
+            with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
+                with mock.patch.object(pyiceberg_smoke, "paginated_identifier_names", return_value=["view-a", "view-b"]):
+                    with self.assertRaisesRegex(RuntimeError, "delete failed"):
+                        pyiceberg_smoke.run_view_probe(args, mock.Mock())
+
+        self.assertIn(("DELETE", f"{view_path}/view-b", None), calls)
+        self.assertIn(("DELETE", f"{view_path}/view-a", None), calls)
+        self.assertIn(("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace), None), calls)
+
+    def test_paginated_identifier_names_follows_tokens_until_null(self) -> None:
+        args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
+        view_path = pyiceberg_smoke.view_endpoint_path(args)
+        responses = [
+            {"identifiers": [], "next-page-token": "token-0"},
+            {"identifiers": [{"name": "orders_a"}], "next-page-token": "token-1"},
+            {"identifiers": [{"name": "orders_b"}], "next-page-token": None},
+        ]
+
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=responses) as request:
+            names = pyiceberg_smoke.paginated_identifier_names(args, mock.Mock(), view_path, page_size=1)
+
+        self.assertEqual(names, ["orders_a", "orders_b"])
+        self.assertEqual(request.call_count, 3)
+        self.assertTrue(request.call_args_list[0].args[3].endswith("?pageSize=1"))
+        self.assertNotIn("pageToken", request.call_args_list[0].args[3])
+        self.assertIn("pageSize=1", request.call_args_list[1].args[3])
+        self.assertIn("pageToken=token-0", request.call_args_list[1].args[3])
+        self.assertIn("pageSize=1", request.call_args_list[2].args[3])
+        self.assertIn("pageToken=token-1", request.call_args_list[2].args[3])
+
+    def test_paginated_identifier_names_rejects_invalid_sequences(self) -> None:
+        args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
+        view_path = pyiceberg_smoke.view_endpoint_path(args)
+        scenarios = [
+            ([{"identifiers": [], "next-page-token": "token-1"}, {"identifiers": [], "next-page-token": "token-1"}], "invalid next-page-token"),
+            ([{"identifiers": [{"name": "orders"}], "next-page-token": "token-1"}, {"identifiers": [{"name": "orders"}], "next-page-token": None}], "duplicate identifier"),
+            ([{"identifiers": []}], "omitted next-page-token"),
+            ([{"identifiers": [{"name": "orders_a"}, {"name": "orders_b"}], "next-page-token": None}], "exceeded pageSize"),
+        ]
+
+        for responses, message in scenarios:
+            with self.subTest(message=message):
+                with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=responses):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        pyiceberg_smoke.paginated_identifier_names(args, mock.Mock(), view_path, page_size=1)
 
     def test_maintenance_probe_rejects_unknown_worker_status(self) -> None:
         args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
@@ -364,7 +490,6 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         metadata_location_path = pyiceberg_smoke.table_endpoint_path(args, "/metadata-location")
         refs_path = pyiceberg_smoke.table_ref_endpoint_path(args)
         ref_name = pyiceberg_smoke.safe_ref_segment(args.namespace, args.table)
-        view_path = pyiceberg_smoke.view_endpoint_path(args)
         config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
         maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
         quarantine_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1/quarantine")
@@ -393,14 +518,6 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 return {"refs": {}}
             if method == "DELETE" and path.startswith(f"{refs_path}/"):
                 return {}
-            if (method, path) == ("POST", view_path):
-                return {}
-            if (method, path) == ("GET", view_path):
-                return {"identifiers": [{"name": "orders_smoke_view"}]}
-            if (method, path) == ("GET", f"{view_path}/orders_smoke_view"):
-                return {"metadata-location": "s3://lake/views/orders_smoke_view/metadata/v1.json"}
-            if (method, path) == ("DELETE", f"{view_path}/orders_smoke_view"):
-                return {}
             if (method, path) == ("PUT", config_path):
                 return {}
             if (method, path) == ("GET", config_path):
@@ -425,18 +542,20 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             raise AssertionError(f"unexpected REST request: {method} {path}")
 
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
-            with mock.patch.object(
-                pyiceberg_smoke,
-                "signed_rest_request_expect_error",
-                return_value=pyiceberg_smoke.RestRequestError(
-                    "DELETE",
-                    f"{refs_path}/{ref_name}",
-                    400,
-                    "snapshot ref has retention policy; force is required",
-                ),
-            ) as expect_error:
-                pyiceberg_smoke.run_catalog_api_probes(args, deps)
+            with mock.patch.object(pyiceberg_smoke, "run_view_probe") as view_probe:
+                with mock.patch.object(
+                    pyiceberg_smoke,
+                    "signed_rest_request_expect_error",
+                    return_value=pyiceberg_smoke.RestRequestError(
+                        "DELETE",
+                        f"{refs_path}/{ref_name}",
+                        400,
+                        "snapshot ref has retention policy; force is required",
+                    ),
+                ) as expect_error:
+                    pyiceberg_smoke.run_catalog_api_probes(args, deps)
 
+        view_probe.assert_called_once_with(args, deps)
         expect_error.assert_called_once_with(
             args,
             deps,

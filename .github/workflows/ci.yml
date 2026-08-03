@@ -340,9 +340,11 @@ jobs:
       - name: Annotate early-stop reason
         if: failure() && github.event_name == 'pull_request'
         run: |
-          echo "## CI early-stop" >> "$GITHUB_STEP_SUMMARY"
-          echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; cancelling run ${GITHUB_RUN_ID} to free runners." >> "$GITHUB_STEP_SUMMARY"
-          echo "Sibling jobs showing **cancelled** were stopped by this job, not by their own failure." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## CI early-stop"
+            echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; cancelling run ${GITHUB_RUN_ID} to free runners."
+            echo "Sibling jobs showing **cancelled** were stopped by this job, not by their own failure."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # curl rather than `gh`: every existing `gh` call in this repo runs on
       # ubuntu-latest, and the sm-standard-* images are custom and trimmed (they
@@ -665,15 +667,17 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
-      # Guard the security negative-auth smoke subset (backlog#1151 sec-5)
-      # against a rename or deletion silently dropping it out of the e2e-smoke
-      # filter. The script lists what the profile selects and fails if the count
-      # of security auth-rejection tests falls below the committed floor in
-      # .config/security-smoke-floor.txt (infra-12 count-floor mechanism). Run
-      # before the smoke suite so a thinned gate fails fast; the `nextest list`
-      # here compiles the e2e_test binaries the run below reuses.
-      - name: Check security smoke subset count floor
-        run: ./scripts/check_security_smoke_count.sh check
+      # Build the e2e test graph once. The archive is reused by the security
+      # count-floor check and the smoke run below, avoiding a second compile of
+      # the same e2e_test target on cold runners (backlog#1645).
+      - name: Archive e2e smoke test binaries
+        env:
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+        run: |
+          cargo nextest archive --profile e2e-smoke -p e2e_test --archive-file "${NEXTEST_ARCHIVE}"
+          cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --message-format json > "${NEXTEST_LISTING}"
+          ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
 
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
       # profile.e2e-smoke default-filter in .config/nextest.toml is the single
@@ -681,7 +685,30 @@ jobs:
       # adding new e2e jobs here. Each test spawns its own rustfs server on a
       # random port and reuses the downloaded debug binary above.
       - name: Run e2e smoke suite
-        run: cargo nextest run --profile e2e-smoke -p e2e_test
+        env:
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-smoke-logs
+        run: |
+          cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" \
+            --status-level all --final-status-level all --failure-output final
+
+      - name: Upload e2e smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-smoke-diagnostics-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/rustfs-e2e-smoke-logs/
+            ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+          if-no-files-found: warn
+
+      - name: Upload e2e smoke JUnit report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-smoke-junit-${{ github.run_number }}
+          path: target/nextest/e2e-smoke/junit.xml
+          if-no-files-found: warn
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
