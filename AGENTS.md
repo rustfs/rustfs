@@ -206,33 +206,13 @@ in [docs/testing/README.md](docs/testing/README.md) (open an issue within 24h,
 quarantine with an issue link, fix or delete within 30 days); the local
 `default` nextest profile never retries.
 
-## Adversarial Validation (Risk-Scaled)
+## Adversarial Validation (Default On)
 
 Every non-exempt output (see Risk tiers) — code change, bug fix, or
 design/solution proposal — passes multi-role adversarial review before it
 counts as done.
 Author confidence is not evidence: each role's job is to refute the change,
 not to bless it.
-
-Adversarial roles are review lenses, not a requirement to spawn one agent per
-role. Decide the required roles before implementation from the behavioral
-blast radius, trust boundaries, and failure modes — never from line count
-alone. A one-line change in a core path may require every relevant role.
-
-Scale agent delegation separately from role coverage:
-
-- Run every role selected by the impact assessment; do not drop a role merely
-  to save agent count or tokens.
-- Combine compatible roles in a small number of reviewer agents when one fresh
-  pass can attack them independently and report separate verdicts.
-- Split reviewers when domains require materially different expertise or when
-  independent review is needed to resolve a concrete uncertainty.
-- Prefer the primary agent's fresh sequential passes for genuinely localized,
-  low-impact changes; use independent reviewers for core or high-risk paths.
-- Reuse an existing reviewer for follow-up validation instead of spawning a new
-  agent for every role, file, finding, or iteration.
-- Before delegating, inspect active agents and stop or reuse idle/overlapping
-  tasks. Never fan out solely because concurrency is available.
 
 ### Risk tiers
 
@@ -250,12 +230,10 @@ Pick the tier from the riskiest file touched; when in doubt, pick the higher.
 
 ### Roles
 
-Run each applicable role as an independent review lens over the final diff (or
-proposal text). Multiple lenses may be combined in one reviewer pass; use
-parallel reviewer agents only when the risk boundaries are genuinely
-independent and the delegation limits above allow it. Otherwise run sequential
-passes that each start fresh from the diff and the nearest scoped `AGENTS.md`,
-discarding the writing session's assumptions.
+Run each applicable role as an independent pass over the final diff (or
+proposal text) — parallel reviewer agents where the tooling supports them,
+otherwise sequential passes that each start fresh from the diff and the
+nearest scoped `AGENTS.md`, discarding the writing session's assumptions.
 Each role either produces findings or reports "attacked X, Y, Z — no break
 found"; a bare pass is not a result. Repo-specific attack probes for every
 role live in `.agents/skills/adversarial-validation/` — run them, they
