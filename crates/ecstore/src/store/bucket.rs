@@ -1404,6 +1404,37 @@ mod tests {
         assert!(!any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
     }
 
+    /// `DeleteBucket`'s emptiness check is a raw disk scan (`has_xlmeta_files`),
+    /// not an S3-level listing, so "the client drained the bucket" and "the
+    /// bucket is deletable" are two different contracts. Nothing pinned the
+    /// second one, which is how the s3-tests lane ended up failing 219 cases on
+    /// `nuke_prefixed_buckets` while every test body passed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_succeeds_after_the_last_object_version_is_deleted() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-after-drain-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        create_bucket_with_object(&ecstore, &bucket, object).await;
+
+        ecstore
+            .delete_object(&bucket, object, ObjectOptions::default())
+            .await
+            .expect("client delete of the only object should succeed");
+
+        assert!(
+            !any_disk_has_object_metadata(&disk_paths, &bucket).await,
+            "deleting the last version must not leave xl.meta on disk: DeleteBucket scans the raw \
+             bucket directory, so residue here is reported to clients as BucketNotEmpty"
+        );
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("DeleteBucket must succeed once the client has drained the bucket");
+    }
+
     #[tokio::test]
     #[serial]
     async fn bucket_delete_default_s3_delete_still_rejects_non_empty_bucket() {
