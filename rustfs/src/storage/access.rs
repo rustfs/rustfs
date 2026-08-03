@@ -926,6 +926,44 @@ fn table_data_plane_admin_action(action: Action) -> Option<AdminAction> {
     }
 }
 
+fn table_credential_claim_matches_resource(
+    action: Action,
+    bucket: &str,
+    claims: &HashMap<String, serde_json::Value>,
+    resource: Option<&crate::table_catalog::TableDataPlaneResource>,
+) -> bool {
+    let table_bucket_claim = claims.get(crate::table_catalog::TABLE_CREDENTIAL_BUCKET_CLAIM);
+    let table_id_claim = claims.get(crate::table_catalog::TABLE_CREDENTIAL_TABLE_ID_CLAIM);
+    let scope_prefix_claim = claims.get(crate::table_catalog::TABLE_CREDENTIAL_SCOPE_PREFIX_CLAIM);
+    if table_bucket_claim.is_none() && table_id_claim.is_none() && scope_prefix_claim.is_none() {
+        return true;
+    }
+    let (
+        Some(serde_json::Value::String(table_bucket)),
+        Some(serde_json::Value::String(table_id)),
+        Some(serde_json::Value::String(scope_prefix)),
+        Some(resource),
+    ) = (table_bucket_claim, table_id_claim, scope_prefix_claim, resource)
+    else {
+        return false;
+    };
+    let action_allowed = matches!(
+        action,
+        Action::S3Action(
+            S3Action::GetObjectAction
+                | S3Action::PutObjectAction
+                | S3Action::DeleteObjectAction
+                | S3Action::AbortMultipartUploadAction
+                | S3Action::ListMultipartUploadPartsAction
+        )
+    );
+    action_allowed
+        && table_bucket == bucket
+        && table_bucket == &resource.table_bucket
+        && table_id == &resource.table_id
+        && scope_prefix == &format!("s3://{}/{}", resource.table_bucket, resource.warehouse_object_prefix)
+}
+
 fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
     let store =
         runtime_sources::current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
@@ -982,7 +1020,11 @@ async fn authorize_table_data_plane_if_needed(
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
     };
-    let Some(resource) = table_data_plane_resource_for_request(bucket, object).await? else {
+    let resource = table_data_plane_resource_for_request(bucket, object).await?;
+    if !table_credential_claim_matches_resource(action, bucket, claims, resource.as_ref()) {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    }
+    let Some(resource) = resource else {
         return Ok(());
     };
     let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
@@ -2249,7 +2291,7 @@ mod tests {
         has_write_offset_bytes_header, legal_hold_write_requested, list_parts_authorize_action,
         load_bucket_policy_existing_object_tag_hint, merge_list_bucket_query_conditions, merge_request_object_tag_conditions,
         owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
-        retention_write_requested, secondary_tag_hint_action, table_data_plane_admin_action,
+        retention_write_requested, secondary_tag_hint_action, table_credential_claim_matches_resource, table_data_plane_admin_action,
         validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
@@ -2360,6 +2402,90 @@ mod tests {
             Some(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction)
         );
         assert_eq!(table_data_plane_admin_action(Action::S3Action(S3Action::ListBucketAction)), None);
+    }
+
+    #[test]
+    fn table_vended_credential_is_bound_to_the_stable_table_identity() {
+        let get_object = Action::S3Action(S3Action::GetObjectAction);
+        let resource = crate::table_catalog::TableDataPlaneResource {
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            table_id: "table-id-v2".to_string(),
+            warehouse_object_prefix: "tables/table-id-v2/".to_string(),
+        };
+        let mut claims = HashMap::new();
+        assert!(table_credential_claim_matches_resource(get_object, "warehouse", &claims, Some(&resource)));
+        assert!(table_credential_claim_matches_resource(get_object, "warehouse", &claims, None));
+
+        claims.insert(
+            crate::table_catalog::TABLE_CREDENTIAL_BUCKET_CLAIM.to_string(),
+            serde_json::Value::String(resource.table_bucket.clone()),
+        );
+        claims.insert(
+            crate::table_catalog::TABLE_CREDENTIAL_SCOPE_PREFIX_CLAIM.to_string(),
+            serde_json::Value::String(format!("s3://{}/{}", resource.table_bucket, resource.warehouse_object_prefix)),
+        );
+        assert!(!table_credential_claim_matches_resource(
+            get_object,
+            "warehouse",
+            &claims,
+            Some(&resource)
+        ));
+        assert!(!table_credential_claim_matches_resource(get_object, "warehouse", &claims, None));
+
+        claims.insert(
+            crate::table_catalog::TABLE_CREDENTIAL_TABLE_ID_CLAIM.to_string(),
+            serde_json::Value::String(resource.table_id.clone()),
+        );
+        assert!(table_credential_claim_matches_resource(get_object, "warehouse", &claims, Some(&resource)));
+        assert!(!table_credential_claim_matches_resource(get_object, "warehouse", &claims, None));
+        assert!(!table_credential_claim_matches_resource(
+            get_object,
+            "other-warehouse",
+            &claims,
+            Some(&resource)
+        ));
+        assert!(!table_credential_claim_matches_resource(
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            "warehouse",
+            &claims,
+            Some(&resource)
+        ));
+
+        claims.insert(
+            crate::table_catalog::TABLE_CREDENTIAL_SCOPE_PREFIX_CLAIM.to_string(),
+            serde_json::Value::String("s3://warehouse/tables/old-table-id/".to_string()),
+        );
+        assert!(!table_credential_claim_matches_resource(
+            get_object,
+            "warehouse",
+            &claims,
+            Some(&resource)
+        ));
+        claims.insert(
+            crate::table_catalog::TABLE_CREDENTIAL_SCOPE_PREFIX_CLAIM.to_string(),
+            serde_json::Value::String(format!("s3://{}/{}", resource.table_bucket, resource.warehouse_object_prefix)),
+        );
+
+        claims.insert(
+            crate::table_catalog::TABLE_CREDENTIAL_TABLE_ID_CLAIM.to_string(),
+            serde_json::Value::String("dropped-table-id".to_string()),
+        );
+        assert!(!table_credential_claim_matches_resource(
+            get_object,
+            "warehouse",
+            &claims,
+            Some(&resource)
+        ));
+
+        claims.insert(crate::table_catalog::TABLE_CREDENTIAL_TABLE_ID_CLAIM.to_string(), serde_json::Value::Null);
+        assert!(!table_credential_claim_matches_resource(
+            get_object,
+            "warehouse",
+            &claims,
+            Some(&resource)
+        ));
     }
 
     #[test]
