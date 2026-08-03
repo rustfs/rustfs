@@ -404,7 +404,7 @@ pub async fn persist_force_delete_intent<S: ReplicationStorage>(
     mut entry: MrfReplicateEntry,
 ) -> Result<(), EcstoreError> {
     entry.force_delete_local_commit = false;
-    update_force_delete_intents(storage, false, move |entries, _exists| {
+    update_force_delete_intents(storage, move |entries, _exists| {
         if entries
             .iter()
             .any(|existing| existing.force_delete_id == entry.force_delete_id)
@@ -421,7 +421,7 @@ pub async fn commit_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
-    update_force_delete_intents(storage, true, move |entries, exists| {
+    update_force_delete_intents(storage, move |entries, exists| {
         if !exists {
             return Err(EcstoreError::ConfigNotFound);
         }
@@ -441,7 +441,7 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
-    update_force_delete_intents(storage, false, move |entries, exists| {
+    update_force_delete_intents(storage, move |entries, exists| {
         if !exists {
             return Ok(false);
         }
@@ -452,42 +452,46 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
     .await
 }
 
-const FORCE_DELETE_INTENT_CAS_RETRIES: usize = 2;
+const FORCE_DELETE_INTENT_CAS_RETRIES: usize = 3;
 
-async fn update_force_delete_intents<S, F>(
-    storage: Arc<S>,
-    retry_until_committed: bool,
-    mut update: F,
-) -> Result<(), EcstoreError>
+fn is_retryable_force_delete_error(error: &EcstoreError) -> bool {
+    matches!(error, EcstoreError::PreconditionFailed) || error.to_string().contains("force-delete journal lock lost")
+}
+
+async fn update_force_delete_intents<S, F>(storage: Arc<S>, mut update: F) -> Result<(), EcstoreError>
 where
     S: ReplicationStorage,
     F: FnMut(&mut Vec<MrfReplicateEntry>, bool) -> Result<bool, EcstoreError>,
 {
     let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let mut attempt = 0usize;
-    loop {
-        // The transaction lock serializes journal read-modify-write operations. Conditional
-        // persistence then takes the journal object's lock, so this order must remain stable.
-        let lock = storage
-            .new_ns_lock(
-                ReplicationMetadataStore::rustfs_meta_bucket(),
-                ReplicationMetadataStore::FORCE_DELETE_REPLICATION_TRANSACTION_LOCK,
-            )
-            .await?;
-        let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
-        let (mut entries, preconditions, exists) = read_force_delete_intents(storage.clone(), file).await?;
-        if !update(&mut entries, exists)? {
-            return Ok(());
-        }
-        match save_force_delete_intents(storage.clone(), file, &guard, entries, preconditions).await {
-            Err(EcstoreError::PreconditionFailed) if retry_until_committed || attempt < FORCE_DELETE_INTENT_CAS_RETRIES => {
-                attempt = attempt.saturating_add(1);
+    for attempt in 0..=FORCE_DELETE_INTENT_CAS_RETRIES {
+        let result = {
+            let lock = storage
+                .new_ns_lock(
+                    ReplicationMetadataStore::rustfs_meta_bucket(),
+                    ReplicationMetadataStore::FORCE_DELETE_REPLICATION_TRANSACTION_LOCK,
+                )
+                .await?;
+            // Lock order is transaction namespace lock -> force-delete journal object lock.
+            // Keep the transaction guard alive through the conditional write so legacy
+            // writers cannot interleave a read-modify-write transition within this process.
+            let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+            let (mut entries, preconditions, exists) = read_force_delete_intents(storage.clone(), file).await?;
+            if !update(&mut entries, exists)? {
+                return Ok(());
+            }
+            save_force_delete_intents(storage.clone(), file, &guard, entries, preconditions).await
+        };
+
+        match result {
+            Err(error) if is_retryable_force_delete_error(&error) && attempt < FORCE_DELETE_INTENT_CAS_RETRIES => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
             }
             result => return result,
         }
     }
+
+    Err(EcstoreError::other("force-delete journal update retries exhausted"))
 }
 
 async fn read_force_delete_intents<S: ReplicationObjectIO>(
@@ -4638,16 +4642,17 @@ mod tests {
         persist_force_delete_intent(storage.clone(), entry.clone())
             .await
             .expect("journal append should succeed");
-        let mut replacements = shared
-            .conditional_write_replacements
-            .lock()
-            .expect("test replacement lock should not be poisoned");
-        for object in ["first", "second", "third"] {
-            let mut replacement = entry.clone();
-            replacement.object = object.to_string();
-            replacements.push_back(encode_mrf_file(&[replacement]).expect("concurrent journal entry should encode"));
+        {
+            let mut replacements = shared
+                .conditional_write_replacements
+                .lock()
+                .expect("test replacement lock should not be poisoned");
+            for object in ["first", "second", "third"] {
+                let mut replacement = entry.clone();
+                replacement.object = object.to_string();
+                replacements.push_back(encode_mrf_file(&[replacement]).expect("concurrent journal entry should encode"));
+            }
         }
-        drop(replacements);
 
         commit_force_delete_intent(storage.clone(), operation_id)
             .await
