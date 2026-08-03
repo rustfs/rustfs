@@ -4423,6 +4423,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_bucket_drive_result_eviction_survives_full_refresh() {
+        let metrics = Metrics::new();
+        for index in 0..MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS {
+            metrics.record_scanner_bucket_drive_result(&format!("bucket-{index}"), "/data1", "success");
+        }
+        for index in 0..MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS {
+            metrics.record_scanner_bucket_drive_result(&format!("bucket-{index}"), "/data1", "success");
+        }
+        metrics.record_scanner_bucket_drive_result("overflow", "/data1", "success");
+
+        let report = metrics.scanner_runtime_details_report();
+
+        assert_eq!(report.bucket_drive_results.len(), MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS);
+        assert!(
+            report
+                .bucket_drive_results
+                .iter()
+                .any(|snapshot| snapshot.bucket == "overflow")
+        );
+        assert!(
+            report
+                .bucket_drive_results
+                .iter()
+                .all(|snapshot| snapshot.bucket != "bucket-0")
+        );
+    }
+
+    #[tokio::test]
     async fn report_includes_usage_freshness_status() {
         let metrics = Metrics::new();
         metrics.record_scanner_dirty_usage_pending(2);

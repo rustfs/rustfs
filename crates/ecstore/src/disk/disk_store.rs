@@ -2339,6 +2339,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_disk_health_wrapper_counts_faulty_precheck_rejections() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        let operation_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_ran_in_call = Arc::clone(&operation_ran);
+
+        let err = wrapper
+            .track_disk_health_with_op(
+                "read_all",
+                || async move {
+                    operation_ran_in_call.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect_err("faulty generic wrapper call should be rejected before operation runs");
+
+        assert_eq!(err, DiskError::FaultyDisk);
+        assert!(!operation_ran.load(Ordering::Relaxed));
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
+        assert_eq!(snapshot.total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn local_disk_health_wrapper_counts_stale_precheck_rejections() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        {
+            let mut format_info = disk.format_info.write().await;
+            format_info.id = Some(Uuid::new_v4());
+            format_info.file_info = Some(
+                tokio::fs::metadata(dir.path())
+                    .await
+                    .expect("temp dir metadata should be readable"),
+            );
+            format_info.last_check = Some(::time::OffsetDateTime::now_utc());
+        }
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+        let operation_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_ran_in_call = Arc::clone(&operation_ran);
+
+        let err = wrapper
+            .track_disk_health_with_op(
+                "write_all",
+                || async move {
+                    operation_ran_in_call.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect_err("stale generic wrapper call should be rejected before operation runs");
+
+        assert_eq!(err, DiskError::DiskNotFound);
+        assert!(!operation_ran.load(Ordering::Relaxed));
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("write_all"), Some(&1));
+        assert_eq!(snapshot.total_errors_availability, 1);
+    }
+
+    #[tokio::test]
     async fn delete_versions_counts_returned_batch_error_classes() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint =
