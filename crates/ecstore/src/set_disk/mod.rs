@@ -3793,7 +3793,12 @@ fn restore_expiry_snapshot_matches(obj_info: &ObjectInfo, opts: &ObjectOptions) 
         && expected.expected_data_dir == obj_info.data_dir
         && obj_info.restore_expires == Some(expected.restore_expiry)
         && !obj_info.restore_ongoing
-        && expected.restore_expiry <= OffsetDateTime::now_utc()
+        // Deliberately no `restore_expiry <= now` clause. Whether the restored
+        // copy is due to expire is the ILM evaluator's decision, already made
+        // when it emitted DeleteRestoredAction; re-deriving it here only adds a
+        // way for a legitimate action to be rejected. The stale-event risk it
+        // looks like it covers is already covered above: a re-restore rewrites
+        // `restore_expires`, so a replayed event fails the equality check.
         && match obj_info.version_id {
             Some(version_id) => opts.version_id.as_deref().and_then(|value| Uuid::parse_str(value).ok()) == Some(version_id),
             None => opts.version_id.is_none(),

@@ -1122,12 +1122,17 @@ impl DefaultMultipartUsecase {
             key_marker,
             max_uploads,
         } = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
-        let expected_incarnation_id = opts
-            .expected_bucket_incarnation_id
-            .ok_or_else(|| s3_error!(InternalError, "ListMultipartUploads bucket generation guard is missing"))?;
-
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // `apply_bucket_generation_guard` tolerates a missing guard (only the S3
+        // access layer installs one), so resolve the current generation rather
+        // than failing the request. Listing is filtered by this value, so a
+        // stale one simply hides foreign-incarnation uploads, as intended.
+        let expected_incarnation_id = match opts.expected_bucket_incarnation_id {
+            Some(incarnation_id) => incarnation_id,
+            None => store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?,
         };
 
         let result = store

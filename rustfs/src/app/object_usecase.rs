@@ -7881,9 +7881,19 @@ impl DefaultObjectUsecase {
             .await
             .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
-        let restore_bucket_incarnation_id = opts
-            .expected_bucket_incarnation_id
-            .ok_or_else(|| s3_error!(InternalError, "RestoreObject bucket generation guard is missing"))?;
+        // `apply_bucket_generation_guard` deliberately tolerates a missing guard
+        // (only the S3 access layer installs one), so this must not hard-require
+        // it. Resolve the current generation instead, exactly as the copy path
+        // does. The fence is unaffected: the value is re-read from disk and
+        // compared below, before the restore is admitted.
+        let restore_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
+            Some(incarnation_id) => incarnation_id,
+            None => {
+                let incarnation_id = store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?;
+                opts.expected_bucket_incarnation_id = Some(incarnation_id);
+                incarnation_id
+            }
+        };
 
         // SELECT-type restores skip both the ongoing check and the metadata
         // write below, so the accept guard would protect nothing for them —
