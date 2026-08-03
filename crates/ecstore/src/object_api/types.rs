@@ -762,6 +762,10 @@ impl ObjectInfo {
     }
 
     pub fn replication_state(&self) -> ReplicationState {
+        // Derived from the durable internal keys, not from the wire form: the
+        // state's positional encoding skips this map.
+        let (target_delete_marker_version_ids, target_delete_marker_version_ids_corrupt) =
+            rustfs_utils::http::target_delete_marker_versions(&self.user_defined);
         ReplicationState {
             replication_status_internal: self.replication_status_internal.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
@@ -779,6 +783,8 @@ impl ObjectInfo {
                     .map(|arn| (arn, v.clone()))
                 })
                 .collect(),
+            target_delete_marker_version_ids,
+            target_delete_marker_version_ids_corrupt,
             ..Default::default()
         }
     }

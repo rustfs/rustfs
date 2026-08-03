@@ -1634,6 +1634,29 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
     }
 }
 
+/// Which version a delete-marker purge should address on one target.
+///
+/// `None` means do not purge at all: the recorded mapping disagreed across the
+/// dual internal prefixes, and guessing an id could destroy a live version on
+/// the target. `Some(id)` is the exact version the target reported when it
+/// accepted the marker; falling back to a source-derived id is only correct
+/// when the target mirrors source version ids, which a generic S3 target does
+/// not.
+fn delete_marker_purge_version_id(
+    state: Option<&ReplicationState>,
+    arn: &str,
+    delete_marker_version_id: Uuid,
+) -> Option<Option<String>> {
+    if state.is_some_and(|state| state.target_delete_marker_version_ids_corrupt) {
+        return None;
+    }
+    let recorded = state.and_then(|state| state.target_delete_marker_version_ids.get(arn).cloned());
+    Some(match recorded {
+        Some(version_id) => Some(version_id),
+        None => target_delete_version_id(delete_marker_version_id, true),
+    })
+}
+
 async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo, dsc: &ReplicateDecision) {
     let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
         return;
@@ -1651,11 +1674,27 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
             continue;
         };
 
+        let Some(purge_version_id) = delete_marker_purge_version_id(
+            dobj.delete_object.replication_state.as_ref(),
+            &tgt_entry.arn,
+            delete_marker_version_id,
+        ) else {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket,
+                object = dobj.delete_object.object_name,
+                arn = tgt_entry.arn,
+                "Skipping delete-marker purge: recorded target version metadata is inconsistent"
+            );
+            continue;
+        };
+
         let _ = tgt_client
             .remove_object(
                 &tgt_client.bucket,
                 &dobj.delete_object.object_name,
-                target_delete_version_id(delete_marker_version_id, true),
+                purge_version_id,
                 replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
             )
             .await;
@@ -2007,16 +2046,24 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         )
         .await
     {
-        Ok(_) => {
+        Ok(assigned_version_id) => {
             debug!(
                 bucket = tgt_client.bucket,
                 object = dobj.delete_object.object_name,
                 version_id = ?version_id,
+                assigned_version_id = ?assigned_version_id,
                 delete_marker = dobj.delete_object.delete_marker,
                 is_version_purge,
                 "replicate_delete_to_target succeeded"
             );
             if !is_version_purge {
+                // Record the version the target actually assigned to the marker it
+                // just created. A later purge addresses that id directly instead of
+                // deriving one from the source uuid, which only holds when the
+                // target mirrors source version ids.
+                if dobj.delete_object.delete_marker {
+                    rinfo.target_delete_marker_version_id = assigned_version_id.filter(|version_id| !version_id.is_empty());
+                }
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
@@ -4008,5 +4055,36 @@ mod tests {
         assert_eq!(target_delete_version_id(version_id, true), Some(version_id.to_string()));
         assert_eq!(target_delete_version_id(Uuid::nil(), true).as_deref(), Some(NULL_VERSION_ID));
         assert_eq!(target_delete_version_id(Uuid::nil(), false), None);
+    }
+
+    #[test]
+    fn delete_marker_purge_prefers_the_recorded_target_version() {
+        let source = Uuid::new_v4();
+        let arn = "arn:rustfs:replication::target:bucket";
+
+        // No recorded mapping: fall back to deriving from the source uuid.
+        assert_eq!(delete_marker_purge_version_id(None, arn, source), Some(Some(source.to_string())));
+
+        // Recorded mapping wins — a generic S3 target assigns its own id, so the
+        // derived one would purge the wrong version or nothing at all.
+        let mut state = ReplicationState::default();
+        state
+            .target_delete_marker_version_ids
+            .insert(arn.to_string(), "target-assigned-id".to_string());
+        assert_eq!(
+            delete_marker_purge_version_id(Some(&state), arn, source),
+            Some(Some("target-assigned-id".to_string()))
+        );
+
+        // A mapping recorded for a different ARN must not be reused.
+        assert_eq!(
+            delete_marker_purge_version_id(Some(&state), "arn:rustfs:replication::other:bucket", source),
+            Some(Some(source.to_string()))
+        );
+
+        // Inconsistent persisted metadata: refuse to purge rather than guess.
+        let mut corrupt = state.clone();
+        corrupt.target_delete_marker_version_ids_corrupt = true;
+        assert_eq!(delete_marker_purge_version_id(Some(&corrupt), arn, source), None);
     }
 }

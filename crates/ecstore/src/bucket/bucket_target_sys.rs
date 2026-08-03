@@ -2000,7 +2000,7 @@ impl TargetClient {
         object: &str,
         version_id: Option<String>,
         opts: RemoveObjectOptions,
-    ) -> Result<(), S3ClientError> {
+    ) -> Result<Option<String>, S3ClientError> {
         let headers = build_remove_object_headers(version_id.as_deref(), &opts);
         let api_version_id = resolve_delete_api_version_id(version_id, &opts);
 
@@ -2023,7 +2023,11 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(_res) => Ok(()),
+            // A DELETE without a version id on a versioned target creates a delete
+            // marker and reports the version it assigned. That id is the only
+            // reliable handle for purging the marker later: a generic S3 target
+            // does not mirror source version ids.
+            Ok(res) => Ok(res.version_id().map(ToOwned::to_owned)),
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();

@@ -868,6 +868,31 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     }
 }
 
+/// `ReplicationState::target_delete_marker_version_ids` is skipped by the
+/// positional `FileInfo` wire form, so a remote disk would otherwise receive a
+/// delete with an empty map and lose the exact per-target version. Copy it into
+/// the object's internal metadata — the durable carrier both sides already
+/// agree on — before the delete is dispatched. Bounds mirror
+/// `persist_target_delete_marker_versions`; anything outside them is dropped
+/// rather than forwarded.
+fn delete_file_info_with_replication_transport_metadata(fi: &FileInfo) -> FileInfo {
+    let mut transported = fi.clone();
+    let Some(state) = transported.replication_state_internal.as_ref() else {
+        return transported;
+    };
+    if state.target_delete_marker_version_ids.len() > 1_000 {
+        return transported;
+    }
+    for (arn, version_id) in &state.target_delete_marker_version_ids {
+        if !arn.starts_with("arn:") || arn.len() > 1_024 || version_id.is_empty() || version_id.len() > 1_024 {
+            continue;
+        }
+        let suffix = format!("{}{}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, arn);
+        rustfs_utils::http::insert_str(&mut transported.metadata, &suffix, version_id.clone());
+    }
+    transported
+}
+
 impl SetDisks {
     /// `put_object` plus the destination key's previous current-version size,
     /// quorum-reduced from the dst `xl.meta` copies `rename_data` reads while
@@ -3001,6 +3026,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        let transported = delete_file_info_with_replication_transport_metadata(fi);
+        let fi = &transported;
         let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
         let rollback_dir = Uuid::new_v4();
