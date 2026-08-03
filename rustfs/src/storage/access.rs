@@ -2291,8 +2291,8 @@ mod tests {
         has_write_offset_bytes_header, legal_hold_write_requested, list_parts_authorize_action,
         load_bucket_policy_existing_object_tag_hint, merge_list_bucket_query_conditions, merge_request_object_tag_conditions,
         owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
-        retention_write_requested, secondary_tag_hint_action, table_credential_claim_matches_resource, table_data_plane_admin_action,
-        validate_post_object_success_controls, versioned_read_action,
+        retention_write_requested, secondary_tag_hint_action, table_credential_claim_matches_resource,
+        table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};

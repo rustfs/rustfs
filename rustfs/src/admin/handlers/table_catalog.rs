@@ -32,14 +32,10 @@ use matchit::Params;
 use metrics::{counter, histogram};
 use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-#[cfg(test)]
-use rustfs_policy::policy::Policy;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_utils::crypto::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad, hex_sha256};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::time::{Duration as StdDuration, Instant};
@@ -78,8 +74,6 @@ const REST_PAGE_SIZE_QUERY_PARAMETER: &str = "pageSize";
 const REST_NAMESPACE_SEPARATOR: char = '\u{1f}';
 const REST_NAMESPACE_SEPARATOR_UTF8: &str = "\u{1f}";
 const REST_NAMESPACE_SEPARATOR_URL_ENCODED: &str = "%1F";
-const TABLE_WAREHOUSE_READ_ACTIONS: &[S3Action] = &[S3Action::GetObjectAction];
-const TABLE_WAREHOUSE_WRITE_ACTIONS: &[S3Action] = &[S3Action::PutObjectAction, S3Action::DeleteObjectAction];
 const TABLE_COMMIT_MAX_MANIFESTS: usize = 10_000;
 const TABLE_COMMIT_MAX_AVRO_BYTES: usize = 512 * 1024 * 1024;
 const TABLE_COMMIT_MAX_FILE_REFERENCES: usize = 1_000_000;
@@ -1349,21 +1343,25 @@ async fn authorize_optional_table_catalog_object_read(
     }
 }
 
-fn table_catalog_prefix_authorization_probe(object_prefix: &str) -> String {
-    format!("{}/{}", object_prefix.trim_end_matches('/'), Uuid::new_v4())
-}
-
-async fn authorize_table_warehouse_s3_actions(
-    req: &mut S3Request<Body>,
+async fn authorize_table_warehouse_claim(
+    req: &S3Request<Body>,
+    principal: &TableCatalogRequestPrincipal,
     bucket: &str,
     warehouse_location: &str,
-    actions: &[S3Action],
 ) -> S3Result<()> {
     validate_table_location_in_bucket(bucket, warehouse_location)?;
     let warehouse_prefix = crate::table_catalog::table_catalog_object_key_from_location(bucket, warehouse_location)
         .ok_or_else(|| s3_error!(InvalidRequest, "table location must be inside the warehouse bucket"))?;
-    let authorization_probe = table_catalog_prefix_authorization_probe(&warehouse_prefix);
-    authorize_table_catalog_s3_actions(req, bucket, &authorization_probe, actions).await
+    validate_admin_request_with_bucket_object(
+        &req.headers,
+        &principal.credentials,
+        principal.owner,
+        false,
+        vec![Action::AdminAction(AdminAction::RegisterTableAction)],
+        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        AdminResourceScope::bucket_object(bucket, warehouse_prefix.trim_end_matches('/')),
+    )
+    .await
 }
 
 async fn read_authorized_table_metadata_json(
@@ -1385,7 +1383,8 @@ async fn read_authorized_table_metadata_json(
         return Err(s3_error!(InvalidRequest, "table metadata object not found: {metadata_location}"));
     };
     let metadata = parse_table_metadata_json(&object.data)?;
-    authorize_table_warehouse_s3_actions(req, bucket, metadata_table_location(&metadata)?, TABLE_WAREHOUSE_WRITE_ACTIONS).await?;
+    let principal = table_catalog_request_principal(req).await?;
+    authorize_table_warehouse_claim(req, &principal, bucket, metadata_table_location(&metadata)?).await?;
     crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard.as_ref()).map_err(catalog_store_error)?;
     Ok((metadata, metadata_guard))
 }
@@ -3187,9 +3186,22 @@ fn validate_supported_table_metadata(metadata: &serde_json::Value) -> S3Result<(
                 return Err(s3_error!(InvalidRequest, "Iceberg v1 table metadata is missing schema"));
             }
             require_metadata_array(metadata, "partition-spec")?;
+            if let Some(snapshots) = metadata.get("snapshots").and_then(serde_json::Value::as_array) {
+                for snapshot in snapshots {
+                    if snapshot
+                        .get("sequence-number")
+                        .is_some_and(|sequence_number| sequence_number.as_i64() != Some(0))
+                    {
+                        return Err(s3_error!(InvalidRequest, "Iceberg v1 snapshot sequence-number must be zero when present"));
+                    }
+                }
+            }
         }
         2 => {
-            require_metadata_i64(metadata, "last-sequence-number")?;
+            let last_sequence_number = require_metadata_i64(metadata, "last-sequence-number")?;
+            if last_sequence_number < 0 {
+                return Err(s3_error!(InvalidRequest, "last-sequence-number must not be negative"));
+            }
             if require_metadata_array(metadata, "schemas")?.is_empty() {
                 return Err(s3_error!(InvalidRequest, "table metadata schemas must not be empty"));
             }
@@ -3203,6 +3215,20 @@ fn validate_supported_table_metadata(metadata: &serde_json::Value) -> S3Result<(
                 return Err(s3_error!(InvalidRequest, "table metadata sort-orders must not be empty"));
             }
             require_metadata_i32(metadata, "default-sort-order-id")?;
+            if let Some(snapshots) = metadata.get("snapshots").and_then(serde_json::Value::as_array) {
+                for snapshot in snapshots {
+                    let sequence_number = snapshot
+                        .get("sequence-number")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| s3_error!(InvalidRequest, "Iceberg v2 snapshot sequence-number must be an integer"))?;
+                    if sequence_number < 0 || sequence_number > last_sequence_number {
+                        return Err(s3_error!(
+                            InvalidRequest,
+                            "Iceberg v2 snapshot sequence-number must be between zero and last-sequence-number"
+                        ));
+                    }
+                }
+            }
         }
         _ => return Err(s3_error!(InvalidRequest, "unsupported Iceberg table format-version")),
     }
@@ -3620,6 +3646,18 @@ fn apply_upgrade_format_version_update(metadata: &mut serde_json::Value, update:
     if version < current {
         return Err(s3_error!(InvalidRequest, "format-version cannot be downgraded"));
     }
+    if current == 1
+        && version == 2
+        && let Some(snapshots) = metadata.get_mut("snapshots").and_then(serde_json::Value::as_array_mut)
+    {
+        for snapshot in snapshots {
+            snapshot
+                .as_object_mut()
+                .ok_or_else(|| s3_error!(InvalidRequest, "snapshot must be an object"))?
+                .entry("sequence-number".to_string())
+                .or_insert_with(|| serde_json::Value::from(0));
+        }
+    }
     metadata_object_mut(metadata)?.insert("format-version".to_string(), serde_json::Value::from(version));
     Ok(())
 }
@@ -3923,6 +3961,8 @@ struct SnapshotReadBudget {
     manifest_count: usize,
     avro_bytes: usize,
     file_reference_count: usize,
+    manifest_lists: BTreeMap<String, Vec<crate::table_catalog::ManifestListReference>>,
+    manifests: BTreeMap<String, Vec<crate::table_catalog::ManifestDataFileReference>>,
 }
 
 impl SnapshotReadBudget {
@@ -4003,7 +4043,6 @@ struct SnapshotFileIdentity {
 }
 
 async fn validate_table_snapshot_commit_conflicts<B>(
-    mut req: Option<&mut S3Request<Body>>,
     context: &SnapshotReadContext<'_, B>,
     current_metadata: &serde_json::Value,
     next_metadata: &serde_json::Value,
@@ -4049,10 +4088,8 @@ where
         })
         .transpose()?;
     let mut read_budget = SnapshotReadBudget::default();
-    let parent_live_files =
-        load_snapshot_live_files(req.as_deref_mut(), context, current_metadata, parent_snapshot_id, &mut read_budget).await?;
+    let parent_live_files = load_snapshot_live_files(context, current_metadata, parent_snapshot_id, &mut read_budget).await?;
     let changes = load_snapshot_file_changes(
-        req,
         context,
         SnapshotChangeContext {
             metadata: next_metadata,
@@ -4109,11 +4146,7 @@ where
     Ok(())
 }
 
-async fn validate_table_snapshot_graph<B>(
-    mut req: Option<&mut S3Request<Body>>,
-    context: &SnapshotReadContext<'_, B>,
-    metadata: &serde_json::Value,
-) -> S3Result<()>
+async fn validate_table_snapshot_graph<B>(context: &SnapshotReadContext<'_, B>, metadata: &serde_json::Value) -> S3Result<()>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
@@ -4130,7 +4163,7 @@ where
             .get("snapshot-id")
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot-id must be an integer"))?;
-        load_snapshot_live_files(req.as_deref_mut(), context, metadata, Some(snapshot_id), &mut read_budget).await?;
+        load_snapshot_live_files(context, metadata, Some(snapshot_id), &mut read_budget).await?;
     }
     Ok(())
 }
@@ -4154,7 +4187,6 @@ fn added_snapshot_update(updates: &[serde_json::Value]) -> S3Result<Option<&serd
 }
 
 async fn load_snapshot_live_files<B>(
-    req: Option<&mut S3Request<Body>>,
     context: &SnapshotReadContext<'_, B>,
     current_metadata: &serde_json::Value,
     snapshot_id: Option<i64>,
@@ -4178,7 +4210,7 @@ where
 
     let mut live_files = SnapshotLiveFiles::default();
     let mut seen_locations = BTreeSet::new();
-    for manifest in read_snapshot_manifest_references(req, context, current_metadata, snapshot, read_budget).await? {
+    for manifest in read_snapshot_manifest_references(context, current_metadata, snapshot, read_budget).await? {
         let SnapshotManifestLocation {
             manifest_path,
             partition_spec_id: _,
@@ -4224,7 +4256,6 @@ where
 }
 
 async fn load_snapshot_file_changes<B>(
-    req: Option<&mut S3Request<Body>>,
     read_context: &SnapshotReadContext<'_, B>,
     change_context: SnapshotChangeContext<'_>,
     read_budget: &mut SnapshotReadBudget,
@@ -4235,8 +4266,7 @@ where
     let mut changes = SnapshotFileChanges::default();
     let mut seen_locations = BTreeSet::new();
     for manifest in
-        read_snapshot_manifest_references(req, read_context, change_context.metadata, change_context.snapshot, read_budget)
-            .await?
+        read_snapshot_manifest_references(read_context, change_context.metadata, change_context.snapshot, read_budget).await?
     {
         for reference in &manifest.references {
             if !seen_locations.insert(reference.location.clone()) {
@@ -4362,7 +4392,6 @@ struct SnapshotManifestReferences {
 }
 
 async fn read_snapshot_manifest_references<B>(
-    mut req: Option<&mut S3Request<Body>>,
     context: &SnapshotReadContext<'_, B>,
     metadata: &serde_json::Value,
     snapshot: &serde_json::Value,
@@ -4371,7 +4400,7 @@ async fn read_snapshot_manifest_references<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let manifest_locations = snapshot_manifest_locations(req.as_deref_mut(), context, snapshot, read_budget).await?;
+    let manifest_locations = snapshot_manifest_locations(context, snapshot, read_budget).await?;
     let partition_spec_ids = table_metadata_partition_spec_ids(metadata)?;
     let format_version = metadata_format_version(metadata)?;
     let mut manifests = Vec::new();
@@ -4400,16 +4429,25 @@ where
             &manifest_location.manifest_path,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestFile,
         )?;
-        authorize_optional_table_catalog_object_read(req.as_deref_mut(), context.bucket, &manifest_key).await?;
-        let manifest_object = context
-            .metadata_backend
-            .read_object_limited(context.bucket, &manifest_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
+        let file_references = if let Some(references) = read_budget.manifests.get(&manifest_key).cloned() {
+            references
+        } else {
+            let manifest_object = context
+                .metadata_backend
+                .read_object_limited(context.bucket, &manifest_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
+                .await
+                .map_err(catalog_store_error)?
+                .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
+            read_budget.charge_avro_bytes(manifest_object.data.len())?;
+            let references = tokio::task::spawn_blocking(move || {
+                crate::table_catalog::data_file_references_from_manifest_avro(&manifest_object.data)
+            })
             .await
-            .map_err(catalog_store_error)?
-            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
-        read_budget.charge_avro_bytes(manifest_object.data.len())?;
-        let file_references =
-            crate::table_catalog::data_file_references_from_manifest_avro(&manifest_object.data).map_err(catalog_store_error)?;
+            .map_err(|err| s3_error!(InternalError, "snapshot manifest parser task failed: {err}"))?
+            .map_err(catalog_store_error)?;
+            read_budget.manifests.insert(manifest_key, references.clone());
+            references
+        };
         read_budget.charge_file_references(file_references.len())?;
         let mut references = Vec::with_capacity(file_references.len());
         for mut reference in file_references {
@@ -4424,7 +4462,7 @@ where
             }
             references.push(reference);
         }
-        validate_manifest_data_file_references(req.as_deref_mut(), context, &references).await?;
+        validate_manifest_data_file_references(context, &references).await?;
         manifests.push(SnapshotManifestReferences {
             location: manifest_location,
             references,
@@ -4442,7 +4480,6 @@ struct SnapshotManifestLocation {
 }
 
 async fn snapshot_manifest_locations<B>(
-    req: Option<&mut S3Request<Body>>,
     context: &SnapshotReadContext<'_, B>,
     snapshot: &serde_json::Value,
     read_budget: &mut SnapshotReadBudget,
@@ -4459,16 +4496,25 @@ where
             manifest_list_location,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestList,
         )?;
-        authorize_optional_table_catalog_object_read(req, context.bucket, &manifest_list_key).await?;
-        let manifest_list_object = context
-            .metadata_backend
-            .read_object_limited(context.bucket, &manifest_list_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
+        let references = if let Some(references) = read_budget.manifest_lists.get(&manifest_list_key).cloned() {
+            references
+        } else {
+            let manifest_list_object = context
+                .metadata_backend
+                .read_object_limited(context.bucket, &manifest_list_key, crate::table_catalog::TABLE_MANIFEST_AVRO_MAX_SIZE)
+                .await
+                .map_err(catalog_store_error)?
+                .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest-list object is missing"))?;
+            read_budget.charge_avro_bytes(manifest_list_object.data.len())?;
+            let references = tokio::task::spawn_blocking(move || {
+                crate::table_catalog::manifest_list_references_from_manifest_list_avro(&manifest_list_object.data)
+            })
             .await
-            .map_err(catalog_store_error)?
-            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest-list object is missing"))?;
-        read_budget.charge_avro_bytes(manifest_list_object.data.len())?;
-        let references = crate::table_catalog::manifest_list_references_from_manifest_list_avro(&manifest_list_object.data)
+            .map_err(|err| s3_error!(InternalError, "snapshot manifest-list parser task failed: {err}"))?
             .map_err(catalog_store_error)?;
+            read_budget.manifest_lists.insert(manifest_list_key, references.clone());
+            references
+        };
         if references.is_empty() {
             return Err(s3_error!(InvalidRequest, "snapshot manifest-list must reference at least one manifest"));
         }
@@ -4509,7 +4555,6 @@ where
 }
 
 async fn validate_manifest_data_file_references<B>(
-    mut req: Option<&mut S3Request<Body>>,
     context: &SnapshotReadContext<'_, B>,
     references: &[crate::table_catalog::ManifestDataFileReference],
 ) -> S3Result<()>
@@ -4527,8 +4572,9 @@ where
                 &reference.location,
                 reference.object_kind.clone(),
             )?;
-            authorize_optional_table_catalog_object_read(req.as_deref_mut(), context.bucket, &object_key).await?;
-            object_keys.push(object_key);
+            if reference.entry_status != Some(2) {
+                object_keys.push(object_key);
+            }
         }
 
         let metadata_backend = context.metadata_backend.clone();
@@ -5050,7 +5096,6 @@ fn table_identifier_from_request(
 }
 
 async fn register_table_response<S, B>(
-    req: Option<&mut S3Request<Body>>,
     store: &S,
     metadata_backend: &B,
     bucket: &str,
@@ -5080,7 +5125,7 @@ where
         table: &table,
         entry: &entry,
     };
-    validate_table_snapshot_graph(req, &snapshot_context, &metadata).await?;
+    validate_table_snapshot_graph(&snapshot_context, &metadata).await?;
     store
         .register_table(entry.clone())
         .await
@@ -5103,7 +5148,7 @@ where
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
     let metadata_data = serde_json::to_vec(&metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize initial table metadata: {}", err))?;
-    let _metadata_guard = metadata_backend
+    let metadata_guard = metadata_backend
         .acquire_write_lock(bucket, &entry.metadata_location)
         .await
         .map_err(catalog_store_error)?;
@@ -5116,12 +5161,13 @@ where
         )
         .await
         .map_err(catalog_store_already_exists_error)?;
+    crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard.as_ref()).map_err(catalog_store_error)?;
     if let Err(err) = store
         .create_table(entry.clone())
         .await
         .map_err(catalog_store_already_exists_error)
     {
-        rollback_initial_metadata(metadata_backend, bucket, &entry.metadata_location, "table").await;
+        rollback_initial_metadata(metadata_backend, metadata_guard.as_ref(), bucket, &entry.metadata_location, "table").await;
         return Err(err);
     }
     Ok(load_table_response_from_entry(entry, metadata))
@@ -5142,7 +5188,7 @@ where
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
     let metadata_data = serde_json::to_vec(&metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize initial view metadata: {}", err))?;
-    let _metadata_guard = metadata_backend
+    let metadata_guard = metadata_backend
         .acquire_write_lock(bucket, &entry.metadata_location)
         .await
         .map_err(catalog_store_error)?;
@@ -5155,12 +5201,13 @@ where
         )
         .await
         .map_err(catalog_store_already_exists_error)?;
+    crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard.as_ref()).map_err(catalog_store_error)?;
     if let Err(err) = store
         .create_view(entry.clone())
         .await
         .map_err(catalog_store_already_exists_error)
     {
-        rollback_initial_metadata(metadata_backend, bucket, &entry.metadata_location, "view").await;
+        rollback_initial_metadata(metadata_backend, metadata_guard.as_ref(), bucket, &entry.metadata_location, "view").await;
         return Err(err);
     }
     Ok(load_view_response_from_entry(entry, metadata))
@@ -5168,10 +5215,21 @@ where
 
 async fn rollback_initial_metadata(
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    metadata_guard: &dyn crate::table_catalog::TableCatalogObjectLockGuard,
     bucket: &str,
     metadata_location: &str,
     object_kind: &'static str,
 ) {
+    if let Err(err) = crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard) {
+        tracing::warn!(
+            bucket = %bucket,
+            metadata_location = %metadata_location,
+            object_kind,
+            error = %err,
+            "retaining initial catalog metadata after publication failure because its lock was lost"
+        );
+        return;
+    }
     if let Err(err) = metadata_backend.delete_object_unlocked(bucket, metadata_location).await {
         tracing::warn!(
             bucket = %bucket,
@@ -5573,7 +5631,6 @@ where
 }
 
 async fn update_table_metadata_location_response<S>(
-    mut req: Option<&mut S3Request<Body>>,
     store: &S,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
@@ -5614,7 +5671,7 @@ where
         table: &table_name,
         entry: &current,
     };
-    validate_table_snapshot_graph(req.as_deref_mut(), &snapshot_context, &target_metadata).await?;
+    validate_table_snapshot_graph(&snapshot_context, &target_metadata).await?;
     let (commit_id, _) = standard_commit_ids(request.commit_id, request.idempotency_key.as_deref());
     if let Some(replay) = published_api_commit_replay(
         store,
@@ -5840,7 +5897,7 @@ where
         table: &table_name,
         entry: &current,
     };
-    validate_table_snapshot_graph(req.as_deref_mut(), &snapshot_context, &target_metadata).await?;
+    validate_table_snapshot_graph(&snapshot_context, &target_metadata).await?;
     request.requirements.push(metadata_digest_requirement(&target_metadata)?);
     if let Some(existing_commit) = existing_commit {
         if !crate::table_catalog::commit_log_matches_request(&existing_commit, &request, &current.table_id) {
@@ -5959,14 +6016,7 @@ where
         table: &table_name,
         entry: &current,
     };
-    validate_table_snapshot_commit_conflicts(
-        req.as_deref_mut(),
-        &snapshot_context,
-        &expected_metadata,
-        &next_metadata,
-        &request.updates,
-    )
-    .await?;
+    validate_table_snapshot_commit_conflicts(&snapshot_context, &expected_metadata, &next_metadata, &request.updates).await?;
     let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id, request.idempotency_key.as_deref());
     let next_generation = crate::table_catalog::next_table_catalog_generation(current.generation).map_err(catalog_store_error)?;
     let next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
@@ -6095,15 +6145,8 @@ where
         table: &table_name,
         entry: current,
     };
-    validate_table_snapshot_commit_conflicts(
-        req.as_deref_mut(),
-        &snapshot_context,
-        &previous_metadata,
-        &target_metadata,
-        &request.updates,
-    )
-    .await?;
-    validate_table_snapshot_graph(req.as_deref_mut(), &snapshot_context, &target_metadata).await?;
+    validate_table_snapshot_commit_conflicts(&snapshot_context, &previous_metadata, &target_metadata, &request.updates).await?;
+    validate_table_snapshot_graph(&snapshot_context, &target_metadata).await?;
     let operation = request
         .operation
         .clone()
@@ -6825,7 +6868,6 @@ where
         .map_err(catalog_store_error)?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
     sync_external_catalog_bridge_response_with_snapshot(
-        None,
         store,
         metadata_backend,
         bucket,
@@ -6847,7 +6889,6 @@ struct ExternalCatalogBridgeSyncSnapshot {
 }
 
 async fn sync_external_catalog_bridge_response_with_snapshot<B>(
-    mut req: Option<&mut S3Request<Body>>,
     store: &crate::table_catalog::ObjectTableCatalogStore<B>,
     metadata_backend: &B,
     bucket: &str,
@@ -6896,9 +6937,9 @@ where
         table: &table_name,
         entry: graph_entry,
     };
-    validate_table_snapshot_graph(req.as_deref_mut(), &snapshot_context, &target_metadata).await?;
+    validate_table_snapshot_graph(&snapshot_context, &target_metadata).await?;
 
-    let (action, table_response, table_id) = if let Some(current) = current {
+    let (action, table_response, table_id, publish_bridge) = if let Some(current) = current {
         if request.expected_version_token.is_none() && request.expected_metadata_location.is_none() {
             if current.metadata_location != request.metadata_location
                 || current.table_uuid != metadata_table_uuid(&target_metadata)?
@@ -6914,6 +6955,7 @@ where
                 EXTERNAL_CATALOG_ACTION_REGISTERED.to_string(),
                 load_table_response_from_entry(current, target_metadata),
                 table_id,
+                true,
             )
         } else {
             let expected_version_token = request
@@ -6924,6 +6966,15 @@ where
                 .expected_metadata_location
                 .clone()
                 .ok_or_else(|| s3_error!(InvalidRequest, "external catalog sync requires expected-metadata-location"))?;
+            if current.metadata_location != request.metadata_location
+                && request.commit_id.is_none()
+                && request.idempotency_key.is_none()
+            {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "external catalog pointer sync requires commit-id or idempotency-key"
+                ));
+            }
             let (commit_id, _) = standard_commit_ids(request.commit_id.clone(), request.idempotency_key.as_deref());
             let result = if let Some(replay) = published_api_commit_replay(
                 store,
@@ -6969,11 +7020,27 @@ where
                     .await
                     .map_err(catalog_store_error)?
             };
+            let publish_bridge = result.table.metadata_location == request.metadata_location;
+            let response_metadata = if publish_bridge {
+                target_metadata
+            } else if !crate::table_catalog::is_valid_table_metadata_location_for_entry(
+                &result.table,
+                &result.table.metadata_location,
+            ) {
+                return Err(iceberg_rest_error(
+                    ICEBERG_ERROR_REST,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "persisted table metadata location is outside the protected table metadata directory",
+                ));
+            } else {
+                read_table_metadata_json(metadata_backend, bucket, &result.table.metadata_location).await?
+            };
             let table_id = result.table.table_id.clone();
             (
                 EXTERNAL_CATALOG_ACTION_COMMITTED.to_string(),
-                load_table_response_from_entry(result.table, target_metadata),
+                load_table_response_from_entry(result.table, response_metadata),
                 table_id,
+                publish_bridge,
             )
         }
     } else {
@@ -6991,16 +7058,32 @@ where
             EXTERNAL_CATALOG_ACTION_REGISTERED.to_string(),
             load_table_response_from_entry(entry, target_metadata),
             table_id,
+            true,
         )
     };
 
-    let mut bridge_entry =
-        external_catalog_bridge_entry_from_sync_request(bucket, namespace, table, &request, external_table_uuid)?;
-    bridge_entry.table_id = table_id;
-    let bridge_entry = store
-        .put_external_catalog_bridge(bridge_entry)
-        .await
-        .map_err(catalog_store_error)?;
+    let bridge_entry = if publish_bridge {
+        let mut bridge_entry =
+            external_catalog_bridge_entry_from_sync_request(bucket, namespace, table, &request, external_table_uuid)?;
+        bridge_entry.table_id = table_id;
+        store
+            .put_external_catalog_bridge(bridge_entry)
+            .await
+            .map_err(catalog_store_error)?
+    } else {
+        store
+            .get_external_catalog_bridge(bucket, &namespace.public_name(), table)
+            .await
+            .map_err(catalog_store_error)?
+            .filter(|bridge| bridge.table_id == table_id)
+            .ok_or_else(|| {
+                iceberg_rest_error(
+                    ICEBERG_ERROR_COMMIT_FAILED,
+                    StatusCode::CONFLICT,
+                    "historical external catalog sync cannot reconstruct the current bridge state",
+                )
+            })?
+    };
     Ok(ExternalCatalogBridgeSyncResponse {
         action,
         table: table_response,
@@ -7025,12 +7108,13 @@ where
     let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
     let metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
     catalog_import_response_with_metadata(
-        None,
         store,
         metadata_backend,
-        bucket,
-        namespace,
-        table,
+        RestTableRoute {
+            bucket,
+            namespace,
+            table,
+        },
         request,
         metadata,
         table_bucket_enabled,
@@ -7039,12 +7123,9 @@ where
 }
 
 async fn catalog_import_response_with_metadata<S, B>(
-    mut req: Option<&mut S3Request<Body>>,
     store: &S,
     metadata_backend: &B,
-    bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &str,
+    route: RestTableRoute<'_>,
     request: CatalogImportRequest,
     metadata: serde_json::Value,
     table_bucket_enabled: bool,
@@ -7053,6 +7134,11 @@ where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
+    let RestTableRoute {
+        bucket,
+        namespace,
+        table,
+    } = route;
     let started = Instant::now();
     let result = async {
         ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
@@ -7072,7 +7158,7 @@ where
             table: &table_name,
             entry: &entry,
         };
-        validate_table_snapshot_graph(req.as_deref_mut(), &snapshot_context, &metadata).await?;
+        validate_table_snapshot_graph(&snapshot_context, &metadata).await?;
         if let Some(existing) = store
             .load_table(bucket, &namespace.public_name(), table)
             .await
@@ -7140,7 +7226,8 @@ where
         .await?
         {
             let result = store.commit_table(replay).await.map_err(catalog_store_error)?;
-            return Ok(commit_table_response_from_result(result, target_metadata));
+            return commit_table_replay_response(None, metadata_backend, bucket, result, &metadata_location, target_metadata)
+                .await;
         }
         if !crate::table_catalog::is_valid_table_metadata_location_for_entry(&current, &metadata_location) {
             return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
@@ -7149,6 +7236,16 @@ where
         validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
         validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
+        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+        let snapshot_context = SnapshotReadContext {
+            metadata_backend,
+            bucket,
+            namespace,
+            table: &table_name,
+            entry: &current,
+        };
+        validate_table_snapshot_graph(&snapshot_context, &target_metadata).await?;
         let commit_request = crate::table_catalog::TableCommitRequest {
             table_bucket: bucket.to_string(),
             namespace: namespace.public_name(),
@@ -7450,7 +7547,7 @@ impl Operation for RestCreateTableHandler {
         let request = read_json_body::<CreateTableRequest>(input).await?;
         if let Some(location) = request.location.as_deref() {
             authorize_table_catalog_resource_for_principal(&req, &principal, &resource, AdminAction::RegisterTableAction).await?;
-            authorize_table_warehouse_s3_actions(&mut req, &warehouse, location, TABLE_WAREHOUSE_WRITE_ACTIONS).await?;
+            authorize_table_warehouse_claim(&req, &principal, &warehouse, location).await?;
         }
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
@@ -7479,17 +7576,9 @@ impl Operation for RestRegisterTableHandler {
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard.as_ref()).map_err(catalog_store_error)?;
-        let response = register_table_response(
-            Some(&mut req),
-            &store,
-            &metadata_backend,
-            &warehouse,
-            &namespace,
-            request,
-            metadata,
-            table_bucket_enabled,
-        )
-        .await?;
+        let response =
+            register_table_response(&store, &metadata_backend, &warehouse, &namespace, request, metadata, table_bucket_enabled)
+                .await?;
         drop(metadata_guard);
         build_json_response(StatusCode::OK, &response)
     }
@@ -7603,11 +7692,7 @@ impl Operation for RestCommitTableHandler {
             .await
             .map_err(catalog_store_error)?
             .ok_or_else(|| iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"))?;
-        let warehouse_read_location =
-            table_commit_warehouse_read_location(Some(&mut req), &store, &metadata_backend, &warehouse, &current, &request)
-                .await?;
-        authorize_table_warehouse_s3_actions(&mut req, &warehouse, &warehouse_read_location, TABLE_WAREHOUSE_READ_ACTIONS)
-            .await?;
+        table_commit_warehouse_read_location(Some(&mut req), &store, &metadata_backend, &warehouse, &current, &request).await?;
         let target_metadata = if let Some(metadata_location) = request.new_metadata_location.as_deref() {
             let metadata_location = table_metadata_location_for_catalog(&warehouse, metadata_location)?;
             authorize_table_catalog_s3_actions(&mut req, &warehouse, &metadata_location, &[S3Action::GetObjectAction]).await?;
@@ -7620,28 +7705,9 @@ impl Operation for RestCommitTableHandler {
                 &metadata_location,
             )
             .await?;
-            authorize_table_warehouse_s3_actions(
-                &mut req,
-                &warehouse,
-                metadata_table_location(&metadata)?,
-                TABLE_WAREHOUSE_WRITE_ACTIONS,
-            )
-            .await?;
             request.new_metadata_location = Some(metadata_location);
             Some(metadata)
         } else {
-            if let Some(update) = request
-                .updates
-                .iter()
-                .rev()
-                .find(|update| update.get("action").and_then(serde_json::Value::as_str) == Some("set-location"))
-            {
-                let location = update
-                    .get("location")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| s3_error!(InvalidRequest, "set-location requires location"))?;
-                authorize_table_warehouse_s3_actions(&mut req, &warehouse, location, TABLE_WAREHOUSE_WRITE_ACTIONS).await?;
-            }
             None
         };
         let response = commit_table_response_with_target_metadata(
@@ -7883,15 +7949,7 @@ impl Operation for UpdateTableMetadataLocationHandler {
             &request.metadata_location,
         )
         .await?;
-        authorize_table_warehouse_s3_actions(
-            &mut req,
-            &warehouse,
-            metadata_table_location(&target_metadata)?,
-            TABLE_WAREHOUSE_WRITE_ACTIONS,
-        )
-        .await?;
         let response = update_table_metadata_location_response(
-            Some(&mut req),
             &store,
             &metadata_backend,
             &warehouse,
@@ -8156,12 +8214,13 @@ impl Operation for ImportTableCatalogHandler {
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard.as_ref()).map_err(catalog_store_error)?;
         let response = catalog_import_response_with_metadata(
-            Some(&mut req),
             &store,
             &metadata_backend,
-            &warehouse,
-            &namespace,
-            &table,
+            RestTableRoute {
+                bucket: &warehouse,
+                namespace: &namespace,
+                table: &table,
+            },
             request,
             metadata,
             table_bucket_enabled,
@@ -8240,7 +8299,6 @@ impl Operation for SyncExternalCatalogBridgeHandler {
             read_authorized_table_metadata_json(&mut req, &metadata_backend, &warehouse, &request.metadata_location).await?;
         crate::table_catalog::ensure_table_catalog_lock_held(metadata_guard.as_ref()).map_err(catalog_store_error)?;
         let response = sync_external_catalog_bridge_response_with_snapshot(
-            Some(&mut req),
             &store,
             &metadata_backend,
             &warehouse,
@@ -8342,13 +8400,6 @@ impl Operation for RollbackTableCatalogHandler {
             &request.metadata_location,
         )
         .await?;
-        authorize_table_warehouse_s3_actions(
-            &mut req,
-            &warehouse,
-            metadata_table_location(&target_metadata)?,
-            TABLE_WAREHOUSE_WRITE_ACTIONS,
-        )
-        .await?;
         let response =
             rollback_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request, target_metadata).await?;
         build_json_response(StatusCode::OK, &response)
@@ -8391,6 +8442,7 @@ mod tests {
             manifest_count: TABLE_COMMIT_MAX_MANIFESTS - 2,
             avro_bytes: TABLE_COMMIT_MAX_AVRO_BYTES - 3,
             file_reference_count: TABLE_COMMIT_MAX_FILE_REFERENCES - 4,
+            ..SnapshotReadBudget::default()
         };
 
         budget.charge_manifests(2).expect("exact manifest limit should be accepted");
@@ -8465,7 +8517,7 @@ mod tests {
             entry: &entry,
         };
 
-        validate_manifest_data_file_references(None, &context, &references)
+        validate_manifest_data_file_references(&context, &references)
             .await
             .expect("existing manifest objects should validate");
         assert!(backend.object_exists_max_in_flight() > 1);
@@ -8475,10 +8527,15 @@ mod tests {
             .delete_object("warehouse", &references[0].location)
             .await
             .expect("test object should be removed");
-        let error = validate_manifest_data_file_references(None, &context, &references)
+        let error = validate_manifest_data_file_references(&context, &references)
             .await
             .expect_err("a missing manifest object should still fail validation");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+
+        references[0].entry_status = Some(2);
+        validate_manifest_data_file_references(&context, &references)
+            .await
+            .expect("a deleted manifest entry need not retain its physical file");
     }
 
     #[tokio::test]
@@ -8532,12 +8589,87 @@ mod tests {
             entry: &entry,
         };
 
-        let error = validate_table_snapshot_graph(None, &context, &metadata)
+        let error = validate_table_snapshot_graph(&context, &metadata)
             .await
             .expect_err("manifest-list partition spec must exist in table metadata");
 
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(error.message(), Some("snapshot manifest references missing partition spec 9"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_graph_reads_shared_manifest_objects_once() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let entry = crate::table_catalog::TableEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+            metadata_location: "tables/table-id/metadata/00001.metadata.json".to_string(),
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let manifest_list = "s3://warehouse/tables/table-id/metadata/snap-1.avro";
+        let data_file = "s3://warehouse/tables/table-id/data/part-1.parquet";
+        seed_test_snapshot_manifest(&backend, "warehouse", manifest_list, 1, 1, &[(data_file, 0, 1, 1, 1)]).await;
+        let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+        metadata["last-sequence-number"] = serde_json::Value::from(2);
+        metadata["snapshots"] = serde_json::json!([
+            {
+                "snapshot-id": 1,
+                "sequence-number": 1,
+                "timestamp-ms": 1,
+                "manifest-list": manifest_list,
+                "summary": {"operation": "append"}
+            },
+            {
+                "snapshot-id": 2,
+                "parent-snapshot-id": 1,
+                "sequence-number": 2,
+                "timestamp-ms": 2,
+                "manifest-list": manifest_list,
+                "summary": {"operation": "append"}
+            }
+        ]);
+        metadata["current-snapshot-id"] = serde_json::Value::from(2);
+        metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 2}});
+        let context = SnapshotReadContext {
+            metadata_backend: &backend,
+            bucket: "warehouse",
+            namespace: &namespace,
+            table: &table,
+            entry: &entry,
+        };
+
+        validate_table_snapshot_graph(&context, &metadata)
+            .await
+            .expect("shared snapshot graph should validate");
+
+        assert_eq!(backend.read_object_call_count(), 2);
+
+        let mut budget = SnapshotReadBudget {
+            file_reference_count: TABLE_COMMIT_MAX_FILE_REFERENCES - 1,
+            ..SnapshotReadBudget::default()
+        };
+        read_snapshot_manifest_references(&context, &metadata, &metadata["snapshots"][0], &mut budget)
+            .await
+            .expect("the first manifest traversal should reach the file reference limit");
+        let error = read_snapshot_manifest_references(&context, &metadata, &metadata["snapshots"][1], &mut budget)
+            .await
+            .err()
+            .expect("a cached manifest traversal must still consume the file reference budget");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -9011,7 +9143,7 @@ mod tests {
         let create_table_block = operation_block(src, "RestCreateTableHandler");
         assert!(create_table_block.contains("request.location.as_deref()"));
         assert!(create_table_block.contains("AdminAction::RegisterTableAction"));
-        assert!(create_table_block.contains("authorize_table_warehouse_s3_actions"));
+        assert!(create_table_block.contains("authorize_table_warehouse_claim"));
 
         let register_table_block = operation_block(src, "RestRegisterTableHandler");
         assert!(register_table_block.contains("read_authorized_table_metadata_json"));
@@ -9020,17 +9152,15 @@ mod tests {
             !function_block(src, "async fn register_table_response").contains("read_table_metadata_json"),
             "register should persist the metadata snapshot used for authorization"
         );
-        let warehouse_auth_block = function_block(src, "async fn authorize_table_warehouse_s3_actions");
-        assert!(warehouse_auth_block.contains("table_catalog_prefix_authorization_probe"));
-        assert!(warehouse_auth_block.contains("actions"));
+        let warehouse_auth_block = function_block(src, "async fn authorize_table_warehouse_claim");
+        assert!(warehouse_auth_block.contains("AdminAction::RegisterTableAction"));
+        assert!(warehouse_auth_block.contains("AdminResourceScope::bucket_object"));
         let s3_auth_block = function_block(src, "async fn authorize_table_catalog_s3_actions");
         assert!(s3_auth_block.contains("table_catalog_request_principal(req).await?"));
         assert!(s3_auth_block.contains("ReqInfo"));
-        assert_eq!(TABLE_WAREHOUSE_READ_ACTIONS, &[S3Action::GetObjectAction]);
-        assert_eq!(TABLE_WAREHOUSE_WRITE_ACTIONS, &[S3Action::PutObjectAction, S3Action::DeleteObjectAction]);
         let metadata_auth_block = function_block(src, "async fn read_authorized_table_metadata_json");
         assert!(metadata_auth_block.contains("S3Action::GetObjectAction"));
-        assert!(metadata_auth_block.contains("authorize_table_warehouse_s3_actions"));
+        assert!(metadata_auth_block.contains("authorize_table_warehouse_claim"));
         assert!(metadata_auth_block.contains("acquire_read_lock"));
         assert!(metadata_auth_block.contains("ensure_table_catalog_lock_held"));
 
@@ -9095,29 +9225,17 @@ mod tests {
         assert!(import_block.contains("read_authorized_table_metadata_json"));
         assert!(import_block.contains("catalog_import_response_with_metadata"));
 
-        for handler in [
-            "RestCommitTableHandler",
-            "UpdateTableMetadataLocationHandler",
-            "RollbackTableCatalogHandler",
-        ] {
-            assert!(
-                operation_block(src, handler).contains("authorize_table_warehouse_s3_actions"),
-                "{handler} should authorize the warehouse prefix before publishing a relocated table"
-            );
-        }
-        assert!(
-            operation_block(src, "RestCommitTableHandler").contains("TABLE_WAREHOUSE_READ_ACTIONS"),
-            "table commits should require read access to manifest and data objects under the warehouse prefix"
-        );
+        let commit_block = operation_block(src, "RestCommitTableHandler");
+        assert!(commit_block.contains("authorize_table_catalog_s3_actions"));
+        assert!(commit_block.contains("S3Action::GetObjectAction"));
         for helper in [
-            "async fn table_commit_warehouse_read_location",
             "async fn read_snapshot_manifest_references",
             "async fn snapshot_manifest_locations",
-            "async fn validate_manifest_data_file_reference",
+            "async fn validate_manifest_data_file_references",
         ] {
             assert!(
-                function_block(src, helper).contains("authorize_optional_table_catalog_object_read"),
-                "{helper} should authorize every concrete object before reading it"
+                !function_block(src, helper).contains("authorize_optional_table_catalog_object_read"),
+                "{helper} should validate the catalog-owned metadata graph without per-object IAM fan-out"
             );
         }
 
@@ -9337,59 +9455,6 @@ mod tests {
             .or_else(|| block.find("\n#[cfg(test)]"))
             .unwrap_or(block.len());
         &block[..end]
-    }
-
-    #[test]
-    fn table_catalog_prefix_authorization_probe_is_an_unpredictable_descendant() {
-        let probe = table_catalog_prefix_authorization_probe("tables/existing/");
-        let suffix = probe
-            .strip_prefix("tables/existing/")
-            .expect("authorization probe should stay inside the warehouse prefix");
-        Uuid::parse_str(suffix).expect("authorization probe suffix should be a UUID");
-    }
-
-    #[tokio::test]
-    async fn table_catalog_prefix_authorization_probe_rejects_marker_only_policy() {
-        let marker_policy = Policy::parse_config(
-            br#"{
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Action": "s3:PutObject",
-                    "Resource": "arn:aws:s3:::warehouse/tables/existing/"
-                }]
-            }"#,
-        )
-        .expect("marker-only policy should parse");
-        let prefix_policy = Policy::parse_config(
-            br#"{
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Action": "s3:PutObject",
-                    "Resource": "arn:aws:s3:::warehouse/tables/existing/*"
-                }]
-            }"#,
-        )
-        .expect("prefix policy should parse");
-        let probe = table_catalog_prefix_authorization_probe("tables/existing/");
-        let groups = None;
-        let conditions = HashMap::new();
-        let claims = HashMap::new();
-        let args = rustfs_policy::policy::Args {
-            account: "testuser",
-            groups: &groups,
-            action: Action::S3Action(S3Action::PutObjectAction),
-            bucket: "warehouse",
-            conditions: &conditions,
-            is_owner: false,
-            object: &probe,
-            claims: &claims,
-            deny_only: false,
-        };
-
-        assert!(!marker_policy.is_allowed(&args).await);
-        assert!(prefix_policy.is_allowed(&args).await);
     }
 
     fn function_block<'a>(src: &'a str, signature: &str) -> &'a str {
@@ -10685,7 +10750,13 @@ mod tests {
             "schema": {"type": "struct", "schema-id": 7, "fields": []},
             "partition-spec": [],
             "properties": {},
-            "snapshots": [],
+            "snapshots": [{
+                "snapshot-id": 10,
+                "timestamp-ms": 1,
+                "manifests": ["s3://warehouse/tables/table-id/metadata/manifest.avro"],
+                "summary": {"operation": "append"}
+            }],
+            "current-snapshot-id": 10,
             "snapshot-log": [],
             "metadata-log": []
         });
@@ -10704,6 +10775,7 @@ mod tests {
         assert_eq!(upgraded["default-spec-id"], 0);
         assert_eq!(upgraded["default-sort-order-id"], 0);
         assert_eq!(upgraded["last-sequence-number"], 0);
+        assert_eq!(upgraded["snapshots"][0]["sequence-number"], 0);
         assert!(upgraded.get("schema").is_none());
         assert!(upgraded.get("partition-spec").is_none());
         validate_supported_table_metadata(&upgraded).expect("upgraded metadata should satisfy the v2 contract");
@@ -10849,6 +10921,96 @@ mod tests {
             .await
             .expect_err("missing namespace should reject view publication");
         assert!(metadata_backend.objects.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_table_response_rejects_lost_initial_metadata_lock_before_catalog_publish() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        metadata_backend.lose_write_locks();
+        let request = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": []
+            }
+        }))
+        .expect("create table request should parse");
+
+        create_table_response(&store, &metadata_backend, "warehouse", &namespace, request, true)
+            .await
+            .expect_err("a lost metadata lock must reject catalog publication");
+
+        assert!(store.tables.lock().await.is_empty());
+        assert_eq!(metadata_backend.objects.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_table_response_retains_initial_metadata_when_publish_fails_after_lock_loss() {
+        let pause = TestCatalogPublishPause::default();
+        let store = Arc::new(TestTableCatalogStore {
+            create_table_pause: Some(pause.clone()),
+            fail_create_table_after_pause: true,
+            ..Default::default()
+        });
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(store.as_ref(), "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            store.as_ref(),
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let request = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": []
+            }
+        }))
+        .expect("create table request should parse");
+        let create_store = Arc::clone(&store);
+        let create_backend = metadata_backend.clone();
+        let create_namespace = namespace.clone();
+        let create = tokio::spawn(async move {
+            create_table_response(create_store.as_ref(), &create_backend, "warehouse", &create_namespace, request, true).await
+        });
+
+        pause.wait_started().await;
+        metadata_backend.lose_write_locks();
+        pause.release();
+        create
+            .await
+            .expect("create task should join")
+            .expect_err("injected catalog publication failure should be returned");
+
+        assert!(store.tables.lock().await.is_empty());
+        assert_eq!(metadata_backend.objects.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -11374,8 +11536,10 @@ mod tests {
                 "writer": "test-client",
                 "requirements": [],
                 "updates": [{
-                    "action": "set-location",
-                    "location": "s3://warehouse/tables/relocated-events"
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "first"
+                    }
                 }]
             });
             standard_commit_table_response(
@@ -11387,7 +11551,7 @@ mod tests {
                 serde_json::from_value(first_request.clone()).expect("first commit request should parse"),
             )
             .await
-            .expect("first commit should relocate the table");
+            .expect("first commit should advance the table");
 
             let second = standard_commit_table_response(
                 &store,
@@ -11749,7 +11913,6 @@ mod tests {
             .await;
 
         let updated = update_table_metadata_location_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -12581,13 +12744,17 @@ mod tests {
         let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
         let current_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let next_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let later_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
         seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current_location.clone()).await;
         let mut current_metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
         current_metadata["last-sequence-number"] = serde_json::json!(1);
         let mut next_metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
         next_metadata["last-sequence-number"] = serde_json::json!(2);
+        let mut later_metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+        later_metadata["last-sequence-number"] = serde_json::json!(3);
         backend.put_json(bucket, &current_location, current_metadata).await;
         backend.put_json(bucket, &next_location, next_metadata).await;
+        backend.put_json(bucket, &later_location, later_metadata).await;
 
         let sync_request = || ExternalCatalogBridgeSyncRequest {
             catalog: "hive-metastore".to_string(),
@@ -12606,6 +12773,14 @@ mod tests {
             rollback_strategy: Some("retain-current-pointer".to_string()),
             properties: BTreeMap::new(),
         };
+        let mut non_idempotent_request = sync_request();
+        non_idempotent_request.idempotency_key = None;
+        let error =
+            sync_external_catalog_bridge_response(&store, &backend, bucket, &namespace, "events", non_idempotent_request, true)
+                .await
+                .expect_err("a pointer-changing external sync must carry a stable request identity");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+
         let synced = sync_external_catalog_bridge_response(&store, &backend, bucket, &namespace, "events", sync_request(), true)
             .await
             .expect("external sync should commit existing table");
@@ -12635,6 +12810,48 @@ mod tests {
             .expect("table should exist");
         assert_eq!(replayed_current.version_token, current.version_token);
         assert_eq!(replayed_current.generation, current.generation);
+
+        let later = sync_external_catalog_bridge_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            ExternalCatalogBridgeSyncRequest {
+                catalog: "hive-metastore".to_string(),
+                external_catalog_id: Some("hms-prod".to_string()),
+                external_namespace: "sales".to_string(),
+                external_table: "orders".to_string(),
+                external_table_uuid: Some("table-uuid".to_string()),
+                metadata_location: table_metadata_location_for_client(bucket, &later_location),
+                external_version_token: Some("hms-version-3".to_string()),
+                expected_version_token: Some(current.version_token.clone()),
+                expected_metadata_location: Some(table_metadata_location_for_client(bucket, &next_location)),
+                commit_id: None,
+                idempotency_key: Some("external-sync-idempotency-3".to_string()),
+                policy_mode: Some("rustfs-authoritative".to_string()),
+                credential_mode: Some("rustfs-table-credentials".to_string()),
+                rollback_strategy: Some("retain-current-pointer".to_string()),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("a later external sync should commit");
+        assert_eq!(later.table.metadata_location, table_metadata_location_for_client(bucket, &later_location));
+
+        let historical =
+            sync_external_catalog_bridge_response(&store, &backend, bucket, &namespace, "events", sync_request(), true)
+                .await
+                .expect("a historical retry should return the latest published state");
+        assert_eq!(historical.table.metadata_location, later.table.metadata_location);
+        assert_eq!(historical.table.config, later.table.config);
+        let bridge = historical
+            .bridge
+            .bridge
+            .expect("historical retry should preserve the current bridge");
+        assert_eq!(bridge.last_synced_metadata_location.as_deref(), Some(later_location.as_str()));
+        assert_eq!(bridge.external_version_token.as_deref(), Some("hms-version-3"));
     }
 
     #[tokio::test]
@@ -12660,7 +12877,6 @@ mod tests {
             .expect("concurrent table drop should succeed");
 
         let result = sync_external_catalog_bridge_response_with_snapshot(
-            None,
             &store,
             &backend,
             bucket,
@@ -12935,6 +13151,24 @@ mod tests {
             validate_supported_table_metadata(&incomplete)
                 .expect_err("missing required Iceberg v2 metadata field must be rejected");
         }
+    }
+
+    #[test]
+    fn table_metadata_validation_bounds_snapshot_sequence_numbers() {
+        let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+        metadata["last-sequence-number"] = serde_json::Value::from(1);
+        metadata["snapshots"] = serde_json::json!([{
+            "snapshot-id": 10,
+            "sequence-number": 2,
+            "timestamp-ms": 1,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+            "summary": {"operation": "append"}
+        }]);
+
+        let error = validate_supported_table_metadata(&metadata)
+            .expect_err("snapshot sequence-number must not exceed last-sequence-number");
+
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -13394,7 +13628,7 @@ mod tests {
             }
         })];
 
-        validate_table_snapshot_commit_conflicts(None, &context, &current_metadata, &current_metadata, &updates)
+        validate_table_snapshot_commit_conflicts(&context, &current_metadata, &current_metadata, &updates)
             .await
             .expect("a branch commit should validate deletes against its declared parent snapshot");
     }
@@ -15687,6 +15921,7 @@ mod tests {
         fail_put_table_bucket: tokio::sync::Mutex<bool>,
         create_table_pause: Option<TestCatalogPublishPause>,
         create_view_pause: Option<TestCatalogPublishPause>,
+        fail_create_table_after_pause: bool,
     }
 
     #[derive(Clone, Default)]
@@ -15717,6 +15952,18 @@ mod tests {
         object_exists_in_flight: Arc<std::sync::atomic::AtomicUsize>,
         object_exists_max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
         locks: TestTableCatalogObjectLocks,
+        write_locks_lost: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct TestTableCatalogObjectLockGuard {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+        lost: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::table_catalog::TableCatalogObjectLockGuard for TestTableCatalogObjectLockGuard {
+        fn is_lock_lost(&self) -> bool {
+            self.lost.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     impl TestTableCatalogObjectBackend {
@@ -15736,6 +15983,10 @@ mod tests {
                 .get(&(bucket.to_string(), object.to_string()))
                 .cloned();
             lock.is_some_and(|lock| lock.try_lock_owned().is_err())
+        }
+
+        fn lose_write_locks(&self) {
+            self.write_locks_lost.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         async fn put_bytes(&self, bucket: &str, object: &str, data: Vec<u8>) {
@@ -16239,7 +16490,10 @@ mod tests {
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                     .clone()
             };
-            Ok(Box::new(lock.lock_owned().await))
+            Ok(Box::new(TestTableCatalogObjectLockGuard {
+                _guard: lock.lock_owned().await,
+                lost: Arc::clone(&self.write_locks_lost),
+            }))
         }
     }
 
@@ -16364,6 +16618,11 @@ mod tests {
             if let Some(pause) = &self.create_table_pause {
                 pause.started.notify_one();
                 pause.release.notified().await;
+            }
+            if self.fail_create_table_after_pause {
+                return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                    "injected table publication failure".to_string(),
+                ));
             }
             self.tables.lock().await.push(entry);
             Ok(())
@@ -17011,7 +17270,6 @@ mod tests {
             .put_json("warehouse", metadata_location, metadata.clone())
             .await;
         let register = register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17128,7 +17386,6 @@ mod tests {
             .await;
 
         register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17178,7 +17435,6 @@ mod tests {
             .await;
 
         let response = register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17229,7 +17485,6 @@ mod tests {
             .put_json("warehouse", metadata_location, metadata.clone())
             .await;
         register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17257,7 +17512,8 @@ mod tests {
         let error = standard_commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", request)
             .await
             .expect_err("warehouse relocation must be rejected");
-        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_UNSUPPORTED_OPERATION.into()));
+        assert_eq!(error.status_code(), Some(StatusCode::NOT_ACCEPTABLE));
         assert_eq!(metadata_backend.objects.lock().await.len(), object_count);
         let unchanged = store
             .load_table("warehouse", "analytics", "events")
@@ -17298,7 +17554,6 @@ mod tests {
 
         assert!(
             register_table_response(
-                None,
                 &store,
                 &metadata_backend,
                 "warehouse",
@@ -17351,7 +17606,6 @@ mod tests {
             .await;
 
         let error = register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17433,7 +17687,6 @@ mod tests {
             .await;
 
         let updated = update_table_metadata_location_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17457,7 +17710,6 @@ mod tests {
         assert_ne!(updated.version_token, current.version_token);
 
         let replayed = update_table_metadata_location_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17518,7 +17770,6 @@ mod tests {
         };
 
         let error = update_table_metadata_location_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17549,7 +17800,6 @@ mod tests {
         )
         .await;
         update_table_metadata_location_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17566,7 +17816,6 @@ mod tests {
             .await
             .expect("referenced data file should be removed");
         let error = update_table_metadata_location_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17649,7 +17898,6 @@ mod tests {
 
         assert!(
             update_table_metadata_location_response(
-                None,
                 &store,
                 &metadata_backend,
                 "warehouse",
@@ -17703,7 +17951,6 @@ mod tests {
             .put_json("warehouse", current_location, current_metadata.clone())
             .await;
         register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",
@@ -17733,7 +17980,6 @@ mod tests {
 
         assert!(
             update_table_metadata_location_response(
-                None,
                 &store,
                 &metadata_backend,
                 "warehouse",
@@ -17867,7 +18113,7 @@ mod tests {
             "events",
             RollbackTableRequest {
                 metadata_location: table_metadata_location_for_client(bucket, &rollback_location),
-                version_token: current.version_token,
+                version_token: current.version_token.clone(),
                 commit_id: None,
                 idempotency_key: Some("rollback-request-1".to_string()),
             },
@@ -17881,6 +18127,52 @@ mod tests {
         assert_eq!(replayed.commit_id, rollback.commit_id);
         assert_eq!(replayed.version_token, rollback.version_token);
         assert_eq!(replayed.generation, rollback.generation);
+
+        let later_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let mut later_metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+        later_metadata["last-sequence-number"] = serde_json::Value::from(3);
+        backend.put_json(bucket, &later_location, later_metadata).await;
+        let later = rollback_table_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            RollbackTableRequest {
+                metadata_location: table_metadata_location_for_client(bucket, &later_location),
+                version_token: rollback.version_token,
+                commit_id: None,
+                idempotency_key: Some("rollback-request-2".to_string()),
+            },
+            read_table_metadata_json(&backend, bucket, &later_location)
+                .await
+                .expect("later rollback metadata should load"),
+        )
+        .await
+        .expect("a later rollback should commit");
+
+        let historical = rollback_table_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            RollbackTableRequest {
+                metadata_location: table_metadata_location_for_client(bucket, &rollback_location),
+                version_token: current.version_token,
+                commit_id: None,
+                idempotency_key: Some("rollback-request-1".to_string()),
+            },
+            read_table_metadata_json(&backend, bucket, &rollback_location)
+                .await
+                .expect("rollback metadata should load"),
+        )
+        .await
+        .expect("a historical rollback retry should return the current table state");
+
+        assert_eq!(historical.metadata_location, later.metadata_location);
+        assert_eq!(historical.version_token, later.version_token);
+        assert_eq!(historical.generation, later.generation);
     }
 
     #[tokio::test]
@@ -18084,7 +18376,6 @@ mod tests {
             .put_json("warehouse", current_location, current_metadata.clone())
             .await;
         register_table_response(
-            None,
             &store,
             &metadata_backend,
             "warehouse",

@@ -110,6 +110,8 @@ const VIEW_ENTRY_FILE: &str = "view-entry.json";
 const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
 const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
+const COMMIT_HEAD_ROOT: &str = "commit-heads";
+const COMMIT_HEAD_FILE: &str = "head.json";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const COMMIT_INTEGRITY_ROOT: &str = "commit-integrity";
 const WAREHOUSE_INDEX_ROOT: &str = "warehouse-index";
@@ -2757,6 +2759,16 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn commit_head_path(&self, table_bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}{}/{}/{}",
+            self.table_bucket_root_prefix(table_bucket),
+            COMMIT_HEAD_ROOT,
+            table_catalog_path_hash(table_id),
+            COMMIT_HEAD_FILE
+        )
+    }
+
     pub fn commit_idempotency_entry_path(&self, table_bucket: &str, table_id: &str, idempotency_key: &str) -> String {
         format!(
             "{}{}/{}/{}.json",
@@ -2961,6 +2973,7 @@ type StrongWarehouseIndex = BTreeMap<String, BTreeMap<String, StrongResourceKey>
 #[derive(Clone, Default)]
 struct StrongTableCatalogState {
     hydrated: bool,
+    hydration_generation: u64,
     snapshot_etag: Option<String>,
     table_buckets: BTreeMap<String, TableBucketEntry>,
     namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
@@ -3520,13 +3533,13 @@ where
         loop {
             let observed_state = {
                 let state = self.state.lock().await;
-                (state.hydrated, state.snapshot_etag.clone())
+                (state.hydrated, state.snapshot_etag.clone(), state.hydration_generation)
             };
             let snapshot_object = self
                 .object_backend
                 .read_object(RUSTFS_META_BUCKET, &Self::snapshot_object_path())
                 .await?;
-            let loaded_state = if let Some(snapshot_object) = snapshot_object {
+            let mut loaded_state = if let Some(snapshot_object) = snapshot_object {
                 let snapshot = serde_json::from_slice::<StrongTableCatalogSnapshot>(&snapshot_object.data).map_err(|err| {
                     TableCatalogStoreError::Internal(format!("failed to decode strong catalog snapshot: {err}"))
                 })?;
@@ -3537,8 +3550,9 @@ where
                     ..StrongTableCatalogState::default()
                 }
             };
+            loaded_state.hydration_generation = observed_state.2;
             let mut state = self.state.lock().await;
-            if (state.hydrated, state.snapshot_etag.clone()) != observed_state {
+            if (state.hydrated, state.snapshot_etag.clone(), state.hydration_generation) != observed_state {
                 continue;
             }
             *state = loaded_state;
@@ -3563,10 +3577,24 @@ where
         snapshot: StrongTableCatalogSnapshot,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        // A stale cache is recoverable from the durable snapshot after cancellation. Readers may
-        // continue from the previous snapshot while the conditional PUT is still in flight.
-        self.state.lock().await.hydrated = false;
-        self.persist_snapshot(snapshot, precondition).await
+        let completed_generation = {
+            let mut state = self.state.lock().await;
+            let writing_generation = state
+                .hydration_generation
+                .checked_add(1)
+                .ok_or_else(|| TableCatalogStoreError::Internal("strong catalog cache generation is exhausted".to_string()))?;
+            let completed_generation = writing_generation
+                .checked_add(1)
+                .ok_or_else(|| TableCatalogStoreError::Internal("strong catalog cache generation is exhausted".to_string()))?;
+            state.hydrated = false;
+            state.hydration_generation = writing_generation;
+            completed_generation
+        };
+        let result = self.persist_snapshot(snapshot, precondition).await;
+        let mut state = self.state.lock().await;
+        state.hydrated = false;
+        state.hydration_generation = completed_generation;
+        result
     }
 
     async fn materialize_bucket_snapshot(
@@ -3821,10 +3849,10 @@ where
     }
 
     fn committed_existing_result_locked(
-        state: &mut StrongTableCatalogState,
+        state: &StrongTableCatalogState,
         request: &TableCommitRequest,
         current: TableEntry,
-    ) -> Option<TableCommitResult> {
+    ) -> Option<(TableCommitResult, bool)> {
         let commit_key = Self::commit_key(&request.table_bucket, &current.table_id, &request.commit_id);
         let existing = state.commits.get(&commit_key)?;
         if !commit_log_matches_request(existing, request, &current.table_id) {
@@ -3839,17 +3867,39 @@ where
 
         let mut committed = existing.clone();
         committed.status = CommitLogStatus::Committed;
-        state.commits.insert(commit_key, committed.clone());
-        if let Some(idempotency_key) = committed.idempotency_key.as_deref() {
+        let idempotency_key = committed
+            .idempotency_key
+            .as_deref()
+            .map(|idempotency_key| Self::idempotency_key(&request.table_bucket, &current.table_id, idempotency_key));
+        let requires_persist = !matches!(existing.status, CommitLogStatus::Committed)
+            || idempotency_key
+                .as_ref()
+                .is_some_and(|idempotency_key| state.idempotency.get(idempotency_key) != Some(&committed));
+        Some((
+            TableCommitResult {
+                table: current,
+                commit_log: committed,
+            },
+            requires_persist,
+        ))
+    }
+
+    fn persist_committed_existing_result_locked(
+        state: &mut StrongTableCatalogState,
+        request: &TableCommitRequest,
+        result: &TableCommitResult,
+    ) {
+        let table_id = &result.table.table_id;
+        state.commits.insert(
+            Self::commit_key(&request.table_bucket, table_id, &request.commit_id),
+            result.commit_log.clone(),
+        );
+        if let Some(idempotency_key) = result.commit_log.idempotency_key.as_deref() {
             state.idempotency.insert(
-                Self::idempotency_key(&request.table_bucket, &current.table_id, idempotency_key),
-                committed.clone(),
+                Self::idempotency_key(&request.table_bucket, table_id, idempotency_key),
+                result.commit_log.clone(),
             );
         }
-        Some(TableCommitResult {
-            table: current,
-            commit_log: committed,
-        })
     }
 
     fn apply_commit_locked(
@@ -3858,11 +3908,14 @@ where
         namespace: &Namespace,
         table: &IdentifierSegment,
         next_warehouse_location: Option<String>,
-    ) -> TableCatalogStoreResult<TableCommitResult> {
+    ) -> TableCatalogStoreResult<(TableCommitResult, bool)> {
         let key = Self::table_key(&request.table_bucket, namespace, table);
         let current = Self::validate_new_table_commit_locked(state, &key, request)?;
-        if let Some(result) = Self::committed_existing_result_locked(state, request, current.clone()) {
-            return Ok(result);
+        if let Some((result, requires_persist)) = Self::committed_existing_result_locked(state, request, current.clone()) {
+            if requires_persist {
+                Self::persist_committed_existing_result_locked(state, request, &result);
+            }
+            return Ok((result, requires_persist));
         }
 
         let commit_log = CommitLogEntry {
@@ -3902,7 +3955,7 @@ where
         }
         state.tables.insert(key, next.clone());
 
-        Ok(TableCommitResult { table: next, commit_log })
+        Ok((TableCommitResult { table: next, commit_log }, true))
     }
 
     pub(crate) async fn plan_table_commit_recovery(
@@ -4456,11 +4509,16 @@ where
                     .commits
                     .get(&Self::commit_key(&request.table_bucket, &current.table_id, &request.commit_id))
                     .cloned();
-                let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
                 let committed =
-                    Self::committed_existing_result_locked(&mut draft_state, &request, current.clone()).map(|result| {
-                        Self::snapshot_from_mutated_state_locked(&mut draft_state)
-                            .map(|snapshot| (result, snapshot, precondition))
+                    Self::committed_existing_result_locked(&state, &request, current.clone()).map(|(result, changed)| {
+                        if changed {
+                            let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
+                            Self::persist_committed_existing_result_locked(&mut draft_state, &request, &result);
+                            Self::snapshot_from_mutated_state_locked(&mut draft_state)
+                                .map(|snapshot| (result, Some(snapshot), precondition))
+                        } else {
+                            Ok((result, None, Self::snapshot_write_precondition_locked(&state)))
+                        }
                     });
                 (current, committed, existing_commit)
             };
@@ -4509,9 +4567,10 @@ where
             }
             if let Some(prepared_result) = committed_existing_result {
                 let result = match prepared_result {
-                    Ok((result, snapshot, precondition)) => {
+                    Ok((result, Some(snapshot), precondition)) => {
                         self.finalize_snapshot_write(snapshot, precondition).await.map(|_| result)
                     }
+                    Ok((result, None, _)) => Ok(result),
                     Err(err) => Err(err),
                 };
                 return table_commit_result(
@@ -4612,20 +4671,21 @@ where
             let state = self.state.lock().await;
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
             match Self::apply_commit_locked(&mut draft_state, &request, &namespace, &table, next_warehouse_location) {
-                Ok(result) => {
-                    Self::snapshot_from_mutated_state_locked(&mut draft_state).map(|snapshot| (result, snapshot, precondition))
-                }
+                Ok((result, true)) => Self::snapshot_from_mutated_state_locked(&mut draft_state)
+                    .map(|snapshot| (result, Some(snapshot), precondition)),
+                Ok((result, false)) => Ok((result, None, precondition)),
                 Err(err) => Err(err),
             }
         };
         let result = match prepared_result {
-            Ok((result, snapshot, precondition)) => {
+            Ok((result, Some(snapshot), precondition)) => {
                 if let Some(current_metadata_guard) = current_metadata_guard.as_deref() {
                     ensure_table_catalog_lock_held(current_metadata_guard)?;
                 }
                 ensure_table_catalog_lock_held(metadata_guard.as_ref())?;
                 self.finalize_snapshot_write(snapshot, precondition).await.map(|_| result)
             }
+            Ok((result, None, _)) => Ok(result),
             Err(err) => Err(err),
         };
         let cas_result = result.as_ref().map(|_| ()).map_err(Clone::clone);
@@ -4824,7 +4884,7 @@ where
                 "new metadata location must be inside the view metadata directory".to_string(),
             ));
         }
-        let _metadata_guard = self
+        let metadata_guard = self
             .object_backend
             .acquire_read_lock(&request.table_bucket, &request.new_metadata_location)
             .await?;
@@ -4882,6 +4942,7 @@ where
             draft_state.views.insert(key, next.clone());
             (Self::snapshot_from_mutated_state_locked(&mut draft_state)?, precondition, next)
         };
+        ensure_table_catalog_lock_held(metadata_guard.as_ref())?;
         self.finalize_snapshot_write(snapshot, precondition).await?;
         Ok(ViewCommitResult { view: next })
     }
@@ -5655,7 +5716,7 @@ where
         index: &TableWarehouseIndexEntry,
         reason: &'static str,
     ) -> TableCatalogStoreResult<bool> {
-        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), object).await?;
+        let guard = self.backend.acquire_write_lock(self.catalog_bucket(), object).await?;
         let Some((current, _)) = self
             .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), object)
             .await?
@@ -5677,6 +5738,7 @@ where
             );
             return Ok(false);
         }
+        ensure_table_catalog_lock_held(guard.as_ref())?;
         self.delete_warehouse_index_object_unlocked(object, index, reason).await?;
         Ok(true)
     }
@@ -6498,6 +6560,93 @@ where
         if let Some(idempotency_path) = idempotency_path {
             self.write_entry(self.catalog_bucket(), idempotency_path, commit_log, TableCatalogPutPrecondition::Any)
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn finalize_commit_head(
+        &self,
+        entry: &TableEntry,
+        commit_log: &CommitLogEntry,
+    ) -> TableCatalogStoreResult<CommitLogEntry> {
+        let commit_path = self
+            .paths
+            .commit_log_entry_path(&entry.table_bucket, &entry.table_id, &commit_log.commit_id);
+        let idempotency_path = commit_log.idempotency_key.as_deref().map(|idempotency_key| {
+            self.paths
+                .commit_idempotency_entry_path(&entry.table_bucket, &entry.table_id, idempotency_key)
+        });
+        let mut committed = commit_log.clone();
+        committed.status = CommitLogStatus::Committed;
+        self.finalize_commit_log(&commit_path, idempotency_path.as_deref(), &committed)
+            .await?;
+        self.write_entry(
+            self.catalog_bucket(),
+            &self.paths.commit_head_path(&entry.table_bucket, &entry.table_id),
+            &committed,
+            TableCatalogPutPrecondition::Any,
+        )
+        .await?;
+        Ok(committed)
+    }
+
+    async fn current_commit_log(&self, entry: &TableEntry) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
+        let mut current = None;
+        for object in self
+            .backend
+            .list_objects(
+                self.catalog_bucket(),
+                &self.paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id),
+            )
+            .await?
+        {
+            if !object.ends_with(".json") {
+                continue;
+            }
+            let Some(commit) = self.read_commit_by_path(&object).await? else {
+                continue;
+            };
+            if commit.table_id != entry.table_id || !table_matches_committed_log(entry, &commit) {
+                continue;
+            }
+            if current.is_some() {
+                return Err(TableCatalogStoreError::Conflict(
+                    "multiple commit records match the current table pointer".to_string(),
+                ));
+            }
+            current = Some(commit);
+        }
+        Ok(current)
+    }
+
+    async fn reconcile_commit_head(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
+        let head_path = self.paths.commit_head_path(&entry.table_bucket, &entry.table_id);
+        let head = self.read_commit_by_path(&head_path).await?;
+        if let Some(head) = head.as_ref() {
+            if head.table_id != entry.table_id {
+                return Err(TableCatalogStoreError::Conflict(
+                    "commit head belongs to a different table identity".to_string(),
+                ));
+            }
+            if table_matches_committed_log(entry, head) {
+                if matches!(head.status, CommitLogStatus::Staged) {
+                    self.finalize_commit_head(entry, head).await?;
+                }
+                return Ok(());
+            }
+            if matches!(head.status, CommitLogStatus::Staged) && table_matches_staged_base(entry, head) {
+                return Ok(());
+            }
+        }
+
+        if let Some(commit) = self.current_commit_log(entry).await? {
+            self.finalize_commit_head(entry, &commit).await?;
+            return Ok(());
+        }
+        if head.is_some() {
+            return Err(TableCatalogStoreError::Conflict(
+                "commit head does not match the current or pre-commit table state".to_string(),
+            ));
         }
         Ok(())
     }
@@ -9339,7 +9488,7 @@ where
         self.ensure_table_warehouse_index_owner(&current_entry).await?;
         let current_metadata_guard = self
             .backend
-            .acquire_write_lock(table_bucket, &current_entry.metadata_location)
+            .acquire_read_lock(table_bucket, &current_entry.metadata_location)
             .await?;
         let Some(locked_current_metadata) = self
             .backend
@@ -9364,7 +9513,7 @@ where
             if object_location == current_entry.metadata_location {
                 continue;
             }
-            let source_guard = self.backend.acquire_write_lock(table_bucket, &object_location).await?;
+            let source_guard = self.backend.acquire_read_lock(table_bucket, &object_location).await?;
             let source = self.backend.object_metadata_unlocked(table_bucket, &object_location).await?;
             if source.as_ref() != Some(&expected) {
                 return Err(TableCatalogStoreError::Conflict(format!(
@@ -9813,10 +9962,22 @@ where
                     ))),
                 );
             };
+            if let Err(err) = self.reconcile_commit_head(&current).await {
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Err(err),
+                );
+            }
 
             let commit_path = self
                 .paths
                 .commit_log_entry_path(&request.table_bucket, &current.table_id, &request.commit_id);
+            let commit_head_path = self.paths.commit_head_path(&request.table_bucket, &current.table_id);
             let integrity_path =
                 self.paths
                     .commit_integrity_entry_path(&request.table_bucket, &current.table_id, &request.commit_id);
@@ -10165,6 +10326,13 @@ where
                     )
                     .await?;
                 }
+                self.write_entry(
+                    self.catalog_bucket(),
+                    &commit_head_path,
+                    &staged_commit_log,
+                    TableCatalogPutPrecondition::Any,
+                )
+                .await?;
                 Ok(())
             }
             .await;
@@ -10329,26 +10497,25 @@ where
                 })
                 .and_then(|_| ensure_table_catalog_lock_held(migration_guard.as_ref()))
                 .and_then(|_| ownership_guard.as_deref().map_or(Ok(()), ensure_table_catalog_lock_held));
-            if let Err(err) = post_cas_fence {
-                return table_commit_result(
-                    &request.table_bucket,
-                    &request.namespace,
-                    &request.table,
-                    &request.commit_id,
-                    &request.operation,
-                    commit_started,
-                    Err(err),
-                );
-            }
             self.delete_table_warehouse_index_if_changed(&current, &next).await;
 
             let mut commit_log = staged_commit_log;
             commit_log.status = CommitLogStatus::Committed;
-            // After the table CAS succeeds, the staged record is the durable recovery source.
-            // A finalization failure must not turn an externally committed pointer into a failed commit response.
-            let _ = self
-                .finalize_commit_log(&commit_path, idempotency_path.as_deref(), &commit_log)
-                .await;
+            let finalization_result = match post_cas_fence {
+                Ok(()) => self.finalize_commit_head(&next, &commit_log).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = finalization_result {
+                tracing::warn!(
+                    table_bucket = %request.table_bucket,
+                    namespace = %request.namespace,
+                    table = %request.table,
+                    table_id = %next.table_id,
+                    commit_id = %request.commit_id,
+                    error = %err,
+                    "table commit pointer advanced with pending commit record finalization"
+                );
+            }
 
             return table_commit_result(
                 &request.table_bucket,
@@ -15203,7 +15370,7 @@ pub(crate) fn validate_table_warehouse_relocation(
     if next_warehouse_location == entry.warehouse_location {
         return Ok(());
     }
-    Err(TableCatalogStoreError::Invalid(
+    Err(TableCatalogStoreError::Unsupported(
         "table warehouse relocation is unsupported because retained snapshots may still reference the current warehouse"
             .to_string(),
     ))
@@ -15790,6 +15957,7 @@ mod tests {
         );
 
         let commit_path = paths.commit_log_entry_path("table/../bucket", "table/../id", "commit/%2f\nid");
+        let commit_head_path = paths.commit_head_path("table/../bucket", "table/../id");
         let idempotency_path = paths.commit_idempotency_entry_path("table/../bucket", "table/../id", "client/%2f\nrequest");
         let warehouse_index_path = paths.warehouse_index_entry_path("table/../bucket", "tables/table/../id/data\nprefix/");
         let warehouse_index_state_path = paths.warehouse_index_state_path("table/../bucket");
@@ -15799,6 +15967,7 @@ mod tests {
 
         for path in [
             commit_path,
+            commit_head_path,
             idempotency_path,
             warehouse_index_path,
             warehouse_index_state_path,
@@ -15830,11 +15999,16 @@ mod tests {
     struct TestCatalogObjectLockGuard {
         _guard: tokio::sync::OwnedMutexGuard<()>,
         lost: bool,
+        lost_after_checks: Option<usize>,
+        held_checks: std::sync::atomic::AtomicUsize,
     }
 
     impl TableCatalogObjectLockGuard for TestCatalogObjectLockGuard {
         fn is_lock_lost(&self) -> bool {
             self.lost
+                || self.lost_after_checks.is_some_and(|lost_after_checks| {
+                    self.held_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= lost_after_checks
+                })
         }
     }
 
@@ -15871,6 +16045,7 @@ mod tests {
         fail_delete_attempts: BTreeMap<(String, String), BTreeSet<usize>>,
         replace_on_write_lock_acquisitions: TestCatalogObjectReplacements,
         lost_write_lock_acquisitions: BTreeMap<TestCatalogObjectLockKey, BTreeSet<usize>>,
+        lost_write_lock_after_checks: BTreeMap<TestCatalogObjectLockKey, BTreeMap<usize, usize>>,
         put_attempts: BTreeMap<(String, String), usize>,
         delete_attempts: BTreeMap<(String, String), usize>,
         write_lock_acquisitions: BTreeMap<(String, String), usize>,
@@ -15950,6 +16125,17 @@ mod tests {
             let key = (bucket.to_string(), object.to_string());
             let attempt = state.write_lock_acquisitions.get(&key).copied().unwrap_or_default() + 1;
             state.lost_write_lock_acquisitions.entry(key).or_default().insert(attempt);
+        }
+
+        async fn lose_next_write_lock_after_checks(&self, bucket: &str, object: &str, checks: usize) {
+            let mut state = self.state.lock().await;
+            let key = (bucket.to_string(), object.to_string());
+            let attempt = state.write_lock_acquisitions.get(&key).copied().unwrap_or_default() + 1;
+            state
+                .lost_write_lock_after_checks
+                .entry(key)
+                .or_default()
+                .insert(attempt, checks);
         }
 
         async fn list_call_count(&self) -> usize {
@@ -16601,6 +16787,10 @@ mod tests {
                 .lost_write_lock_acquisitions
                 .get(&key)
                 .is_some_and(|attempts| attempts.contains(&attempt));
+            let lost_after_checks = state
+                .lost_write_lock_after_checks
+                .get_mut(&key)
+                .and_then(|acquisitions| acquisitions.remove(&attempt));
             let replacement = state
                 .replace_on_write_lock_acquisitions
                 .get_mut(&key)
@@ -16628,7 +16818,12 @@ mod tests {
                 state.objects.insert(key, TestCatalogObjectRecord { data, etag, mod_time });
             }
             drop(state);
-            Ok(Box::new(TestCatalogObjectLockGuard { _guard: guard, lost }))
+            Ok(Box::new(TestCatalogObjectLockGuard {
+                _guard: guard,
+                lost,
+                lost_after_checks,
+                held_checks: std::sync::atomic::AtomicUsize::new(0),
+            }))
         }
     }
 
@@ -17563,7 +17758,7 @@ mod tests {
             .await
             .expect_err("warehouse relocation must remain unsupported while retained snapshots use the old prefix");
 
-        assert_matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("relocation is unsupported"));
+        assert_matches!(error, TableCatalogStoreError::Unsupported(message) if message.contains("relocation is unsupported"));
         assert!(
             !backend
                 .object_exists(RUSTFS_META_BUCKET, &relocated_index_path)
@@ -18054,8 +18249,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
 
@@ -18079,6 +18274,38 @@ mod tests {
             .expect("restored table data-plane lookup should succeed")
             .expect("restored table should keep data-plane protection");
         assert_eq!(resource.table, "orders");
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_keeps_warehouse_index_after_lock_loss() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+        let entry = store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        backend.lose_next_write_lock(RUSTFS_META_BUCKET, &index_path).await;
+
+        let error = store
+            .delete_table_warehouse_index(&entry)
+            .await
+            .expect_err("warehouse index deletion must stop after lock loss");
+
+        assert_matches!(error, TableCatalogStoreError::Conflict(_));
+        assert!(
+            backend
+                .object_exists(RUSTFS_META_BUCKET, &index_path)
+                .await
+                .expect("warehouse index lookup should succeed")
+        );
     }
 
     #[tokio::test]
@@ -23726,15 +23953,18 @@ mod tests {
         let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
 
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .put_table_bucket(test_bucket_entry(bucket))
+            .await
+            .expect("table bucket should be created");
         store
             .create_namespace(test_namespace_entry(bucket, &namespace))
             .await
-            .unwrap();
+            .expect("namespace should be created");
         store
             .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
             .await
-            .unwrap();
+            .expect("table should be created");
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
         let client_requirement = serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"});
         let metadata_digest = hex_sha256(b"{}", str::to_owned);
@@ -23962,23 +24192,21 @@ mod tests {
             .await
             .expect("table should be created");
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        let request = TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            commit_id: "commit-1".to_string(),
+            idempotency_key: Some("client-request".to_string()),
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current_metadata,
+            new_metadata_location: new_metadata.clone(),
+            requirements: Vec::new(),
+            writer: Some("pyiceberg/test".to_string()),
+        };
 
-        let result = store
-            .commit_table(TableCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                commit_id: "commit-1".to_string(),
-                idempotency_key: Some("client-request".to_string()),
-                operation: "append".to_string(),
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: current_metadata,
-                new_metadata_location: new_metadata.clone(),
-                requirements: Vec::new(),
-                writer: Some("pyiceberg/test".to_string()),
-            })
-            .await
-            .expect("commit should succeed");
+        let result = store.commit_table(request.clone()).await.expect("commit should succeed");
 
         let restarted = StrongTableCatalogStore::new(backend.clone());
         let loaded = restarted
@@ -24015,6 +24243,24 @@ mod tests {
         assert_eq!(recovery.finalization_required_count, 0);
         assert_eq!(recovery.idempotency_repair_required_count, 0);
         assert_eq!(recovery.manual_review_count, 0);
+
+        backend
+            .fail_next_put(
+                RUSTFS_META_BUCKET,
+                &StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path(),
+            )
+            .await;
+        let replay = restarted
+            .commit_table(request)
+            .await
+            .expect("a clean replay should not rewrite the durable snapshot");
+        assert_eq!(replay.table.version_token, result.table.version_token);
+
+        let error = restarted
+            .put_table_bucket(test_bucket_entry("later-bucket"))
+            .await
+            .expect_err("the injected snapshot write failure should remain pending after replay");
+        assert_matches!(error, TableCatalogStoreError::Internal(_));
     }
 
     #[tokio::test]
@@ -24388,6 +24634,10 @@ mod tests {
             .await
             .expect("create task should join")
             .expect("table should be created");
+        assert!(
+            !store.state.lock().await.hydrated,
+            "a reload of the previous snapshot must remain invalidated after the durable write"
+        );
 
         let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/file.parquet")
             .await
@@ -24398,6 +24648,67 @@ mod tests {
         assert_eq!(resource.table, table.as_str());
         assert_eq!(resource.table_id, "table-id");
         assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
+    }
+
+    #[tokio::test]
+    async fn strong_catalog_view_replace_rejects_lost_metadata_lock() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = StrongTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+        let current_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+        let next_metadata = default_view_metadata_file_path(&namespace, &view, "00002.metadata.json");
+
+        store
+            .put_table_bucket(test_bucket_entry(bucket))
+            .await
+            .expect("table bucket should be created");
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+        store
+            .create_view(test_view_entry(bucket, &namespace, &view, current_metadata.clone()))
+            .await
+            .expect("view should be created");
+        backend
+            .seed_object(
+                bucket,
+                &next_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 1,
+                    "view-uuid": "view-uuid",
+                    "location": format!("s3://{bucket}/views/view-id")
+                }))
+                .expect("view metadata should serialize"),
+            )
+            .await;
+        backend.lose_next_write_lock(bucket, &next_metadata).await;
+
+        let error = store
+            .replace_view(ViewCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata.clone(),
+                new_metadata_location: next_metadata,
+                new_metadata_sha256: None,
+            })
+            .await
+            .expect_err("view replacement must stop after metadata lock loss");
+
+        assert_matches!(error, TableCatalogStoreError::Conflict(_));
+        let restarted = StrongTableCatalogStore::new(backend);
+        let loaded = restarted
+            .load_view(bucket, &namespace.public_name(), view.as_str())
+            .await
+            .expect("view lookup should succeed")
+            .expect("view should still exist");
+        assert_eq!(loaded.metadata_location, current_metadata);
+        assert_eq!(loaded.version_token, "token-v1");
+        assert_eq!(loaded.generation, 1);
     }
 
     #[tokio::test]
@@ -25433,7 +25744,7 @@ mod tests {
                 .await
                 .expect_err("external table warehouse relocation should be rejected");
 
-            assert_matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("relocation is unsupported"));
+            assert_matches!(error, TableCatalogStoreError::Unsupported(message) if message.contains("relocation is unsupported"));
             let loaded = store
                 .load_table(bucket, &namespace.public_name(), table.as_str())
                 .await
@@ -25721,7 +26032,11 @@ mod tests {
             .await
             .expect("an older client should replay the committed result without internal digest requirements");
         assert_eq!(replay.table.version_token, result.table.version_token);
-        assert_eq!(backend.list_call_count().await, 0);
+        assert_eq!(
+            backend.list_call_count().await,
+            1,
+            "the first post-upgrade commit should scan once before establishing the durable commit head"
+        );
         assert_eq!(
             backend
                 .write_lock_acquisition_count(store.catalog_bucket(), &ownership_lock_path)
@@ -26038,7 +26353,11 @@ mod tests {
         let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
         assert_eq!(loaded.metadata_location, current_metadata);
         assert_eq!(loaded.version_token, "token-v1");
-        let staged = store.get_commit_by_id(bucket, "table-id", "commit-1").await.unwrap().unwrap();
+        let staged = store
+            .get_commit_by_id(bucket, "table-id", "commit-1")
+            .await
+            .expect("commit lookup should succeed")
+            .expect("staged commit should exist");
         assert_eq!(staged.status, CommitLogStatus::Staged);
     }
 
@@ -26051,6 +26370,7 @@ mod tests {
         let table = IdentifierSegment::parse("orders").unwrap();
         let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let later_metadata = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
         let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
 
         store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
@@ -26063,6 +26383,7 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &later_metadata, b"{}".to_vec()).await;
         backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
         let request = TableCommitRequest {
@@ -26088,11 +26409,115 @@ mod tests {
         let staged = store.get_commit_by_id(bucket, "table-id", "commit-1").await.unwrap().unwrap();
         assert_eq!(staged.status, CommitLogStatus::Staged);
 
-        let retry = store.commit_table(request).await.unwrap();
-        assert_eq!(retry.table.version_token, result.table.version_token);
-        assert_eq!(retry.commit_log.status, CommitLogStatus::Committed);
+        let later = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-2".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: result.table.version_token.clone(),
+                expected_metadata_location: new_metadata,
+                new_metadata_location: later_metadata.clone(),
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .expect("a later commit should finalize the prior recovery head before advancing");
+        assert_eq!(later.table.metadata_location, later_metadata);
         let committed = store.get_commit_by_id(bucket, "table-id", "commit-1").await.unwrap().unwrap();
         assert_eq!(committed.status, CommitLogStatus::Committed);
+
+        let retry = store
+            .commit_table(request)
+            .await
+            .expect("a historical retry should return the current committed table state");
+        assert_eq!(retry.table.version_token, later.table.version_token);
+        assert_eq!(retry.commit_log.status, CommitLogStatus::Committed);
+        assert_eq!(retry.table.metadata_location, later_metadata);
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_returns_committed_result_when_lock_is_lost_after_cas() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let later_metadata = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        store
+            .put_table_bucket(test_bucket_entry(bucket))
+            .await
+            .expect("table bucket should be created");
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+        store
+            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .await
+            .expect("table should be created");
+        backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &later_metadata, b"{}".to_vec()).await;
+        let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
+        backend
+            .lose_next_write_lock_after_checks(store.catalog_bucket(), &table_path, 2)
+            .await;
+
+        let committed = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: new_metadata.clone(),
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .expect("a successful pointer CAS must remain externally committed after lock loss");
+
+        assert_eq!(committed.table.metadata_location, new_metadata);
+        assert_eq!(committed.commit_log.status, CommitLogStatus::Committed);
+        let staged = store
+            .get_commit_by_id(bucket, "table-id", "commit-1")
+            .await
+            .expect("commit lookup should succeed")
+            .expect("staged commit should exist");
+        assert_eq!(staged.status, CommitLogStatus::Staged);
+
+        let later = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-2".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: committed.table.version_token,
+                expected_metadata_location: new_metadata,
+                new_metadata_location: later_metadata.clone(),
+                requirements: Vec::new(),
+                writer: None,
+            })
+            .await
+            .expect("a later commit should recover the staged record before advancing");
+
+        assert_eq!(later.table.metadata_location, later_metadata);
+        let recovered = store
+            .get_commit_by_id(bucket, "table-id", "commit-1")
+            .await
+            .expect("commit lookup should succeed")
+            .expect("recovered commit should exist");
+        assert_eq!(recovered.status, CommitLogStatus::Committed);
     }
 
     #[tokio::test]
