@@ -17,7 +17,7 @@ use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt::Display,
     future::Future,
     pin::Pin,
@@ -719,7 +719,7 @@ pub struct ScannerDiskBucketScanSnapshot {
     pub active: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ScannerBucketDriveResultKey {
     bucket: String,
     drive: String,
@@ -737,6 +737,12 @@ impl ScannerBucketDriveResultKey {
 }
 
 const MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct ScannerBucketDriveResults {
+    counts: HashMap<ScannerBucketDriveResultKey, ScannerBucketDriveResultValue>,
+    eviction_index: BTreeSet<(u64, ScannerBucketDriveResultKey)>,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ScannerBucketDriveResultValue {
@@ -775,7 +781,7 @@ pub struct Metrics {
     scanner_set_scans_queued: AtomicU64,
     scanner_set_scans_active: AtomicU64,
     scanner_disk_bucket_scan_states: Mutex<HashMap<ScannerDiskBucketScanKey, ScannerDiskBucketScanState>>,
-    scanner_bucket_drive_results: Mutex<HashMap<ScannerBucketDriveResultKey, ScannerBucketDriveResultValue>>,
+    scanner_bucket_drive_results: Mutex<ScannerBucketDriveResults>,
     scanner_bucket_drive_result_clock: AtomicU64,
     current_scan_cycle_bucket_drive_results_start: Mutex<HashMap<ScannerBucketDriveResultKey, u64>>,
     last_scan_cycle_bucket_drive_results: Mutex<Vec<ScannerBucketDriveResultSnapshot>>,
@@ -1785,7 +1791,7 @@ impl Metrics {
             scanner_set_scans_queued: AtomicU64::new(0),
             scanner_set_scans_active: AtomicU64::new(0),
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
-            scanner_bucket_drive_results: Mutex::new(HashMap::new()),
+            scanner_bucket_drive_results: Mutex::new(ScannerBucketDriveResults::default()),
             scanner_bucket_drive_result_clock: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_results_start: Mutex::new(HashMap::new()),
             last_scan_cycle_bucket_drive_results: Mutex::new(Vec::new()),
@@ -2386,31 +2392,28 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let last_seen = self.scanner_bucket_drive_result_clock.fetch_add(1, Ordering::Relaxed);
-        if !results.contains_key(&key)
-            && results.len() >= MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS
-            && let Some(stale_key) = results
-                .iter()
-                .min_by(|left, right| {
-                    left.1
-                        .last_seen
-                        .cmp(&right.1.last_seen)
-                        .then_with(|| left.0.bucket.cmp(&right.0.bucket))
-                        .then_with(|| left.0.drive.cmp(&right.0.drive))
-                        .then_with(|| left.0.result.cmp(&right.0.result))
-                })
-                .map(|(key, _)| key.clone())
-        {
-            results.remove(&stale_key);
+        if let Some(previous_last_seen) = results.counts.get_mut(&key).map(|value| {
+            let previous_last_seen = value.last_seen;
+            value.count = value.count.saturating_add(1);
+            value.last_seen = last_seen;
+            previous_last_seen
+        }) {
+            results.eviction_index.remove(&(previous_last_seen, key.clone()));
+            results.eviction_index.insert((last_seen, key));
+            return;
         }
-        match results.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let value = entry.get_mut();
-                value.count = value.count.saturating_add(1);
-                value.last_seen = last_seen;
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(ScannerBucketDriveResultValue { count: 1, last_seen });
-            }
+
+        if results.counts.len() >= MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS
+            && let Some((_, stale_key)) = results.eviction_index.pop_first()
+        {
+            results.counts.remove(&stale_key);
+        }
+
+        if results.counts.len() < MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS {
+            results
+                .counts
+                .insert(key.clone(), ScannerBucketDriveResultValue { count: 1, last_seen });
+            results.eviction_index.insert((last_seen, key));
         }
     }
 
@@ -2694,6 +2697,7 @@ impl Metrics {
         self.scanner_bucket_drive_results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .counts
             .iter()
             .map(|(key, value)| (key.clone(), value.count))
             .collect()
@@ -4389,6 +4393,32 @@ mod tests {
                 .bucket_drive_results
                 .iter()
                 .all(|snapshot| snapshot.bucket != "bucket-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_bucket_drive_result_eviction_keeps_recent_keys() {
+        let metrics = Metrics::new();
+        for index in 0..MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS {
+            metrics.record_scanner_bucket_drive_result(&format!("bucket-{index}"), "/data1", "success");
+        }
+        metrics.record_scanner_bucket_drive_result("bucket-0", "/data1", "success");
+        metrics.record_scanner_bucket_drive_result("overflow", "/data1", "success");
+
+        let report = metrics.scanner_runtime_details_report();
+
+        assert_eq!(report.bucket_drive_results.len(), MAX_SCANNER_BUCKET_DRIVE_RESULT_KEYS);
+        assert!(
+            report
+                .bucket_drive_results
+                .iter()
+                .any(|snapshot| snapshot.bucket == "bucket-0" && snapshot.count == 2)
+        );
+        assert!(
+            report
+                .bucket_drive_results
+                .iter()
+                .all(|snapshot| snapshot.bucket != "bucket-1")
         );
     }
 

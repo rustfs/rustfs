@@ -4358,6 +4358,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
+            let cached_disk_id = disk.cached_disk_id().await;
             if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
                 match disk
                     .disk_info(&DiskInfoOptions {
@@ -4412,6 +4413,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             runtime_state: Some(runtime_state.as_str().to_string()),
                             offline_duration_seconds,
                             metrics: disk.metrics_snapshot(),
+                            uuid: cached_disk_id.map_or_else(String::new, |id| id.to_string()),
                             ..Default::default()
                         };
                         if let Some((total, used, free, _)) = capacity_snapshot {
@@ -4433,6 +4435,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 let mut disk_info =
                     build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds, capacity_snapshot);
                 disk_info.metrics = disk.metrics_snapshot();
+                disk_info.uuid = cached_disk_id.map_or_else(String::new, |id| id.to_string());
                 ret.push(disk_info);
             }
         } else {
@@ -7707,6 +7710,13 @@ mod tests {
             .as_ref()
             .expect("disk 1 should exist")
             .force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+        let offline_disk_id = Uuid::new_v4();
+        disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .set_disk_id_state(Some(offline_disk_id))
+            .await
+            .expect("offline disk id should be cached");
         disks[2]
             .as_ref()
             .expect("disk 2 should exist")
@@ -7750,6 +7760,7 @@ mod tests {
             endpoints[2].get_file_path(),
             "offline disk should keep stable endpoint path"
         );
+        assert_eq!(info[2].uuid, offline_disk_id.to_string());
         assert!(
             info[2].metrics.is_some(),
             "offline runtime fallback should preserve disk metrics snapshot"

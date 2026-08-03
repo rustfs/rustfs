@@ -1551,6 +1551,7 @@ impl LocalDiskWrapper {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.metrics.record_operation_call(op);
         // Check if disk is faulty
         if self.health.is_faulty() {
             self.metrics.record_availability_error();
@@ -1575,7 +1576,6 @@ impl LocalDiskWrapper {
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         let _waiting_guard = self.health.waiting_guard();
         let _metric_waiting_guard = self.metrics.waiting_guard();
-        self.metrics.record_operation_call(op);
         let started = Instant::now();
 
         if timeout_duration == Duration::ZERO {
@@ -1704,6 +1704,7 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
         if opts.noop && opts.metrics {
+            self.metrics.record_operation_call("disk_info");
             let info = DiskInfo {
                 metrics: self.metrics_snapshot(),
                 ..Default::default()
@@ -1716,6 +1717,7 @@ impl DiskAPI for LocalDiskWrapper {
         }
 
         if self.health.is_faulty() {
+            self.metrics.record_operation_call("disk_info");
             self.metrics.record_availability_error();
             return Err(DiskError::FaultyDisk);
         }
@@ -1826,6 +1828,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
+        self.metrics.record_operation_call("delete_versions");
         // Check if disk is faulty before proceeding
         if self.health.is_faulty() {
             self.metrics.record_availability_error();
@@ -1842,7 +1845,6 @@ impl DiskAPI for LocalDiskWrapper {
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         self.health.increment_waiting();
         let metric_waiting_guard = self.metrics.waiting_guard();
-        self.metrics.record_operation_call("delete_versions");
         let started = Instant::now();
 
         // Execute the operation
@@ -2331,7 +2333,9 @@ mod tests {
             .expect_err("returned availability error should propagate");
 
         assert_eq!(err, DiskError::DiskNotFound);
-        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
+        assert_eq!(snapshot.total_errors_availability, 1);
     }
 
     #[tokio::test]
@@ -2392,7 +2396,9 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result.first(), Some(Some(DiskError::FaultyDisk))));
-        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("delete_versions"), Some(&1));
+        assert_eq!(snapshot.total_errors_availability, 1);
     }
 
     #[tokio::test]
@@ -2414,7 +2420,9 @@ mod tests {
             .expect_err("faulty disk_info should be rejected");
 
         assert_eq!(err, DiskError::FaultyDisk);
-        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("disk_info"), Some(&1));
+        assert_eq!(snapshot.total_errors_availability, 1);
     }
 
     #[tokio::test]
@@ -2442,7 +2450,9 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result.first(), Some(Some(DiskError::DiskNotFound))));
-        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("delete_versions"), Some(&1));
+        assert_eq!(snapshot.total_errors_availability, 1);
     }
 
     impl AsyncWrite for PendingWriter {
