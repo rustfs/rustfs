@@ -21,10 +21,6 @@ spec:
     - "*.{{ include "rustfs.fullname" . }}-headless"
     - "*.{{ include "rustfs.fullname" . }}-headless.{{ .Release.Namespace }}.svc.{{ include "rustfs.clusterDomain" . }}"
     - "{{ include "rustfs.fullname" . }}-svc.{{ .Release.Namespace }}.svc.{{ include "rustfs.clusterDomain" . }}"
-  {{- range .Values.ingress.hosts }}
-    - {{ .host | quote }}
-    - {{ printf "*.%s" .host | quote }}
-  {{- end }}
   usages:
     - server auth
 {{- end }}
