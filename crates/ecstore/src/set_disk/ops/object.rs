@@ -3706,9 +3706,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            // Normalize both sides before comparing. `goi.version_id` is the
+            // client-facing identity, where `from_file_info` synthesizes
+            // `Some(Uuid::nil())` for a null version on a versioned or
+            // versioning-suspended bucket; `version_id` is the storage identity,
+            // where an explicit `?versionId=null` maps to `None`. Comparing them
+            // raw makes an explicit null-version delete of a null delete marker
+            // look like a version mismatch, so the `MethodNotAllowed` from the
+            // lookup below is recorded as a delete failure and the marker is
+            // never purged — the bucket then stays non-empty on disk forever.
             let explicit_delete_marker = dobj.version_id.is_some()
                 && goi.delete_marker
-                && goi.version_id == version_id
+                && delete_file_info_version_id(goi.version_id) == version_id
                 && matches!(gerr.as_ref(), Some(StorageError::MethodNotAllowed));
             if let Some(err) = gerr.as_ref()
                 && !source_missing

@@ -11040,6 +11040,71 @@ mod tests {
         assert_eq!(restored, payload);
     }
 
+    /// The other half of the suspended-versioning delete contract: a client
+    /// that drains such a bucket lists the null delete marker and then purges
+    /// it as `?versionId=null`, which is what `nuke_bucket` does before
+    /// `DeleteBucket`. That purge must succeed — if it is rejected the marker's
+    /// `xl.meta` survives, and `DeleteBucket`'s raw disk scan then reports
+    /// `BucketNotEmpty` for a bucket the client has already emptied.
+    #[tokio::test]
+    async fn set_level_explicit_null_version_delete_purges_the_null_delete_marker() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-null-marker-purge";
+        let object = "object.txt";
+        // The delete path reads versioned/suspended from the bucket-config
+        // snapshot, not from `opts`, so inject a real Suspended config —
+        // otherwise `from_file_info` never synthesizes the null version id and
+        // the branch under test is not reached.
+        let suspended = crate::bucket::replication::DeleteReplicationConfigSnapshot::from_configs_for_test(
+            s3s::dto::VersioningConfiguration {
+                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                ..Default::default()
+            },
+            None,
+        );
+        let opts = ObjectOptions {
+            no_lock: true,
+            version_suspended: true,
+            delete_replication_config_snapshot: Some(Arc::new(suspended)),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"suspended version body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("suspended-version object should be written");
+
+        let marker = set_disks
+            .delete_object(bucket, object, opts.clone())
+            .await
+            .expect("version-suspended delete should create a null marker");
+        assert!(marker.delete_marker);
+        assert_eq!(marker.version_id, Some(Uuid::nil()));
+
+        let (_deleted, errs) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(Uuid::nil()),
+                    ..Default::default()
+                }],
+                opts.clone(),
+            )
+            .await;
+
+        assert!(
+            errs.iter().all(Option::is_none),
+            "explicit null-version purge of the null delete marker must succeed, got {errs:?}"
+        );
+    }
+
     #[tokio::test]
     async fn set_level_version_suspended_delete_creates_null_delete_marker() {
         let set_disks = make_local_bucket_test_set_disks().await;
