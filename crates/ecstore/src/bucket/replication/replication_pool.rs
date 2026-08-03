@@ -49,6 +49,7 @@ use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use futures_util::stream::{self, StreamExt};
 use metrics::{counter, histogram};
+use rustfs_utils::hash::HashAlgorithm;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -228,15 +229,30 @@ fn durable_mrf_backlog_tracker_from_entries(entries: &[MrfReplicateEntry]) -> Du
 
 fn move_staged_mrf_entries(pending: &mut Vec<MrfReplicateEntry>, staged: &mut Vec<MrfReplicateEntry>) -> Vec<MrfReplicateEntry> {
     let pending_capacity = MRF_PENDING_CAP.saturating_sub(pending.len());
-    let capped_batch = staged.split_off(pending_capacity.min(staged.len()));
-    pending.append(staged);
+    let mut staged_entries = std::mem::take(staged);
+    let capped_batch = staged_entries.split_off(pending_capacity.min(staged_entries.len()));
+    pending.append(&mut staged_entries);
     capped_batch
 }
 
 #[derive(Debug)]
 struct PendingMrfAppend {
-    payload: Vec<u8>,
+    digest: [u8; 32],
     entry_count: usize,
+}
+
+fn mrf_payload_digest(data: &[u8]) -> [u8; 32] {
+    let encoded = HashAlgorithm::SHA256.hash_encode(data);
+    let mut digest = [0; 32];
+    digest.copy_from_slice(encoded.as_ref());
+    digest
+}
+
+fn add_durable_mrf_suffix(tracker: &mut DurableMrfBacklogTracker, entries: &[MrfReplicateEntry], count: usize) {
+    let start = entries.len().saturating_sub(count);
+    for entry in &entries[start..] {
+        tracker.add_entry(entry);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1432,7 +1448,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 if pending.len() >= MRF_PENDING_CAP && recovery_applied {
                     if dirty {
                         if let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
-                            durable_tracker = durable_mrf_backlog_tracker_from_entries(&pending);
+                            add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
                             set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                             let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
                             observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
@@ -1502,7 +1518,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             if new_entries_pending_stats >= 1000
                                 && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
                             {
-                                durable_tracker = durable_mrf_backlog_tracker_from_entries(&pending);
+                                add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
                                 set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                                 let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
                                 observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
@@ -1516,7 +1532,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         None => {
                             // Channel closed (pool shutting down) — final flush.
                             if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
-                                durable_tracker = durable_mrf_backlog_tracker_from_entries(&pending);
+                                add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
                                 set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                                 let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
                                 observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
@@ -1534,6 +1550,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             let new_entries = pending.split_off(initial_pending_len.min(pending.len()));
                             pending = retry_entries;
                             pending.extend(new_entries);
+                            let pending_capacity = MRF_PENDING_CAP.saturating_sub(pending.len());
+                            let moved_count = pending_capacity.min(capped_batch.len());
+                            if moved_count > 0 {
+                                pending.extend(capped_batch.drain(..moved_count));
+                                new_entries_pending_stats += moved_count;
+                                new_entries_pending_observability += moved_count;
+                            }
                             durable_tracker = durable_mrf_backlog_tracker_from_entries(
                                 &pending[..pending.len().saturating_sub(new_entries_pending_stats)],
                             );
@@ -1542,7 +1565,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     },
                     _ = interval.tick() => {
                         if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
-                            durable_tracker = durable_mrf_backlog_tracker_from_entries(&pending);
+                            add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
                             set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                             let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
                             observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
@@ -2228,9 +2251,10 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
             }
         };
 
+    let current_digest = mrf_payload_digest(&current);
     if pending_payload
         .as_ref()
-        .is_some_and(|pending| pending.payload.as_slice() == current.as_slice())
+        .is_some_and(|pending| pending.digest == current_digest)
     {
         return Some(duration_millis_u64(started.elapsed()));
     }
@@ -2252,7 +2276,7 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
         && entries.len() >= pending.entry_count
     {
         match encode_mrf_file(&entries[..pending.entry_count]) {
-            Ok(prefix) if prefix.as_slice() == pending.payload.as_slice() => return Some(duration_millis_u64(started.elapsed())),
+            Ok(prefix) if mrf_payload_digest(&prefix) == pending.digest => return Some(duration_millis_u64(started.elapsed())),
             Ok(_) => {}
             Err(error) => {
                 observe_mrf_flush_failure(0);
@@ -2282,7 +2306,7 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
         }
     };
     *pending_payload = Some(PendingMrfAppend {
-        payload: data.clone(),
+        digest: mrf_payload_digest(&data),
         entry_count: entries.len(),
     });
     if let Err(error) =
@@ -4525,6 +4549,121 @@ mod tests {
             handle.abort();
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn mrf_recovery_shrink_refills_pending_and_flushes_before_shutdown() {
+        assert!(
+            runtime_sources::replication_pool().is_none(),
+            "test requires the runtime replication pool to be unavailable"
+        );
+        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("60000"))], async {
+            let shared = empty_resync_shared_state();
+            let retained = vec![MrfReplicateEntry::default(); MRF_PENDING_CAP];
+            *shared.data.lock().expect("test data lock should not be poisoned") =
+                encode_mrf_file(&retained).expect("full startup MRF backlog should encode");
+            shared.delay_first_read.store(true, Ordering::SeqCst);
+            shared.block_next_write.store(true, Ordering::SeqCst);
+            let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-recovery-shrink", shared.clone()))).await;
+            let read_started = shared.first_read_started.notified();
+            let write_started = shared.write_started.notified();
+
+            pool.start_mrf_persister().await;
+            tokio::time::timeout(Duration::from_secs(2), read_started)
+                .await
+                .expect("startup MRF read should be delayed");
+            pool.mrf_save_tx
+                .send(MrfReplicateEntry {
+                    bucket: "mrf-recovery-shrink".to_string(),
+                    object: "staged-overflow".to_string(),
+                    op: MrfOpKind::Object,
+                    ..Default::default()
+                })
+                .await
+                .expect("overflow entry should be staged before recovery completes");
+            *pool.mrf_recovery_result.lock().await = Some(vec![MrfReplicateEntry::default(); MRF_PENDING_CAP - 1]);
+            pool.mrf_recovery_complete.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(5), write_started)
+                .await
+                .expect("recovery shrink should trigger the normal pending flush before shutdown");
+            assert!(
+                decode_mrf_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+                    .expect("the blocked write should leave the old backlog readable")
+                    .iter()
+                    .all(|entry| entry.object != "staged-overflow"),
+                "the staged overflow must remain pending until the flush completes"
+            );
+            shared.allow_write.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let data = shared.data.lock().expect("test data lock should not be poisoned").clone();
+                    if decode_mrf_file(&data).is_ok_and(|entries| {
+                        entries.len() == MRF_PENDING_CAP && entries.last().is_some_and(|entry| entry.object == "staged-overflow")
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the recovered pending prefix should persist before the task is stopped");
+
+            let handle = pool
+                .task_handles
+                .lock()
+                .await
+                .pop()
+                .expect("MRF persister task should be registered");
+            handle.abort();
+        })
+        .await;
+    }
+
+    #[test]
+    fn mrf_durable_tracker_flushes_only_the_new_suffix() {
+        let retained = MrfReplicateEntry {
+            bucket: "mrf-tracker-suffix".to_string(),
+            size: 3,
+            ..Default::default()
+        };
+        let appended = MrfReplicateEntry {
+            bucket: retained.bucket.clone(),
+            size: 5,
+            ..Default::default()
+        };
+        let pending = [retained.clone(), appended.clone()];
+        let mut tracker = durable_mrf_backlog_tracker_from_entries(std::slice::from_ref(&retained));
+
+        add_durable_mrf_suffix(&mut tracker, &pending, 1);
+
+        let snapshot = tracker.into_snapshot();
+        assert_eq!(snapshot.summary.buckets.len(), 1);
+        assert_eq!(snapshot.summary.buckets[0].count, 2);
+        assert_eq!(snapshot.summary.buckets[0].bytes, 8);
+    }
+
+    #[test]
+    fn move_staged_mrf_entries_releases_staging_capacity() {
+        let mut pending = vec![MrfReplicateEntry::default(); MRF_PENDING_CAP - 1];
+        let mut staged = Vec::with_capacity(2);
+        staged.push(MrfReplicateEntry {
+            object: "pending-entry".to_string(),
+            ..Default::default()
+        });
+        staged.push(MrfReplicateEntry {
+            object: "capped-entry".to_string(),
+            ..Default::default()
+        });
+
+        let capped_batch = move_staged_mrf_entries(&mut pending, &mut staged);
+
+        assert_eq!(pending.len(), MRF_PENDING_CAP);
+        assert_eq!(pending.last().expect("pending prefix should be filled").object, "pending-entry");
+        assert_eq!(capped_batch.len(), 1);
+        assert_eq!(capped_batch[0].object, "capped-entry");
+        assert_eq!(staged.capacity(), 0, "the staging allocation should be released after the move");
     }
 
     #[tokio::test]
