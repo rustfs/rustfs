@@ -4572,7 +4572,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), read_started)
                 .await
                 .expect("startup MRF read should be delayed");
-            for object in ["staged-overflow-1", "staged-overflow-2"] {
+            for object in ["staged-overflow-1", "staged-overflow-2", "staged-overflow-3"] {
                 pool.mrf_save_tx
                     .send(MrfReplicateEntry {
                         bucket: "mrf-recovery-shrink".to_string(),
@@ -4583,7 +4583,7 @@ mod tests {
                     .await
                     .expect("overflow entry should be staged before recovery completes");
             }
-            *pool.mrf_recovery_result.lock().await = Some(vec![MrfReplicateEntry::default(); MRF_PENDING_CAP - 1]);
+            *pool.mrf_recovery_result.lock().await = Some(vec![MrfReplicateEntry::default(); MRF_PENDING_CAP - 2]);
             pool.mrf_recovery_complete.notify_one();
 
             tokio::time::timeout(Duration::from_secs(5), write_started)
@@ -4620,7 +4620,8 @@ mod tests {
                 .expect("the capped suffix should be persisted after the pending flush");
             assert_eq!(persisted.len(), MRF_PENDING_CAP + 1);
             assert_eq!(persisted[MRF_PENDING_CAP - 1].object, "staged-overflow-1");
-            assert_eq!(persisted.last().expect("capped suffix should be present").object, "staged-overflow-2");
+            assert_eq!(persisted[MRF_PENDING_CAP].object, "staged-overflow-2");
+            assert_eq!(persisted.last().expect("capped suffix should be present").object, "staged-overflow-3");
 
             let handle = pool
                 .task_handles
