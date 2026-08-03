@@ -510,6 +510,15 @@ fn mrf_file_for_entry(entry: &MrfReplicateEntry) -> &'static str {
     }
 }
 
+/// An MRF source lookup that reports the object or version as gone is terminal:
+/// the source no longer exists, so replaying it would achieve nothing. Anything
+/// else is transient and must be retried, or a flaky disk silently drops the
+/// backlog entry. Named helper (from #5659) so the classification is pinned by
+/// its own tests rather than being an inline guard.
+fn should_retry_mrf_source_lookup(error: &EcstoreError) -> bool {
+    !is_err_object_not_found(error) && !is_err_version_not_found(error)
+}
+
 fn targeted_mrf_entry_is_valid(entry: &MrfReplicateEntry) -> bool {
     let targets = normalized_target_arns(&entry.target_arns);
     entry.op == MrfOpKind::Delete
@@ -683,7 +692,7 @@ async fn recovered_mrf_operations<S: ReplicationStorage>(entry: &MrfReplicateEnt
             };
             let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
                 Ok(oi) => oi,
-                Err(error) if is_err_object_not_found(&error) || is_err_version_not_found(&error) => {
+                Err(error) if !should_retry_mrf_source_lookup(&error) => {
                     return RecoveredMrfOperations::TerminalSkip;
                 }
                 Err(_) => return RecoveredMrfOperations::Retry,
@@ -5168,6 +5177,28 @@ mod tests {
         assert_eq!(shared.object_info_count.load(Ordering::SeqCst), 1);
         let encoded = shared.data.lock().expect("test MRF data lock should not be poisoned").clone();
         assert!(decode_mrf_file(&encoded).expect("acknowledged MRF should decode").is_empty());
+    }
+
+    /// Ported unchanged from #5659: these pin the guarantee, not the
+    /// implementation, so they keep holding across this branch's MRF rewrite.
+    #[test]
+    fn mrf_object_replay_source_lookup_discards_missing_objects_and_retries_transient_errors() {
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::FileNotFound));
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::FileVersionNotFound));
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::VersionNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+        assert!(should_retry_mrf_source_lookup(&EcstoreError::Unexpected));
+    }
+
+    #[test]
+    fn mrf_metadata_replay_source_lookup_discards_missing_objects_and_retries_transient_errors() {
+        for error in [EcstoreError::FileNotFound, EcstoreError::FileVersionNotFound] {
+            assert!(!should_retry_mrf_source_lookup(&error));
+        }
+        assert!(should_retry_mrf_source_lookup(&EcstoreError::Unexpected));
     }
 
     #[tokio::test]

@@ -677,21 +677,22 @@ pub(crate) type ExistingBaseDirectoryGuard = ();
 #[cfg(windows)]
 fn lock_windows_directory(path: &Path) -> io::Result<winapi_util::Handle> {
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x10;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_SHARE_READ: u32 = 0x1;
-
+    // Relative child publication requires write sharing on every guarded
+    // ancestor. Omitting delete sharing still prevents any directory in the
+    // resolved path from being renamed or removed before the commit finishes.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let handle = winapi_util::Handle::from_file(file);
     let info = winapi_util::file::information(&handle)?;
-    if info.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0
+    if info.file_attributes() & u64::from(FILE_ATTRIBUTE_DIRECTORY) == 0
         || info.file_attributes() & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) != 0
     {
         return Err(io::Error::from(io::ErrorKind::NotADirectory));
@@ -1223,21 +1224,51 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_parent_guard_blocks_base_and_intermediate_replacement() {
+    fn windows_parent_guard_blocks_parent_replacement() {
         let temp_dir = tempdir().expect("create temp dir");
         let base = temp_dir.path().join("bucket");
         std::fs::create_dir(&base).expect("create destination base");
         let parent = base.join("object").join("nested");
         let guard = mkdir_all_below_existing_base_std(&parent, &base).expect("create and lock destination parents");
 
+        std::fs::read_dir(&parent).expect("the locked parent must remain readable");
         std::fs::rename(&base, temp_dir.path().join("replacement-base"))
             .expect_err("the locked base must not be replaceable before commit");
         std::fs::rename(base.join("object"), base.join("replacement-object"))
             .expect_err("a locked intermediate directory must not be replaceable before commit");
+        std::fs::rename(&parent, base.join("replacement-parent"))
+            .expect_err("the locked destination parent must not be replaceable before commit");
+        assert!(parent.is_dir(), "failed replacement must leave the guarded parent in place");
 
         drop(guard);
         std::fs::rename(base.join("object"), base.join("replacement-object"))
             .expect("replacement should succeed after the commit guard is released");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_guarded_parent_allows_same_and_descendant_publication() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        let parent = base.join("object");
+        std::fs::create_dir_all(&parent).expect("create destination parent");
+        let _guard = mkdir_all_below_existing_base_std(&parent, &base).expect("guard destination parent");
+        let first_src = temp_dir.path().join("first-stage");
+        let second_src = temp_dir.path().join("second-stage");
+        std::fs::write(&first_src, b"first").expect("write first source");
+        std::fs::write(&second_src, b"second").expect("write second source");
+
+        rename_all(&first_src, parent.join("first"), &base)
+            .await
+            .expect("same-parent rename must succeed while a guard is held");
+        rename_all(&second_src, parent.join("nested").join("second"), &base)
+            .await
+            .expect("descendant-parent rename must succeed while an ancestor guard is held");
+        assert_eq!(std::fs::read(parent.join("first")).expect("read first destination"), b"first");
+        assert_eq!(
+            std::fs::read(parent.join("nested").join("second")).expect("read second destination"),
+            b"second"
+        );
     }
 
     #[cfg(unix)]

@@ -4438,6 +4438,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
+            let cached_disk_id = disk.cached_disk_id().await;
             if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
                 match disk
                     .disk_info(&DiskInfoOptions {
@@ -4492,6 +4493,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             runtime_state: Some(runtime_state.as_str().to_string()),
                             offline_duration_seconds,
                             metrics: disk.metrics_snapshot(),
+                            uuid: cached_disk_id.map_or_else(String::new, |id| id.to_string()),
                             ..Default::default()
                         };
                         if let Some((total, used, free, _)) = capacity_snapshot {
@@ -4513,6 +4515,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 let mut disk_info =
                     build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds, capacity_snapshot);
                 disk_info.metrics = disk.metrics_snapshot();
+                disk_info.uuid = cached_disk_id.map_or_else(String::new, |id| id.to_string());
                 ret.push(disk_info);
             }
         } else {
@@ -4787,6 +4790,7 @@ pub fn is_infrequent_access_class(storage_class: &str) -> bool {
 mod tests {
     use super::*;
     use crate::bucket::replication::{replication_statuses_map, version_purge_statuses_map};
+    use crate::cluster::rpc::{RemoteDisk, TcpHttpInternodeDataTransport};
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::DataDirDeleteStatus;
@@ -5076,6 +5080,26 @@ mod tests {
             .expect("format should be saved");
 
         (dir, endpoint, disk)
+    }
+
+    async fn make_remote_disk_for_info_test(disk_idx: usize) -> (Endpoint, DiskStore) {
+        let endpoint_url = format!("http://remote-server:9000/data{disk_idx}");
+        let mut endpoint = Endpoint::try_from(endpoint_url.as_str()).expect("remote endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should be created");
+
+        (endpoint, Arc::new(disk::Disk::Remote(Box::new(remote_disk))))
     }
 
     #[tokio::test]
@@ -7799,6 +7823,13 @@ mod tests {
             .as_ref()
             .expect("disk 1 should exist")
             .force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+        let offline_disk_id = Uuid::new_v4();
+        disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .set_disk_id_state(Some(offline_disk_id))
+            .await
+            .expect("offline disk id should be cached");
         disks[2]
             .as_ref()
             .expect("disk 2 should exist")
@@ -7842,9 +7873,49 @@ mod tests {
             endpoints[2].get_file_path(),
             "offline disk should keep stable endpoint path"
         );
+        assert_eq!(info[2].uuid, offline_disk_id.to_string());
         assert!(
             info[2].metrics.is_some(),
             "offline runtime fallback should preserve disk metrics snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_preserves_remote_cached_disk_id_when_offline() {
+        let (endpoint, disk) = make_remote_disk_for_info_test(0).await;
+        let remote_disk_id = Uuid::new_v4();
+        disk.set_disk_id_state(Some(remote_disk_id))
+            .await
+            .expect("remote disk id should be cached");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].state, "offline");
+        assert_eq!(info[0].runtime_state.as_deref(), Some("offline"));
+        assert_eq!(info[0].uuid, remote_disk_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_preserves_cached_disk_id_after_failed_live_probe() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let cached_disk_id = Uuid::new_v4();
+        disk.set_disk_id_state(Some(cached_disk_id))
+            .await
+            .expect("disk id should be cached before the failed probe");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].runtime_state.as_deref(), Some("suspect"));
+        assert_eq!(info[0].uuid, cached_disk_id.to_string());
+        assert_eq!(
+            info[0].drive_path,
+            temp_dir.path().to_string_lossy(),
+            "failed live probe should still keep the endpoint path"
         );
     }
 

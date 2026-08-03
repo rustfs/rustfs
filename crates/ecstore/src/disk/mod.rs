@@ -149,6 +149,13 @@ impl Disk {
             Disk::Remote(_) => None,
         }
     }
+
+    pub(crate) async fn cached_disk_id(&self) -> Option<Uuid> {
+        match self {
+            Disk::Local(local_disk) => local_disk.get_current_disk_id().await,
+            Disk::Remote(remote_disk) => remote_disk.get_disk_id().await.ok().flatten(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
