@@ -6116,6 +6116,8 @@ mod tests {
             backend_identity: Some([1; 32]),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
 
         let err = state
@@ -6262,6 +6264,8 @@ mod tests {
             backend_identity: Some([1; 32]),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
 
         state
@@ -10559,6 +10563,8 @@ mod tests {
             backend_identity: Some(identity),
             version_id_exact: false,
             version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
 
         let err = crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
@@ -10598,6 +10604,8 @@ mod tests {
             backend_identity: Some(identity),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
 
         crate::set_disk::cleanup_rejected_transition_upload_durably(

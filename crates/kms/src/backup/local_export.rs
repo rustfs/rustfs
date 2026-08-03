@@ -49,8 +49,8 @@
 //! manifest, which decodes as an incomplete bundle and can never be restored.
 
 use crate::backends::local::{
-    LocalKmsClient, STORED_MASTER_KEY_FORMAT_VERSION, StoredKeyProtection, stored_master_key_format_version,
-    unknown_protection_marker,
+    LocalKmsClient, STORED_MASTER_KEY_FORMAT_VERSION, StoredKeyProtection, UNKNOWN_STORED_KEY_PROTECTION,
+    has_unknown_protection_marker, stored_master_key_format_version,
 };
 use crate::backup::capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
 use crate::backup::error::BackupError;
@@ -208,8 +208,7 @@ pub async fn export_local_backup(
     request: &LocalBackupExportRequest,
 ) -> Result<BackupManifest> {
     request.validate()?;
-    prepare_destination(&request.destination).await?;
-
+    validate_destination(&request.destination).await?;
     let snapshot = collect_snapshot(client).await?;
     if snapshot.records.is_empty() {
         return Err(KmsError::invalid_operation(
@@ -236,6 +235,7 @@ pub async fn export_local_backup(
         None => None,
     };
 
+    prepare_destination(&request.destination).await?;
     let manifest = build_and_write_bundle(kek, request, &snapshot, master_key_verifier).await?;
     Ok(manifest)
 }
@@ -389,11 +389,11 @@ async fn collect_snapshot(client: &LocalKmsClient) -> Result<CollectedSnapshot> 
         if format_version > STORED_MASTER_KEY_FORMAT_VERSION {
             return Err(KmsError::unsupported_format_version(&stem, format_version.to_string()));
         }
-        let unknown_marker = unknown_protection_marker(&raw).map_err(|error| {
+        let has_unknown_marker = has_unknown_protection_marker(&raw).map_err(|error| {
             KmsError::material_corrupt(&stem, format!("stored key record is not a readable JSON object: {error}"))
         })?;
-        if let Some(version) = unknown_marker {
-            return Err(KmsError::unsupported_format_version(&stem, version));
+        if has_unknown_marker {
+            return Err(KmsError::unsupported_format_version(&stem, UNKNOWN_STORED_KEY_PROTECTION));
         }
         let probe: StoredRecordProbe = serde_json::from_slice(&raw)
             .map_err(|error| KmsError::material_corrupt(&stem, format!("stored key record does not deserialize: {error}")))?;
@@ -619,7 +619,7 @@ fn local_kdf_descriptor(snapshot: &CollectedSnapshot, master_key_verifier: Optio
     }
 }
 
-async fn prepare_destination(destination: &Path) -> Result<()> {
+async fn validate_destination(destination: &Path) -> Result<()> {
     if fs::try_exists(destination).await? {
         let mut entries = fs::read_dir(destination)
             .await
@@ -630,6 +630,11 @@ async fn prepare_destination(destination: &Path) -> Result<()> {
             ));
         }
     }
+    Ok(())
+}
+
+async fn prepare_destination(destination: &Path) -> Result<()> {
+    validate_destination(destination).await?;
     fs::create_dir_all(destination.join(KEYS_DIR)).await?;
     Ok(())
 }
@@ -1146,7 +1151,7 @@ mod tests {
         let record_path = client.key_directory().join("alpha.key");
         let mut record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&record_path).expect("read record")).expect("decode record");
-        record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        record["at_rest_protection"] = serde_json::json!("secret-marker-value-must-not-leak");
         std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode record")).expect("write record");
 
         let bundle = TempDir::new().expect("bundle dir");
@@ -1155,9 +1160,10 @@ mod tests {
             .expect_err("an uninterpretable record must abort the export");
         assert!(
             matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
-                if key_id == "alpha" && version == "post-quantum-v2"),
+                if key_id == "alpha" && version == UNKNOWN_STORED_KEY_PROTECTION),
             "got {error:?}"
         );
+        assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
     }
 
     #[tokio::test]
@@ -1172,7 +1178,8 @@ mod tests {
         std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode record")).expect("write record");
 
         let bundle = TempDir::new().expect("bundle dir");
-        let error = export_local_backup(&client, &test_kek(), &export_request(bundle.path().join("bundle")))
+        let destination = bundle.path().join("bundle");
+        let error = export_local_backup(&client, &test_kek(), &export_request(destination.clone()))
             .await
             .expect_err("a newer record format must abort the export");
         assert!(
@@ -1180,5 +1187,17 @@ mod tests {
                 if key_id == "alpha" && version == "99"),
             "got {error:?}"
         );
+        assert!(
+            !destination.exists(),
+            "format validation must finish before the export creates its destination"
+        );
+
+        record["format_version"] = serde_json::json!(STORED_MASTER_KEY_FORMAT_VERSION);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode supported record"))
+            .expect("write supported record");
+        export_local_backup(&client, &test_kek(), &export_request(destination.clone()))
+            .await
+            .expect("the same destination must remain usable after validation fails");
+        assert!(destination.join(LOCAL_BUNDLE_MANIFEST_FILE).exists());
     }
 }

@@ -25,10 +25,14 @@ use crate::bucket::utils::is_meta_bucketname;
 use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
-    tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
+    tier_delete_journal::{
+        enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
+        record_tier_delete_journal_backend_identity, remove_tier_delete_journal_entry,
+    },
     tier_sweeper::{
-        Jentry, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_lease_idempotent,
-        delete_object_from_remote_tier_with_lease_idempotent,
+        Jentry, RemoteTierDeleteOutcome, TierDeleteJournalState,
+        delete_confirmed_transition_candidate_exact_with_lease_idempotent, delete_object_from_remote_tier_with_lease_idempotent,
+        transitioned_delete_journal_entry_for_source,
     },
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
@@ -2060,6 +2064,8 @@ pub(crate) async fn cleanup_rejected_transition_upload_durably(
         } else {
             rustfs_filemeta::TransitionVersionState::Exact
         },
+        state: TierDeleteJournalState::Committed,
+        source: None,
     };
 
     let journal_error = if let Some(api) = api.as_ref() {
@@ -3659,6 +3665,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
+        let mut journal_entries: Vec<(usize, Jentry)> = Vec::new();
 
         for (i, dobj) in objects.iter().enumerate() {
             if del_errs[i].is_some() {
@@ -3689,7 +3696,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
             let replication_needs_source = replicate_delete
                 && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (goi, gerr) = if object_lock_check_required || replication_needs_source {
+            let (goi, gerr) = if object_lock_check_required || replication_needs_source || opts.tier_delete_journal_api.is_some()
+            {
                 let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
                 (goi, gerr)
             } else {
@@ -3698,7 +3706,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
-            let explicit_delete_marker = goi.delete_marker && matches!(gerr.as_ref(), Some(Error::MethodNotAllowed));
+            let explicit_delete_marker = dobj.version_id.is_some()
+                && goi.delete_marker
+                && goi.version_id == version_id
+                && matches!(gerr.as_ref(), Some(StorageError::MethodNotAllowed));
             if let Some(err) = gerr.as_ref()
                 && !source_missing
                 && !explicit_delete_marker
@@ -3712,6 +3723,23 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             {
                 del_errs[i] = Some(err);
                 continue;
+            }
+
+            if opts.tier_delete_journal_api.is_some()
+                && let Some(mut je) = transitioned_delete_journal_entry_for_source(
+                    version_id,
+                    versioned,
+                    version_suspended,
+                    bucket,
+                    &replication_object_name,
+                    &goi,
+                )
+            {
+                if let Err(err) = record_tier_delete_journal_backend_identity(&mut je, &goi.user_defined) {
+                    del_errs[i] = Some(Error::other(err));
+                    continue;
+                }
+                journal_entries.push((i, je));
             }
 
             let mut admitted = dobj.clone();
@@ -3757,6 +3785,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 if versioned {
                     vr.version_id = Some(Uuid::new_v4());
                 }
+            }
+
+            if goi.delete_marker && dobj.version_id.is_some() && goi.version_id == version_id {
+                vr.deleted = true;
+                vr.mod_time = goi.mod_time;
             }
 
             let v = {
@@ -3841,6 +3874,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return (del_objects, del_errs);
         }
 
+        let mut persisted_journal_entries = Vec::with_capacity(journal_entries.len());
+        if let Some(api) = opts.tier_delete_journal_api.as_ref() {
+            for (idx, mut je) in journal_entries {
+                if let Err(err) = persist_tier_delete_journal_entry(Arc::clone(api), &je).await {
+                    del_errs[idx] = Some(Error::other(err));
+                    continue;
+                }
+                je.state = TierDeleteJournalState::Prepared;
+                persisted_journal_entries.push((idx, je));
+            }
+        }
+
+        for fi_vers in &mut vers {
+            fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
+        }
+        vers.retain(|fi_vers| !fi_vers.versions.is_empty());
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -4018,6 +4067,37 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         join_all(rollback_futures).await;
 
         // TODO: add_partial
+
+        if let Some(api) = opts.tier_delete_journal_api.as_ref() {
+            for (idx, je) in persisted_journal_entries {
+                if del_errs[idx].is_none() {
+                    let mut committed = je;
+                    committed.state = TierDeleteJournalState::Committed;
+                    if let Err(err) = persist_tier_delete_journal_entry(Arc::clone(api), &committed).await {
+                        warn!(
+                            object = %committed.obj_name,
+                            tier = %committed.tier_name,
+                            error = ?err,
+                            "batch tier delete committed locally but journal commit failed; recovery will retry"
+                        );
+                    } else if let Err(err) = enqueue_committed_tier_delete_journal_entry(&committed).await {
+                        warn!(
+                            object = %committed.obj_name,
+                            tier = %committed.tier_name,
+                            error = ?err,
+                            "batch tier delete journal committed but could not be queued; recovery will retry"
+                        );
+                    }
+                } else if let Err(err) = remove_tier_delete_journal_entry(Arc::clone(api), &je).await {
+                    warn!(
+                        object = %je.obj_name,
+                        tier = %je.tier_name,
+                        error = ?err,
+                        "failed to remove aborted batch tier delete journal"
+                    );
+                }
+            }
+        }
 
         if dist_erasure {
             self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;

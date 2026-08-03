@@ -9383,6 +9383,8 @@ mod tests {
             backend_identity: Some(current_identity),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
         journal_store
             .insert_config_object(

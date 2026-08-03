@@ -309,11 +309,11 @@ impl AwsKmsBackend {
             loader = loader.region(aws_sdk_kms::config::Region::new(region.clone()));
         }
         let sdk_config = loader.load().await;
-        if sdk_config.region().is_none() {
+        let Some(region) = sdk_config.region() else {
             return Err(KmsError::configuration_error(
                 "AWS KMS backend could not resolve a region; set the backend region or AWS_REGION",
             ));
-        }
+        };
 
         let mut builder = aws_sdk_kms::config::Builder::from(&sdk_config)
             // `crate::policy` owns retries and timeouts; leaving the SDK's own
@@ -324,13 +324,18 @@ impl AwsKmsBackend {
             builder = builder.endpoint_url(endpoint_url);
         }
 
-        Ok(Self::with_client(aws_sdk_kms::Client::from_conf(builder.build()), &config))
+        Ok(Self::with_client(
+            aws_sdk_kms::Client::from_conf(builder.build()),
+            &config,
+            aws_backend_config.endpoint_url.as_deref().unwrap_or_default(),
+            region.as_ref(),
+        ))
     }
 
-    fn with_client(client: aws_sdk_kms::Client, config: &KmsConfig) -> Self {
+    fn with_client(client: aws_sdk_kms::Client, config: &KmsConfig, endpoint: &str, region: &str) -> Self {
         Self {
             client,
-            retry: RetryPolicy::from_config(config),
+            retry: RetryPolicy::for_backend(config, "aws", endpoint, Some(region), "operations"),
             cancel: CancellationToken::new(),
         }
     }
@@ -826,6 +831,7 @@ mod tests {
     use aws_smithy_types::body::SdkBody;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// AWS KMS speaks awsJson1_1; every request goes to `/` on the regional
     /// endpoint, so the replayed request side carries no useful assertion.
@@ -857,6 +863,15 @@ mod tests {
         )
     }
 
+    fn scripted_endpoint() -> String {
+        static NEXT_SCRIPTED_BACKEND_ID: AtomicU64 = AtomicU64::new(0);
+
+        format!(
+            "https://scripted-{}.example.invalid",
+            NEXT_SCRIPTED_BACKEND_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     fn scripted_backend(events: Vec<ReplayEvent>) -> (StaticReplayClient, AwsKmsBackend) {
         let http_client = StaticReplayClient::new(events);
         let sdk_config = aws_sdk_kms::Config::builder()
@@ -867,8 +882,18 @@ mod tests {
             .retry_config(aws_sdk_kms::config::retry::RetryConfig::disabled())
             .build();
         let kms_config = KmsConfig::aws(Some("us-east-1".to_string()));
-        let backend = AwsKmsBackend::with_client(aws_sdk_kms::Client::from_conf(sdk_config), &kms_config);
+        let endpoint = scripted_endpoint();
+        let backend = AwsKmsBackend::with_client(aws_sdk_kms::Client::from_conf(sdk_config), &kms_config, &endpoint, "us-east-1");
         (http_client, backend)
+    }
+
+    fn aws_config(endpoint: &str, region: &str) -> KmsConfig {
+        let mut config = KmsConfig::aws(Some(region.to_owned()));
+        let BackendConfig::Aws(aws) = &mut config.backend_config else {
+            panic!("AWS constructor must create an AWS backend configuration");
+        };
+        aws.endpoint_url = Some(endpoint.to_owned());
+        config
     }
 
     fn key_metadata_json(key_id: &str, state: &str) -> serde_json::Value {
@@ -898,6 +923,27 @@ mod tests {
     fn capabilities_snapshot(capabilities: BackendCapabilities) -> std::collections::BTreeMap<String, bool> {
         serde_json::from_value(serde_json::to_value(capabilities).expect("capabilities should serialize"))
             .expect("capabilities should deserialize into a flat bool map")
+    }
+
+    #[tokio::test]
+    async fn aws_backend_new_identity_includes_endpoint_and_region() {
+        let endpoint = scripted_endpoint();
+        let first = AwsKmsBackend::new(aws_config(&endpoint, "us-east-1"))
+            .await
+            .expect("first AWS backend");
+        let matching = AwsKmsBackend::new(aws_config(&endpoint, "us-east-1"))
+            .await
+            .expect("matching AWS backend");
+        let other_region = AwsKmsBackend::new(aws_config(&endpoint, "us-west-2"))
+            .await
+            .expect("other-region AWS backend");
+        let other_endpoint = AwsKmsBackend::new(aws_config(&scripted_endpoint(), "us-east-1"))
+            .await
+            .expect("other-endpoint AWS backend");
+
+        assert!(first.retry.shares_active_capacity_with(&matching.retry));
+        assert!(!first.retry.shares_active_capacity_with(&other_region.retry));
+        assert!(!first.retry.shares_active_capacity_with(&other_endpoint.retry));
     }
 
     #[tokio::test]
@@ -1023,7 +1069,7 @@ mod tests {
         let mut kms_config = KmsConfig::aws(Some("us-east-1".to_string()));
         kms_config.timeout = std::time::Duration::from_millis(5_000);
         kms_config.retry_attempts = 1;
-        let backend = AwsKmsBackend::with_client(aws_sdk_kms::Client::from_conf(sdk_config), &kms_config);
+        let backend = AwsKmsBackend::with_client(aws_sdk_kms::Client::from_conf(sdk_config), &kms_config, "", "us-east-1");
 
         let error = backend
             .describe_key(DescribeKeyRequest {

@@ -35,7 +35,6 @@ pub(crate) use context::{
     resolve_bucket_monitor_handle as current_bucket_monitor_handle, resolve_buffer_config as current_buffer_config,
     resolve_daily_tier_stats as current_daily_tier_stats, resolve_deployment_id as current_deployment_id,
     resolve_encryption_service as current_encryption_service, resolve_endpoints_handle as current_endpoints_handle,
-    resolve_expiry_state_handle as current_expiry_state_handle,
     resolve_federated_identity_service as current_federated_identity_service, resolve_iam_handle as current_iam_handle,
     resolve_iam_ready as current_iam_ready, resolve_internode_metrics as current_internode_metrics,
     resolve_kms_runtime_service_manager as current_kms_runtime_service_manager,

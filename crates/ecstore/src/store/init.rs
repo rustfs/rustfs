@@ -2602,6 +2602,8 @@ mod tests {
             backend_identity: Some(identity_a),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
         let entry_b = Jentry {
             obj_name: "remote-b".to_string(),
@@ -2610,6 +2612,8 @@ mod tests {
             backend_identity: Some(identity_b),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
         let remove_a = backend_a.arm_failing_remove_barrier().await;
         persist_tier_delete_journal_entry(store_a.clone(), &entry_a)
