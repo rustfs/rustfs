@@ -4264,17 +4264,19 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
-                    let quarantined = writes
-                        .iter()
-                        .any(|(file, data)| file.starts_with(MRF_CORRUPT_FILE_PREFIX) && data == &[0xde, 0xad, 0xbe, 0xef]);
-                    let cleared = writes
-                        .iter()
-                        .any(|(file, data)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE && data.is_empty());
-                    if quarantined && cleared {
+                    let quarantine_complete = {
+                        let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
+                        let quarantined = writes
+                            .iter()
+                            .any(|(file, data)| file.starts_with(MRF_CORRUPT_FILE_PREFIX) && data == &[0xde, 0xad, 0xbe, 0xef]);
+                        let cleared = writes
+                            .iter()
+                            .any(|(file, data)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE && data.is_empty());
+                        quarantined && cleared
+                    };
+                    if quarantine_complete {
                         break;
                     }
-                    drop(writes);
                     tokio::task::yield_now().await;
                 }
             })
@@ -4849,7 +4851,7 @@ mod tests {
             size: 5,
             ..Default::default()
         };
-        let pending = [retained.clone(), appended.clone()];
+        let pending = [retained.clone(), appended];
         let mut tracker = durable_mrf_backlog_tracker_from_entries(std::slice::from_ref(&retained));
 
         add_durable_mrf_suffix(&mut tracker, &pending, 1);
