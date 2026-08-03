@@ -239,9 +239,9 @@ pub struct ReplicationState {
     pub targets: HashMap<String, ReplicationStatusType>,
     pub purge_targets: HashMap<String, VersionPurgeStatusType>,
     pub reset_statuses_map: HashMap<String, String>,
-    /// Mirror of `rustfs_filemeta::ReplicationState`. Skipped by serde for the
-    /// same reason: the state has a positional wire form, so this map travels in
-    /// the object's internal metadata and is re-derived on read.
+    /// Skipped by serde: this state has a positional wire form, so the map
+    /// travels in the object's internal metadata and is re-derived on read.
+    /// Kept in step with the filemeta crate's copy of the same state.
     #[serde(skip)]
     pub target_delete_marker_version_ids: HashMap<String, String>,
     #[serde(skip)]
@@ -1033,7 +1033,7 @@ fn version_purge_statuses_string(targets: &HashMap<String, VersionPurgeStatusTyp
     if result.is_empty() { None } else { Some(result) }
 }
 
-/// Mirror of the bounds in `rustfs_filemeta::replication`.
+/// Kept in step with the bounds used by the filemeta crate's copy.
 const MAX_REPLICATION_TARGET_VERSION_ENTRIES: usize = 1_000;
 const MAX_REPLICATION_TARGET_ARN_LEN: usize = 1_024;
 const MAX_REPLICATION_TARGET_VERSION_ID_LEN: usize = 1_024;
