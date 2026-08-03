@@ -280,6 +280,7 @@ async fn backup_manifest_shape_is_stable() {
             rustfs_version: "0.0.0".to_string(),
             snapshot_generation: 1,
             destination: out.path().join("bundle"),
+            sanitized_config: None,
         },
     )
     .await

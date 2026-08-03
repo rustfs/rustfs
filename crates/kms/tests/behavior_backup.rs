@@ -35,7 +35,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::TestKms;
+use common::{TestKms, without_probe_key};
 use rustfs_kms::backends::local::LocalKmsClient;
 use rustfs_kms::backup::{
     ArtifactKind, BackupError, BackupKek, BackupManifest, CompletenessState, ContentDigest, LOCAL_BUNDLE_MANIFEST_FILE,
@@ -58,6 +58,9 @@ fn export_request(destination: PathBuf) -> LocalBackupExportRequest {
         rustfs_version: "0.0.0-behavior".to_string(),
         snapshot_generation: 7,
         destination,
+        // These specs cover the key-material path; the sanitized configuration
+        // is the admin layer's own artifact and is exercised separately.
+        sanitized_config: None,
     }
 }
 
@@ -193,7 +196,9 @@ async fn exported_key_ids(bundle_dir: &Path, manifest: &BackupManifest) -> Vec<S
         found.push(key_id.to_string());
     }
     found.sort();
-    found
+    // The probe key is exported like any other — correctly so — but these specs
+    // assert over the keys they seeded.
+    without_probe_key(found)
 }
 
 #[tokio::test]

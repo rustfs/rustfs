@@ -73,6 +73,7 @@ async fn schedule(backend: &LocalKmsBackend, key_id: &str, days: u32) {
             key_id: key_id.to_string(),
             pending_window_in_days: Some(days),
             force_immediate: None,
+            confirm_key_id: None,
         })
         .await
         .expect("deletion should be scheduled");
@@ -440,6 +441,7 @@ async fn the_background_sweep_never_removes_an_un_due_key() {
             key_id: key_id.clone(),
             pending_window_in_days: Some(7),
             force_immediate: None,
+            confirm_key_id: None,
         })
         .await
         .expect("schedule deletion");

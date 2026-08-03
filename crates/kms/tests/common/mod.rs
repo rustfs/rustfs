@@ -336,6 +336,17 @@ where
     }
 }
 
+/// Drop the service's own startup probe key from a listing.
+///
+/// Starting the service provisions the reserved [`rustfs_kms::probe::PROBE_KEY_ID`]
+/// to verify the backend is actually usable, so it exists on every running
+/// service and is not something a spec created. Exact-set assertions filter it
+/// out: it is startup machinery, not behavior under test, and asserting it in
+/// every expected list would couple those specs to the probe's naming.
+pub fn without_probe_key(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    ids.into_iter().filter(|id| id != rustfs_kms::probe::PROBE_KEY_ID).collect()
+}
+
 /// Build an encryption context from literal pairs.
 pub fn ctx(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()

@@ -392,6 +392,7 @@ async fn key_states_and_ciphertext_survive_a_restart() {
             key_id: "survivor-pending".to_string(),
             pending_window_in_days: Some(7),
             force_immediate: None,
+            confirm_key_id: None,
         })
         .await
         .expect("schedule deletion");
@@ -489,7 +490,7 @@ async fn key_states_and_ciphertext_survive_a_restart() {
 
 #[tokio::test]
 async fn a_destroyed_key_stays_destroyed_across_a_restart() {
-    let mut kms = TestKms::local().await;
+    let mut kms = TestKms::local_with(|config| config.allow_immediate_deletion = true).await;
     let manager = kms.kms().await;
     kms.create_key("gone-for-good").await;
     kms.create_key("kept").await;
@@ -499,6 +500,7 @@ async fn a_destroyed_key_stays_destroyed_across_a_restart() {
             key_id: "gone-for-good".to_string(),
             pending_window_in_days: None,
             force_immediate: Some(true),
+            confirm_key_id: Some("gone-for-good".to_string()),
         })
         .await
         .expect("forced deletion");

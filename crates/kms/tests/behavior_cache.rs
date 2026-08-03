@@ -43,7 +43,7 @@ async fn describe_state(kms: &KmsManager, key_id: &str) -> KeyState {
 }
 
 async fn entry_count(kms: &KmsManager) -> u64 {
-    kms.cache_stats().await.expect("cache is enabled").0
+    kms.cache_stats().await.expect("cache is enabled").entries
 }
 
 #[tokio::test]
@@ -156,6 +156,7 @@ async fn every_state_mutation_invalidates_the_cached_entry() {
             key_id: key_id.clone(),
             pending_window_in_days: Some(7),
             force_immediate: None,
+            confirm_key_id: None,
         })
         .await
         .expect("schedule deletion");
@@ -183,7 +184,7 @@ async fn every_state_mutation_invalidates_the_cached_entry() {
 
 #[tokio::test]
 async fn a_destroyed_key_cannot_be_served_from_cache() {
-    let kms = TestKms::local().await;
+    let kms = TestKms::local_with(|config| config.allow_immediate_deletion = true).await;
     let manager = kms.kms().await;
     let key_id = kms.create_key("destroyed").await;
 
@@ -194,6 +195,7 @@ async fn a_destroyed_key_cannot_be_served_from_cache() {
             key_id: key_id.clone(),
             pending_window_in_days: None,
             force_immediate: Some(true),
+            confirm_key_id: Some(key_id.clone()),
         })
         .await
         .expect("forced deletion");
@@ -285,22 +287,20 @@ async fn disabling_the_cache_changes_no_observable_behavior() {
     }
 }
 
-/// What `cache_stats` actually returns: an entry count and nothing else.
+/// `cache_stats` reports live counters a caller can compute a hit rate from.
 ///
-/// The tuple is `(entry_count, 0)` — the second element is a hard-coded zero
-/// because moka exposes no miss counter unless statistics are enabled. This is
-/// asserted as the real contract so callers do not compute a hit rate from it.
-/// The doc comment on `KmsCache::stats` still claims "(hit count, miss count)"
-/// and is wrong; that is a documentation fix, not a behavioural one — nothing
-/// at runtime depends on the second element.
+/// Pinned because the numbers are operator-facing: a counter frozen at zero
+/// reads as "the cache is never helping" and invites someone to tune away a
+/// cache that is in fact working.
 #[tokio::test]
-async fn cache_stats_returns_an_entry_count_and_no_hit_or_miss_data() {
+async fn cache_stats_reports_hits_and_misses_separately() {
     let kms = TestKms::local().await;
     let manager = kms.kms().await;
     kms.create_key("stats-a").await;
     kms.create_key("stats-b").await;
 
-    // Generate plenty of traffic that would move a real hit/miss counter.
+    // Traffic a real hit/miss counter has to move: the same key read over and
+    // over, plus a lookup that can never be served from cache.
     for _ in 0..10 {
         assert_eq!(describe_state(&manager, "stats-a").await, KeyState::Enabled);
         assert!(
@@ -313,7 +313,11 @@ async fn cache_stats_returns_an_entry_count_and_no_hit_or_miss_data() {
         );
     }
 
-    let (first, second) = manager.cache_stats().await.expect("cache is enabled");
-    assert_eq!(first, 2, "the first element is the number of cached entries, not hits");
-    assert_eq!(second, 0, "the second element is always zero: no hit or miss data is collected");
+    let stats = manager.cache_stats().await.expect("cache is enabled");
+    assert_eq!(stats.entries, 2, "both created keys are cached and the absent one is not");
+    assert!(stats.hits > 0, "re-reading one key ten times must register hits, got {stats:?}");
+    assert!(
+        stats.misses > 0,
+        "a lookup that cannot be served from cache must register a miss, got {stats:?}"
+    );
 }

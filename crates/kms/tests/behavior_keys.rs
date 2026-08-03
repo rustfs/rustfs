@@ -39,7 +39,7 @@ mod common;
 
 use common::{
     BackendCase, BackendKind, TestKms, assert_invalid_operation, assert_key_already_exists, assert_key_not_found,
-    assert_unsupported_capability, ctx, for_each_backend,
+    assert_unsupported_capability, ctx, for_each_backend, without_probe_key,
 };
 use rustfs_kms::{
     CancelKeyDeletionRequest, CreateKeyRequest, DecryptRequest, DeleteKeyRequest, DescribeKeyRequest, EncryptRequest,
@@ -207,7 +207,7 @@ async fn list_keys_reports_created_keys_and_honours_filters() {
         .list_keys(ListKeysRequest::default())
         .await
         .expect("list should succeed");
-    let mut ids: Vec<_> = all.keys.iter().map(|key| key.key_id.clone()).collect();
+    let mut ids = without_probe_key(all.keys.iter().map(|key| key.key_id.clone()));
     ids.sort();
     assert_eq!(ids, vec!["list-a", "list-b", "list-c"], "every created key must be listed");
 
@@ -254,7 +254,7 @@ async fn list_keys_reports_created_keys_and_honours_filters() {
         })
         .await
         .expect("filtered list should succeed");
-    let mut active_ids: Vec<_> = active.keys.iter().map(|k| k.key_id.clone()).collect();
+    let mut active_ids = without_probe_key(active.keys.iter().map(|k| k.key_id.clone()));
     active_ids.sort();
     assert_eq!(active_ids, vec!["list-a", "list-c"], "the disabled key drops out of the Active filter");
 
@@ -307,6 +307,7 @@ async fn scheduled_deletion_carries_a_deadline_and_can_be_cancelled() {
             key_id: key_id.clone(),
             pending_window_in_days: Some(7),
             force_immediate: None,
+            confirm_key_id: None,
         })
         .await
         .expect("scheduling deletion should succeed");
@@ -364,6 +365,7 @@ async fn deletion_pending_window_is_bounded() {
                     key_id: key_id.clone(),
                     pending_window_in_days: Some(days),
                     force_immediate: None,
+                    confirm_key_id: None,
                 })
                 .await,
             "between 7 and 30",
@@ -383,6 +385,7 @@ async fn deletion_pending_window_is_bounded() {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(days),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await
             .unwrap_or_else(|error| panic!("{days} days must be accepted: {error:?}"));
@@ -392,7 +395,7 @@ async fn deletion_pending_window_is_bounded() {
 
 #[tokio::test]
 async fn forced_immediate_deletion_removes_the_key() {
-    let kms = TestKms::local().await;
+    let kms = TestKms::local_with(|config| config.allow_immediate_deletion = true).await;
     let manager = kms.kms().await;
     let key_id = kms.create_key("burn-now").await;
 
@@ -401,6 +404,7 @@ async fn forced_immediate_deletion_removes_the_key() {
             key_id: key_id.clone(),
             pending_window_in_days: None,
             force_immediate: Some(true),
+            confirm_key_id: Some(key_id.clone()),
         })
         .await
         .expect("forced deletion should succeed");
@@ -470,6 +474,7 @@ async fn key_state_gates_every_operation() {
                         key_id: key_id.clone(),
                         pending_window_in_days: Some(7),
                         force_immediate: None,
+                        confirm_key_id: None,
                     })
                     .await
                     .is_err(),
@@ -537,6 +542,7 @@ async fn key_state_gates_every_operation() {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await
             .expect("Disabled must permit scheduling deletion");
@@ -552,6 +558,7 @@ async fn key_state_gates_every_operation() {
                     key_id: key_id.clone(),
                     pending_window_in_days: Some(7),
                     force_immediate: None,
+                    confirm_key_id: None,
                 })
                 .await,
             "pending deletion",
@@ -627,6 +634,7 @@ async fn static_backend_refuses_every_lifecycle_mutation() {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await,
         "read-only",
@@ -649,6 +657,7 @@ async fn static_backend_refuses_every_lifecycle_mutation() {
                 key_id: "other".to_string(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             })
             .await,
         "other",

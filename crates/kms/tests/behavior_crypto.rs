@@ -373,7 +373,7 @@ async fn corrupt_ciphertext_fails_cleanly() {
 async fn a_data_key_is_not_transferable_between_master_keys() {
     // Two independent master keys on the same backend: a blob wrapped by one
     // must not open under the other, even with an identical context.
-    let kms = TestKms::local().await;
+    let kms = TestKms::local_with(|config| config.allow_immediate_deletion = true).await;
     let manager = kms.kms().await;
     kms.create_key("wrapper-a").await;
     kms.create_key("wrapper-b").await;
@@ -420,6 +420,7 @@ async fn a_data_key_is_not_transferable_between_master_keys() {
             key_id: "wrapper-a".to_string(),
             pending_window_in_days: None,
             force_immediate: Some(true),
+            confirm_key_id: Some("wrapper-a".to_string()),
         })
         .await
         .expect("forced deletion should succeed");
