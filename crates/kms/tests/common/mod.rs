@@ -54,28 +54,24 @@ pub fn static_secret_key() -> String {
     BASE64.encode([0x5au8; 32])
 }
 
-/// Which offline backend a harness instance is running.
+/// Which backend a harness instance is running.
 ///
-/// **Coverage gap — read before trusting this runner.** Only Local and Static
-/// are here, because the two Vault backends need a live server. That is not a
-/// neutral omission:
+/// Local and Static always run. The two Vault backends are **opt-in**: they
+/// need a reachable server, so they join the matrix only when
+/// `RUSTFS_KMS_VAULT_TOKEN` is set (see [`live_vault_backends`]).
 ///
-/// * the Vault KV2 and Vault Transit backends get **no business-capability
-///   coverage at all** from this suite — every Vault-shaped config elsewhere in
-///   it is exercising configuration validation, serde, or unreachable-backend
-///   handling, never a working Vault;
-/// * `rotate` and `versioning` are advertised *only* by the Vault backends, so
-///   every capability-gated branch for them in `for_each_backend` specs runs
-///   the `UnsupportedCapability` side and never the working side. A rotation
-///   that silently lost prior key versions would not fail anything here.
-///
-/// Closing this needs either a stateful fake Vault exposed for integration
-/// tests, or a CI lane that runs the `#[ignore]`d live-Vault cases against a
-/// dev server. Do not read a green run as "the Vault backends work".
+/// This matters for how a green run should be read. `rotate` and `versioning`
+/// are advertised *only* by the Vault backends, so without the Vault lane every
+/// capability-gated branch for them in a `for_each_backend` spec runs the
+/// `UnsupportedCapability` side and never the working side — a rotation that
+/// silently dropped prior key versions would pass. An offline-only run says
+/// nothing about whether the Vault backends work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Local,
     Static,
+    VaultKv2,
+    VaultTransit,
 }
 
 impl BackendKind {
@@ -83,8 +79,46 @@ impl BackendKind {
         match self {
             Self::Local => "local",
             Self::Static => "static",
+            Self::VaultKv2 => "vault-kv2",
+            Self::VaultTransit => "vault-transit",
         }
     }
+
+    /// Whether this backend keeps its state on an external server that outlives
+    /// the harness, so key names must not collide between runs.
+    pub fn is_vault(self) -> bool {
+        matches!(self, Self::VaultKv2 | Self::VaultTransit)
+    }
+}
+
+/// Address of the live Vault, defaulting to the usual local dev server.
+pub fn vault_address() -> String {
+    std::env::var("RUSTFS_KMS_VAULT_ADDR").unwrap_or_else(|_| "http://127.0.0.1:8200".to_string())
+}
+
+/// Token for the live Vault, or `None` when the Vault lane is switched off.
+///
+/// Presence of this variable is the single switch that adds the Vault backends
+/// to every `for_each_backend` spec.
+pub fn vault_token() -> Option<String> {
+    std::env::var("RUSTFS_KMS_VAULT_TOKEN").ok().filter(|token| !token.is_empty())
+}
+
+/// The Vault backends to include in the matrix for this run.
+pub fn live_vault_backends() -> Vec<BackendKind> {
+    match vault_token() {
+        Some(_) => vec![BackendKind::VaultKv2, BackendKind::VaultTransit],
+        None => Vec::new(),
+    }
+}
+
+/// A key name that cannot collide with another run against the same Vault.
+///
+/// Vault state is persistent and shared, unlike the per-test temp directory the
+/// local backend gets, so a fixed name would make a rerun collide with its own
+/// leftovers and turn every assertion into a function of run order.
+pub fn unique_key_name(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// A running KMS service, reachable only through the crate's public API.
@@ -114,6 +148,39 @@ impl TestKms {
             kind: BackendKind::Local,
             config,
             _dir: Some(dir),
+        }
+    }
+
+    /// Vault KV v2 backend against the live server.
+    ///
+    /// Panics when the Vault lane is off — callers gate on
+    /// [`live_vault_backends`] rather than calling this blind.
+    pub async fn vault_kv2() -> Self {
+        let token = vault_token().expect("RUSTFS_KMS_VAULT_TOKEN must be set to run the Vault lane");
+        let address = vault_address().parse().expect("RUSTFS_KMS_VAULT_ADDR must be a URL");
+        // A local dev Vault speaks plain HTTP, which the config guard refuses
+        // unless development mode is declared explicitly.
+        let config = KmsConfig::vault(address, token).with_insecure_development_defaults();
+        let manager = start_manager(&config).await;
+        Self {
+            manager,
+            kind: BackendKind::VaultKv2,
+            config,
+            _dir: None,
+        }
+    }
+
+    /// Vault Transit backend against the live server.
+    pub async fn vault_transit() -> Self {
+        let token = vault_token().expect("RUSTFS_KMS_VAULT_TOKEN must be set to run the Vault lane");
+        let address = vault_address().parse().expect("RUSTFS_KMS_VAULT_ADDR must be a URL");
+        let config = KmsConfig::vault_transit(address, token).with_insecure_development_defaults();
+        let manager = start_manager(&config).await;
+        Self {
+            manager,
+            kind: BackendKind::VaultTransit,
+            config,
+            _dir: None,
         }
     }
 
@@ -224,6 +291,16 @@ impl BackendCase {
                     key_id: STATIC_KEY_ID.to_string(),
                 }
             }
+            BackendKind::VaultKv2 => {
+                let kms = TestKms::vault_kv2().await;
+                let key_id = kms.create_key(&unique_key_name("behavior-kv2")).await;
+                Self { kms, key_id }
+            }
+            BackendKind::VaultTransit => {
+                let kms = TestKms::vault_transit().await;
+                let key_id = kms.create_key(&unique_key_name("behavior-transit")).await;
+                Self { kms, key_id }
+            }
         }
     }
 
@@ -236,7 +313,10 @@ impl BackendCase {
     }
 }
 
-/// Run one behavior spec against every offline backend.
+/// Run one behavior spec against every backend in this run's matrix.
+///
+/// Always Local and Static; plus the Vault backends when the Vault lane is on
+/// (see [`live_vault_backends`]).
 ///
 /// The spec is expected to branch on `case.caps()`: a capability a backend
 /// advertises must behave correctly, and one it does not advertise must be
@@ -247,7 +327,10 @@ where
     F: Fn(BackendCase) -> Fut,
     Fut: Future<Output = ()>,
 {
-    for kind in [BackendKind::Local, BackendKind::Static] {
+    let kinds = [BackendKind::Local, BackendKind::Static]
+        .into_iter()
+        .chain(live_vault_backends());
+    for kind in kinds {
         let case = BackendCase::new(kind).await;
         spec(case).await;
     }

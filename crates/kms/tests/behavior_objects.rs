@@ -87,7 +87,12 @@ async fn objects_round_trip_across_sizes_and_algorithms() {
                 !encrypted.metadata.encrypted_data_key.is_empty(),
                 "the wrapped DEK must be stored with the object"
             );
-            if size > 0 {
+            // Only assert this where a collision is not a realistic outcome. A
+            // 1-byte object matches its own ciphertext once every 256 runs, so
+            // asserting it there would make the suite flaky rather than strict.
+            // Small objects are still covered: the tag is checked above and the
+            // decrypt round-trip below is what actually proves the encryption.
+            if size >= 8 {
                 assert_ne!(encrypted.ciphertext, data, "ciphertext must differ from plaintext");
             }
 

@@ -1,0 +1,18 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: field_names(&manifest)
+---
+- artifacts
+- at_rest_protection
+- backend
+- backup_id
+- backup_kek
+- completeness
+- created_at
+- deployment_identity
+- format_version
+- local_kdf
+- manifest_digest
+- responsibility
+- rustfs_version
+- snapshot_generation
