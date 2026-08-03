@@ -76,6 +76,7 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Uri};
+use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -345,6 +346,7 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        record_s3_op(S3Operation::AbortMultipartUpload);
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let AbortMultipartUploadInput {
@@ -1532,6 +1534,14 @@ mod tests {
     use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
 
+    fn s3_op_total(op: S3Operation) -> u64 {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.op == op.as_str())
+            .map(|snapshot| snapshot.total)
+            .unwrap_or_default()
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
@@ -1838,9 +1848,11 @@ mod tests {
             .build()
             .unwrap();
         let req = build_request(input, Method::DELETE);
+        let before = s3_op_total(S3Operation::AbortMultipartUpload);
 
         let err = make_usecase().execute_abort_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(s3_op_total(S3Operation::AbortMultipartUpload), before + 1);
     }
 
     #[tokio::test]

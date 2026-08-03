@@ -105,6 +105,9 @@ pub(crate) fn deleted_object_for_replication(delete_object: DeletedObject) -> Re
         replication_state: delete_object.replication_state.as_ref().map(replication_state_from_filemeta),
         found: delete_object.found,
         force_delete: delete_object.force_delete,
+        force_delete_id: delete_object.force_delete_id,
+        force_delete_target_arns: delete_object.force_delete_target_arns,
+        force_delete_generation: delete_object.force_delete_generation,
     }
 }
 

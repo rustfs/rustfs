@@ -38,6 +38,13 @@ impl ReplicationConfigStore {
         com::read_config_preserve_empty(api, file).await
     }
 
+    pub(crate) async fn read_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::read_config_no_lock(api, file).await
+    }
+
     pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
     where
         S: ReplicationObjectIO,
@@ -45,7 +52,9 @@ impl ReplicationConfigStore {
         com::save_config(api, file, data).await
     }
 
-    pub(crate) async fn read_no_lock<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, String)>
+    /// Renamed from `read_no_lock` when main's plain `read_no_lock` landed
+    /// (#5641): both names existed with different return types.
+    pub(crate) async fn read_no_lock_with_etag<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, String)>
     where
         S: ReplicationObjectIO,
     {
@@ -85,5 +94,12 @@ impl ReplicationConfigStore {
             opts.add_namespace_lock_lost_signal(signal);
         }
         com::save_config_with_opts(api, file, data, &opts).await
+    }
+
+    pub(crate) async fn save_no_lock<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::save_config_no_lock(api, file, data).await
     }
 }

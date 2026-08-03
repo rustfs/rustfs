@@ -1128,7 +1128,7 @@ mod tests {
                     source_mod_time: None,
                     enqueued_order: None,
                     target_arns: vec!["arn-a".to_string(), "arn-durable-only".to_string()],
-                    target_delete_marker_version_id: None,
+                    ..Default::default()
                 },
                 MrfReplicateEntry {
                     bucket: "other-bucket".to_string(),
@@ -1144,7 +1144,7 @@ mod tests {
                     source_mod_time: None,
                     enqueued_order: None,
                     target_arns: Vec::new(),
-                    target_delete_marker_version_id: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -1206,7 +1206,7 @@ mod tests {
                 source_mod_time: None,
                 enqueued_order: None,
                 target_arns: Vec::new(),
-                target_delete_marker_version_id: None,
+                ..Default::default()
             }],
         };
 

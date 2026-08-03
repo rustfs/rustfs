@@ -68,6 +68,9 @@ mod tests {
                 retry_count: 1,
                 size: 1024,
                 op: MrfOpKind::Metadata,
+                force_delete_id: None,
+                force_delete_generation: None,
+                force_delete_local_commit: false,
                 force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
@@ -84,6 +87,9 @@ mod tests {
                 retry_count: 2,
                 size: 1024,
                 op: MrfOpKind::Object,
+                force_delete_id: None,
+                force_delete_generation: None,
+                force_delete_local_commit: false,
                 force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
@@ -100,6 +106,9 @@ mod tests {
                 retry_count: 0,
                 size: 0,
                 op: MrfOpKind::Delete,
+                force_delete_id: None,
+                force_delete_generation: None,
+                force_delete_local_commit: false,
                 force_delete: true,
                 delete_marker_version_id: Some(del_vid),
                 delete_marker: true,
@@ -197,6 +206,7 @@ mod tests {
             target_delete_marker_version_id: Some("opaque-target-version".to_string()),
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let encoded = encode_mrf_file(&[entry]).expect("new MRF should encode");
         let legacy: Vec<LegacyMrfEntry> = rmp_serde::from_slice(&encoded[4..]).expect("old reader should ignore new map keys");

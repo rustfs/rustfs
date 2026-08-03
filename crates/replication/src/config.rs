@@ -23,7 +23,7 @@ use s3s::dto::{
     ReplicationRuleStatus, ReplicationRules,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 pub const REPLICATION_CAPABILITY_CONTRACT_VERSION: u32 = 1;
@@ -93,6 +93,7 @@ pub trait ReplicationConfigurationExt {
     fn get_destination(&self) -> Destination;
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
+    fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String>;
     fn filter_target_replication_decisions(&self, obj: &ObjectOpts) -> Vec<(String, bool)> {
         self.filter_target_arns(obj)
             .into_iter()
@@ -432,6 +433,51 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             arns.push(arn);
         }
         arns
+    }
+
+    fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String> {
+        let role = self.role.trim();
+        let mut selected = BTreeMap::<String, (&ReplicationRule, bool)>::new();
+
+        for rule in &self.rules {
+            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+                continue;
+            }
+
+            let rule_prefix = rule.prefix();
+            if !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(prefix) {
+                continue;
+            }
+
+            let target = if role.is_empty() {
+                rule.destination.bucket.trim()
+            } else {
+                role
+            };
+            if target.is_empty() {
+                continue;
+            }
+
+            let delete_enabled =
+                rule.delete_replication.as_ref().is_some_and(|delete| {
+                    delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED)
+                }) || rule.delete_marker_replication.as_ref().is_some_and(|delete_marker| {
+                    delete_marker.status
+                        == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
+                });
+
+            if selected
+                .get(target)
+                .is_none_or(|(current, _)| rule.priority > current.priority)
+            {
+                selected.insert(target.to_string(), (rule, delete_enabled));
+            }
+        }
+
+        selected
+            .into_iter()
+            .filter_map(|(target, (_, enabled))| enabled.then_some(target))
+            .collect()
     }
 
     fn filter_target_replication_decisions(&self, obj: &ObjectOpts) -> Vec<(String, bool)> {
@@ -1068,5 +1114,27 @@ mod tests {
         });
 
         assert_eq!(decisions, vec![(target_a.to_string(), false), (target_b.to_string(), true)]);
+    }
+
+    #[test]
+    fn force_delete_targets_use_overlapping_rules_and_highest_priority_switch() {
+        let target_a = "arn:target:a";
+        let target_b = "arn:target:b";
+        let mut a_parent = delete_marker_rule("a-parent", target_a, "logs/", 1, true);
+        a_parent.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let a_child_disabled = delete_marker_rule("a-child", target_a, "logs/2026/", 5, false);
+        let b_child = delete_marker_rule("b-child", target_b, "logs/2026/", 2, true);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![a_parent, a_child_disabled, b_child],
+        };
+
+        assert_eq!(
+            config.filter_force_delete_target_arns("logs/2026/app.log"),
+            vec![target_b.to_string()],
+            "the child rule must win for target A while the overlapping child target B remains eligible"
+        );
     }
 }

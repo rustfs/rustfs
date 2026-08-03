@@ -4439,7 +4439,13 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
             if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
-                match disk.disk_info(&DiskInfoOptions::default()).await {
+                match disk
+                    .disk_info(&DiskInfoOptions {
+                        metrics: true,
+                        ..Default::default()
+                    })
+                    .await
+                {
                     Ok(res) => {
                         disk.record_capacity_probe(res.total, res.used, res.free);
                         ret.push(rustfs_madmin::Disk {
@@ -4470,6 +4476,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             utilization: utilization_percent(res.total, res.used),
                             used_inodes: res.used_inodes,
                             free_inodes: res.free_inodes,
+                            metrics: Some(res.metrics),
                             ..Default::default()
                         });
                     }
@@ -4477,12 +4484,14 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                         let mut disk_info = rustfs_madmin::Disk {
                             state: err.to_string(),
                             endpoint: eps[i].to_string(),
+                            drive_path: eps[i].get_file_path(),
                             local: eps[i].is_local,
                             pool_index: eps[i].pool_idx,
                             set_index: eps[i].set_idx,
                             disk_index: eps[i].disk_idx,
                             runtime_state: Some(runtime_state.as_str().to_string()),
                             offline_duration_seconds,
+                            metrics: disk.metrics_snapshot(),
                             ..Default::default()
                         };
                         if let Some((total, used, free, _)) = capacity_snapshot {
@@ -4501,16 +4510,15 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     }
                 }
             } else {
-                ret.push(build_runtime_snapshot_disk(
-                    &eps[i],
-                    runtime_state,
-                    offline_duration_seconds,
-                    capacity_snapshot,
-                ));
+                let mut disk_info =
+                    build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds, capacity_snapshot);
+                disk_info.metrics = disk.metrics_snapshot();
+                ret.push(disk_info);
             }
         } else {
             ret.push(rustfs_madmin::Disk {
                 endpoint: eps[i].to_string(),
+                drive_path: eps[i].get_file_path(),
                 local: eps[i].is_local,
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
@@ -4536,6 +4544,7 @@ fn build_runtime_snapshot_disk(
 ) -> rustfs_madmin::Disk {
     let mut disk = rustfs_madmin::Disk {
         endpoint: endpoint.to_string(),
+        drive_path: endpoint.get_file_path(),
         local: endpoint.is_local,
         pool_index: endpoint.pool_idx,
         set_index: endpoint.set_idx,
@@ -7801,14 +7810,42 @@ mod tests {
         assert_eq!(info[0].state, "ok");
         assert_eq!(info[0].runtime_state.as_deref(), Some("online"));
         assert!(!info[0].drive_path.is_empty(), "online disk should keep immediate disk_info probe");
+        assert!(
+            info[0]
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.api_calls.get("disk_info"))
+                .copied()
+                .unwrap_or_default()
+                > 0,
+            "online disk should expose disk_info operation metrics"
+        );
 
         assert_eq!(info[1].state, "ok");
         assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
         assert!(!info[1].drive_path.is_empty(), "suspect disk should still probe for fresher disk info");
+        assert!(
+            info[1]
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.last_minute.get("disk_info"))
+                .map(|action| action.count)
+                .unwrap_or_default()
+                > 0,
+            "suspect disk should expose last-minute disk_info latency"
+        );
 
         assert_eq!(info[2].state, "offline");
         assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));
-        assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
+        assert_eq!(
+            info[2].drive_path,
+            endpoints[2].get_file_path(),
+            "offline disk should keep stable endpoint path"
+        );
+        assert!(
+            info[2].metrics.is_some(),
+            "offline runtime fallback should preserve disk metrics snapshot"
+        );
     }
 
     #[tokio::test]

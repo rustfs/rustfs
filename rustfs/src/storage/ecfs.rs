@@ -413,7 +413,6 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        record_s3_op(S3Operation::DeleteObjectTagging);
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
@@ -1257,7 +1256,6 @@ impl S3 for FS {
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        record_s3_op(S3Operation::PutObjectAcl);
         let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let bucket = &req.input.bucket;
         let key = &req.input.key;
@@ -1600,7 +1598,6 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        record_s3_op(S3Operation::PutObjectTagging);
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {

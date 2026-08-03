@@ -30,8 +30,9 @@
 # Keep this regex in sync with the module names in the e2e-smoke filter.
 #
 # Usage:
-#   scripts/check_security_smoke_count.sh          # count check (alias of check)
-#   scripts/check_security_smoke_count.sh check    # count check only
+#   scripts/check_security_smoke_count.sh                    # count check (alias of check)
+#   scripts/check_security_smoke_count.sh check              # count check only
+#   scripts/check_security_smoke_count.sh check listing.json  # reuse a nextest listing
 
 set -euo pipefail
 
@@ -51,6 +52,17 @@ case "$mode" in
         ;;
 esac
 
+if (( $# > 2 )); then
+    echo "usage: $0 [check] [nextest-listing.json]" >&2
+    exit 2
+fi
+
+listing_file="${2:-}"
+if [[ -n "$listing_file" && ! -f "$listing_file" ]]; then
+    echo "error: nextest listing does not exist: $listing_file" >&2
+    exit 1
+fi
+
 floor="$(grep -Ev '^[[:space:]]*(#|$)' "$FLOOR_FILE" | head -n1 | tr -d '[:space:]')"
 if ! [[ "$floor" =~ ^[0-9]+$ ]]; then
     echo "error: $FLOOR_FILE does not contain a numeric floor (got: '$floor')" >&2
@@ -59,13 +71,20 @@ fi
 
 # List via the e2e-smoke PROFILE so the default-filter is applied: only the
 # tests the PR smoke suite would actually run appear in the output. Count the
-# ones whose test name starts with a security module prefix. The structured JSON
-# listing is used (not the human format) for the same reason infra-12 does: the
-# human format's indentation varies across nextest versions; a JSON schema change
-# makes jq fail loudly rather than silently collapsing the count to zero.
-count="$(cargo nextest list --profile e2e-smoke -p e2e_test --message-format json \
-    | jq --arg re "$SECURITY_SMOKE_REGEX" \
-        '[."rust-suites"[].testcases | to_entries[] | select(.key | test($re))] | length')"
+# ones whose test name starts with a security module prefix. CI passes the
+# listing produced from the smoke archive so this guard does not rebuild the
+# e2e test graph immediately before the smoke run. The structured JSON listing
+# is used (not the human format) because a schema change makes jq fail loudly
+# rather than silently collapsing the count to zero.
+if [[ -n "$listing_file" ]]; then
+    count="$(jq --arg re "$SECURITY_SMOKE_REGEX" \
+        '[."rust-suites"[].testcases | to_entries[] | select(.value["filter-match"].status == "matches") | select(.key | test($re))] | length' \
+        "$listing_file")"
+else
+    count="$(cargo nextest list --profile e2e-smoke -p e2e_test --message-format json \
+        | jq --arg re "$SECURITY_SMOKE_REGEX" \
+            '[."rust-suites"[].testcases | to_entries[] | select(.value["filter-match"].status == "matches") | select(.key | test($re))] | length')"
+fi
 if ! [[ "$count" =~ ^[0-9]+$ ]]; then
     echo "error: could not parse nextest JSON listing (got count: '$count')" >&2
     exit 1

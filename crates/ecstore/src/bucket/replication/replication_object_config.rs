@@ -18,6 +18,7 @@ use crate::bucket::metadata::BucketMetadata;
 use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use s3s::dto::{BucketVersioningStatus, ReplicationConfiguration, ReplicationRuleStatus, VersioningConfiguration};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tracing::error;
 
 use super::replication_config_boundary::{
@@ -81,6 +82,15 @@ impl DeleteReplicationConfigSnapshot {
         self.metadata
             .as_ref()
             .and_then(|metadata| metadata.replication_config.as_ref())
+    }
+
+    pub(crate) fn force_delete_target_set(&self, prefix: &str) -> Option<(Vec<String>, OffsetDateTime)> {
+        self.metadata.as_ref().and_then(|metadata| {
+            metadata
+                .replication_config
+                .as_ref()
+                .map(|config| (config.filter_force_delete_target_arns(prefix), metadata.replication_config_updated_at))
+        })
     }
 
     pub(crate) fn has_active_rule(&self, object: &str) -> bool {

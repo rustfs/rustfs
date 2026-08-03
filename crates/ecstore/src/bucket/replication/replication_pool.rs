@@ -232,6 +232,10 @@ static DURABLE_MRF_TARGET_BACKLOG: LazyLock<StdRwLock<Vec<DurableMrfTargetBacklo
 static MRF_BACKLOG_OBSERVABILITY: LazyLock<StdRwLock<MrfBacklogObservabilityTracker>> =
     LazyLock::new(|| StdRwLock::new(MrfBacklogObservabilityTracker::default()));
 
+fn should_replay_force_delete_intent(entry: &MrfReplicateEntry) -> bool {
+    entry.force_delete_id.is_some() && entry.force_delete_local_commit && !entry.target_arns.is_empty()
+}
+
 #[derive(Debug, Clone, Default)]
 struct DurableMrfBacklogTracker {
     available: bool,
@@ -398,9 +402,7 @@ where
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         });
     }
     tracker.into_snapshot()
@@ -599,6 +601,13 @@ fn mrf_claim_key(file: &str, encoded: &[u8]) -> String {
 async fn recovered_mrf_operations<S: ReplicationStorage>(entry: &MrfReplicateEntry, storage: &Arc<S>) -> RecoveredMrfOperations {
     match entry.op {
         MrfOpKind::Delete => {
+            // Force-delete intents are owned by `start_force_delete_processor`,
+            // which replays them from FORCE_DELETE_REPLICATION_FILE (#5641).
+            // Replaying them here as ordinary deletes would double-process the
+            // intent and lose its target set, so skip them terminally.
+            if entry.force_delete_id.is_some() {
+                return RecoveredMrfOperations::TerminalSkip;
+            }
             let (versioned, version_suspended) =
                 match ReplicationVersioningStore::prefix_state(&entry.bucket, &entry.object).await {
                     Ok(state) => state,
@@ -1021,6 +1030,82 @@ async fn process_mrf_file<S: ReplicationStorage>(_file: &str, storage: Arc<S>) -
     process_mrf_backlog(storage).await
 }
 
+pub async fn persist_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    mut entry: MrfReplicateEntry,
+) -> Result<(), EcstoreError> {
+    entry.force_delete_local_commit = false;
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    let lock = storage
+        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+        .await?;
+    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+
+    let mut entries = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
+        Ok(data) => decode_mrf_file(&data)?,
+        Err(EcstoreError::ConfigNotFound) => Vec::new(),
+        Err(err) => return Err(err),
+    };
+
+    if entries
+        .iter()
+        .any(|existing| existing.force_delete_id == entry.force_delete_id)
+    {
+        return Ok(());
+    }
+
+    entries.push(entry);
+    let data = encode_mrf_file(&entries)?;
+    ReplicationConfigStore::save_no_lock(storage, file, data).await
+}
+
+pub async fn commit_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    operation_id: uuid::Uuid,
+) -> Result<(), EcstoreError> {
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    let lock = storage
+        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+        .await?;
+    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+
+    let data = ReplicationConfigStore::read_no_lock(storage.clone(), file).await?;
+    let mut entries = decode_mrf_file(&data)?;
+    let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
+        return Err(EcstoreError::ConfigNotFound);
+    };
+    if entry.force_delete_local_commit {
+        return Ok(());
+    }
+    entry.force_delete_local_commit = true;
+    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+}
+
+pub async fn complete_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    operation_id: uuid::Uuid,
+) -> Result<(), EcstoreError> {
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    let lock = storage
+        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+        .await?;
+    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+
+    let data = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
+        Ok(data) => data,
+        Err(EcstoreError::ConfigNotFound) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let mut entries = decode_mrf_file(&data)?;
+    let original_len = entries.len();
+    entries.retain(|entry| entry.force_delete_id != Some(operation_id));
+    if entries.len() == original_len {
+        return Ok(());
+    }
+
+    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("replication resync {active_resync_id} is already active for {bucket}/{arn}")]
 struct ResyncActiveConflictError {
@@ -1135,8 +1220,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         pool.resize_workers(worker_counts.workers, 0).await;
         pool.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
 
-        // Start the persister immediately. Recovery is started only after the
-        // pool has been published in the instance context.
+        // Start the persister immediately. MRF recovery is started only after the
+        // pool has been published in the instance context; the force-delete
+        // processor keeps main's construction-time placement (#5641).
+        pool.start_force_delete_processor().await;
         pool.start_mrf_persister().await;
 
         pool
@@ -1722,6 +1809,67 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         self.task_handles.lock().await.push(handle);
     }
 
+    async fn start_force_delete_processor(&self) {
+        let storage = self.storage.clone();
+        let handle =
+            tokio::spawn(async move {
+                let data =
+                    match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(EcstoreError::ConfigNotFound) => return,
+                        Err(error) => {
+                            warn!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                error = %error,
+                                "Failed to load durable force-delete intents"
+                            );
+                            return;
+                        }
+                    };
+
+                let entries = match decode_mrf_file(&data) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            error = %error,
+                            "Failed to decode durable force-delete intents"
+                        );
+                        return;
+                    }
+                };
+
+                for entry in entries {
+                    if !should_replay_force_delete_intent(&entry) {
+                        continue;
+                    }
+                    let Some(operation_id) = entry.force_delete_id else {
+                        continue;
+                    };
+                    schedule_replication_delete(DeletedObjectReplicationInfo {
+                        delete_object: ReplicationDeletedObject {
+                            object_name: entry.object,
+                            force_delete: true,
+                            force_delete_id: Some(operation_id),
+                            force_delete_target_arns: entry.target_arns,
+                            force_delete_generation: entry.force_delete_generation,
+                            ..Default::default()
+                        },
+                        bucket: entry.bucket,
+                        op_type: ReplicationType::Heal,
+                        event_type: REPLICATE_HEAL_DELETE.to_string(),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            });
+        self.task_handles.lock().await.push(handle);
+    }
+
     /// Starts the MRF persister — ongoing background task.
     ///
     /// Drains `mrf_save_rx` (entries that overflowed the normal worker channels) and
@@ -2286,7 +2434,7 @@ fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
 }
 
 async fn read_mrf_entries_no_lock<S: ReplicationObjectIO>(file: &str, storage: &Arc<S>) -> Result<MrfFileContents, EcstoreError> {
-    match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
+    match ReplicationConfigStore::read_no_lock_with_etag(storage.clone(), file).await {
         Ok((data, etag)) => {
             let entries = decode_mrf_file(&data).map_err(|error| EcstoreError::other(error.to_string()))?;
             if file == ReplicationMetadataStore::TARGETED_MRF_REPLICATION_FILE && !entries.iter().all(targeted_mrf_entry_is_valid)
@@ -2979,6 +3127,7 @@ mod tests {
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
             if !object.ends_with("/.replication/resync.bin")
+                && !object.ends_with("config/replication/force-delete.bin")
                 && object != ReplicationMetadataStore::MRF_REPLICATION_FILE
                 && object != ReplicationMetadataStore::TARGETED_MRF_REPLICATION_FILE
             {
@@ -3979,9 +4128,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -4101,9 +4248,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
         observe_mrf_pending(&entry);
 
@@ -4306,6 +4451,7 @@ mod tests {
                 target_delete_marker_version_id: None,
                 source_mod_time: None,
                 enqueued_order: None,
+                ..Default::default()
             };
             let legacy_data = encode_mrf_file(std::slice::from_ref(&legacy)).expect("legacy MRF should encode");
             *shared.data.lock().expect("test legacy MRF lock should not be poisoned") = legacy_data.clone();
@@ -4360,6 +4506,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let targeted = MrfReplicateEntry {
             object: "targeted".to_string(),
@@ -4417,6 +4564,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -4458,6 +4606,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let first = MrfReplicateEntry {
             object: "first".to_string(),
@@ -4503,6 +4652,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         *shared.data.lock().expect("test MRF data lock should not poison") =
             encode_mrf_file(std::slice::from_ref(&base)).expect("base MRF should encode");
@@ -4580,6 +4730,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let retained = MrfReplicateEntry {
             object: "retained".to_string(),
@@ -4651,6 +4802,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let concurrent = MrfReplicateEntry {
             object: "concurrent".to_string(),
@@ -4708,6 +4860,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         assert!(
             merge_mrf_entries_to_disk(ReplicationMetadataStore::MRF_REPLICATION_FILE, std::slice::from_ref(&entry), &storage,)
@@ -4758,6 +4911,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let targeted = MrfReplicateEntry {
             object: "targeted".to_string(),
@@ -4810,6 +4964,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let targeted_retry = MrfReplicateEntry {
             target_arns: vec!["arn:target-a".to_string()],
@@ -4884,6 +5039,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         *shared.data.lock().expect("test MRF data lock should not be poisoned") =
             encode_mrf_file(std::slice::from_ref(&entry)).expect("test MRF entry should encode");
@@ -4916,6 +5072,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let terminal_entry = MrfReplicateEntry {
             object: "terminal".to_string(),
@@ -4953,6 +5110,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         *shared.data.lock().expect("test MRF data lock should not be poisoned") =
             encode_mrf_file(std::slice::from_ref(&entry)).expect("test MRF entry should encode");
@@ -4988,6 +5146,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         *shared.data.lock().expect("test MRF data lock should not be poisoned") =
             encode_mrf_file(std::slice::from_ref(&entry)).expect("test MRF entry should encode");
@@ -5032,6 +5191,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
 
         let result =
@@ -5061,6 +5221,7 @@ mod tests {
             target_delete_marker_version_id: Some("opaque-target-marker".to_string()),
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let malformed_data = encode_mrf_file(std::slice::from_ref(&malformed)).expect("malformed entry should encode");
         *shared
@@ -5143,9 +5304,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: vec!["arn:rustfs:replication:target-a".to_string()],
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
 
         stats.inc_q(&entry.bucket, entry.size, false, ReplicationType::Heal);
@@ -5169,9 +5328,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -5291,9 +5448,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -5329,9 +5484,7 @@ mod tests {
             delete_marker: true,
             delete_marker_mtime: Some(mtime_nanos),
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -5367,9 +5520,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(&[entry]).expect("encode");
@@ -5400,9 +5551,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
-                target_delete_marker_version_id: None,
-                source_mod_time: None,
-                enqueued_order: None,
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b".to_string(),
@@ -5416,9 +5565,7 @@ mod tests {
                 delete_marker: true,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
-                target_delete_marker_version_id: None,
-                source_mod_time: None,
-                enqueued_order: None,
+                ..Default::default()
             },
         ];
 
@@ -5455,6 +5602,7 @@ mod tests {
             target_delete_marker_version_id: Some(target_delete_marker_version_id.to_string()),
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let persisted = encode_mrf_file(std::slice::from_ref(&entry)).expect("targeted MRF delete should encode");
         let recovered = decode_mrf_file(&persisted).expect("targeted MRF delete should decode");
@@ -5506,6 +5654,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
 
         let replay = recovered_mrf_delete_infos(
@@ -5543,6 +5692,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
         let legacy = MrfReplicateEntry {
             target_arns: Vec::new(),
@@ -5610,6 +5760,7 @@ mod tests {
             target_delete_marker_version_id: None,
             source_mod_time: None,
             enqueued_order: None,
+            ..Default::default()
         };
 
         let replay = recovered_mrf_delete_infos(
@@ -5641,9 +5792,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
 
@@ -5660,9 +5809,7 @@ mod tests {
             delete_marker: true,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
 
@@ -5680,9 +5827,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
     }
@@ -5749,9 +5894,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         }];
         let encoded = encode_mrf_file(&entries).expect("durable MRF backlog should encode");
 
@@ -5800,9 +5943,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
-                target_delete_marker_version_id: None,
-                source_mod_time: None,
-                enqueued_order: None,
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b1".to_string(),
@@ -5816,9 +5957,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: vec!["arn:target-a".to_string()],
-                target_delete_marker_version_id: None,
-                source_mod_time: None,
-                enqueued_order: None,
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b1".to_string(),
@@ -5832,9 +5971,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
-                target_delete_marker_version_id: None,
-                source_mod_time: None,
-                enqueued_order: None,
+                ..Default::default()
             },
         ];
 
@@ -5890,13 +6027,89 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
-            target_delete_marker_version_id: None,
-            source_mod_time: None,
-            enqueued_order: None,
+            ..Default::default()
         }])
         .expect("invalid persisted entry should still encode for boundary testing");
         let invalid = durable_mrf_backlog_from_read(Ok(negative));
         assert!(!invalid.available);
         assert!(invalid.entries.is_empty());
+    }
+
+    #[test]
+    fn force_delete_replay_requires_local_commit_and_keeps_persisted_targets() {
+        let operation_id = Uuid::new_v4();
+        let pending = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "logs/".to_string(),
+            target_arns: vec!["arn:target:old-generation".to_string()],
+            force_delete_id: Some(operation_id),
+            force_delete_generation: Some(11),
+            force_delete_local_commit: false,
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        assert!(!should_replay_force_delete_intent(&pending));
+
+        let mut committed = pending;
+        committed.force_delete_local_commit = true;
+        let recovered = decode_mrf_file(&encode_mrf_file(&[committed.clone()]).expect("force-delete intent should encode"))
+            .expect("force-delete intent should decode");
+        assert!(should_replay_force_delete_intent(&recovered[0]));
+        assert_eq!(recovered[0].target_arns, vec!["arn:target:old-generation"]);
+        assert_eq!(recovered[0].force_delete_generation, Some(11));
+
+        committed.target_arns.clear();
+        assert!(!should_replay_force_delete_intent(&committed));
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_append_commit_and_cleanup_are_idempotent() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "logs/".to_string(),
+            target_arns: vec!["arn:target:stable".to_string()],
+            force_delete_id: Some(operation_id),
+            force_delete_generation: Some(12),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("first journal append should succeed");
+        persist_force_delete_intent(storage.clone(), entry)
+            .await
+            .expect("duplicate journal append should be a no-op");
+
+        let data = ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should be readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].force_delete_local_commit);
+        assert!(!should_replay_force_delete_intent(&entries[0]));
+
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("commit marker should persist");
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("duplicate commit marker should be a no-op");
+        let data = ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("committed journal should be readable");
+        let entries = decode_mrf_file(&data).expect("committed journal should decode");
+        assert!(should_replay_force_delete_intent(&entries[0]));
+        assert_eq!(entries[0].target_arns, vec!["arn:target:stable"]);
+
+        complete_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("journal cleanup should succeed");
+        complete_force_delete_intent(storage, operation_id)
+            .await
+            .expect("duplicate journal cleanup should be a no-op");
     }
 }
