@@ -285,14 +285,9 @@ pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<
             corrupt = true;
             continue;
         }
-        let at_capacity = versions.len() >= MAX_ENTRIES;
         match versions.entry(arn.to_string()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                if at_capacity {
-                    corrupt = true;
-                } else {
-                    entry.insert(Some(value.clone()));
-                }
+                entry.insert(Some(value.clone()));
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 if entry.get().as_deref() != Some(value.as_str()) {
@@ -302,6 +297,18 @@ pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<
             }
         }
     }
+
+    // Apply the cap after collecting, never during. Capping mid-iteration made
+    // the surviving subset depend on `HashMap` order, so two disks decoding the
+    // same metadata could keep different entries and hash differently — turning
+    // an over-cap object into a quorum failure instead of a reported corruption.
+    // `BTreeMap` order is total, so truncating here is identical everywhere.
+    if versions.len() > MAX_ENTRIES {
+        corrupt = true;
+        let retained = versions.keys().take(MAX_ENTRIES).cloned().collect::<Vec<_>>();
+        versions.retain(|arn, _| retained.binary_search(arn).is_ok());
+    }
+
     (
         versions
             .into_iter()
@@ -575,5 +582,26 @@ mod tests {
 
         assert_eq!(versions.len(), 1_000);
         assert!(corrupt);
+    }
+    #[test]
+    fn target_delete_marker_versions_cap_is_deterministic_across_decodes() {
+        // Two decodes of the same oversized metadata must agree, or the two disks
+        // holding it hash differently and the object loses quorum instead of
+        // reporting corruption.
+        let mut metadata = HashMap::new();
+        for index in 0..1_050 {
+            metadata.insert(
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:target:{index:05}"),
+                format!("version-{index}"),
+            );
+        }
+
+        let (first, first_corrupt) = target_delete_marker_versions(&metadata);
+        let (second, second_corrupt) = target_delete_marker_versions(&metadata);
+
+        assert!(first_corrupt, "exceeding the cap must be reported as corrupt");
+        assert_eq!(first_corrupt, second_corrupt);
+        assert_eq!(first, second, "the retained subset must not depend on map iteration order");
+        assert_eq!(first.len(), 1_000);
     }
 }

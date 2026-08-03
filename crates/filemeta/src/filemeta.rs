@@ -165,7 +165,15 @@ fn persist_target_delete_marker_versions(
     transport_metadata: &HashMap<String, String>,
 ) {
     let mut bounded = BTreeMap::new();
-    let (transport_versions, _) = rustfs_utils::http::target_delete_marker_versions(transport_metadata);
+    // A corrupt carrier means the dual internal prefixes disagreed. Do not merge
+    // anything derived from it: this helper only ever inserts, so declining to
+    // merge leaves whatever durable keys the object already carries untouched,
+    // which is strictly safer than committing a mapping we cannot trust.
+    let (transport_versions, transport_corrupt) = rustfs_utils::http::target_delete_marker_versions(transport_metadata);
+    if transport_corrupt {
+        warn!("delete-marker target version transport metadata is inconsistent; leaving the persisted mapping unchanged");
+        return;
+    }
     for (arn, version_id) in transport_versions.iter().chain(versions.iter()) {
         if !valid_target_delete_marker_version(arn, version_id)
             || (bounded.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES
