@@ -1756,7 +1756,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
         let input = AbortMultipartUploadInput::builder()
             .bucket("bucket".to_string())
