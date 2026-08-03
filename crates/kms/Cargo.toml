@@ -99,6 +99,9 @@ tokio = { workspace = true, features = ["net", "test-util"] }
 # Replays canned AWS KMS HTTP exchanges so the AWS backend tests stay offline.
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
 http = { workspace = true }
+# Captures warning events in format-compatibility tests without installing a
+# process-wide subscriber.
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [features]
 default = []

@@ -33,12 +33,15 @@ impl DeletedObjectReplicationInfo {
             return vec![self.target_arn.clone()];
         }
 
-        let mut target_arns = self
-            .delete_object
-            .replication_state
-            .as_ref()
-            .map(admitted_target_arns_from_replication_state)
-            .unwrap_or_default();
+        let mut target_arns = if !self.delete_object.force_delete_target_arns.is_empty() {
+            self.delete_object.force_delete_target_arns.clone()
+        } else {
+            self.delete_object
+                .replication_state
+                .as_ref()
+                .map(admitted_target_arns_from_replication_state)
+                .unwrap_or_default()
+        };
         target_arns.sort();
         target_arns.dedup();
         target_arns
@@ -69,6 +72,9 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
                 .delete_marker_mtime
                 .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
             target_arns: self.admitted_target_arns(),
+            force_delete_id: self.delete_object.force_delete_id,
+            force_delete_generation: self.delete_object.force_delete_generation,
+            force_delete_local_commit: self.delete_object.force_delete,
         }
     }
 
@@ -229,6 +235,35 @@ mod tests {
             vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
             "MRF deletes must preserve the admitted target identities in stable order"
         );
+    }
+
+    #[test]
+    fn deleted_object_replication_info_preserves_force_delete_handoff() {
+        let operation_id = Uuid::new_v4();
+        let info = DeletedObjectReplicationInfo {
+            bucket: "bucket".to_string(),
+            delete_object: DeletedObject {
+                object_name: "prefix/".to_string(),
+                force_delete: true,
+                force_delete_id: Some(operation_id),
+                force_delete_target_arns: vec![
+                    "arn:target-b".to_string(),
+                    "arn:target-a".to_string(),
+                    "arn:target-b".to_string(),
+                ],
+                force_delete_generation: Some(17),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let entry = info.to_mrf_entry();
+
+        assert!(entry.force_delete);
+        assert_eq!(entry.force_delete_id, Some(operation_id));
+        assert_eq!(entry.force_delete_generation, Some(17));
+        assert!(entry.force_delete_local_commit);
+        assert_eq!(entry.target_arns, vec!["arn:target-a", "arn:target-b"]);
     }
 
     #[test]

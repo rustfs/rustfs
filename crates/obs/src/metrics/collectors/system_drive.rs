@@ -78,6 +78,24 @@ pub struct DriveDetailedStats {
     pub perc_util: Option<f64>,
 }
 
+/// Detailed drive statistics with runtime topology and per-operation dimensions.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DriveRuntimeDetailedStats {
+    pub(crate) stats: DriveDetailedStats,
+    pub(crate) pool_index: Option<String>,
+    pub(crate) set_index: Option<String>,
+    pub(crate) drive_index: Option<String>,
+    pub(crate) disk_id: Option<String>,
+    pub(crate) runtime_state: Option<String>,
+    pub(crate) healing: bool,
+    pub(crate) scanning: bool,
+    pub(crate) offline_duration_seconds: Option<u64>,
+    /// Drive API calls by operation
+    pub(crate) api_calls: Vec<(String, u64)>,
+    /// Last-minute API latency by operation, in microseconds
+    pub(crate) api_latency_by_api_micros: Vec<(String, u64)>,
+}
+
 /// Aggregate drive count statistics.
 #[derive(Debug, Clone, Default)]
 pub struct DriveCountStats {
@@ -93,6 +111,58 @@ pub struct DriveCountStats {
 ///
 /// Returns a vector of Prometheus metrics for each drive.
 pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<PrometheusMetric> {
+    let runtime_stats = stats
+        .iter()
+        .cloned()
+        .map(|stats| DriveRuntimeDetailedStats {
+            stats,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    collect_drive_runtime_detailed_metrics(&runtime_stats)
+}
+
+pub(crate) fn collect_drive_runtime_detailed_metrics(stats: &[DriveRuntimeDetailedStats]) -> Vec<PrometheusMetric> {
+    const DRIVE_RUNTIME_STATES: [&str; 5] = ["online", "offline", "returning", "suspect", "unknown"];
+
+    fn topology_labels(stat: &DriveRuntimeDetailedStats) -> Option<[Cow<'static, str>; 5]> {
+        Some([
+            Cow::Owned(stat.stats.server.clone()),
+            Cow::Owned(stat.stats.drive.clone()),
+            Cow::Owned(stat.pool_index.as_ref()?.clone()),
+            Cow::Owned(stat.set_index.as_ref()?.clone()),
+            Cow::Owned(stat.drive_index.as_ref()?.clone()),
+        ])
+    }
+
+    fn has_topology_labels(stat: &DriveRuntimeDetailedStats) -> bool {
+        stat.pool_index.is_some() && stat.set_index.is_some() && stat.drive_index.is_some()
+    }
+
+    fn normalized_runtime_state(runtime_state: &str) -> &str {
+        DRIVE_RUNTIME_STATES
+            .iter()
+            .copied()
+            .find(|state| state.eq_ignore_ascii_case(runtime_state))
+            .unwrap_or("unknown")
+    }
+
+    fn push_topology_metric(
+        metrics: &mut Vec<PrometheusMetric>,
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        value: f64,
+        labels: &[Cow<'static, str>; 5],
+    ) {
+        metrics.push(
+            PrometheusMetric::from_descriptor(descriptor, value)
+                .with_label(SERVER_LABEL, labels[0].clone())
+                .with_label(DRIVE_LABEL, labels[1].clone())
+                .with_label(POOL_INDEX_LABEL, labels[2].clone())
+                .with_label(SET_INDEX_LABEL, labels[3].clone())
+                .with_label(DRIVE_INDEX_LABEL, labels[4].clone()),
+        );
+    }
+
     fn push_drive_metric(
         metrics: &mut Vec<PrometheusMetric>,
         descriptor: &'static crate::metrics::schema::MetricDescriptor,
@@ -107,19 +177,49 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
         );
     }
 
-    let mut metrics = Vec::with_capacity(stats.len() * 23);
+    let metric_capacity = stats
+        .iter()
+        .map(|stat| {
+            let api_metrics = if has_topology_labels(stat) {
+                stat.api_calls.len() + stat.api_latency_by_api_micros.len()
+            } else {
+                0
+            };
+            31 + api_metrics
+        })
+        .sum();
+    let mut metrics = Vec::with_capacity(metric_capacity);
 
     for stat in stats {
-        let server_label = stat.server.as_str();
-        let drive_label = stat.drive.as_str();
+        let server_label = stat.stats.server.as_str();
+        let drive_label = stat.stats.drive.as_str();
+        let topology_labels = topology_labels(stat);
 
-        push_drive_metric(&mut metrics, &DRIVE_TOTAL_BYTES_MD, stat.total_bytes as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_USED_BYTES_MD, stat.used_bytes as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_FREE_BYTES_MD, stat.free_bytes as f64, server_label, drive_label);
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_TOTAL_BYTES_MD,
+            stat.stats.total_bytes as f64,
+            server_label,
+            drive_label,
+        );
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_USED_BYTES_MD,
+            stat.stats.used_bytes as f64,
+            server_label,
+            drive_label,
+        );
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_FREE_BYTES_MD,
+            stat.stats.free_bytes as f64,
+            server_label,
+            drive_label,
+        );
         push_drive_metric(
             &mut metrics,
             &DRIVE_CAPACITY_OBSERVATION_AGE_SECONDS_MD,
-            stat.capacity_observation_age_seconds as f64,
+            stat.stats.capacity_observation_age_seconds as f64,
             server_label,
             drive_label,
         );
@@ -127,58 +227,122 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
             metrics.push(
                 PrometheusMetric::from_descriptor(
                     &DRIVE_CAPACITY_OBSERVATION_STATE_MD,
-                    if state == stat.capacity_observation_state { 1.0 } else { 0.0 },
+                    if state == stat.stats.capacity_observation_state {
+                        1.0
+                    } else {
+                        0.0
+                    },
                 )
                 .with_label_owned(SERVER_LABEL, server_label.to_string())
                 .with_label_owned(DRIVE_LABEL, drive_label.to_string())
                 .with_label_owned("state", state.to_string()),
             );
         }
-        if let Some(value) = stat.used_inodes {
+        if let Some(value) = stat.stats.used_inodes {
             push_drive_metric(&mut metrics, &DRIVE_USED_INODES_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.free_inodes {
+        if let Some(value) = stat.stats.free_inodes {
             push_drive_metric(&mut metrics, &DRIVE_FREE_INODES_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.total_inodes {
+        if let Some(value) = stat.stats.total_inodes {
             push_drive_metric(&mut metrics, &DRIVE_TOTAL_INODES_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.timeout_errors_total {
+        if let Some(value) = stat.stats.timeout_errors_total {
             push_drive_metric(&mut metrics, &DRIVE_TIMEOUT_ERRORS_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.io_errors_total {
+        if let Some(value) = stat.stats.io_errors_total {
             push_drive_metric(&mut metrics, &DRIVE_IO_ERRORS_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.availability_errors_total {
+        if let Some(value) = stat.stats.availability_errors_total {
             push_drive_metric(&mut metrics, &DRIVE_AVAILABILITY_ERRORS_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.waiting_io {
+        if let Some(value) = stat.stats.waiting_io {
             push_drive_metric(&mut metrics, &DRIVE_WAITING_IO_MD, value as f64, server_label, drive_label);
         }
-        if let Some(value) = stat.api_latency_micros {
+        if let Some(value) = stat.stats.api_latency_micros {
             push_drive_metric(&mut metrics, &DRIVE_API_LATENCY_MD, value as f64, server_label, drive_label);
         }
-        push_drive_metric(&mut metrics, &DRIVE_HEALTH_MD, stat.health as f64, server_label, drive_label);
-        if let Some(value) = stat.reads_per_sec {
+        push_drive_metric(&mut metrics, &DRIVE_HEALTH_MD, stat.stats.health as f64, server_label, drive_label);
+        if let Some(value) = stat.stats.reads_per_sec {
             push_drive_metric(&mut metrics, &DRIVE_READS_PER_SEC_MD, value, server_label, drive_label);
         }
-        if let Some(value) = stat.reads_kb_per_sec {
+        if let Some(value) = stat.stats.reads_kb_per_sec {
             push_drive_metric(&mut metrics, &DRIVE_READS_KB_PER_SEC_MD, value, server_label, drive_label);
         }
-        if let Some(value) = stat.reads_await {
+        if let Some(value) = stat.stats.reads_await {
             push_drive_metric(&mut metrics, &DRIVE_READS_AWAIT_MD, value, server_label, drive_label);
         }
-        if let Some(value) = stat.writes_per_sec {
+        if let Some(value) = stat.stats.writes_per_sec {
             push_drive_metric(&mut metrics, &DRIVE_WRITES_PER_SEC_MD, value, server_label, drive_label);
         }
-        if let Some(value) = stat.writes_kb_per_sec {
+        if let Some(value) = stat.stats.writes_kb_per_sec {
             push_drive_metric(&mut metrics, &DRIVE_WRITES_KB_PER_SEC_MD, value, server_label, drive_label);
         }
-        if let Some(value) = stat.writes_await {
+        if let Some(value) = stat.stats.writes_await {
             push_drive_metric(&mut metrics, &DRIVE_WRITES_AWAIT_MD, value, server_label, drive_label);
         }
-        if let Some(value) = stat.perc_util {
+        if let Some(value) = stat.stats.perc_util {
             push_drive_metric(&mut metrics, &DRIVE_PERC_UTIL_MD, value, server_label, drive_label);
+        }
+        if let Some(labels) = &topology_labels {
+            if let Some(disk_id) = stat.disk_id.as_ref().filter(|disk_id| !disk_id.is_empty()) {
+                metrics.push(
+                    PrometheusMetric::from_descriptor(&DRIVE_INFO_MD, 1.0)
+                        .with_label(SERVER_LABEL, labels[0].clone())
+                        .with_label(DRIVE_LABEL, labels[1].clone())
+                        .with_label(POOL_INDEX_LABEL, labels[2].clone())
+                        .with_label(SET_INDEX_LABEL, labels[3].clone())
+                        .with_label(DRIVE_INDEX_LABEL, labels[4].clone())
+                        .with_label_owned(DISK_ID_LABEL, disk_id.clone()),
+                );
+            }
+            if let Some(runtime_state) = stat.runtime_state.as_ref().filter(|state| !state.is_empty()) {
+                let runtime_state = normalized_runtime_state(runtime_state);
+                for state in DRIVE_RUNTIME_STATES {
+                    metrics.push(
+                        PrometheusMetric::from_descriptor(
+                            &DRIVE_RUNTIME_STATE_MD,
+                            if state == runtime_state { 1.0 } else { 0.0 },
+                        )
+                        .with_label(SERVER_LABEL, labels[0].clone())
+                        .with_label(DRIVE_LABEL, labels[1].clone())
+                        .with_label(POOL_INDEX_LABEL, labels[2].clone())
+                        .with_label(SET_INDEX_LABEL, labels[3].clone())
+                        .with_label(DRIVE_INDEX_LABEL, labels[4].clone())
+                        .with_label(STATE_LABEL, state),
+                    );
+                }
+            }
+            push_topology_metric(&mut metrics, &DRIVE_HEALING_MD, if stat.healing { 1.0 } else { 0.0 }, labels);
+            push_topology_metric(&mut metrics, &DRIVE_SCANNING_MD, if stat.scanning { 1.0 } else { 0.0 }, labels);
+            push_topology_metric(
+                &mut metrics,
+                &DRIVE_OFFLINE_DURATION_SECONDS_MD,
+                stat.offline_duration_seconds.unwrap_or(0) as f64,
+                labels,
+            );
+            for (api, value) in &stat.api_calls {
+                metrics.push(
+                    PrometheusMetric::from_descriptor(&DRIVE_API_CALLS_MD, *value as f64)
+                        .with_label(SERVER_LABEL, labels[0].clone())
+                        .with_label(DRIVE_LABEL, labels[1].clone())
+                        .with_label(POOL_INDEX_LABEL, labels[2].clone())
+                        .with_label(SET_INDEX_LABEL, labels[3].clone())
+                        .with_label(DRIVE_INDEX_LABEL, labels[4].clone())
+                        .with_label_owned(API_LABEL, api.clone()),
+                );
+            }
+            for (api, value) in &stat.api_latency_by_api_micros {
+                metrics.push(
+                    PrometheusMetric::from_descriptor(&DRIVE_API_LATENCY_BY_API_MD, *value as f64)
+                        .with_label(SERVER_LABEL, labels[0].clone())
+                        .with_label(DRIVE_LABEL, labels[1].clone())
+                        .with_label(POOL_INDEX_LABEL, labels[2].clone())
+                        .with_label(SET_INDEX_LABEL, labels[3].clone())
+                        .with_label(DRIVE_INDEX_LABEL, labels[4].clone())
+                        .with_label_owned(API_LABEL, api.clone()),
+                );
+            }
         }
     }
 
@@ -259,36 +423,48 @@ mod tests {
 
     #[test]
     fn test_collect_drive_detailed_metrics() {
-        let stats = vec![DriveDetailedStats {
-            server: "node1:9000".to_string(),
-            drive: "/data/disk1".to_string(),
-            total_bytes: 1024 * 1024 * 1024 * 100, // 100 GB
-            used_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
-            free_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
-            capacity_observation_state: "live",
-            capacity_observation_age_seconds: 0,
-            used_inodes: Some(100000),
-            free_inodes: Some(900000),
-            total_inodes: Some(1000000),
-            timeout_errors_total: Some(5),
-            io_errors_total: Some(10),
-            availability_errors_total: Some(2),
-            waiting_io: Some(3),
-            api_latency_micros: Some(1500),
-            health: 1,
-            reads_per_sec: Some(100.0),
-            reads_kb_per_sec: Some(1024.0),
-            reads_await: Some(5.5),
-            writes_per_sec: Some(50.0),
-            writes_kb_per_sec: Some(512.0),
-            writes_await: Some(10.2),
-            perc_util: Some(75.5),
+        let stats = vec![DriveRuntimeDetailedStats {
+            pool_index: Some("0".to_string()),
+            set_index: Some("1".to_string()),
+            drive_index: Some("2".to_string()),
+            disk_id: Some("disk-uuid-1".to_string()),
+            runtime_state: Some("online".to_string()),
+            healing: true,
+            scanning: false,
+            offline_duration_seconds: Some(0),
+            api_calls: vec![("read".to_string(), 7)],
+            api_latency_by_api_micros: vec![("read".to_string(), 2500)],
+            stats: DriveDetailedStats {
+                server: "node1:9000".to_string(),
+                drive: "/data/disk1".to_string(),
+                total_bytes: 1024 * 1024 * 1024 * 100, // 100 GB
+                used_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
+                free_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
+                capacity_observation_state: "live",
+                capacity_observation_age_seconds: 0,
+                used_inodes: Some(100000),
+                free_inodes: Some(900000),
+                total_inodes: Some(1000000),
+                timeout_errors_total: Some(5),
+                io_errors_total: Some(10),
+                availability_errors_total: Some(2),
+                waiting_io: Some(3),
+                api_latency_micros: Some(1500),
+                health: 1,
+                reads_per_sec: Some(100.0),
+                reads_kb_per_sec: Some(1024.0),
+                reads_await: Some(5.5),
+                writes_per_sec: Some(50.0),
+                writes_kb_per_sec: Some(512.0),
+                writes_await: Some(10.2),
+                perc_util: Some(75.5),
+            },
         }];
 
-        let metrics = collect_drive_detailed_metrics(&stats);
+        let metrics = collect_drive_runtime_detailed_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 23);
+        assert_eq!(metrics.len(), 34);
 
         // Verify total bytes metric
         let total_bytes_name = DRIVE_TOTAL_BYTES_MD.get_full_metric_name();
@@ -303,6 +479,32 @@ mod tests {
         );
         assert_metric_label_keys(&metrics, &DRIVE_API_LATENCY_MD, 1500.0, &[SERVER_LABEL, DRIVE_LABEL]);
         assert_metric_label_keys(&metrics, &DRIVE_CAPACITY_OBSERVATION_STATE_MD, 1.0, &[SERVER_LABEL, DRIVE_LABEL, "state"]);
+        assert_metric_label_keys(
+            &metrics,
+            &DRIVE_INFO_MD,
+            1.0,
+            &[
+                SERVER_LABEL,
+                DRIVE_LABEL,
+                POOL_INDEX_LABEL,
+                SET_INDEX_LABEL,
+                DRIVE_INDEX_LABEL,
+                DISK_ID_LABEL,
+            ],
+        );
+        assert_metric_label_keys(
+            &metrics,
+            &DRIVE_API_CALLS_MD,
+            7.0,
+            &[
+                SERVER_LABEL,
+                DRIVE_LABEL,
+                POOL_INDEX_LABEL,
+                SET_INDEX_LABEL,
+                DRIVE_INDEX_LABEL,
+                API_LABEL,
+            ],
+        );
     }
 
     #[test]
@@ -351,6 +553,75 @@ mod tests {
                 .iter()
                 .all(|metric| metric.name != DRIVE_IO_ERRORS_MD.get_full_metric_name())
         );
+    }
+
+    #[test]
+    fn drive_runtime_state_metrics_keep_suspect_state_active() {
+        let stats = vec![DriveRuntimeDetailedStats {
+            pool_index: Some("0".to_string()),
+            set_index: Some("1".to_string()),
+            drive_index: Some("2".to_string()),
+            runtime_state: Some("suspect".to_string()),
+            stats: DriveDetailedStats {
+                server: "node1:9000".to_string(),
+                drive: "/data/disk1".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+
+        let metrics = collect_drive_runtime_detailed_metrics(&stats);
+        let state_metrics = metrics
+            .iter()
+            .filter(|metric| metric.name == DRIVE_RUNTIME_STATE_MD.get_full_metric_name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(state_metrics.len(), 5);
+        assert!(state_metrics.iter().any(|metric| {
+            metric.value == 1.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "suspect")
+        }));
+        assert!(state_metrics.iter().filter(|metric| metric.value == 1.0).all(|metric| {
+            metric
+                .labels
+                .iter()
+                .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "suspect")
+        }));
+    }
+
+    #[test]
+    fn drive_offline_duration_zeroes_recovered_topology_drive() {
+        let stats = vec![DriveRuntimeDetailedStats {
+            pool_index: Some("0".to_string()),
+            set_index: Some("1".to_string()),
+            drive_index: Some("2".to_string()),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: None,
+            stats: DriveDetailedStats {
+                server: "node1:9000".to_string(),
+                drive: "/data/disk1".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+
+        let metrics = collect_drive_runtime_detailed_metrics(&stats);
+
+        assert!(metrics.iter().any(|metric| {
+            metric.name == DRIVE_OFFLINE_DURATION_SECONDS_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == DRIVE_INDEX_LABEL && value == "2")
+        }));
     }
 
     #[test]

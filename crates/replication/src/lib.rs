@@ -44,8 +44,8 @@ pub use filemeta::{
     REPLICATE_INCOMING_DELETE, REPLICATE_MRF, REPLICATE_QUEUED, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision,
     ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState,
     ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
-    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
-    version_purge_statuses_map,
+    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replicate_decision_for_admitted_targets,
+    replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
 pub use multipart::{

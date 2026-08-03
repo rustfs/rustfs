@@ -32,7 +32,6 @@ use super::storage_api::object_usecase::bucket::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
         lifecycle::{self, TransitionOptions},
-        tier_delete_journal, tier_sweeper,
     },
     metadata_sys,
     object_lock::{
@@ -42,11 +41,11 @@ use super::storage_api::object_usecase::bucket::{
     predict_lifecycle_expiration,
     quota::{QuotaCheckResult, QuotaError, QuotaOperation},
     replication::{
-        DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, delete_replication_state_from_config,
-        delete_replication_version_id, deleted_object_has_pending_replication_delete, has_active_delete_rule,
-        load_delete_config_snapshot, must_replicate_object, schedule_object_replication, schedule_replication_delete,
-        schedule_replication_deletes, set_deleted_object_replication_state, should_schedule_delete_replication,
-        should_use_existing_delete_replication_info,
+        DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
+        delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
+        force_delete_target_set, has_active_delete_rule, load_delete_config_snapshot, must_replicate_object,
+        persist_force_delete_intent, schedule_object_replication, schedule_replication_delete, schedule_replication_deletes,
+        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -108,8 +107,8 @@ use super::storage_api::object_usecase::{
     validate_ssec_for_read, wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
-    AppContext, current_app_context, current_expiry_state_handle, current_notify_interface_for_context,
-    current_object_data_cache_for_context, current_object_store_handle_for_context,
+    AppContext, current_app_context, current_notify_interface_for_context, current_object_data_cache_for_context,
+    current_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
@@ -749,53 +748,6 @@ fn tune_reader_stream_buffer_size(
     }
 
     selected_size
-}
-
-async fn enqueue_transitioned_delete_cleanup(
-    store: Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    opts: &ObjectOptions,
-    existing: Option<&ObjectInfo>,
-) -> std::io::Result<()> {
-    let Some(existing) = existing else {
-        return Ok(());
-    };
-    let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
-
-    let je = if opts.delete_prefix {
-        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object, existing.transition_version_state)
-    } else {
-        let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        tier_sweeper::transitioned_delete_journal_entry(
-            version_id,
-            opts.versioned,
-            opts.version_suspended,
-            &existing.transitioned_object,
-            existing.transition_version_state,
-        )
-    };
-    let Some(mut je) = je else {
-        return Ok(());
-    };
-
-    tier_delete_journal::record_tier_delete_journal_backend_identity(&mut je, &existing.user_defined)?;
-    tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
-
-    let expiry_state = current_expiry_state_handle();
-    let mut expiry_state = expiry_state.write().await;
-    if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je) {
-        warn!(
-            bucket,
-            object,
-            remote_object = %existing.transitioned_object.name,
-            remote_version_id = %existing.transitioned_object.version_id,
-            tier = %existing.transitioned_object.tier,
-            error = ?err,
-            "transitioned object cleanup journal persisted but was not queued"
-        );
-    }
-    Ok(())
 }
 
 pin_project! {
@@ -6932,7 +6884,7 @@ impl DefaultObjectUsecase {
         invalidate_object_data_cache_objects_before_mutation(&cache_adapter, &bucket, cache_keys_before_delete.iter()).await;
 
         let (dobjs, errs) = store
-            .delete_objects(
+            .delete_objects_with_tier_delete_journal(
                 &bucket,
                 object_to_delete.clone(),
                 ObjectOptions {
@@ -6969,27 +6921,6 @@ impl DefaultObjectUsecase {
             {
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
                 let (versioned, version_suspended) = object_versioning[i];
-                if let Err(err) = enqueue_transitioned_delete_cleanup(
-                    store.clone(),
-                    &bucket,
-                    &object_to_delete[i].object_name,
-                    &ObjectOptions {
-                        version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
-                        versioned,
-                        version_suspended,
-                        ..Default::default()
-                    },
-                    existing_object_infos[i].as_ref(),
-                )
-                .await
-                {
-                    warn!(
-                        bucket = %bucket,
-                        object = %object_to_delete[i].object_name,
-                        error = ?err,
-                        "failed to persist transitioned object cleanup journal"
-                    );
-                }
                 let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
                 if creates_delete_marker {
                     record_bucket_delete_marker_memory(&bucket).await;
@@ -7206,6 +7137,7 @@ impl DefaultObjectUsecase {
         opts.expected_current_version_id = expected_current_version_id.clone();
 
         let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
+        let mut force_delete_intent = None;
 
         // Check Object Lock retention before deletion
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
@@ -7245,10 +7177,36 @@ impl DefaultObjectUsecase {
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
         }
 
+        if replicate_force_delete
+            && let Some((target_arns, generation)) = force_delete_target_set(&delete_config_snapshot, &key)
+            && !target_arns.is_empty()
+        {
+            let operation_id =
+                persist_force_delete_intent(store.clone(), bucket.clone(), key.clone(), target_arns.clone(), generation)
+                    .await
+                    .map_err(ApiError::from)?;
+            force_delete_intent = Some((operation_id, target_arns, generation));
+        }
+
         let obj_info = {
-            match store.delete_object(&bucket, &key, opts.clone()).await {
+            match store
+                .delete_object_with_tier_delete_journal(&bucket, &key, opts.clone())
+                .await
+            {
                 Ok(obj) => obj,
                 Err(err) => {
+                    if let Some((operation_id, _, _)) = force_delete_intent.as_ref()
+                        && let Err(cleanup_error) =
+                            crate::storage::storage_api::complete_force_delete_intent(store.clone(), *operation_id).await
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %key,
+                            operation_id = %operation_id,
+                            error = %cleanup_error,
+                            "failed to remove uncommitted force-delete intent after local delete failure"
+                        );
+                    }
                     if is_err_bucket_not_found(&err) {
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
                     }
@@ -7263,16 +7221,6 @@ impl DefaultObjectUsecase {
             }
         };
 
-        if let Err(err) =
-            enqueue_transitioned_delete_cleanup(store.clone(), &bucket, &key, &opts, existing_object_info.as_ref()).await
-        {
-            warn!(
-                bucket = %bucket,
-                object = %key,
-                error = ?err,
-                "failed to persist transitioned object cleanup journal"
-            );
-        }
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
         } else {
@@ -7287,7 +7235,31 @@ impl DefaultObjectUsecase {
         }
 
         if obj_info.name.is_empty() {
-            if replicate_force_delete {
+            if let Some((operation_id, target_arns, generation)) = force_delete_intent {
+                if let Err(error) = commit_force_delete_intent(store.clone(), operation_id).await {
+                    warn!(
+                        bucket = %bucket,
+                        object = %key,
+                        operation_id = %operation_id,
+                        error = %error,
+                        "failed to mark force-delete intent committed after local delete"
+                    );
+                }
+                let generation = i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX);
+                schedule_replication_delete(
+                    StorageDeletedObject {
+                        object_name: key.clone(),
+                        force_delete: true,
+                        force_delete_id: Some(operation_id),
+                        force_delete_target_arns: target_arns,
+                        force_delete_generation: Some(generation),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                )
+                .await;
+            } else if replicate_force_delete {
                 let mut delete_object = StorageDeletedObject {
                     object_name: key.clone(),
                     force_delete: true,
@@ -9862,115 +9834,6 @@ mod tests {
         );
         assert!(context.object_data_cache().materialize_fill_enabled());
         (store, context)
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn transitioned_delete_cleanup_persists_known_state_and_rejects_unknown_state() {
-        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-        if current_app_context().is_none() {
-            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
-        }
-        let identity = [11_u8; 32];
-        let mut metadata = HashMap::new();
-        rustfs_utils::http::metadata_compat::insert_str(
-            &mut metadata,
-            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-            rustfs_utils::crypto::hex(identity),
-        );
-        let mut current = ObjectInfo {
-            user_defined: Arc::new(metadata),
-            ..Default::default()
-        };
-        current.transitioned_object.status = lifecycle::TRANSITION_COMPLETE.to_string();
-        current.transitioned_object.tier = "WARM".to_string();
-        current.transitioned_object.name = "remote/identity-bound".to_string();
-        current.transitioned_object.version_id = "remote-version".to_string();
-        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
-
-        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>, version_id_exact: bool| {
-            use sha2::{Digest, Sha256};
-
-            let mut hasher = Sha256::new();
-            hasher.update(b"WARM");
-            hasher.update([0]);
-            hasher.update(remote_object.as_bytes());
-            hasher.update([0]);
-            hasher.update(b"remote-version");
-            if let Some(backend_identity) = backend_identity {
-                hasher.update([0]);
-                hasher.update(backend_identity);
-            }
-            if version_id_exact {
-                hasher.update([0]);
-                hasher.update(b"exact-version-id");
-            }
-            format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
-        };
-
-        enqueue_transitioned_delete_cleanup(store.clone(), "bucket", "identity-bound", &ObjectOptions::default(), Some(&current))
-            .await
-            .expect("normal transitioned delete should persist an identity-bound journal");
-        let mut identity_bound = store
-            .get_object_reader(
-                ".rustfs.sys",
-                &journal_name("remote/identity-bound", Some(identity), true),
-                None,
-                http::HeaderMap::new(),
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("identity-bound journal should be readable");
-        let mut identity_bound_data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut identity_bound.stream, &mut identity_bound_data)
-            .await
-            .expect("identity-bound journal body should be readable");
-        let identity_bound: serde_json::Value =
-            serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
-        assert_eq!(identity_bound["version"], serde_json::json!(4));
-        assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
-        assert_eq!(identity_bound["version_id_exact"], serde_json::json!(true));
-        assert_eq!(identity_bound["version_state"], serde_json::json!("exact"));
-
-        current.user_defined = Arc::new(HashMap::new());
-        current.transitioned_object.name = "remote/legacy".to_string();
-        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
-        enqueue_transitioned_delete_cleanup(
-            store.clone(),
-            "bucket",
-            "legacy",
-            &ObjectOptions {
-                delete_prefix: true,
-                ..Default::default()
-            },
-            Some(&current),
-        )
-        .await
-        .expect("unknown force-delete cleanup should fail closed without a journal");
-        let legacy_err = match store
-            .get_object_reader(
-                ".rustfs.sys",
-                &journal_name("remote/legacy", None, false),
-                None,
-                http::HeaderMap::new(),
-                &ObjectOptions::default(),
-            )
-            .await
-        {
-            Ok(_) => panic!("unknown remote version state must not persist a delete journal"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(
-                &legacy_err,
-                StorageError::FileNotFound
-                    | StorageError::ObjectNotFound(_, _)
-                    | StorageError::FileVersionNotFound
-                    | StorageError::VersionNotFound(_, _, _)
-                    | StorageError::VolumeNotFound
-            ),
-            "unknown remote version state must leave no journal, got {legacy_err:?}"
-        );
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {

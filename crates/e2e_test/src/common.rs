@@ -50,6 +50,21 @@ pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
 
+fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
+    let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
+    Some(log_dir.join(format!("{temp_name}.log")))
+}
+
+fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
+    let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR")?;
+    if stdfs::create_dir_all(&log_dir).is_err() {
+        warn!(?log_dir, "failed to create configured E2E server log directory");
+        return None;
+    }
+
+    capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
+}
+
 fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
     let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
     let mut config = Config::builder()
@@ -361,6 +376,7 @@ impl RustFSTestEnvironment {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = format!("/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
+        let capture_log_path = configured_capture_log_path(&temp_dir);
 
         // Use a unique port for each test environment
         let port = Self::find_available_port().await?;
@@ -374,7 +390,7 @@ impl RustFSTestEnvironment {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
-            capture_log_path: None,
+            capture_log_path,
         })
     }
 
@@ -382,6 +398,7 @@ impl RustFSTestEnvironment {
     pub async fn with_address(address: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = format!("/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
+        let capture_log_path = configured_capture_log_path(&temp_dir);
 
         let url = format!("http://{address}");
 
@@ -392,7 +409,7 @@ impl RustFSTestEnvironment {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
-            capture_log_path: None,
+            capture_log_path,
         })
     }
 
@@ -1390,6 +1407,14 @@ mod tests {
             Some("sftp,ftps,webdav".to_string())
         );
         assert_eq!(normalize_rustfs_build_features(" , "), None);
+    }
+
+    #[test]
+    fn capture_log_path_uses_temp_directory_basename() {
+        assert_eq!(
+            capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
+            Some(PathBuf::from("/tmp/e2e-logs/rustfs_e2e_test_abc.log"))
+        );
     }
 
     #[test]

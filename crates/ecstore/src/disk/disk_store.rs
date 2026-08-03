@@ -27,15 +27,17 @@ use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_madmin::{info_commands::DiskMetrics, metrics::TimedAction};
 #[cfg(not(test))]
 use std::sync::OnceLock;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, LazyLock, RwLock as StdRwLock,
         atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
@@ -55,6 +57,13 @@ const EVENT_DISK_TIMEOUT_POLICY_FALLBACK: &str = "disk_timeout_policy_fallback";
 enum TimeoutHealthAction {
     MarkFailure,
     IgnoreFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiskMetricMutation {
+    None,
+    Write,
+    Delete,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +113,56 @@ impl DriveTimeoutProfile {
 static DRIVE_TIMEOUT_PROFILE_CACHE: OnceLock<DriveTimeoutProfile> = OnceLock::new();
 #[cfg(not(test))]
 static DRIVE_TIMEOUT_HEALTH_POLICY_CACHE: OnceLock<TimeoutHealthPolicy> = OnceLock::new();
+
+const DISK_OPERATION_NAMES: &[&str] = &[
+    "read_metadata",
+    "disk_info",
+    "make_volume",
+    "make_volumes",
+    "list_volumes",
+    "stat_volume",
+    "delete_volume",
+    "walk_dir",
+    "delete_version",
+    "delete_versions",
+    "delete_paths",
+    "acquire_snapshot_lease",
+    "release_snapshot_lease",
+    "renew_snapshot_lease",
+    "delete_data_dir",
+    "write_metadata",
+    "update_metadata",
+    "read_version",
+    "read_xl",
+    "rename_data",
+    "list_dir",
+    "read_file",
+    "read_file_stream",
+    "read_file_mmap_copy",
+    "read_file_mmap_copy_with_metrics",
+    "append_file",
+    "create_file",
+    "rename_file",
+    "rename_part",
+    "prepare_part_transaction",
+    "settle_part_transaction",
+    "delete",
+    "verify_file",
+    "check_parts",
+    "read_parts",
+    "read_multiple",
+    "write_all",
+    "read_all",
+];
+
+static DISK_OPERATION_INDEX: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
+    DISK_OPERATION_NAMES
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, name)| (name, index))
+        .collect()
+});
 
 lazy_static::lazy_static! {
     static ref TEST_DATA: Bytes = Bytes::from(vec![42u8; 2048]);
@@ -326,6 +385,286 @@ pub struct DiskHealthTracker {
     pub last_capacity_probe_unix_secs: AtomicI64,
 }
 
+#[derive(Debug)]
+pub(crate) struct DiskHealthMetricEpoch {
+    /// Preallocated per-operation metrics for built-in disk operation names.
+    operation_metrics: Box<[DiskOperationMetricEntry]>,
+    /// Fallback for tests or future extension operations outside DISK_OPERATION_NAMES.
+    fallback_operation_metrics: StdRwLock<HashMap<&'static str, Arc<DiskOperationMetrics>>>,
+    /// Caller API operations currently executing through the disk health wrapper.
+    api_waiting: AtomicU32,
+    /// Operations rejected because the disk was unavailable for the caller.
+    total_errors_availability: AtomicU64,
+    /// Operations that timed out in the disk health wrapper.
+    total_errors_timeout: AtomicU64,
+    /// Completed disk write mutations.
+    total_writes: AtomicU64,
+    /// Completed disk delete mutations.
+    total_deletes: AtomicU64,
+}
+
+impl Default for DiskHealthMetricEpoch {
+    fn default() -> Self {
+        Self {
+            operation_metrics: DISK_OPERATION_NAMES
+                .iter()
+                .copied()
+                .map(|name| DiskOperationMetricEntry {
+                    name,
+                    metrics: DiskOperationMetrics::default(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            fallback_operation_metrics: StdRwLock::new(HashMap::new()),
+            api_waiting: AtomicU32::new(0),
+            total_errors_availability: AtomicU64::new(0),
+            total_errors_timeout: AtomicU64::new(0),
+            total_writes: AtomicU64::new(0),
+            total_deletes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl DiskHealthMetricEpoch {
+    fn fallback_operation_metrics_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<&'static str, Arc<DiskOperationMetrics>>> {
+        self.fallback_operation_metrics
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn fallback_operation_metrics_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<&'static str, Arc<DiskOperationMetrics>>> {
+        self.fallback_operation_metrics
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn predefined_operation_metric(&self, op: &'static str) -> Option<&DiskOperationMetrics> {
+        DISK_OPERATION_INDEX
+            .get(op)
+            .and_then(|index| self.operation_metrics.get(*index))
+            .map(|entry| &entry.metrics)
+    }
+
+    fn fallback_operation_metric(&self, op: &'static str) -> Arc<DiskOperationMetrics> {
+        if let Some(metrics) = self.fallback_operation_metrics_read().get(op).cloned() {
+            return metrics;
+        }
+
+        let mut operation_metrics = self.fallback_operation_metrics_write();
+        operation_metrics.entry(op).or_default().clone()
+    }
+
+    fn record_operation_call(&self, op: &'static str) {
+        if let Some(metrics) = self.predefined_operation_metric(op) {
+            metrics.record_call_atomic();
+        } else {
+            self.fallback_operation_metric(op).record_call_atomic();
+        }
+    }
+
+    fn record_operation_latency(&self, op: &'static str, elapsed: Duration) {
+        let now_sec = current_unix_secs();
+        if let Some(metrics) = self.predefined_operation_metric(op) {
+            metrics.record_latency_atomic(now_sec, elapsed);
+        } else {
+            self.fallback_operation_metric(op).record_latency_atomic(now_sec, elapsed);
+        }
+    }
+
+    fn record_availability_error(&self) {
+        self.total_errors_availability.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_timeout_error(&self) {
+        self.total_errors_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_mutation_success(&self, mutation: DiskMetricMutation) {
+        match mutation {
+            DiskMetricMutation::None => {}
+            DiskMetricMutation::Write => {
+                self.total_writes.fetch_add(1, Ordering::Relaxed);
+            }
+            DiskMetricMutation::Delete => {
+                self.total_deletes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn waiting_guard(&self) -> DiskMetricWaitingGuard<'_> {
+        self.api_waiting.fetch_add(1, Ordering::Relaxed);
+        DiskMetricWaitingGuard { metrics: self }
+    }
+
+    fn waiting_count(&self) -> u32 {
+        self.api_waiting.load(Ordering::Relaxed)
+    }
+
+    fn metrics_snapshot(&self) -> DiskMetrics {
+        let now_sec = current_unix_secs();
+        let fallback_operation_metrics = self.fallback_operation_metrics_read();
+        let mut last_minute = HashMap::with_capacity(self.operation_metrics.len() + fallback_operation_metrics.len());
+        let mut api_calls = HashMap::with_capacity(self.operation_metrics.len() + fallback_operation_metrics.len());
+        for entry in self.operation_metrics.iter() {
+            Self::insert_operation_snapshot(entry.name, &entry.metrics, now_sec, &mut last_minute, &mut api_calls);
+        }
+        for (op, action) in fallback_operation_metrics.iter() {
+            Self::insert_operation_snapshot(op, action, now_sec, &mut last_minute, &mut api_calls);
+        }
+
+        DiskMetrics {
+            last_minute,
+            api_calls,
+            total_waiting: self.waiting_count(),
+            total_errors_availability: self.total_errors_availability.load(Ordering::Relaxed),
+            total_errors_timeout: self.total_errors_timeout.load(Ordering::Relaxed),
+            total_writes: self.total_writes.load(Ordering::Relaxed),
+            total_deletes: self.total_deletes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn insert_operation_snapshot(
+        op: &str,
+        action: &DiskOperationMetrics,
+        now_sec: u64,
+        last_minute: &mut HashMap<String, TimedAction>,
+        api_calls: &mut HashMap<String, u64>,
+    ) {
+        let lifetime_calls = action.lifetime_calls.load(Ordering::Relaxed);
+        if lifetime_calls > 0 {
+            last_minute.insert(op.to_string(), action.last_minute_snapshot(now_sec));
+            api_calls.insert(op.to_string(), lifetime_calls);
+        }
+    }
+}
+
+struct DiskMetricWaitingGuard<'a> {
+    metrics: &'a DiskHealthMetricEpoch,
+}
+
+impl Drop for DiskMetricWaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.api_waiting.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReconnectDiskHealthState {
+    pub(crate) health: Arc<DiskHealthTracker>,
+    pub(crate) metrics: Arc<DiskHealthMetricEpoch>,
+}
+
+#[derive(Debug)]
+struct DiskOperationMetricEntry {
+    name: &'static str,
+    metrics: DiskOperationMetrics,
+}
+
+#[derive(Debug)]
+struct TimedActionSlot {
+    version: AtomicU64,
+    unix_sec: AtomicU64,
+    count: AtomicU64,
+    acc_time: AtomicU64,
+}
+
+impl Default for TimedActionSlot {
+    fn default() -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            unix_sec: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            acc_time: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DiskOperationMetrics {
+    lifetime_calls: AtomicU64,
+    last_minute: Box<[TimedActionSlot]>,
+}
+
+impl Default for DiskOperationMetrics {
+    fn default() -> Self {
+        Self {
+            lifetime_calls: AtomicU64::new(0),
+            last_minute: std::iter::repeat_with(TimedActionSlot::default)
+                .take(60)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+}
+
+impl DiskOperationMetrics {
+    fn record_call(&mut self) {
+        self.lifetime_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_latency(&mut self, now_sec: u64, elapsed: Duration) {
+        self.record_latency_atomic(now_sec, elapsed);
+    }
+
+    fn record(&mut self, now_sec: u64, elapsed: Duration) {
+        self.record_call();
+        self.record_latency(now_sec, elapsed);
+    }
+
+    fn record_call_atomic(&self) {
+        self.lifetime_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_latency_atomic(&self, now_sec: u64, elapsed: Duration) {
+        let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let slot = &self.last_minute[(now_sec % 60) as usize];
+        loop {
+            let version = slot.version.load(Ordering::Acquire);
+            if !version.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            if slot
+                .version
+                .compare_exchange(version, version.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if slot.unix_sec.load(Ordering::Acquire) != now_sec {
+                    slot.count.store(0, Ordering::Relaxed);
+                    slot.acc_time.store(0, Ordering::Relaxed);
+                    slot.unix_sec.store(now_sec, Ordering::Release);
+                }
+                slot.count.fetch_add(1, Ordering::Relaxed);
+                slot.acc_time.fetch_add(elapsed_nanos, Ordering::Relaxed);
+                slot.version.store(version.wrapping_add(2), Ordering::Release);
+                break;
+            }
+        }
+    }
+
+    fn last_minute_snapshot(&self, now_sec: u64) -> TimedAction {
+        let mut snapshot = TimedAction::default();
+        for slot in &self.last_minute {
+            let version = slot.version.load(Ordering::Acquire);
+            if !version.is_multiple_of(2) {
+                continue;
+            }
+            let slot_sec = slot.unix_sec.load(Ordering::Acquire);
+            let count = slot.count.load(Ordering::Acquire);
+            let acc_time = slot.acc_time.load(Ordering::Acquire);
+            if slot.version.load(Ordering::Acquire) == version && slot_sec <= now_sec && now_sec.saturating_sub(slot_sec) < 60 {
+                snapshot.count = snapshot.count.saturating_add(count);
+                snapshot.acc_time = snapshot.acc_time.saturating_add(acc_time);
+            }
+        }
+        snapshot
+    }
+}
+
 pub(crate) struct DiskHealthWaitingGuard<'a> {
     health: &'a DiskHealthTracker,
 }
@@ -370,6 +709,10 @@ impl DiskHealthTracker {
         self.last_capacity_free.store(free, Ordering::Release);
         self.last_capacity_probe_unix_secs
             .store(current_unix_secs() as i64, Ordering::Release);
+    }
+
+    pub(crate) fn metric_epoch_for_reconnect(&self) -> Self {
+        Self::new()
     }
 
     pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
@@ -671,6 +1014,8 @@ pub struct LocalDiskWrapper {
     disk: Arc<LocalDisk>,
     /// Health tracker
     health: Arc<DiskHealthTracker>,
+    /// Internal metrics epoch preserved across local disk reconnects.
+    metrics: Arc<DiskHealthMetricEpoch>,
     /// Whether health checking is enabled
     health_check: bool,
     /// Cancellation token for monitoring tasks
@@ -684,6 +1029,36 @@ pub struct LocalDiskWrapper {
 impl LocalDiskWrapper {
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
+        Self::new_with_health_and_metrics(
+            disk,
+            health_check,
+            Arc::new(DiskHealthTracker::new()),
+            Arc::new(DiskHealthMetricEpoch::default()),
+        )
+    }
+
+    pub(crate) fn new_with_health(disk: Arc<LocalDisk>, health_check: bool, health: Arc<DiskHealthTracker>) -> Self {
+        Self::new_with_health_and_metrics(disk, health_check, health, Arc::new(DiskHealthMetricEpoch::default()))
+    }
+
+    pub(crate) fn new_with_reconnect_state(
+        disk: Arc<LocalDisk>,
+        health_check: bool,
+        reconnect: Option<ReconnectDiskHealthState>,
+    ) -> Self {
+        let reconnect = reconnect.unwrap_or_else(|| ReconnectDiskHealthState {
+            health: Arc::new(DiskHealthTracker::new()),
+            metrics: Arc::new(DiskHealthMetricEpoch::default()),
+        });
+        Self::new_with_health_and_metrics(disk, health_check, reconnect.health, reconnect.metrics)
+    }
+
+    fn new_with_health_and_metrics(
+        disk: Arc<LocalDisk>,
+        health_check: bool,
+        health: Arc<DiskHealthTracker>,
+        metrics: Arc<DiskHealthMetricEpoch>,
+    ) -> Self {
         // Check environment variable for health check override.
         // Only enable if both param and env are true.
         let env_health_check =
@@ -691,7 +1066,8 @@ impl LocalDiskWrapper {
 
         let wrapper = Self {
             disk,
-            health: Arc::new(DiskHealthTracker::new()),
+            health,
+            metrics,
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
@@ -699,6 +1075,13 @@ impl LocalDiskWrapper {
         };
         record_drive_runtime_state(&wrapper.disk.endpoint(), RuntimeDriveHealthState::Online);
         wrapper
+    }
+
+    pub(crate) fn health_tracker_epoch_for_reconnect(&self) -> ReconnectDiskHealthState {
+        ReconnectDiskHealthState {
+            health: Arc::new(self.health.metric_epoch_for_reconnect()),
+            metrics: self.metrics.clone(),
+        }
     }
 
     pub fn get_disk(&self) -> Arc<LocalDisk> {
@@ -1053,6 +1436,38 @@ impl LocalDiskWrapper {
         *self.disk_id.write().await = id;
     }
 
+    pub(crate) fn metrics_snapshot(&self) -> DiskMetrics {
+        self.metrics.metrics_snapshot()
+    }
+
+    fn record_result_error_metrics<T>(&self, result: &Result<T>) {
+        match result {
+            Err(DiskError::Timeout) => self.metrics.record_timeout_error(),
+            Err(DiskError::FaultyDisk | DiskError::FaultyRemoteDisk | DiskError::DiskNotFound) => {
+                self.metrics.record_availability_error();
+            }
+            _ => {}
+        }
+    }
+
+    fn record_batch_delete_error_metrics(&self, result: &[Option<Error>]) {
+        let mut saw_timeout = false;
+        let mut saw_availability = false;
+        for error in result.iter().flatten() {
+            match error {
+                DiskError::Timeout => saw_timeout = true,
+                DiskError::FaultyDisk | DiskError::FaultyRemoteDisk | DiskError::DiskNotFound => saw_availability = true,
+                _ => {}
+            }
+        }
+        if saw_timeout {
+            self.metrics.record_timeout_error();
+        }
+        if saw_availability {
+            self.metrics.record_availability_error();
+        }
+    }
+
     /// Get the current disk ID
     pub async fn get_current_disk_id(&self) -> Option<Uuid> {
         *self.disk_id.read().await
@@ -1066,6 +1481,27 @@ impl LocalDiskWrapper {
         Fut: std::future::Future<Output = Result<T>>,
     {
         self.track_disk_health_with_op("unknown", operation, timeout_duration).await
+    }
+
+    async fn track_disk_health_mutation<T, F, Fut>(
+        &self,
+        op: &'static str,
+        mutation: DiskMetricMutation,
+        operation: F,
+        timeout_duration: Duration,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.track_disk_health_with_op_timeout_action_and_mutation(
+            op,
+            operation,
+            timeout_duration,
+            TimeoutHealthAction::MarkFailure,
+            mutation,
+        )
+        .await
     }
 
     pub async fn track_disk_health_with_op<T, F, Fut>(
@@ -1093,8 +1529,31 @@ impl LocalDiskWrapper {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.track_disk_health_with_op_timeout_action_and_mutation(
+            op,
+            operation,
+            timeout_duration,
+            timeout_health_action,
+            DiskMetricMutation::None,
+        )
+        .await
+    }
+
+    async fn track_disk_health_with_op_timeout_action_and_mutation<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        timeout_health_action: TimeoutHealthAction,
+        mutation: DiskMetricMutation,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // Check if disk is faulty
         if self.health.is_faulty() {
+            self.metrics.record_availability_error();
             warn!(
                 event = EVENT_DISK_HEALTH_CHECK_FAILED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1107,16 +1566,25 @@ impl LocalDiskWrapper {
         }
 
         // Check if disk is stale
-        self.check_disk_stale().await?;
+        if let Err(err) = self.check_disk_stale().await {
+            self.metrics.record_availability_error();
+            return Err(err);
+        }
 
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         let _waiting_guard = self.health.waiting_guard();
+        let _metric_waiting_guard = self.metrics.waiting_guard();
+        self.metrics.record_operation_call(op);
+        let started = Instant::now();
 
         if timeout_duration == Duration::ZERO {
             let result = operation().await;
+            self.metrics.record_operation_latency(op, started.elapsed());
+            self.record_result_error_metrics(&result);
             if result.is_ok() {
                 self.health.record_operation_success(&self.endpoint(), "operation_success");
+                self.metrics.record_mutation_success(mutation);
             }
             return result;
         }
@@ -1125,13 +1593,18 @@ impl LocalDiskWrapper {
 
         match result {
             Ok(operation_result) => {
+                self.metrics.record_operation_latency(op, started.elapsed());
+                self.record_result_error_metrics(&operation_result);
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.record_operation_success(&self.endpoint(), "operation_success");
+                    self.metrics.record_mutation_success(mutation);
                 }
                 operation_result
             }
             Err(_) => {
+                self.metrics.record_operation_latency(op, started.elapsed());
+                self.metrics.record_timeout_error();
                 // Timeout occurred, mark disk as potentially faulty.
                 if timeout_health_action == TimeoutHealthAction::MarkFailure
                     && self.health.mark_failure(&self.endpoint(), "operation_timeout")
@@ -1231,46 +1704,67 @@ impl DiskAPI for LocalDiskWrapper {
 
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
         if opts.noop && opts.metrics {
-            let mut info = DiskInfo::default();
-            // Add health metrics
-            info.metrics.total_waiting = self.health.waiting_count();
+            let info = DiskInfo {
+                metrics: self.metrics_snapshot(),
+                ..Default::default()
+            };
             if self.health.is_faulty() {
+                self.metrics.record_availability_error();
                 return Err(DiskError::FaultyDisk);
             }
             return Ok(info);
         }
 
         if self.health.is_faulty() {
+            self.metrics.record_availability_error();
             return Err(DiskError::FaultyDisk);
         }
 
-        self.track_disk_health_with_op_and_timeout_action(
-            "disk_info",
-            || async {
-                let result = self.disk.disk_info(opts).await?;
+        let result = self
+            .track_disk_health_with_op_and_timeout_action(
+                "disk_info",
+                || async {
+                    let result = self.disk.disk_info(opts).await?;
 
-                if let Some(current_disk_id) = *self.disk_id.read().await
-                    && Some(current_disk_id) != result.id
-                {
-                    return Err(DiskError::DiskNotFound);
-                };
+                    if let Some(current_disk_id) = *self.disk_id.read().await
+                        && Some(current_disk_id) != result.id
+                    {
+                        return Err(DiskError::DiskNotFound);
+                    };
 
-                Ok(result)
-            },
-            get_drive_disk_info_timeout(),
-            self.scanner_timeout_health_action(),
+                    Ok(result)
+                },
+                get_drive_disk_info_timeout(),
+                self.scanner_timeout_health_action(),
+            )
+            .await;
+
+        result.map(|mut info| {
+            if opts.metrics {
+                info.metrics = self.metrics_snapshot();
+            }
+            info
+        })
+    }
+
+    async fn make_volume(&self, volume: &str) -> Result<()> {
+        self.track_disk_health_mutation(
+            "make_volume",
+            DiskMetricMutation::Write,
+            || async { self.disk.make_volume(volume).await },
+            get_max_timeout_duration(),
         )
         .await
     }
 
-    async fn make_volume(&self, volume: &str) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.make_volume(volume).await }, get_max_timeout_duration())
-            .await
-    }
-
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.make_volumes(volumes).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_mutation(
+            "make_volumes",
+            DiskMetricMutation::Write,
+            || async { self.disk.make_volumes(volumes).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
@@ -1279,13 +1773,22 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        self.track_disk_health(|| async { self.disk.stat_volume(volume).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_with_op(
+            "stat_volume",
+            || async { self.disk.stat_volume(volume).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete_volume(volume, force_delete).await }, Duration::ZERO)
-            .await
+        self.track_disk_health_mutation(
+            "delete_volume",
+            DiskMetricMutation::Delete,
+            || async { self.disk.delete_volume(volume, force_delete).await },
+            Duration::ZERO,
+        )
+        .await
     }
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
@@ -1313,7 +1816,9 @@ impl DiskAPI for LocalDiskWrapper {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
             || async { self.disk.delete_version(volume, path, fi, force_del_marker, opts).await },
             get_max_timeout_duration(),
         )
@@ -1323,38 +1828,53 @@ impl DiskAPI for LocalDiskWrapper {
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         // Check if disk is faulty before proceeding
         if self.health.is_faulty() {
+            self.metrics.record_availability_error();
             return vec![Some(DiskError::FaultyDisk); versions.len()];
         }
 
         // Check if disk is stale
         if let Err(e) = self.check_disk_stale().await {
+            self.metrics.record_availability_error();
             return vec![Some(e); versions.len()];
         }
 
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         self.health.increment_waiting();
+        let metric_waiting_guard = self.metrics.waiting_guard();
+        self.metrics.record_operation_call("delete_versions");
+        let started = Instant::now();
 
         // Execute the operation
         let result = self.disk.delete_versions(volume, versions, opts).await;
+        self.metrics.record_operation_latency("delete_versions", started.elapsed());
+        self.record_batch_delete_error_metrics(&result);
 
         self.health.decrement_waiting();
+        drop(metric_waiting_guard);
         let has_err = result.iter().any(|e| e.is_some());
         if !has_err {
             // Log success and decrement waiting counter
             self.health.record_operation_success(&self.endpoint(), "operation_success");
+            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
         }
 
         result
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete_paths(volume, paths).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_mutation(
+            "delete_paths",
+            DiskMetricMutation::Delete,
+            || async { self.disk.delete_paths(volume, paths).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "acquire_snapshot_lease",
             || async { self.disk.acquire_snapshot_lease(volume, path).await },
             get_max_timeout_duration(),
         )
@@ -1362,7 +1882,8 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "release_snapshot_lease",
             || async { self.disk.release_snapshot_lease(volume, path, token).await },
             get_max_timeout_duration(),
         )
@@ -1370,7 +1891,8 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "renew_snapshot_lease",
             || async { self.disk.renew_snapshot_lease(volume, path, token).await },
             get_max_timeout_duration(),
         )
@@ -1378,7 +1900,9 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "delete_data_dir",
+            DiskMetricMutation::Delete,
             || async { self.disk.delete_data_dir(volume, path, opts).await },
             get_max_timeout_duration(),
         )
@@ -1386,7 +1910,9 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "write_metadata",
+            DiskMetricMutation::Write,
             || async { self.disk.write_metadata(org_volume, volume, path, fi).await },
             get_max_timeout_duration(),
         )
@@ -1394,7 +1920,9 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "update_metadata",
+            DiskMetricMutation::Write,
             || async { self.disk.update_metadata(volume, path, fi, opts).await },
             get_max_timeout_duration(),
         )
@@ -1409,7 +1937,8 @@ impl DiskAPI for LocalDiskWrapper {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_version",
             || async { self.disk.read_version(org_volume, volume, path, version_id, opts).await },
             get_max_timeout_duration(),
         )
@@ -1417,8 +1946,12 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
-        self.track_disk_health(|| async { self.disk.read_xl(volume, path, read_data).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_with_op(
+            "read_xl",
+            || async { self.disk.read_xl(volume, path, read_data).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn rename_data(
@@ -1429,8 +1962,9 @@ impl DiskAPI for LocalDiskWrapper {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.track_disk_health_with_op(
+        self.track_disk_health_mutation(
             "rename_data",
+            DiskMetricMutation::Write,
             || async { self.disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await },
             get_max_timeout_duration(),
         )
@@ -1448,12 +1982,17 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<crate::disk::FileReader> {
-        self.track_disk_health(|| async { self.disk.read_file(volume, path).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_with_op(
+            "read_file",
+            || async { self.disk.read_file(volume, path).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<crate::disk::FileReader> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_file_stream",
             || async { self.disk.read_file_stream(volume, path, offset, length).await },
             get_max_timeout_duration(),
         )
@@ -1461,7 +2000,8 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_file_mmap_copy",
             || async { self.disk.read_file_mmap_copy(volume, path, offset, length).await },
             get_max_timeout_duration(),
         )
@@ -1476,7 +2016,8 @@ impl DiskAPI for LocalDiskWrapper {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<bytes::Bytes> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_file_mmap_copy_with_metrics",
             || async {
                 self.disk
                     .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
@@ -1488,12 +2029,14 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<crate::disk::FileWriter> {
-        self.track_disk_health(|| async { self.disk.append_file(volume, path).await }, Duration::ZERO)
+        self.track_disk_health_with_op("append_file", || async { self.disk.append_file(volume, path).await }, Duration::ZERO)
             .await
     }
 
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<crate::disk::FileWriter> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "create_file",
+            DiskMetricMutation::Write,
             || async { self.disk.create_file(origvolume, volume, path, file_size).await },
             Duration::ZERO,
         )
@@ -1501,7 +2044,9 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "rename_file",
+            DiskMetricMutation::Write,
             || async { self.disk.rename_file(src_volume, src_path, dst_volume, dst_path).await },
             get_max_timeout_duration(),
         )
@@ -1509,7 +2054,9 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "rename_part",
+            DiskMetricMutation::Write,
             || async { self.disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await },
             get_max_timeout_duration(),
         )
@@ -1524,7 +2071,9 @@ impl DiskAPI for LocalDiskWrapper {
         dst_path: &str,
         meta: Bytes,
     ) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "prepare_part_transaction",
+            DiskMetricMutation::Write,
             || async {
                 self.disk
                     .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
@@ -1536,7 +2085,9 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: crate::disk::PartTransactionAction) -> Result<()> {
-        self.track_disk_health(
+        self.track_disk_health_mutation(
+            "settle_part_transaction",
+            DiskMetricMutation::Write,
             || async { self.disk.settle_part_transaction(volume, path, action).await },
             get_max_timeout_duration(),
         )
@@ -1544,38 +2095,52 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete(volume, path, opt).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_mutation(
+            "delete",
+            DiskMetricMutation::Delete,
+            || async { self.disk.delete(volume, path, opt).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        self.track_disk_health(|| async { self.disk.verify_file(volume, path, fi).await }, Duration::ZERO)
+        self.track_disk_health_with_op("verify_file", || async { self.disk.verify_file(volume, path, fi).await }, Duration::ZERO)
             .await
     }
 
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        self.track_disk_health(|| async { self.disk.check_parts(volume, path, fi).await }, Duration::ZERO)
+        self.track_disk_health_with_op("check_parts", || async { self.disk.check_parts(volume, path, fi).await }, Duration::ZERO)
             .await
     }
 
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        self.track_disk_health(|| async { self.disk.read_parts(bucket, paths).await }, Duration::ZERO)
+        self.track_disk_health_with_op("read_parts", || async { self.disk.read_parts(bucket, paths).await }, Duration::ZERO)
             .await
     }
 
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
-        self.track_disk_health(|| async { self.disk.read_multiple(req).await }, Duration::ZERO)
+        self.track_disk_health_with_op("read_multiple", || async { self.disk.read_multiple(req).await }, Duration::ZERO)
             .await
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.write_all(volume, path, data).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_mutation(
+            "write_all",
+            DiskMetricMutation::Write,
+            || async { self.disk.write_all(volume, path, data).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
-        self.track_disk_health(|| async { self.disk.read_all(volume, path).await }, get_max_timeout_duration())
-            .await
+        self.track_disk_health_with_op(
+            "read_all",
+            || async { self.disk.read_all(volume, path).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 }
 
@@ -1586,6 +2151,7 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use std::{
         io,
+        panic::{AssertUnwindSafe, catch_unwind},
         pin::Pin,
         task::{Context, Poll},
     };
@@ -1603,6 +2169,106 @@ mod tests {
         assert_eq!(health.waiting_count(), 0);
     }
 
+    #[test]
+    fn disk_operation_metrics_keep_lifetime_calls_separate_from_last_minute_latency() {
+        let mut metrics = DiskOperationMetrics::default();
+        metrics.record(10, Duration::from_micros(5));
+        metrics.record(69, Duration::from_micros(7));
+        metrics.record(70, Duration::from_micros(11));
+
+        assert_eq!(metrics.lifetime_calls.load(Ordering::Relaxed), 3);
+
+        let window = metrics.last_minute_snapshot(70);
+        assert_eq!(window.count, 2);
+        assert_eq!(window.acc_time, 18_000);
+    }
+
+    #[test]
+    fn disk_health_metrics_snapshot_exports_waiting_errors_and_operation_windows() {
+        let metrics = DiskHealthMetricEpoch::default();
+        metrics.record_operation_call("read_all");
+        metrics.record_operation_latency("read_all", Duration::from_micros(13));
+        metrics.record_availability_error();
+        metrics.record_timeout_error();
+        {
+            let _guard = metrics.waiting_guard();
+            let snapshot = metrics.metrics_snapshot();
+            assert_eq!(snapshot.total_waiting, 1);
+            assert_eq!(snapshot.total_errors_availability, 1);
+            assert_eq!(snapshot.total_errors_timeout, 1);
+            assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
+            assert_eq!(snapshot.last_minute.get("read_all").map(|action| action.count), Some(1));
+        }
+    }
+
+    #[test]
+    fn disk_health_metrics_snapshot_excludes_recovery_monitor_waiting() {
+        let health = DiskHealthTracker::new();
+        let metrics = DiskHealthMetricEpoch::default();
+
+        health.increment_waiting();
+        let snapshot = metrics.metrics_snapshot();
+
+        assert_eq!(health.waiting_count(), 1);
+        assert_eq!(snapshot.total_waiting, 0);
+    }
+
+    #[test]
+    fn disk_health_metrics_snapshot_keeps_expired_operation_windows() {
+        let epoch = DiskHealthMetricEpoch::default();
+        let metrics = epoch
+            .predefined_operation_metric("read_all")
+            .expect("read_all should have a preallocated metrics slot");
+        metrics.record_call_atomic();
+        metrics.record_latency_atomic(current_unix_secs().saturating_sub(60), Duration::from_micros(13));
+
+        let snapshot = epoch.metrics_snapshot();
+
+        assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
+        assert_eq!(snapshot.last_minute.get("read_all").map(|action| action.count), Some(0));
+    }
+
+    #[test]
+    fn disk_metric_epoch_recovers_poisoned_map_lock() {
+        let epoch = DiskHealthMetricEpoch::default();
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = epoch
+                .fallback_operation_metrics
+                .write()
+                .expect("test should lock fallback operation metrics");
+            panic!("poison disk operation metrics lock");
+        }));
+
+        assert!(panic_result.is_err());
+        epoch.record_operation_call("custom_test_op");
+        epoch.record_operation_latency("custom_test_op", Duration::from_micros(13));
+        let snapshot = epoch.metrics_snapshot();
+
+        assert_eq!(snapshot.api_calls.get("custom_test_op"), Some(&1));
+    }
+
+    #[test]
+    fn reconnect_health_tracker_shares_metric_epoch_without_health_state() {
+        let health = DiskHealthTracker::new();
+        let metrics = Arc::new(DiskHealthMetricEpoch::default());
+        metrics.record_operation_call("read_all");
+        metrics.record_availability_error();
+        health.set_faulty();
+
+        let reconnect = ReconnectDiskHealthState {
+            health: Arc::new(health.metric_epoch_for_reconnect()),
+            metrics: metrics.clone(),
+        };
+        metrics.record_operation_call("read_all");
+        reconnect.metrics.record_timeout_error();
+
+        assert!(!reconnect.health.is_faulty());
+        let snapshot = reconnect.metrics.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("read_all"), Some(&2));
+        assert_eq!(snapshot.total_errors_availability, 1);
+        assert_eq!(snapshot.total_errors_timeout, 1);
+    }
+
     #[tokio::test]
     async fn local_disk_health_wrapper_balances_task_cancellation() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -1613,7 +2279,11 @@ mod tests {
         let task_wrapper = Arc::clone(&wrapper);
         let task = tokio::spawn(async move {
             task_wrapper
-                .track_disk_health(|| async { std::future::pending::<Result<()>>().await }, Duration::ZERO)
+                .track_disk_health_with_op(
+                    "test_pending",
+                    || async { std::future::pending::<Result<()>>().await },
+                    Duration::ZERO,
+                )
                 .await
         });
 
@@ -1628,6 +2298,151 @@ mod tests {
         let _ = task.await;
 
         assert_eq!(wrapper.health.waiting_count(), 0);
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("test_pending"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn local_disk_health_wrapper_preserves_legacy_call_shape() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        wrapper
+            .track_disk_health(|| async { Ok(()) }, Duration::ZERO)
+            .await
+            .expect("legacy health wrapper call should succeed");
+
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("unknown"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn local_disk_health_wrapper_counts_returned_availability_errors() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        let err = wrapper
+            .track_disk_health_with_op("read_all", || async { Err::<(), DiskError>(DiskError::DiskNotFound) }, Duration::ZERO)
+            .await
+            .expect_err("returned availability error should propagate");
+
+        assert_eq!(err, DiskError::DiskNotFound);
+        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_versions_counts_returned_batch_error_classes() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        wrapper.record_batch_delete_error_metrics(&[
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FaultyDisk),
+            Some(DiskError::Timeout),
+            None,
+        ]);
+        let snapshot = wrapper.metrics_snapshot();
+
+        assert_eq!(snapshot.total_errors_availability, 1);
+        assert_eq!(snapshot.total_errors_timeout, 1);
+    }
+
+    #[tokio::test]
+    async fn local_disk_metrics_count_successful_write_and_delete_mutations() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        wrapper.make_volume("bucket").await.expect("volume should be created");
+        wrapper
+            .write_all("bucket", "object", Bytes::from_static(b"data"))
+            .await
+            .expect("object should be written");
+        wrapper
+            .delete("bucket", "object", DeleteOptions::default())
+            .await
+            .expect("object should be deleted");
+
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.total_writes, 2);
+        assert_eq!(snapshot.total_deletes, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_versions_counts_faulty_drive_availability_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let result = wrapper
+            .delete_versions("bucket", vec![FileInfoVersions::default()], DeleteOptions::default())
+            .await;
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result.first(), Some(Some(DiskError::FaultyDisk))));
+        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn disk_info_counts_faulty_noop_metrics_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let err = wrapper
+            .disk_info(&DiskInfoOptions {
+                noop: true,
+                metrics: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("faulty disk_info should be rejected");
+
+        assert_eq!(err, DiskError::FaultyDisk);
+        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_versions_counts_stale_drive_availability_rejection() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        {
+            let mut format_info = disk.format_info.write().await;
+            format_info.id = Some(Uuid::new_v4());
+            format_info.file_info = Some(
+                tokio::fs::metadata(dir.path())
+                    .await
+                    .expect("temp dir metadata should be readable"),
+            );
+            format_info.last_check = Some(::time::OffsetDateTime::now_utc());
+        }
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+
+        let result = wrapper
+            .delete_versions("bucket", vec![FileInfoVersions::default()], DeleteOptions::default())
+            .await;
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result.first(), Some(Some(DiskError::DiskNotFound))));
+        assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
     }
 
     impl AsyncWrite for PendingWriter {
@@ -2228,6 +3043,7 @@ mod tests {
             assert_eq!(walk_err, DiskError::Timeout);
             assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
             assert!(!wrapper.health.is_faulty());
+            assert_eq!(wrapper.metrics_snapshot().total_errors_timeout, 1);
 
             let info = wrapper
                 .stat_volume(bucket)

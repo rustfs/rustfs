@@ -15,6 +15,7 @@
 use rustfs_s3_types::EventName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
 pub enum S3Operation {
     AbortMultipartUpload,
     CompleteMultipartUpload,
@@ -125,6 +126,80 @@ impl EventMapping {
 }
 
 impl S3Operation {
+    pub const ALL: [Self; 66] = [
+        Self::AbortMultipartUpload,
+        Self::CompleteMultipartUpload,
+        Self::CopyObject,
+        Self::CreateBucket,
+        Self::CreateMultipartUpload,
+        Self::DeleteBucket,
+        Self::DeleteBucketCors,
+        Self::DeleteBucketEncryption,
+        Self::DeleteBucketLifecycle,
+        Self::DeleteBucketPolicy,
+        Self::DeleteBucketReplication,
+        Self::DeleteBucketTagging,
+        Self::DeleteObject,
+        Self::DeleteObjectTagging,
+        Self::DeleteObjects,
+        Self::DeletePublicAccessBlock,
+        Self::GetBucketAcl,
+        Self::GetBucketCors,
+        Self::GetBucketEncryption,
+        Self::GetBucketLifecycleConfiguration,
+        Self::GetBucketLocation,
+        Self::GetBucketLogging,
+        Self::GetBucketNotificationConfiguration,
+        Self::GetBucketPolicy,
+        Self::GetBucketPolicyStatus,
+        Self::GetBucketReplication,
+        Self::GetBucketTagging,
+        Self::GetBucketVersioning,
+        Self::GetObject,
+        Self::GetObjectAcl,
+        Self::GetObjectAttributes,
+        Self::GetObjectLegalHold,
+        Self::GetObjectLockConfiguration,
+        Self::GetObjectRetention,
+        Self::GetObjectTagging,
+        Self::GetObjectTorrent,
+        Self::GetPublicAccessBlock,
+        Self::HeadBucket,
+        Self::HeadObject,
+        Self::ListBuckets,
+        Self::ListMultipartUploads,
+        Self::ListObjectVersions,
+        Self::ListObjects,
+        Self::ListObjectsV2,
+        Self::ListParts,
+        Self::PutBucketAcl,
+        Self::PutBucketCors,
+        Self::PutBucketEncryption,
+        Self::PutBucketLifecycleConfiguration,
+        Self::PutBucketLogging,
+        Self::PutBucketNotificationConfiguration,
+        Self::PutBucketPolicy,
+        Self::PutBucketReplication,
+        Self::PutBucketTagging,
+        Self::PutBucketVersioning,
+        Self::PutObject,
+        Self::PutObjectAcl,
+        Self::PutObjectLegalHold,
+        Self::PutObjectLockConfiguration,
+        Self::PutObjectRetention,
+        Self::PutObjectTagging,
+        Self::PutPublicAccessBlock,
+        Self::RestoreObject,
+        Self::SelectObjectContent,
+        Self::UploadPart,
+        Self::UploadPartCopy,
+    ];
+
+    #[inline]
+    pub const fn metric_index(self) -> usize {
+        self as usize
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AbortMultipartUpload => "s3:AbortMultipartUpload",

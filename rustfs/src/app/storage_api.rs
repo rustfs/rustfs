@@ -210,7 +210,6 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod runtime_sources {
-    pub(crate) type ExpiryState = super::runtime::ExpiryState;
     #[cfg(test)]
     pub(crate) type TierConfigMgr = super::runtime::TierConfigMgr;
 }
@@ -373,57 +372,6 @@ pub(crate) mod bucket {
             }
         }
         pub(crate) use lifecycle_contract as lifecycle;
-
-        pub(crate) mod tier_delete_journal {
-            use std::sync::Arc;
-
-            pub(crate) fn record_tier_delete_journal_backend_identity(
-                je: &mut super::tier_sweeper::Jentry,
-                metadata: &std::collections::HashMap<String, String>,
-            ) -> std::io::Result<()> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_delete_journal::record_tier_delete_journal_backend_identity(je, metadata)
-            }
-
-            pub(crate) async fn persist_tier_delete_journal_entry(
-                api: Arc<crate::storage::storage_api::ECStore>,
-                je: &super::tier_sweeper::Jentry,
-            ) -> std::io::Result<()> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(
-                    api, je,
-                )
-                .await
-            }
-        }
-
-        pub(crate) mod tier_sweeper {
-            pub(crate) type Jentry = crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::Jentry;
-
-            pub(crate) fn transitioned_delete_journal_entry(
-                version_id: Option<uuid::Uuid>,
-                versioned: bool,
-                suspended: bool,
-                transitioned: &super::super::super::storage_contracts::TransitionedObject,
-                transition_version_state: rustfs_filemeta::TransitionVersionState,
-            ) -> Option<Jentry> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
-                    version_id,
-                    versioned,
-                    suspended,
-                    transitioned,
-                    transition_version_state,
-                )
-            }
-
-            pub(crate) fn transitioned_force_delete_journal_entry(
-                transitioned: &super::super::super::storage_contracts::TransitionedObject,
-                transition_version_state: rustfs_filemeta::TransitionVersionState,
-            ) -> Option<Jentry> {
-                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(
-                    transitioned,
-                    transition_version_state,
-                )
-            }
-        }
     }
 
     pub(crate) mod metadata {
@@ -629,6 +577,44 @@ pub(crate) mod bucket {
         #[cfg(test)]
         pub(crate) use replication_contracts::replication_statuses_map;
 
+        pub(crate) async fn persist_force_delete_intent(
+            store: Arc<crate::storage::storage_api::ECStore>,
+            bucket: String,
+            object: String,
+            target_arns: Vec<String>,
+            generation: time::OffsetDateTime,
+        ) -> crate::storage::storage_api::Result<Uuid> {
+            let operation_id = Uuid::new_v4();
+            crate::storage::storage_api::persist_force_delete_intent(
+                store,
+                replication_contracts::MrfReplicateEntry {
+                    bucket,
+                    object,
+                    version_id: None,
+                    retry_count: 0,
+                    size: 0,
+                    op: replication_contracts::MrfOpKind::Delete,
+                    force_delete: true,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                    target_arns,
+                    force_delete_id: Some(operation_id),
+                    force_delete_generation: Some(i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX)),
+                    force_delete_local_commit: false,
+                },
+            )
+            .await
+            .map(|_| operation_id)
+        }
+
+        pub(crate) async fn commit_force_delete_intent(
+            store: Arc<crate::storage::storage_api::ECStore>,
+            operation_id: Uuid,
+        ) -> crate::storage::storage_api::Result<()> {
+            crate::storage::storage_api::commit_force_delete_intent(store, operation_id).await
+        }
+
         /// Test-only counter of `must_replicate_object` invocations.
         ///
         /// Used by white-box regression tests to assert that a single PUT
@@ -664,6 +650,13 @@ pub(crate) mod bucket {
 
         pub(crate) fn has_active_delete_rule(snapshot: &DeleteReplicationConfigSnapshot, object: &str) -> bool {
             ReplicationObjectBridge::has_active_delete_rule(snapshot, object)
+        }
+
+        pub(crate) fn force_delete_target_set(
+            snapshot: &DeleteReplicationConfigSnapshot,
+            prefix: &str,
+        ) -> Option<(Vec<String>, time::OffsetDateTime)> {
+            ReplicationObjectBridge::force_delete_target_set(snapshot, prefix)
         }
 
         pub(crate) fn delete_replication_version_id(

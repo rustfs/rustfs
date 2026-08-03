@@ -22,6 +22,7 @@ use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
+use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use crate::types::*;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
@@ -32,11 +33,16 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jiff::Zoned;
 use rand::RngExt;
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, warn};
@@ -480,9 +486,32 @@ pub(crate) enum StoredKeyProtection {
     PlaintextDevOnly,
 }
 
-/// The record's `at_rest_protection` value when this build cannot interpret
-/// it, rendered for diagnostics. `Ok(None)` means the marker is absent
-/// (pre-beta.9 records) or names a protection mode this build implements.
+pub(crate) const UNKNOWN_STORED_KEY_PROTECTION: &str = "unknown-at-rest-protection";
+const MAX_PROTECTION_MARKER_RAW_BYTES: usize = 128;
+
+impl UnknownFieldSummary {
+    fn record_for_local_key(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("local-key-record") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: AtomicU64 = AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "Local KMS key record contains unknown fields"
+            );
+        }
+    }
+}
+
+/// Reports whether the record's `at_rest_protection` value is unknown to this
+/// build. `false` means the marker is absent (pre-beta.9 records), null, or
+/// names a protection mode this build implements.
 ///
 /// Every reader of a stored key record must consult this before its own
 /// schema parse. Letting a strict [`StoredKeyProtection`] field fail inside a
@@ -490,29 +519,38 @@ pub(crate) enum StoredKeyProtection {
 /// operator who reads corruption starts a disaster recovery instead of a
 /// version rollback. The probe deliberately ignores every other field, so the
 /// verdict is available even for records whose schema this build cannot
-/// satisfy, and no key material is copied out of the caller's buffer.
+/// satisfy. The raw marker is borrowed and length-bounded before enum parsing;
+/// it is never propagated into a caller-visible error or diagnostic.
 ///
 /// `Err` carries the JSON error so callers can keep their own classification
 /// for bytes that are not a record at all.
-pub(crate) fn unknown_protection_marker(record: &[u8]) -> serde_json::Result<Option<String>> {
+pub(crate) fn has_unknown_protection_marker(record: &[u8]) -> serde_json::Result<bool> {
     #[derive(Deserialize)]
-    struct MarkerProbe {
+    struct MarkerProbe<'a> {
         #[serde(default)]
-        at_rest_protection: Option<serde_json::Value>,
+        #[serde(borrow)]
+        at_rest_protection: Option<&'a serde_json::value::RawValue>,
     }
 
     let Some(marker) = serde_json::from_slice::<MarkerProbe>(record)?.at_rest_protection else {
-        return Ok(None);
+        return Ok(false);
     };
-    if serde_json::from_value::<StoredKeyProtection>(marker.clone()).is_ok() {
-        return Ok(None);
+    if marker.get().len() > MAX_PROTECTION_MARKER_RAW_BYTES {
+        return Ok(true);
     }
-    Ok(Some(marker.as_str().map(str::to_owned).unwrap_or_else(|| marker.to_string())))
+    if serde_json::from_str::<StoredKeyProtection>(marker.get()).is_ok() {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Serializable representation of a master key stored on disk
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct StoredMasterKey {
+    /// Persisted record schema version. Records written before this field was
+    /// introduced default to version 1 during deserialization.
+    #[serde(default = "default_stored_master_key_format_version")]
+    format_version: u32,
     key_id: String,
     version: u32,
     algorithm: String,
@@ -535,6 +573,205 @@ struct StoredMasterKey {
     nonce: Vec<u8>,
     #[serde(default)]
     at_rest_protection: StoredKeyProtection,
+}
+
+pub(crate) const STORED_MASTER_KEY_FORMAT_VERSION: u32 = 1;
+
+fn default_stored_master_key_format_version() -> u32 {
+    STORED_MASTER_KEY_FORMAT_VERSION
+}
+
+/// Read only the schema marker before attempting the complete key-record
+/// decode. A future record may add or remove required fields, but its version
+/// still needs to be reported as unsupported rather than as generic corruption.
+pub(crate) fn stored_master_key_format_version(record: &[u8]) -> serde_json::Result<u32> {
+    #[derive(Deserialize)]
+    struct FormatProbe {
+        #[serde(default = "default_stored_master_key_format_version")]
+        format_version: u32,
+    }
+
+    Ok(serde_json::from_slice::<FormatProbe>(record)?.format_version)
+}
+
+impl<'de> Deserialize<'de> for StoredMasterKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        enum Field {
+            FormatVersion,
+            KeyId,
+            Version,
+            Algorithm,
+            Usage,
+            Status,
+            Description,
+            Metadata,
+            CreatedAt,
+            RotatedAt,
+            CreatedBy,
+            DeletionDate,
+            EncryptedKeyMaterial,
+            Nonce,
+            AtRestProtection,
+            Unknown(BoundedUnknownFieldName),
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a Local KMS key record field name")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(match value {
+                            "format_version" => Field::FormatVersion,
+                            "key_id" => Field::KeyId,
+                            "version" => Field::Version,
+                            "algorithm" => Field::Algorithm,
+                            "usage" => Field::Usage,
+                            "status" => Field::Status,
+                            "description" => Field::Description,
+                            "metadata" => Field::Metadata,
+                            "created_at" => Field::CreatedAt,
+                            "rotated_at" => Field::RotatedAt,
+                            "created_by" => Field::CreatedBy,
+                            "deletion_date" => Field::DeletionDate,
+                            "encrypted_key_material" => Field::EncryptedKeyMaterial,
+                            "nonce" => Field::Nonce,
+                            "at_rest_protection" => Field::AtRestProtection,
+                            _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct ZonedValue(#[serde(with = "crate::time_serde::zoned")] Zoned);
+
+        #[derive(Deserialize)]
+        struct OptionalZonedValue(#[serde(with = "crate::time_serde::option_zoned")] Option<Zoned>);
+
+        struct StoredMasterKeyVisitor;
+
+        impl<'de> Visitor<'de> for StoredMasterKeyVisitor {
+            type Value = StoredMasterKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Local KMS key record")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                macro_rules! read_field {
+                    ($slot:ident, $name:literal) => {{
+                        if $slot.is_some() {
+                            return Err(de::Error::duplicate_field($name));
+                        }
+                        $slot = Some(map.next_value()?);
+                    }};
+                }
+
+                let mut format_version = None;
+                let mut key_id = None;
+                let mut version = None;
+                let mut algorithm = None;
+                let mut usage = None;
+                let mut status = None;
+                let mut description = None;
+                let mut metadata = None;
+                let mut created_at: Option<ZonedValue> = None;
+                let mut rotated_at: Option<OptionalZonedValue> = None;
+                let mut created_by = None;
+                let mut deletion_date: Option<OptionalZonedValue> = None;
+                let mut encrypted_key_material = None;
+                let mut nonce = None;
+                let mut at_rest_protection = None;
+                let mut unknown_fields = UnknownFieldSummary::default();
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::FormatVersion => read_field!(format_version, "format_version"),
+                        Field::KeyId => read_field!(key_id, "key_id"),
+                        Field::Version => read_field!(version, "version"),
+                        Field::Algorithm => read_field!(algorithm, "algorithm"),
+                        Field::Usage => read_field!(usage, "usage"),
+                        Field::Status => read_field!(status, "status"),
+                        Field::Description => read_field!(description, "description"),
+                        Field::Metadata => read_field!(metadata, "metadata"),
+                        Field::CreatedAt => read_field!(created_at, "created_at"),
+                        Field::RotatedAt => read_field!(rotated_at, "rotated_at"),
+                        Field::CreatedBy => read_field!(created_by, "created_by"),
+                        Field::DeletionDate => read_field!(deletion_date, "deletion_date"),
+                        Field::EncryptedKeyMaterial => read_field!(encrypted_key_material, "encrypted_key_material"),
+                        Field::Nonce => read_field!(nonce, "nonce"),
+                        Field::AtRestProtection => read_field!(at_rest_protection, "at_rest_protection"),
+                        Field::Unknown(field) => {
+                            let _: IgnoredAny = map.next_value()?;
+                            unknown_fields.observe(field);
+                        }
+                    }
+                }
+
+                let key = StoredMasterKey {
+                    format_version: format_version.unwrap_or_else(default_stored_master_key_format_version),
+                    key_id: key_id.ok_or_else(|| de::Error::missing_field("key_id"))?,
+                    version: version.ok_or_else(|| de::Error::missing_field("version"))?,
+                    algorithm: algorithm.ok_or_else(|| de::Error::missing_field("algorithm"))?,
+                    usage: usage.ok_or_else(|| de::Error::missing_field("usage"))?,
+                    status: status.ok_or_else(|| de::Error::missing_field("status"))?,
+                    description: description.unwrap_or(None),
+                    metadata: metadata.ok_or_else(|| de::Error::missing_field("metadata"))?,
+                    created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?.0,
+                    rotated_at: rotated_at.map(|value: OptionalZonedValue| value.0).unwrap_or(None),
+                    created_by: created_by.unwrap_or(None),
+                    deletion_date: deletion_date.map(|value: OptionalZonedValue| value.0).unwrap_or(None),
+                    encrypted_key_material: encrypted_key_material
+                        .ok_or_else(|| de::Error::missing_field("encrypted_key_material"))?,
+                    nonce: nonce.ok_or_else(|| de::Error::missing_field("nonce"))?,
+                    at_rest_protection: at_rest_protection.unwrap_or_default(),
+                };
+                unknown_fields.record_for_local_key();
+                Ok(key)
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "format_version",
+            "key_id",
+            "version",
+            "algorithm",
+            "usage",
+            "status",
+            "description",
+            "metadata",
+            "created_at",
+            "rotated_at",
+            "created_by",
+            "deletion_date",
+            "encrypted_key_material",
+            "nonce",
+            "at_rest_protection",
+        ];
+        deserializer.deserialize_struct("StoredMasterKey", FIELDS, StoredMasterKeyVisitor)
+    }
 }
 
 impl LocalKmsClient {
@@ -804,6 +1041,39 @@ impl LocalKmsClient {
                     path.display()
                 ))
             })?;
+            let format_version = stored_master_key_format_version(&content).map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} is not interpretable by this build ({error}); \
+                     refusing to generate a replacement salt — restore the salt file from backup, or run a build that \
+                     understands the record",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
+            if format_version > STORED_MASTER_KEY_FORMAT_VERSION {
+                return Err(KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} declares unsupported format version {format_version}; \
+                     refusing to generate a replacement salt",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                )));
+            }
+            let has_unknown_marker = has_unknown_protection_marker(&content).map_err(|error| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} is not a readable JSON object ({error}); \
+                     refusing to generate a replacement salt",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                ))
+            })?;
+            if has_unknown_marker {
+                return Err(KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} is missing and key record {} uses {UNKNOWN_STORED_KEY_PROTECTION}; \
+                     refusing to generate a replacement salt",
+                    Self::master_key_salt_path(config).display(),
+                    path.display()
+                )));
+            }
             let probe = serde_json::from_slice::<ProtectionProbe>(&content).map_err(|error| {
                 KmsError::configuration_error(format!(
                     "Local KMS master key salt at {} is missing and key record {} is not interpretable by this build ({error}); \
@@ -851,13 +1121,19 @@ impl LocalKmsClient {
 
         let content = fs::read(&key_path).await?;
 
+        let format_version = stored_master_key_format_version(&content)
+            .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not a readable JSON object: {e}")))?;
+        if format_version > STORED_MASTER_KEY_FORMAT_VERSION {
+            return Err(KmsError::unsupported_format_version(key_id, format_version.to_string()));
+        }
+
         // Two-stage parse so an unrecognised protection marker is reported as an
         // unsupported format (a newer build may still read the key) instead of being
         // folded into generic corruption with every other malformed record.
-        let unknown_marker = unknown_protection_marker(&content)
+        let has_unknown_marker = has_unknown_protection_marker(&content)
             .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record is not a readable JSON object: {e}")))?;
-        if let Some(version) = unknown_marker {
-            return Err(KmsError::unsupported_format_version(key_id, version));
+        if has_unknown_marker {
+            return Err(KmsError::unsupported_format_version(key_id, UNKNOWN_STORED_KEY_PROTECTION));
         }
         let stored_key: StoredMasterKey = serde_json::from_slice(&content)
             .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key record does not deserialize: {e}")))?;
@@ -1023,6 +1299,7 @@ impl LocalKmsClient {
         };
 
         let stored_key = StoredMasterKey {
+            format_version: STORED_MASTER_KEY_FORMAT_VERSION,
             key_id: master_key.key_id.clone(),
             version: master_key.version,
             algorithm: master_key.algorithm.clone(),
@@ -1903,6 +2180,8 @@ impl KmsBackend for LocalKmsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{deserialize_with_ignored_only_unknown, unknown_field_metric};
+    use metrics_util::debugging::DebuggingRecorder;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -2115,8 +2394,8 @@ mod tests {
             ),
             (
                 "unknown protection marker",
-                with_field("at_rest_protection", serde_json::json!("post-quantum-v2")),
-                |e| matches!(e, KmsError::UnsupportedFormatVersion { version, .. } if version == "post-quantum-v2"),
+                with_field("at_rest_protection", serde_json::json!("secret-marker-value-must-not-leak")),
+                |e| matches!(e, KmsError::UnsupportedFormatVersion { version, .. } if version == UNKNOWN_STORED_KEY_PROTECTION),
             ),
         ];
 
@@ -2426,6 +2705,230 @@ mod tests {
         let key_info = client.load_master_key("legacy-key").await.expect("legacy key should load");
         assert_eq!(key_info.key_id, "legacy-key");
         assert_eq!(key_info.created_at.time_zone().iana_name(), Some("UTC"));
+    }
+
+    #[tokio::test]
+    async fn stored_master_key_format_version_is_explicit_and_legacy_defaults_to_v1() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
+        client.create_key("format-key", "AES_256", None).await.expect("create key");
+
+        let key_path = client.master_key_path("format-key").expect("valid key id");
+        let current_record = fs::read(&key_path).await.expect("read key record");
+        let mut record: serde_json::Value = serde_json::from_slice(&current_record).expect("decode key record");
+        assert_eq!(record.get("format_version"), Some(&serde_json::json!(STORED_MASTER_KEY_FORMAT_VERSION)));
+
+        #[derive(Deserialize)]
+        struct LegacyStoredMasterKeyProbe {
+            key_id: String,
+            version: u32,
+            algorithm: String,
+            usage: KeyUsage,
+            status: KeyStatus,
+            description: Option<String>,
+            metadata: HashMap<String, String>,
+            #[serde(with = "crate::time_serde::zoned")]
+            created_at: Zoned,
+            #[serde(with = "crate::time_serde::option_zoned")]
+            rotated_at: Option<Zoned>,
+            created_by: Option<String>,
+            #[serde(default, with = "crate::time_serde::option_zoned")]
+            deletion_date: Option<Zoned>,
+            encrypted_key_material: String,
+            nonce: Vec<u8>,
+            #[serde(default)]
+            at_rest_protection: StoredKeyProtection,
+        }
+        let legacy: LegacyStoredMasterKeyProbe =
+            serde_json::from_slice(&current_record).expect("the pre-format-version reader must accept a v1 record");
+        let LegacyStoredMasterKeyProbe {
+            key_id,
+            version,
+            algorithm,
+            usage: _usage,
+            status: _status,
+            description: _description,
+            metadata: _metadata,
+            created_at: _created_at,
+            rotated_at: _rotated_at,
+            created_by: _created_by,
+            deletion_date: _deletion_date,
+            encrypted_key_material,
+            nonce,
+            at_rest_protection,
+        } = legacy;
+        assert_eq!(key_id, "format-key");
+        assert_eq!(version, 1);
+        assert_eq!(algorithm, "AES_256");
+        assert!(!encrypted_key_material.is_empty());
+        assert!(nonce.is_empty());
+        assert_eq!(at_rest_protection, StoredKeyProtection::PlaintextDevOnly);
+
+        // A record from before the explicit field was added remains readable.
+        record
+            .as_object_mut()
+            .expect("key record is an object")
+            .remove("format_version")
+            .expect("current records carry format_version");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode legacy key record"))
+            .await
+            .expect("write legacy key record");
+        let info = client
+            .describe_key("format-key", None)
+            .await
+            .expect("legacy key record should load");
+        assert_eq!(info.key_id, "format-key");
+    }
+
+    #[tokio::test]
+    async fn stored_master_key_accepts_an_older_numeric_format_version() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
+        client
+            .create_key("older-format-key", "AES_256", None)
+            .await
+            .expect("create key");
+
+        let key_path = client.master_key_path("older-format-key").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key record")).expect("decode key record");
+        record["format_version"] = serde_json::json!(0);
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode older key record"))
+            .await
+            .expect("write older key record");
+
+        let info = client
+            .describe_key("older-format-key", None)
+            .await
+            .expect("older format version should remain readable");
+        assert_eq!(info.key_id, "older-format-key");
+    }
+
+    #[tokio::test]
+    async fn stored_master_key_rejects_a_newer_format_version_before_decrypting() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
+        client
+            .create_key("future-format-key", "AES_256", None)
+            .await
+            .expect("create key");
+
+        let key_path = client.master_key_path("future-format-key").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key record")).expect("decode key record");
+        record["format_version"] = serde_json::json!(99);
+        record.as_object_mut().expect("key record is an object").remove("usage");
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode future key record"))
+            .await
+            .expect("write future key record");
+
+        let error = client
+            .describe_key("future-format-key", None)
+            .await
+            .expect_err("a newer key format must fail closed");
+        assert!(matches!(
+            error,
+            KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "future-format-key" && version == "99"
+        ));
+    }
+
+    #[test]
+    fn unknown_protection_marker_is_static_for_every_unknown_shape() {
+        for marker in [
+            serde_json::json!("secret-string-must-not-leak"),
+            serde_json::json!({"future_mode": "secret-object-must-not-leak"}),
+            serde_json::json!(["secret-array-must-not-leak"]),
+            serde_json::json!(99),
+        ] {
+            let record =
+                serde_json::to_vec(&serde_json::json!({"at_rest_protection": marker})).expect("encode protection marker");
+            assert!(has_unknown_protection_marker(&record).expect("probe protection marker"));
+        }
+        let long_marker = "secret-marker-must-not-be-copied".repeat(1024);
+        let record =
+            serde_json::to_vec(&serde_json::json!({"at_rest_protection": long_marker})).expect("encode long protection marker");
+        assert!(has_unknown_protection_marker(&record).expect("probe long protection marker"));
+
+        for marker in [
+            serde_json::Value::Null,
+            serde_json::json!("legacy-unspecified"),
+            serde_json::json!("encrypted-master-key"),
+            serde_json::json!("plaintext-dev-only"),
+        ] {
+            let record =
+                serde_json::to_vec(&serde_json::json!({"at_rest_protection": marker})).expect("encode protection marker");
+            assert!(!has_unknown_protection_marker(&record).expect("probe protection marker"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_master_key_unknown_fields_remain_readable() {
+        const UNKNOWN_FIELD_VALUE: &str = "field value must not be logged";
+        let (client, _temp_dir) = create_dev_mode_client().await;
+        client
+            .create_key("unknown-field-key", "AES_256", None)
+            .await
+            .expect("create key");
+
+        let key_path = client.master_key_path("unknown-field-key").expect("valid key id");
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read key record")).expect("decode key record");
+        let long_field = format!("{}界", "a".repeat(126));
+        let long_prefix = "a".repeat(126);
+        let injection_field = "b\n\u{1b}[31m";
+        let record_with_unknown = |field: &str| {
+            let mut record = record.clone();
+            let object = record.as_object_mut().expect("key record is an object");
+            object.insert(field.to_owned(), serde_json::json!(UNKNOWN_FIELD_VALUE));
+            object.insert("zeta_extension".to_owned(), serde_json::json!("another value must not be logged"));
+            serde_json::to_vec_pretty(&record).expect("encode key record with unknown fields")
+        };
+        let long_record = record_with_unknown(&long_field);
+        let mut injection_record: serde_json::Value =
+            serde_json::from_slice(&record_with_unknown(injection_field)).expect("decode injection record");
+        injection_record["key_id"] = serde_json::json!("tenant-secret-or-untrusted-record-id");
+        let injection_record = serde_json::to_vec(&injection_record).expect("encode injection record");
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let parse = |record: &[u8]| {
+            let recorder = DebuggingRecorder::new();
+            let stored = metrics::with_local_recorder(&recorder, || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    serde_json::from_slice(record).expect("unknown fields must remain forward-compatible")
+                })
+            });
+            assert_eq!(unknown_field_metric(&recorder, "local-key-record"), 2);
+            stored
+        };
+        let stored: StoredMasterKey = parse(&long_record);
+        let _: StoredMasterKey = parse(&long_record);
+        let _: StoredMasterKey = parse(&injection_record);
+        let _: StoredMasterKey = parse(&injection_record);
+        assert_eq!(stored.key_id, "unknown-field-key");
+
+        let output = logs.output();
+        assert!(output.contains("WARN"));
+        assert_eq!(output.matches("Local KMS key record contains unknown fields").count(), 3);
+        assert!(output.contains(&long_prefix));
+        assert!(!output.contains(&long_field));
+        assert!(output.contains("field_name_truncated=true"));
+        assert!(output.contains(r#"\n\u{1b}[31m"#));
+        assert!(!output.contains("zeta_extension"));
+        assert!(output.contains("field_count=2"));
+        for observed_records in [1, 2, 4] {
+            assert!(output.contains(&format!("observed_records={observed_records}")));
+        }
+        assert!(!output.contains("observed_records=3"));
+        assert!(!output.contains("tenant-secret-or-untrusted-record-id"));
+        assert!(!output.contains(UNKNOWN_FIELD_VALUE));
+        assert!(!output.contains("another value must not be logged"));
+
+        let streamed: StoredMasterKey = deserialize_with_ignored_only_unknown(record, "stream_only_extension")
+            .expect("unknown values must be consumed through deserialize_ignored_any");
+        assert_eq!(streamed.key_id, "unknown-field-key");
     }
 
     #[tokio::test]
@@ -3033,17 +3536,26 @@ mod tests {
             serde_json::from_slice(&fs::read(&key_path).await.expect("read key file")).expect("decode record");
         drop(client);
 
+        const UNKNOWN_MARKER_VALUE: &str = "secret-marker-value-must-not-leak";
         let mut newer_build_record = pristine.clone();
-        newer_build_record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        newer_build_record["at_rest_protection"] = serde_json::json!(UNKNOWN_MARKER_VALUE);
         let newer_build_record = serde_json::to_vec_pretty(&newer_build_record).expect("encode record");
+        let mut future_format_record = pristine.clone();
+        future_format_record["format_version"] = serde_json::json!(99);
+        let future_format_record = serde_json::to_vec_pretty(&future_format_record).expect("encode record");
         let truncated = {
             let bytes = serde_json::to_vec_pretty(&pristine).expect("encode record");
             bytes[..bytes.len() / 2].to_vec()
         };
 
-        for (name, content) in [
-            ("record from a newer build", newer_build_record),
-            ("record that does not decode", truncated),
+        for (name, content, expected_error) in [
+            ("record from a newer build", newer_build_record, Some(UNKNOWN_STORED_KEY_PROTECTION)),
+            (
+                "record with a future format version",
+                future_format_record,
+                Some("unsupported format version 99"),
+            ),
+            ("record that does not decode", truncated, None),
         ] {
             fs::write(&key_path, &content).await.expect("write record");
             fs::remove_file(&salt_path).await.ok();
@@ -3060,6 +3572,16 @@ mod tests {
                 "{name}: expected a salt-specific configuration error, got {error:?}"
             );
             assert!(error.to_string().contains("salt"), "{name}: error must point at the salt: {error}");
+            assert!(
+                !error.to_string().contains(UNKNOWN_MARKER_VALUE),
+                "{name}: raw marker values must stay redacted"
+            );
+            if let Some(expected_error) = expected_error {
+                assert!(
+                    error.to_string().contains(expected_error),
+                    "{name}: error must explain the incompatibility: {error}"
+                );
+            }
             assert_eq!(
                 sorted_dir_file_names(temp_dir.path()).await,
                 vec!["sealed-key.key".to_string()],
@@ -3085,7 +3607,9 @@ mod tests {
         let key_path = client.master_key_path("beta").expect("valid key id");
         let mut record: serde_json::Value =
             serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
-        record["at_rest_protection"] = serde_json::json!("post-quantum-v2");
+        record["at_rest_protection"] = serde_json::json!({
+            "future_mode": ["secret-marker-value-must-not-leak"]
+        });
         fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
             .await
             .expect("write record");
@@ -3096,9 +3620,10 @@ mod tests {
             .expect_err("a listing must not quietly omit a key it cannot read");
         assert!(
             matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
-                if key_id == "beta" && version == "post-quantum-v2"),
+                if key_id == "beta" && version == UNKNOWN_STORED_KEY_PROTECTION),
             "got {error:?}"
         );
+        assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
     }
 
     #[tokio::test]

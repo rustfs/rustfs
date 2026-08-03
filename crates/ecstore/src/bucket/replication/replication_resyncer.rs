@@ -792,6 +792,7 @@ impl ReplicationResyncer {
             let storage = storage.clone();
             let results_tx = results_tx.clone();
             let bucket_name = opts.bucket.clone();
+            let target_arn = opts.arn.clone();
 
             let f = tokio::spawn(async move {
                 while let Some(mut roi) = rx.recv().await {
@@ -819,6 +820,7 @@ impl ReplicationResyncer {
                             bucket: roi.bucket.clone(),
                             event_type: REPLICATE_EXISTING_DELETE.to_string(),
                             op_type: ReplicationType::ExistingObject,
+                            target_arn: target_arn.clone(),
                             ..Default::default()
                         };
                         replicate_delete(doi, storage.clone()).await;
@@ -1640,54 +1642,62 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
 async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
+    let admitted_target_arns = dobj.admitted_target_arns();
 
-    let rcfg = match get_replication_config(bucket).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            debug!(
-                event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_missing",
-                "Skipping replication force-delete because replication config is missing"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: object_name.clone(),
-                    ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
+    let legacy_target_arns = if admitted_target_arns.is_empty() {
+        match get_replication_config(bucket).await {
+            Ok(Some(config)) => config.filter_target_arns(&ObjectOpts {
+                name: object_name.clone(),
                 ..Default::default()
-            });
-            return;
-        }
-        Err(err) => {
-            debug!(
-                event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                error = %err,
-                reason = "replication_config_lookup_failed",
-                "Skipping replication force-delete because replication config lookup failed"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: object_name.clone(),
+            }),
+            Ok(None) => {
+                debug!(
+                    event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    reason = "replication_config_missing",
+                    "Skipping replication force-delete because replication config is missing"
+                );
+                send_local_event(EventArgs {
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                    bucket_name: bucket.clone(),
+                    object: ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: object_name.clone(),
+                        ..Default::default()
+                    },
+                    user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return;
+                });
+                Vec::new()
+            }
+            Err(err) => {
+                debug!(
+                    event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    error = %err,
+                    reason = "replication_config_lookup_failed",
+                    "Skipping replication force-delete because replication config lookup failed"
+                );
+                send_local_event(EventArgs {
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                    bucket_name: bucket.clone(),
+                    object: ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: object_name.clone(),
+                        ..Default::default()
+                    },
+                    user_agent: "Internal: [Replication]".to_string(),
+                    ..Default::default()
+                });
+                Vec::new()
+            }
         }
+    } else {
+        Vec::new()
     };
 
     let ns_lock = match storage
@@ -1749,22 +1759,18 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         }
     };
 
-    let tgt_arns = {
-        let admitted = dobj.admitted_target_arns();
-        if admitted.is_empty() {
-            rcfg.filter_target_arns(&ObjectOpts {
-                name: object_name.clone(),
-                ..Default::default()
-            })
-        } else {
-            admitted
-        }
+    let tgt_arns = if admitted_target_arns.is_empty() {
+        legacy_target_arns
+    } else {
+        admitted_target_arns
     };
 
     let mut join_set = JoinSet::new();
+    let mut all_succeeded = true;
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &arn).await else {
+            all_succeeded = false;
             debug!(
                 event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1814,7 +1820,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
-                return;
+                return false;
             }
 
             if let Err(e) = tgt_client
@@ -1843,23 +1849,45 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
+                return false;
             }
+
+            true
         });
     }
 
     while let Some(result) = join_set.join_next().await {
-        if let Err(e) = result {
-            error!(
-                event = EVENT_RESYNC_TASK_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                object = %object_name,
-                operation = "force_delete",
-                error = %e,
-                "Replication resync task failed"
-            );
+        match result {
+            Ok(success) => all_succeeded &= success,
+            Err(error) => {
+                all_succeeded = false;
+                error!(
+                    event = EVENT_RESYNC_TASK_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    object = %object_name,
+                    operation = "force_delete",
+                    error = %error,
+                    "Replication resync task failed"
+                );
+            }
         }
+    }
+
+    if all_succeeded
+        && let Some(operation_id) = dobj.delete_object.force_delete_id
+        && let Err(error) = super::replication_pool::complete_force_delete_intent(storage, operation_id).await
+    {
+        warn!(
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = %bucket,
+            object = %object_name,
+            operation_id = %operation_id,
+            error = %error,
+            "Force-delete replication completed but durable intent cleanup failed"
+        );
     }
 }
 
@@ -2009,10 +2037,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
-    // The admission decision is the target-granular contract. Re-evaluating the
-    // live config here could fan a synchronous request out to targets that were
-    // not admitted, or promote an async target after a mixed-mode split.
-    let tgt_arns = roi.dsc.replicate_target_arns();
+    let tgt_arns = roi.admitted_target_arns();
 
     // Acquire a per-object namespace lock so that at most one worker (across all cluster
     // nodes and MRF retry goroutines) replicates this object version at a time.

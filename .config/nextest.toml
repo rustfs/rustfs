@@ -9,6 +9,8 @@
 #   * bucket_lifecycle_ops::tests::concurrent_resend_same_part_commits_one_generation
 #     uses the shared multipart fixture and a deterministic uploadId-lock
 #     handoff, so it must not overlap another process mutating that fixture.
+#   * bucket::metadata_sys::tests::concurrent_config_writes_from_separate_nodes_do_not_lose_writes
+#     uses the shared transaction lock and must not overlap other ecstore tests.
 #
 # serial_test's #[serial] attribute does NOT serialize these across runs:
 # nextest executes each test in its own process, where the in-process
@@ -40,7 +42,7 @@ e2e-inline-boundaries = { max-threads = 1 }
 
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
-filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
+filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the multipart crash-consistency scenarios (dist-2, backlog#1150):
@@ -104,9 +106,9 @@ filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(
 test-group = 'ecstore-serial-flaky'
 retries = 2
 
-# Keep the deterministic multipart handoff isolated across nextest processes.
+# Keep deterministic ECStore write handoffs isolated across nextest processes.
 [[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(concurrent_resend_same_part_commits_one_generation)'
+filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes))'
 test-group = 'ecstore-serial-flaky'
 
 # QUARANTINE: OPEN rustfs#4690 — walk_dir stall-budget accounting test depends
@@ -211,6 +213,17 @@ default-filter = """
     )
 """
 fail-fast = false
+
+[profile.e2e-smoke.junit]
+path = "junit.xml"
+
+# The pagination boundary cases can stall when a server/listing regression
+# prevents the continuation request from completing. Keep the timeout scoped
+# to those known failure modes so legitimate lifecycle/tiering waits retain
+# their test-level timing budget.
+[[profile.e2e-smoke.overrides]]
+filter = 'package(e2e_test) & test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/)'
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 
 # ---------------------------------------------------------------------------
 # e2e-repl-nightly profile — scheduled full replication e2e lane (repl-1)

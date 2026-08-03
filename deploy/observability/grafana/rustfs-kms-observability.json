@@ -21,7 +21,7 @@
       }
     ]
   },
-  "description": "KMS backend operation metrics emitted at the operation-policy choke point (crates/kms/src/policy.rs). All label values are static enum strings; key identifiers, key material, and tokens never appear in labels. These metrics do not carry the RustFS `server` label — use your scrape topology (job/instance or promoted OTel resource attributes) to split by node. Alert response procedures: docs/operations/kms-observability-runbook.md.",
+  "description": "KMS backend operation metrics emitted at the operation-policy choke point (crates/kms/src/policy.rs). All label values are bounded enums or fixed call-site tokens; key identifiers, key material, and tokens never appear in labels. These metrics do not carry the RustFS `server` label — use your scrape topology (job/instance or promoted OTel resource attributes) to split by node. Alert response procedures: docs/operations/kms-observability-runbook.md.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -34,7 +34,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Terminal outcomes of KMS backend operations. `fatal` means a non-retryable failure ended the operation on first observation; `budget_exhausted` and `deadline_exceeded` mean retries ran out; `cancelled` is normal during shutdown.",
+      "description": "Terminal outcomes of KMS backend operations. `fatal` is non-retryable; `budget_exhausted` and `deadline_exceeded` mean retry limits ran out; `backpressure_timeout` and `backpressure_rejected` are admission failures; `circuit_open` means the breaker opened or rejected the operation; `cancelled` is normal during shutdown.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -218,7 +218,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Share of operations that terminated in fatal, budget_exhausted, or deadline_exceeded. The cancelled outcome is plotted separately because shutdown windows legitimately spike it. The ratio is meaningless at near-zero traffic — read it together with the operation rate panels.",
+      "description": "Share of operations that terminated in fatal, budget_exhausted, deadline_exceeded, backpressure_timeout, backpressure_rejected, or circuit_open. The cancelled outcome is plotted separately because shutdown windows legitimately spike it. The ratio is meaningless at near-zero traffic — read it together with the operation rate panels.",
       "fieldConfig": {
         "defaults": {
           "color": {

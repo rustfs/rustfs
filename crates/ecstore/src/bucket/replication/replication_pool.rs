@@ -16,8 +16,8 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
-    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replicate_decision_for_admitted_targets,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
@@ -135,6 +135,10 @@ static DURABLE_MRF_TARGET_BACKLOG: LazyLock<StdRwLock<Vec<DurableMrfTargetBacklo
     LazyLock::new(|| StdRwLock::new(Vec::new()));
 static MRF_BACKLOG_OBSERVABILITY: LazyLock<StdRwLock<MrfBacklogObservabilityTracker>> =
     LazyLock::new(|| StdRwLock::new(MrfBacklogObservabilityTracker::default()));
+
+fn should_replay_force_delete_intent(entry: &MrfReplicateEntry) -> bool {
+    entry.force_delete_id.is_some() && entry.force_delete_local_commit && !entry.target_arns.is_empty()
+}
 
 #[derive(Debug, Clone, Default)]
 struct DurableMrfBacklogTracker {
@@ -302,6 +306,7 @@ where
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         });
     }
     tracker.into_snapshot()
@@ -392,6 +397,82 @@ fn durable_mrf_backlog_from_read(result: Result<Vec<u8>, EcstoreError>) -> Durab
 
 pub async fn read_durable_mrf_backlog<S: ReplicationObjectIO>(storage: Arc<S>) -> DurableMrfBacklog {
     durable_mrf_backlog_from_read(ReplicationConfigStore::read(storage, ReplicationMetadataStore::MRF_REPLICATION_FILE).await)
+}
+
+pub async fn persist_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    mut entry: MrfReplicateEntry,
+) -> Result<(), EcstoreError> {
+    entry.force_delete_local_commit = false;
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    let lock = storage
+        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+        .await?;
+    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+
+    let mut entries = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
+        Ok(data) => decode_mrf_file(&data)?,
+        Err(EcstoreError::ConfigNotFound) => Vec::new(),
+        Err(err) => return Err(err),
+    };
+
+    if entries
+        .iter()
+        .any(|existing| existing.force_delete_id == entry.force_delete_id)
+    {
+        return Ok(());
+    }
+
+    entries.push(entry);
+    let data = encode_mrf_file(&entries)?;
+    ReplicationConfigStore::save_no_lock(storage, file, data).await
+}
+
+pub async fn commit_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    operation_id: uuid::Uuid,
+) -> Result<(), EcstoreError> {
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    let lock = storage
+        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+        .await?;
+    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+
+    let data = ReplicationConfigStore::read_no_lock(storage.clone(), file).await?;
+    let mut entries = decode_mrf_file(&data)?;
+    let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
+        return Err(EcstoreError::ConfigNotFound);
+    };
+    if entry.force_delete_local_commit {
+        return Ok(());
+    }
+    entry.force_delete_local_commit = true;
+    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+}
+
+pub async fn complete_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    operation_id: uuid::Uuid,
+) -> Result<(), EcstoreError> {
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    let lock = storage
+        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
+        .await?;
+    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+
+    let data = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
+        Ok(data) => data,
+        Err(EcstoreError::ConfigNotFound) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let mut entries = decode_mrf_file(&data)?;
+    let original_len = entries.len();
+    entries.retain(|entry| entry.force_delete_id != Some(operation_id));
+    if entries.len() == original_len {
+        return Ok(());
+    }
+
+    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -497,6 +578,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
         // Start background tasks
         pool.start_mrf_processor().await;
+        pool.start_force_delete_processor().await;
         pool.start_mrf_persister().await;
 
         pool
@@ -972,6 +1054,32 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             for entry in entries.iter() {
                 match entry.op {
                     MrfOpKind::Delete => {
+                        if should_replay_force_delete_intent(entry) {
+                            let Some(operation_id) = entry.force_delete_id else {
+                                continue;
+                            };
+                            schedule_replication_delete(DeletedObjectReplicationInfo {
+                                delete_object: ReplicationDeletedObject {
+                                    object_name: entry.object.clone(),
+                                    force_delete: true,
+                                    force_delete_id: Some(operation_id),
+                                    force_delete_target_arns: entry.target_arns.clone(),
+                                    force_delete_generation: entry.force_delete_generation,
+                                    ..Default::default()
+                                },
+                                bucket: entry.bucket.clone(),
+                                op_type: ReplicationType::Heal,
+                                event_type: REPLICATE_HEAL_DELETE.to_string(),
+                                ..Default::default()
+                            })
+                            .await;
+                            queued_count += 1;
+                            continue;
+                        }
+                        if entry.force_delete_id.is_some() {
+                            continue;
+                        }
+
                         // Reconstruct a heal delete and re-queue it.  We do NOT call
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
@@ -990,21 +1098,25 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             delete_marker: entry.delete_marker,
                             ..Default::default()
                         };
-                        let dsc = check_replicate_delete(
-                            &entry.bucket,
-                            &ObjectToDelete {
-                                object_name: entry.object.clone(),
-                                version_id: entry.version_id,
-                                ..Default::default()
-                            },
-                            &oi,
-                            &ObjectOptions {
-                                versioned,
-                                ..Default::default()
-                            },
-                            None,
-                        )
-                        .await;
+                        let dsc = if entry.target_arns.is_empty() {
+                            check_replicate_delete(
+                                &entry.bucket,
+                                &ObjectToDelete {
+                                    object_name: entry.object.clone(),
+                                    version_id: entry.version_id,
+                                    ..Default::default()
+                                },
+                                &oi,
+                                &ObjectOptions {
+                                    versioned,
+                                    ..Default::default()
+                                },
+                                None,
+                            )
+                            .await
+                        } else {
+                            replicate_decision_for_admitted_targets(&entry.target_arns)
+                        };
                         let mut rstate = oi.replication_state();
                         rstate.replicate_decision_str = dsc.to_string();
 
@@ -1036,7 +1148,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         schedule_replication_delete(dv).await;
                         queued_count += 1;
                     }
-                    MrfOpKind::Object => {
+                    MrfOpKind::Object | MrfOpKind::Heal | MrfOpKind::ExistingObject => {
                         let opts = ObjectOptions {
                             version_id: entry.version_id.map(|u| u.to_string()),
                             ..Default::default()
@@ -1055,9 +1167,16 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 continue;
                             }
                         };
-                        // Route through queue_replication_heal so the replication decision (dsc)
-                        // is computed from the live config — required for replicate_object.
-                        queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
+                        if entry.target_arns.is_empty() {
+                            // Legacy entries predate target admission persistence. They cannot
+                            // be safely attributed, so retain the old live-config fallback.
+                            queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
+                        } else if let Some(pool) = runtime_sources::replication_pool() {
+                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+                            let mut roi = replicate_object_info_from_object_info(oi, dsc, entry.op.replication_type());
+                            roi.retry_count = entry.retry_count.max(0) as u32;
+                            let _ = pool.queue_replica_task(roi).await;
+                        }
                         queued_count += 1;
                     }
                     MrfOpKind::Metadata => {
@@ -1117,6 +1236,67 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 );
             }
         });
+        self.task_handles.lock().await.push(handle);
+    }
+
+    async fn start_force_delete_processor(&self) {
+        let storage = self.storage.clone();
+        let handle =
+            tokio::spawn(async move {
+                let data =
+                    match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(EcstoreError::ConfigNotFound) => return,
+                        Err(error) => {
+                            warn!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                error = %error,
+                                "Failed to load durable force-delete intents"
+                            );
+                            return;
+                        }
+                    };
+
+                let entries = match decode_mrf_file(&data) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            error = %error,
+                            "Failed to decode durable force-delete intents"
+                        );
+                        return;
+                    }
+                };
+
+                for entry in entries {
+                    if !should_replay_force_delete_intent(&entry) {
+                        continue;
+                    }
+                    let Some(operation_id) = entry.force_delete_id else {
+                        continue;
+                    };
+                    schedule_replication_delete(DeletedObjectReplicationInfo {
+                        delete_object: ReplicationDeletedObject {
+                            object_name: entry.object,
+                            force_delete: true,
+                            force_delete_id: Some(operation_id),
+                            force_delete_target_arns: entry.target_arns,
+                            force_delete_generation: entry.force_delete_generation,
+                            ..Default::default()
+                        },
+                        bucket: entry.bucket,
+                        op_type: ReplicationType::Heal,
+                        event_type: REPLICATE_HEAL_DELETE.to_string(),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            });
         self.task_handles.lock().await.push(handle);
     }
 
@@ -2205,7 +2385,7 @@ mod tests {
             _h: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
-            if !object.ends_with("/.replication/resync.bin") {
+            if !object.ends_with("/.replication/resync.bin") && !object.ends_with("config/replication/force-delete.bin") {
                 return Err(EcstoreError::FileNotFound);
             }
 
@@ -3093,6 +3273,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -3191,6 +3372,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
+                ..Default::default()
             },
             "test",
         )
@@ -3223,6 +3405,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
         observe_mrf_pending(&entry);
 
@@ -3278,6 +3461,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: vec!["arn:rustfs:replication:target-a".to_string()],
+            ..Default::default()
         };
 
         stats.inc_q(&entry.bucket, entry.size, false, ReplicationType::Heal);
@@ -3301,6 +3485,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -3414,6 +3599,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -3449,6 +3635,7 @@ mod tests {
             delete_marker: true,
             delete_marker_mtime: Some(mtime_nanos),
             target_arns: Vec::new(),
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -3484,6 +3671,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(&[entry]).expect("encode");
@@ -3514,6 +3702,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b".to_string(),
@@ -3527,6 +3716,7 @@ mod tests {
                 delete_marker: true,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
+                ..Default::default()
             },
         ];
 
@@ -3558,6 +3748,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
 
@@ -3574,6 +3765,7 @@ mod tests {
             delete_marker: true,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
 
@@ -3591,6 +3783,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
     }
@@ -3657,6 +3850,7 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         }];
         let encoded = encode_mrf_file(&entries).expect("durable MRF backlog should encode");
 
@@ -3705,6 +3899,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b1".to_string(),
@@ -3718,6 +3913,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: vec!["arn:target-a".to_string()],
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b1".to_string(),
@@ -3731,6 +3927,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
+                ..Default::default()
             },
         ];
 
@@ -3786,10 +3983,89 @@ mod tests {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: Vec::new(),
+            ..Default::default()
         }])
         .expect("invalid persisted entry should still encode for boundary testing");
         let invalid = durable_mrf_backlog_from_read(Ok(negative));
         assert!(!invalid.available);
         assert!(invalid.entries.is_empty());
+    }
+
+    #[test]
+    fn force_delete_replay_requires_local_commit_and_keeps_persisted_targets() {
+        let operation_id = Uuid::new_v4();
+        let pending = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "logs/".to_string(),
+            target_arns: vec!["arn:target:old-generation".to_string()],
+            force_delete_id: Some(operation_id),
+            force_delete_generation: Some(11),
+            force_delete_local_commit: false,
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        assert!(!should_replay_force_delete_intent(&pending));
+
+        let mut committed = pending;
+        committed.force_delete_local_commit = true;
+        let recovered = decode_mrf_file(&encode_mrf_file(&[committed.clone()]).expect("force-delete intent should encode"))
+            .expect("force-delete intent should decode");
+        assert!(should_replay_force_delete_intent(&recovered[0]));
+        assert_eq!(recovered[0].target_arns, vec!["arn:target:old-generation"]);
+        assert_eq!(recovered[0].force_delete_generation, Some(11));
+
+        committed.target_arns.clear();
+        assert!(!should_replay_force_delete_intent(&committed));
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_append_commit_and_cleanup_are_idempotent() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "logs/".to_string(),
+            target_arns: vec!["arn:target:stable".to_string()],
+            force_delete_id: Some(operation_id),
+            force_delete_generation: Some(12),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("first journal append should succeed");
+        persist_force_delete_intent(storage.clone(), entry)
+            .await
+            .expect("duplicate journal append should be a no-op");
+
+        let data = ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should be readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].force_delete_local_commit);
+        assert!(!should_replay_force_delete_intent(&entries[0]));
+
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("commit marker should persist");
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("duplicate commit marker should be a no-op");
+        let data = ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("committed journal should be readable");
+        let entries = decode_mrf_file(&data).expect("committed journal should decode");
+        assert!(should_replay_force_delete_intent(&entries[0]));
+        assert_eq!(entries[0].target_arns, vec!["arn:target:stable"]);
+
+        complete_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("journal cleanup should succeed");
+        complete_force_delete_intent(storage, operation_id)
+            .await
+            .expect("duplicate journal cleanup should be a no-op");
     }
 }

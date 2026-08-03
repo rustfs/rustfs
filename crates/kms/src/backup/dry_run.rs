@@ -72,6 +72,7 @@ impl From<&BackupError> for RestoreBlocker {
             BackupError::Corrupted { .. } => RestoreBlockerCode::BundleCorrupted,
             BackupError::Truncated { .. } => RestoreBlockerCode::BundleTruncated,
             BackupError::UnknownVersion { .. } => RestoreBlockerCode::UnknownFormatVersion,
+            BackupError::UnsupportedFormatVersion { .. } => RestoreBlockerCode::UnknownFormatVersion,
             BackupError::WrongKek { .. } => RestoreBlockerCode::WrongBackupKek,
             BackupError::MissingArtifact { .. } => RestoreBlockerCode::MissingArtifact,
             BackupError::IncompleteBundle { .. } => RestoreBlockerCode::IncompleteBundle,
