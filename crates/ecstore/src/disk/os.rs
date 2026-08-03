@@ -2586,12 +2586,13 @@ mod tests {
         });
         let parent_for_retry = parent.clone();
         let replacement = base.join("replacement-object");
+        let replacement_for_retry = replacement.clone();
         let replacement_source = temp_dir.path().join("replacement-source");
         let src_for_retry = src.clone();
         let replacement_source_for_retry = replacement_source.clone();
         let dst_for_retry = dst.clone();
         windows_rename_test_hooks::install_before_rename_retry(&dst, move || {
-            std::fs::rename(&parent_for_retry, &replacement)
+            std::fs::rename(&parent_for_retry, &replacement_for_retry)
                 .expect_err("the destination guard must remain held between rename attempts");
             std::fs::rename(&src_for_retry, &replacement_source_for_retry)
                 .expect_err("the source handle must remain held between rename attempts");
