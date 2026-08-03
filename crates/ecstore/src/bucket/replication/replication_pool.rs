@@ -453,7 +453,6 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
     .await
 }
 
-
 const FORCE_DELETE_INTENT_CAS_RETRIES: usize = 3;
 
 fn is_retryable_force_delete_error(error: &EcstoreError) -> bool {
