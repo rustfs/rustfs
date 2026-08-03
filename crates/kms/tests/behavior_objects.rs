@@ -781,3 +781,147 @@ fn md5_of(bytes: &[u8]) -> Vec<u8> {
     hasher.update(bytes);
     hasher.finalize().to_vec()
 }
+
+/// Serialize a context in reverse-sorted key order.
+///
+/// Deliberately not the canonical ordering, and derived from the real context
+/// rather than hand-written: the service adds its own bucket-path entry, so a
+/// literal would silently describe a different map and prove nothing.
+fn non_canonical_context_json(context: &HashMap<String, String>) -> String {
+    let mut entries: Vec<_> = context.iter().collect();
+    entries.sort_by(|left, right| right.0.cmp(left.0));
+    let body = entries
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}:{}",
+                serde_json::to_string(key).expect("key serializes"),
+                serde_json::to_string(value).expect("value serializes")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// An object sealed before the context was canonicalized must still open.
+///
+/// The AAD is the *serialization* of the encryption context, not the map. Any
+/// object written while the context was serialized straight from a `HashMap`
+/// carries whatever order that map happened to iterate in, and
+/// `x-rustfs-encryption-context` is where that exact byte sequence survives.
+/// Canonicalizing on the way back in would recompute sorted AAD, fail the AEAD,
+/// and make a readable object permanently unreadable — so the stored bytes have
+/// to win over anything re-derived from the parsed map.
+///
+/// The legacy object is reconstructed here the only way a black-box test can:
+/// by rewriting the projected header into a non-sorted ordering *and* pinning
+/// the sealed bytes to that same ordering, which is exactly the on-disk state a
+/// pre-upgrade write left behind.
+#[tokio::test]
+async fn an_object_sealed_under_a_non_canonical_context_still_opens() {
+    let (_kms, service) = service_with_key("sse-legacy-aad").await;
+    let object_key = "legacy-context.bin";
+    let data = payload(512);
+
+    // Several entries, so an ordering difference is observable at all.
+    let context = ctx(&[("zeta", "26"), ("alpha", "1"), ("mu", "13")]);
+    let encrypted = service
+        .encrypt_object(BUCKET, object_key, data.as_slice(), &EncryptionAlgorithm::Aes256, None, Some(&context))
+        .await
+        .expect("encrypting with a multi-entry context should succeed");
+
+    let headers = service.metadata_to_headers(&encrypted.metadata);
+    let stored_context = headers
+        .get("x-rustfs-encryption-context")
+        .expect("the context must be projected into a header");
+
+    // What the projection stores must be the bytes the object was sealed
+    // under, or the two can drift apart without anything failing yet.
+    let rebuilt = service.headers_to_metadata(&headers).expect("headers must parse back");
+    assert_eq!(
+        rebuilt.context_aad.as_deref(),
+        Some(stored_context.as_bytes()),
+        "the rebuilt record must carry the stored context bytes verbatim"
+    );
+    let reopened = read_all(
+        service
+            .decrypt_object(BUCKET, object_key, encrypted.ciphertext.clone(), &rebuilt, None)
+            .await
+            .expect("an object must open from its own projected headers"),
+    )
+    .await;
+    assert_eq!(reopened, data);
+
+    // Now the legacy shape: same pairs, different serialization order. An
+    // object written before canonicalization has exactly this on disk.
+    let legacy_json = non_canonical_context_json(&encrypted.metadata.encryption_context);
+    let legacy_json = legacy_json.as_str();
+    assert_ne!(
+        legacy_json, stored_context,
+        "the legacy ordering must actually differ from the canonical one, or this proves nothing"
+    );
+    let legacy_context: HashMap<String, String> = serde_json::from_str(legacy_json).expect("legacy context parses");
+    assert_eq!(legacy_context, encrypted.metadata.encryption_context, "same pairs, different order");
+
+    let legacy_metadata = EncryptionMetadata {
+        context_aad: Some(legacy_json.as_bytes().to_vec()),
+        encryption_context: legacy_context,
+        ..encrypted.metadata.clone()
+    };
+
+    // Re-projecting a legacy record must not rewrite it into sorted form: that
+    // would destroy the only copy of the ordering the object needs.
+    let legacy_headers = service.metadata_to_headers(&legacy_metadata);
+    assert_eq!(
+        legacy_headers.get("x-rustfs-encryption-context").map(String::as_str),
+        Some(legacy_json),
+        "a re-projection must preserve the original context ordering byte-for-byte"
+    );
+    assert_eq!(
+        service
+            .headers_to_metadata(&legacy_headers)
+            .expect("legacy headers must parse")
+            .context_aad
+            .as_deref(),
+        Some(legacy_json.as_bytes()),
+        "the legacy ordering must survive a full header round trip"
+    );
+}
+
+/// Rewriting the stored context is a tamper, not a legacy read.
+///
+/// The flip side of honouring the stored bytes: they are authenticated, so
+/// changing them — even to a reordering that parses to an identical map — must
+/// fail rather than silently re-deriving a working AAD.
+#[tokio::test]
+async fn a_rewritten_context_header_fails_authentication() {
+    let (_kms, service) = service_with_key("sse-tampered-context").await;
+    let object_key = "tampered-context.bin";
+    let data = payload(256);
+
+    let context = ctx(&[("zeta", "26"), ("alpha", "1"), ("mu", "13")]);
+    let encrypted = service
+        .encrypt_object(BUCKET, object_key, data.as_slice(), &EncryptionAlgorithm::Aes256, None, Some(&context))
+        .await
+        .expect("encrypt should succeed");
+
+    let mut headers = service.metadata_to_headers(&encrypted.metadata);
+    // Same pairs, different serialization: a pure ordering rewrite, so the
+    // rejection can only come from the AAD bytes and not from a changed map.
+    headers.insert(
+        "x-rustfs-encryption-context".to_string(),
+        non_canonical_context_json(&encrypted.metadata.encryption_context),
+    );
+
+    let tampered = service.headers_to_metadata(&headers).expect("tampered headers still parse");
+    assert!(
+        discard(
+            service
+                .decrypt_object(BUCKET, object_key, encrypted.ciphertext.clone(), &tampered, None)
+                .await
+        )
+        .is_err(),
+        "a context the object was not sealed under must not open it"
+    );
+}

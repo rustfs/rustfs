@@ -1482,6 +1482,13 @@ impl LocalKmsClient {
         // Parse the data key envelope from ciphertext
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
 
+        // NOTE: this comparison is an authorization check, not a cryptographic
+        // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
+        // rides in the envelope unauthenticated: anyone able to rewrite the
+        // stored envelope can rewrite this field and present a matching context.
+        // The Static and Vault Transit backends do bind it (as AEAD AAD and as
+        // the Transit KDF context respectively); closing the gap here needs a
+        // versioned envelope, since existing ciphertext was sealed without AAD.
         // Verify encryption context matches
         // Check that all keys in envelope.encryption_context are present in request.encryption_context
         // and their values match. This ensures the context used for decryption matches what was used for encryption.

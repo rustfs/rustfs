@@ -508,6 +508,9 @@ impl ObjectEncryptionService {
             tag: Some(tag),
             encryption_context: context,
             encrypted_at: Zoned::now(),
+            // Pinned to the bytes actually fed to the AEAD, so the projection
+            // below can store them verbatim instead of re-deriving them.
+            context_aad: Some(aad),
             original_size,
             encrypted_data_key: data_key.ciphertext_blob,
         };
@@ -568,7 +571,13 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;
 
         // Build AAD from encryption context
-        let aad = context_aad(&metadata.encryption_context)?;
+        // Prefer the bytes the object was sealed under. Deriving them from the
+        // parsed map would re-order a pre-canonicalization context and fail the
+        // AEAD on an object that is otherwise perfectly readable.
+        let aad = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context)?,
+        };
 
         // Get tag from metadata
         let tag = metadata
@@ -658,6 +667,9 @@ impl ObjectEncryptionService {
             tag: Some(tag),
             encryption_context: context,
             encrypted_at: Zoned::now(),
+            // Pinned to the bytes actually fed to the AEAD, so the projection
+            // below can store them verbatim instead of re-deriving them.
+            context_aad: Some(aad),
             original_size,
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
@@ -712,7 +724,13 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, customer_key)?;
 
         // Build AAD from encryption context
-        let aad = context_aad(&metadata.encryption_context)?;
+        // Prefer the bytes the object was sealed under. Deriving them from the
+        // parsed map would re-order a pre-canonicalization context and fail the
+        // AEAD on an object that is otherwise perfectly readable.
+        let aad = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context)?,
+        };
 
         // Get tag from metadata
         let tag = metadata
@@ -805,9 +823,16 @@ impl ObjectEncryptionService {
             base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
         );
 
+        // Whatever the object was sealed under is what gets stored: for a
+        // pre-canonicalization object that is its original ordering, which must
+        // survive a re-projection rather than being rewritten into sorted form.
+        let context_bytes = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context).unwrap_or_default(),
+        };
         headers.insert(
             "x-rustfs-encryption-context".to_string(),
-            serde_json::to_string(&metadata.encryption_context).unwrap_or_default(),
+            String::from_utf8_lossy(&context_bytes).into_owned(),
         );
 
         headers
@@ -875,11 +900,17 @@ impl ObjectEncryptionService {
             Vec::new() // Empty for SSE-C
         };
 
-        let encryption_context = if let Some(context_str) = headers.get("x-rustfs-encryption-context") {
-            serde_json::from_str(context_str)
-                .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?
-        } else {
-            HashMap::new()
+        // The stored string is the AAD verbatim. It is parsed into a map for
+        // callers that inspect the context, but the bytes are carried through
+        // untouched: re-serializing the parsed map is exactly how the original
+        // ordering — and with it the ability to open the object — was lost.
+        let (encryption_context, context_aad) = match headers.get("x-rustfs-encryption-context") {
+            Some(context_str) => (
+                serde_json::from_str(context_str)
+                    .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?,
+                Some(context_str.as_bytes().to_vec()),
+            ),
+            None => (HashMap::new(), None),
         };
 
         Ok(EncryptionMetadata {
@@ -892,6 +923,7 @@ impl ObjectEncryptionService {
             encrypted_at: Zoned::now(),
             original_size: 0, // Not available from headers
             encrypted_data_key,
+            context_aad,
         })
     }
 }
@@ -1008,6 +1040,8 @@ mod tests {
             encrypted_at: Zoned::now(),
             original_size: 100,
             encrypted_data_key: vec![1, 2, 3, 4],
+            // A hand-built record with no sealed bytes to defer to.
+            context_aad: None,
         };
 
         // Convert to headers

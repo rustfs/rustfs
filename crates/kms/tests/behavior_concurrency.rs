@@ -284,6 +284,30 @@ async fn lifecycle_churn_against_live_traffic_stays_coherent() {
     }
     assert_eq!(total, 4 * 40, "every request must be accounted for");
 
+    // The totals above say nothing about the state gate on their own: if the
+    // disable/enable loop happens to fall entirely between request windows,
+    // every request succeeds and the count still balances — and an
+    // implementation that refused everything would balance too. Asserting
+    // `refused > 0` on the concurrent phase would only trade that hole for a
+    // scheduling-dependent flake, so both branches are pinned deterministically
+    // here instead. Removing the state gate, or breaking progress in the
+    // enabled state, now fails this test.
+    let gated_request = || GenerateDataKeyRequest {
+        key_id: key_id.clone(),
+        key_spec: KeySpec::Aes256,
+        encryption_context: context(),
+    };
+
+    manager.disable_key(&key_id).await.expect("disable for the gated check");
+    assert_invalid_operation(manager.generate_data_key(gated_request()).await, "is disabled");
+
+    manager.enable_key(&key_id).await.expect("enable for the gated check");
+    let after_enable = manager
+        .generate_data_key(gated_request())
+        .await
+        .expect("an enabled key must generate again after the churn");
+    assert_eq!(after_enable.plaintext_key.len(), 32, "the post-churn key must be well formed");
+
     // The key survives the churn in a well-defined state.
     manager.enable_key(&key_id).await.expect("final enable");
     assert_eq!(
