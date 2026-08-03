@@ -1822,6 +1822,17 @@ pub(crate) fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogS
     table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
 }
 
+fn ensure_service_managed_table_warehouse(entry: &TableEntry) -> TableCatalogStoreResult<()> {
+    let warehouse_object_prefix = table_warehouse_object_prefix(entry)?;
+    let service_managed_prefix = format!("tables/{}/", entry.table_id);
+    if warehouse_object_prefix != service_managed_prefix {
+        return Err(TableCatalogStoreError::Unsupported(
+            "table maintenance requires a RustFS-managed warehouse location".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn table_warehouse_index_entry(entry: &TableEntry) -> TableCatalogStoreResult<TableWarehouseIndexEntry> {
     Ok(TableWarehouseIndexEntry {
         version: TABLE_CATALOG_ENTRY_VERSION,
@@ -3552,13 +3563,10 @@ where
         snapshot: StrongTableCatalogSnapshot,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
-        // Keep readers behind the state lock until durable publication finishes. Marking the
-        // cache stale first also makes cancellation at any persistence await recover by reload.
-        let mut state = self.state.lock().await;
-        state.hydrated = false;
-        let result = self.persist_snapshot(snapshot, precondition).await;
-        drop(state);
-        result
+        // A stale cache is recoverable from the durable snapshot after cancellation. Readers may
+        // continue from the previous snapshot while the conditional PUT is still in flight.
+        self.state.lock().await.hydrated = false;
+        self.persist_snapshot(snapshot, precondition).await
     }
 
     async fn materialize_bucket_snapshot(
@@ -5817,13 +5825,31 @@ where
         &self,
         entry: &TableEntry,
         reservation: WarehouseIndexReservation,
+        ownership_guard: Option<&dyn TableCatalogObjectLockGuard>,
         reason: &'static str,
     ) {
         if reservation != WarehouseIndexReservation::Created {
             return;
         }
         let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
-        if let Err(err) = self.delete_table_warehouse_index(entry).await {
+        let result = if let Some(ownership_guard) = ownership_guard {
+            self.delete_created_table_warehouse_index_ownership_locked(entry, ownership_guard, reason)
+                .await
+        } else {
+            let ownership_lock_path = self.paths.warehouse_index_ownership_lock_path(&entry.table_bucket);
+            match self
+                .backend
+                .acquire_write_lock(self.catalog_bucket(), &ownership_lock_path)
+                .await
+            {
+                Ok(ownership_guard) => {
+                    self.delete_created_table_warehouse_index_ownership_locked(entry, ownership_guard.as_ref(), reason)
+                        .await
+                }
+                Err(err) => Err(err),
+            }
+        };
+        if let Err(err) = result {
             tracing::warn!(
                 table_bucket = %entry.table_bucket,
                 namespace = %entry.namespace,
@@ -5835,6 +5861,29 @@ where
                 "failed to roll back table warehouse index reservation"
             );
         }
+    }
+
+    async fn delete_created_table_warehouse_index_ownership_locked(
+        &self,
+        entry: &TableEntry,
+        ownership_guard: &dyn TableCatalogObjectLockGuard,
+        reason: &'static str,
+    ) -> TableCatalogStoreResult<()> {
+        ensure_table_catalog_lock_held(ownership_guard)?;
+        let index = table_warehouse_index_entry(entry)?;
+        if self.warehouse_index_entry_has_active_owner_unlocked(&index).await? {
+            return Ok(());
+        }
+        ensure_table_catalog_lock_held(ownership_guard)?;
+        self.delete_warehouse_index_object(
+            &self
+                .paths
+                .warehouse_index_entry_path(&index.table_bucket, &index.warehouse_object_prefix),
+            &index,
+            reason,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn delete_table_warehouse_index(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
@@ -6159,7 +6208,13 @@ where
             ensure_table_catalog_lock_held(table_guard.as_ref())?;
             ensure_table_catalog_lock_held(view_guard.as_ref())?;
             self.write_entry_unlocked(self.catalog_bucket(), &table_path, &entry, precondition)
-                .await
+                .await?;
+            ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+            ensure_table_catalog_lock_held(ownership_guard.as_ref())?;
+            ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
+            ensure_table_catalog_lock_held(table_guard.as_ref())?;
+            ensure_table_catalog_lock_held(view_guard.as_ref())?;
+            Ok(())
         }
         .await;
         if result.is_err() {
@@ -6167,7 +6222,11 @@ where
                 self.rollback_materialized_namespace(&entry.table_bucket, &namespace, &namespace_path, namespace_guard.as_ref())
                     .await;
             }
-            self.delete_created_table_warehouse_index(&entry, reservation, "table entry write failed")
+            drop(view_guard);
+            drop(table_guard);
+            drop(namespace_guard);
+            drop(ownership_guard);
+            self.delete_created_table_warehouse_index(&entry, reservation, None, "table entry write failed")
                 .await;
         }
         result
@@ -6254,7 +6313,12 @@ where
             ensure_table_catalog_lock_held(table_guard.as_ref())?;
             ensure_table_catalog_lock_held(view_guard.as_ref())?;
             self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition)
-                .await
+                .await?;
+            ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+            ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
+            ensure_table_catalog_lock_held(table_guard.as_ref())?;
+            ensure_table_catalog_lock_held(view_guard.as_ref())?;
+            Ok(())
         }
         .await;
         if result.is_err() && materialize_namespace {
@@ -6321,34 +6385,16 @@ where
         let identity_path = self
             .paths
             .external_catalog_bridge_identity_path(table_bucket, &namespace, &table);
-        let identity_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &identity_path).await?;
+        let identity_guard = self.backend.acquire_read_lock(self.catalog_bucket(), &identity_path).await?;
         let identity = self
             .read_entry_unlocked::<ExternalCatalogBridgeIdentityEntry>(self.catalog_bucket(), &identity_path)
             .await?
             .map(|(identity, _)| identity);
-        let identity = match identity {
-            Some(identity) => identity,
-            None => {
-                let identity = ExternalCatalogBridgeIdentityEntry {
-                    version: TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION,
-                    table_bucket: table_bucket.to_string(),
-                    namespace: namespace.public_name(),
-                    table: table.as_str().to_string(),
-                    table_id: current.table_id.clone(),
-                };
-                ensure_table_catalog_lock_held(table_guard.as_ref())?;
-                ensure_table_catalog_lock_held(bridge_guard.as_ref())?;
-                ensure_table_catalog_lock_held(identity_guard.as_ref())?;
-                self.write_entry_unlocked(
-                    self.catalog_bucket(),
-                    &identity_path,
-                    &identity,
-                    TableCatalogPutPrecondition::IfAbsent,
-                )
-                .await?;
-                identity
-            }
-        };
+        let identity = identity.ok_or_else(|| {
+            TableCatalogStoreError::Conflict(
+                "external catalog bridge identity is missing; resync the bridge before use".to_string(),
+            )
+        })?;
         if bridge.version != TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION
             || bridge.table_bucket != table_bucket
             || bridge.namespace != namespace.public_name()
@@ -6428,6 +6474,10 @@ where
         ensure_table_catalog_lock_held(identity_guard.as_ref())?;
         self.write_entry_unlocked(self.catalog_bucket(), &identity_path, &identity, TableCatalogPutPrecondition::Any)
             .await?;
+        ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+        ensure_table_catalog_lock_held(table_guard.as_ref())?;
+        ensure_table_catalog_lock_held(bridge_guard.as_ref())?;
+        ensure_table_catalog_lock_held(identity_guard.as_ref())?;
         Ok(entry)
     }
 
@@ -7890,6 +7940,7 @@ where
                 "current metadata location must be inside the table metadata directory".to_string(),
             ));
         }
+        ensure_service_managed_table_warehouse(&entry)?;
         self.backfill_table_warehouse_index(table_bucket).await?;
 
         let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
@@ -7942,6 +7993,7 @@ where
                 "current metadata location must be inside the table metadata directory".to_string(),
             ));
         }
+        ensure_service_managed_table_warehouse(&entry)?;
         self.backfill_table_warehouse_index(table_bucket).await?;
 
         let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
@@ -7986,6 +8038,7 @@ where
                 "current metadata location must be inside the table metadata directory".to_string(),
             ));
         }
+        ensure_service_managed_table_warehouse(&entry)?;
 
         let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -8687,6 +8740,7 @@ where
                 "current metadata location must be inside the table metadata directory".to_string(),
             ));
         }
+        ensure_service_managed_table_warehouse(&entry)?;
         self.backfill_table_warehouse_index(table_bucket).await?;
         self.ensure_table_warehouse_prefix_available(&entry).await?;
         self.ensure_table_warehouse_index_owner(&entry).await?;
@@ -9466,7 +9520,10 @@ where
         ensure_table_catalog_lock_held(migration_guard.as_ref())?;
         ensure_table_catalog_lock_held(guard.as_ref())?;
         self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::Any)
-            .await
+            .await?;
+        ensure_table_catalog_lock_held(registry_guard.as_ref())?;
+        ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+        ensure_table_catalog_lock_held(guard.as_ref())
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
@@ -9496,7 +9553,10 @@ where
         ensure_table_catalog_lock_held(bucket_guard.as_ref())?;
         ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
         self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, precondition)
-            .await
+            .await?;
+        ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+        ensure_table_catalog_lock_held(bucket_guard.as_ref())?;
+        ensure_table_catalog_lock_held(namespace_guard.as_ref())
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
@@ -9608,7 +9668,10 @@ where
         ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
         self.backend
             .delete_object_unlocked(self.catalog_bucket(), &namespace_path)
-            .await
+            .await?;
+        ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+        ensure_table_catalog_lock_held(bucket_guard.as_ref())?;
+        ensure_table_catalog_lock_held(namespace_guard.as_ref())
     }
 
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
@@ -10107,8 +10170,13 @@ where
             .await;
             if let Err(err) = staged_write_result {
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "commit staging failed")
-                        .await;
+                    self.delete_created_table_warehouse_index(
+                        &next,
+                        reservation,
+                        ownership_guard.as_deref(),
+                        "commit staging failed",
+                    )
+                    .await;
                 }
                 return table_commit_result(
                     &request.table_bucket,
@@ -10124,8 +10192,13 @@ where
             let cas_started = Instant::now();
             if let Err(err) = ensure_table_catalog_lock_held(table_guard.as_ref()) {
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "table lock lost before pointer CAS")
-                        .await;
+                    self.delete_created_table_warehouse_index(
+                        &next,
+                        reservation,
+                        ownership_guard.as_deref(),
+                        "table lock lost before pointer CAS",
+                    )
+                    .await;
                 }
                 return table_commit_result(
                     &request.table_bucket,
@@ -10139,8 +10212,13 @@ where
             }
             if let Err(err) = ensure_table_catalog_lock_held(metadata_guard.as_ref()) {
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "metadata lock lost before pointer CAS")
-                        .await;
+                    self.delete_created_table_warehouse_index(
+                        &next,
+                        reservation,
+                        ownership_guard.as_deref(),
+                        "metadata lock lost before pointer CAS",
+                    )
+                    .await;
                 }
                 return table_commit_result(
                     &request.table_bucket,
@@ -10156,8 +10234,13 @@ where
                 && let Err(err) = ensure_table_catalog_lock_held(current_metadata_guard)
             {
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "base metadata lock lost before pointer CAS")
-                        .await;
+                    self.delete_created_table_warehouse_index(
+                        &next,
+                        reservation,
+                        ownership_guard.as_deref(),
+                        "base metadata lock lost before pointer CAS",
+                    )
+                    .await;
                 }
                 return table_commit_result(
                     &request.table_bucket,
@@ -10171,8 +10254,13 @@ where
             }
             if let Err(err) = ensure_table_catalog_lock_held(migration_guard.as_ref()) {
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "catalog migration lock lost")
-                        .await;
+                    self.delete_created_table_warehouse_index(
+                        &next,
+                        reservation,
+                        ownership_guard.as_deref(),
+                        "catalog migration lock lost",
+                    )
+                    .await;
                 }
                 return table_commit_result(
                     &request.table_bucket,
@@ -10184,11 +10272,13 @@ where
                     Err(err),
                 );
             }
-            if let Some(ownership_guard) = ownership_guard.as_deref()
-                && let Err(err) = ensure_table_catalog_lock_held(ownership_guard)
-            {
+            let ownership_lock_error = ownership_guard
+                .as_deref()
+                .and_then(|ownership_guard| ensure_table_catalog_lock_held(ownership_guard).err());
+            if let Some(err) = ownership_lock_error {
+                drop(ownership_guard.take());
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "warehouse ownership lock lost")
+                    self.delete_created_table_warehouse_index(&next, reservation, None, "warehouse ownership lock lost")
                         .await;
                 }
                 return table_commit_result(
@@ -10212,9 +10302,34 @@ where
             record_table_commit_cas_result(&request.operation, cas_started, &cas_result);
             if let Err(err) = cas_result {
                 if let Some(reservation) = reservation {
-                    self.delete_created_table_warehouse_index(&next, reservation, "table pointer CAS failed")
-                        .await;
+                    self.delete_created_table_warehouse_index(
+                        &next,
+                        reservation,
+                        ownership_guard.as_deref(),
+                        "table pointer CAS failed",
+                    )
+                    .await;
                 }
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Err(err),
+                );
+            }
+            let post_cas_fence = ensure_table_catalog_lock_held(table_guard.as_ref())
+                .and_then(|_| ensure_table_catalog_lock_held(metadata_guard.as_ref()))
+                .and_then(|_| {
+                    current_metadata_guard
+                        .as_deref()
+                        .map_or(Ok(()), ensure_table_catalog_lock_held)
+                })
+                .and_then(|_| ensure_table_catalog_lock_held(migration_guard.as_ref()))
+                .and_then(|_| ownership_guard.as_deref().map_or(Ok(()), ensure_table_catalog_lock_held));
+            if let Err(err) = post_cas_fence {
                 return table_commit_result(
                     &request.table_bucket,
                     &request.namespace,
@@ -10283,44 +10398,78 @@ where
         ensure_table_catalog_lock_held(table_guard.as_ref())?;
         self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await?;
         if let Err(err) = self.delete_table_warehouse_index(&entry).await {
+            ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+            ensure_table_catalog_lock_held(ownership_guard.as_ref())?;
+            ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
+            ensure_table_catalog_lock_held(table_guard.as_ref())?;
+            self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::IfAbsent)
+                .await
+                .map_err(|restore_err| {
+                    TableCatalogStoreError::Internal(format!(
+                        "failed to delete table warehouse index ({err}) and failed to restore the table entry ({restore_err})"
+                    ))
+                })?;
+            return Err(err);
+        }
+        let bridge_cleanup = ensure_table_catalog_lock_held(bridge_guard.as_ref())
+            .and_then(|_| ensure_table_catalog_lock_held(migration_guard.as_ref()));
+        let bridge_deleted = match bridge_cleanup {
+            Ok(()) => match self.backend.delete_object_unlocked(self.catalog_bucket(), &bridge_path).await {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(
+                        table_bucket = %entry.table_bucket,
+                        namespace = %entry.namespace,
+                        table = %entry.table,
+                        table_id = %entry.table_id,
+                        object = %bridge_path,
+                        error = %err,
+                        "failed to clean up a stale external catalog bridge after dropping table"
+                    );
+                    false
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    table_bucket = %entry.table_bucket,
+                    namespace = %entry.namespace,
+                    table = %entry.table,
+                    table_id = %entry.table_id,
+                    object = %bridge_path,
+                    error = %err,
+                    "skipped stale external catalog bridge cleanup after dropping table"
+                );
+                false
+            }
+        };
+        if bridge_deleted
+            && let Err(err) = ensure_table_catalog_lock_held(identity_guard.as_ref())
+                .and_then(|_| ensure_table_catalog_lock_held(migration_guard.as_ref()))
+        {
             tracing::warn!(
                 table_bucket = %entry.table_bucket,
                 namespace = %entry.namespace,
                 table = %entry.table,
                 table_id = %entry.table_id,
+                object = %identity_path,
                 error = %err,
-                "failed to clean up stale table warehouse index after dropping table"
+                "skipped stale external catalog bridge identity cleanup after dropping table"
             );
-        }
-        for (path, guard) in [
-            (&bridge_path, bridge_guard.as_ref()),
-            (&identity_path, identity_guard.as_ref()),
-        ] {
-            if let Err(err) =
-                ensure_table_catalog_lock_held(guard).and_then(|_| ensure_table_catalog_lock_held(migration_guard.as_ref()))
-            {
-                tracing::warn!(
-                    table_bucket = %entry.table_bucket,
-                    namespace = %entry.namespace,
-                    table = %entry.table,
-                    table_id = %entry.table_id,
-                    object = %path,
-                    error = %err,
-                    "skipped stale external catalog bridge cleanup after dropping table"
-                );
-                continue;
-            }
-            if let Err(err) = self.backend.delete_object_unlocked(self.catalog_bucket(), path).await {
-                tracing::warn!(
-                    table_bucket = %entry.table_bucket,
-                    namespace = %entry.namespace,
-                    table = %entry.table,
-                    table_id = %entry.table_id,
-                    object = %path,
-                    error = %err,
-                    "failed to clean up a stale external catalog bridge after dropping table"
-                );
-            }
+        } else if bridge_deleted
+            && let Err(err) = self
+                .backend
+                .delete_object_unlocked(self.catalog_bucket(), &identity_path)
+                .await
+        {
+            tracing::warn!(
+                table_bucket = %entry.table_bucket,
+                namespace = %entry.namespace,
+                table = %entry.table,
+                table_id = %entry.table_id,
+                object = %identity_path,
+                error = %err,
+                "failed to clean up a stale external catalog bridge identity after dropping table"
+            );
         }
         Ok(())
     }
@@ -10473,6 +10622,10 @@ where
             TableCatalogPutPrecondition::IfMatch(current_etag),
         )
         .await?;
+        ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+        ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
+        ensure_table_catalog_lock_held(view_guard.as_ref())?;
+        ensure_table_catalog_lock_held(metadata_guard.as_ref())?;
         Ok(ViewCommitResult { view: next })
     }
 
@@ -10499,7 +10652,10 @@ where
         ensure_table_catalog_lock_held(migration_guard.as_ref())?;
         ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
         ensure_table_catalog_lock_held(view_guard.as_ref())?;
-        self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await
+        self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await?;
+        ensure_table_catalog_lock_held(migration_guard.as_ref())?;
+        ensure_table_catalog_lock_held(namespace_guard.as_ref())?;
+        ensure_table_catalog_lock_held(view_guard.as_ref())
     }
 
     async fn get_commit_by_id(
@@ -11127,10 +11283,11 @@ where
             .map_err(|_| TableCatalogStoreError::Internal("catalog list limit exceeds storage API range".to_string()))?;
 
         loop {
+            let previous_continuation = continuation.clone();
             let result = self
                 .store
                 .clone()
-                .list_objects_v2(bucket, prefix, continuation, None, max_keys, false, None, false)
+                .list_objects_v2(bucket, prefix, continuation.take(), None, max_keys, false, None, false)
                 .await
                 .map_err(|err| storage_error_to_catalog("list catalog objects", err))?;
 
@@ -11142,9 +11299,19 @@ where
                 break;
             }
 
-            let Some(next) = result.next_continuation_token else {
-                break;
-            };
+            let next = result
+                .next_continuation_token
+                .filter(|next| !next.is_empty())
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Internal(
+                        "storage returned a truncated catalog listing without a continuation token".to_string(),
+                    )
+                })?;
+            if previous_continuation.as_deref() == Some(next.as_str()) {
+                return Err(TableCatalogStoreError::Internal(
+                    "storage repeated a catalog listing continuation token".to_string(),
+                ));
+            }
             continuation = Some(next);
         }
 
@@ -15036,8 +15203,10 @@ pub(crate) fn validate_table_warehouse_relocation(
     if next_warehouse_location == entry.warehouse_location {
         return Ok(());
     }
-    table_metadata_dir_path_for_entry(entry)?;
-    Ok(())
+    Err(TableCatalogStoreError::Invalid(
+        "table warehouse relocation is unsupported because retained snapshots may still reference the current warehouse"
+            .to_string(),
+    ))
 }
 
 pub(crate) fn is_valid_table_metadata_location_for_entry(entry: &TableEntry, metadata_location: &str) -> bool {
@@ -17103,6 +17272,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_maintenance_rejects_external_warehouse_locations() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        let mut entry = test_table_entry(bucket, &namespace, &table, current);
+        entry.warehouse_location = format!("s3://{bucket}/external/orders");
+        store.create_table(entry).await.unwrap();
+
+        let error = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect_err("background maintenance must not use internal authority for an external warehouse");
+
+        assert!(matches!(error, TableCatalogStoreError::Unsupported(_)));
+        assert!(error.to_string().contains("RustFS-managed warehouse"));
+    }
+
+    #[tokio::test]
     async fn maintenance_planning_rejects_missing_or_mismatched_table_uuid() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -17328,7 +17523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warehouse_relocation_reservation_denies_access_until_table_cas() {
+    async fn warehouse_relocation_is_rejected_before_index_reservation() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
@@ -17350,63 +17545,40 @@ mod tests {
                 .unwrap(),
             )
             .await;
-        let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
         let relocated_index_path = store.paths.warehouse_index_entry_path(bucket, relocated_prefix);
-        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &table_path).await;
-        let commit_store = store.clone();
-        let namespace_name = namespace.public_name();
-        let table_name = table.as_str().to_string();
-        let current_for_commit = current.clone();
-        let next_for_commit = next.clone();
-        let commit = tokio::spawn(async move {
-            commit_store
-                .commit_table(TableCommitRequest {
-                    table_bucket: bucket.to_string(),
-                    namespace: namespace_name,
-                    table: table_name,
-                    commit_id: "relocate-commit".to_string(),
-                    idempotency_key: None,
-                    operation: "set-location".to_string(),
-                    expected_version_token: "token-v1".to_string(),
-                    expected_metadata_location: current_for_commit,
-                    new_metadata_location: next_for_commit,
-                    requirements: Vec::new(),
-                    writer: Some("test".to_string()),
-                })
-                .await
-        });
-        pause.wait_started().await;
-
-        assert!(
-            backend
-                .object_exists(RUSTFS_META_BUCKET, &relocated_index_path)
-                .await
-                .unwrap()
-        );
-        let pending_error =
-            table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
-                .await
-                .expect_err("a reservation without the matching table pointer must fail closed");
-        assert_matches!(
-            pending_error,
-            TableCatalogStoreError::Internal(message) if message.contains("different warehouse prefix")
-        );
-        assert!(
-            backend
-                .object_exists(RUSTFS_META_BUCKET, &relocated_index_path)
-                .await
-                .unwrap()
-        );
-
-        pause.release();
-        let committed = commit.await.unwrap().expect("relocation commit should complete");
-        assert_eq!(committed.table.metadata_location, next);
-        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
+        let error = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "relocate-commit".to_string(),
+                idempotency_key: None,
+                operation: "set-location".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current.clone(),
+                new_metadata_location: next,
+                requirements: Vec::new(),
+                writer: Some("test".to_string()),
+            })
             .await
-            .expect("committed relocation should resolve")
-            .expect("relocated object should have a table owner");
-        assert_eq!(resource.table_id, "table-id");
-        assert_eq!(resource.warehouse_object_prefix, relocated_prefix);
+            .expect_err("warehouse relocation must remain unsupported while retained snapshots use the old prefix");
+
+        assert_matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("relocation is unsupported"));
+        assert!(
+            !backend
+                .object_exists(RUSTFS_META_BUCKET, &relocated_index_path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_table(bucket, "sales", "orders")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata_location,
+            current
+        );
     }
 
     #[tokio::test]
@@ -24985,7 +25157,7 @@ mod tests {
 
             let err = store.register_table(overlapping).await.unwrap_err();
 
-            assert_matches!(err, TableCatalogStoreError::Conflict(_));
+            assert_matches!(err, TableCatalogStoreError::Invalid(message) if message.contains("relocation is unsupported"));
             assert!(store.load_table(bucket, "sales", "customers").await.unwrap().is_none());
         }
     }
@@ -25261,7 +25433,7 @@ mod tests {
                 .await
                 .expect_err("external table warehouse relocation should be rejected");
 
-            assert_matches!(error, TableCatalogStoreError::Unsupported(_));
+            assert_matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("relocation is unsupported"));
             let loaded = store
                 .load_table(bucket, &namespace.public_name(), table.as_str())
                 .await
@@ -25673,73 +25845,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_table_catalog_store_does_not_commit_after_warehouse_ownership_lock_loss() {
-        let backend = TestCatalogObjectBackend::default();
-        let store = ObjectTableCatalogStore::new(backend.clone());
-        let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
-
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
-        store
-            .create_namespace(test_namespace_entry(bucket, &namespace))
-            .await
-            .unwrap();
-        store
-            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
-            .await
-            .unwrap();
-        store.backfill_table_warehouse_index(bucket).await.unwrap();
-        backend
-            .seed_object(
-                bucket,
-                &new_metadata,
-                serde_json::to_vec(&serde_json::json!({
-                    "location": "s3://analytics/tables/relocated-table-id",
-                    "table-uuid": "table-uuid"
-                }))
-                .unwrap(),
-            )
-            .await;
-        backend
-            .lose_next_write_lock(store.catalog_bucket(), &store.paths.warehouse_index_ownership_lock_path(bucket))
-            .await;
-
-        let error = store
-            .commit_table(TableCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                commit_id: "commit-lock-loss".to_string(),
-                idempotency_key: None,
-                operation: "set-location".to_string(),
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: current_metadata.clone(),
-                new_metadata_location: new_metadata,
-                requirements: Vec::new(),
-                writer: Some("pyiceberg/test".to_string()),
-            })
-            .await
-            .expect_err("a lost warehouse ownership lock must prevent the table CAS");
-
-        assert_matches!(
-            error,
-            TableCatalogStoreError::Conflict(message) if message.contains("lock lease was lost")
-        );
-        let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
-        assert_eq!(loaded.metadata_location, current_metadata);
-        assert!(
-            store
-                .get_commit_by_id(bucket, "table-id", "commit-lock-loss")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
     async fn object_table_catalog_store_does_not_commit_after_migration_permit_loss() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -25885,152 +25990,6 @@ mod tests {
                 current_metadata
             );
         }
-    }
-
-    #[tokio::test]
-    async fn object_table_catalog_store_syncs_warehouse_location_from_committed_metadata() {
-        let backend = TestCatalogObjectBackend::default();
-        let store = ObjectTableCatalogStore::new(backend.clone());
-        let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
-
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
-        store
-            .create_namespace(test_namespace_entry(bucket, &namespace))
-            .await
-            .unwrap();
-        store
-            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
-            .await
-            .unwrap();
-        store.backfill_table_warehouse_index(bucket).await.unwrap();
-        backend.reset_call_counts().await;
-        backend
-            .seed_object(
-                bucket,
-                &new_metadata,
-                serde_json::to_vec(&serde_json::json!({
-                    "location": "s3://analytics/tables/relocated-table-id",
-                    "table-uuid": "table-uuid"
-                }))
-                .unwrap(),
-            )
-            .await;
-
-        let result = store
-            .commit_table(TableCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                commit_id: "commit-1".to_string(),
-                idempotency_key: None,
-                operation: "set-location".to_string(),
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: current_metadata,
-                new_metadata_location: new_metadata,
-                requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
-                writer: Some("pyiceberg/test".to_string()),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.table.warehouse_location, "s3://analytics/tables/relocated-table-id");
-        backend.reset_call_counts().await;
-        let resource = table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
-            .await
-            .expect("data-plane resource lookup should succeed")
-            .expect("relocated table warehouse object should resolve to the table");
-        assert_eq!(resource.table, "orders");
-        assert_eq!(resource.warehouse_object_prefix, "tables/relocated-table-id/");
-        let old_resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
-            .await
-            .expect("old table warehouse lookup should succeed");
-        assert!(old_resource.is_none());
-        assert_eq!(backend.list_call_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn object_table_catalog_store_reuses_old_prefix_after_failed_relocation_index_delete() {
-        let backend = TestCatalogObjectBackend::default();
-        let store = ObjectTableCatalogStore::new(backend.clone());
-        let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        let next_table = IdentifierSegment::parse("returns").unwrap();
-        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-        let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
-        let old_index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
-
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
-        store
-            .create_namespace(test_namespace_entry(bucket, &namespace))
-            .await
-            .unwrap();
-        let old_entry = test_table_entry(bucket, &namespace, &table, current_metadata.clone());
-        store
-            .create_table(old_entry.clone())
-            .await
-            .expect("old table should be created");
-        backend
-            .seed_object(
-                bucket,
-                &new_metadata,
-                serde_json::to_vec(&serde_json::json!({
-                    "location": "s3://analytics/tables/relocated-table-id",
-                    "table-uuid": "table-uuid"
-                }))
-                .unwrap(),
-            )
-            .await;
-        backend.fail_delete_attempt(RUSTFS_META_BUCKET, &old_index_path, 1).await;
-
-        store
-            .commit_table(TableCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                commit_id: "commit-1".to_string(),
-                idempotency_key: None,
-                operation: "set-location".to_string(),
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: current_metadata.clone(),
-                new_metadata_location: new_metadata,
-                requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
-                writer: Some("pyiceberg/test".to_string()),
-            })
-            .await
-            .unwrap();
-
-        let next_table_metadata = default_table_metadata_file_path(&namespace, &next_table, "00001.metadata.json");
-        let mut next_entry = test_table_entry(bucket, &namespace, &next_table, next_table_metadata);
-        next_entry.table_id = "next-table-id".to_string();
-        next_entry.warehouse_location = format!("s3://{bucket}/tables/table-id");
-        store
-            .create_table(next_entry)
-            .await
-            .expect("stale old warehouse index should not block prefix reuse");
-
-        let (index, _) = store
-            .read_entry::<TableWarehouseIndexEntry>(store.catalog_bucket(), &old_index_path)
-            .await
-            .unwrap()
-            .expect("reused prefix index should exist");
-        assert_eq!(index.table, "returns");
-        assert_eq!(index.table_id, "next-table-id");
-
-        store
-            .delete_table_warehouse_index(&old_entry)
-            .await
-            .expect("old owner should not delete reused prefix index");
-        let reused_resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
-            .await
-            .expect("reused prefix lookup should succeed")
-            .expect("reused prefix should still resolve to the new table");
-        assert_eq!(reused_resource.table, "returns");
-        assert_eq!(reused_resource.table_id, "next-table-id");
     }
 
     #[tokio::test]
