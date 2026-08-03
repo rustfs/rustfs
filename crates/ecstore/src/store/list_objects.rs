@@ -5819,6 +5819,83 @@ impl Sets {
 }
 
 impl SetDisks {
+    pub(crate) async fn inner_list_object_versions_for_recursive_delete(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
+        if marker.is_none() && version_marker.is_some() {
+            return Err(StorageError::NotImplemented);
+        }
+
+        let has_version_marker = version_marker.is_some();
+        let version_marker = version_marker.map(parse_version_marker).transpose()?;
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let mut opts = ListPathOptions {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            limit: effective_max_keys,
+            marker,
+            incl_deleted: true,
+            ask_disks: list_objects_quorum_from_env(),
+            versioned: true,
+            include_marker: has_version_marker,
+            ..Default::default()
+        };
+        opts.parse_marker();
+
+        let mut list_result = self
+            .list_path_result(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                err: Some(err.into()),
+                ..Default::default()
+            });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+        let disk_has_more = list_result.err.is_none();
+        if let Some(err) = list_result.err.take()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        }
+        if let Some(result) = list_result.entries.as_mut()
+            && !has_version_marker
+        {
+            result.forward_past(opts.marker.clone());
+        }
+        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions_for_recursive_delete(
+            &entries,
+            bucket,
+            prefix,
+            None,
+            version_marker,
+        )
+        .await?;
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &None,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            true,
+            last_scanned_key.as_deref(),
+        );
+        Ok(ListObjectVersionsInfo {
+            is_truncated,
+            next_marker,
+            next_version_idmarker,
+            objects,
+            prefixes,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn inner_list_objects_v2(
         self: Arc<Self>,

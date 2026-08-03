@@ -42,6 +42,7 @@ pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destination-id";
 pub const SUFFIX_TRANSITION_TRANSACTION_ID: &str = "transition-transaction-id";
 pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
+pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";

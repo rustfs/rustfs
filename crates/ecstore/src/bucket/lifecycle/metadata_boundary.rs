@@ -12,20 +12,127 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
-use time::OffsetDateTime;
+use std::sync::Arc;
 
-use crate::bucket::metadata_sys;
-use crate::error::Result;
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::bucket::metadata_sys::{self, ObjectLockConfigState};
+use crate::error::{Error, Result};
+
+#[derive(Debug)]
+pub(crate) struct LifecycleExpiryConfigs {
+    pub(crate) lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+    pub(crate) object_lock: Option<Arc<ObjectLockConfiguration>>,
+    pub(crate) bucket_incarnation_id: Uuid,
+}
+
+pub(crate) async fn get_expiry_configs(api: &crate::store::ECStore, bucket: &str) -> Result<LifecycleExpiryConfigs> {
+    let bucket_incarnation_id = api.bucket_incarnation_id_from_disk(bucket).await?;
+    let sys = metadata_sys::bucket_metadata_sys_of(&api.ctx)?;
+    let sys = sys.read().await.clone();
+    let metadata = sys.get_authoritative_metadata(bucket).await?;
+    if !metadata.bucket_incarnation_sidecar || metadata.bucket_incarnation_id != bucket_incarnation_id {
+        return Err(Error::other(format!("bucket lifecycle metadata is not authoritative: {bucket}")));
+    }
+
+    let lifecycle = if metadata.lifecycle_config.is_none() && !metadata.lifecycle_config_xml.is_empty() {
+        return Err(Error::other("persisted bucket lifecycle configuration is invalid"));
+    } else {
+        metadata
+            .lifecycle_config
+            .clone()
+            .filter(|config| !config.rules.is_empty())
+            .map(Arc::new)
+    };
+    if lifecycle.is_none() {
+        return Ok(LifecycleExpiryConfigs {
+            lifecycle: None,
+            object_lock: None,
+            bucket_incarnation_id,
+        });
+    }
+    let object_lock = match metadata_sys::object_lock_config_state_from_authoritative_metadata(&metadata)? {
+        ObjectLockConfigState::Configured { config, .. } => Some(Arc::new(config)),
+        ObjectLockConfigState::ConfirmedAbsent => None,
+        ObjectLockConfigState::Fabricated => {
+            return Err(Error::other(format!("bucket Object Lock metadata is not authoritative: {bucket}")));
+        }
+    };
+
+    Ok(LifecycleExpiryConfigs {
+        lifecycle,
+        object_lock,
+        bucket_incarnation_id,
+    })
+}
 
 pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
     metadata_sys::get_lifecycle_config(bucket).await
 }
 
-pub(crate) async fn get_object_lock_config(bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
-    metadata_sys::get_object_lock_config(bucket).await
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bucket::metadata::BucketMetadata;
+    use crate::bucket::metadata_sys::{self, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use s3s::dto::{ExpirationStatus, LifecycleExpiration, LifecycleRule};
+    use serial_test::serial;
 
-pub(crate) async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
-    metadata_sys::get_replication_config(bucket).await
+    fn lifecycle_config() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expiry_configs_are_resolved_from_the_owning_store() {
+        let (_dirs_a, store_a) = isolated_store_over_temp_disks().await;
+        let (_dirs_b, store_b) = isolated_store_over_temp_disks().await;
+        let bucket = "same-name-expiry-config";
+        store_a
+            .peer_sys
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .unwrap();
+        store_b
+            .peer_sys
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .unwrap();
+        metadata_sys::init_bucket_metadata_sys(store_a.clone(), vec![bucket.to_string()]).await;
+        metadata_sys::init_bucket_metadata_sys(store_b.clone(), vec![bucket.to_string()]).await;
+
+        let mut metadata = BucketMetadata::new(bucket);
+        let lifecycle = lifecycle_config();
+        metadata.lifecycle_config_xml = crate::bucket::utils::serialize(&lifecycle).unwrap();
+        metadata.lifecycle_config = Some(lifecycle);
+        metadata_sys::set_new_bucket_metadata_in(&store_a.ctx, metadata)
+            .await
+            .unwrap();
+        metadata_sys::set_new_bucket_metadata_in(&store_b.ctx, BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+
+        assert!(get_expiry_configs(&store_a, bucket).await.unwrap().lifecycle.is_some());
+        assert!(get_expiry_configs(&store_b, bucket).await.unwrap().lifecycle.is_none());
+    }
 }

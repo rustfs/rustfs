@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config};
+use super::{StorageError, add_object_lock_years, get_bucket_cors_config};
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
 use crate::storage::storage_api::ecfs_extend_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
+use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLockConfigState};
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -87,7 +88,7 @@ pub(crate) fn remove_object_lock_metadata_for_copy(metadata: &mut HashMap<String
 }
 
 /// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
-pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
+pub(crate) fn apply_lock_retention(object_lock_config: Option<&ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
     if has_object_lock_retention_metadata(metadata) {
         return;
     }
@@ -98,8 +99,10 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
         return;
     }
 
-    let Some(default_retention) = config.rule.and_then(|r| r.default_retention) else { return };
-    let Some(mode) = default_retention.mode else { return };
+    let Some(default_retention) = config.rule.as_ref().and_then(|r| r.default_retention.as_ref()) else {
+        return;
+    };
+    let Some(mode) = default_retention.mode.as_ref() else { return };
 
     let now = OffsetDateTime::now_utc();
     let retain_until = match (default_retention.days, default_retention.years) {
@@ -116,7 +119,7 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
 }
 
 pub(crate) fn apply_default_lock_retention_metadata(
-    object_lock_configuration: Option<ObjectLockConfiguration>,
+    object_lock_configuration: Option<&ObjectLockConfiguration>,
     metadata: &mut HashMap<String, String>,
 ) -> bool {
     if has_object_lock_retention_metadata(metadata) {
@@ -133,40 +136,73 @@ pub(crate) fn apply_default_lock_retention_metadata(
     true
 }
 
-pub(crate) async fn apply_bucket_default_lock_retention(
+pub(crate) async fn load_bucket_object_lock_config_state(bucket: &str) -> S3Result<ObjectLockConfigState> {
+    map_bucket_object_lock_config_state(bucket, metadata_sys::get_object_lock_config_state(bucket).await)
+}
+
+pub(crate) fn map_bucket_object_lock_config_state(
     bucket: &str,
+    result: Result<ObjectLockConfigState, StorageError>,
+) -> S3Result<ObjectLockConfigState> {
+    match result {
+        Ok(ObjectLockConfigState::Fabricated) => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ))
+        }
+        Ok(state) => Ok(state),
+        Err(err) => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_load_failed",
+                bucket = %bucket,
+                error = ?err,
+                "Failed to load bucket object lock configuration"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ))
+        }
+    }
+}
+
+pub(crate) fn apply_bucket_default_lock_retention(
+    bucket: &str,
+    state: &ObjectLockConfigState,
     metadata: &mut HashMap<String, String>,
     has_explicit_retention: bool,
 ) -> S3Result<()> {
-    if has_explicit_retention {
-        return Ok(());
-    }
-
-    if has_object_lock_retention_metadata(metadata) {
-        return Ok(());
-    }
-
-    let object_lock_configuration = match get_bucket_object_lock_config(bucket).await {
-        Ok((cfg, _created)) => Some(cfg),
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                None
-            } else {
-                warn!(
-                    component = LOG_COMPONENT_STORAGE,
-                    subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
-                    event = "object_lock_config_load_failed",
-                    bucket = %bucket,
-                    error = ?err,
-                    "Failed to load bucket object lock configuration"
-                );
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to load Object Lock configuration".to_string(),
-                ));
-            }
+    let object_lock_configuration = match state {
+        ObjectLockConfigState::Configured { config, .. } => Some(config),
+        ObjectLockConfigState::ConfirmedAbsent => None,
+        ObjectLockConfigState::Fabricated => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ));
         }
     };
+
+    if has_explicit_retention || has_object_lock_retention_metadata(metadata) {
+        return Ok(());
+    }
 
     apply_default_lock_retention_metadata(object_lock_configuration, metadata);
     Ok(())
@@ -429,37 +465,39 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
 }
 
 pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
-    match get_bucket_object_lock_config(bucket).await {
-        Ok((cfg, _created)) => {
-            if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    "Object Lock is not enabled for this bucket".to_string(),
-                ));
-            }
+    let state = load_bucket_object_lock_config_state(bucket).await?;
+    validate_bucket_object_lock_enabled_state(bucket, &state)
+}
+
+pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &ObjectLockConfigState) -> S3Result<()> {
+    match state {
+        ObjectLockConfigState::Configured { config, .. }
+            if config.object_lock_enabled == Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) =>
+        {
+            Ok(())
         }
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    "Bucket is missing ObjectLockConfiguration".to_string(),
-                ));
-            }
+        ObjectLockConfigState::Configured { .. } => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Object Lock is not enabled for this bucket".to_string(),
+        )),
+        ObjectLockConfigState::ConfirmedAbsent => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Bucket is missing ObjectLockConfiguration".to_string(),
+        )),
+        ObjectLockConfigState::Fabricated => {
             warn!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
-                event = "object_lock_config_load_failed",
+                event = "object_lock_config_not_authoritative",
                 bucket = %bucket,
-                error = ?err,
-                "Failed to load bucket object lock configuration"
+                "Bucket Object Lock configuration is not authoritative"
             );
-            return Err(S3Error::with_message(
+            Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 "Failed to get bucket ObjectLockConfiguration".to_string(),
-            ));
+            ))
         }
     }
-    Ok(())
 }
 
 /// Validates HTTP conditional request headers for a single object according to

@@ -1689,6 +1689,44 @@ async fn four_node_inline_storage_and_get_boundaries() -> TestResult {
 
 #[tokio::test]
 #[serial]
+async fn four_node_empty_legacy_volumes_start_as_fresh() -> TestResult {
+    init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    for data_dir in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+        tokio::fs::create_dir_all(Path::new(data_dir).join(".minio.sys")).await?;
+    }
+
+    cluster.start().await?;
+
+    // Starting is not the assertion. The regression is that an empty legacy
+    // `.minio.sys` must be classified as a *fresh* volume, not as an existing
+    // MinIO deployment to adopt or migrate. Pin what that classification leaves
+    // on disk and in the namespace.
+    let buckets = cluster.create_s3_client(0)?.list_buckets().send().await?;
+    assert!(
+        buckets.buckets().is_empty(),
+        "a fresh classification must not adopt buckets from the pre-existing directories, got {:?}",
+        buckets.buckets().iter().filter_map(|b| b.name()).collect::<Vec<_>>()
+    );
+
+    for data_dir in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+        assert!(
+            Path::new(data_dir).join(".rustfs.sys").join("format.json").is_file(),
+            "each drive must be formatted as fresh: {data_dir} has no .rustfs.sys/format.json"
+        );
+        let mut legacy = tokio::fs::read_dir(Path::new(data_dir).join(".minio.sys")).await?;
+        assert!(
+            legacy.next_entry().await?.is_none(),
+            "the empty legacy directory must be left untouched, not migrated into: {data_dir}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn four_node_inline_fallback_controls() -> TestResult {
     init_logging();
 

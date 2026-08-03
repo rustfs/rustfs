@@ -14,6 +14,7 @@
 
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
+use crate::storage::storage_api::DiskError;
 use crate::storage::storage_api::rpc_consumer::http_service::{
     DEFAULT_READ_BUFFER_SIZE, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, find_local_disk_by_ref, sign_ns_scanner_capability, verify_rpc_signature,
@@ -541,7 +542,7 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
                 error = %e,
                 "internode rpc request failed"
             );
-            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+            return response_with_disk_error(&e, message);
         }
     };
 
@@ -1252,6 +1253,21 @@ fn response_with_status(status: StatusCode, message: impl Into<String>) -> Respo
         .expect("failed to build rpc error response")
 }
 
+fn response_with_disk_error(error: &DiskError, message: impl Into<String>) -> Response<Body> {
+    let missing = match error {
+        DiskError::FileNotFound => Some(rustfs_rio::INTERNODE_FILE_NOT_FOUND),
+        DiskError::VolumeNotFound => Some(rustfs_rio::INTERNODE_VOLUME_NOT_FOUND),
+        _ => None,
+    };
+    let mut response = response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+    if let Some(missing) = missing {
+        response
+            .headers_mut()
+            .insert(rustfs_rio::INTERNODE_DISK_ERROR_HEADER, HeaderValue::from_static(missing));
+    }
+    response
+}
+
 fn internode_rpc_subsystem(operation: Option<&'static str>) -> &'static str {
     match operation {
         Some(INTERNODE_OPERATION_WALK_DIR) => LOG_SUBSYSTEM_DIRECTORY_WALK,
@@ -1279,19 +1295,19 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 #[cfg(test)]
 mod tests {
     use super::{
-        LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_NAMESPACE_SCANNER, LOG_SUBSYSTEM_ROUTING,
-        NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY,
+        DiskError, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_NAMESPACE_SCANNER,
+        LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY,
         NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PATH, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
         NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_STREAM_PATH, PutFileQuery,
         READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
         internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, ns_scanner_response_body,
         ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_stage_error_message, read_file_body_stream,
-        remote_scanner_claim_rejection, supports_walk_dir_stream_completion, validate_walk_dir_completion_request,
-        verify_internode_rpc_signature, verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body,
-        write_body_chunks_to_writer,
+        remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
+        validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
+        verify_walk_dir_body_digest, walk_dir_response_body, write_body_chunks_to_writer,
     };
     use bytes::Bytes;
-    use http::{HeaderMap, Method, StatusCode, Uri};
+    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use http_body_util::BodyExt;
     use rustfs_io_metrics::internode_metrics::{
         INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
@@ -1700,5 +1716,22 @@ mod tests {
         }
 
         assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn read_file_error_response_marks_only_missing_disk_errors() {
+        for (error, expected) in [
+            (DiskError::FileNotFound, rustfs_rio::INTERNODE_FILE_NOT_FOUND),
+            (DiskError::VolumeNotFound, rustfs_rio::INTERNODE_VOLUME_NOT_FOUND),
+        ] {
+            let response = response_with_disk_error(&error, error.to_string());
+            assert_eq!(
+                response.headers().get(rustfs_rio::INTERNODE_DISK_ERROR_HEADER),
+                Some(&HeaderValue::from_static(expected))
+            );
+        }
+
+        let response = response_with_disk_error(&DiskError::DiskAccessDenied, "permission denied");
+        assert!(response.headers().get(rustfs_rio::INTERNODE_DISK_ERROR_HEADER).is_none());
     }
 }

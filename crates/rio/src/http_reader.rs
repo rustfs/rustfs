@@ -50,6 +50,9 @@ const HTTP_VERSION_10_LABEL: &str = "http/1.0";
 const HTTP_VERSION_11_LABEL: &str = "http/1.1";
 const HTTP_VERSION_2_LABEL: &str = "h2";
 const HTTP_VERSION_UNKNOWN_LABEL: &str = "unknown";
+pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
+pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
+pub const INTERNODE_VOLUME_NOT_FOUND: &str = "volume-not-found";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -163,8 +166,15 @@ impl std::fmt::Display for InternodeHttpRequestContext {
 pub struct InternodeHttpError {
     kind: InternodeHttpErrorKind,
     context: InternodeHttpRequestContext,
+    remote_disk_error: Option<RemoteDiskErrorKind>,
     #[source]
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RemoteDiskErrorKind {
+    FileNotFound,
+    VolumeNotFound,
 }
 
 impl std::fmt::Debug for InternodeHttpError {
@@ -172,6 +182,7 @@ impl std::fmt::Debug for InternodeHttpError {
         f.debug_struct("InternodeHttpError")
             .field("kind", &self.kind)
             .field("context", &self.context)
+            .field("remote_disk_error_present", &self.remote_disk_error.is_some())
             .field("source_present", &self.source.is_some())
             .finish()
     }
@@ -186,10 +197,19 @@ impl InternodeHttpError {
         &self.context
     }
 
+    pub fn is_remote_file_not_found(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::FileNotFound)
+    }
+
+    pub fn is_remote_volume_not_found(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::VolumeNotFound)
+    }
+
     fn new(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext) -> Self {
         Self {
             kind,
             context,
+            remote_disk_error: None,
             source: None,
         }
     }
@@ -213,6 +233,7 @@ impl InternodeHttpError {
         Self {
             kind,
             context,
+            remote_disk_error: None,
             source: Some(Box::new(source)),
         }
     }
@@ -220,11 +241,52 @@ impl InternodeHttpError {
     fn into_io_error(self) -> io::Error {
         io::Error::new(self.kind.io_error_kind(), self)
     }
+
+    fn with_remote_disk_error(
+        kind: InternodeHttpErrorKind,
+        context: InternodeHttpRequestContext,
+        remote_disk_error: RemoteDiskErrorKind,
+    ) -> Self {
+        Self {
+            kind,
+            context,
+            remote_disk_error: Some(remote_disk_error),
+            source: None,
+        }
+    }
 }
 
 #[doc(hidden)]
 pub fn new_test_internode_http_io_error(kind: InternodeHttpErrorKind) -> io::Error {
     InternodeHttpError::new_for_test(kind).into_io_error()
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_file_not_found_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::FileNotFound,
+    )
+    .into_io_error()
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_volume_not_found_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::VolumeNotFound,
+    )
+    .into_io_error()
 }
 
 fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[Vec<u8>]) -> reqwest::ClientBuilder {
@@ -726,6 +788,32 @@ fn classify_http_status(status: reqwest::StatusCode) -> InternodeHttpErrorKind {
     InternodeHttpErrorKind::HttpStatus(status)
 }
 
+#[derive(Debug)]
+struct ClassifiedHttpResponse {
+    kind: InternodeHttpErrorKind,
+    remote_disk_error: Option<RemoteDiskErrorKind>,
+}
+
+fn classify_http_response(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    operation: Option<&'static str>,
+) -> ClassifiedHttpResponse {
+    let kind = classify_http_status(status);
+    if status != reqwest::StatusCode::INTERNAL_SERVER_ERROR || operation != Some(INTERNODE_OPERATION_READ_FILE_STREAM) {
+        return ClassifiedHttpResponse {
+            kind,
+            remote_disk_error: None,
+        };
+    }
+    let remote_disk_error = match headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok()) {
+        Some(INTERNODE_FILE_NOT_FOUND) => Some(RemoteDiskErrorKind::FileNotFound),
+        Some(INTERNODE_VOLUME_NOT_FOUND) => Some(RemoteDiskErrorKind::VolumeNotFound),
+        _ => None,
+    };
+    ClassifiedHttpResponse { kind, remote_disk_error }
+}
+
 fn internode_reqwest_error(method: &Method, url: &str, operation: Option<&'static str>, err: reqwest::Error) -> io::Error {
     let context = internode_request_context(method, url, operation);
     let classified = classify_reqwest_error(&err);
@@ -742,10 +830,24 @@ fn internode_classified_error(
     method: &Method,
     url: &str,
     operation: Option<&'static str>,
-    kind: InternodeHttpErrorKind,
+    classified: ClassifiedHttpResponse,
 ) -> io::Error {
     let context = internode_request_context(method, url, operation);
-    InternodeHttpError::new(kind, context).into_io_error()
+    match classified.remote_disk_error {
+        Some(remote_disk_error) => InternodeHttpError::with_remote_disk_error(classified.kind, context, remote_disk_error),
+        None => InternodeHttpError::new(classified.kind, context),
+    }
+    .into_io_error()
+}
+
+fn internode_kind_error(
+    method: &Method,
+    url: &str,
+    operation: Option<&'static str>,
+    classified: InternodeHttpErrorKind,
+) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    InternodeHttpError::new(classified, context).into_io_error()
 }
 
 fn internode_status_error(method: &Method, url: &str, operation: Option<&'static str>, status: reqwest::StatusCode) -> io::Error {
@@ -826,10 +928,11 @@ impl HttpReader {
         record_internode_http_version(track_internode_metrics, internode_operation, http_version_metric_label(resp.version()));
         maybe_warn_h2_inert(resp.version());
         if resp.status().is_success().not() {
+            let classified = classify_http_response(resp.status(), resp.headers(), internode_operation);
             record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
-            record_internode_classified_error(track_internode_metrics, internode_operation, classify_http_status(resp.status()));
-            return Err(internode_status_error(&method, &url, internode_operation, resp.status()));
+            record_internode_classified_error(track_internode_metrics, internode_operation, classified.kind);
+            return Err(internode_classified_error(&method, &url, internode_operation, classified));
         }
 
         record_internode_outgoing_request(track_internode_metrics, internode_operation);
@@ -1073,7 +1176,7 @@ impl HttpWriter {
                     record_internode_error(track_internode_metrics, internode_operation);
                     let classified = classify_reqwest_error(&e);
                     record_internode_classified_error(track_internode_metrics, internode_operation, classified);
-                    let _ = err_tx.send(internode_classified_error(&method_clone, &url_clone, internode_operation, classified));
+                    let _ = err_tx.send(internode_kind_error(&method_clone, &url_clone, internode_operation, classified));
                     let io_err = internode_reqwest_error(&method_clone, &url_clone, internode_operation, e);
                     return Err(io_err);
                 }
@@ -1677,6 +1780,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disk_error_wire_tokens_are_stable() {
+        assert_eq!(INTERNODE_DISK_ERROR_HEADER, "x-rustfs-disk-error");
+        assert_eq!(INTERNODE_FILE_NOT_FOUND, "file-not-found");
+        assert_eq!(INTERNODE_VOLUME_NOT_FOUND, "volume-not-found");
+    }
+
+    #[test]
+    fn classify_http_response_requires_an_explicit_missing_disk_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_NOT_FOUND.parse().unwrap());
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert_eq!(
+            classified.kind,
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(classified.kind.io_error_kind(), io::ErrorKind::Other);
+        assert_eq!(classified.kind.metric_label(), "http_status_other");
+        assert!(matches!(classified.remote_disk_error, Some(RemoteDiskErrorKind::FileNotFound)));
+
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_VOLUME_NOT_FOUND.parse().unwrap());
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert!(matches!(classified.remote_disk_error, Some(RemoteDiskErrorKind::VolumeNotFound)));
+
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, "permission-denied".parse().unwrap());
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert!(classified.remote_disk_error.is_none());
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_NOT_FOUND.parse().unwrap());
+        let wrong_status =
+            classify_http_response(reqwest::StatusCode::NOT_FOUND, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM));
+        assert!(wrong_status.remote_disk_error.is_none());
+        let wrong_operation =
+            classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert!(wrong_operation.remote_disk_error.is_none());
+    }
+
     #[derive(Clone, Default)]
     struct TestState {
         head_count: Arc<AtomicUsize>,
@@ -2158,7 +2309,7 @@ mod tests {
 
     #[test]
     fn dns_resolution_error_uses_network_io_kind() {
-        let err = internode_classified_error(
+        let err = internode_kind_error(
             &Method::GET,
             "http://missing.invalid/rustfs/rpc/read_file_stream",
             Some(INTERNODE_OPERATION_READ_FILE_STREAM),

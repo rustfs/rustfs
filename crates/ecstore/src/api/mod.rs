@@ -130,13 +130,15 @@ pub mod bucket {
 
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataSys, acquire_bucket_metadata_transaction_lock, delete, get, get_accelerate_config, get_bucket_policy,
+            BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
+            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
-            get_object_lock_config, get_public_access_block_config, get_quota_config, get_replication_config,
-            get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
-            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
-            update, update_bucket_targets_under_transaction_lock, update_config_with, update_under_transaction_lock,
+            get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
+            get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config,
+            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
+            set_bucket_metadata, update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
+            update_under_transaction_lock,
         };
     }
 
@@ -403,11 +405,11 @@ pub mod notification {
 pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
-        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, ObjectEncryptionResolver, ObjectInfo,
-        ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode,
-        ReadEncryptionRequest, StreamConsumer, get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook,
-        register_get_object_body_cache_hook, register_object_mutation_hook, unregister_get_object_body_cache_hook,
-        unregister_object_mutation_hook,
+        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver,
+        ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader,
+        ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, StreamConsumer, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::PreparedGetObjectReader;
 }

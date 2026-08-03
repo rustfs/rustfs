@@ -62,6 +62,33 @@ fn md5_hex(input: impl AsRef<[u8]>) -> String {
     hex::encode(hasher.finalize())
 }
 
+async fn create_restricted_user(
+    env: &RustFSTestEnvironment,
+    username: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={username}", env.url);
+    let body = serde_json::json!({
+        "secretKey": secret_key,
+        "status": "enabled"
+    })
+    .to_string();
+    crate::common::awscurl_put(&url, &body, &env.access_key, &env.secret_key).await?;
+    Ok(())
+}
+
+fn restricted_user_client(env: &RustFSTestEnvironment, username: &str, secret_key: &str) -> aws_sdk_s3::Client {
+    let credentials = aws_sdk_s3::config::Credentials::new(username, secret_key, None, None, "snowball-pax-auth-test");
+    let config = aws_sdk_s3::Config::builder()
+        .credentials_provider(credentials)
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(&env.url)
+        .force_path_style(true)
+        .behavior_version_latest()
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
 /// Env var consumed by the local SSE-S3 DEK provider when KMS is not configured.
 ///
 /// Since rustfs#3564 the server fails closed on managed SSE (SSE-S3 or
@@ -5660,6 +5687,70 @@ async fn test_signed_put_object_extract_preserves_object_lock_retention() -> Res
 
 #[tokio::test]
 #[serial]
+async fn test_signed_put_object_extract_pax_retention_overrides_request_retention()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-pax-retention-precedence";
+    let archive_key = "retention.tar";
+    let extracted_key = "alpha.txt";
+    let request_retain_until = aws_sdk_s3::primitives::DateTime::from_secs(2_114_380_800);
+    let pax_retain_until = "2040-01-01T00:00:00Z";
+
+    let client = env.create_s3_client();
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+
+    let pax = HashMap::from([
+        ("minio.metadata.x-amz-object-lock-mode", "COMPLIANCE".to_string()),
+        ("minio.metadata.x-amz-object-lock-retain-until-date", pax_retain_until.to_string()),
+    ]);
+    let archive = make_tar_with_pax_entry(extracted_key, b"alpha-body", None, &pax).await;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Governance)
+        .object_lock_retain_until_date(request_retain_until)
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let retention = client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(extracted_key)
+        .send()
+        .await?
+        .retention()
+        .expect("retention should be present")
+        .clone();
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("COMPLIANCE"));
+    assert_eq!(
+        retention
+            .retain_until_date()
+            .expect("retain_until_date should be present")
+            .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?,
+        pax_retain_until
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5778,6 +5869,282 @@ async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
     assert_eq!(metadata.get("project").map(String::as_str), Some("alpha-demo"));
     assert_eq!(metadata.get("owner").map(String::as_str), Some("ops"));
     assert_eq!(head.version_id(), Some(expected_version_id.as_str()));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retention_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    if !crate::common::awscurl_available() {
+        return Ok(());
+    }
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-pax-auth";
+    let put_only_user = "snowball-put-only";
+    let put_only_secret = "snowball-put-only-secret";
+    let conditional_user = "snowball-retention-condition";
+    let conditional_secret = "snowball-retention-condition-secret";
+    let wrong_action_user = "snowball-wrong-action";
+    let wrong_action_secret = "snowball-wrong-action-secret";
+    let version_condition_user = "snowball-version-condition";
+    let version_condition_secret = "snowball-version-condition-secret";
+    let pax_context_user = "snowball-pax-context";
+    let pax_context_secret = "snowball-pax-context-secret";
+    let conditional_version_id = Uuid::new_v4().to_string();
+    let admin_client = env.create_s3_client();
+    admin_client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    create_restricted_user(&env, put_only_user, put_only_secret).await?;
+    create_restricted_user(&env, conditional_user, conditional_secret).await?;
+    create_restricted_user(&env, wrong_action_user, wrong_action_secret).await?;
+    create_restricted_user(&env, version_condition_user, version_condition_secret).await?;
+    create_restricted_user(&env, pax_context_user, pax_context_secret).await?;
+
+    let object_resource = format!("arn:aws:s3:::{bucket}/*");
+    let context_archive_resources = [
+        format!("arn:aws:s3:::{bucket}/tag-context.tar"),
+        format!("arn:aws:s3:::{bucket}/lock-context.tar"),
+    ];
+    let tag_entry_resource = format!("arn:aws:s3:::{bucket}/tag-context-entry.txt");
+    let lock_entry_resource = format!("arn:aws:s3:::{bucket}/lock-context-entry.txt");
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "PutOnly",
+                "Effect": "Allow",
+                "Principal": { "AWS": [put_only_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [object_resource.clone()]
+            },
+            {
+                "Sid": "RetentionWithLimit",
+                "Effect": "Allow",
+                "Principal": { "AWS": [conditional_user] },
+                "Action": ["s3:PutObject", "s3:PutObjectRetention"],
+                "Resource": [object_resource.clone()]
+            },
+            {
+                "Sid": "DenyRetentionBeyondCutoff",
+                "Effect": "Deny",
+                "Principal": { "AWS": [conditional_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [object_resource.clone()],
+                "Condition": {
+                    "DateGreaterThan": {
+                        "s3:object-lock-retain-until-date": "2030-01-01T00:00:00Z"
+                    }
+                }
+            },
+            {
+                "Sid": "WrongAdditionalAction",
+                "Effect": "Allow",
+                "Principal": { "AWS": [wrong_action_user] },
+                "Action": ["s3:PutObject", "s3:PutObjectLegalHold"],
+                "Resource": [object_resource.clone()]
+            },
+            {
+                "Sid": "VersionConditionPut",
+                "Effect": "Allow",
+                "Principal": { "AWS": [version_condition_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [object_resource.clone()]
+            },
+            {
+                "Sid": "VersionConditionReplicate",
+                "Effect": "Allow",
+                "Principal": { "AWS": [version_condition_user] },
+                "Action": ["s3:ReplicateObject"],
+                "Resource": [object_resource],
+                "Condition": {
+                    "StringEquals": {
+                        "s3:VersionId": conditional_version_id.clone()
+                    }
+                }
+            },
+            {
+                "Sid": "PaxContextArchives",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectTagging"],
+                "Resource": context_archive_resources
+            },
+            {
+                "Sid": "PaxTagContextPut",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [tag_entry_resource.clone()],
+                "Condition": {
+                    "StringEquals": {
+                        "s3:RequestObjectTag/classification": "public"
+                    }
+                }
+            },
+            {
+                "Sid": "PaxTagContextAction",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObjectTagging"],
+                "Resource": [tag_entry_resource]
+            },
+            {
+                "Sid": "PaxLockContextPut",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [lock_entry_resource.clone()],
+                "Condition": {
+                    "StringEquals": {
+                        "s3:object-lock-mode": "COMPLIANCE"
+                    }
+                }
+            },
+            {
+                "Sid": "PaxLockContextAction",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObjectRetention"],
+                "Resource": [lock_entry_resource]
+            }
+        ]
+    })
+    .to_string();
+    admin_client.put_bucket_policy().bucket(bucket).policy(policy).send().await?;
+
+    let put_only_client = restricted_user_client(&env, put_only_user, put_only_secret);
+    let conditional_client = restricted_user_client(&env, conditional_user, conditional_secret);
+    let wrong_action_client = restricted_user_client(&env, wrong_action_user, wrong_action_secret);
+    let cases = [
+        (
+            "legal-hold.tar",
+            put_only_client,
+            HashMap::from([("minio.metadata.x-amz-object-lock-legal-hold", "ON".to_string())]),
+        ),
+        (
+            "retention-condition.tar",
+            conditional_client,
+            HashMap::from([
+                ("minio.metadata.x-amz-object-lock-mode", "COMPLIANCE".to_string()),
+                ("minio.metadata.x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00Z".to_string()),
+            ]),
+        ),
+        (
+            "version-id.tar",
+            wrong_action_client,
+            HashMap::from([("minio.versionId", Uuid::new_v4().to_string())]),
+        ),
+    ];
+
+    for (archive_key, client, pax) in cases {
+        let archive = make_tar_with_pax_entry("entry.txt", b"must-not-write", None, &pax).await;
+        let err = client
+            .put_object()
+            .bucket(bucket)
+            .key(archive_key)
+            .body(ByteStream::from(archive))
+            .customize()
+            .mutate_request(|req| {
+                req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            })
+            .send()
+            .await
+            .expect_err("missing, conditional, or wrong PAX privilege must be rejected");
+        assert_eq!(
+            err.as_service_error().and_then(|error| error.meta().code()),
+            Some("AccessDenied"),
+            "{archive_key}"
+        );
+    }
+
+    let version_condition_client = restricted_user_client(&env, version_condition_user, version_condition_secret);
+    let matching_version_pax = HashMap::from([("minio.versionId", conditional_version_id)]);
+    let archive = make_tar_with_pax_entry("condition-entry.txt", b"condition-body", None, &matching_version_pax).await;
+    version_condition_client
+        .put_object()
+        .bucket(bucket)
+        .key("version-condition.tar")
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let pax_context_client = restricted_user_client(&env, pax_context_user, pax_context_secret);
+    let tag_pax = HashMap::from([("minio.metadata.x-amz-tagging", "classification=public".to_string())]);
+    let archive = make_tar_with_pax_entry("tag-context-entry.txt", b"tag-context-body", None, &tag_pax).await;
+    pax_context_client
+        .put_object()
+        .bucket(bucket)
+        .key("tag-context.tar")
+        .tagging("classification=restricted")
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    let tags = admin_client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key("tag-context-entry.txt")
+        .send()
+        .await?;
+    assert!(
+        tags.tag_set()
+            .iter()
+            .any(|tag| tag.key() == "classification" && tag.value() == "public")
+    );
+
+    let pax_retain_until = "2040-01-01T00:00:00Z";
+    let lock_pax = HashMap::from([
+        ("minio.metadata.x-amz-object-lock-mode", "COMPLIANCE".to_string()),
+        ("minio.metadata.x-amz-object-lock-retain-until-date", pax_retain_until.to_string()),
+    ]);
+    let archive = make_tar_with_pax_entry("lock-context-entry.txt", b"lock-context-body", None, &lock_pax).await;
+    pax_context_client
+        .put_object()
+        .bucket(bucket)
+        .key("lock-context.tar")
+        .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Governance)
+        .object_lock_retain_until_date(aws_sdk_s3::primitives::DateTime::from_secs(2_114_380_800))
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    let retention = admin_client
+        .get_object_retention()
+        .bucket(bucket)
+        .key("lock-context-entry.txt")
+        .send()
+        .await?
+        .retention()
+        .expect("PAX retention should be present")
+        .clone();
+    assert_eq!(retention.mode().map(|mode| mode.as_str()), Some("COMPLIANCE"));
+    assert_eq!(
+        retention
+            .retain_until_date()
+            .expect("PAX retain-until should be present")
+            .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?,
+        pax_retain_until
+    );
 
     Ok(())
 }
