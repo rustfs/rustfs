@@ -83,3 +83,4 @@ worktrees/*
 
 # Local AI-agent review artifacts (omo evidence dumps)
 .omo/
+/crates/kms/tests/snapshots
