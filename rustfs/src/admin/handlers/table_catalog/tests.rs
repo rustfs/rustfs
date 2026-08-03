@@ -202,10 +202,10 @@ fn table_catalog_admin_operation_result_labels_are_stable() {
 
 #[test]
 fn table_catalog_handlers_require_table_admin_actions() {
-    let src = include_str!("table_catalog.rs");
+    let src = table_catalog_handler_source();
 
     assert!(
-        operation_block(src, "GetCatalogConfigHandler")
+        operation_block(&src, "GetCatalogConfigHandler")
             .contains("authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;")
     );
     assert!(
@@ -254,7 +254,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
         ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
     ] {
-        let block = operation_block(src, handler);
+        let block = operation_block(&src, handler);
         assert!(
             block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action}).await?;")),
             "{handler} should require {action} with catalog resource auth"
@@ -269,7 +269,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         );
     }
 
-    let sync_bridge_block = operation_block(src, "SyncExternalCatalogBridgeHandler");
+    let sync_bridge_block = operation_block(&src, "SyncExternalCatalogBridgeHandler");
     assert!(
         sync_bridge_block.contains("AdminAction::RegisterTableAction"),
         "external catalog sync should require register authorization before creating a missing table"
@@ -279,7 +279,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         "external catalog sync should branch authorization on current table existence"
     );
 
-    let migration_block = operation_block(src, "GetTableCatalogMigrationHandler");
+    let migration_block = operation_block(&src, "GetTableCatalogMigrationHandler");
     assert!(
         migration_block.contains("TableCatalogResource::warehouse(&warehouse)"),
         "catalog migration dry-run should authorize against the warehouse resource"
@@ -288,7 +288,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         "MaterializeTableCatalogMigrationHandler",
         "CancelTableCatalogMigrationHandler",
     ] {
-        let block = operation_block(src, handler);
+        let block = operation_block(&src, handler);
         assert!(
             block.contains("authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;"),
             "{handler} should require the global catalog migration action"
@@ -324,7 +324,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("RecoverTableCatalogHandler", "AdminAction::CommitTableAction"),
         ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
     ] {
-        let block = operation_block(src, handler);
+        let block = operation_block(&src, handler);
         assert!(
             block.contains("TableCatalogResource::table(&warehouse, &namespace, &table)"),
             "{handler} should build a table-aware catalog resource"
@@ -338,7 +338,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
 
 #[test]
 fn table_catalog_list_handlers_parse_standard_pagination() {
-    let src = include_str!("table_catalog.rs");
+    let src = table_catalog_handler_source();
     for (handler, helper_call) in [
         (
             "RestListNamespacesHandler",
@@ -353,7 +353,7 @@ fn table_catalog_list_handlers_parse_standard_pagination() {
             "list_views_response(&store, &warehouse, &namespace, &req.uri).await?",
         ),
     ] {
-        let block = operation_block(src, handler);
+        let block = operation_block(&src, handler);
         assert!(
             block.contains(helper_call),
             "{handler} should pass the request URI to its paginated list helper"
@@ -363,7 +363,7 @@ fn table_catalog_list_handlers_parse_standard_pagination() {
 
 #[test]
 fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_state() {
-    let src = include_str!("table_catalog.rs");
+    let src = table_catalog_handler_source();
 
     for handler in [
         "GetTableCatalogMigrationHandler",
@@ -411,7 +411,7 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
         "RecoverTableCatalogHandler",
         "RollbackTableCatalogHandler",
     ] {
-        let block = operation_block(src, handler);
+        let block = operation_block(&src, handler);
         assert!(
             block.contains("ensure_table_bucket_enabled(&warehouse).await?;")
                 || block.contains("table_bucket_enabled_from_metadata(&warehouse).await?;"),
@@ -422,8 +422,8 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
 
 #[test]
 fn enable_table_bucket_response_writes_metadata_marker_before_catalog_entry() {
-    let src = include_str!("table_catalog.rs");
-    let block = function_block(src, "async fn enable_table_bucket_response");
+    let src = table_catalog_handler_source();
+    let block = function_block(&src, "async fn enable_table_bucket_response");
     let marker_write = block
         .find("enable_table_bucket_marker(bucket).await?;")
         .expect("enable should write the metadata marker");
@@ -465,6 +465,21 @@ fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
         .or_else(|| block.find("\n#[cfg(test)]"))
         .unwrap_or(block.len());
     &block[..end]
+}
+
+fn table_catalog_handler_source() -> String {
+    [
+        include_str!("mod.rs"),
+        include_str!("config.rs"),
+        include_str!("credentials.rs"),
+        include_str!("maintenance.rs"),
+        include_str!("namespace.rs"),
+        include_str!("refs.rs"),
+        include_str!("routes.rs"),
+        include_str!("table.rs"),
+        include_str!("view.rs"),
+    ]
+    .join("\n")
 }
 
 fn function_block<'a>(src: &'a str, signature: &str) -> &'a str {

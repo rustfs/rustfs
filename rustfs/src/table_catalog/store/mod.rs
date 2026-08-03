@@ -14,10 +14,14 @@
 
 use super::*;
 
+mod migration;
 mod object;
 mod strong;
 
+use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
+#[cfg(test)]
+pub(super) use strong::StrongTableCatalogSnapshot;
 pub(crate) use strong::StrongTableCatalogStore;
 
 #[async_trait::async_trait]

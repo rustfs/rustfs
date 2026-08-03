@@ -54,14 +54,14 @@ mod routes;
 mod table;
 mod view;
 
-use config::*;
-use credentials::*;
-use maintenance::*;
-use namespace::*;
-use refs::*;
+pub use config::*;
+pub use credentials::*;
+pub use maintenance::*;
+pub use namespace::*;
+pub use refs::*;
 pub use routes::register_table_catalog_route;
-use table::*;
-use view::*;
+pub use table::*;
+pub use view::*;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const ENV_TABLE_CATALOG_CREDENTIAL_VENDING: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING";

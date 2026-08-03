@@ -1,8 +1,7 @@
 use super::identifier::{
-    TableIdentifier, TablePathResolver, default_namespace_marker_path, default_namespace_root_prefix,
-    default_table_current_pointer_path, default_table_lifecycle_path, default_table_marker_path, default_table_root_prefix,
-    default_view_metadata_dir_path, default_view_root_prefix, is_valid_table_metadata_file_name, namespace_name_from_marker_path,
-    table_name_from_marker_path, validate_object_mutation,
+    TableIdentifier, TablePathResolver, default_namespace_marker_path, default_table_current_pointer_path,
+    default_table_lifecycle_path, default_table_marker_path, default_table_root_prefix, is_valid_table_metadata_file_name,
+    namespace_name_from_marker_path, table_name_from_marker_path, validate_object_mutation,
 };
 use super::*;
 use datafusion::{
@@ -8445,7 +8444,7 @@ fn table_metadata_pointer_json_round_trips() {
 
 #[test]
 fn object_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("app/object_usecase.rs");
+    let source = include_str!("../app/object_usecase.rs");
     let delete_object = source
         .split_once("pub async fn execute_delete_object")
         .and_then(|(_, remainder)| remainder.split_once("pub async fn execute_head_object"))
@@ -8471,7 +8470,7 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("app/multipart_usecase.rs");
+    let source = include_str!("../app/multipart_usecase.rs");
 
     assert_eq!(
         source
@@ -8483,7 +8482,7 @@ fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("storage/ecfs.rs");
+    let source = include_str!("../storage/ecfs.rs");
 
     assert_eq!(
         source

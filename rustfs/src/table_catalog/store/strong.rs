@@ -14,17 +14,17 @@
 
 use super::*;
 
-type StrongNamespaceKey = (String, String);
+pub(in crate::table_catalog) type StrongNamespaceKey = (String, String);
 type StrongResourceKey = (String, String, String);
 type StrongCommitKey = (String, String, String);
 type StrongWarehouseIndex = BTreeMap<String, BTreeMap<String, StrongResourceKey>>;
 
 #[derive(Clone, Default)]
-pub(super) struct StrongTableCatalogState {
+pub(in crate::table_catalog) struct StrongTableCatalogState {
     pub(super) hydrated: bool,
     pub(super) snapshot_etag: Option<String>,
     pub(super) table_buckets: BTreeMap<String, TableBucketEntry>,
-    pub(super) namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
+    pub(in crate::table_catalog) namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
     pub(super) tables: BTreeMap<StrongResourceKey, TableEntry>,
     pub(super) views: BTreeMap<StrongResourceKey, ViewEntry>,
     pub(super) commits: BTreeMap<StrongCommitKey, CommitLogEntry>,
@@ -33,7 +33,7 @@ pub(super) struct StrongTableCatalogState {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct StrongCommitSnapshotRecord {
+pub(in crate::table_catalog) struct StrongCommitSnapshotRecord {
     pub(super) table_bucket: String,
     pub(super) table_id: String,
     pub(super) lookup_key: String,
@@ -41,14 +41,14 @@ pub(super) struct StrongCommitSnapshotRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct StrongTableCatalogSnapshot {
-    version: u16,
-    table_buckets: Vec<TableBucketEntry>,
-    namespaces: Vec<NamespaceEntry>,
-    tables: Vec<TableEntry>,
-    views: Vec<ViewEntry>,
-    commits: Vec<StrongCommitSnapshotRecord>,
-    idempotency: Vec<StrongCommitSnapshotRecord>,
+pub(in crate::table_catalog) struct StrongTableCatalogSnapshot {
+    pub(in crate::table_catalog) version: u16,
+    pub(in crate::table_catalog) table_buckets: Vec<TableBucketEntry>,
+    pub(in crate::table_catalog) namespaces: Vec<NamespaceEntry>,
+    pub(in crate::table_catalog) tables: Vec<TableEntry>,
+    pub(in crate::table_catalog) views: Vec<ViewEntry>,
+    pub(in crate::table_catalog) commits: Vec<StrongCommitSnapshotRecord>,
+    pub(in crate::table_catalog) idempotency: Vec<StrongCommitSnapshotRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -105,7 +105,7 @@ pub(crate) struct StrongTableCatalogStore<B> {
     // 1. Using RwLock for read-heavy paths (but most paths need write access)
     // 2. Splitting into logical groups (e.g., metadata vs commits)
     // 3. Using optimistic concurrency with version checks
-    state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
+    pub(in crate::table_catalog) state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
     // Serializes local snapshot mutations; object ETags fence independent store instances.
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -122,7 +122,7 @@ where
         }
     }
 
-    fn namespace_key(table_bucket: &str, namespace: &Namespace) -> StrongNamespaceKey {
+    pub(in crate::table_catalog) fn namespace_key(table_bucket: &str, namespace: &Namespace) -> StrongNamespaceKey {
         (table_bucket.to_string(), namespace.public_name())
     }
 
@@ -138,7 +138,7 @@ where
         (table_bucket.to_string(), table_id.to_string(), idempotency_key.to_string())
     }
 
-    fn snapshot_object_path() -> String {
+    pub(in crate::table_catalog) fn snapshot_object_path() -> String {
         format!("{INTERNAL_CATALOG_ROOT}/{STRONG_TABLE_CATALOG_BACKING_ROOT}/{STRONG_TABLE_CATALOG_SNAPSHOT_FILE}")
     }
 
