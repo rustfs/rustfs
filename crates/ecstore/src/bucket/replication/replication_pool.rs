@@ -4600,12 +4600,7 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    let data = shared.data.lock().expect("test data lock should not be poisoned").clone();
-                    if decode_mrf_file(&data).is_ok_and(|entries| {
-                        entries.len() == MRF_PENDING_CAP + 1
-                            && entries[MRF_PENDING_CAP - 1].object == "staged-overflow-1"
-                            && entries.last().is_some_and(|entry| entry.object == "staged-overflow-2")
-                    }) {
+                    if shared.write_count.load(Ordering::SeqCst) >= 2 {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -4613,6 +4608,19 @@ mod tests {
             })
             .await
             .expect("the recovered pending prefix should persist before the task is stopped");
+
+            let persisted = shared
+                .writes
+                .lock()
+                .expect("test writes lock should not be poisoned")
+                .iter()
+                .rev()
+                .find(|(file, _)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE)
+                .map(|(_, data)| decode_mrf_file(data).expect("persisted MRF data should decode"))
+                .expect("the capped suffix should be persisted after the pending flush");
+            assert_eq!(persisted.len(), MRF_PENDING_CAP + 1);
+            assert_eq!(persisted[MRF_PENDING_CAP - 1].object, "staged-overflow-1");
+            assert_eq!(persisted.last().expect("capped suffix should be present").object, "staged-overflow-2");
 
             let handle = pool
                 .task_handles
