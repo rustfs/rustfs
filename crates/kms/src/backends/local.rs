@@ -1450,7 +1450,23 @@ impl LocalKmsClient {
         let key_info = self.describe_key(&request.key_id, context).await?;
         ensure_key_status_permits(&request.key_id, &key_info.status, StateGatedOperation::Encrypt)?;
 
-        let (ciphertext, _nonce) = self.encrypt_with_master_key(&request.key_id, &request.plaintext).await?;
+        let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.key_id, &request.plaintext).await?;
+
+        // The ciphertext must be the same envelope `decrypt` parses: the nonce
+        // and the bound context live in it, so handing back the bare AES-GCM
+        // output would make every `encrypt` result permanently unopenable.
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: request.key_id.clone(),
+            key_spec: key_info.algorithm.clone(),
+            encrypted_key,
+            nonce,
+            encryption_context: request.encryption_context.clone(),
+            created_at: Zoned::now(),
+            // Local rotation is rejected, so the key has a single material version.
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope)?;
 
         Ok(EncryptResponse {
             ciphertext,
@@ -1466,6 +1482,13 @@ impl LocalKmsClient {
         // Parse the data key envelope from ciphertext
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
 
+        // NOTE: this comparison is an authorization check, not a cryptographic
+        // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
+        // rides in the envelope unauthenticated: anyone able to rewrite the
+        // stored envelope can rewrite this field and present a matching context.
+        // The Static and Vault Transit backends do bind it (as AEAD AAD and as
+        // the Transit KDF context respectively); closing the gap here needs a
+        // versioned envelope, since existing ciphertext was sealed without AAD.
         // Verify encryption context matches
         // Check that all keys in envelope.encryption_context are present in request.encryption_context
         // and their values match. This ensures the context used for decryption matches what was used for encryption.
@@ -1849,10 +1872,14 @@ impl KmsBackend for LocalKmsBackend {
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         let plaintext = self.client.decrypt(&request, None).await?;
 
-        // For simplicity, return basic response - in real implementation would extract more info from ciphertext
+        // The envelope that was just opened names the master key that opened it.
+        // Reporting "unknown" left every caller unable to tell which key was
+        // actually used, which is what audit and key-rotation checks read.
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+
         Ok(DecryptResponse {
             plaintext,
-            key_id: "unknown".to_string(), // Would be extracted from ciphertext metadata
+            key_id: envelope.master_key_id,
             encryption_algorithm: Some("AES-256-GCM".to_string()),
         })
     }

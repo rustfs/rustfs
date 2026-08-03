@@ -27,7 +27,7 @@ use jiff::Zoned;
 use rand::Rng;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -227,6 +227,23 @@ struct DataKeyEnvelopeMarker {
     _encryption_context: IgnoredAny,
     #[serde(rename = "created_at")]
     _created_at: IgnoredAny,
+}
+
+/// Serialize an encryption context into deterministic AAD bytes.
+///
+/// The AAD has to be reproducible byte-for-byte at decrypt time. A `HashMap`
+/// serializes in its own iteration order, which differs between instances — so
+/// a context rebuilt from storage (or from headers) would produce different
+/// bytes than the one used to seal, and the sealed data would never open
+/// again. Ordering by key removes that dependency.
+///
+/// Shared by every layer that binds a context as additional data. It lives
+/// here rather than beside one caller because a second, subtly different copy
+/// is exactly how the object layer ended up serializing a `HashMap` directly
+/// while the Static backend was already canonicalizing.
+pub fn context_aad(context: &HashMap<String, String>) -> Result<Vec<u8>> {
+    let canonical: BTreeMap<&str, &str> = context.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+    serde_json::to_vec(&canonical).map_err(Into::into)
 }
 
 /// Returns whether ciphertext is a RustFS KMS data-key envelope.

@@ -232,7 +232,7 @@ impl ReplicationPriority {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReplicationOperation {
     Object(Box<ReplicateObjectInfo>),
     Delete(Box<DeletedObjectReplicationInfo>),

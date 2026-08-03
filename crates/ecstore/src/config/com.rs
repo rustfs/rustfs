@@ -586,10 +586,47 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
-    save_config_with_opts_and_metadata(api, file, data, opts).await.map(|_| ())
+    save_config_with_opts_inner(api, file, data, opts, true).await.map(|_| ())
+}
+
+/// Saves a configuration object without logging an error for a retryable caller-owned failure.
+pub async fn save_config_with_opts_quiet<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts_inner(api, file, data, opts, false).await.map(|_| ())
 }
 
 async fn save_config_with_opts_and_metadata<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<ObjectInfo>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts_inner(api, file, data, opts, true).await
+}
+
+async fn save_config_with_opts_inner<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    opts: &ObjectOptions,
+    log_error: bool,
+) -> Result<ObjectInfo>
 where
     S: ObjectIO<
             Error = Error,
@@ -605,7 +642,9 @@ where
     match api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         Ok(object_info) => Ok(object_info),
         Err(err) => {
-            error!("save_config_with_opts: err: {:?}, file: {}", err, file);
+            if log_error {
+                error!("save_config_with_opts: err: {:?}, file: {}", err, file);
+            }
             Err(err)
         }
     }
