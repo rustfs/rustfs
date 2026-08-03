@@ -120,10 +120,12 @@ use crate::metrics::schema::notification_target::{
 };
 use crate::metrics::schema::scanner::{
     BUCKET_LABEL as SCANNER_BUCKET_LABEL, CYCLE_SCOPE_LABEL as SCANNER_CYCLE_SCOPE_LABEL, DRIVE_LABEL as SCANNER_DRIVE_LABEL,
-    RESULT_LABEL as SCANNER_RESULT_LABEL, SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
+    RESULT_LABEL as SCANNER_RESULT_LABEL, SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD, SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD,
 };
 use crate::metrics::schema::system_drive::{
-    DISK_ID_LABEL, DRIVE_INDEX_LABEL, DRIVE_INFO_MD, DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL,
+    API_LABEL as DRIVE_API_LABEL, DISK_ID_LABEL, DRIVE_API_CALLS_MD, DRIVE_API_LATENCY_BY_API_MD, DRIVE_HEALING_MD,
+    DRIVE_INDEX_LABEL, DRIVE_INFO_MD, DRIVE_LABEL, DRIVE_OFFLINE_DURATION_SECONDS_MD, DRIVE_RUNTIME_STATE_MD, DRIVE_SCANNING_MD,
+    POOL_INDEX_LABEL, SET_INDEX_LABEL, STATE_LABEL as DRIVE_STATE_LABEL,
 };
 use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
@@ -300,11 +302,54 @@ type AuditLegacyTargetKey = String;
 type AuditTargetKey = (String, String); // (server, target_id)
 type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
 type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
+type DriveTopologyKey = (String, String, String, String, String); // (server, drive, pool, set, drive_index)
+type DriveTopologyApiKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, api)
 type DriveInfoKey = (String, String, String, String, String, String); // (server, drive, pool, set, drive_index, disk_id)
-type ScannerBucketDriveResultKey = (String, String, String, String, String); // (server, cycle_scope, bucket, drive, result)
+type ScannerCycleBucketDriveResultKey = (String, String, String, String, String); // (server, cycle_scope, bucket, drive, result)
+type ScannerBucketDriveResultKey = (String, String, String, String); // (server, bucket, drive, result)
 
 fn drive_info_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveInfoKey> {
     stats.iter().filter_map(drive_info_key).collect()
+}
+
+fn drive_topology_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveTopologyKey> {
+    stats.iter().filter_map(drive_topology_key).collect()
+}
+
+fn drive_topology_api_live_keys(stats: &[DriveRuntimeDetailedStats]) -> HashSet<DriveTopologyApiKey> {
+    stats
+        .iter()
+        .filter_map(|stat| {
+            let topology = drive_topology_key(stat)?;
+            Some(
+                stat.api_calls
+                    .iter()
+                    .map(|(api, _)| api)
+                    .chain(stat.api_latency_by_api_micros.iter().map(|(api, _)| api))
+                    .map(move |api| {
+                        (
+                            topology.0.clone(),
+                            topology.1.clone(),
+                            topology.2.clone(),
+                            topology.3.clone(),
+                            topology.4.clone(),
+                            api.clone(),
+                        )
+                    }),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+fn drive_topology_key(stat: &DriveRuntimeDetailedStats) -> Option<DriveTopologyKey> {
+    Some((
+        stat.stats.server.clone(),
+        stat.stats.drive.clone(),
+        stat.pool_index.as_ref()?.clone(),
+        stat.set_index.as_ref()?.clone(),
+        stat.drive_index.as_ref()?.clone(),
+    ))
 }
 
 fn drive_info_key(stat: &DriveRuntimeDetailedStats) -> Option<DriveInfoKey> {
@@ -331,7 +376,46 @@ fn retire_drive_info_metric_series(key: &DriveInfoKey) -> usize {
     retire_metric_series(&DRIVE_INFO_MD.get_full_metric_name(), &labels)
 }
 
-fn scanner_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerBucketDriveResultKey> {
+fn retire_drive_topology_metric_series(key: &DriveTopologyKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
+        (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
+        (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
+        (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
+    ];
+    let mut retired = 0;
+    for descriptor in [&DRIVE_HEALING_MD, &DRIVE_SCANNING_MD, &DRIVE_OFFLINE_DURATION_SECONDS_MD] {
+        retired += retire_metric_series(&descriptor.get_full_metric_name(), &labels);
+    }
+    for state in ["online", "offline", "returning", "suspect", "unknown"] {
+        let state_labels = [
+            (SERVER_LABEL, Cow::Owned(key.0.clone())),
+            (DRIVE_LABEL, Cow::Owned(key.1.clone())),
+            (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
+            (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
+            (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
+            (DRIVE_STATE_LABEL, Cow::Borrowed(state)),
+        ];
+        retired += retire_metric_series(&DRIVE_RUNTIME_STATE_MD.get_full_metric_name(), &state_labels);
+    }
+    retired
+}
+
+fn retire_drive_topology_api_metric_series(key: &DriveTopologyApiKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (DRIVE_LABEL, Cow::Owned(key.1.clone())),
+        (POOL_INDEX_LABEL, Cow::Owned(key.2.clone())),
+        (SET_INDEX_LABEL, Cow::Owned(key.3.clone())),
+        (DRIVE_INDEX_LABEL, Cow::Owned(key.4.clone())),
+        (DRIVE_API_LABEL, Cow::Owned(key.5.clone())),
+    ];
+    retire_metric_series(&DRIVE_API_CALLS_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&DRIVE_API_LATENCY_BY_API_MD.get_full_metric_name(), &labels)
+}
+
+fn scanner_cycle_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerCycleBucketDriveResultKey> {
     stats
         .current_cycle_bucket_drive_results
         .iter()
@@ -356,7 +440,15 @@ fn scanner_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet
         .collect()
 }
 
-fn retire_scanner_last_bucket_drive_result_metric_series(key: &ScannerBucketDriveResultKey) -> usize {
+fn scanner_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerBucketDriveResultKey> {
+    stats
+        .bucket_drive_results
+        .iter()
+        .map(|result| (stats.server.clone(), result.bucket.clone(), result.drive.clone(), result.result.clone()))
+        .collect()
+}
+
+fn retire_scanner_cycle_bucket_drive_result_metric_series(key: &ScannerCycleBucketDriveResultKey) -> usize {
     let labels = [
         (SERVER_LABEL, Cow::Owned(key.0.clone())),
         (SCANNER_CYCLE_SCOPE_LABEL, Cow::Owned(key.1.clone())),
@@ -365,6 +457,16 @@ fn retire_scanner_last_bucket_drive_result_metric_series(key: &ScannerBucketDriv
         (SCANNER_RESULT_LABEL, Cow::Owned(key.4.clone())),
     ];
     retire_metric_series(&SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_scanner_bucket_drive_result_metric_series(key: &ScannerBucketDriveResultKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (SCANNER_BUCKET_LABEL, Cow::Owned(key.1.clone())),
+        (SCANNER_DRIVE_LABEL, Cow::Owned(key.2.clone())),
+        (SCANNER_RESULT_LABEL, Cow::Owned(key.3.clone())),
+    ];
+    retire_metric_series(&SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD.get_full_metric_name(), &labels)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -1740,6 +1842,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = metrics_interval(node_interval, Duration::ZERO);
         let mut prev_drive_info_keys: HashSet<DriveInfoKey> = HashSet::new();
+        let mut prev_drive_topology_keys: HashSet<DriveTopologyKey> = HashSet::new();
+        let mut prev_drive_topology_api_keys: HashSet<DriveTopologyApiKey> = HashSet::new();
         let mut has_seen_drive_info_snapshot = false;
         loop {
             tokio::select! {
@@ -1747,12 +1851,29 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::NodeDiskStats, "node_disk_stats", async {
                         let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_runtime_stats().await;
                         let current_drive_info_keys = drive_info_live_keys(&drive_stats);
+                        let current_drive_topology_keys = drive_topology_live_keys(&drive_stats);
+                        let current_drive_topology_api_keys = drive_topology_api_live_keys(&drive_stats);
                         let retire_drive_info_keys = if has_seen_drive_info_snapshot {
                             prev_drive_info_keys.difference(&current_drive_info_keys).cloned().collect::<Vec<_>>()
                         } else {
                             Vec::new()
                         };
+                        let retire_drive_topology_keys = if has_seen_drive_info_snapshot {
+                            prev_drive_topology_keys.difference(&current_drive_topology_keys).cloned().collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        let retire_drive_topology_api_keys = if has_seen_drive_info_snapshot {
+                            prev_drive_topology_api_keys
+                                .difference(&current_drive_topology_api_keys)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
                         prev_drive_info_keys = current_drive_info_keys;
+                        prev_drive_topology_keys = current_drive_topology_keys;
+                        prev_drive_topology_api_keys = current_drive_topology_api_keys;
                         has_seen_drive_info_snapshot = true;
                         let mut metrics = collect_node_metrics(&disk_stats);
                         metrics.extend(collect_drive_runtime_detailed_metrics(&drive_stats));
@@ -1760,6 +1881,12 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         report_metrics(&metrics);
                         for key in retire_drive_info_keys {
                             let _ = retire_drive_info_metric_series(&key);
+                        }
+                        for key in retire_drive_topology_keys {
+                            let _ = retire_drive_topology_metric_series(&key);
+                        }
+                        for key in retire_drive_topology_api_keys {
+                            let _ = retire_drive_topology_api_metric_series(&key);
                         }
                     }).await;
                 }
@@ -2044,7 +2171,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 2, 3));
         let mut has_seen_scanner_snapshot = false;
-        let mut prev_scanner_last_bucket_drive_result_keys: HashSet<ScannerBucketDriveResultKey> = HashSet::new();
+        let mut prev_scanner_cycle_bucket_drive_result_keys: HashSet<ScannerCycleBucketDriveResultKey> = HashSet::new();
+        let mut prev_scanner_bucket_drive_result_keys: HashSet<ScannerBucketDriveResultKey> = HashSet::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -2059,16 +2187,23 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                 metrics.extend(collect_ilm_runtime_metrics(&stats));
                             }
 
-                            let mut retire_scanner_last_bucket_drive_result_keys = Vec::new();
+                            let mut retire_scanner_cycle_bucket_drive_result_keys = Vec::new();
+                            let mut retire_scanner_bucket_drive_result_keys = Vec::new();
                             if let Some(stats) = collect_scanner_runtime_metric_stats().await {
+                                let current_cycle_keys = scanner_cycle_bucket_drive_result_live_keys(&stats);
                                 let current_keys = scanner_bucket_drive_result_live_keys(&stats);
                                 if has_seen_scanner_snapshot {
-                                    retire_scanner_last_bucket_drive_result_keys = prev_scanner_last_bucket_drive_result_keys
+                                    retire_scanner_cycle_bucket_drive_result_keys = prev_scanner_cycle_bucket_drive_result_keys
+                                        .difference(&current_cycle_keys)
+                                        .cloned()
+                                        .collect();
+                                    retire_scanner_bucket_drive_result_keys = prev_scanner_bucket_drive_result_keys
                                         .difference(&current_keys)
                                         .cloned()
                                         .collect();
                                 }
-                                prev_scanner_last_bucket_drive_result_keys = current_keys;
+                                prev_scanner_cycle_bucket_drive_result_keys = current_cycle_keys;
+                                prev_scanner_bucket_drive_result_keys = current_keys;
                                 has_seen_scanner_snapshot = true;
                                 metrics.extend(collect_scanner_runtime_metrics(&stats));
                             }
@@ -2076,8 +2211,11 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             if !metrics.is_empty() {
                                 report_metrics(&metrics);
                             }
-                            for key in retire_scanner_last_bucket_drive_result_keys {
-                                let _ = retire_scanner_last_bucket_drive_result_metric_series(&key);
+                            for key in retire_scanner_cycle_bucket_drive_result_keys {
+                                let _ = retire_scanner_cycle_bucket_drive_result_metric_series(&key);
+                            }
+                            for key in retire_scanner_bucket_drive_result_keys {
+                                let _ = retire_scanner_bucket_drive_result_metric_series(&key);
                             }
                         },
                     ).await;
@@ -2421,6 +2559,9 @@ mod tests {
             set_index: Some("1".to_string()),
             drive_index: Some("2".to_string()),
             disk_id: Some(disk_id.to_string()),
+            runtime_state: Some("online".to_string()),
+            api_calls: vec![("read_all".to_string(), 1)],
+            api_latency_by_api_micros: vec![("write_all".to_string(), 2)],
             stats: crate::metrics::DriveDetailedStats {
                 server: "server-a".to_string(),
                 drive: "/data1".to_string(),
@@ -2434,6 +2575,19 @@ mod tests {
         ScannerRuntimeStats {
             server: "server-a".to_string(),
             last_cycle_bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
+                bucket: bucket.to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn scanner_stats_with_lifetime_result(bucket: &str) -> ScannerRuntimeStats {
+        ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
                 bucket: bucket.to_string(),
                 drive: "/data1".to_string(),
                 result: "success".to_string(),
@@ -2481,9 +2635,48 @@ mod tests {
     }
 
     #[test]
+    fn drive_topology_keys_detect_removed_drives() {
+        let previous = drive_topology_live_keys(&[drive_info_stat("disk-old")]);
+        let current = drive_topology_live_keys(&[]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "/data1".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+        )));
+    }
+
+    #[test]
+    fn drive_topology_api_keys_detect_removed_drives() {
+        let previous = drive_topology_api_live_keys(&[drive_info_stat("disk-old")]);
+        let current = drive_topology_api_live_keys(&[]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "/data1".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+            "read_all".to_string(),
+        )));
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "/data1".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+            "write_all".to_string(),
+        )));
+    }
+
+    #[test]
     fn scanner_last_bucket_drive_result_keys_detect_superseded_cycle_results() {
-        let previous = scanner_bucket_drive_result_live_keys(&scanner_stats_with_last_result("photos"));
-        let current = scanner_bucket_drive_result_live_keys(&scanner_stats_with_last_result("logs"));
+        let previous = scanner_cycle_bucket_drive_result_live_keys(&scanner_stats_with_last_result("photos"));
+        let current = scanner_cycle_bucket_drive_result_live_keys(&scanner_stats_with_last_result("logs"));
         let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
 
         assert!(retired.contains(&(
@@ -2504,8 +2697,8 @@ mod tests {
 
     #[test]
     fn scanner_bucket_drive_result_keys_detect_completed_current_cycle_results() {
-        let previous = scanner_bucket_drive_result_live_keys(&scanner_stats_with_current_result("photos"));
-        let current = scanner_bucket_drive_result_live_keys(&ScannerRuntimeStats {
+        let previous = scanner_cycle_bucket_drive_result_live_keys(&scanner_stats_with_current_result("photos"));
+        let current = scanner_cycle_bucket_drive_result_live_keys(&ScannerRuntimeStats {
             server: "server-a".to_string(),
             ..Default::default()
         });
@@ -2518,6 +2711,16 @@ mod tests {
             "/data1".to_string(),
             "success".to_string(),
         )));
+    }
+
+    #[test]
+    fn scanner_bucket_drive_result_keys_detect_evicted_lifetime_results() {
+        let previous = scanner_bucket_drive_result_live_keys(&scanner_stats_with_lifetime_result("photos"));
+        let current = scanner_bucket_drive_result_live_keys(&scanner_stats_with_lifetime_result("logs"));
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&("server-a".to_string(), "photos".to_string(), "/data1".to_string(), "success".to_string(),)));
+        assert!(current.contains(&("server-a".to_string(), "logs".to_string(), "/data1".to_string(), "success".to_string(),)));
     }
 
     #[test]

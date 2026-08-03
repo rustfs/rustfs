@@ -391,6 +391,8 @@ pub(crate) struct DiskHealthMetricEpoch {
     operation_metrics: Box<[DiskOperationMetricEntry]>,
     /// Fallback for tests or future extension operations outside DISK_OPERATION_NAMES.
     fallback_operation_metrics: StdRwLock<HashMap<&'static str, Arc<DiskOperationMetrics>>>,
+    /// Caller API operations currently executing through the disk health wrapper.
+    api_waiting: AtomicU32,
     /// Operations rejected because the disk was unavailable for the caller.
     total_errors_availability: AtomicU64,
     /// Operations that timed out in the disk health wrapper.
@@ -414,6 +416,7 @@ impl Default for DiskHealthMetricEpoch {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             fallback_operation_metrics: StdRwLock::new(HashMap::new()),
+            api_waiting: AtomicU32::new(0),
             total_errors_availability: AtomicU64::new(0),
             total_errors_timeout: AtomicU64::new(0),
             total_writes: AtomicU64::new(0),
@@ -492,7 +495,16 @@ impl DiskHealthMetricEpoch {
         }
     }
 
-    fn metrics_snapshot(&self, total_waiting: u32) -> DiskMetrics {
+    fn waiting_guard(&self) -> DiskMetricWaitingGuard<'_> {
+        self.api_waiting.fetch_add(1, Ordering::Relaxed);
+        DiskMetricWaitingGuard { metrics: self }
+    }
+
+    fn waiting_count(&self) -> u32 {
+        self.api_waiting.load(Ordering::Relaxed)
+    }
+
+    fn metrics_snapshot(&self) -> DiskMetrics {
         let now_sec = current_unix_secs();
         let fallback_operation_metrics = self.fallback_operation_metrics_read();
         let mut last_minute = HashMap::with_capacity(self.operation_metrics.len() + fallback_operation_metrics.len());
@@ -507,7 +519,7 @@ impl DiskHealthMetricEpoch {
         DiskMetrics {
             last_minute,
             api_calls,
-            total_waiting,
+            total_waiting: self.waiting_count(),
             total_errors_availability: self.total_errors_availability.load(Ordering::Relaxed),
             total_errors_timeout: self.total_errors_timeout.load(Ordering::Relaxed),
             total_writes: self.total_writes.load(Ordering::Relaxed),
@@ -527,6 +539,16 @@ impl DiskHealthMetricEpoch {
             last_minute.insert(op.to_string(), action.last_minute_snapshot(now_sec));
             api_calls.insert(op.to_string(), lifetime_calls);
         }
+    }
+}
+
+struct DiskMetricWaitingGuard<'a> {
+    metrics: &'a DiskHealthMetricEpoch,
+}
+
+impl Drop for DiskMetricWaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.api_waiting.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1415,7 +1437,7 @@ impl LocalDiskWrapper {
     }
 
     pub(crate) fn metrics_snapshot(&self) -> DiskMetrics {
-        self.metrics.metrics_snapshot(self.health.waiting_count())
+        self.metrics.metrics_snapshot()
     }
 
     fn record_result_error_metrics<T>(&self, result: &Result<T>) {
@@ -1425,6 +1447,24 @@ impl LocalDiskWrapper {
                 self.metrics.record_availability_error();
             }
             _ => {}
+        }
+    }
+
+    fn record_batch_delete_error_metrics(&self, result: &[Option<Error>]) {
+        let mut saw_timeout = false;
+        let mut saw_availability = false;
+        for error in result.iter().flatten() {
+            match error {
+                DiskError::Timeout => saw_timeout = true,
+                DiskError::FaultyDisk | DiskError::FaultyRemoteDisk | DiskError::DiskNotFound => saw_availability = true,
+                _ => {}
+            }
+        }
+        if saw_timeout {
+            self.metrics.record_timeout_error();
+        }
+        if saw_availability {
+            self.metrics.record_availability_error();
         }
     }
 
@@ -1534,6 +1574,7 @@ impl LocalDiskWrapper {
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         let _waiting_guard = self.health.waiting_guard();
+        let _metric_waiting_guard = self.metrics.waiting_guard();
         self.metrics.record_operation_call(op);
         let started = Instant::now();
 
@@ -1800,14 +1841,17 @@ impl DiskAPI for LocalDiskWrapper {
         // Record operation start
         self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         self.health.increment_waiting();
+        let metric_waiting_guard = self.metrics.waiting_guard();
         self.metrics.record_operation_call("delete_versions");
         let started = Instant::now();
 
         // Execute the operation
         let result = self.disk.delete_versions(volume, versions, opts).await;
         self.metrics.record_operation_latency("delete_versions", started.elapsed());
+        self.record_batch_delete_error_metrics(&result);
 
         self.health.decrement_waiting();
+        drop(metric_waiting_guard);
         let has_err = result.iter().any(|e| e.is_some());
         if !has_err {
             // Log success and decrement waiting counter
@@ -2141,21 +2185,32 @@ mod tests {
 
     #[test]
     fn disk_health_metrics_snapshot_exports_waiting_errors_and_operation_windows() {
-        let health = DiskHealthTracker::new();
         let metrics = DiskHealthMetricEpoch::default();
         metrics.record_operation_call("read_all");
         metrics.record_operation_latency("read_all", Duration::from_micros(13));
         metrics.record_availability_error();
         metrics.record_timeout_error();
         {
-            let _guard = health.waiting_guard();
-            let snapshot = metrics.metrics_snapshot(health.waiting_count());
+            let _guard = metrics.waiting_guard();
+            let snapshot = metrics.metrics_snapshot();
             assert_eq!(snapshot.total_waiting, 1);
             assert_eq!(snapshot.total_errors_availability, 1);
             assert_eq!(snapshot.total_errors_timeout, 1);
             assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
             assert_eq!(snapshot.last_minute.get("read_all").map(|action| action.count), Some(1));
         }
+    }
+
+    #[test]
+    fn disk_health_metrics_snapshot_excludes_recovery_monitor_waiting() {
+        let health = DiskHealthTracker::new();
+        let metrics = DiskHealthMetricEpoch::default();
+
+        health.increment_waiting();
+        let snapshot = metrics.metrics_snapshot();
+
+        assert_eq!(health.waiting_count(), 1);
+        assert_eq!(snapshot.total_waiting, 0);
     }
 
     #[test]
@@ -2167,7 +2222,7 @@ mod tests {
         metrics.record_call_atomic();
         metrics.record_latency_atomic(current_unix_secs().saturating_sub(60), Duration::from_micros(13));
 
-        let snapshot = epoch.metrics_snapshot(0);
+        let snapshot = epoch.metrics_snapshot();
 
         assert_eq!(snapshot.api_calls.get("read_all"), Some(&1));
         assert_eq!(snapshot.last_minute.get("read_all").map(|action| action.count), Some(0));
@@ -2187,7 +2242,7 @@ mod tests {
         assert!(panic_result.is_err());
         epoch.record_operation_call("custom_test_op");
         epoch.record_operation_latency("custom_test_op", Duration::from_micros(13));
-        let snapshot = epoch.metrics_snapshot(0);
+        let snapshot = epoch.metrics_snapshot();
 
         assert_eq!(snapshot.api_calls.get("custom_test_op"), Some(&1));
     }
@@ -2208,7 +2263,7 @@ mod tests {
         reconnect.metrics.record_timeout_error();
 
         assert!(!reconnect.health.is_faulty());
-        let snapshot = reconnect.metrics.metrics_snapshot(reconnect.health.waiting_count());
+        let snapshot = reconnect.metrics.metrics_snapshot();
         assert_eq!(snapshot.api_calls.get("read_all"), Some(&2));
         assert_eq!(snapshot.total_errors_availability, 1);
         assert_eq!(snapshot.total_errors_timeout, 1);
@@ -2277,6 +2332,26 @@ mod tests {
 
         assert_eq!(err, DiskError::DiskNotFound);
         assert_eq!(wrapper.metrics_snapshot().total_errors_availability, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_versions_counts_returned_batch_error_classes() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        wrapper.record_batch_delete_error_metrics(&[
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FaultyDisk),
+            Some(DiskError::Timeout),
+            None,
+        ]);
+        let snapshot = wrapper.metrics_snapshot();
+
+        assert_eq!(snapshot.total_errors_availability, 1);
+        assert_eq!(snapshot.total_errors_timeout, 1);
     }
 
     #[tokio::test]
