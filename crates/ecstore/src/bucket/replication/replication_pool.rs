@@ -1446,6 +1446,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                if !channel_closed && rx.is_closed() && rx.is_empty() {
+                    channel_closed = true;
+                }
                 if recovery_applied && channel_closed && !dirty && capped_batch.is_empty() {
                     break;
                 }
@@ -1508,7 +1511,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     continue;
                 }
                 tokio::select! {
-                    entry = rx.recv(), if !channel_closed && pending.len() < MRF_PENDING_CAP => match entry {
+                    entry = rx.recv(), if (!channel_closed || !rx.is_empty()) && pending.len() < MRF_PENDING_CAP => match entry {
                         Some(e) => {
                             observe_mrf_pending(&e);
                             pending.push(e);
