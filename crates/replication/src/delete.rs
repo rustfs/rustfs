@@ -14,7 +14,6 @@
 
 use std::any::Any;
 
-use crate::filemeta::MRF_BLOCKED_DELETE_MARKER_VERSION_STATE_RETRY_COUNT;
 use crate::storage_api::DeletedObject;
 use crate::{MrfOpKind, MrfReplicateEntry, ReplicationState, ReplicationType, ReplicationWorkerOperation};
 
@@ -26,8 +25,6 @@ pub struct DeletedObjectReplicationInfo {
     pub op_type: ReplicationType,
     pub reset_id: String,
     pub target_arn: String,
-    pub target_delete_marker_version_id: Option<String>,
-    pub blocked_delete_marker_version_state: bool,
 }
 
 impl DeletedObjectReplicationInfo {
@@ -61,11 +58,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
             bucket: self.bucket.clone(),
             object: self.delete_object.object_name.clone(),
             version_id: self.delete_object.version_id,
-            retry_count: if self.blocked_delete_marker_version_state {
-                MRF_BLOCKED_DELETE_MARKER_VERSION_STATE_RETRY_COUNT
-            } else {
-                0
-            },
+            retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
             force_delete: self.delete_object.force_delete,
@@ -78,13 +71,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
                 .delete_object
                 .delete_marker_mtime
                 .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
-            source_mod_time: self
-                .delete_object
-                .delete_marker_mtime
-                .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
-            enqueued_order: None,
             target_arns: self.admitted_target_arns(),
-            target_delete_marker_version_id: self.target_delete_marker_version_id.clone(),
             force_delete_id: self.delete_object.force_delete_id,
             force_delete_generation: self.delete_object.force_delete_generation,
             force_delete_local_commit: self.delete_object.force_delete,
@@ -161,7 +148,6 @@ mod tests {
                 ..Default::default()
             },
             target_arn: "arn:target-a".to_string(),
-            target_delete_marker_version_id: Some("opaque-target-version".to_string()),
             ..Default::default()
         };
 
@@ -182,7 +168,6 @@ mod tests {
             "delete-marker mtime must be persisted in the MRF entry"
         );
         assert_eq!(entry.target_arns, vec!["arn:target-a".to_string()]);
-        assert_eq!(entry.target_delete_marker_version_id.as_deref(), Some("opaque-target-version"));
         assert_eq!(info.get_object(), "object");
     }
 
@@ -250,27 +235,6 @@ mod tests {
             vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
             "MRF deletes must preserve the admitted target identities in stable order"
         );
-    }
-
-    #[test]
-    fn blocked_delete_marker_version_state_survives_mrf_encoding() {
-        let info = DeletedObjectReplicationInfo {
-            bucket: "bucket".to_string(),
-            delete_object: DeletedObject {
-                object_name: "object".to_string(),
-                delete_marker: true,
-                delete_marker_version_id: Some(Uuid::new_v4()),
-                ..Default::default()
-            },
-            target_arn: "arn:target-a".to_string(),
-            target_delete_marker_version_id: Some("conflicting-target-id".to_string()),
-            blocked_delete_marker_version_state: true,
-            ..Default::default()
-        };
-
-        let entry = info.to_mrf_entry();
-
-        assert!(entry.blocked_delete_marker_version_state());
     }
 
     #[test]

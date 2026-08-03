@@ -81,24 +81,6 @@ fn restore_metadata_update_preserves_protected_metadata(
             .all(|(key, value)| replacement.get(key) == Some(value))
 }
 
-fn delete_file_info_with_replication_transport_metadata(fi: &FileInfo) -> FileInfo {
-    let mut transported = fi.clone();
-    let Some(state) = transported.replication_state_internal.as_ref() else {
-        return transported;
-    };
-    if state.target_delete_marker_version_ids.len() > 1_000 {
-        return transported;
-    }
-    for (arn, version_id) in &state.target_delete_marker_version_ids {
-        if !arn.starts_with("arn:") || arn.len() > 1_024 || version_id.is_empty() || version_id.len() > 1_024 {
-            continue;
-        }
-        let suffix = format!("{}{}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, arn);
-        rustfs_utils::http::insert_str(&mut transported.metadata, &suffix, version_id.clone());
-    }
-    transported
-}
-
 #[cfg(test)]
 mod restore_metadata_update_tests {
     use super::*;
@@ -136,38 +118,6 @@ mod restore_metadata_update_tests {
 #[cfg(test)]
 mod delete_replication_transport_tests {
     use super::*;
-
-    #[test]
-    fn delete_version_rpc_encodings_carry_target_marker_mapping_in_metadata() {
-        let arn = "arn:rustfs:replication::target:bucket";
-        let version_id = "opaque-target-marker";
-        let fi = FileInfo {
-            replication_state_internal: Some(replication_state_to_filemeta(&ReplicationState {
-                target_delete_marker_version_ids: HashMap::from([(arn.to_string(), version_id.to_string())]),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let transported = delete_file_info_with_replication_transport_metadata(&fi);
-
-        let msgpack = rmp_serde::to_vec(&transported).expect("delete FileInfo should encode as RPC msgpack");
-        let msgpack_decoded: FileInfo = rmp_serde::from_slice(&msgpack).expect("delete FileInfo RPC msgpack should decode");
-        let json = serde_json::to_string(&transported).expect("delete FileInfo should encode as RPC JSON");
-        let json_decoded: FileInfo = serde_json::from_str(&json).expect("delete FileInfo RPC JSON should decode");
-
-        for decoded in [msgpack_decoded, json_decoded] {
-            assert!(
-                decoded
-                    .replication_state_internal
-                    .as_ref()
-                    .is_some_and(|state| state.target_delete_marker_version_ids.is_empty()),
-                "the positional replication state remains rolling-upgrade compatible"
-            );
-            let (versions, corrupt) = rustfs_utils::http::target_delete_marker_versions(&decoded.metadata);
-            assert!(!corrupt);
-            assert_eq!(versions.get(arn).map(String::as_str), Some(version_id));
-        }
-    }
 }
 
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
@@ -3436,8 +3386,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let transported = delete_file_info_with_replication_transport_metadata(fi);
-        let fi = &transported;
         let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
         let rollback_dir = Uuid::new_v4();

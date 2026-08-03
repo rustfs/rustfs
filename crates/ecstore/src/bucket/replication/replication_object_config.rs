@@ -423,37 +423,23 @@ pub(crate) async fn check_replicate_delete_strict(
     del_opts: &ObjectOptions,
     gerr: Option<String>,
 ) -> Result<ReplicateDecision> {
-    check_replicate_delete_strict_with_availability(bucket, dobj, oi, del_opts, gerr)
-        .await
-        .map(|(decision, _)| decision)
-}
-
-pub(crate) async fn check_replicate_delete_strict_with_availability(
-    bucket: &str,
-    dobj: &ObjectToDelete,
-    oi: &ObjectInfo,
-    del_opts: &ObjectOptions,
-    gerr: Option<String>,
-) -> Result<(ReplicateDecision, bool)> {
     let Some(config) = get_replication_config(bucket).await? else {
-        return Ok((ReplicateDecision::default(), false));
+        return Ok(ReplicateDecision::default());
     };
     let mut decision = check_replicate_delete_with_config(dobj, oi, del_opts, gerr.is_some(), Some(&config), false, false);
     if gerr.is_some() {
-        return Ok((decision, false));
+        return Ok(decision);
     }
 
-    let mut missing_required_client = false;
     for target in decision.targets_map.values_mut() {
         if let Some(client) = ReplicationTargetStore::remote_target_client(bucket, &target.arn).await {
             target.synchronous = client.replicate_sync;
         } else {
-            missing_required_client |= target.replicate;
             target.replicate = false;
             target.synchronous = false;
         }
     }
-    Ok((decision, missing_required_client))
+    Ok(decision)
 }
 
 pub(crate) fn check_replicate_delete_with_snapshot(

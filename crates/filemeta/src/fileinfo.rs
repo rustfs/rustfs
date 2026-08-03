@@ -1851,44 +1851,4 @@ mod tests {
         };
         assert!(with_state.replication_info_equals(&with_state_clone));
     }
-
-    #[test]
-    fn target_marker_state_uses_metadata_without_changing_fileinfo_positional_wire() {
-        let arn = "arn:rustfs:replication::target:bucket";
-        let suffix = format!("{}{}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, arn);
-        let mut legacy_shape = FileInfo {
-            replication_state_internal: Some(ReplicationState {
-                replicate_decision_str: "decision".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let mut current = legacy_shape.clone();
-        let current_state = current
-            .replication_state_internal
-            .as_mut()
-            .expect("test replication state should exist");
-        current_state
-            .target_delete_marker_version_ids
-            .insert(arn.to_string(), "opaque-target-id".to_string());
-        current_state.target_delete_marker_version_ids_corrupt = true;
-        rustfs_utils::http::insert_str(&mut current.metadata, &suffix, "opaque-target-id".to_string());
-        rustfs_utils::http::insert_str(&mut legacy_shape.metadata, &suffix, "opaque-target-id".to_string());
-
-        assert_eq!(
-            current.marshal_msg().expect("current FileInfo should encode"),
-            legacy_shape.marshal_msg().expect("legacy-shape FileInfo should encode"),
-            "in-memory target state must not add positional FileInfo fields"
-        );
-
-        let decoded = FileInfo::unmarshal(&current.marshal_msg().expect("current FileInfo should encode"))
-            .expect("current FileInfo should decode");
-        let decoded_state = decoded.replication_state_internal.expect("replication state should decode");
-        assert!(decoded_state.target_delete_marker_version_ids.is_empty());
-        assert!(!decoded_state.target_delete_marker_version_ids_corrupt);
-        assert_eq!(
-            rustfs_utils::http::get_consistent_str(&decoded.metadata, &suffix),
-            Some("opaque-target-id")
-        );
-    }
 }

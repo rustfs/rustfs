@@ -1672,6 +1672,38 @@ async fn wait_for_source_delete_marker_replication_failed(
     }
 }
 
+/// Return the `LastModified` of the (single) delete marker for `key`, if present.
+async fn delete_marker_last_modified(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<aws_sdk_s3::primitives::DateTime>, Box<dyn Error + Send + Sync>> {
+    let output = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+    Ok(output
+        .delete_markers()
+        .iter()
+        .filter(|marker| marker.key() == Some(key))
+        .find_map(|marker| marker.last_modified().cloned()))
+}
+
+/// Poll the target until a delete marker for `key` appears, returning its mtime.
+async fn wait_for_target_delete_marker(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<aws_sdk_s3::primitives::DateTime, Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(mtime) = delete_marker_last_modified(client, bucket, key).await? {
+            return Ok(mtime);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("target never received a delete marker for {key}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn run_replication_check(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -4528,36 +4560,6 @@ async fn test_bucket_replication_replays_failed_entries_after_source_restart() -
     Ok(())
 }
 
-async fn delete_marker_last_modified(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<aws_sdk_s3::primitives::DateTime>, Box<dyn Error + Send + Sync>> {
-    let output = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
-    Ok(output
-        .delete_markers()
-        .iter()
-        .filter(|marker| marker.key() == Some(key))
-        .find_map(|marker| marker.last_modified().cloned()))
-}
-
-async fn wait_for_target_delete_marker(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<aws_sdk_s3::primitives::DateTime, Box<dyn Error + Send + Sync>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(mtime) = delete_marker_last_modified(client, bucket, key).await? {
-            return Ok(mtime);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("target never received a delete marker for {key}").into());
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-}
-
 #[tokio::test]
 #[serial]
 async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_without_source_restart() -> TestResult {
@@ -4607,12 +4609,6 @@ async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_w
         .send()
         .await?;
     assert_eq!(delete.delete_marker(), Some(true));
-    assert!(
-        !delete
-            .version_id()
-            .ok_or("source DELETE omitted marker version ID")?
-            .is_empty()
-    );
 
     let source_mtime = delete_marker_last_modified(&source_client, source_bucket, object_key)
         .await?
@@ -4625,10 +4621,6 @@ async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_w
 
     target_env.restart_server_preserving_data(vec![], &[]).await?;
 
-    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
-
-    // The assertion this test is named for (backlog#867): the replayed marker
-    // must carry the source's mtime, not the replay time.
     let target_mtime = wait_for_target_delete_marker(&target_client, target_bucket, object_key).await?;
     assert_eq!(
         target_mtime, source_mtime,

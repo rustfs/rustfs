@@ -27,7 +27,6 @@ use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
-use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -63,20 +62,17 @@ use rustfs_utils::http::{
 };
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
 use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
-use tokio::sync::OwnedMutexGuard;
 use tokio::sync::RwLock;
 use tower::Service;
 use tracing::error;
@@ -87,29 +83,8 @@ use uuid::Uuid;
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
-const ERR_TARGET_CLIENT_RETIRED: &str = "replication target client retired";
-const ERR_TARGET_CLIENT_RETIRED_CODE: &str = "TargetClientRetired";
-const TARGET_CLIENT_CLEANUP_PROBES_PER_REGISTRATION: usize = 8;
 
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
-static TARGET_CLIENT_GENERATIONS: OnceLock<std::sync::RwLock<TargetClientRegistry>> = OnceLock::new();
-
-#[derive(Default)]
-struct TargetClientRegistry {
-    registrations: HashMap<usize, TargetClientRegistration>,
-    cleanup_queue: VecDeque<usize>,
-}
-
-struct TargetClientRegistration {
-    client: Weak<TargetClient>,
-    generation: Arc<EndpointProbeState>,
-    health_key: Arc<str>,
-}
-
-struct TargetUpdateGuards {
-    _bucket: OwnedMutexGuard<()>,
-    _arns: Vec<OwnedMutexGuard<()>>,
-}
 
 fn replication_target_versioning_enabled(versioning: Option<&BucketVersioningStatus>) -> bool {
     matches!(versioning, Some(BucketVersioningStatus::Enabled))
@@ -132,7 +107,6 @@ impl Default for ArnTarget {
 
 impl ArnTarget {
     pub fn with_client(client: Arc<TargetClient>) -> Self {
-        register_target_client(&client);
         Self {
             client: Some(client),
             last_refresh: OffsetDateTime::now_utc(),
@@ -276,10 +250,6 @@ impl Default for EpHealth {
     }
 }
 
-fn canonical_endpoint_health_key(url: &Url) -> String {
-    url.origin().ascii_serialization()
-}
-
 fn endpoint_health_key(url: &Url) -> String {
     let host = url.host_str().unwrap_or_default();
     match url.port() {
@@ -296,42 +266,6 @@ fn target_health(target: &TargetClient) -> EpHealth {
         online: true,
         ..Default::default()
     }
-}
-
-fn target_endpoint_health_key(target: &BucketTarget) -> Option<String> {
-    target.url().ok().map(|url| canonical_endpoint_health_key(&url))
-}
-
-fn public_health_key_from_canonical(endpoint: &str) -> Option<String> {
-    Url::parse(endpoint).ok().map(|url| endpoint_health_key(&url))
-}
-
-fn target_client_config_unchanged(old: &BucketTarget, new: &BucketTarget) -> bool {
-    let credentials_unchanged = match (&old.credentials, &new.credentials) {
-        (Some(old), Some(new)) => {
-            old.access_key == new.access_key
-                && old.secret_key == new.secret_key
-                && old.session_token == new.session_token
-                && old.expiration == new.expiration
-        }
-        (None, None) => true,
-        _ => false,
-    };
-
-    old.endpoint == new.endpoint
-        && old.secure == new.secure
-        && credentials_unchanged
-        && old.target_bucket == new.target_bucket
-        && old.storage_class == new.storage_class
-        && old.disable_proxy == new.disable_proxy
-        && old.arn == new.arn
-        && old.reset_id == new.reset_id
-        && old.health_check_duration == new.health_check_duration
-        && old.replication_sync == new.replication_sync
-        && old.region == new.region
-        && old.path == new.path
-        && old.skip_tls_verify == new.skip_tls_verify
-        && old.ca_cert_pem == new.ca_cert_pem
 }
 
 fn update_endpoint_health(health: &mut EpHealth, online: bool, latency: Duration, now: OffsetDateTime) {
@@ -360,130 +294,15 @@ struct TargetClientBuildProbe {
 }
 
 #[derive(Debug, Default)]
-struct EndpointProbeState {
-    retired: AtomicBool,
-    in_flight: Arc<RwLock<()>>,
-}
-
-impl EndpointProbeState {
-    async fn acquire(self: &Arc<Self>) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
-        let guard = Arc::clone(&self.in_flight).read_owned().await;
-        (!self.retired.load(Ordering::Acquire)).then_some(guard)
-    }
-
-    fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
-    }
-
-    async fn wait_for_idle(&self) {
-        let _guard = self.in_flight.write().await;
-    }
-}
-
-fn target_client_identity(client: &TargetClient) -> usize {
-    std::ptr::from_ref(client).addr()
-}
-
-fn target_client_health_key_from_endpoint(client: &TargetClient) -> Arc<str> {
-    Url::parse(&client.endpoint)
-        .map(|url| Arc::from(canonical_endpoint_health_key(&url)))
-        .unwrap_or_else(|_| Arc::from(client.endpoint.as_str()))
-}
-
-fn target_client_registration(client: &TargetClient) -> Option<(Arc<EndpointProbeState>, Arc<str>)> {
-    let registrations = TARGET_CLIENT_GENERATIONS
-        .get()?
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registrations
-        .registrations
-        .get(&target_client_identity(client))
-        .filter(|registration| std::ptr::eq(registration.client.as_ptr(), client))
-        .map(|registration| (Arc::clone(&registration.generation), Arc::clone(&registration.health_key)))
-}
-
-fn register_target_clients<'a>(clients: impl IntoIterator<Item = &'a Arc<TargetClient>>) {
-    let clients = clients
-        .into_iter()
-        .filter(|client| target_client_registration(client).is_none())
-        .collect::<Vec<_>>();
-    if clients.is_empty() {
-        return;
-    }
-    let mut registrations = TARGET_CLIENT_GENERATIONS
-        .get_or_init(Default::default)
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let cleanup_probes = registrations
-        .cleanup_queue
-        .len()
-        .min(clients.len().saturating_mul(TARGET_CLIENT_CLEANUP_PROBES_PER_REGISTRATION));
-    for _ in 0..cleanup_probes {
-        let Some(identity) = registrations.cleanup_queue.pop_front() else {
-            break;
-        };
-        if registrations
-            .registrations
-            .get(&identity)
-            .is_some_and(|registration| registration.client.strong_count() == 0)
-        {
-            registrations.registrations.remove(&identity);
-        } else {
-            registrations.cleanup_queue.push_back(identity);
-        }
-    }
-    for client in clients {
-        let identity = target_client_identity(client);
-        if registrations
-            .registrations
-            .get(&identity)
-            .is_some_and(|registration| std::ptr::eq(registration.client.as_ptr(), client.as_ref()))
-        {
-            continue;
-        }
-        registrations.registrations.insert(
-            identity,
-            TargetClientRegistration {
-                client: Arc::downgrade(client),
-                generation: Arc::new(EndpointProbeState::default()),
-                health_key: target_client_health_key_from_endpoint(client),
-            },
-        );
-        registrations.cleanup_queue.push_back(identity);
-    }
-}
-
-fn register_target_client(client: &Arc<TargetClient>) -> Arc<EndpointProbeState> {
-    if let Some(generation) = target_client_generation(client) {
-        return generation;
-    }
-    register_target_clients(std::iter::once(client));
-    target_client_generation(client).expect("registered target client generation should exist")
-}
-
-fn target_client_generation(client: &TargetClient) -> Option<Arc<EndpointProbeState>> {
-    target_client_registration(client).map(|(generation, _)| generation)
-}
-
-fn target_client_health_key(client: &TargetClient) -> Arc<str> {
-    target_client_registration(client)
-        .map(|(_, health_key)| health_key)
-        .unwrap_or_else(|| target_client_health_key_from_endpoint(client))
-}
-
-#[derive(Debug, Default)]
 pub struct BucketTargetSys {
     pub arn_remotes_map: Arc<RwLock<HashMap<String, ArnTarget>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
-    pub(crate) target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
-    health_probe_states: RwLock<HashMap<String, Arc<EndpointProbeState>>>,
-    retired_health_endpoints: RwLock<HashSet<String>>,
+    target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     pub hc_client: Arc<HttpClient>,
     pub a_mutex: Arc<Mutex<HashMap<String, ArnErrs>>>,
     pub arn_errs_map: Arc<RwLock<HashMap<String, ArnErrs>>>,
-    update_mutexes: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    arn_update_mutexes: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    target_update_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     #[cfg(test)]
     target_client_build_probe: Arc<Mutex<Option<TargetClientBuildProbe>>>,
     heartbeat_started: OnceLock<()>,
@@ -500,13 +319,10 @@ impl BucketTargetSys {
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
-            health_probe_states: RwLock::new(HashMap::new()),
-            retired_health_endpoints: RwLock::new(HashSet::new()),
             hc_client: Arc::new(HttpClient::new()),
             a_mutex: Arc::new(Mutex::new(HashMap::new())),
             arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
-            update_mutexes: Mutex::new(HashMap::new()),
-            arn_update_mutexes: Mutex::new(HashMap::new()),
+            target_update_mutexes: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             target_client_build_probe: Arc::new(Mutex::new(None)),
             heartbeat_started: OnceLock::new(),
@@ -523,182 +339,93 @@ impl BucketTargetSys {
         });
     }
 
-    async fn keyed_update_mutex(update_mutexes: &Mutex<HashMap<String, Weak<Mutex<()>>>>, key: &str) -> Arc<Mutex<()>> {
-        let mut update_mutexes = update_mutexes.lock().await;
-        if let Some(update_mutex) = update_mutexes.get(key).and_then(Weak::upgrade) {
-            return update_mutex;
-        }
-        update_mutexes.retain(|_, update_mutex| update_mutex.strong_count() > 0);
-        let update_mutex = Arc::new(Mutex::new(()));
-        update_mutexes.insert(key.to_string(), Arc::downgrade(&update_mutex));
-        update_mutex
-    }
-
     async fn target_update_mutex(&self, bucket: &str) -> Arc<Mutex<()>> {
-        Self::keyed_update_mutex(&self.update_mutexes, bucket).await
-    }
-
-    async fn arn_update_mutex(&self, arn: &str) -> Arc<Mutex<()>> {
-        Self::keyed_update_mutex(&self.arn_update_mutexes, arn).await
-    }
-
-    async fn lock_target_arns(&self, arns: &mut Vec<String>) -> Vec<OwnedMutexGuard<()>> {
-        // Lock order: bucket, sorted ARNs, targets, ARN clients, health, probes,
-        // retired endpoints. Drain only after the map locks are released.
-        arns.sort_unstable();
-        arns.dedup();
-        let mut guards = Vec::with_capacity(arns.len());
-        for arn in arns {
-            guards.push(self.arn_update_mutex(arn).await.lock_owned().await);
+        let mut mutexes = self.target_update_mutexes.lock().await;
+        mutexes.retain(|_, mutex| mutex.strong_count() > 0);
+        if let Some(mutex) = mutexes.get(bucket).and_then(Weak::upgrade) {
+            return mutex;
         }
-        guards
-    }
-
-    async fn drain_retired_states(update_guards: TargetUpdateGuards, states: Vec<Arc<EndpointProbeState>>) {
-        if states.is_empty() {
-            return;
-        }
-        let drain = tokio::spawn(async move {
-            let _update_guards = update_guards;
-            for state in states {
-                state.wait_for_idle().await;
-            }
-        });
-        if let Err(err) = drain.await {
-            error!(error = %err, "retired replication target drain failed");
-        }
+        let mutex = Arc::new(Mutex::new(()));
+        mutexes.insert(bucket.to_string(), Arc::downgrade(&mutex));
+        mutex
     }
 
     pub async fn is_offline(&self, url: &Url) -> bool {
-        let endpoint = canonical_endpoint_health_key(url);
-        let health_key = endpoint_health_key(url);
-        let health_map = self.h_mutex.read().await;
-        let retired_endpoints = self.retired_health_endpoints.read().await;
-        if retired_endpoints.contains(&endpoint) {
-            return true;
-        }
-        if let Some(health) = health_map.get(&health_key) {
-            return !health.online;
-        }
-        drop(retired_endpoints);
-        drop(health_map);
-
-        !self.init_hc_if_active(url, false).await
-    }
-
-    pub(crate) async fn target_is_offline(&self, target: &TargetClient) -> bool {
-        let Ok(_lease) = target.operation_lease().await else {
-            return true;
-        };
-        let remotes = self.arn_remotes_map.read().await;
-        let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
-            return true;
-        };
-        if !std::ptr::eq(current.as_ref(), target) {
-            return true;
-        }
+        let key = endpoint_health_key(url);
         {
-            let health_map = self.target_h_mutex.read().await;
-            if target_client_generation(target).is_some_and(|generation| generation.retired.load(Ordering::Acquire)) {
-                return true;
-            }
-            if let Some(health) = health_map.get(&target.arn) {
+            let health_map = self.h_mutex.read().await;
+            if let Some(health) = health_map.get(&key) {
                 return !health.online;
             }
         }
-        let mut health_map = self.target_h_mutex.write().await;
-        if target_client_generation(target).is_some_and(|generation| generation.retired.load(Ordering::Acquire)) {
-            return true;
-        }
-        let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
-        !health.online
+        self.init_hc(url).await;
+        false
     }
 
     pub async fn mark_offline(&self, url: &Url) {
         let key = endpoint_health_key(url);
         let mut health_map = self.h_mutex.write().await;
-        let retired_endpoints = self.retired_health_endpoints.read().await;
-        if retired_endpoints.contains(&canonical_endpoint_health_key(url)) {
-            return;
-        }
         if let Some(health) = health_map.get_mut(&key) {
             update_endpoint_health(health, false, Duration::from_secs(0), OffsetDateTime::now_utc());
         }
     }
 
-    pub(crate) async fn mark_target_offline(&self, target: &TargetClient) {
-        let Ok(_lease) = target.operation_lease().await else {
-            return;
+    pub async fn init_hc(&self, url: &Url) {
+        let mut health_map = self.h_mutex.write().await;
+        let host = endpoint_health_key(url);
+        health_map.insert(
+            host.clone(),
+            EpHealth {
+                endpoint: host,
+                scheme: url.scheme().to_string(),
+                online: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    pub(crate) async fn is_target_offline(&self, target: &Arc<TargetClient>) -> bool {
+        // Lock order: arn_remotes_map, then target_h_mutex. A stale client must not
+        // read or initialize the health state of its replacement.
+        let remotes = self.arn_remotes_map.read().await;
+        let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
+            return true;
         };
+        if !Arc::ptr_eq(current, target) {
+            return true;
+        }
+        {
+            let health_map = self.target_h_mutex.read().await;
+            if let Some(health) = health_map.get(&target.arn) {
+                return !health.online;
+            }
+        }
+        let mut health_map = self.target_h_mutex.write().await;
+        let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
+        !health.online
+    }
+
+    pub(crate) async fn mark_target_offline(&self, target: &Arc<TargetClient>) {
+        // Lock order: arn_remotes_map, then target_h_mutex. Ignore failures reported
+        // by a client that has already been replaced.
         let remotes = self.arn_remotes_map.read().await;
         let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
             return;
         };
-        if !std::ptr::eq(current.as_ref(), target) {
+        if !Arc::ptr_eq(current, target) {
             return;
         }
         let mut health_map = self.target_h_mutex.write().await;
-        if target_client_generation(target).is_some_and(|generation| generation.retired.load(Ordering::Acquire)) {
-            return;
-        }
         let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
         update_endpoint_health(health, false, Duration::from_secs(0), OffsetDateTime::now_utc());
     }
 
     #[cfg(test)]
     async fn init_target_health(&self, target: &TargetClient) {
-        self.target_h_mutex
-            .write()
-            .await
-            .insert(target.arn.clone(), target_health(target));
+        let mut health_map = self.target_h_mutex.write().await;
+        health_map.insert(target.arn.clone(), target_health(target));
+        drop(health_map);
         self.init_hc(&target.to_url()).await;
-    }
-
-    pub async fn init_hc(&self, url: &Url) {
-        self.init_hc_if_active(url, true).await;
-    }
-
-    async fn init_hc_if_active(&self, url: &Url, replace: bool) -> bool {
-        let mut health_map = self.h_mutex.write().await;
-        let mut probe_states = self.health_probe_states.write().await;
-        let endpoint = canonical_endpoint_health_key(url);
-        let health_key = endpoint_health_key(url);
-        let mut retired_endpoints = self.retired_health_endpoints.write().await;
-        if replace {
-            retired_endpoints.remove(&endpoint);
-        } else if retired_endpoints.contains(&endpoint) {
-            return false;
-        }
-        let health = EpHealth {
-            endpoint: health_key,
-            scheme: url.scheme().to_string(),
-            online: true,
-            ..Default::default()
-        };
-        if replace {
-            if let Some(previous) = health_map.insert(health.endpoint.clone(), health) {
-                let previous_scheme = if previous.scheme.is_empty() {
-                    "https"
-                } else {
-                    previous.scheme.as_str()
-                };
-                if previous_scheme != url.scheme()
-                    && let Ok(previous_url) = Url::parse(&format!("{previous_scheme}://{}", previous.endpoint))
-                {
-                    let previous_endpoint = canonical_endpoint_health_key(&previous_url);
-                    retired_endpoints.insert(previous_endpoint.clone());
-                    if let Some(previous_probe) = probe_states.remove(&previous_endpoint) {
-                        previous_probe.retire();
-                    }
-                }
-            }
-        } else {
-            health_map.entry(health.endpoint.clone()).or_insert(health);
-        }
-        probe_states
-            .entry(endpoint)
-            .or_insert_with(|| Arc::new(EndpointProbeState::default()));
-        true
     }
 
     pub async fn heartbeat(&self) {
@@ -721,19 +448,19 @@ impl BucketTargetSys {
         };
 
         let checks = stream::iter(targets.into_iter().map(|target| async move {
-            let Ok(lease) = target.operation_lease().await else {
-                return None;
-            };
             let start = Instant::now();
             let online = Self::check_endpoint_health(&target).await;
-            Some((target, lease, online, start.elapsed()))
+            (target, online, start.elapsed())
         }));
         let mut checks = checks.buffer_unordered(MAX_CONCURRENT_TARGET_HEALTH_CHECKS);
         let mut endpoint_checks = HashMap::<String, (String, bool, Duration)>::new();
 
-        while let Some(Some((target, _lease, online, duration))) = checks.next().await {
+        while let Some((target, online, duration)) = checks.next().await {
             let url = target.to_url();
+
             {
+                // Lock order: arn_remotes_map, then target_h_mutex. Keeping the remote
+                // read guard prevents a replaced client from receiving stale health.
                 let remotes = self.arn_remotes_map.read().await;
                 let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
                     continue;
@@ -768,16 +495,6 @@ impl BucketTargetSys {
         }
     }
 
-    async fn apply_probe_result(&self, health_key: &str, probe_state: &EndpointProbeState, online: bool, duration: Duration) {
-        let mut health_map = self.h_mutex.write().await;
-        if probe_state.retired.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(health) = health_map.get_mut(health_key) {
-            update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
-        }
-    }
-
     async fn check_endpoint_health(target: &TargetClient) -> bool {
         match tokio::time::timeout(Duration::from_secs(3), target.client.head_bucket().bucket(&target.bucket).send()).await {
             Ok(Ok(_)) => true,
@@ -787,11 +504,13 @@ impl BucketTargetSys {
     }
 
     pub async fn health_stats(&self) -> HashMap<String, EpHealth> {
-        self.h_mutex.read().await.clone()
+        let health_map = self.h_mutex.read().await;
+        health_map.clone()
     }
 
     async fn target_health_stats(&self) -> HashMap<String, EpHealth> {
-        self.target_h_mutex.read().await.clone()
+        let health_map = self.target_h_mutex.read().await;
+        health_map.clone()
     }
 
     pub async fn list_targets(&self, bucket: &str, arn_type: &str) -> Vec<BucketTarget> {
@@ -857,118 +576,20 @@ impl BucketTargetSys {
     }
 
     pub async fn delete(&self, bucket: &str) {
-        let bucket_guard = self.target_update_mutex(bucket).await.lock_owned().await;
-        let mut arns = self
-            .targets_map
-            .read()
-            .await
-            .get(bucket)
-            .into_iter()
-            .flatten()
-            .map(|target| target.arn.clone())
-            .collect::<Vec<_>>();
-        let arn_guards = self.lock_target_arns(&mut arns).await;
-        let update_guards = TargetUpdateGuards {
-            _bucket: bucket_guard,
-            _arns: arn_guards,
-        };
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let _update_guard = update_mutex.lock().await;
+
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
-        let mut target_health_map = self.target_h_mutex.write().await;
-        let mut health_map = self.h_mutex.write().await;
-        let mut probe_states = self.health_probe_states.write().await;
-        let mut retired_endpoints = self.retired_health_endpoints.write().await;
-        let mut retired_clients = Vec::new();
-        let mut retired_endpoint_candidates = HashSet::new();
+        let mut health_map = self.target_h_mutex.write().await;
 
         if let Some(targets) = targets_map.remove(bucket) {
-            let remaining_arns = targets_map
-                .values()
-                .flatten()
-                .map(|target| target.arn.as_str())
-                .collect::<HashSet<_>>();
             for target in targets {
-                if let Some(endpoint) = target_endpoint_health_key(&target) {
-                    retired_endpoint_candidates.insert(endpoint);
-                }
-                if remaining_arns.contains(target.arn.as_str()) {
-                    continue;
-                }
-                if let Some(client) = arn_remotes_map.remove(&target.arn).and_then(|target| target.client) {
-                    target_health_map.remove(&target.arn);
-                    retired_endpoint_candidates.insert(target_client_health_key(&client).to_string());
-                    if let Some(generation) = target_client_generation(&client) {
-                        generation.retire();
-                        retired_clients.push(generation);
-                    }
-                }
+                arn_remotes_map.remove(&target.arn);
+                health_map.remove(&target.arn);
             }
         }
-
-        let retired_probes = Self::retire_inactive_endpoint_health(
-            &arn_remotes_map,
-            &retired_endpoint_candidates,
-            &mut health_map,
-            &mut probe_states,
-            &mut retired_endpoints,
-        );
-        drop(retired_endpoints);
-        drop(probe_states);
-        drop(health_map);
-        drop(target_health_map);
-        drop(arn_remotes_map);
-        drop(targets_map);
-        retired_clients.extend(retired_probes);
-        Self::drain_retired_states(update_guards, retired_clients).await;
-    }
-
-    fn retire_inactive_endpoint_health(
-        arn_remotes_map: &HashMap<String, ArnTarget>,
-        retired_endpoint_candidates: &HashSet<String>,
-        health_map: &mut HashMap<String, EpHealth>,
-        probe_states: &mut HashMap<String, Arc<EndpointProbeState>>,
-        retired_endpoints: &mut HashSet<String>,
-    ) -> Vec<Arc<EndpointProbeState>> {
-        if retired_endpoint_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let active_endpoints = arn_remotes_map
-            .values()
-            .filter_map(|target| target.client.as_ref())
-            .map(|client| target_client_health_key(client).to_string())
-            .collect::<HashSet<_>>();
-        let active_public_endpoints = active_endpoints
-            .iter()
-            .filter_map(|endpoint| {
-                let url = Url::parse(endpoint).ok()?;
-                Some((endpoint_health_key(&url), url.scheme().to_string()))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut retired_probes = Vec::new();
-
-        for endpoint in retired_endpoint_candidates {
-            if active_endpoints.contains(endpoint) {
-                retired_endpoints.remove(endpoint);
-                continue;
-            }
-            retired_endpoints.insert(endpoint.clone());
-            if let Some(probe_state) = probe_states.remove(endpoint) {
-                probe_state.retire();
-                retired_probes.push(probe_state);
-            }
-            if let Some(health_key) = public_health_key_from_canonical(endpoint) {
-                if let Some(active_scheme) = active_public_endpoints.get(&health_key) {
-                    if let Some(health) = health_map.get_mut(&health_key) {
-                        health.scheme.clone_from(active_scheme);
-                    }
-                } else {
-                    health_map.remove(&health_key);
-                }
-            }
-        }
-
-        retired_probes
     }
 
     pub async fn set_target(
@@ -1308,22 +929,6 @@ impl BucketTargetSys {
         arn_remotes_map.get(arn).and_then(|target| target.client.clone())
     }
 
-    #[doc(hidden)]
-    pub async fn get_remote_target_client_if_current(&self, bucket: &str, target: &BucketTarget) -> Option<Arc<TargetClient>> {
-        let targets_map = self.targets_map.read().await;
-        let current = targets_map.get(bucket)?.iter().find(|current| {
-            current.arn == target.arn
-                && current.target_type == target.target_type
-                && current.deployment_id == target.deployment_id
-                && target_client_config_unchanged(current, target)
-        })?;
-        let arn_remotes_map = self.arn_remotes_map.read().await;
-        let client = arn_remotes_map.get(&current.arn)?.client.clone()?;
-        target_client_generation(&client)
-            .is_none_or(|generation| !generation.retired.load(Ordering::Acquire))
-            .then_some(client)
-    }
-
     pub async fn get_remote_bucket_target_by_arn(&self, bucket: &str, arn: &str) -> Option<BucketTarget> {
         let targets_map = self.targets_map.read().await;
         targets_map
@@ -1332,160 +937,62 @@ impl BucketTargetSys {
     }
 
     pub async fn update_all_targets(&self, bucket: &str, targets: Option<&BucketTargets>) {
-        let bucket_guard = self.target_update_mutex(bucket).await.lock_owned().await;
-        let existing_targets = self.targets_map.read().await.get(bucket).cloned().unwrap_or_default();
-        let mut arns = existing_targets.iter().map(|target| target.arn.clone()).collect::<Vec<_>>();
-        if let Some(targets) = targets {
-            arns.extend(targets.targets.iter().map(|target| target.arn.clone()));
-        }
-        let arn_guards = self.lock_target_arns(&mut arns).await;
-        let update_guards = TargetUpdateGuards {
-            _bucket: bucket_guard,
-            _arns: arn_guards,
-        };
-        let existing_clients = {
-            let arn_remotes_map = self.arn_remotes_map.read().await;
-            existing_targets
-                .iter()
-                .filter_map(|target| {
-                    arn_remotes_map
-                        .get(&target.arn)
-                        .and_then(|target| target.client.clone())
-                        .map(|client| (target.arn.clone(), client))
-                })
-                .collect::<HashMap<_, _>>()
-        };
-        let existing_configs = existing_targets
-            .iter()
-            .map(|target| (target.arn.as_str(), target))
-            .collect::<HashMap<_, _>>();
-        let mut prepared_clients = HashMap::new();
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let _update_guard = update_mutex.lock().await;
 
-        if let Some(new_targets) = targets
-            && !new_targets.is_empty()
-        {
+        let mut clients = Vec::new();
+        if let Some(new_targets) = targets {
             for target in &new_targets.targets {
-                let reusable = existing_configs
-                    .get(target.arn.as_str())
-                    .filter(|old| target_client_config_unchanged(old, target))
-                    .and_then(|_| existing_clients.get(&target.arn).cloned())
-                    .filter(|client| {
-                        target_client_generation(client).is_none_or(|generation| !generation.retired.load(Ordering::Acquire))
-                    });
-                let client = if reusable.is_some() {
-                    reusable
-                } else {
-                    match self.get_remote_target_client_internal(target).await {
-                        Ok(client) => Some(Arc::new(client)),
-                        // The target stays in `targets_map`, so it keeps showing up in
-                        // `bucket remote ls` while no client exists to replicate through it —
-                        // replication then drops every object for this ARN. Without this the
-                        // rejection (loopback endpoint, bad CA, unparseable URL) left no trace
-                        // anywhere.
-                        Err(err) => {
-                            warn!(
-                                bucket = %bucket,
-                                arn = %target.arn,
-                                endpoint = %target.endpoint,
-                                error = %err,
-                                "replication target client unavailable; objects for this ARN will not replicate"
-                            );
-                            None
-                        }
-                    }
-                };
-                prepared_clients.insert(target.arn.clone(), client);
+                clients.push((target, self.get_remote_target_client_internal(target).await.map(Arc::new)));
             }
         }
-        register_target_clients(prepared_clients.values().flatten());
 
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
-        let mut target_health_map = self.target_h_mutex.write().await;
-        let mut health_map = self.h_mutex.write().await;
-        let mut probe_states = self.health_probe_states.write().await;
-        let mut retired_endpoints = self.retired_health_endpoints.write().await;
-        let mut retired_clients = Vec::new();
-        let mut retired_endpoint_candidates = HashSet::new();
-        if let Some(old_targets) = targets_map.remove(bucket) {
-            let needs_remaining_arns = old_targets.iter().any(|target| !prepared_clients.contains_key(&target.arn));
-            let remaining_arns = if needs_remaining_arns {
-                targets_map
-                    .values()
-                    .flatten()
-                    .map(|target| target.arn.as_str())
-                    .collect::<HashSet<_>>()
-            } else {
-                HashSet::new()
-            };
-            for target in old_targets {
-                if !prepared_clients.contains_key(&target.arn) && remaining_arns.contains(target.arn.as_str()) {
-                    if let Some(endpoint) = target_endpoint_health_key(&target) {
-                        retired_endpoint_candidates.insert(endpoint);
-                    }
-                    self.update_bandwidth_limit(bucket, &target.arn, 0);
-                    continue;
-                }
-                let mut reused = false;
-                if let Some(client) = arn_remotes_map.remove(&target.arn).and_then(|target| target.client) {
-                    reused = prepared_clients
-                        .get(&target.arn)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|prepared| Arc::ptr_eq(prepared, &client));
-                    if !reused {
-                        target_health_map.remove(&target.arn);
-                        retired_endpoint_candidates.insert(target_client_health_key(&client).to_string());
-                        if let Some(generation) = target_client_generation(&client) {
-                            generation.retire();
-                            retired_clients.push(generation);
-                        }
-                    }
-                }
-                if !reused && let Some(endpoint) = target_endpoint_health_key(&target) {
-                    retired_endpoint_candidates.insert(endpoint);
-                }
+        let mut health_map = self.target_h_mutex.write().await;
+        // Remove existing targets
+        if let Some(existing_targets) = targets_map.remove(bucket) {
+            for target in existing_targets {
+                arn_remotes_map.remove(&target.arn);
+                health_map.remove(&target.arn);
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
-        if let Some(new_targets) = targets {
-            for target in &new_targets.targets {
-                if let Some(client) = prepared_clients.get(&target.arn).and_then(Option::as_ref) {
-                    retired_endpoints.remove(target_client_health_key(client).as_ref());
-                    target_health_map
-                        .entry(target.arn.clone())
-                        .or_insert_with(|| target_health(client));
-                    arn_remotes_map.insert(
-                        target.arn.clone(),
-                        ArnTarget {
-                            client: Some(Arc::clone(client)),
-                            last_refresh: OffsetDateTime::now_utc(),
-                        },
-                    );
-                    self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
-                }
-            }
-        }
+
+        // Add new targets
         if let Some(new_targets) = targets
             && !new_targets.is_empty()
         {
+            for (target, client) in clients {
+                match client {
+                    Ok(client) => {
+                        arn_remotes_map.insert(
+                            target.arn.clone(),
+                            ArnTarget {
+                                client: Some(client.clone()),
+                                last_refresh: OffsetDateTime::now_utc(),
+                            },
+                        );
+                        health_map.insert(client.arn.clone(), target_health(&client));
+                        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
+                    }
+                    // The target stays in `targets_map`, so it keeps showing up in
+                    // `bucket remote ls` while no client exists to replicate through it —
+                    // replication then drops every object for this ARN. Without this the
+                    // rejection (loopback endpoint, bad CA, unparseable URL) left no trace
+                    // anywhere.
+                    Err(err) => warn!(
+                        bucket = %bucket,
+                        arn = %target.arn,
+                        endpoint = %target.endpoint,
+                        error = %err,
+                        "replication target client unavailable; objects for this ARN will not replicate"
+                    ),
+                }
+            }
             targets_map.insert(bucket.to_string(), new_targets.targets.clone());
         }
-
-        let retired_probes = Self::retire_inactive_endpoint_health(
-            &arn_remotes_map,
-            &retired_endpoint_candidates,
-            &mut health_map,
-            &mut probe_states,
-            &mut retired_endpoints,
-        );
-        drop(retired_endpoints);
-        drop(probe_states);
-        drop(health_map);
-        drop(target_health_map);
-        drop(arn_remotes_map);
-        drop(targets_map);
-        retired_clients.extend(retired_probes);
-        Self::drain_retired_states(update_guards, retired_clients).await;
     }
 
     pub async fn set(&self, bucket: &str, meta: &BucketMetadata) {
@@ -1496,6 +1003,7 @@ impl BucketTargetSys {
         if config.is_empty() {
             return;
         }
+
         self.update_all_targets(bucket, Some(config)).await;
     }
 
@@ -2241,33 +1749,12 @@ pub struct TargetClient {
     pub client: Arc<S3Client>,
 }
 
-struct TargetOperationLease {
-    _guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-}
-
 impl TargetClient {
     pub fn to_url(&self) -> Url {
         Url::parse(&self.endpoint).unwrap()
     }
 
-    async fn operation_lease(&self) -> Result<TargetOperationLease, S3ClientError> {
-        let Some(generation) = target_client_generation(self) else {
-            return Ok(TargetOperationLease { _guard: None });
-        };
-        let guard = generation.acquire().await.ok_or_else(|| {
-            S3ClientError::with_metadata(ERR_TARGET_CLIENT_RETIRED, None, Some(ERR_TARGET_CLIENT_RETIRED_CODE.to_string()), None)
-        })?;
-        Ok(TargetOperationLease { _guard: Some(guard) })
-    }
-
-    #[doc(hidden)]
-    pub async fn send_with_operation_lease<F: Future>(&self, operation: F) -> Result<F::Output, S3ClientError> {
-        let _lease = self.operation_lease().await?;
-        Ok(operation.await)
-    }
-
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3ClientError> {
-        let _lease = self.operation_lease().await?;
         match self.client.head_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(true),
             Err(e) => match e {
@@ -2302,7 +1789,6 @@ impl TargetClient {
     }
 
     pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<BucketVersioningStatus>, S3ClientError> {
-        let _lease = self.operation_lease().await?;
         match self.client.get_bucket_versioning().bucket(bucket).send().await {
             Ok(res) => Ok(res.status),
             Err(e) => Err(e.into()),
@@ -2315,7 +1801,6 @@ impl TargetClient {
         object: &str,
         version_id: Option<String>,
     ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
-        let _lease = self.operation_lease().await.map_err(SdkError::construction_failure)?;
         match self
             .client
             .head_object()
@@ -2338,7 +1823,6 @@ impl TargetClient {
         body: ByteStream,
         opts: &PutObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let _lease = self.operation_lease().await?;
         let mut headers = opts.header();
 
         let builder = self.client.put_object();
@@ -2401,7 +1885,6 @@ impl TargetClient {
         object: &str,
         opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        let _lease = self.operation_lease().await?;
         let mut headers = HeaderMap::new();
         let version_id = opts.internal.source_version_id.clone();
         if !version_id.is_empty() {
@@ -2445,7 +1928,6 @@ impl TargetClient {
         body: ByteStream,
         opts: &PutObjectPartOptions,
     ) -> Result<UploadPartOutput, S3ClientError> {
-        let _lease = self.operation_lease().await?;
         let headers = opts.custom_header.clone();
 
         match self
@@ -2483,7 +1965,6 @@ impl TargetClient {
         parts: Vec<CompletedPart>,
         opts: &PutObjectOptions,
     ) -> Result<CompleteMultipartUploadOutput, S3ClientError> {
-        let _lease = self.operation_lease().await?;
         let multipart_upload = CompletedMultipartUpload::builder().set_parts(Some(parts)).build();
 
         let headers = opts.header();
@@ -2520,19 +2001,6 @@ impl TargetClient {
         version_id: Option<String>,
         opts: RemoveObjectOptions,
     ) -> Result<(), S3ClientError> {
-        self.remove_object_with_output(bucket, object, version_id, opts)
-            .await
-            .map(|_| ())
-    }
-
-    pub async fn remove_object_with_output(
-        &self,
-        bucket: &str,
-        object: &str,
-        version_id: Option<String>,
-        opts: RemoveObjectOptions,
-    ) -> Result<DeleteObjectOutput, S3ClientError> {
-        let _lease = self.operation_lease().await?;
         let headers = build_remove_object_headers(version_id.as_deref(), &opts);
         let api_version_id = resolve_delete_api_version_id(version_id, &opts);
 
@@ -2555,7 +2023,7 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(res) => Ok(res),
+            Ok(_res) => Ok(()),
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();
@@ -2686,36 +2154,13 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug)]
-    struct BlockingHttpConnector {
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl SmithyHttpConnector for BlockingHttpConnector {
-        fn call(&self, _request: HttpRequest) -> HttpConnectorFuture {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let started = Arc::clone(&self.started);
-            let release = Arc::clone(&self.release);
-            HttpConnectorFuture::new(async move {
-                started.notify_one();
-                release.notified().await;
-                Ok(HttpResponse::new(
-                    aws_smithy_runtime_api::http::StatusCode::try_from(204_u16).expect("204 should be a valid response status"),
-                    SdkBody::empty(),
-                ))
-            })
-        }
-    }
-
     fn recording_target_client() -> (TargetClient, Arc<std::sync::Mutex<Vec<String>>>) {
         let request_uris = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector = SharedHttpConnector::new(RecordingHttpConnector {
             request_uris: Arc::clone(&request_uris),
         });
         let http_client = http_client_fn(move |_settings, _components| connector.clone());
-        let client = s3_client_with_http_client(443, http_client);
+        let client = s3_client_for_test(443, Some(http_client));
         (
             TargetClient {
                 endpoint: "https://localhost:443".to_string(),
@@ -2732,81 +2177,6 @@ mod tests {
             },
             request_uris,
         )
-    }
-
-    fn blocking_target_client() -> (
-        TargetClient,
-        Arc<tokio::sync::Notify>,
-        Arc<tokio::sync::Notify>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let connector = SharedHttpConnector::new(BlockingHttpConnector {
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-            calls: Arc::clone(&calls),
-        });
-        let http_client = http_client_fn(move |_settings, _components| connector.clone());
-        let client = s3_client_with_http_client(443, http_client);
-        (
-            TargetClient {
-                endpoint: "https://localhost:443".to_string(),
-                credentials: None,
-                bucket: "target-bucket".to_string(),
-                storage_class: String::new(),
-                disable_proxy: false,
-                arn: "old-arn".to_string(),
-                reset_id: String::new(),
-                secure: true,
-                health_check_duration: Duration::from_secs(5),
-                replicate_sync: false,
-                client: Arc::new(client),
-            },
-            started,
-            release,
-            calls,
-        )
-    }
-
-    fn spawn_single_request_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>) -> (u16, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
-
-        ensure_rustls_crypto_provider();
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test TLS listener should bind");
-        let port = listener
-            .local_addr()
-            .expect("test TLS listener should have an address")
-            .port();
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.cert.der().clone()],
-                rustls_pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
-                    .expect("test TLS private key should convert"),
-            )
-            .expect("test TLS server config should build");
-
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("test TLS client should connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("test TLS read timeout should configure");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(10)))
-                .expect("test TLS write timeout should configure");
-            let connection = rustls::ServerConnection::new(Arc::new(server_config)).expect("test TLS connection should build");
-            let mut stream = rustls::StreamOwned::new(connection, stream);
-            let mut request = [0_u8; 8192];
-            let _ = stream.read(&mut request).expect("test TLS request should be readable");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("test TLS response should be written");
-            stream.flush().expect("test TLS response should flush");
-        });
-
-        (port, handle)
     }
 
     fn spawn_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>, requests: usize) -> (u16, std::thread::JoinHandle<()>) {
@@ -2837,8 +2207,7 @@ mod tests {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(10)))
                     .expect("test TLS write timeout should configure");
-                let connection =
-                    rustls::ServerConnection::new(Arc::clone(&server_config)).expect("test TLS connection should build");
+                let connection = rustls::ServerConnection::new(server_config.clone()).expect("test TLS connection should build");
                 let mut stream = rustls::StreamOwned::new(connection, stream);
                 let mut request = [0_u8; 8192];
                 if stream.read(&mut request).is_err() {
@@ -2873,29 +2242,44 @@ mod tests {
         (port, handle)
     }
 
-    fn s3_client_with_http_client(port: u16, http_client: SharedHttpClient) -> S3Client {
-        let credentials = SdkCredentials::builder()
-            .access_key_id("test-access")
-            .secret_access_key("test-secret")
-            .provider_name("bucket_target_tls_test")
-            .build();
-        let config = S3Config::builder()
-            .endpoint_url(format!("https://localhost:{port}"))
-            .credentials_provider(SharedCredentialsProvider::new(credentials))
-            .region(SdkRegion::new("us-east-1"))
-            .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .http_client(http_client)
-            .build();
+    fn spawn_delayed_http_server() -> (
+        u16,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
 
-        S3Client::from_conf(config)
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address")
+            .port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+            let mut request = [0_u8; 8192];
+            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+            assert!(bytes_read > 0, "test HTTP request should not be empty");
+            accepted_tx.send(()).expect("test should wait for request");
+            release_rx.recv().expect("test should release response");
+            stream
+                .write_all(b"HTTP/1.1 500 Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test HTTP response should be written");
+        });
+        (port, accepted_rx, release_tx, handle)
+    }
+
+    fn s3_client_for_test(port: u16, http_client: Option<SharedHttpClient>) -> S3Client {
+        s3_client_for_endpoint_test(format!("https://localhost:{port}"), http_client)
     }
 
     fn s3_client_for_endpoint_test(endpoint: String, http_client: Option<SharedHttpClient>) -> S3Client {
         let credentials = SdkCredentials::builder()
             .access_key_id("test-access")
             .secret_access_key("test-secret")
-            .provider_name("bucket_target_health_test")
+            .provider_name("bucket_target_tls_test")
             .build();
         let mut config = S3Config::builder()
             .endpoint_url(endpoint)
@@ -2906,6 +2290,7 @@ mod tests {
         if let Some(http_client) = http_client {
             config = config.http_client(http_client);
         }
+
         S3Client::from_conf(config.build())
     }
 
@@ -3020,39 +2405,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_endpoint_health_key_keeps_scheme_while_public_key_stays_compatible() {
-        let explicit_port = Url::parse("https://REMOTE.example:9443").expect("url should parse");
-        let default_port = Url::parse("https://REMOTE.example:443").expect("url should parse");
-        let ipv6 = Url::parse("http://[2001:0db8::1]:9000").expect("url should parse");
+    fn endpoint_health_key_preserves_explicit_port() {
+        let url = Url::parse("https://remote.example:9443").expect("url should parse");
 
-        assert_eq!(canonical_endpoint_health_key(&explicit_port), "https://remote.example:9443");
-        assert_eq!(canonical_endpoint_health_key(&default_port), "https://remote.example");
-        assert_eq!(canonical_endpoint_health_key(&ipv6), "http://[2001:db8::1]:9000");
-        assert_eq!(endpoint_health_key(&explicit_port), "remote.example:9443");
-        assert_eq!(endpoint_health_key(&default_port), "remote.example");
-
-        for (target, url) in [
-            (
-                BucketTarget {
-                    endpoint: "REMOTE.example:443".to_string(),
-                    secure: true,
-                    ..Default::default()
-                },
-                default_port,
-            ),
-            (
-                BucketTarget {
-                    endpoint: "[2001:0db8::1]:9000".to_string(),
-                    ..Default::default()
-                },
-                ipv6,
-            ),
-        ] {
-            assert_eq!(
-                target_endpoint_health_key(&target).as_deref(),
-                Some(canonical_endpoint_health_key(&url).as_str())
-            );
-        }
+        assert_eq!(endpoint_health_key(&url), "remote.example:9443");
     }
 
     #[test]
@@ -3071,322 +2427,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_health_check_rejects_untrusted_self_signed_certificate() {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
-        let (port, server) = spawn_https_server(&cert, 1);
-        let endpoint = format!("https://localhost:{port}");
-        let target = target_client_for_test("arn:default-tls", endpoint.clone(), s3_client_for_endpoint_test(endpoint, None));
-
-        assert!(!BucketTargetSys::check_endpoint_health(&target).await);
-        server.join().expect("test TLS server should stop");
-    }
-
-    #[tokio::test]
-    async fn target_health_check_honors_skip_tls_verify_client() {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
-        let (port, server) = spawn_https_server(&cert, 1);
-        let endpoint = format!("https://localhost:{port}");
-        let target = target_client_for_test(
-            "arn:skip-tls",
-            endpoint.clone(),
-            s3_client_for_endpoint_test(endpoint, Some(build_insecure_aws_s3_http_client())),
-        );
-
-        assert!(BucketTargetSys::check_endpoint_health(&target).await);
-        server.join().expect("test TLS server should stop");
-    }
-
-    #[tokio::test]
-    async fn target_health_check_honors_custom_ca_client() {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
-        let http_client = build_aws_s3_http_client_from_target_ca_pem(&cert.cert.pem())
-            .await
-            .expect("custom CA client should build");
-        let (port, server) = spawn_https_server(&cert, 1);
-        let endpoint = format!("https://localhost:{port}");
-        let target = target_client_for_test(
-            "arn:custom-ca",
-            endpoint.clone(),
-            s3_client_for_endpoint_test(endpoint, Some(http_client)),
-        );
-
-        assert!(BucketTargetSys::check_endpoint_health(&target).await);
-        server.join().expect("test TLS server should stop");
-    }
-
-    #[tokio::test]
-    async fn target_health_check_treats_client_errors_as_online_and_server_errors_as_offline() {
-        for (status, expected_online) in [(403, true), (500, false)] {
-            let (port, server) = spawn_http_status_server(status);
-            let endpoint = format!("http://127.0.0.1:{port}");
-            let target = target_client_for_test(
-                &format!("arn:http-{status}"),
-                endpoint.clone(),
-                s3_client_for_endpoint_test(endpoint, None),
-            );
-
-            assert_eq!(BucketTargetSys::check_endpoint_health(&target).await, expected_online);
-            server.join().expect("test HTTP server should stop");
-        }
-    }
-
-    #[tokio::test]
-    async fn heartbeat_keeps_tls_health_isolated_by_arn_for_shared_endpoint() {
+    async fn list_targets_applies_health_stats_by_arn_and_preserves_endpoint_port() {
         let sys = BucketTargetSys::default();
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
-        let (port, server) = spawn_https_server(&cert, 2);
-        let endpoint = format!("https://localhost:{port}");
-        let strict = target_client_for_test("arn:strict", endpoint.clone(), s3_client_for_endpoint_test(endpoint.clone(), None));
-        let insecure = target_client_for_test(
-            "arn:insecure",
-            endpoint.clone(),
-            s3_client_for_endpoint_test(endpoint, Some(build_insecure_aws_s3_http_client())),
-        );
-        {
-            let mut remotes = sys.arn_remotes_map.write().await;
-            remotes.insert(strict.arn.clone(), ArnTarget::with_client(strict.clone()));
-            remotes.insert(insecure.arn.clone(), ArnTarget::with_client(insecure.clone()));
-        }
-
-        sys.heartbeat_once().await;
-
-        assert!(sys.target_is_offline(&strict).await);
-        assert!(!sys.target_is_offline(&insecure).await);
-        server.join().expect("test TLS server should stop");
-    }
-
-    #[tokio::test]
-    async fn heartbeat_discards_result_from_replaced_client_with_same_arn() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let (stale, started, release, _) = blocking_target_client();
-        let stale = Arc::new(stale);
-        let target_arn = stale.arn.clone();
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(stale.arn.clone(), ArnTarget::with_client(Arc::clone(&stale)));
-
-        let heartbeat_sys = Arc::clone(&sys);
-        let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("heartbeat should reach the stale target connector");
-
-        let replacement_endpoint = "https://replacement.example:9443".to_string();
-        let replacement = target_client_for_test(
-            &target_arn,
-            replacement_endpoint.clone(),
-            s3_client_for_endpoint_test(replacement_endpoint, None),
-        );
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(replacement.arn.clone(), ArnTarget::with_client(Arc::clone(&replacement)));
-        sys.init_target_health(&replacement).await;
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), heartbeat)
-            .await
-            .expect("heartbeat should finish after the stale response")
-            .expect("heartbeat task should not panic");
-
-        assert!(!sys.target_is_offline(&replacement).await);
-    }
-
-    #[tokio::test]
-    async fn target_update_mutex_reuses_live_lock_and_reclaims_dead_entries() {
-        let sys = BucketTargetSys::default();
-        let first = sys.target_update_mutex("first").await;
-        let same = sys.target_update_mutex("first").await;
-        assert!(Arc::ptr_eq(&first, &same));
-        drop(first);
-        drop(same);
-
-        let _second = sys.target_update_mutex("second").await;
-        let mutexes = sys.update_mutexes.lock().await;
-        assert!(!mutexes.contains_key("first"));
-        assert!(mutexes.contains_key("second"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn target_updates_serialize_client_build_through_publication_per_bucket() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let started = Arc::new(tokio::sync::Semaphore::new(0));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
-            arn: "arn:first".to_string(),
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-        });
-        let target = |arn: &str| BucketTarget {
-            arn: arn.to_string(),
-            endpoint: "192.168.1.10:9000".to_string(),
-            target_bucket: "target-bucket".to_string(),
-            region: "us-east-1".to_string(),
-            credentials: Some(Credentials {
-                access_key: "access".to_string(),
-                secret_key: "secret".to_string(),
-                session_token: None,
-                expiration: None,
-            }),
-            ..Default::default()
-        };
-        let first_targets = BucketTargets {
-            targets: vec![target("arn:first")],
-        };
-        let second_targets = BucketTargets {
-            targets: vec![target("arn:second")],
-        };
-        let first_sys = Arc::clone(&sys);
-        let first = tokio::spawn(async move {
-            first_sys.update_all_targets("bucket", Some(&first_targets)).await;
-        });
-        tokio::time::timeout(Duration::from_secs(2), started.acquire())
-            .await
-            .expect("first client build should start")
-            .expect("first started semaphore should remain open")
-            .forget();
-
-        let second_started = Arc::new(tokio::sync::Semaphore::new(0));
-        let second_release = Arc::new(tokio::sync::Semaphore::new(0));
-        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
-            arn: "arn:second".to_string(),
-            started: Arc::clone(&second_started),
-            release: Arc::clone(&second_release),
-        });
-        let second_sys = Arc::clone(&sys);
-        let second = tokio::spawn(async move {
-            second_sys.update_all_targets("bucket", Some(&second_targets)).await;
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), second_started.acquire())
-                .await
-                .is_err()
-        );
-        assert!(!sys.targets_map.read().await.contains_key("bucket"));
-
-        release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(2), first)
-            .await
-            .expect("first target update should not stall")
-            .expect("first target update should finish");
-        tokio::time::timeout(Duration::from_secs(1), second_started.acquire())
-            .await
-            .expect("second client build should start after first update publishes")
-            .expect("second started semaphore should remain open")
-            .forget();
-        second_release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(2), second)
-            .await
-            .expect("second target update should not stall")
-            .expect("second target update should finish");
-        let targets = sys.targets_map.read().await;
-        assert_eq!(targets["bucket"][0].arn, "arn:second");
-    }
-
-    #[tokio::test]
-    async fn retired_probe_cannot_pollute_reactivated_public_health() {
-        let sys = BucketTargetSys::default();
-        let url = Url::parse("https://remote.example:9000").expect("URL should parse");
-        sys.init_hc(&url).await;
-        let old_probe = Arc::new(EndpointProbeState::default());
-        old_probe.retire();
-
-        sys.apply_probe_result("remote.example:9000", &old_probe, false, Duration::from_secs(1))
-            .await;
-
-        let health = sys.h_mutex.read().await;
-        assert!(health["remote.example:9000"].online);
-        assert_eq!(health["remote.example:9000"].scheme, "https");
-    }
-
-    #[tokio::test]
-    async fn public_is_offline_keeps_the_unknown_endpoint_initialization_contract() {
-        let sys = BucketTargetSys::default();
-        let url = Url::parse("https://remote.example:9443").expect("url should parse");
-
-        assert!(!sys.is_offline(&url).await);
-        let health = sys.h_mutex.read().await;
-        assert_eq!(health["remote.example:9443"].endpoint, "remote.example:9443");
-        drop(health);
-        assert!(sys.health_stats().await.contains_key("remote.example:9443"));
-    }
-
-    #[tokio::test]
-    async fn public_init_replaces_health_without_letting_old_scheme_mark_it_offline() {
-        let sys = BucketTargetSys::default();
-        let http_url = Url::parse("http://remote.example:9000").expect("HTTP URL should parse");
-        let https_url = Url::parse("https://remote.example:9000").expect("HTTPS URL should parse");
-        sys.init_hc(&http_url).await;
-        sys.mark_offline(&http_url).await;
-        let old_probe = Arc::clone(
-            sys.health_probe_states
-                .read()
-                .await
-                .get("http://remote.example:9000")
-                .expect("HTTP probe should exist"),
-        );
-
-        sys.init_hc(&https_url).await;
-        sys.mark_offline(&http_url).await;
-
-        let health = sys.h_mutex.read().await;
-        assert!(health["remote.example:9000"].online);
-        assert_eq!(health["remote.example:9000"].scheme, "https");
-        drop(health);
-        assert!(old_probe.acquire().await.is_none());
-        assert!(
-            sys.health_probe_states
-                .read()
-                .await
-                .contains_key("https://remote.example:9000")
-        );
-
-        let https_probe = Arc::clone(
-            sys.health_probe_states
-                .read()
-                .await
-                .get("https://remote.example:9000")
-                .expect("HTTPS probe should exist"),
-        );
-        sys.init_hc(&http_url).await;
-        let health = sys.h_mutex.read().await;
-        assert!(health["remote.example:9000"].online);
-        assert_eq!(health["remote.example:9000"].scheme, "http");
-        drop(health);
-        assert!(https_probe.acquire().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn list_targets_applies_health_stats_for_endpoint_with_port() {
-        let sys = BucketTargetSys::default();
-        let url = Url::parse("https://remote.example:9443").expect("url should parse");
-        sys.init_hc(&url).await;
-        sys.mark_offline(&url).await;
-        let public_stats = sys.health_stats().await;
-        assert_eq!(public_stats["remote.example:9443"].endpoint, "remote.example:9443");
-        assert!(!public_stats.contains_key("https://remote.example:9443"));
-
         let arn = "arn:rustfs:replication:us-east-1:bucket:id";
+        let endpoint = "https://remote.example:9443".to_string();
+        let client = target_client_for_test(
+            arn,
+            endpoint.clone(),
+            S3Client::from_conf(
+                S3Config::builder()
+                    .endpoint_url(endpoint)
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(arn.to_string(), ArnTarget::with_client(client.clone()));
+        sys.init_target_health(&client).await;
+        sys.mark_target_offline(&client).await;
+
         sys.targets_map.write().await.insert(
             "bucket".to_string(),
             vec![BucketTarget {
                 endpoint: "remote.example:9443".to_string(),
                 arn: arn.to_string(),
                 target_type: BucketTargetType::ReplicationService,
-                secure: true,
                 ..Default::default()
             }],
-        );
-        sys.target_h_mutex.write().await.insert(
-            arn.to_string(),
-            EpHealth {
-                endpoint: "remote.example:9443".to_string(),
-                scheme: "https".to_string(),
-                online: false,
-                offline_count: 1,
-                ..Default::default()
-            },
         );
 
         let targets = sys.list_targets("", "").await;
@@ -3394,1034 +2463,97 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].online);
         assert_eq!(targets[0].offline_count, 1);
+        assert_eq!(sys.target_health_stats().await[arn].endpoint, "remote.example:9443");
     }
 
     #[tokio::test]
-    async fn endpoint_refresh_preserves_shared_health_then_delete_retires_it() {
-        let sys = Arc::new(BucketTargetSys::default());
-        sys.targets_map.write().await.extend([
-            (
-                "edited-bucket".to_string(),
-                vec![BucketTarget {
-                    endpoint: "old.example:9000".to_string(),
-                    arn: "old-arn".to_string(),
-                    ..Default::default()
-                }],
-            ),
-            (
-                "shared-bucket".to_string(),
-                vec![BucketTarget {
-                    endpoint: "old.example:9000".to_string(),
-                    arn: "shared-arn".to_string(),
-                    ..Default::default()
-                }],
-            ),
-        ]);
-        let old_url = Url::parse("http://old.example:9000").expect("old URL should parse");
-        sys.init_hc(&old_url).await;
-        let (mut old_client, _) = recording_target_client();
-        old_client.endpoint = canonical_endpoint_health_key(&old_url);
-        old_client.arn = "old-arn".to_string();
-        let old_client = Arc::new(old_client);
-        let (mut shared_client, _) = recording_target_client();
-        shared_client.endpoint = canonical_endpoint_health_key(&old_url);
-        shared_client.arn = "shared-arn".to_string();
-        let mut arn_remotes_map = sys.arn_remotes_map.write().await;
-        arn_remotes_map.insert("old-arn".to_string(), ArnTarget::with_client(Arc::clone(&old_client)));
-        arn_remotes_map.insert("shared-arn".to_string(), ArnTarget::with_client(Arc::new(shared_client)));
-        drop(arn_remotes_map);
-        let old_probe = Arc::clone(
-            sys.health_probe_states
-                .read()
-                .await
-                .get("http://old.example:9000")
-                .expect("old endpoint probe should exist"),
-        );
-
-        let updated = BucketTargets {
-            targets: vec![BucketTarget {
-                endpoint: "new.example:9000".to_string(),
-                arn: "old-arn".to_string(),
-                ..Default::default()
-            }],
+    async fn target_health_is_isolated_by_arn_for_shared_endpoint() {
+        let sys = BucketTargetSys::default();
+        let endpoint = "https://shared.example:9443".to_string();
+        let config = || {
+            S3Config::builder()
+                .endpoint_url(endpoint.clone())
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build()
         };
-        sys.update_all_targets("edited-bucket", Some(&updated)).await;
-        let (mut current_client, _) = recording_target_client();
-        current_client.endpoint = "http://new.example:9000".to_string();
-        current_client.arn = "old-arn".to_string();
+        let first = target_client_for_test("arn:first", endpoint.clone(), S3Client::from_conf(config()));
+        let second = target_client_for_test("arn:second", endpoint.clone(), S3Client::from_conf(config()));
+
         sys.arn_remotes_map
             .write()
             .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(Arc::new(current_client)));
-
-        assert!(sys.h_mutex.read().await.contains_key("old.example:9000"));
-        assert!(sys.target_is_offline(&old_client).await);
-
-        let probe_lease = old_probe.acquire().await.expect("shared endpoint should remain active");
-        let delete_sys = Arc::clone(&sys);
-        let delete = tokio::spawn(async move { delete_sys.delete("shared-bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while sys.h_mutex.read().await.contains_key("old.example:9000") {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delete should retire the last shared endpoint");
-        assert!(!delete.is_finished(), "delete returned while an old endpoint probe was in flight");
-        drop(probe_lease);
-        tokio::time::timeout(Duration::from_secs(10), delete)
+            .insert(first.arn.clone(), ArnTarget::with_client(first.clone()));
+        sys.arn_remotes_map
+            .write()
             .await
-            .expect("delete should finish after the old probe exits")
-            .expect("delete task should not panic");
+            .insert(second.arn.clone(), ArnTarget::with_client(second.clone()));
+        sys.init_target_health(&first).await;
+        sys.init_target_health(&second).await;
+        sys.mark_target_offline(&first).await;
 
-        assert!(!sys.h_mutex.read().await.contains_key("old.example:9000"));
-        assert!(old_probe.acquire().await.is_none());
-        assert!(sys.target_is_offline(&old_client).await);
-        assert!(sys.is_offline(&old_url).await);
-        assert!(!sys.h_mutex.read().await.contains_key("old.example:9000"));
-        assert!(!sys.health_probe_states.read().await.contains_key("http://old.example:9000"));
-
-        sys.update_all_targets(
-            "reactivated-bucket",
-            Some(&BucketTargets {
-                targets: vec![BucketTarget {
-                    endpoint: "old.example:9000".to_string(),
-                    arn: "reactivated-arn".to_string(),
-                    credentials: Some(Credentials::default()),
-                    ..Default::default()
-                }],
-            }),
-        )
-        .await;
-        assert!(!sys.is_offline(&old_url).await);
-        assert!(sys.h_mutex.read().await.contains_key("old.example:9000"));
+        assert!(sys.is_target_offline(&first).await);
+        assert!(!sys.is_target_offline(&second).await);
     }
 
     #[tokio::test]
-    async fn deleting_target_without_a_client_retires_its_health_probe() {
+    async fn stale_client_cannot_change_replacement_health_for_same_arn() {
         let sys = BucketTargetSys::default();
-        let old_url = Url::parse("http://old.example:9000").expect("old URL should parse");
+        let arn = "arn:replacement";
+        let config = |endpoint: &str| {
+            S3Config::builder()
+                .endpoint_url(endpoint)
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build()
+        };
+        let stale = target_client_for_test(
+            arn,
+            "https://stale.example:9443".to_string(),
+            S3Client::from_conf(config("https://stale.example:9443")),
+        );
+        let current = target_client_for_test(
+            arn,
+            "https://current.example:9443".to_string(),
+            S3Client::from_conf(config("https://current.example:9443")),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(arn.to_string(), ArnTarget::with_client(current.clone()));
+        sys.init_target_health(&current).await;
+
+        sys.mark_target_offline(&stale).await;
+
+        assert!(sys.is_target_offline(&stale).await);
+        assert!(!sys.is_target_offline(&current).await);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_target_health_by_arn() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:delete";
+        let endpoint = "https://delete.example:9443".to_string();
+        let client = target_client_for_test(
+            arn,
+            endpoint.clone(),
+            S3Client::from_conf(
+                S3Config::builder()
+                    .endpoint_url(endpoint)
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+        );
         sys.targets_map.write().await.insert(
             "bucket".to_string(),
             vec![BucketTarget {
-                endpoint: "old.example:9000".to_string(),
-                arn: "missing-client-arn".to_string(),
+                arn: arn.to_string(),
                 ..Default::default()
             }],
         );
-        sys.init_hc(&old_url).await;
+        sys.init_target_health(&client).await;
 
         sys.delete("bucket").await;
 
-        assert!(sys.is_offline(&old_url).await);
-        assert!(!sys.h_mutex.read().await.contains_key("old.example:9000"));
-        assert!(!sys.health_probe_states.read().await.contains_key("http://old.example:9000"));
-    }
-
-    #[tokio::test]
-    async fn editing_target_without_a_client_retires_its_old_health_probe() {
-        let sys = BucketTargetSys::default();
-        let old_url = Url::parse("http://old.example:9000").expect("old URL should parse");
-        sys.targets_map.write().await.insert(
-            "bucket".to_string(),
-            vec![BucketTarget {
-                endpoint: "old.example:9000".to_string(),
-                arn: "missing-client-arn".to_string(),
-                ..Default::default()
-            }],
-        );
-        sys.init_hc(&old_url).await;
-
-        sys.update_all_targets(
-            "bucket",
-            Some(&BucketTargets {
-                targets: vec![BucketTarget {
-                    endpoint: "new.example:9000".to_string(),
-                    arn: "missing-client-arn".to_string(),
-                    credentials: Some(Credentials::default()),
-                    ..Default::default()
-                }],
-            }),
-        )
-        .await;
-
-        assert!(sys.is_offline(&old_url).await);
-        assert!(!sys.h_mutex.read().await.contains_key("old.example:9000"));
-        assert!(!sys.health_probe_states.read().await.contains_key("http://old.example:9000"));
-    }
-
-    #[tokio::test]
-    async fn deleting_one_bucket_preserves_a_client_referenced_by_another_bucket() {
-        let sys = BucketTargetSys::default();
-        let target = BucketTarget {
-            arn: "shared-arn".to_string(),
-            ..Default::default()
-        };
-        sys.targets_map.write().await.extend([
-            ("bucket-a".to_string(), vec![target.clone()]),
-            ("bucket-b".to_string(), vec![target.clone()]),
-        ]);
-        let (client, _) = recording_target_client();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(target.arn.clone(), ArnTarget::with_client(Arc::clone(&client)));
-        let generation = target_client_generation(&client).expect("registered client should have a generation");
-
-        sys.delete("bucket-a").await;
-
-        let current = sys
-            .get_remote_target_client_by_arn("bucket-b", &target.arn)
-            .await
-            .expect("shared client should remain installed");
-        assert!(Arc::ptr_eq(&client, &current));
-        assert!(!generation.retired.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn same_arn_refresh_snapshots_the_client_after_arn_serialization() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let target = BucketTarget {
-            endpoint: "old.example:9000".to_string(),
-            arn: "shared-arn".to_string(),
-            ..Default::default()
-        };
-        sys.targets_map.write().await.extend([
-            ("bucket-a".to_string(), vec![target.clone()]),
-            ("bucket-b".to_string(), vec![target.clone()]),
-        ]);
-        let (mut old_client, _) = recording_target_client();
-        old_client.endpoint = "http://old.example:9000".to_string();
-        old_client.arn = target.arn.clone();
-        let old_client = Arc::new(old_client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(target.arn.clone(), ArnTarget::with_client(Arc::clone(&old_client)));
-        let old_generation = target_client_generation(&old_client).expect("old client should have a generation");
-        let arn_guard = sys.arn_update_mutex(&target.arn).await.lock_owned().await;
-
-        let refresh_sys = Arc::clone(&sys);
-        let refreshed_target = target.clone();
-        let refresh = tokio::spawn(async move {
-            refresh_sys
-                .update_all_targets(
-                    "bucket-b",
-                    Some(&BucketTargets {
-                        targets: vec![refreshed_target],
-                    }),
-                )
-                .await;
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let bucket_mutex = sys.target_update_mutex("bucket-b").await;
-                if bucket_mutex.try_lock().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("refresh should wait on the shared ARN");
-
-        old_generation.retire();
-        let (mut new_client, _) = recording_target_client();
-        new_client.endpoint = "http://new.example:9000".to_string();
-        new_client.arn = target.arn.clone();
-        let new_client = Arc::new(new_client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(target.arn.clone(), ArnTarget::with_client(Arc::clone(&new_client)));
-        drop(arn_guard);
-        tokio::time::timeout(Duration::from_secs(10), refresh)
-            .await
-            .expect("refresh should finish after ARN release")
-            .expect("refresh task should not panic");
-
-        let current = sys
-            .get_remote_target_client_by_arn("bucket-b", &target.arn)
-            .await
-            .expect("new client should remain installed");
-        assert!(Arc::ptr_eq(&new_client, &current));
-        assert!(old_generation.retired.load(Ordering::Acquire));
-        assert!(
-            !target_client_generation(&new_client)
-                .expect("new client should have a generation")
-                .retired
-                .load(Ordering::Acquire)
-        );
-    }
-
-    #[tokio::test]
-    async fn endpoint_refresh_waits_for_in_flight_heartbeat_probe() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let (mut old_client, started, release, _) = blocking_target_client();
-        old_client.arn = "old-arn".to_string();
-        old_client.endpoint = "https://localhost:444".to_string();
-        let old_endpoint = old_client.endpoint.trim_start_matches("https://").to_string();
-        sys.targets_map.write().await.insert(
-            "edited-bucket".to_string(),
-            vec![BucketTarget {
-                endpoint: old_endpoint.clone(),
-                arn: "old-arn".to_string(),
-                secure: true,
-                ..Default::default()
-            }],
-        );
-        let old_url = Url::parse(&format!("https://{old_endpoint}")).expect("old URL should parse");
-        sys.init_hc(&old_url).await;
-        let old_client = Arc::new(old_client);
-        let old_generation = register_target_client(&old_client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(old_client));
-
-        let heartbeat_sys = Arc::clone(&sys);
-        let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("heartbeat should connect to the old endpoint");
-
-        let refresh_sys = Arc::clone(&sys);
-        let refresh = tokio::spawn(async move {
-            refresh_sys
-                .update_all_targets(
-                    "edited-bucket",
-                    Some(&BucketTargets {
-                        targets: vec![BucketTarget {
-                            endpoint: "new.example:9000".to_string(),
-                            arn: "old-arn".to_string(),
-                            ..Default::default()
-                        }],
-                    }),
-                )
-                .await;
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !old_generation.retired.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("endpoint refresh should retire the old client generation");
-        assert!(!refresh.is_finished(), "refresh returned while an old endpoint probe was in flight");
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), heartbeat)
-            .await
-            .expect("heartbeat should finish after the response")
-            .expect("heartbeat task should not panic");
-        tokio::time::timeout(Duration::from_secs(10), refresh)
-            .await
-            .expect("refresh should finish after the old probe exits")
-            .expect("refresh task should not panic");
-        let health = sys.h_mutex.read().await;
-        assert!(
-            !health.contains_key(&endpoint_health_key(&old_url)),
-            "retired endpoint health remained: {health:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn target_delete_waits_for_in_flight_heartbeat_probe() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let (mut old_client, started, release, _) = blocking_target_client();
-        old_client.arn = "old-arn".to_string();
-        old_client.endpoint = "https://localhost:444".to_string();
-        let old_endpoint = old_client.endpoint.trim_start_matches("https://").to_string();
-        let old_url = old_client.to_url();
-        sys.targets_map.write().await.insert(
-            "bucket".to_string(),
-            vec![BucketTarget {
-                endpoint: old_endpoint,
-                arn: "old-arn".to_string(),
-                secure: true,
-                ..Default::default()
-            }],
-        );
-        sys.init_hc(&old_url).await;
-        let old_client = Arc::new(old_client);
-        let old_generation = register_target_client(&old_client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(old_client));
-
-        let heartbeat_sys = Arc::clone(&sys);
-        let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("heartbeat should connect to the old endpoint");
-        let delete_sys = Arc::clone(&sys);
-        let delete = tokio::spawn(async move { delete_sys.delete("bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !old_generation.retired.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delete should retire the old client generation");
-        assert!(!delete.is_finished(), "delete returned while an old endpoint probe was in flight");
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), heartbeat)
-            .await
-            .expect("heartbeat should finish after the response")
-            .expect("heartbeat task should not panic");
-        tokio::time::timeout(Duration::from_secs(10), delete)
-            .await
-            .expect("delete should finish after the old probe exits")
-            .expect("delete task should not panic");
-        assert!(!sys.h_mutex.read().await.contains_key(&endpoint_health_key(&old_url)));
-        sys.heartbeat_once().await;
-    }
-
-    #[tokio::test]
-    async fn unchanged_target_refresh_reuses_the_active_client() {
-        let sys = BucketTargetSys::default();
-        let target = BucketTarget {
-            endpoint: "old.example:9000".to_string(),
-            arn: "old-arn".to_string(),
-            ..Default::default()
-        };
-        sys.targets_map
-            .write()
-            .await
-            .insert("bucket".to_string(), vec![target.clone()]);
-        let (mut client, _) = recording_target_client();
-        client.endpoint = "http://old.example:9000".to_string();
-        client.arn = target.arn.clone();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(target.arn.clone(), ArnTarget::with_client(Arc::clone(&client)));
-
-        sys.update_all_targets(
-            "bucket",
-            Some(&BucketTargets {
-                targets: vec![target.clone()],
-            }),
-        )
-        .await;
-
-        let current = sys
-            .get_remote_target_client_by_arn("bucket", &target.arn)
-            .await
-            .expect("unchanged target should retain its client");
-        assert!(Arc::ptr_eq(&client, &current));
-        assert!(
-            target_client_generation(&client)
-                .expect("registered client should have a generation")
-                .acquire()
-                .await
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn target_client_config_detects_generation_changing_fields() {
-        let target = BucketTarget {
-            endpoint: "old.example:9000".to_string(),
-            arn: "old-arn".to_string(),
-            target_bucket: "target-bucket".to_string(),
-            storage_class: "STANDARD".to_string(),
-            reset_id: "reset-id".to_string(),
-            health_check_duration: Duration::from_secs(5),
-            replication_sync: true,
-            region: "us-east-1".to_string(),
-            path: "path".to_string(),
-            credentials: Some(Credentials {
-                access_key: "access".to_string(),
-                secret_key: "secret".to_string(),
-                session_token: Some("session".to_string()),
-                expiration: Some(chrono::Utc::now()),
-            }),
-            ca_cert_pem: "ca".to_string(),
-            ..Default::default()
-        };
-        assert!(target_client_config_unchanged(&target, &target.clone()));
-
-        let mut changed_targets = Vec::new();
-        macro_rules! change {
-            ($field:ident, $value:expr) => {{
-                let mut changed = target.clone();
-                changed.$field = $value;
-                changed_targets.push(changed);
-            }};
-        }
-        change!(endpoint, "new.example:9000".to_string());
-        change!(secure, true);
-        change!(target_bucket, "other-bucket".to_string());
-        change!(storage_class, "GLACIER".to_string());
-        change!(disable_proxy, true);
-        change!(arn, "new-arn".to_string());
-        change!(reset_id, "new-reset".to_string());
-        change!(health_check_duration, Duration::from_secs(6));
-        change!(replication_sync, false);
-        change!(region, "eu-west-1".to_string());
-        change!(path, "dns".to_string());
-        change!(skip_tls_verify, true);
-        change!(ca_cert_pem, "new-ca".to_string());
-        for (field, value) in [
-            ("access_key", "changed-access"),
-            ("secret_key", "changed-secret"),
-            ("session_token", "changed-session"),
-        ] {
-            let mut changed = target.clone();
-            let credentials = changed.credentials.as_mut().expect("credentials should exist");
-            match field {
-                "access_key" => credentials.access_key = value.to_string(),
-                "secret_key" => credentials.secret_key = value.to_string(),
-                "session_token" => credentials.session_token = Some(value.to_string()),
-                _ => unreachable!(),
-            }
-            changed_targets.push(changed);
-        }
-        let mut expiration = target.clone();
-        expiration.credentials.as_mut().expect("credentials should exist").expiration = None;
-        changed_targets.push(expiration);
-        let mut no_credentials = target.clone();
-        no_credentials.credentials = None;
-        changed_targets.push(no_credentials);
-
-        for changed in changed_targets {
-            assert!(!target_client_config_unchanged(&target, &changed));
-        }
-    }
-
-    #[tokio::test]
-    async fn current_target_client_rejects_stale_probe_snapshot_fields() {
-        let sys = BucketTargetSys::default();
-        let target = BucketTarget {
-            arn: "current-arn".to_string(),
-            target_bucket: "current-target-bucket".to_string(),
-            target_type: BucketTargetType::ReplicationService,
-            deployment_id: "current-deployment".to_string(),
-            ..Default::default()
-        };
-        sys.targets_map
-            .write()
-            .await
-            .insert("source-bucket".to_string(), vec![target.clone()]);
-        let (client, _) = recording_target_client();
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(target.arn.clone(), ArnTarget::with_client(Arc::new(client)));
-
-        assert!(
-            sys.get_remote_target_client_if_current("source-bucket", &target)
-                .await
-                .is_some()
-        );
-        for stale in [
-            BucketTarget {
-                target_bucket: "stale-target-bucket".to_string(),
-                ..target.clone()
-            },
-            BucketTarget {
-                target_type: BucketTargetType::IlmService,
-                ..target.clone()
-            },
-            BucketTarget {
-                deployment_id: "stale-deployment".to_string(),
-                ..target.clone()
-            },
-        ] {
-            assert!(
-                sys.get_remote_target_client_if_current("source-bucket", &stale)
-                    .await
-                    .is_none()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn retired_client_cannot_mark_the_current_endpoint_offline() {
-        let sys = BucketTargetSys::default();
-        let (client, _) = recording_target_client();
-        let client = Arc::new(client);
-        let generation = register_target_client(&client);
-        let url = client.to_url();
-        sys.init_hc(&url).await;
-        generation.retire();
-
-        sys.mark_target_offline(&client).await;
-
-        assert!(
-            sys.h_mutex
-                .read()
-                .await
-                .get(&endpoint_health_key(&client.to_url()))
-                .expect("endpoint health should remain present")
-                .online
-        );
-    }
-
-    #[tokio::test]
-    async fn client_retired_while_waiting_for_health_lock_cannot_reinsert_old_endpoint() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let (client, _) = recording_target_client();
-        let client = Arc::new(client);
-        let generation = register_target_client(&client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(client.arn.clone(), ArnTarget::with_client(Arc::clone(&client)));
-        let health_guard = sys.target_h_mutex.write().await;
-
-        let check_sys = Arc::clone(&sys);
-        let check_client = Arc::clone(&client);
-        let check = tokio::spawn(async move { check_sys.target_is_offline(&check_client).await });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if generation.in_flight.try_write().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("offline check should acquire the client generation lease");
-
-        generation.retire();
-        drop(health_guard);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), check)
-                .await
-                .expect("offline check should finish")
-                .expect("offline check task should not panic")
-        );
-        assert!(!sys.target_h_mutex.read().await.contains_key(&client.arn));
-    }
-
-    #[tokio::test]
-    async fn retired_client_rejects_every_target_operation_before_dispatch() {
-        let (client, request_uris) = recording_target_client();
-        let client = Arc::new(client);
-        let generation = register_target_client(&client);
-        generation.retire();
-        let put_options = PutObjectOptions::default();
-
-        assert!(client.bucket_exists("target-bucket").await.is_err());
-        assert!(client.get_bucket_versioning("target-bucket").await.is_err());
-        assert!(client.head_object("target-bucket", "object", None).await.is_err());
-        assert!(
-            client
-                .put_object("target-bucket", "object", 1, ByteStream::from_static(b"x"), &put_options,)
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .create_multipart_upload("target-bucket", "object", &put_options)
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .put_object_part(
-                    "target-bucket",
-                    "object",
-                    "upload-id",
-                    1,
-                    1,
-                    ByteStream::from_static(b"x"),
-                    &PutObjectPartOptions::default(),
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .complete_multipart_upload("target-bucket", "object", "upload-id", Vec::new(), &put_options)
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .remove_object("target-bucket", "object", None, remove_opts(false, false))
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .send_with_operation_lease(client.client.list_object_versions().bucket("target-bucket").send())
-                .await
-                .is_err()
-        );
-        assert!(
-            request_uris
-                .lock()
-                .expect("recorded request lock should not be poisoned")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn endpoint_refresh_waits_for_in_flight_target_request_and_rejects_late_dispatch() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let old_target = BucketTarget {
-            endpoint: "localhost:443".to_string(),
-            secure: true,
-            arn: "old-arn".to_string(),
-            ..Default::default()
-        };
-        sys.targets_map.write().await.extend([
-            ("bucket".to_string(), vec![old_target.clone()]),
-            ("same-arn-bucket".to_string(), vec![old_target]),
-        ]);
-        let (client, started, release, calls) = blocking_target_client();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(Arc::clone(&client)));
-        let generation = target_client_generation(&client).expect("registered client should have a generation");
-
-        let request_client = Arc::clone(&client);
-        let request = tokio::spawn(async move { request_client.bucket_exists("target-bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("target request should reach the connector");
-
-        let refresh_sys = Arc::clone(&sys);
-        let refresh = tokio::spawn(async move {
-            refresh_sys
-                .update_all_targets(
-                    "bucket",
-                    Some(&BucketTargets {
-                        targets: vec![BucketTarget {
-                            endpoint: "new.example:9000".to_string(),
-                            arn: "old-arn".to_string(),
-                            ..Default::default()
-                        }],
-                    }),
-                )
-                .await;
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !generation.retired.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("endpoint refresh should retire the old client");
-        assert!(!refresh.is_finished(), "refresh returned while an old target request was in flight");
-        let bucket_update_mutex = sys.target_update_mutex("bucket").await;
-        assert!(
-            bucket_update_mutex.try_lock().is_err(),
-            "target updates must remain serialized while retired requests drain"
-        );
-        tokio::time::timeout(Duration::from_secs(10), sys.update_all_targets("other-bucket", None))
-            .await
-            .expect("an unrelated bucket update must not wait for the retired request");
-        let same_arn_sys = Arc::clone(&sys);
-        let same_arn_refresh = tokio::spawn(async move {
-            same_arn_sys
-                .update_all_targets(
-                    "same-arn-bucket",
-                    Some(&BucketTargets {
-                        targets: vec![BucketTarget {
-                            endpoint: "new.example:9000".to_string(),
-                            arn: "old-arn".to_string(),
-                            ..Default::default()
-                        }],
-                    }),
-                )
-                .await;
-        });
-        let same_arn_bucket_mutex = sys.target_update_mutex("same-arn-bucket").await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if same_arn_bucket_mutex.try_lock().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("same-ARN refresh should reach the ARN serialization gate");
-        assert!(
-            !same_arn_refresh.is_finished(),
-            "same-ARN updates must remain serialized while retired requests drain"
-        );
-
-        release.notify_one();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), request)
-                .await
-                .expect("target request should finish after release")
-                .expect("target request task should not panic")
-                .expect("mock target should return success")
-        );
-        tokio::time::timeout(Duration::from_secs(10), refresh)
-            .await
-            .expect("refresh should finish after the target request exits")
-            .expect("refresh task should not panic");
-        tokio::time::timeout(Duration::from_secs(10), same_arn_refresh)
-            .await
-            .expect("same-ARN refresh should finish after the target request exits")
-            .expect("same-ARN refresh task should not panic");
-
-        let call_count = calls.load(Ordering::SeqCst);
-        let error = client
-            .bucket_exists("target-bucket")
-            .await
-            .expect_err("retired client must reject late requests");
-        assert_eq!(error.to_string(), ERR_TARGET_CLIENT_RETIRED);
-        assert_eq!(calls.load(Ordering::SeqCst), call_count);
-    }
-
-    #[tokio::test]
-    async fn cancelled_refresh_before_commit_preserves_the_old_target() {
-        let sys = Arc::new(BucketTargetSys::default());
-        let target = BucketTarget {
-            arn: "old-arn".to_string(),
-            ..Default::default()
-        };
-        sys.targets_map
-            .write()
-            .await
-            .insert("bucket".to_string(), vec![target.clone()]);
-        let (client, _) = recording_target_client();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(target.arn.clone(), ArnTarget::with_client(Arc::clone(&client)));
-        let generation = target_client_generation(&client).expect("registered client should have a generation");
-        let health_guard = sys.h_mutex.write().await;
-
-        let refresh_sys = Arc::clone(&sys);
-        let refresh = tokio::spawn(async move {
-            refresh_sys
-                .update_all_targets(
-                    "bucket",
-                    Some(&BucketTargets {
-                        targets: vec![BucketTarget {
-                            endpoint: "new.example:9000".to_string(),
-                            arn: "old-arn".to_string(),
-                            credentials: Some(Credentials::default()),
-                            ..Default::default()
-                        }],
-                    }),
-                )
-                .await;
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if sys.targets_map.try_write().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("refresh should reach the pre-commit health lock");
-        refresh.abort();
-        let _ = refresh.await;
-        drop(health_guard);
-
-        let targets_map = sys.targets_map.read().await;
-        let current_targets = targets_map.get("bucket").expect("old target config should remain installed");
-        assert_eq!(current_targets.len(), 1);
-        assert_eq!(current_targets[0].arn, target.arn);
-        drop(targets_map);
-        let current = sys
-            .get_remote_target_client_by_arn("bucket", "old-arn")
-            .await
-            .expect("old client should remain installed");
-        assert!(Arc::ptr_eq(&client, &current));
-        assert!(!generation.retired.load(Ordering::Acquire));
-        assert!(
-            client
-                .bucket_exists("target-bucket")
-                .await
-                .expect("old client should remain usable")
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_refresh_keeps_the_bucket_serialized_until_retired_requests_drain() {
-        let sys = Arc::new(BucketTargetSys::default());
-        sys.targets_map.write().await.insert(
-            "bucket".to_string(),
-            vec![BucketTarget {
-                endpoint: "localhost:443".to_string(),
-                secure: true,
-                arn: "old-arn".to_string(),
-                ..Default::default()
-            }],
-        );
-        let (client, started, release, _) = blocking_target_client();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(Arc::clone(&client)));
-        let generation = target_client_generation(&client).expect("registered client should have a generation");
-
-        let request_client = Arc::clone(&client);
-        let request = tokio::spawn(async move { request_client.bucket_exists("target-bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("target request should reach the connector");
-
-        let refresh_sys = Arc::clone(&sys);
-        let refresh = tokio::spawn(async move { refresh_sys.update_all_targets("bucket", None).await });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !generation.retired.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("refresh should retire the client");
-        refresh.abort();
-        let _ = refresh.await;
-
-        let bucket_update_mutex = sys.target_update_mutex("bucket").await;
-        assert!(
-            bucket_update_mutex.try_lock().is_err(),
-            "cancellation must not release the bucket update lease before drain"
-        );
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), request)
-            .await
-            .expect("target request should finish after release")
-            .expect("target request task should not panic")
-            .expect("mock target should return success");
-        tokio::time::timeout(Duration::from_secs(10), sys.update_all_targets("bucket", None))
-            .await
-            .expect("next update should finish after drain");
-    }
-
-    #[tokio::test]
-    async fn target_delete_waits_for_in_flight_target_request() {
-        let sys = Arc::new(BucketTargetSys::default());
-        sys.targets_map.write().await.insert(
-            "bucket".to_string(),
-            vec![BucketTarget {
-                arn: "old-arn".to_string(),
-                ..Default::default()
-            }],
-        );
-        let (client, started, release, _) = blocking_target_client();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(Arc::clone(&client)));
-        let generation = target_client_generation(&client).expect("registered client should have a generation");
-
-        let request_client = Arc::clone(&client);
-        let request = tokio::spawn(async move { request_client.bucket_exists("target-bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("target request should reach the connector");
-        let delete_sys = Arc::clone(&sys);
-        let delete = tokio::spawn(async move { delete_sys.delete("bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !generation.retired.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delete should retire the client");
-        assert!(!delete.is_finished(), "delete returned while a target request was in flight");
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), request)
-            .await
-            .expect("target request should finish after release")
-            .expect("target request task should not panic")
-            .expect("mock target should return success");
-        tokio::time::timeout(Duration::from_secs(10), delete)
-            .await
-            .expect("delete should finish after the target request exits")
-            .expect("delete task should not panic");
-    }
-
-    #[tokio::test]
-    async fn cancelled_delete_keeps_the_bucket_serialized_until_retired_requests_drain() {
-        let sys = Arc::new(BucketTargetSys::default());
-        sys.targets_map.write().await.insert(
-            "bucket".to_string(),
-            vec![BucketTarget {
-                arn: "old-arn".to_string(),
-                ..Default::default()
-            }],
-        );
-        let (client, started, release, _) = blocking_target_client();
-        let client = Arc::new(client);
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert("old-arn".to_string(), ArnTarget::with_client(Arc::clone(&client)));
-        let generation = target_client_generation(&client).expect("registered client should have a generation");
-        let request_client = Arc::clone(&client);
-        let request = tokio::spawn(async move { request_client.bucket_exists("target-bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .expect("target request should reach the connector");
-
-        let delete_sys = Arc::clone(&sys);
-        let delete = tokio::spawn(async move { delete_sys.delete("bucket").await });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !generation.retired.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delete should retire the client");
-        delete.abort();
-        let _ = delete.await;
-        let bucket_update_mutex = sys.target_update_mutex("bucket").await;
-        assert!(bucket_update_mutex.try_lock().is_err(), "cancelled delete must keep the drain lease");
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), request)
-            .await
-            .expect("target request should finish after release")
-            .expect("target request task should not panic")
-            .expect("mock target should return success");
-        tokio::time::timeout(Duration::from_secs(10), sys.update_all_targets("bucket", None))
-            .await
-            .expect("next update should finish after delete drain");
-    }
-
-    #[tokio::test]
-    async fn endpoint_refresh_retires_health_for_the_old_scheme() {
-        let sys = BucketTargetSys::default();
-        sys.targets_map.write().await.insert(
-            "edited-bucket".to_string(),
-            vec![BucketTarget {
-                endpoint: "remote.example:9000".to_string(),
-                ..Default::default()
-            }],
-        );
-        sys.init_hc(&Url::parse("http://remote.example:9000").expect("HTTP URL should parse"))
-            .await;
-
-        sys.update_all_targets(
-            "edited-bucket",
-            Some(&BucketTargets {
-                targets: vec![BucketTarget {
-                    endpoint: "remote.example:9000".to_string(),
-                    secure: true,
-                    ..Default::default()
-                }],
-            }),
-        )
-        .await;
-
-        assert!(!sys.h_mutex.read().await.contains_key("remote.example:9000"));
+        assert!(!sys.target_health_stats().await.contains_key(arn));
     }
 
     #[test]
@@ -4634,6 +2766,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_health_check_rejects_untrusted_self_signed_certificate() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let target =
+            target_client_for_test("arn:default-tls", format!("https://localhost:{port}"), s3_client_for_test(port, None));
+
+        assert!(!BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_honors_skip_tls_verify_client() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let target = target_client_for_test(
+            "arn:skip-tls",
+            format!("https://localhost:{port}"),
+            s3_client_for_test(port, Some(build_insecure_aws_s3_http_client())),
+        );
+
+        assert!(BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_honors_custom_ca_client() {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let http_client = build_aws_s3_http_client_from_target_ca_pem(&cert.cert.pem())
+            .await
+            .expect("custom CA client should build");
+        let (port, server) = spawn_https_server(&cert, 1);
+        let target = target_client_for_test(
+            "arn:custom-ca",
+            format!("https://localhost:{port}"),
+            s3_client_for_test(port, Some(http_client)),
+        );
+
+        assert!(BucketTargetSys::check_endpoint_health(&target).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_health_check_treats_client_errors_as_online_and_server_errors_as_offline() {
+        for (status, expected_online) in [(403, true), (500, false)] {
+            let (port, server) = spawn_http_status_server(status);
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let target = target_client_for_test(
+                &format!("arn:http-{status}"),
+                endpoint.clone(),
+                s3_client_for_endpoint_test(endpoint, None),
+            );
+
+            assert_eq!(BucketTargetSys::check_endpoint_health(&target).await, expected_online);
+            server.join().expect("test HTTP server should stop");
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_tls_health_isolated_by_arn_for_shared_endpoint() {
+        let sys = BucketTargetSys::default();
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
+        let (port, server) = spawn_https_server(&cert, 2);
+        let endpoint = format!("https://localhost:{port}");
+        let strict = target_client_for_test("arn:strict", endpoint.clone(), s3_client_for_test(port, None));
+        let insecure = target_client_for_test(
+            "arn:insecure",
+            endpoint,
+            s3_client_for_test(port, Some(build_insecure_aws_s3_http_client())),
+        );
+        {
+            let mut remotes = sys.arn_remotes_map.write().await;
+            remotes.insert(strict.arn.clone(), ArnTarget::with_client(strict.clone()));
+            remotes.insert(insecure.arn.clone(), ArnTarget::with_client(insecure.clone()));
+        }
+
+        sys.heartbeat_once().await;
+
+        assert!(sys.is_target_offline(&strict).await);
+        assert!(!sys.is_target_offline(&insecure).await);
+        server.join().expect("test TLS server should stop");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_discards_result_from_replaced_client_with_same_arn() {
+        let sys = Arc::new(BucketTargetSys::default());
+        let (port, accepted, release, server) = spawn_delayed_http_server();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let stale = target_client_for_test("arn:replacement", endpoint.clone(), s3_client_for_endpoint_test(endpoint, None));
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(stale.arn.clone(), ArnTarget::with_client(stale));
+        let heartbeat_sys = sys.clone();
+        let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
+        accepted.await.expect("heartbeat request should reach test server");
+
+        let replacement_endpoint = "https://replacement.example:9443".to_string();
+        let replacement = target_client_for_test(
+            "arn:replacement",
+            replacement_endpoint.clone(),
+            S3Client::from_conf(
+                S3Config::builder()
+                    .endpoint_url(replacement_endpoint)
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+        );
+        sys.arn_remotes_map
+            .write()
+            .await
+            .insert(replacement.arn.clone(), ArnTarget::with_client(replacement.clone()));
+        sys.init_target_health(&replacement).await;
+        release.send(()).expect("stale heartbeat response should be released");
+        heartbeat.await.expect("heartbeat should finish");
+
+        assert!(!sys.is_target_offline(&replacement).await);
+        server.join().expect("test HTTP server should stop");
+    }
+
+    #[tokio::test]
+    async fn target_update_mutex_reuses_live_lock_and_reclaims_dead_entries() {
+        let sys = BucketTargetSys::default();
+        let first = sys.target_update_mutex("first").await;
+        let same = sys.target_update_mutex("first").await;
+        assert!(Arc::ptr_eq(&first, &same));
+        drop(first);
+        drop(same);
+
+        let _second = sys.target_update_mutex("second").await;
+        let mutexes = sys.target_update_mutexes.lock().await;
+        assert!(!mutexes.contains_key("first"));
+        assert!(mutexes.contains_key("second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn target_updates_serialize_client_build_through_publication_per_bucket() {
+        let sys = Arc::new(BucketTargetSys::default());
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
+            arn: "arn:first".to_string(),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let target = |arn: &str| BucketTarget {
+            arn: arn.to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+        let first_targets = BucketTargets {
+            targets: vec![target("arn:first")],
+        };
+        let second_targets = BucketTargets {
+            targets: vec![target("arn:second")],
+        };
+        let first_sys = sys.clone();
+        let first = tokio::spawn(async move {
+            first_sys.update_all_targets("bucket", Some(&first_targets)).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.acquire())
+            .await
+            .expect("first client build should start")
+            .expect("first started semaphore should remain open")
+            .forget();
+        let second_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let second_release = Arc::new(tokio::sync::Semaphore::new(0));
+        *sys.target_client_build_probe.lock().await = Some(TargetClientBuildProbe {
+            arn: "arn:second".to_string(),
+            started: second_started.clone(),
+            release: second_release.clone(),
+        });
+        let second_sys = sys.clone();
+        let second = tokio::spawn(async move {
+            second_sys.update_all_targets("bucket", Some(&second_targets)).await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_started.acquire())
+                .await
+                .is_err()
+        );
+        assert!(!sys.targets_map.read().await.contains_key("bucket"));
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first target update should not stall")
+            .expect("first target update should finish");
+        tokio::time::timeout(Duration::from_secs(1), second_started.acquire())
+            .await
+            .expect("second client build should start after first update publishes")
+            .expect("second started semaphore should remain open")
+            .forget();
+        second_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second target update should not stall")
+            .expect("second target update should finish");
+        let targets = sys.targets_map.read().await;
+        assert_eq!(targets["bucket"][0].arn, "arn:second");
+    }
+
+    #[tokio::test]
     async fn replication_trust_store_composes_system_global_and_target_roots_for_real_tls() {
         let tls_dir = tempfile::tempdir().expect("temporary TLS directory should be created");
         let global_ca =
@@ -4654,8 +2996,8 @@ mod tests {
         );
         let http_client = build_aws_s3_http_client_with_trust_store(trust_store).expect("composed TLS client should build");
 
-        let (global_port, global_server) = spawn_single_request_https_server(&global_ca);
-        s3_client_with_http_client(global_port, http_client.clone())
+        let (global_port, global_server) = spawn_https_server(&global_ca, 1);
+        s3_client_for_test(global_port, Some(http_client.clone()))
             .head_bucket()
             .bucket("test-bucket")
             .send()
@@ -4663,8 +3005,8 @@ mod tests {
             .expect("global RUSTFS_TLS_PATH CA should authenticate its TLS server");
         global_server.join().expect("global CA TLS server should finish");
 
-        let (target_port, target_server) = spawn_single_request_https_server(&target_ca);
-        s3_client_with_http_client(target_port, http_client)
+        let (target_port, target_server) = spawn_https_server(&target_ca, 1);
+        s3_client_for_test(target_port, Some(http_client))
             .head_bucket()
             .bucket("test-bucket")
             .send()

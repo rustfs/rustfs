@@ -52,8 +52,6 @@ pub(crate) fn replication_state_from_filemeta(state: &rustfs_filemeta::Replicati
             .map(|(arn, status)| (arn.clone(), version_purge_status_from_filemeta(status.clone())))
             .collect(),
         reset_statuses_map: state.reset_statuses_map.clone(),
-        target_delete_marker_version_ids: state.target_delete_marker_version_ids.clone(),
-        target_delete_marker_version_ids_corrupt: state.target_delete_marker_version_ids_corrupt,
     }
 }
 
@@ -85,27 +83,5 @@ pub fn replication_state_to_filemeta(state: &ReplicationState) -> rustfs_filemet
             .map(|(arn, status)| (arn.clone(), version_purge_status_to_filemeta(status.clone())))
             .collect(),
         reset_statuses_map: state.reset_statuses_map.clone(),
-        target_delete_marker_version_ids: state.target_delete_marker_version_ids.clone(),
-        target_delete_marker_version_ids_corrupt: state.target_delete_marker_version_ids_corrupt,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    fn target_delete_marker_versions_survive_filemeta_boundary_round_trip() {
-        let arn = "arn:rustfs:replication::target:bucket";
-        let version_id = "opaque-target-version";
-        let state = ReplicationState {
-            target_delete_marker_version_ids: HashMap::from([(arn.to_string(), version_id.to_string())]),
-            ..Default::default()
-        };
-
-        let round_trip = replication_state_from_filemeta(&replication_state_to_filemeta(&state));
-
-        assert_eq!(round_trip.target_delete_marker_version_ids.get(arn).map(String::as_str), Some(version_id));
     }
 }

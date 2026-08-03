@@ -33,7 +33,7 @@ use rustfs_utils::http::{
     SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
     SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes,
     get_bytes, get_consistent_bytes, get_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
-    strip_internal_prefix, target_delete_marker_versions,
+    strip_internal_prefix,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -2725,10 +2725,6 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
         }
     }
 
-    (rs.target_delete_marker_version_ids, rs.target_delete_marker_version_ids_corrupt) = target_delete_marker_versions(metadata);
-    has |= !rs.target_delete_marker_version_ids.is_empty();
-    has |= rs.target_delete_marker_version_ids_corrupt;
-
     if has { Some(rs) } else { None }
 }
 
@@ -4751,47 +4747,6 @@ mod tests {
             rs.target_state(arn).resync_timestamp,
             ts,
             "lookup must find the round-tripped reset status"
-        );
-    }
-
-    #[test]
-    fn target_delete_marker_version_metadata_is_forward_and_backward_compatible() {
-        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
-        let suffix = format!("{}{arn}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX);
-        let mut metadata = HashMap::from([(format!("{RUSTFS_INTERNAL_PREFIX}replication-status"), format!("{arn}=COMPLETED;"))]);
-
-        let old = get_internal_replication_state(&metadata).expect("legacy replication metadata should parse");
-        assert!(
-            old.target_delete_marker_version_ids.is_empty(),
-            "a new reader must treat the missing legacy field as empty"
-        );
-
-        metadata.insert(format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX), "target-id".to_string());
-        metadata.insert(format!("{RUSTFS_INTERNAL_PREFIX}{suffix}"), "target-id".to_string());
-        let current = get_internal_replication_state(&metadata).expect("new replication metadata should parse");
-        assert_eq!(
-            current.target_delete_marker_version_ids.get(arn).map(String::as_str),
-            Some("target-id"),
-            "matching dual-prefix values must remain readable"
-        );
-        assert_eq!(
-            current.targets.get(arn),
-            Some(&ReplicationStatusType::Completed),
-            "the added metadata key must not disturb fields understood by old nodes"
-        );
-
-        metadata.insert(
-            format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
-            "conflicting-id".to_string(),
-        );
-        let conflicted = get_internal_replication_state(&metadata).expect("replication status should still parse");
-        assert!(
-            conflicted.target_delete_marker_version_ids.is_empty(),
-            "a destructive version ID must fail closed when the dual prefixes disagree"
-        );
-        assert!(
-            conflicted.target_delete_marker_version_ids_corrupt,
-            "a dual-prefix conflict must remain distinguishable from missing legacy metadata"
         );
     }
 

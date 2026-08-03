@@ -992,8 +992,6 @@ impl ObjectInfo {
     }
 
     pub fn replication_state(&self) -> ReplicationState {
-        let (target_delete_marker_version_ids, target_delete_marker_version_ids_corrupt) =
-            rustfs_utils::http::target_delete_marker_versions(&self.user_defined);
         ReplicationState {
             replication_status_internal: self.replication_status_internal.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
@@ -1011,8 +1009,6 @@ impl ObjectInfo {
                     .map(|arn| (arn, v.clone()))
                 })
                 .collect(),
-            target_delete_marker_version_ids,
-            target_delete_marker_version_ids_corrupt,
             ..Default::default()
         }
     }
@@ -1198,13 +1194,7 @@ mod tests {
     #[test]
     fn object_info_replication_helpers_parse_target_status_and_reset_headers() {
         let reset_key = rustfs_utils::http::internal_key_rustfs("replication-reset-arn:target-a");
-        let marker_suffix = format!(
-            "{}{}",
-            rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
-            "arn:target-a"
-        );
-        let mut user_defined = HashMap::from([(reset_key, "reset-id".to_string())]);
-        rustfs_utils::http::insert_str(&mut user_defined, &marker_suffix, "target-marker-id".to_string());
+        let user_defined = HashMap::from([(reset_key, "reset-id".to_string())]);
         let object = ObjectInfo {
             replication_status_internal: Some("arn:target-a=COMPLETED;arn:target-b=FAILED;".to_string()),
             version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
@@ -1220,35 +1210,6 @@ mod tests {
         assert_eq!(state.targets.get("arn:target-b"), Some(&ReplicationStatusType::Failed));
         assert_eq!(state.purge_targets.get("arn:target-a"), Some(&VersionPurgeStatusType::Pending));
         assert_eq!(state.reset_statuses_map.get("arn:target-a"), Some(&"reset-id".to_string()));
-        assert_eq!(
-            state.target_delete_marker_version_ids.get("arn:target-a").map(String::as_str),
-            Some("target-marker-id")
-        );
-        assert!(!state.target_delete_marker_version_ids_corrupt);
-    }
-
-    #[test]
-    fn object_info_replication_state_preserves_delete_marker_version_conflicts() {
-        let arn = "arn:target-a";
-        let suffix = format!("{}{arn}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX);
-        let object = ObjectInfo {
-            user_defined: Arc::new(HashMap::from([
-                (
-                    format!("{}{}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX, suffix),
-                    "target-id-a".to_string(),
-                ),
-                (
-                    format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, suffix),
-                    "target-id-b".to_string(),
-                ),
-            ])),
-            ..Default::default()
-        };
-
-        let state = object.replication_state();
-
-        assert!(state.target_delete_marker_version_ids.is_empty());
-        assert!(state.target_delete_marker_version_ids_corrupt);
     }
 
     #[test]

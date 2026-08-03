@@ -15,8 +15,6 @@
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
-#[cfg(test)]
-use super::storage_api::bucket::target::Credentials;
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
@@ -1969,15 +1967,10 @@ async fn check_replication_target(
         }
     };
 
-    match target_client.bucket_exists(&target.target_bucket).await {
-        Ok(true) => result.phases.bucket = ReplicationCheckPhaseStatus::passed(),
-        Ok(false) => {
-            let error = "target bucket does not exist";
-            result.phases.bucket = ReplicationCheckPhaseStatus::failed(error);
-            fail_replication_check_target(&mut result, error);
-            return result;
-        }
+    match target_client.client.head_bucket().bucket(&target.target_bucket).send().await {
+        Ok(_) => result.phases.bucket = ReplicationCheckPhaseStatus::passed(),
         Err(err) => {
+            let err = S3ClientError::from(err);
             let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
             result.phases.bucket = ReplicationCheckPhaseStatus::failed(&error);
             fail_replication_check_target(&mut result, error);
@@ -2162,17 +2155,13 @@ async fn allocate_replication_probe_key(target_client: &TargetClient, target_buc
     for _ in 0..4 {
         let probe_key = new_replication_probe_key();
         let output = target_client
-            .send_with_operation_lease(
-                target_client
-                    .client
-                    .list_object_versions()
-                    .bucket(target_bucket)
-                    .prefix(&probe_key)
-                    .max_keys(2)
-                    .send(),
-            )
+            .client
+            .list_object_versions()
+            .bucket(target_bucket)
+            .prefix(&probe_key)
+            .max_keys(2)
+            .send()
             .await
-            .map_err(|err| format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject))?
             .map_err(|err| {
                 format_replication_check_client_error(&S3ClientError::from(err), ReplicationCheckFailureContext::ReplicateObject)
             })?;
@@ -2193,10 +2182,14 @@ async fn allocate_replication_probe_key(target_client: &TargetClient, target_buc
 
 async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) -> Result<Arc<TargetClient>, String> {
     let target_sys = BucketTargetSys::get();
-    target_sys
-        .get_remote_target_client_if_current(bucket, target)
-        .await
-        .ok_or_else(|| "replication target client unavailable".to_string())
+    match target_sys.get_remote_target_client(bucket, &target.arn).await {
+        Some(client) => Ok(client),
+        None => target_sys
+            .get_remote_target_client_internal(target)
+            .await
+            .map(Arc::new)
+            .map_err(|err| err.to_string()),
+    }
 }
 
 fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
@@ -2247,25 +2240,22 @@ async fn put_replication_probe_object(
     );
 
     target_client
-        .send_with_operation_lease(
-            target_client
-                .client
-                .put_object()
-                .bucket(target_bucket)
-                .key(probe_key)
-                .if_none_match("*")
-                .content_length(8)
-                .body(AwsByteStream::from_static(b"aaaaaaaa"))
-                .customize()
-                .map_request(move |mut req| {
-                    for (key, value) in headers.clone() {
-                        req.headers_mut().insert(key.expect("operation should succeed"), value);
-                    }
-                    Result::<_, std::io::Error>::Ok(req)
-                })
-                .send(),
-        )
-        .await?
+        .client
+        .put_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .if_none_match("*")
+        .content_length(8)
+        .body(AwsByteStream::from_static(b"aaaaaaaa"))
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
         .map(|output| output.version_id().map(ToOwned::to_owned))
         .map_err(S3ClientError::from)
 }
@@ -2296,23 +2286,20 @@ async fn delete_replication_probe_object(
     }
 
     target_client
-        .send_with_operation_lease(
-            target_client
-                .client
-                .delete_object()
-                .bucket(target_bucket)
-                .key(probe_key)
-                .set_version_id(version_id.map(ToOwned::to_owned))
-                .customize()
-                .map_request(move |mut req| {
-                    for (key, value) in headers.clone() {
-                        req.headers_mut().insert(key.expect("operation should succeed"), value);
-                    }
-                    Result::<_, std::io::Error>::Ok(req)
-                })
-                .send(),
-        )
-        .await?
+        .client
+        .delete_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .set_version_id(version_id.map(ToOwned::to_owned))
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
         .map(|output| output.version_id().map(ToOwned::to_owned))
         .map_err(S3ClientError::from)
 }
@@ -2324,16 +2311,13 @@ async fn delete_replication_probe_version(
     version_id: &str,
 ) -> Result<(), S3ClientError> {
     target_client
-        .send_with_operation_lease(
-            target_client
-                .client
-                .delete_object()
-                .bucket(target_bucket)
-                .key(probe_key)
-                .version_id(version_id)
-                .send(),
-        )
-        .await?
+        .client
+        .delete_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .version_id(version_id)
+        .send()
+        .await
         .map(|_| ())
         .map_err(S3ClientError::from)
 }
@@ -2360,27 +2344,21 @@ async fn cleanup_replication_probe<'a>(
     let mut key_marker = None;
     let mut version_id_marker = None;
     loop {
-        let output = {
-            target_client
-                .send_with_operation_lease(
-                    target_client
-                        .client
-                        .list_object_versions()
-                        .bucket(target_bucket)
-                        .prefix(probe_key)
-                        .set_key_marker(key_marker.clone())
-                        .set_version_id_marker(version_id_marker.clone())
-                        .send(),
+        let output = target_client
+            .client
+            .list_object_versions()
+            .bucket(target_bucket)
+            .prefix(probe_key)
+            .set_key_marker(key_marker.clone())
+            .set_version_id_marker(version_id_marker.clone())
+            .send()
+            .await
+            .map_err(|err| {
+                format_replication_check_client_error(
+                    &S3ClientError::from(err),
+                    ReplicationCheckFailureContext::DeleteObjectVersion,
                 )
-                .await
-                .map_err(|err| format_replication_check_client_error(&err, ReplicationCheckFailureContext::DeleteObjectVersion))?
-                .map_err(|err| {
-                    format_replication_check_client_error(
-                        &S3ClientError::from(err),
-                        ReplicationCheckFailureContext::DeleteObjectVersion,
-                    )
-                })?
-        };
+            })?;
 
         let mut discovered_ids = Vec::new();
         discovered_ids.extend(
@@ -2473,14 +2451,11 @@ async fn target_client_object_lock_enabled_with_client(
     target_bucket: &str,
 ) -> Result<bool, S3ClientError> {
     match target_client
-        .send_with_operation_lease(
-            target_client
-                .client
-                .get_object_lock_configuration()
-                .bucket(target_bucket)
-                .send(),
-        )
-        .await?
+        .client
+        .get_object_lock_configuration()
+        .bucket(target_bucket)
+        .send()
+        .await
     {
         Ok(res) => Ok(res
             .object_lock_configuration()
@@ -3385,84 +3360,6 @@ mod tests {
                 None => Ok(()),
             }
         }
-    }
-
-    #[tokio::test]
-    async fn retired_client_blocks_every_raw_replication_check_request() {
-        let sys = BucketTargetSys::default();
-        let target = BucketTarget {
-            endpoint: "10.255.255.1:81".to_string(),
-            target_bucket: "target-bucket".to_string(),
-            arn: "arn:rustfs:replication:test:bucket:retired".to_string(),
-            credentials: Some(Credentials::default()),
-            ..Default::default()
-        };
-        sys.update_all_targets(
-            "source-bucket",
-            Some(&BucketTargets {
-                targets: vec![target.clone()],
-            }),
-        )
-        .await;
-        let client = sys
-            .get_remote_target_client_if_current("source-bucket", &target)
-            .await
-            .expect("target client should be installed");
-        sys.update_all_targets("source-bucket", None).await;
-
-        let deadline = Duration::from_secs(1);
-        let allocation_error = tokio::time::timeout(deadline, allocate_replication_probe_key(&client, &target.target_bucket))
-            .await
-            .expect("retired client must not dispatch list-object-versions")
-            .expect_err("retired client must reject probe allocation");
-        assert_eq!(allocation_error, "target replicate object check failed: TargetClientRetired");
-
-        let put_error = tokio::time::timeout(
-            deadline,
-            put_replication_probe_object(&client, &target.target_bucket, "probe", OffsetDateTime::now_utc()),
-        )
-        .await
-        .expect("retired client must not dispatch put-object")
-        .expect_err("retired client must reject probe put");
-        assert_eq!(put_error.error, "replication target client retired");
-
-        let delete_error = tokio::time::timeout(
-            deadline,
-            delete_replication_probe_object(
-                &client,
-                &target.target_bucket,
-                "probe",
-                None,
-                build_replication_probe_remove_options(OffsetDateTime::now_utc(), true),
-            ),
-        )
-        .await
-        .expect("retired client must not dispatch delete-marker")
-        .expect_err("retired client must reject delete-marker");
-        assert_eq!(delete_error.error, "replication target client retired");
-
-        let version_delete_error = tokio::time::timeout(
-            deadline,
-            delete_replication_probe_version(&client, &target.target_bucket, "probe", "version"),
-        )
-        .await
-        .expect("retired client must not dispatch version delete")
-        .expect_err("retired client must reject version delete");
-        assert_eq!(version_delete_error.error, "replication target client retired");
-
-        let cleanup_error =
-            tokio::time::timeout(deadline, cleanup_replication_probe(&client, &target.target_bucket, "probe", [None, None]))
-                .await
-                .expect("retired client must not dispatch cleanup list")
-                .expect_err("retired client must reject cleanup list");
-        assert_eq!(cleanup_error, "target delete object version check failed: TargetClientRetired");
-
-        let object_lock_error =
-            tokio::time::timeout(deadline, target_client_object_lock_enabled_with_client(&client, &target.target_bucket))
-                .await
-                .expect("retired client must not dispatch object-lock request")
-                .expect_err("retired client must reject object-lock request");
-        assert_eq!(object_lock_error.error, "replication target client retired");
     }
 
     #[tokio::test]
@@ -4492,11 +4389,7 @@ mod tests {
     #[test]
     fn object_lambda_auth_headers_use_constant_time_helper() {
         let source = include_str!("router.rs");
-        let production = source
-            .split_once("fn validate_object_lambda_response_auth_headers")
-            .and_then(|(_, remainder)| remainder.split_once("fn format_timestamp_http_date"))
-            .map(|(production, _)| production)
-            .expect("object lambda response auth validator should remain in production code");
+        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
         assert!(!production.contains("route == Some(output_route)"));
         assert!(!production.contains("token == Some(output_token)"));
         assert!(production.contains("constant_time_eq(route, output_route)"));

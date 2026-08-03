@@ -189,7 +189,7 @@ fn i64_to_u64_floor_zero(value: i64) -> u64 {
     u64::try_from(value.max(0)).unwrap_or(0)
 }
 
-pub(super) fn normalized_target_arns(target_arns: &[String]) -> Vec<&str> {
+fn normalized_target_arns(target_arns: &[String]) -> Vec<&str> {
     let mut target_arns = target_arns
         .iter()
         .map(String::as_str)

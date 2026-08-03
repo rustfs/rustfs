@@ -15,8 +15,6 @@
 use super::replication_bandwidth_boundary;
 use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::replication_config_store::ReplicationConfigStore;
-#[cfg(test)]
-use super::replication_error_boundary::Error;
 use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
@@ -30,15 +28,12 @@ use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
-#[cfg(test)]
-use super::replication_object_decision_boundary::should_retry_delete_marker_purge;
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
     is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
 };
-use super::replication_pool::get_global_replication_pool;
-use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
+use super::replication_queue_boundary::DeletedObjectReplicationInfo;
 use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
@@ -84,7 +79,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
-use tokio::task::{Id as TaskId, JoinError, JoinHandle, JoinSet};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
@@ -118,251 +113,8 @@ const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
 ];
 
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
-const MAX_PARALLEL_DELETE_MARKER_RECONCILIATIONS: usize = 32;
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
-
-#[cfg(test)]
-struct DeleteReplicationSourceCheckProbeState {
-    bucket: String,
-    object: String,
-    responses: Vec<Option<(bool, Option<ReplicationState>)>>,
-    pause_on_call: Option<usize>,
-    calls: std::sync::atomic::AtomicUsize,
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Semaphore,
-}
-
-#[cfg(test)]
-pub(super) struct DeleteReplicationSourceCheckProbe {
-    state: Arc<DeleteReplicationSourceCheckProbeState>,
-    _exclusive: tokio::sync::OwnedMutexGuard<()>,
-}
-
-#[cfg(test)]
-static DELETE_REPLICATION_SOURCE_CHECK_PROBE: std::sync::OnceLock<
-    std::sync::Mutex<Option<Arc<DeleteReplicationSourceCheckProbeState>>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-static DELETE_REPLICATION_SOURCE_CHECK_EXCLUSIVE: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-struct DeleteRetryCaptureState {
-    bucket: String,
-    object: String,
-    batches: Vec<Vec<DeletedObjectReplicationInfo>>,
-}
-
-#[cfg(test)]
-struct DeleteRetryCapture {
-    bucket: String,
-    object: String,
-    _exclusive: tokio::sync::OwnedMutexGuard<()>,
-}
-
-#[cfg(test)]
-static DELETE_RETRY_CAPTURE: std::sync::OnceLock<std::sync::Mutex<Option<DeleteRetryCaptureState>>> = std::sync::OnceLock::new();
-#[cfg(test)]
-static DELETE_RETRY_CAPTURE_EXCLUSIVE: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-impl DeleteRetryCapture {
-    async fn install(bucket: &str, object: &str) -> Self {
-        let exclusive = DELETE_RETRY_CAPTURE_EXCLUSIVE
-            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-            .lock_owned()
-            .await;
-        let state = DeleteRetryCaptureState {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            batches: Vec::new(),
-        };
-        *DELETE_RETRY_CAPTURE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("delete retry capture mutex should not poison") = Some(state);
-        Self {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            _exclusive: exclusive,
-        }
-    }
-
-    fn batches(&self) -> Vec<Vec<DeletedObjectReplicationInfo>> {
-        DELETE_RETRY_CAPTURE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("delete retry capture mutex should not poison")
-            .as_ref()
-            .filter(|state| state.bucket == self.bucket && state.object == self.object)
-            .map(|state| state.batches.clone())
-            .unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-impl Drop for DeleteRetryCapture {
-    fn drop(&mut self) {
-        let mut slot = DELETE_RETRY_CAPTURE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("delete retry capture mutex should not poison");
-        if slot
-            .as_ref()
-            .is_some_and(|state| state.bucket == self.bucket && state.object == self.object)
-        {
-            *slot = None;
-        }
-    }
-}
-
-#[cfg(test)]
-fn capture_delete_retries(dobj: &DeletedObjectReplicationInfo, retries: &[DeletedObjectReplicationInfo]) -> bool {
-    let mut slot = DELETE_RETRY_CAPTURE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("delete retry capture mutex should not poison");
-    let Some(state) = slot
-        .as_mut()
-        .filter(|state| state.bucket == dobj.bucket && state.object == dobj.delete_object.object_name)
-    else {
-        return false;
-    };
-    state.batches.push(retries.to_vec());
-    true
-}
-
-#[cfg(test)]
-impl DeleteReplicationSourceCheckProbe {
-    pub(super) async fn install(bucket: &str, object: &str, responses: Vec<bool>, pause_on_call: Option<usize>) -> Self {
-        Self::install_states(
-            bucket,
-            object,
-            responses.into_iter().map(|matches| Some((matches, None))).collect(),
-            pause_on_call,
-        )
-        .await
-    }
-
-    pub(super) async fn install_results(
-        bucket: &str,
-        object: &str,
-        responses: Vec<Option<bool>>,
-        pause_on_call: Option<usize>,
-    ) -> Self {
-        Self::install_states(
-            bucket,
-            object,
-            responses
-                .into_iter()
-                .map(|response| response.map(|matches| (matches, None)))
-                .collect(),
-            pause_on_call,
-        )
-        .await
-    }
-
-    async fn install_states(
-        bucket: &str,
-        object: &str,
-        responses: Vec<Option<(bool, Option<ReplicationState>)>>,
-        pause_on_call: Option<usize>,
-    ) -> Self {
-        assert!(!responses.is_empty(), "source-check probe needs at least one response");
-        let exclusive = DELETE_REPLICATION_SOURCE_CHECK_EXCLUSIVE
-            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-            .lock_owned()
-            .await;
-        let state = Arc::new(DeleteReplicationSourceCheckProbeState {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            responses,
-            pause_on_call,
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Semaphore::new(0),
-        });
-        let mut slot = DELETE_REPLICATION_SOURCE_CHECK_PROBE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("source-check probe mutex should not poison");
-        *slot = Some(Arc::clone(&state));
-        drop(slot);
-        Self {
-            state,
-            _exclusive: exclusive,
-        }
-    }
-
-    async fn wait_until_paused(&self) {
-        let pause_on_call = self.state.pause_on_call.expect("probe should have a paused call");
-        tokio::time::timeout(TokioDuration::from_secs(30), async {
-            loop {
-                if self.state.calls.load(std::sync::atomic::Ordering::Acquire) >= pause_on_call {
-                    return;
-                }
-                self.state.entered.notified().await;
-            }
-        })
-        .await
-        .expect("source check should reach the deterministic pause");
-    }
-
-    fn release(&self) {
-        self.state.release.add_permits(1);
-    }
-}
-
-#[cfg(test)]
-impl Drop for DeleteReplicationSourceCheckProbe {
-    fn drop(&mut self) {
-        let mut slot = DELETE_REPLICATION_SOURCE_CHECK_PROBE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("source-check probe mutex should not poison");
-        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
-            *slot = None;
-        }
-        drop(slot);
-        self.state.release.add_permits(1);
-    }
-}
-
-#[cfg(test)]
-fn delete_replication_source_check_probe(bucket: &str, object: &str) -> Option<Arc<DeleteReplicationSourceCheckProbeState>> {
-    DELETE_REPLICATION_SOURCE_CHECK_PROBE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("source-check probe mutex should not poison")
-        .as_ref()
-        .filter(|state| state.bucket == bucket && state.object == object)
-        .cloned()
-}
-
-#[cfg(test)]
-async fn probe_delete_replication_source_check(
-    state: Arc<DeleteReplicationSourceCheckProbeState>,
-) -> Result<(bool, Option<ReplicationState>)> {
-    let call = state.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-    if state.pause_on_call == Some(call) {
-        state.entered.notify_one();
-        state
-            .release
-            .acquire()
-            .await
-            .expect("source-check probe should remain open")
-            .forget();
-    }
-    state
-        .responses
-        .get(call - 1)
-        .expect("source-check probe should define every response")
-        .clone()
-        .ok_or_else(|| Error::other("injected source-check failure"))
-}
 
 fn resync_target_error_detail<E, R>(error: &SdkError<E, R>) -> Option<String>
 where
@@ -1450,18 +1202,87 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
     Ok(())
 }
 
-pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectReplicationInfo, storage: Arc<S>) -> bool {
+pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
+    let _ = replicate_delete_with_outcome(dobj, storage).await;
+}
+
+pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
+    dobj: DeletedObjectReplicationInfo,
+    storage: Arc<S>,
+) -> bool {
     if dobj.delete_object.force_delete {
-        replicate_force_delete_to_targets(&dobj, storage).await;
-        return true;
+        return replicate_force_delete_to_targets(&dobj, storage).await;
     }
 
     let bucket = dobj.bucket.clone();
+    let mut source_state_verified = true;
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         Some(version_id.to_owned())
     } else {
         dobj.delete_object.version_id
     };
+
+    if dobj.delete_object.delete_marker
+        && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
+    {
+        let source_marker_state = storage
+            .get_object_info(
+                &bucket,
+                &dobj.delete_object.object_name,
+                &ObjectOptions {
+                    version_id: Some(delete_marker_version_id.to_string()),
+                    versioned: ReplicationVersioningStore::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                    version_suspended: ReplicationVersioningStore::prefix_suspended(&bucket, &dobj.delete_object.object_name)
+                        .await,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match source_marker_state {
+            Ok(info) if info.delete_marker && info.version_id == Some(delete_marker_version_id) => {}
+            Ok(_) => {
+                debug!(
+                    event = EVENT_REPLICATION_DELETE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    reason = "source_not_delete_marker",
+                    "Skipping stale delete-marker replication"
+                );
+                return true;
+            }
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+                debug!(
+                    event = EVENT_REPLICATION_DELETE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    reason = "source_version_missing",
+                    "Skipping stale delete-marker replication"
+                );
+                return true;
+            }
+            Err(err) => {
+                source_state_verified = false;
+                debug!(
+                    event = EVENT_REPLICATION_DELETE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    error = %err,
+                    reason = "source_state_verification_failed",
+                    "Failed to verify source delete-marker state before replication"
+                );
+            }
+        }
+    }
 
     let dsc = match parse_replicate_decision(
         &bucket,
@@ -1533,7 +1354,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
         }
     };
 
-    let replication_guard = match ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
         Ok(lock_guard) => lock_guard,
         Err(e) => {
             debug!(
@@ -1563,100 +1384,22 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
         }
     };
 
+    // Initialize replicated infos
     let mut rinfos = ReplicatedInfos {
         replication_timestamp: Some(OffsetDateTime::now_utc()),
         targets: Vec::with_capacity(dsc.targets_map.len()),
     };
-    let mut source_marker_was_present = false;
-    let mut source_marker_is_absent = false;
-    let mut run_target_operations = true;
-
-    if dobj.delete_object.delete_marker
-        && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
-    {
-        match source_delete_marker_matches(
-            storage.clone(),
-            bucket.clone(),
-            dobj.delete_object.object_name.clone(),
-            delete_marker_version_id,
-            &replication_guard,
-        )
-        .await
-        {
-            Ok((true, current_state)) => {
-                source_marker_was_present = true;
-                refresh_delete_replication_state(&mut dobj, current_state);
-            }
-            Ok((false, _)) => {
-                run_target_operations = false;
-                source_marker_is_absent = true;
-                debug!(
-                    event = EVENT_REPLICATION_DELETE_SKIPPED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    bucket,
-                    object = dobj.delete_object.object_name,
-                    version_id = %delete_marker_version_id,
-                    reason = "source_version_missing_or_replaced",
-                    "Reconciling a stale delete-marker replication task"
-                );
-                if target_delete_marker_version_conflicts(&dobj) {
-                    rinfos.targets = failed_delete_targets_for_decision(
-                        &dobj,
-                        &dsc,
-                        "target delete-marker version metadata conflicts with the retry",
-                    );
-                } else {
-                    let target_versions = delete_marker_target_versions(&dobj, &rinfos);
-                    rinfos.targets = replicate_delete_marker_purge_to_targets(
-                        bucket.clone(),
-                        dobj.clone(),
-                        dsc.clone(),
-                        target_versions.clone(),
-                        true,
-                    )
-                    .await;
-                }
-            }
-            Err(err) => {
-                run_target_operations = false;
-                for tgt_entry in dsc.targets_map.values() {
-                    if !tgt_entry.replicate || (!dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn) {
-                        continue;
-                    }
-                    let mut rinfo = delete_target_state(&dobj, &tgt_entry.arn);
-                    rinfo.replication_status = ReplicationStatusType::Failed;
-                    rinfo.error = Some(err.to_string());
-                    rinfos.targets.push(rinfo);
-                }
-                debug!(
-                    event = EVENT_REPLICATION_DELETE_SKIPPED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    bucket,
-                    object = dobj.delete_object.object_name,
-                    version_id = %delete_marker_version_id,
-                    error = %err,
-                    reason = "source_state_verification_failed",
-                    "Failed to verify source delete-marker state before replication"
-                );
-            }
-        }
-    }
-
-    if run_target_operations && target_delete_marker_version_conflicts(&dobj) {
-        run_target_operations = false;
-        rinfos.targets =
-            failed_delete_targets_for_decision(&dobj, &dsc, "target delete-marker version metadata conflicts with the retry");
-    }
 
     let mut join_set = JoinSet::new();
-    let mut target_tasks = HashMap::new();
-    let target_task_delete = Arc::new(dobj.clone());
 
     // Process each target
     let target_arns = dobj.admitted_target_arns();
-    for tgt_entry in dsc.targets_map.values().filter(|_| run_target_operations) {
+    let expected_targets = dsc
+        .targets_map
+        .values()
+        .filter(|target| target.replicate && (target_arns.is_empty() || target_arns.iter().any(|arn| arn == &target.arn)))
+        .count();
+    for tgt_entry in dsc.targets_map.values() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
             continue;
@@ -1669,14 +1412,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
 
         // Get the remote target client
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &tgt_entry.arn).await else {
-            let mut rinfo = delete_target_state(&dobj, &tgt_entry.arn);
-            if is_version_delete_replication(&dobj.delete_object) {
-                rinfo.version_purge_status = VersionPurgeStatusType::Failed;
-            } else {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-            }
-            rinfo.error = Some("replication target client unavailable".to_string());
-            rinfos.targets.push(rinfo);
             debug!(
                 event = EVENT_REPLICATION_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1702,19 +1437,19 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
             continue;
         };
 
-        let dobj_clone = Arc::clone(&target_task_delete);
+        let dobj_clone = dobj.clone();
 
         // Spawn task in the join set
-        let task = join_set.spawn(async move { replicate_delete_to_target(dobj_clone.as_ref(), tgt_client.clone()).await });
-        target_tasks.insert(task.id(), tgt_entry.arn.clone());
+        join_set.spawn(async move { replicate_delete_to_target(&dobj_clone, tgt_client.clone()).await });
     }
 
     // Collect all results
-    while let Some(result) = join_set.join_next_with_id().await {
-        match delete_target_join_result(result, &mut target_tasks, &dobj) {
-            Ok(tgt_info) => rinfos.targets.push(tgt_info),
-            Err((e, rinfo)) => {
-                rinfos.targets.push(*rinfo);
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(tgt_info) => {
+                rinfos.targets.push(tgt_info);
+            }
+            Err(e) => {
                 error!(
                     event = EVENT_RESYNC_TASK_FAILED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1741,74 +1476,32 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
         }
     }
 
-    let mut lock_lost = replication_guard.is_lock_lost();
-    if run_target_operations
-        && source_marker_was_present
-        && !lock_lost
-        && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
-    {
-        match source_delete_marker_matches(
-            storage.clone(),
-            bucket.clone(),
-            dobj.delete_object.object_name.clone(),
-            delete_marker_version_id,
-            &replication_guard,
-        )
-        .await
-        {
-            Ok((true, current_state)) => {
-                refresh_delete_replication_state(&mut dobj, current_state);
-            }
-            Ok((false, _)) => {
-                source_marker_is_absent = true;
-                let target_versions = delete_marker_target_versions(&dobj, &rinfos);
-                merge_delete_target_results(
-                    &mut rinfos,
-                    replicate_delete_marker_purge_to_targets(
-                        bucket.clone(),
-                        dobj.clone(),
-                        dsc.clone(),
-                        target_versions.clone(),
-                        false,
-                    )
-                    .await,
-                );
-            }
-            Err(err) => {
-                for target in &mut rinfos.targets {
-                    target.replication_status = ReplicationStatusType::Failed;
-                    if target.error.is_none() {
-                        target.error = Some(err.to_string());
-                    }
-                }
-                debug!(
-                    event = EVENT_REPLICATION_DELETE_SKIPPED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    bucket,
-                    object = dobj.delete_object.object_name,
-                    version_id = %delete_marker_version_id,
-                    error = %err,
-                    reason = "source_state_post_verification_failed",
-                    "Failed to verify source delete-marker state after replication"
-                );
-            }
-        }
-    }
-
-    lock_lost |= replication_guard.is_lock_lost();
-    if lock_lost {
-        for target in &mut rinfos.targets {
-            if is_version_delete_replication(&dobj.delete_object) {
-                target.version_purge_status = VersionPurgeStatusType::Failed;
-            } else {
-                target.replication_status = ReplicationStatusType::Failed;
-            }
-            target.error.get_or_insert_with(|| "replication lock lease lost".to_string());
-        }
-    }
-
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+
+    let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object);
+    if requires_delayed_purge {
+        let bucket_clone = bucket.clone();
+        let dobj_clone = dobj.clone();
+        let dsc_clone = dsc.clone();
+        let storage_clone = storage.clone();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                if let Some(delete_marker_version_id) = dobj_clone.delete_object.delete_marker_version_id
+                    && source_delete_marker_missing(
+                        &*storage_clone,
+                        &bucket_clone,
+                        &dobj_clone.delete_object.object_name,
+                        delete_marker_version_id,
+                    )
+                    .await
+                {
+                    replicate_delete_marker_purge_to_targets(&bucket_clone, &dobj_clone, &dsc_clone).await;
+                    break;
+                }
+                tokio::time::sleep(TokioDuration::from_secs(1)).await;
+            }
+        });
+    }
 
     let (replication_status, prev_status) = if !is_version_purge {
         (
@@ -1832,6 +1525,16 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
         )
     };
 
+    if let Some(stats) = runtime_sources::replication_stats() {
+        for tgt in rinfos.targets.iter() {
+            if tgt.replication_status != tgt.prev_replication_status {
+                stats
+                    .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
+                    .await;
+            }
+        }
+    }
+
     let mut drs = get_replication_state(
         &rinfos,
         &dobj.delete_object.replication_state.clone().unwrap_or_default(),
@@ -1840,7 +1543,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
     if replication_status != prev_status {
         drs.replication_timestamp = Some(OffsetDateTime::now_utc());
     }
-    let target_version_state_conflicts = target_delete_marker_version_conflicts(&dobj);
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
         EventName::ObjectReplicationComplete.to_string()
@@ -1848,477 +1550,119 @@ pub async fn replicate_delete<S: ReplicationStorage>(mut dobj: DeletedObjectRepl
         EventName::ObjectReplicationFailed.to_string()
     };
 
-    let mut state_applied = source_marker_is_absent;
-    let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &dobj.delete_object.object_name).await;
-    let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &dobj.delete_object.object_name).await;
-    lock_lost |= replication_guard.is_lock_lost();
-    if lock_lost {
-        mark_delete_targets_failed(&mut rinfos, is_version_purge, "replication lock lease lost");
-    }
-    if !source_marker_is_absent && !lock_lost && !target_version_state_conflicts {
-        let mut delete_options = ObjectOptions {
-            version_id: version_id.map(|v| v.to_string()),
-            mod_time: dobj.delete_object.delete_marker_mtime,
-            delete_replication: Some(drs),
-            versioned,
-            version_suspended,
-            ..Default::default()
-        };
-        if let Some(signal) = replication_guard.lock_lost_signal() {
-            delete_options.add_namespace_lock_lost_signal(signal);
-        }
-        match storage
-            .delete_object(&bucket, &dobj.delete_object.object_name, delete_options)
-            .await
-        {
-            Ok(object) => {
-                if replication_guard.is_lock_lost() {
-                    mark_delete_targets_failed(&mut rinfos, is_version_purge, "replication lock lease lost during commit");
-                } else {
-                    state_applied = true;
-                    send_event(EventArgs {
-                        event_name: event_name.clone(),
-                        bucket_name: bucket.clone(),
-                        object,
-                        ..Default::default()
-                    });
-                }
-            }
-            Err(e) => {
-                mark_delete_targets_failed(&mut rinfos, is_version_purge, &e.to_string());
-                error!(
-                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    bucket = %bucket,
-                    arn = %dobj.target_arn,
-                    object = %dobj.delete_object.object_name,
-                    operation = "apply_replication_delete_state",
-                    error = %e,
-                    "Replication target operation failed"
-                );
-                send_event(EventArgs {
-                    event_name: event_name.clone(),
-                    bucket_name: bucket.clone(),
-                    object: ObjectInfo {
-                        bucket: bucket.clone(),
-                        name: dobj.delete_object.object_name.clone(),
-                        version_id,
-                        delete_marker: dobj.delete_object.delete_marker,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    drop(replication_guard);
-    let has_failed_targets = rinfos.targets.iter().any(|target| {
-        target.replication_status == ReplicationStatusType::Failed
-            || target.version_purge_status == VersionPurgeStatusType::Failed
-    });
-    let retry_admission = persist_failed_delete_replications(&dobj, &rinfos).await;
-    if let Some(stats) = runtime_sources::replication_stats() {
-        for tgt in &rinfos.targets {
-            if tgt.replication_status != tgt.prev_replication_status {
-                stats
-                    .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
-                    .await;
-            }
-        }
-    }
-    if target_version_state_conflicts {
-        false
-    } else {
-        (state_applied && !has_failed_targets) || (has_failed_targets && retry_admission == ReplicationQueueAdmission::Queued)
-    }
-}
-
-fn delete_target_join_result(
-    result: std::result::Result<(TaskId, ReplicatedTargetInfo), JoinError>,
-    target_tasks: &mut HashMap<TaskId, String>,
-    dobj: &DeletedObjectReplicationInfo,
-) -> std::result::Result<ReplicatedTargetInfo, (JoinError, Box<ReplicatedTargetInfo>)> {
-    match result {
-        Ok((task_id, target)) => {
-            target_tasks.remove(&task_id);
-            Ok(target)
-        }
-        Err(error) => {
-            let target_arn = target_tasks.remove(&error.id()).unwrap_or_default();
-            let mut target = delete_target_state(dobj, &target_arn);
-            if is_version_delete_replication(&dobj.delete_object) {
-                target.version_purge_status = VersionPurgeStatusType::Failed;
-            } else {
-                target.replication_status = ReplicationStatusType::Failed;
-            }
-            target.error = Some(error.to_string());
-            Err((error, Box::new(target)))
-        }
-    }
-}
-
-async fn source_delete_marker_matches<S: EcstoreObjectOperations>(
-    storage: Arc<S>,
-    bucket: String,
-    object_name: String,
-    delete_marker_version_id: Uuid,
-    _replication_guard: &rustfs_lock::NamespaceLockGuard,
-) -> Result<(bool, Option<ReplicationState>)> {
-    #[cfg(test)]
-    if let Some(probe) = delete_replication_source_check_probe(&bucket, &object_name) {
-        return probe_delete_replication_source_check(probe).await;
-    }
-
-    match storage
-        .get_object_info(
+    let state_persisted = match storage
+        .delete_object(
             &bucket,
-            &object_name,
-            &ObjectOptions {
-                version_id: Some(delete_marker_version_id.to_string()),
-                versioned: ReplicationVersioningStore::prefix_enabled(&bucket, &object_name).await,
-                version_suspended: ReplicationVersioningStore::prefix_suspended(&bucket, &object_name).await,
+            &dobj.delete_object.object_name,
+            ObjectOptions {
+                version_id: version_id.map(|v| v.to_string()),
+                mod_time: dobj.delete_object.delete_marker_mtime,
+                delete_replication: Some(drs),
+                versioned: ReplicationVersioningStore::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
                 ..Default::default()
             },
         )
         .await
     {
-        Ok(info) if source_delete_marker_matches_id(&info, delete_marker_version_id) => {
-            Ok((true, Some(info.replication_state())))
-        }
-        Ok(_) => Ok((false, None)),
-        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok((false, None)),
-        Err(err) => Err(err),
-    }
-}
-
-fn source_delete_marker_matches_id(info: &ObjectInfo, delete_marker_version_id: Uuid) -> bool {
-    info.delete_marker && info.version_id == Some(delete_marker_version_id)
-}
-
-fn refresh_delete_replication_state(dobj: &mut DeletedObjectReplicationInfo, current_state: Option<ReplicationState>) {
-    if let Some(current_state) = current_state {
-        dobj.blocked_delete_marker_version_state = false;
-        if !dobj.target_arn.is_empty()
-            && let Some(version_id) = current_state.target_delete_marker_version_ids.get(&dobj.target_arn)
-        {
-            dobj.target_delete_marker_version_id = Some(version_id.clone());
-        }
-        dobj.delete_object.replication_state = Some(current_state);
-    }
-}
-
-fn delete_target_state(dobj: &DeletedObjectReplicationInfo, arn: &str) -> ReplicatedTargetInfo {
-    let mut rinfo = dobj
-        .delete_object
-        .replication_state
-        .clone()
-        .unwrap_or_default()
-        .target_state(arn);
-    if dobj.target_arn == arn
-        && let Some(version_id) = dobj.target_delete_marker_version_id.as_ref()
-    {
-        rinfo.target_delete_marker_version_id = Some(version_id.clone());
-    }
-    rinfo.op_type = dobj.op_type;
-    rinfo
-}
-
-fn target_delete_marker_version_conflicts(dobj: &DeletedObjectReplicationInfo) -> bool {
-    if dobj.blocked_delete_marker_version_state {
-        return true;
-    }
-    if target_delete_marker_version_metadata_corrupt(dobj) {
-        return true;
-    }
-    if dobj.target_arn.is_empty() {
-        return false;
-    }
-    let Some(retry_version_id) = dobj.target_delete_marker_version_id.as_deref() else {
-        return false;
-    };
-    dobj.delete_object
-        .replication_state
-        .as_ref()
-        .and_then(|state| state.target_delete_marker_version_ids.get(&dobj.target_arn))
-        .is_some_and(|persisted_version_id| persisted_version_id != retry_version_id)
-}
-
-fn target_delete_marker_version_metadata_corrupt(dobj: &DeletedObjectReplicationInfo) -> bool {
-    dobj.delete_object
-        .replication_state
-        .as_ref()
-        .is_some_and(|state| state.target_delete_marker_version_ids_corrupt)
-}
-
-fn failed_delete_targets_for_decision(
-    dobj: &DeletedObjectReplicationInfo,
-    dsc: &ReplicateDecision,
-    error: &str,
-) -> Vec<ReplicatedTargetInfo> {
-    dsc.targets_map
-        .values()
-        .filter(|target| target.replicate && (dobj.target_arn.is_empty() || dobj.target_arn == target.arn))
-        .map(|target| {
-            let mut rinfo = delete_target_state(dobj, &target.arn);
-            if is_version_delete_replication(&dobj.delete_object) {
-                rinfo.version_purge_status = VersionPurgeStatusType::Failed;
-            } else {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-            }
-            rinfo.error = Some(error.to_string());
-            rinfo
-        })
-        .collect()
-}
-
-fn mark_delete_targets_failed(rinfos: &mut ReplicatedInfos, is_version_purge: bool, error: &str) {
-    for target in &mut rinfos.targets {
-        if is_version_purge {
-            target.version_purge_status = VersionPurgeStatusType::Failed;
-        } else {
-            target.replication_status = ReplicationStatusType::Failed;
-        }
-        target.error.get_or_insert_with(|| error.to_string());
-    }
-}
-
-fn delete_marker_target_versions(dobj: &DeletedObjectReplicationInfo, rinfos: &ReplicatedInfos) -> HashMap<String, String> {
-    let mut versions = dobj
-        .delete_object
-        .replication_state
-        .as_ref()
-        .map(|state| state.target_delete_marker_version_ids.clone())
-        .unwrap_or_default();
-    if !dobj.target_arn.is_empty()
-        && let Some(version_id) = dobj.target_delete_marker_version_id.as_ref()
-    {
-        versions.entry(dobj.target_arn.clone()).or_insert_with(|| version_id.clone());
-    }
-    for target in &rinfos.targets {
-        if let Some(version_id) = target.target_delete_marker_version_id.as_ref() {
-            versions.insert(target.arn.clone(), version_id.clone());
-        }
-    }
-    versions
-}
-
-fn merge_delete_target_results(rinfos: &mut ReplicatedInfos, results: Vec<ReplicatedTargetInfo>) {
-    let mut indexes = rinfos
-        .targets
-        .iter()
-        .enumerate()
-        .map(|(index, target)| (target.arn.clone(), index))
-        .collect::<HashMap<_, _>>();
-    for result in results {
-        if let Some(index) = indexes.get(&result.arn).copied() {
-            rinfos.targets[index] = result;
-        } else {
-            indexes.insert(result.arn.clone(), rinfos.targets.len());
-            rinfos.targets.push(result);
-        }
-    }
-}
-
-async fn persist_failed_delete_replications(
-    dobj: &DeletedObjectReplicationInfo,
-    rinfos: &ReplicatedInfos,
-) -> ReplicationQueueAdmission {
-    let mut retry_base = dobj.clone();
-    retry_base.blocked_delete_marker_version_state = target_delete_marker_version_conflicts(dobj);
-    retry_base.delete_object.replication_state = None;
-    let mut failed = Vec::new();
-    for target in rinfos.targets.iter().filter(|target| {
-        target.replication_status == ReplicationStatusType::Failed
-            || target.version_purge_status == VersionPurgeStatusType::Failed
-    }) {
-        if target.arn.is_empty()
-            || target.arn.len() > 1_024
-            || target
-                .target_delete_marker_version_id
-                .as_ref()
-                .is_some_and(|version_id| version_id.is_empty() || version_id.len() > 1_024)
-        {
-            return ReplicationQueueAdmission::Missed;
-        }
-        let mut retry = retry_base.clone();
-        retry.target_arn = target.arn.clone();
-        retry.target_delete_marker_version_id = target.target_delete_marker_version_id.clone();
-        failed.push(retry);
-    }
-    if failed.is_empty() {
-        return ReplicationQueueAdmission::Skipped;
-    }
-
-    #[cfg(test)]
-    if capture_delete_retries(dobj, &failed) {
-        return ReplicationQueueAdmission::Queued;
-    }
-
-    let Some(pool) = get_global_replication_pool() else {
-        error!(
-            event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-            bucket = %dobj.bucket,
-            object = %dobj.delete_object.object_name,
-            operation = "persist_failed_replication_delete",
-            "Replication pool is unavailable for durable delete retry"
-        );
-        return ReplicationQueueAdmission::Missed;
-    };
-
-    let admission = pool.queue_mrf_delete_tasks(failed).await;
-    if admission != ReplicationQueueAdmission::Queued {
-        error!(
-            event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-            bucket = %dobj.bucket,
-            object = %dobj.delete_object.object_name,
-            operation = "persist_failed_replication_delete",
-            "Failed to durably queue replication delete retries"
-        );
-    }
-    admission
-}
-
-async fn replicate_delete_marker_purge_to_targets(
-    bucket: String,
-    dobj: DeletedObjectReplicationInfo,
-    dsc: ReplicateDecision,
-    target_versions: HashMap<String, String>,
-    allow_legacy_source_version_fallback: bool,
-) -> Vec<ReplicatedTargetInfo> {
-    let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
-        return Vec::new();
-    };
-
-    // Materialize the target set before any await so the returned future is Send.
-    #[allow(clippy::needless_collect)]
-    let target_arns = dsc
-        .targets_map
-        .values()
-        .filter(|target| target.replicate && (dobj.target_arn.is_empty() || dobj.target_arn == target.arn))
-        .map(|target| target.arn.clone())
-        .collect::<Vec<_>>();
-    let target_versions = Arc::new(target_versions);
-
-    futures::stream::iter(target_arns.into_iter().map(|target_arn| {
-        let bucket = bucket.clone();
-        let dobj = dobj.clone();
-        let target_versions = Arc::clone(&target_versions);
-        async move {
-            let mut rinfo = delete_target_state(&dobj, &target_arn);
-            let mapped_target_version = target_versions.get(&target_arn).cloned();
-            let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &target_arn).await else {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some("replication target client unavailable".to_string());
-                return rinfo;
-            };
-            rinfo.endpoint = tgt_client.endpoint.clone();
-            rinfo.secure = tgt_client.secure;
-            let target_version_id = mapped_target_version.clone().or_else(|| {
-                if allow_legacy_source_version_fallback {
-                    target_delete_version_id(delete_marker_version_id, true)
-                } else {
-                    None
-                }
+        Ok(object) => {
+            send_event(EventArgs {
+                event_name,
+                bucket_name: bucket.clone(),
+                object,
+                ..Default::default()
             });
-            let Some(target_version_id) = target_version_id else {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some("target delete-marker version id unavailable".to_string());
-                return rinfo;
-            };
-            if target_version_id.is_empty() || target_version_id.len() > 1_024 {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some("target delete-marker version id is invalid".to_string());
-                return rinfo;
-            }
-            rinfo.target_delete_marker_version_id = mapped_target_version.clone();
-
-            match purge_target_delete_marker_version(
-                &bucket,
-                &dobj.delete_object.object_name,
-                &tgt_client,
-                &target_version_id,
-                dobj.delete_object.delete_marker_mtime,
-            )
-            .await
-            {
-                Ok(_) => rinfo.replication_status = ReplicationStatusType::Completed,
-                Err(err) => {
-                    rinfo.replication_status = ReplicationStatusType::Failed;
-                    rinfo.error = Some(err);
-                }
-            }
-            rinfo
+            true
         }
-    }))
-    .buffer_unordered(MAX_PARALLEL_DELETE_MARKER_RECONCILIATIONS)
-    .collect::<Vec<_>>()
-    .await
+        Err(e) => {
+            error!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                arn = %dobj.target_arn,
+                object = %dobj.delete_object.object_name,
+                operation = "apply_replication_delete_state",
+                error = %e,
+                "Replication target operation failed"
+            );
+            send_event(EventArgs {
+                event_name,
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            false
+        }
+    };
+
+    expected_targets > 0
+        && rinfos.targets.len() == expected_targets
+        && state_persisted
+        && source_state_verified
+        && !requires_delayed_purge
+        && replication_status == ReplicationStatusType::Completed
 }
 
-async fn purge_target_delete_marker_version(
-    source_bucket: &str,
-    object: &str,
-    tgt_client: &Arc<TargetClient>,
-    target_version_id: &str,
-    replication_mtime: Option<OffsetDateTime>,
-) -> std::result::Result<(), String> {
-    if target_version_id.is_empty() || target_version_id.len() > 1_024 {
-        return Err("target delete-marker version id is invalid".to_string());
-    }
-
-    match head_object_with_proxy_stats(source_bucket, tgt_client, &tgt_client.bucket, object, Some(target_version_id.to_string()))
-        .await
-    {
-        Err(SdkError::ServiceError(service_err))
-            if (matches!(service_err.err().code(), Some("MethodNotAllowed" | "405"))
-                || service_err.raw().status().as_u16() == 405)
-                && service_err
-                    .raw()
-                    .headers()
-                    .get("x-amz-delete-marker")
-                    .is_some_and(|value| value.eq_ignore_ascii_case("true")) => {}
-        Err(SdkError::ServiceError(service_err))
-            if matches!(service_err.err().code(), Some("MethodNotAllowed" | "405"))
-                || service_err.raw().status().as_u16() == 405 =>
-        {
-            return Err("target delete-marker validation response omitted x-amz-delete-marker: true".to_string());
-        }
-        Err(SdkError::ServiceError(service_err))
-            if service_err.err().is_not_found() || service_err.raw().status().as_u16() == 404 =>
-        {
-            return Ok(());
-        }
-        Err(err) => {
-            mark_replication_target_offline_if_needed(tgt_client, &err).await;
-            return Err(format!("target delete-marker validation failed: {err}"));
-        }
-        Ok(_) => return Err("target version is not a delete marker".to_string()),
-    }
-
-    match tgt_client
-        .remove_object(
-            &tgt_client.bucket,
-            object,
-            Some(target_version_id.to_string()),
-            replication_delete_marker_purge_remove_options(replication_mtime),
+async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
+    storage: &S,
+    bucket: &str,
+    object_name: &str,
+    delete_marker_version_id: Uuid,
+) -> bool {
+    match storage
+        .get_object_info(
+            bucket,
+            object_name,
+            &ObjectOptions {
+                version_id: Some(delete_marker_version_id.to_string()),
+                versioned: ReplicationVersioningStore::prefix_enabled(bucket, object_name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(bucket, object_name).await,
+                ..Default::default()
+            },
         )
         .await
     {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            mark_replication_target_offline_if_needed(tgt_client, &err).await;
-            Err(err.to_string())
-        }
+        Ok(info) => !info.delete_marker || info.version_id != Some(delete_marker_version_id),
+        Err(err) => is_err_object_not_found(&err) || is_err_version_not_found(&err),
     }
 }
 
-async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
+async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo, dsc: &ReplicateDecision) {
+    let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
+        return;
+    };
+
+    for tgt_entry in dsc.targets_map.values() {
+        if !tgt_entry.replicate {
+            continue;
+        }
+        let target_arns = dobj.admitted_target_arns();
+        if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
+            continue;
+        }
+        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
+            continue;
+        };
+
+        let _ = tgt_client
+            .remove_object(
+                &tgt_client.bucket,
+                &dobj.delete_object.object_name,
+                target_delete_version_id(delete_marker_version_id, true),
+                replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
+            )
+            .await;
+    }
+}
+
+async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) -> bool {
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
     let admitted_target_arns = dobj.admitted_target_arns();
@@ -2406,7 +1750,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
 
@@ -2434,7 +1778,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
 
@@ -2443,6 +1787,9 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     } else {
         admitted_target_arns
     };
+    if tgt_arns.is_empty() {
+        return false;
+    }
 
     let mut join_set = JoinSet::new();
     let mut all_succeeded = true;
@@ -2567,7 +1914,10 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
             error = %error,
             "Force-delete replication completed but durable intent cleanup failed"
         );
+        return false;
     }
+
+    all_succeeded
 }
 
 fn target_delete_version_id(version_id: Uuid, version_purge: bool) -> Option<String> {
@@ -2578,45 +1928,33 @@ fn target_delete_version_id(version_id: Uuid, version_purge: bool) -> Option<Str
     }
 }
 
-fn is_target_delete_marker_creation(delete_object: &ReplicationDeletedObject) -> bool {
-    delete_object.delete_marker && !is_version_delete_replication(delete_object)
-}
-
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
-    let source_version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
+    let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
     } else {
         dobj.delete_object.version_id.unwrap_or_default()
     };
 
-    let mut rinfo = delete_target_state(dobj, &tgt_client.arn);
+    let mut rinfo = dobj
+        .delete_object
+        .replication_state
+        .clone()
+        .unwrap_or_default()
+        .target_state(&tgt_client.arn);
+    rinfo.op_type = dobj.op_type;
     rinfo.endpoint = tgt_client.endpoint.clone();
     rinfo.secure = tgt_client.secure;
 
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
-    let is_marker_creation = is_target_delete_marker_creation(&dobj.delete_object);
-    if target_delete_marker_version_conflicts(dobj) {
-        if is_version_purge {
-            rinfo.version_purge_status = VersionPurgeStatusType::Failed;
-        } else {
-            rinfo.replication_status = ReplicationStatusType::Failed;
-        }
-        rinfo.error = Some("target delete-marker version metadata conflicts with the retry".to_string());
-        return rinfo;
-    }
     if !is_version_purge
         && rinfo.prev_replication_status == ReplicationStatusType::Completed
         && dobj.op_type != ReplicationType::ExistingObject
-        && dobj.target_delete_marker_version_id.is_none()
     {
         rinfo.replication_status = rinfo.prev_replication_status.clone();
         return rinfo;
     }
 
-    if is_version_purge
-        && rinfo.version_purge_status == VersionPurgeStatusType::Complete
-        && dobj.target_delete_marker_version_id.is_none()
-    {
+    if is_version_purge && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
         return rinfo;
     }
 
@@ -2629,87 +1967,9 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if is_version_purge && dobj.delete_object.delete_marker_version_id.is_some() {
-        let mapped_target_version = rinfo.target_delete_marker_version_id.clone();
-        let target_version_id = mapped_target_version
-            .clone()
-            .or_else(|| target_delete_version_id(source_version_id, true));
-        let Some(target_version_id) = target_version_id else {
-            rinfo.version_purge_status = VersionPurgeStatusType::Failed;
-            rinfo.error = Some("target delete-marker version id unavailable".to_string());
-            return rinfo;
-        };
-        rinfo.target_delete_marker_version_id = mapped_target_version.clone();
-        match purge_target_delete_marker_version(
-            &dobj.bucket,
-            &dobj.delete_object.object_name,
-            &tgt_client,
-            &target_version_id,
-            dobj.delete_object.delete_marker_mtime,
-        )
-        .await
-        {
-            Ok(()) => rinfo.version_purge_status = VersionPurgeStatusType::Complete,
-            Err(err) => {
-                rinfo.version_purge_status = VersionPurgeStatusType::Failed;
-                rinfo.error = Some(err);
-            }
-        }
-        return rinfo;
-    }
+    let version_id = target_delete_version_id(version_id, is_version_purge);
 
-    if is_marker_creation && let Some(target_version_id) = rinfo.target_delete_marker_version_id.clone() {
-        match head_object_with_proxy_stats(
-            &dobj.bucket,
-            tgt_client.as_ref(),
-            &tgt_client.bucket,
-            &dobj.delete_object.object_name,
-            Some(target_version_id),
-        )
-        .await
-        {
-            Err(SdkError::ServiceError(service_err))
-                if (matches!(service_err.err().code(), Some("MethodNotAllowed" | "405"))
-                    || service_err.raw().status().as_u16() == 405)
-                    && service_err
-                        .raw()
-                        .headers()
-                        .get("x-amz-delete-marker")
-                        .is_some_and(|value| value.eq_ignore_ascii_case("true")) =>
-            {
-                rinfo.replication_status = ReplicationStatusType::Completed;
-                return rinfo;
-            }
-            Err(SdkError::ServiceError(service_err))
-                if service_err.err().is_not_found() || service_err.raw().status().as_u16() == 404 =>
-            {
-                rinfo.target_delete_marker_version_id = None;
-            }
-            Err(SdkError::ServiceError(service_err))
-                if matches!(service_err.err().code(), Some("MethodNotAllowed" | "405"))
-                    || service_err.raw().status().as_u16() == 405 =>
-            {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some("target delete-marker validation response omitted x-amz-delete-marker: true".to_string());
-                return rinfo;
-            }
-            Err(err) => {
-                mark_replication_target_offline_if_needed(&tgt_client, &err).await;
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some(format!("target delete-marker validation failed: {err}"));
-                return rinfo;
-            }
-            Ok(_) => {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some("target version is not a delete marker".to_string());
-                return rinfo;
-            }
-        }
-    }
-
-    let version_id = target_delete_version_id(source_version_id, is_version_purge);
-
-    if is_marker_creation {
+    if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
         match head_object_with_proxy_stats(
             &dobj.bucket,
             tgt_client.as_ref(),
@@ -2721,18 +1981,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         {
             Ok(_) => {}
             Err(e) => {
-                let non_retryable = match &e {
-                    SdkError::ServiceError(service_err) => {
-                        let status = service_err.raw().status().as_u16();
-                        status != 404
-                            && status != 405
-                            && is_retryable_delete_replication_head_error(
-                                service_err.err().is_not_found(),
-                                service_err.err().code(),
-                            )
-                    }
-                    _ => true,
-                };
+                let non_retryable = matches!(
+                    &e,
+                    SdkError::ServiceError(service_err)
+                        if is_retryable_delete_replication_head_error(
+                            service_err.err().is_not_found(),
+                            service_err.err().code(),
+                        )
+                );
                 if non_retryable {
                     rinfo.replication_status = ReplicationStatusType::Failed;
                     rinfo.error = Some(e.to_string());
@@ -2743,15 +1999,15 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     }
 
     match tgt_client
-        .remove_object_with_output(
+        .remove_object(
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
             version_id.clone(),
-            replication_delete_remove_options(is_marker_creation, dobj.delete_object.delete_marker_mtime),
+            replication_delete_remove_options(dobj.delete_object.delete_marker, dobj.delete_object.delete_marker_mtime),
         )
         .await
     {
-        Ok(output) => {
+        Ok(_) => {
             debug!(
                 bucket = tgt_client.bucket,
                 object = dobj.delete_object.object_name,
@@ -2761,17 +2017,6 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
                 "replicate_delete_to_target succeeded"
             );
             if !is_version_purge {
-                if is_marker_creation {
-                    let Some(target_version_id) = output
-                        .version_id
-                        .filter(|version_id| !version_id.is_empty() && version_id.len() <= 1_024)
-                    else {
-                        rinfo.replication_status = ReplicationStatusType::Failed;
-                        rinfo.error = Some("target delete-marker response omitted a valid version id".to_string());
-                        return rinfo;
-                    };
-                    rinfo.target_delete_marker_version_id = Some(target_version_id);
-                }
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
@@ -2817,7 +2062,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo
 }
 
-pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) -> (ReplicationState, bool) {
+pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) -> ReplicationState {
+    replicate_object_with_outcome(roi, storage).await.0
+}
+
+pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
+    roi: ReplicateObjectInfo,
+    storage: Arc<S>,
+) -> (ReplicationState, bool) {
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
@@ -2849,7 +2101,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             return (roi.replication_state.unwrap_or_default(), false);
         }
     };
-    let obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+    let _obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
         Ok(g) => g,
         Err(e) => {
             debug!(
@@ -2874,11 +2126,9 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     };
 
     let mut join_set = JoinSet::new();
-    let mut target_missing = false;
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &arn).await else {
-            target_missing = true;
             // Deliberately debug: this fires once per object per ARN, so a target that
             // stays unreachable would flood the log from the replication hot path. The
             // condition is reported once per pass by the site-replication reconciler and
@@ -2919,7 +2169,6 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         replication_timestamp: Some(OffsetDateTime::now_utc()),
         targets: Vec::with_capacity(join_set.len()),
     };
-    let mut target_task_failed = false;
 
     while let Some(result) = join_set.join_next().await {
         match result {
@@ -2927,7 +2176,6 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 rinfos.targets.push(tgt_info);
             }
             Err(e) => {
-                target_task_failed = true;
                 error!(
                     event = EVENT_RESYNC_TASK_FAILED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2954,26 +2202,23 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let replication_status = merged_state.composite_replication_status();
     let new_replication_internal = merged_state.replication_status_internal.clone();
     let mut object_info = roi.to_object_info();
-    let mut metadata_persisted = true;
+    let mut state_persisted = true;
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
         let mut eval_metadata = HashMap::new();
         if let Some(ref s) = new_replication_internal {
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, s.clone());
         }
-        let mut popts = ObjectOptions {
+        let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
             eval_metadata: Some(eval_metadata),
             ..Default::default()
         };
-        if let Some(signal) = obj_lock_guard.lock_lost_signal() {
-            popts.add_namespace_lock_lost_signal(signal);
-        }
 
         match storage.put_object_metadata(&bucket, &object, &popts).await {
             Ok(u) => object_info = u,
             Err(e) => {
-                metadata_persisted = false;
+                state_persisted = false;
                 // Persisting the resynced replication status failed. Don't swallow
                 // it silently — the object's on-disk status now disagrees with the
                 // resync result and needs operator visibility (backlog#799 B23).
@@ -2998,10 +2243,6 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 }
             }
         }
-    }
-
-    if obj_lock_guard.is_lock_lost() {
-        metadata_persisted = false;
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
@@ -3031,12 +2272,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         }
     }
 
-    let acknowledged = replication_status == ReplicationStatusType::Completed
-        && !target_missing
-        && !target_task_failed
-        && metadata_persisted
-        && !rinfos.targets.is_empty();
-    (merged_state, acknowledged)
+    (merged_state, state_persisted)
 }
 
 trait ReplicateObjectInfoExt {
@@ -3267,8 +2503,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some(e.to_string());
                 warn!(
                     event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -3673,7 +2907,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
-                rinfo.replication_status = ReplicationStatusType::Failed;
                 rinfo.error = Some(e.to_string());
                 warn!(
                     event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
@@ -3923,27 +3156,19 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
 #[cfg(test)]
 mod tests {
-    use super::super::replication_filemeta_boundary::{ReplicateTargetDecision, ReplicationState, ReplicationWorkerOperation};
-    use super::super::replication_storage_boundary::StorageNamespaceLocking as _;
-    use super::super::replication_target_boundary::{ArnTarget, BucketTarget, BucketTargets, TargetRegistry};
+    use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
     use super::*;
-    use crate::layout::endpoint::Endpoint;
-    use crate::layout::format::FormatV3;
-    use crate::set_disk::SetDisks;
     use s3s::dto::{
         BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ExcludedPrefix, ReplicationRule,
         ReplicationRuleStatus, VersioningConfiguration,
     };
     use std::collections::HashMap;
     use time::OffsetDateTime;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
     use uuid::Uuid;
 
     fn test_target_client(endpoint: String) -> Arc<TargetClient> {
         let config = aws_sdk_s3::Config::builder()
             .endpoint_url(endpoint.clone())
-            .force_path_style(true)
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
                 aws_credential_types::Credentials::new("access", "secret", None, None, "test"),
@@ -3968,1095 +3193,6 @@ mod tests {
 
     async fn register_test_target(target: &Arc<TargetClient>) {
         ReplicationTargetStore::register_test_target(target).await;
-    }
-
-    struct TestHttpResponse {
-        status: &'static str,
-        headers: Vec<(&'static str, String)>,
-        body: String,
-    }
-
-    async fn test_s3_server(responses: Vec<TestHttpResponse>) -> (String, JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test S3 listener should bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
-        let handle = tokio::spawn(async move {
-            let mut requests = Vec::with_capacity(responses.len());
-            for response in responses {
-                let (mut stream, _) = listener.accept().await.expect("test S3 client should connect");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 2048];
-                loop {
-                    let read = stream.read(&mut buffer).await.expect("test S3 request should be readable");
-                    assert_ne!(read, 0, "test S3 request closed before headers completed");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                requests.push(String::from_utf8(request).expect("test S3 request should be UTF-8"));
-
-                let mut headers = String::new();
-                for (name, value) in response.headers {
-                    headers.push_str(name);
-                    headers.push_str(": ");
-                    headers.push_str(&value);
-                    headers.push_str("\r\n");
-                }
-                let reply = format!(
-                    "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.status,
-                    headers,
-                    response.body.len(),
-                    response.body
-                );
-                stream
-                    .write_all(reply.as_bytes())
-                    .await
-                    .expect("test S3 response should be writable");
-            }
-            requests
-        });
-        (endpoint, handle)
-    }
-
-    async fn blocked_marker_creation_server(
-        target_version_id: String,
-    ) -> (String, JoinHandle<Vec<String>>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test S3 listener should bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let entered_for_server = Arc::clone(&entered);
-        let release_for_server = Arc::clone(&release);
-        let handle = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (index, response) in [
-                TestHttpResponse {
-                    status: "404 Not Found",
-                    headers: Vec::new(),
-                    body: String::new(),
-                },
-                TestHttpResponse {
-                    status: "204 No Content",
-                    headers: vec![("x-amz-version-id", target_version_id)],
-                    body: String::new(),
-                },
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let (mut stream, _) = listener.accept().await.expect("test S3 client should connect");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 2048];
-                loop {
-                    let read = stream.read(&mut buffer).await.expect("test S3 request should be readable");
-                    assert_ne!(read, 0, "test S3 request closed before headers completed");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                requests.push(String::from_utf8(request).expect("test S3 request should be UTF-8"));
-                if index == 1 {
-                    entered_for_server.notify_one();
-                    release_for_server
-                        .acquire()
-                        .await
-                        .expect("RPC pause should remain open")
-                        .forget();
-                }
-                let mut headers = String::new();
-                for (name, value) in response.headers {
-                    headers.push_str(name);
-                    headers.push_str(": ");
-                    headers.push_str(&value);
-                    headers.push_str("\r\n");
-                }
-                let reply = format!(
-                    "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.status,
-                    headers,
-                    response.body.len(),
-                    response.body
-                );
-                stream
-                    .write_all(reply.as_bytes())
-                    .await
-                    .expect("test S3 response should be writable");
-            }
-            requests
-        });
-        (endpoint, handle, entered, release)
-    }
-
-    fn marker_replication_task(
-        bucket: &str,
-        object: &str,
-        source_version_id: Uuid,
-        target_arn: Option<&str>,
-        target_version_id: Option<&str>,
-    ) -> DeletedObjectReplicationInfo {
-        let mut decision = ReplicateDecision::new();
-        if let Some(target_arn) = target_arn {
-            decision.set(ReplicateTargetDecision::new(target_arn.to_string(), true, false));
-        }
-        let targets = target_arn
-            .map(|target_arn| HashMap::from([(target_arn.to_string(), ReplicationStatusType::Pending)]))
-            .unwrap_or_default();
-        let target_delete_marker_version_ids = target_arn
-            .zip(target_version_id)
-            .map(|(target_arn, target_version_id)| HashMap::from([(target_arn.to_string(), target_version_id.to_string())]))
-            .unwrap_or_default();
-
-        DeletedObjectReplicationInfo {
-            bucket: bucket.to_string(),
-            delete_object: ReplicationDeletedObject {
-                object_name: object.to_string(),
-                delete_marker: true,
-                delete_marker_version_id: Some(source_version_id),
-                replication_state: Some(ReplicationState {
-                    replicate_decision_str: decision.to_string(),
-                    replication_status_internal: target_arn.map(|target_arn| format!("{target_arn}=PENDING;")),
-                    targets,
-                    target_delete_marker_version_ids,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            target_arn: target_arn.unwrap_or_default().to_string(),
-            target_delete_marker_version_id: target_version_id.map(str::to_string),
-            op_type: ReplicationType::Delete,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn refreshed_delete_state_preserves_completed_targets() {
-        let target_a = "arn:target-a";
-        let target_b = "arn:target-b";
-        let mut delete = marker_replication_task("source", "object", Uuid::new_v4(), Some(target_b), None);
-        let current_state = ReplicationState {
-            targets: HashMap::from([
-                (target_a.to_string(), ReplicationStatusType::Completed),
-                (target_b.to_string(), ReplicationStatusType::Failed),
-            ]),
-            ..Default::default()
-        };
-
-        refresh_delete_replication_state(&mut delete, Some(current_state));
-        assert_eq!(
-            delete_target_state(&delete, target_a).prev_replication_status,
-            ReplicationStatusType::Completed
-        );
-        assert_eq!(
-            delete_target_state(&delete, target_b).prev_replication_status,
-            ReplicationStatusType::Failed
-        );
-
-        let merged = get_replication_state(
-            &ReplicatedInfos {
-                replication_timestamp: None,
-                targets: vec![ReplicatedTargetInfo {
-                    arn: target_b.to_string(),
-                    replication_status: ReplicationStatusType::Completed,
-                    ..Default::default()
-                }],
-            },
-            delete
-                .delete_object
-                .replication_state
-                .as_ref()
-                .expect("refreshed state should exist"),
-            None,
-        );
-        assert_eq!(merged.targets.get(target_a), Some(&ReplicationStatusType::Completed));
-        assert_eq!(merged.targets.get(target_b), Some(&ReplicationStatusType::Completed));
-    }
-
-    #[test]
-    fn source_delete_marker_match_preserves_historical_versions() {
-        let version_id = Uuid::new_v4();
-        let marker = ObjectInfo {
-            delete_marker: true,
-            version_id: Some(version_id),
-            is_latest: true,
-            ..Default::default()
-        };
-        assert!(source_delete_marker_matches_id(&marker, version_id));
-
-        let historical = ObjectInfo {
-            is_latest: false,
-            ..marker.clone()
-        };
-        assert!(source_delete_marker_matches_id(&historical, version_id));
-        assert!(!source_delete_marker_matches_id(&marker, Uuid::new_v4()));
-    }
-
-    #[tokio::test]
-    async fn panicked_delete_target_worker_is_recorded_as_failed() {
-        let target_arn = "arn:target-a";
-        let task = marker_replication_task("source", "object", Uuid::new_v4(), Some(target_arn), None);
-        let mut join_set = JoinSet::new();
-        let handle = join_set.spawn(async {
-            panic!("injected target worker panic");
-            #[allow(unreachable_code)]
-            ReplicatedTargetInfo::default()
-        });
-        let mut target_tasks = HashMap::from([(handle.id(), target_arn.to_string())]);
-
-        let result = delete_target_join_result(
-            join_set.join_next_with_id().await.expect("panic result should be available"),
-            &mut target_tasks,
-            &task,
-        )
-        .expect_err("a panicked worker must fail the target");
-
-        assert_eq!(result.1.arn, target_arn);
-        assert_eq!(result.1.replication_status, ReplicationStatusType::Failed);
-        assert!(result.1.error.as_deref().is_some_and(|error| error.contains("panic")));
-        assert!(target_tasks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancelled_delete_target_worker_is_recorded_as_failed() {
-        let target_arn = "arn:target-a";
-        let task = marker_replication_task("source", "object", Uuid::new_v4(), Some(target_arn), None);
-        let mut join_set = JoinSet::new();
-        let handle = join_set.spawn(std::future::pending::<ReplicatedTargetInfo>());
-        let mut target_tasks = HashMap::from([(handle.id(), target_arn.to_string())]);
-        handle.abort();
-
-        let result = delete_target_join_result(
-            join_set
-                .join_next_with_id()
-                .await
-                .expect("cancellation result should be available"),
-            &mut target_tasks,
-            &task,
-        )
-        .expect_err("a cancelled worker must fail the target");
-
-        assert_eq!(result.1.arn, target_arn);
-        assert_eq!(result.1.replication_status, ReplicationStatusType::Failed);
-        assert!(result.1.error.as_deref().is_some_and(|error| error.contains("cancel")));
-        assert!(target_tasks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_delete_retries_are_admitted_as_one_validated_batch() {
-        let bucket = format!("retry-batch-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let task = marker_replication_task(&bucket, &object, Uuid::new_v4(), None, None);
-        let capture = DeleteRetryCapture::install(&bucket, &object).await;
-        let infos = ReplicatedInfos {
-            replication_timestamp: None,
-            targets: vec![
-                ReplicatedTargetInfo {
-                    arn: "arn:target-a".to_string(),
-                    replication_status: ReplicationStatusType::Failed,
-                    target_delete_marker_version_id: Some("target-id-a".to_string()),
-                    ..Default::default()
-                },
-                ReplicatedTargetInfo {
-                    arn: "arn:target-b".to_string(),
-                    replication_status: ReplicationStatusType::Failed,
-                    target_delete_marker_version_id: Some("target-id-b".to_string()),
-                    ..Default::default()
-                },
-            ],
-        };
-
-        assert_eq!(persist_failed_delete_replications(&task, &infos).await, ReplicationQueueAdmission::Queued);
-        let batches = capture.batches();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 2);
-        assert_eq!(batches[0][0].target_delete_marker_version_id.as_deref(), Some("target-id-a"));
-        assert_eq!(batches[0][1].target_delete_marker_version_id.as_deref(), Some("target-id-b"));
-
-        let mut invalid = infos;
-        invalid.targets[1].arn.clear();
-        assert_eq!(
-            persist_failed_delete_replications(&task, &invalid).await,
-            ReplicationQueueAdmission::Missed
-        );
-        assert_eq!(capture.batches().len(), 1, "an invalid member must reject the whole batch");
-    }
-
-    async fn lock_only_replication_storage() -> Arc<SetDisks> {
-        SetDisks::new(
-            "replication-race-test".to_string(),
-            Arc::new(RwLock::new(vec![None])),
-            1,
-            0,
-            0,
-            0,
-            vec![Endpoint::try_from("http://127.0.0.1:9000/data").expect("test endpoint should parse")],
-            FormatV3::new(1, 1),
-            Vec::new(),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn delete_marker_source_check_runs_under_replication_lock() {
-        let bucket = format!("source-check-lock-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let source_version_id = Uuid::new_v4();
-        let storage = lock_only_replication_storage().await;
-        let probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![true, true], Some(1)).await;
-        let task = tokio::spawn(replicate_delete(
-            marker_replication_task(&bucket, &object, source_version_id, None, None),
-            Arc::clone(&storage),
-        ));
-
-        probe.wait_until_paused().await;
-        let competing = storage
-            .new_ns_lock(&bucket, &format!("/[replicate]/{object}"))
-            .await
-            .expect("competing replication lock should be constructed");
-        let err = competing
-            .get_write_lock_quiet(TokioDuration::from_millis(50))
-            .await
-            .expect_err("source verification must retain the replication write lock");
-        assert!(matches!(err, rustfs_lock::error::LockError::Timeout { .. }));
-
-        probe.release();
-        tokio::time::timeout(TokioDuration::from_secs(30), task)
-            .await
-            .expect("replication task should finish after the probe releases")
-            .expect("replication task should not panic");
-    }
-
-    #[tokio::test]
-    async fn delete_marker_postcheck_and_target_rpc_remain_under_replication_lock() {
-        let target_version_id = "opaque-target-marker-version";
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "404 Not Found",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: vec![("x-amz-version-id", target_version_id.to_string())],
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("postcheck-lock-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let storage = lock_only_replication_storage().await;
-        let probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![true, true], Some(2)).await;
-        let task = tokio::spawn(replicate_delete(
-            marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), None),
-            Arc::clone(&storage),
-        ));
-
-        probe.wait_until_paused().await;
-        let competing = storage
-            .new_ns_lock(&bucket, &format!("/[replicate]/{object}"))
-            .await
-            .expect("competing replication lock should be constructed");
-        assert!(matches!(
-            competing.get_write_lock_quiet(TokioDuration::from_millis(50)).await,
-            Err(rustfs_lock::error::LockError::Timeout { .. })
-        ));
-
-        probe.release();
-        tokio::time::timeout(TokioDuration::from_secs(30), task)
-            .await
-            .expect("replication task should finish after the post-check releases")
-            .expect("replication task should not panic");
-        tokio::time::timeout(TokioDuration::from_secs(30), server)
-            .await
-            .expect("target RPCs should finish before the post-check pause")
-            .expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn delete_marker_target_rpc_remains_under_replication_lock() {
-        let (endpoint, server, rpc_entered, rpc_release) =
-            blocked_marker_creation_server("opaque-target-version".to_string()).await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("target-rpc-lock-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![true, true], None).await;
-        let task = tokio::spawn(replicate_delete(
-            marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), None),
-            Arc::clone(&storage),
-        ));
-
-        tokio::time::timeout(TokioDuration::from_secs(30), rpc_entered.notified())
-            .await
-            .expect("target RPC should reach its deterministic pause");
-        let competing = storage
-            .new_ns_lock(&bucket, &format!("/[replicate]/{object}"))
-            .await
-            .expect("competing replication lock should be constructed");
-        assert!(matches!(
-            competing.get_write_lock_quiet(TokioDuration::from_millis(50)).await,
-            Err(rustfs_lock::error::LockError::Timeout { .. })
-        ));
-
-        rpc_release.add_permits(1);
-        tokio::time::timeout(TokioDuration::from_secs(30), task)
-            .await
-            .expect("replication task should finish after the target RPC releases")
-            .expect("replication task should not panic");
-        tokio::time::timeout(TokioDuration::from_secs(30), server)
-            .await
-            .expect("test S3 server should finish")
-            .expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn postcheck_source_disappearance_purges_generic_target_marker_by_returned_version_id() {
-        let target_version_id = "opaque-target-marker-version";
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "404 Not Found",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: vec![
-                    ("x-amz-delete-marker", "true".to_string()),
-                    ("x-amz-version-id", target_version_id.to_string()),
-                ],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers: vec![("x-amz-delete-marker", "true".to_string())],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-
-        let bucket = format!("postcheck-source-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let source_version_id = Uuid::new_v4();
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![true, false], None).await;
-        let completed = tokio::time::timeout(
-            TokioDuration::from_secs(30),
-            replicate_delete(
-                marker_replication_task(&bucket, &object, source_version_id, Some(&target_arn), None),
-                storage,
-            ),
-        )
-        .await
-        .expect("post-check reconciliation should finish");
-        assert!(completed, "a source-absent exact purge must be terminally acknowledged");
-
-        let requests = tokio::time::timeout(TokioDuration::from_secs(30), server)
-            .await
-            .expect("test S3 server should receive all requests")
-            .expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-
-        assert_eq!(requests.len(), 4);
-        let create = requests[1].lines().next().expect("marker create request line should exist");
-        let compensation = requests[3].lines().next().expect("marker purge request line should exist");
-        assert!(create.starts_with("DELETE "));
-        assert!(!create.contains("versionId="), "generic marker creation must not address the source UUID");
-        assert!(compensation.starts_with("DELETE "));
-        assert!(compensation.contains(&format!("versionId={target_version_id}")));
-        assert!(!compensation.contains(&source_version_id.to_string()));
-    }
-
-    #[tokio::test]
-    async fn precheck_source_absence_purges_known_exact_target_marker_once() {
-        let target_version_id = "opaque-known-target-marker";
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers: vec![("x-amz-delete-marker", "true".to_string())],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("precheck-source-absent-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![false], None).await;
-
-        assert!(
-            replicate_delete(
-                marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), Some(target_version_id),),
-                storage,
-            )
-            .await
-        );
-
-        let requests = server.await.expect("test S3 server should not panic");
-        assert_eq!(requests.len(), 2);
-        for request in requests {
-            assert!(
-                request
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .contains(&format!("versionId={target_version_id}"))
-            );
-        }
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn postcheck_error_keeps_target_marker_and_records_failure() {
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "404 Not Found",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: vec![("x-amz-version-id", "opaque-target-marker".to_string())],
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("postcheck-error-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install_results(&bucket, &object, vec![Some(true), None], None).await;
-        let retry_capture = DeleteRetryCapture::install(&bucket, &object).await;
-
-        let completed = tokio::time::timeout(
-            TokioDuration::from_secs(30),
-            replicate_delete(
-                marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), None),
-                storage,
-            ),
-        )
-        .await
-        .expect("post-check error handling should finish");
-        assert!(completed, "a post-check error may be acknowledged only after durable retry admission");
-
-        let requests = tokio::time::timeout(TokioDuration::from_secs(30), server)
-            .await
-            .expect("only the initial target marker creation should run")
-            .expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-        assert_eq!(requests.len(), 2, "source verification errors must not trigger destructive compensation");
-        let batches = retry_capture.batches();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 1);
-        assert_eq!(batches[0][0].target_arn, target_arn);
-        assert_eq!(batches[0][0].target_delete_marker_version_id.as_deref(), Some("opaque-target-marker"));
-    }
-
-    #[tokio::test]
-    async fn precheck_error_does_not_mutate_target_or_acknowledge() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test S3 listener should bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("precheck-error-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install_results(&bucket, &object, vec![None], None).await;
-        let retry_capture = DeleteRetryCapture::install(&bucket, &object).await;
-
-        let completed = replicate_delete(
-            marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), None),
-            storage,
-        )
-        .await;
-
-        assert!(
-            completed,
-            "a source precheck error may be acknowledged only after durable retry admission"
-        );
-        assert!(
-            tokio::time::timeout(TokioDuration::from_millis(50), listener.accept())
-                .await
-                .is_err(),
-            "a source precheck error must not issue a target request"
-        );
-        let batches = retry_capture.batches();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 1);
-        assert_eq!(batches[0][0].target_arn, target_arn);
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn access_denied_compensation_stays_failed_and_same_target_replay_converges() {
-        let target_version_id = "opaque-replay-target-version";
-        let access_denied = "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>";
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers: vec![("x-amz-delete-marker", "true".to_string())],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "403 Forbidden",
-                headers: vec![("Content-Type", "application/xml".to_string())],
-                body: access_denied.to_string(),
-            },
-            TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers: vec![("x-amz-delete-marker", "true".to_string())],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-
-        let source_version_id = Uuid::new_v4();
-        let task =
-            marker_replication_task("source-bucket", "object", source_version_id, Some(&target_arn), Some(target_version_id));
-        let dsc = parse_replicate_decision(
-            &task.bucket,
-            &task
-                .delete_object
-                .replication_state
-                .as_ref()
-                .expect("test task should have replication state")
-                .replicate_decision_str,
-        )
-        .expect("test decision should parse");
-        let versions = HashMap::from([(target_arn.clone(), target_version_id.to_string())]);
-
-        let first =
-            replicate_delete_marker_purge_to_targets(task.bucket.clone(), task.clone(), dsc.clone(), versions.clone(), false)
-                .await;
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].arn, target_arn);
-        assert_eq!(first[0].replication_status, ReplicationStatusType::Failed);
-        assert!(first[0].error.as_deref().is_some_and(|error| error.contains("AccessDenied")));
-        assert_eq!(first[0].target_delete_marker_version_id.as_deref(), Some(target_version_id));
-
-        let replay = replicate_delete_marker_purge_to_targets(task.bucket.clone(), task.clone(), dsc, versions, false).await;
-        assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].arn, target_arn);
-        assert_eq!(replay[0].replication_status, ReplicationStatusType::Completed);
-        assert_eq!(replay[0].target_delete_marker_version_id.as_deref(), Some(target_version_id));
-
-        let requests = tokio::time::timeout(TokioDuration::from_secs(30), server)
-            .await
-            .expect("test S3 server should receive both purge attempts")
-            .expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-        assert_eq!(requests.len(), 4);
-        for request in [&requests[1], &requests[3]] {
-            let request_line = request.lines().next().expect("purge request line should exist");
-            assert!(request_line.starts_with("DELETE "));
-            assert!(request_line.contains(&format!("versionId={target_version_id}")));
-            assert!(!request_line.contains(&source_version_id.to_string()));
-        }
-    }
-
-    #[tokio::test]
-    async fn delete_marker_purge_rejects_405_without_delete_marker_header() {
-        for headers in [Vec::new(), vec![("x-amz-delete-marker", "false".to_string())]] {
-            let (endpoint, server) = test_s3_server(vec![TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers,
-                body: String::new(),
-            }])
-            .await;
-            let target_client = test_target_client(endpoint);
-
-            let result =
-                purge_target_delete_marker_version("source-bucket", "object", &target_client, "candidate-version", None).await;
-
-            assert!(result.is_err());
-            let requests = server.await.expect("test S3 server should not panic");
-            assert_eq!(requests.len(), 1, "an unverified 405 must not be followed by DELETE");
-            TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_source_id_fallback_treats_missing_marker_as_complete() {
-        let (endpoint, server) = test_s3_server(vec![TestHttpResponse {
-            status: "404 Not Found",
-            headers: Vec::new(),
-            body: String::new(),
-        }])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let task = marker_replication_task("source-bucket", "object", Uuid::new_v4(), Some(&target_arn), None);
-        let dsc = parse_replicate_decision(
-            &task.bucket,
-            &task
-                .delete_object
-                .replication_state
-                .as_ref()
-                .expect("test task should have replication state")
-                .replicate_decision_str,
-        )
-        .expect("test decision should parse");
-
-        let result = replicate_delete_marker_purge_to_targets(task.bucket.clone(), task, dsc, HashMap::new(), true).await;
-        assert_eq!(result[0].replication_status, ReplicationStatusType::Completed);
-        assert!(result[0].target_delete_marker_version_id.is_none());
-
-        let requests = server.await.expect("test S3 server should not panic");
-        assert_eq!(requests.len(), 1);
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn marker_creation_rejects_missing_empty_and_oversized_target_version_ids() {
-        let mut responses = Vec::new();
-        for version_id in [None, Some(String::new()), Some("x".repeat(1_025))] {
-            responses.push(TestHttpResponse {
-                status: "404 Not Found",
-                headers: Vec::new(),
-                body: String::new(),
-            });
-            responses.push(TestHttpResponse {
-                status: "204 No Content",
-                headers: version_id
-                    .map(|version_id| vec![("x-amz-version-id", version_id)])
-                    .unwrap_or_default(),
-                body: String::new(),
-            });
-        }
-        let (endpoint, server) = test_s3_server(responses).await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        register_test_target(&target_client).await;
-
-        for _ in 0..3 {
-            let task = marker_replication_task("source-bucket", "object", Uuid::new_v4(), Some(&target_arn), None);
-            let result = replicate_delete_to_target(&task, Arc::clone(&target_client)).await;
-            assert_eq!(result.replication_status, ReplicationStatusType::Failed);
-            assert!(result.target_delete_marker_version_id.is_none());
-            assert!(
-                result
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("valid version id"))
-            );
-        }
-
-        let requests = server.await.expect("test S3 server should not panic");
-        assert_eq!(requests.len(), 6);
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().target_h_mutex.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn targeted_marker_retry_keeps_verified_existing_target_marker() {
-        let target_version_id = "opaque-existing-target-marker";
-        let (endpoint, server) = test_s3_server(vec![TestHttpResponse {
-            status: "405 Method Not Allowed",
-            headers: vec![("x-amz-delete-marker", "true".to_string())],
-            body: String::new(),
-        }])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_endpoint = target_client.endpoint.clone();
-        let target_arn = target_client.arn.clone();
-        register_test_target(&target_client).await;
-        let task = marker_replication_task("source-bucket", "object", Uuid::new_v4(), Some(&target_arn), Some(target_version_id));
-
-        let result = replicate_delete_to_target(&task, target_client).await;
-
-        assert_eq!(result.replication_status, ReplicationStatusType::Completed);
-        assert_eq!(result.target_delete_marker_version_id.as_deref(), Some(target_version_id));
-        let requests = tokio::time::timeout(TokioDuration::from_secs(30), server)
-            .await
-            .expect("test S3 server should receive the verification request")
-            .expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().target_h_mutex.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_endpoint);
-        assert_eq!(requests.len(), 1);
-        let request_line = requests[0].lines().next().unwrap_or_default();
-        assert!(request_line.starts_with("HEAD "));
-        assert!(request_line.contains(&format!("versionId={target_version_id}")));
-    }
-
-    #[tokio::test]
-    async fn targeted_marker_retry_recreates_only_when_mapped_marker_is_missing() {
-        let old_target_version_id = "opaque-missing-target-marker";
-        let new_target_version_id = "opaque-new-target-marker";
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "404 Not Found",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "404 Not Found",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: vec![("x-amz-version-id", new_target_version_id.to_string())],
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_endpoint = target_client.endpoint.clone();
-        let target_arn = target_client.arn.clone();
-        register_test_target(&target_client).await;
-        let task =
-            marker_replication_task("source-bucket", "object", Uuid::new_v4(), Some(&target_arn), Some(old_target_version_id));
-
-        let result = replicate_delete_to_target(&task, target_client).await;
-
-        assert_eq!(result.replication_status, ReplicationStatusType::Completed);
-        assert_eq!(result.target_delete_marker_version_id.as_deref(), Some(new_target_version_id));
-        let requests = server.await.expect("test S3 server should not panic");
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().target_h_mutex.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_endpoint);
-        assert_eq!(requests.len(), 3);
-        let mapped_probe = requests[0].lines().next().unwrap_or_default();
-        assert!(mapped_probe.starts_with("HEAD "));
-        assert!(mapped_probe.contains(&format!("versionId={old_target_version_id}")));
-        assert!(requests[1].lines().next().unwrap_or_default().starts_with("HEAD "));
-        assert!(requests[2].lines().next().unwrap_or_default().starts_with("DELETE "));
-        assert!(!requests[2].lines().next().unwrap_or_default().contains("versionId="));
-    }
-
-    #[tokio::test]
-    async fn targeted_retry_postcheck_purges_verified_existing_marker_id() {
-        let target_version_id = "opaque-existing-target-marker";
-        let (endpoint, server) = test_s3_server(vec![
-            TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers: vec![("x-amz-delete-marker", "true".to_string())],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "405 Method Not Allowed",
-                headers: vec![("x-amz-delete-marker", "true".to_string())],
-                body: String::new(),
-            },
-            TestHttpResponse {
-                status: "204 No Content",
-                headers: Vec::new(),
-                body: String::new(),
-            },
-        ])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("targeted-postcheck-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let task = marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), Some(target_version_id));
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![true, false], None).await;
-
-        assert!(replicate_delete(task, storage).await);
-
-        let requests = server.await.expect("test S3 server should not panic");
-        assert_eq!(requests.len(), 3);
-        let compensation = requests[2].lines().next().expect("compensation request line should exist");
-        assert!(compensation.contains(&format!("versionId={target_version_id}")));
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn source_absent_conflicting_target_id_is_retained_without_remote_mutation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test S3 listener should bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("conflicting-target-id-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let mut task = marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), Some("mrf-target-version"));
-        task.delete_object
-            .replication_state
-            .as_mut()
-            .expect("test replication state should exist")
-            .target_delete_marker_version_ids
-            .insert(target_arn.clone(), "xl-meta-target-version".to_string());
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![false], None).await;
-
-        let completed = replicate_delete(task, storage).await;
-
-        assert!(!completed, "a conflicting task must remain retained even when a retry was durably queued");
-        assert!(
-            tokio::time::timeout(TokioDuration::from_millis(50), listener.accept())
-                .await
-                .is_err(),
-            "conflicting target IDs must not issue a target request"
-        );
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn refreshed_target_id_rebases_stale_mrf_without_remote_mutation() {
-        let (endpoint, server) = test_s3_server(vec![TestHttpResponse {
-            status: "405 Method Not Allowed",
-            headers: vec![("x-amz-delete-marker", "true".to_string())],
-            body: String::new(),
-        }])
-        .await;
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        register_test_target(&target_client).await;
-        let bucket = format!("refreshed-conflict-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let task = marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), Some("mrf-target-version"));
-        let refreshed = ReplicationState {
-            target_delete_marker_version_ids: HashMap::from([(target_arn.clone(), "xl-meta-target-version".to_string())]),
-            ..Default::default()
-        };
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install_states(
-            &bucket,
-            &object,
-            vec![Some((true, Some(refreshed.clone()))), Some((true, Some(refreshed)))],
-            None,
-        )
-        .await;
-        let retry_capture = DeleteRetryCapture::install(&bucket, &object).await;
-
-        assert!(replicate_delete(task, storage).await);
-        let requests = server.await.expect("test S3 server should not panic");
-        assert_eq!(requests.len(), 1);
-        let request_line = requests[0].lines().next().unwrap_or_default();
-        assert!(request_line.starts_with("HEAD "));
-        assert!(request_line.contains("versionId=xl-meta-target-version"));
-        let batches = retry_capture.batches();
-        assert_eq!(batches.len(), 1, "the injected local commit failure should remain retryable");
-        assert_eq!(batches[0].len(), 1);
-        assert!(!batches[0][0].blocked_delete_marker_version_state);
-        assert_eq!(batches[0][0].target_delete_marker_version_id.as_deref(), Some("xl-meta-target-version"));
-        assert!(!batches[0][0].to_mrf_entry().blocked_delete_marker_version_state());
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().target_h_mutex.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
-    }
-
-    #[tokio::test]
-    async fn corrupt_target_version_metadata_remains_fail_closed_across_retries() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test S3 listener should bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("test listener address should exist"));
-        let target_client = test_target_client(endpoint);
-        let target_arn = target_client.arn.clone();
-        TargetRegistry::get()
-            .arn_remotes_map
-            .write()
-            .await
-            .insert(target_arn.clone(), ArnTarget::with_client(Arc::clone(&target_client)));
-        let bucket = format!("corrupt-target-id-{}", Uuid::new_v4());
-        let object = format!("object-{}", Uuid::new_v4());
-        let mut task = marker_replication_task(&bucket, &object, Uuid::new_v4(), Some(&target_arn), None);
-        task.delete_object
-            .replication_state
-            .as_mut()
-            .expect("test replication state should exist")
-            .target_delete_marker_version_ids_corrupt = true;
-        let storage = lock_only_replication_storage().await;
-        let _probe = DeleteReplicationSourceCheckProbe::install(&bucket, &object, vec![false, false], None).await;
-
-        assert!(!replicate_delete(task.clone(), Arc::clone(&storage)).await);
-        assert!(!replicate_delete(task, storage).await);
-        assert!(
-            tokio::time::timeout(TokioDuration::from_millis(50), listener.accept())
-                .await
-                .is_err(),
-            "corrupt target version metadata must remain non-destructive across retries"
-        );
-        TargetRegistry::get().arn_remotes_map.write().await.remove(&target_arn);
-        TargetRegistry::get().h_mutex.write().await.remove(&target_client.endpoint);
     }
 
     #[test]
@@ -5311,23 +3447,6 @@ mod tests {
             !is_version_delete_replication(&dobj),
             "delete-marker creation should remain on the delete-marker replication path"
         );
-    }
-
-    #[test]
-    fn test_target_delete_marker_creation_excludes_replayed_version_purges() {
-        let marker = ReplicationDeletedObject {
-            delete_marker: true,
-            delete_marker_version_id: Some(Uuid::new_v4()),
-            ..Default::default()
-        };
-        let replayed_purge = ReplicationDeletedObject {
-            delete_marker: true,
-            version_id: Some(Uuid::new_v4()),
-            ..Default::default()
-        };
-
-        assert!(is_target_delete_marker_creation(&marker));
-        assert!(!is_target_delete_marker_creation(&replayed_purge));
     }
 
     #[test]
