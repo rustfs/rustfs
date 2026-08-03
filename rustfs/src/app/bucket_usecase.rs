@@ -75,6 +75,7 @@ use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
+use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
@@ -1313,6 +1314,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
+        record_s3_op(S3Operation::HeadBucket);
         let input = req.input;
 
         let Some(store) = self.object_store() else {
@@ -1502,6 +1504,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        record_s3_op(S3Operation::DeleteBucketPolicy);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
@@ -2265,6 +2268,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        record_s3_op(S3Operation::PutBucketPolicy);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
@@ -2713,6 +2717,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    fn s3_op_total(op: S3Operation) -> u64 {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.op == op.as_str())
+            .map(|snapshot| snapshot.total)
+            .unwrap_or_default()
+    }
 
     #[tokio::test]
     async fn bucket_usecase_task_finishes_post_commit_hooks_after_parent_cancellation() {
@@ -3337,9 +3349,27 @@ mod tests {
 
         let req = build_request(input, Method::HEAD);
         let usecase = DefaultBucketUsecase::without_context();
+        let before = s3_op_total(S3Operation::HeadBucket);
 
         let err = usecase.execute_head_bucket(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(s3_op_total(S3Operation::HeadBucket), before + 1);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_bucket_policy_records_s3_operation_before_store_lookup() {
+        let input = DeleteBucketPolicyInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
+        let before = s3_op_total(S3Operation::DeleteBucketPolicy);
+
+        let err = usecase.execute_delete_bucket_policy(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(s3_op_total(S3Operation::DeleteBucketPolicy), before + 1);
     }
 
     #[tokio::test]
@@ -4327,9 +4357,11 @@ mod tests {
 
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
+        let before = s3_op_total(S3Operation::PutBucketPolicy);
 
         let err = usecase.execute_put_bucket_policy(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(s3_op_total(S3Operation::PutBucketPolicy), before + 1);
     }
 
     #[tokio::test]

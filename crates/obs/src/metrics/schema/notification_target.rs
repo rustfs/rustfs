@@ -19,14 +19,25 @@ use std::sync::LazyLock;
 
 pub const TARGET_ID: &str = "target_id";
 pub const TARGET_TYPE: &str = "target_type";
+pub const SERVER: &str = "server";
 
 const NOTIFICATION_TARGET_LABELS: [&str; 2] = [TARGET_ID, TARGET_TYPE];
+const NOTIFICATION_TARGET_SERVER_LABELS: [&str; 3] = [SERVER, TARGET_ID, TARGET_TYPE];
 
 pub static NOTIFICATION_TARGET_FAILED_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::NotificationTargetFailedMessages,
         "Total number of notification messages that permanently failed to send",
         &NOTIFICATION_TARGET_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
+pub static NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("target_failed_messages_by_server".to_string()),
+        "Total number of notification messages that permanently failed to send by server and target",
+        &NOTIFICATION_TARGET_SERVER_LABELS,
         subsystems::NOTIFICATION,
     )
 });
@@ -40,6 +51,15 @@ pub static NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD: LazyLock<MetricDescriptor
     )
 });
 
+pub static NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("target_failed_store_length_by_server".to_string()),
+        "Number of notification messages held in the failed-events store by server and target",
+        &NOTIFICATION_TARGET_SERVER_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
 pub static NOTIFICATION_TARGET_QUEUE_LENGTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::NotificationTargetQueueLength,
@@ -49,11 +69,29 @@ pub static NOTIFICATION_TARGET_QUEUE_LENGTH_MD: LazyLock<MetricDescriptor> = Laz
     )
 });
 
+pub static NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("target_queue_length_by_server".to_string()),
+        "Number of queued notification messages pending delivery by server and target",
+        &NOTIFICATION_TARGET_SERVER_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
 pub static NOTIFICATION_TARGET_TOTAL_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::NotificationTargetTotalMessages,
         "Total number of notification messages successfully delivered",
         &NOTIFICATION_TARGET_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
+pub static NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("target_total_messages_by_server".to_string()),
+        "Total number of notification messages successfully delivered by server and target",
+        &NOTIFICATION_TARGET_SERVER_LABELS,
         subsystems::NOTIFICATION,
     )
 });

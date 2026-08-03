@@ -246,7 +246,7 @@ pub use process_lock_metrics::{
     record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts, snapshot_process_lock_events,
     snapshot_process_platform_stats,
 };
-pub use s3_api_metrics::{init_s3_metrics, record_s3_op};
+pub use s3_api_metrics::{S3OperationMetricSnapshot, init_s3_metrics, record_s3_op, s3_op_metrics_snapshot};
 pub use sampler::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform,
     snapshot_process_resource, snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,
