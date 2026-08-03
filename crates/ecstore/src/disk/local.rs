@@ -6701,7 +6701,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
             let r = (|| -> Result<Bytes> {
                 let meta = std::fs::metadata(&file_path).map_err(DiskError::from)?;
                 let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-                if meta.len() < end as u64 {
+                if meta.len() < u64::try_from(end).unwrap_or(u64::MAX) {
                     return Err(DiskError::FileCorrupt);
                 }
 
@@ -6710,7 +6710,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                 let mut total = 0usize;
                 while total < length {
                     let nbytes = file
-                        .read_at(&mut buf[total..], (offset + total) as u64)
+                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
                         .map_err(DiskError::from)?;
                     if nbytes == 0 {
                         return Err(DiskError::FileCorrupt);
@@ -17986,5 +17986,6 @@ mod test {
         assert!(results[0].is_ok());
         assert_eq!(results[0].as_ref().unwrap().as_ref(), b"good data");
         assert!(results[1].is_err());
+        assert!(matches!(results[1].as_ref().unwrap_err(), DiskError::Io(_)));
     }
 }

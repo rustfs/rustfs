@@ -63,7 +63,6 @@ use metrics::counter;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    io::Cursor,
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
@@ -1425,6 +1424,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     skip_verify_bitrot: bool,
 ) -> Option<BitrotReaderSetup> {
     use crate::disk::local::batch_shard_pread;
+    use std::io::Cursor;
 
     let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
     if adj_len > object_mmap_read_max_length() {
