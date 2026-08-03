@@ -141,7 +141,10 @@ impl MrfProtocolCapabilities {
                 min_reader_version: peer.min_reader_version,
             });
         }
-        if peer.version != self.version {
+        if self.version < MRF_ENVELOPE_VERSION {
+            return Err(MrfEnvelopeError::UnsupportedVersion { version: self.version });
+        }
+        if peer.version < MRF_ENVELOPE_VERSION {
             return Err(MrfEnvelopeError::UnsupportedVersion { version: peer.version });
         }
         if peer.min_reader_version > self.version {
@@ -150,8 +153,14 @@ impl MrfProtocolCapabilities {
                 supported_version: self.version,
             });
         }
+        if self.min_reader_version > peer.version {
+            return Err(MrfEnvelopeError::RollbackFenced {
+                min_reader_version: self.min_reader_version,
+                supported_version: peer.version,
+            });
+        }
         Ok(Self {
-            version: self.version,
+            version: self.version.min(peer.version),
             min_reader_version: self.min_reader_version.max(peer.min_reader_version),
             capabilities: MrfCapabilities(self.capabilities.bits() & peer.capabilities.bits()),
         })
@@ -215,6 +224,9 @@ impl MrfEnvelope {
             return Err(MrfEnvelopeError::UnsupportedFormat { format });
         }
         let version = LittleEndian::read_u16(&data[6..8]);
+        if version < MRF_ENVELOPE_VERSION {
+            return Err(MrfEnvelopeError::UnsupportedVersion { version });
+        }
         let min_reader_version = LittleEndian::read_u16(&data[8..10]);
         if min_reader_version > supported.version {
             return Err(MrfEnvelopeError::RollbackFenced {
@@ -564,6 +576,13 @@ mod tests {
             MrfEnvelope::decode(&reserved, MrfProtocolCapabilities::current()),
             Err(MrfEnvelopeError::ReservedHeaderBits { bits: 1 })
         );
+
+        let mut legacy = ENVELOPE_FIXTURE.to_vec();
+        legacy[6..8].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            MrfEnvelope::decode(&legacy, MrfProtocolCapabilities::current()),
+            Err(MrfEnvelopeError::UnsupportedVersion { version: 0 })
+        );
     }
 
     #[test]
@@ -622,5 +641,16 @@ mod tests {
         let peer = MrfProtocolCapabilities::new(1, 1, MrfCapabilities::with(MrfCapability::ForceDelete));
         let negotiated = local.negotiate(peer).expect("same-version peers should negotiate");
         assert_eq!(negotiated.capabilities(), MrfCapabilities::empty());
+    }
+
+    #[test]
+    fn protocol_negotiation_accepts_a_forward_compatible_peer() {
+        let reader = MrfProtocolCapabilities::current();
+        let writer = MrfProtocolCapabilities::new(2, 1, MrfCapabilities::current());
+        let negotiated = reader
+            .negotiate(writer)
+            .expect("v1 reader should negotiate with a compatible v2 writer");
+        assert_eq!(negotiated.version(), 1);
+        assert_eq!(negotiated.min_reader_version(), 1);
     }
 }

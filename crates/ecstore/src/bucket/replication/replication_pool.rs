@@ -22,7 +22,7 @@ use super::replication_filemeta_boundary::{
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
-use super::replication_object_config::{ReplicationConfig, check_replicate_delete, must_replicate};
+use super::replication_object_config::{ReplicationConfig, check_replicate_delete_strict, must_replicate};
 use super::replication_object_decision_boundary::MustReplicateOptions;
 use super::replication_queue_boundary::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
@@ -1097,21 +1097,35 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 ..Default::default()
                             };
                             let dsc = if entry.target_arns.is_empty() {
-                                check_replicate_delete(
-                                    &entry.bucket,
-                                    &ObjectToDelete {
-                                        object_name: entry.object.clone(),
-                                        version_id: entry.version_id,
-                                        ..Default::default()
+                                match ReplicationMetadataStore::optional_replication_config(&entry.bucket).await {
+                                    Ok(None) => continue,
+                                    Err(_) => {
+                                        retry_entries.push(entry.clone());
+                                        continue;
+                                    }
+                                    Ok(Some(_)) => match check_replicate_delete_strict(
+                                        &entry.bucket,
+                                        &ObjectToDelete {
+                                            object_name: entry.object.clone(),
+                                            version_id: entry.version_id,
+                                            ..Default::default()
+                                        },
+                                        &oi,
+                                        &ObjectOptions {
+                                            versioned,
+                                            ..Default::default()
+                                        },
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        Ok(dsc) => dsc,
+                                        Err(_) => {
+                                            retry_entries.push(entry.clone());
+                                            continue;
+                                        }
                                     },
-                                    &oi,
-                                    &ObjectOptions {
-                                        versioned,
-                                        ..Default::default()
-                                    },
-                                    None,
-                                )
-                                .await
+                                }
                             } else {
                                 replicate_decision_for_admitted_targets(&entry.target_arns)
                             };
@@ -1306,31 +1320,32 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let recovery_result = self.mrf_recovery_result.clone();
 
         let handle = tokio::spawn(async move {
-            let mut pending =
+            let mut pending = loop {
                 match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
                     Ok(data) => match decode_mrf_file(&data) {
-                        Ok(entries) => entries,
+                        Ok(entries) => break entries,
                         Err(error) => {
                             warn!(
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_REPLICATION,
                                 error = %error,
-                                "Failed to seed MRF persister from the startup recovery file"
+                                "Failed to seed MRF persister from the startup recovery file; retrying without overwriting it"
                             );
-                            Vec::new()
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     },
-                    Err(EcstoreError::ConfigNotFound) => Vec::new(),
+                    Err(EcstoreError::ConfigNotFound) => break Vec::new(),
                     Err(error) => {
                         warn!(
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_REPLICATION,
                             error = %error,
-                            "Failed to read the startup MRF backlog for persister seeding"
+                            "Failed to read the startup MRF backlog for persister seeding; retrying without overwriting it"
                         );
-                        Vec::new()
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                };
+                }
+            };
             let initial_pending_len = pending.len();
             // The on-disk MRF file is a restart-recovery backstop: entries are
             // only replayed (and the file cleared) at startup, never during the
@@ -1351,11 +1366,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             if initial_pending_len > 0 {
                 set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
             }
-            let mut flushed_len = initial_pending_len;
+            let mut new_entries_pending_stats = 0usize;
+            let mut new_entries_pending_observability = 0usize;
             let mut dirty = false;
             let mut capped = initial_pending_len >= MRF_PENDING_CAP;
             let mut recovery_applied = false;
-            let mut disk_appended = Vec::new();
             if capped {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
@@ -1372,17 +1387,25 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             loop {
                 if pending.len() >= MRF_PENDING_CAP && recovery_applied {
-                    let appended_len = disk_appended.len();
-                    if (dirty || !disk_appended.is_empty())
-                        && let Some(duration_millis) = flush_mrf_pending_to_disk(&mut pending, &mut disk_appended, &storage).await
-                    {
-                        set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
-                        let persisted_start = flushed_len;
-                        let persisted_end = pending.len().saturating_sub(appended_len);
-                        observe_mrf_pending_flushed(&pending[persisted_start..persisted_end], duration_millis);
-                        dec_mrf_entries(stats.as_ref(), &pending[persisted_start..persisted_end]);
-                        flushed_len = pending.len();
-                        dirty = false;
+                    if dirty {
+                        if let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                            set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                            let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                            observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                            new_entries_pending_observability = 0;
+                            if new_entries_pending_stats > 0 {
+                                let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                new_entries_pending_stats = 0;
+                            }
+                            dirty = false;
+                        } else {
+                            // Keep the channel bounded while the current backlog
+                            // cannot be persisted; draining it here would turn a
+                            // failed flush into unbounded in-memory growth.
+                            interval.tick().await;
+                            continue;
+                        }
                     }
                     if !capped {
                         capped = true;
@@ -1393,20 +1416,27 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             "MRF pending backlog reached capacity — applying backpressure"
                         );
                     }
+                    let mut batch = Vec::new();
                     while let Ok(entry) = rx.try_recv() {
-                        if !dirty && disk_appended.is_empty() && append_mrf_entry_to_disk(&entry, &storage).await {
-                            durable_tracker.add_entry(&entry);
-                            observe_mrf_pending(&entry);
-                            dec_mrf_entries(stats.as_ref(), std::slice::from_ref(&entry));
-                            disk_appended.push(entry);
+                        batch.push(entry);
+                    }
+                    if !batch.is_empty() {
+                        for entry in &batch {
+                            durable_tracker.add_entry(entry);
+                            observe_mrf_pending(entry);
+                        }
+                        if !dirty && let Some(duration_millis) = append_mrf_entries_to_disk(&batch, &storage).await {
+                            set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                            observe_mrf_pending_flushed(&batch, duration_millis);
+                            dec_mrf_entries(stats.as_ref(), &batch);
                         } else {
-                            durable_tracker.add_entry(&entry);
-                            observe_mrf_pending(&entry);
-                            pending.push(entry);
+                            new_entries_pending_stats += batch.len();
+                            new_entries_pending_observability += batch.len();
+                            pending.extend(batch);
                             dirty = true;
                         }
                     }
-                    if rx.is_closed() && rx.is_empty() && !dirty && disk_appended.is_empty() {
+                    if rx.is_closed() && rx.is_empty() && !dirty {
                         break;
                     }
                     interval.tick().await;
@@ -1418,18 +1448,23 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             durable_tracker.add_entry(&e);
                             observe_mrf_pending(&e);
                             pending.push(e);
+                            new_entries_pending_stats += 1;
+                            new_entries_pending_observability += 1;
                             dirty = true;
                             // Flush eagerly once enough new entries have accumulated
                             // since the last write (measured against the flushed
                             // set, not the absolute length, so a large backlog is
                             // not rewritten on every single add).
-                            if pending.len() - flushed_len >= 1000
+                            if new_entries_pending_stats >= 1000
                                 && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
                             {
                                 set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
-                                observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
-                                dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
-                                flushed_len = pending.len();
+                                let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                                observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                                new_entries_pending_observability = 0;
+                                let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                new_entries_pending_stats = 0;
                                 dirty = false;
                             }
                         }
@@ -1437,8 +1472,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             // Channel closed (pool shutting down) — final flush.
                             if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
                                 set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
-                                observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
-                                dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
+                                let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                                observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                                if new_entries_pending_stats > 0 {
+                                    let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                    dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                }
                             }
                             break;
                         }
@@ -1447,19 +1486,29 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         recovery_applied = true;
                         if let Some(retry_entries) = recovery_result.lock().await.take() {
                             let new_entries = pending.split_off(initial_pending_len.min(pending.len()));
-                            let new_entries_len = new_entries.len();
                             pending = retry_entries;
                             pending.extend(new_entries);
-                            flushed_len = pending.len().saturating_sub(new_entries_len);
+                            durable_tracker = DurableMrfBacklogTracker {
+                                available: true,
+                                ..Default::default()
+                            };
+                            for entry in &pending {
+                                durable_tracker.add_entry(entry);
+                            }
                             dirty = true;
                         }
                     },
                     _ = interval.tick() => {
                         if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
                             set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
-                            observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
-                            dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
-                            flushed_len = pending.len();
+                            let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                            observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                            new_entries_pending_observability = 0;
+                            if new_entries_pending_stats > 0 {
+                                let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                new_entries_pending_stats = 0;
+                            }
                             dirty = false;
                         }
                     }
@@ -2016,25 +2065,13 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
     }
 }
 
-async fn flush_mrf_pending_to_disk<S: ReplicationObjectIO>(
-    pending: &mut Vec<MrfReplicateEntry>,
-    disk_appended: &mut Vec<MrfReplicateEntry>,
+async fn append_mrf_entries_to_disk<S: ReplicationObjectIO>(
+    entries_to_append: &[MrfReplicateEntry],
     storage: &Arc<S>,
 ) -> Option<u64> {
-    if disk_appended.is_empty() {
-        return flush_mrf_to_disk(pending, storage).await;
+    if entries_to_append.is_empty() {
+        return Some(0);
     }
-
-    let mut combined = Vec::with_capacity(pending.len() + disk_appended.len());
-    combined.extend_from_slice(pending);
-    combined.extend(disk_appended.iter().cloned());
-    let duration_millis = flush_mrf_to_disk(&combined, storage).await?;
-    *pending = combined;
-    disk_appended.clear();
-    Some(duration_millis)
-}
-
-async fn append_mrf_entry_to_disk<S: ReplicationObjectIO>(entry: &MrfReplicateEntry, storage: &Arc<S>) -> bool {
     let mut entries = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
         Ok(data) => match decode_mrf_file(&data) {
             Ok(entries) => entries,
@@ -2045,7 +2082,7 @@ async fn append_mrf_entry_to_disk<S: ReplicationObjectIO>(entry: &MrfReplicateEn
                     error = %error,
                     "Failed to decode MRF backlog before appending a capped entry"
                 );
-                return false;
+                return None;
             }
         },
         Err(EcstoreError::ConfigNotFound) => Vec::new(),
@@ -2056,11 +2093,11 @@ async fn append_mrf_entry_to_disk<S: ReplicationObjectIO>(entry: &MrfReplicateEn
                 error = %error,
                 "Failed to read MRF backlog before appending a capped entry"
             );
-            return false;
+            return None;
         }
     };
-    entries.push(entry.clone());
-    flush_mrf_to_disk(&entries, storage).await.is_some()
+    entries.extend_from_slice(entries_to_append);
+    flush_mrf_to_disk(&entries, storage).await
 }
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
