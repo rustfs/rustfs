@@ -1280,6 +1280,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_format_load_initializes_all_disks() {
+        let (_temp_dir, mut disks) = local_disks(3).await;
+
+        let format = connect_load_init_formats(true, &mut disks, 1, 3, None)
+            .await
+            .expect("fresh disks should receive a storage format");
+
+        let (formats, errors) = load_format_erasure_all(&disks, false).await;
+        assert!(errors.iter().all(Option::is_none), "every disk should load its fresh format: {errors:?}");
+        assert!(
+            formats_match_reference_slots(&formats, &format, 0),
+            "fresh format publication must preserve every disk slot"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_format_load_does_not_initialize_with_a_missing_disk() {
         let (_temp_dir, mut disks) = two_local_disks_with_missing_third().await;
 
