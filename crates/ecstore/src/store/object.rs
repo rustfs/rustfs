@@ -23,9 +23,16 @@ use crate::bucket::lifecycle::{
         Jentry, attach_tier_delete_source, transitioned_delete_journal_entry_for_source, transitioned_force_delete_journal_entry,
     },
 };
+use crate::bucket::metadata_sys::{
+    acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_in, get_cached_bucket_incarnation_id_in,
+    get_object_lock_config_and_incarnation_from_disk_in,
+};
+use crate::bucket::object_lock::objectlock_sys::{
+    check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
+};
 use crate::bucket::replication::ReplicationObjectBridge;
 use crate::disk::OldCurrentSize;
-use crate::object_api::DeleteLockFence;
+use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
@@ -43,6 +50,10 @@ use std::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 
+#[cfg(not(test))]
+const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
+#[cfg(test)]
+const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
 const FORCE_DELETE_LIST_PAGE_SIZE: i32 = 1_000;
 
 fn build_tier_delete_journal_entry(
@@ -365,6 +376,13 @@ impl RestoreAcceptGuard {
     pub fn is_lock_lost(&self) -> bool {
         self.0.guard.is_lock_lost()
     }
+
+    pub fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        opts.ensure_namespace_lock_fence();
+        if let Some(signal) = self.0.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+    }
 }
 
 impl Drop for ObjectLockDiagGuard {
@@ -483,6 +501,77 @@ fn resolve_latest_object_access(
 
 fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
     opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
+}
+
+#[cfg(test)]
+struct DeleteAfterObjectLockSnapshotBarrierState {
+    bucket: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct DeleteAfterObjectLockSnapshotBarrier {
+    state: Arc<DeleteAfterObjectLockSnapshotBarrierState>,
+}
+
+#[cfg(test)]
+static DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DeleteAfterObjectLockSnapshotBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DeleteAfterObjectLockSnapshotBarrier {
+    pub(crate) fn install(bucket: &str) -> Self {
+        let state = Arc::new(DeleteAfterObjectLockSnapshotBarrierState {
+            bucket: bucket.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete snapshot barrier mutex should not poison");
+        assert!(slot.is_none(), "delete snapshot barrier must not already be installed");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        self.state.arrived.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeleteAfterObjectLockSnapshotBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        if let Some(slot) = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER.get() {
+            let mut slot = slot.lock().expect("delete snapshot barrier mutex should not poison");
+            if slot.as_ref().is_some_and(|installed| Arc::ptr_eq(installed, &self.state)) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
+    let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete snapshot barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
+    }
 }
 
 /// Whether a delete-time lookup miss on a directory key should trigger an orphan
@@ -643,6 +732,54 @@ fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
 }
 
 impl ECStore {
+    /// Captures Object Lock state once for a batch of PUTs to the same bucket.
+    /// `handle_put_object` only reuses the token for the same store, bucket,
+    /// bucket incarnation, and Object Lock configuration revision.
+    pub async fn object_lock_config_snapshot(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
+        check_valid_bucket_name(bucket)?;
+        let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let (state, bucket_incarnation_id, config_revision) =
+            get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+        if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
+            return Err(Error::other("bucket lifecycle lock was lost while loading the Object Lock snapshot"));
+        }
+        Ok(Arc::new(ObjectLockConfigSnapshot::for_guarded_store_bucket(
+            self.id,
+            bucket,
+            bucket_incarnation_id,
+            config_revision,
+            state,
+            lifecycle_guard,
+            metadata_guard,
+        )))
+    }
+
+    async fn object_lock_config_snapshot_under_lifecycle_fence(
+        &self,
+        bucket: &str,
+        lifecycle_fence: &NamespaceLockFence,
+    ) -> Result<Arc<ObjectLockConfigSnapshot>> {
+        if lifecycle_fence.is_lock_lost() {
+            return Err(Error::other("bucket lifecycle lock was lost before loading the Object Lock snapshot"));
+        }
+        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let (state, bucket_incarnation_id, config_revision) =
+            get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+        if lifecycle_fence.is_lock_lost() || metadata_guard.is_lock_lost() {
+            return Err(Error::other("bucket lock was lost while loading the Object Lock snapshot"));
+        }
+        Ok(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
+            self.id,
+            bucket,
+            bucket_incarnation_id,
+            config_revision,
+            state,
+            lifecycle_fence.clone(),
+            metadata_guard,
+        )))
+    }
+
     /// Resolves a GET's object identity without constructing its body reader.
     ///
     /// This is an additive two-stage counterpart to `get_object_reader`. The
@@ -748,6 +885,10 @@ impl ECStore {
         }
 
         let guard = self.acquire_object_write_lock(op, bucket, object).await?;
+        if let Some(signal) = guard.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        opts.ensure_namespace_lock_fence();
         opts.no_lock = true;
 
         Ok(Some(guard))
@@ -788,9 +929,10 @@ impl ECStore {
             guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
         }
         opts.no_lock = true;
-        opts.delete_lock_fence = Some(DeleteLockFence::new(
-            guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal).collect(),
-        ));
+        for signal in guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal) {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        opts.ensure_namespace_lock_fence();
 
         Ok(guards)
     }
@@ -1057,17 +1199,40 @@ impl ECStore {
         check_put_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
+        let mut opts = opts.clone();
+        if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
+            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
+        }
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
+            if opts.object_lock_config_snapshot.is_none() {
+                opts.object_lock_config_snapshot = Some(self.object_lock_config_snapshot(bucket).await?);
+            }
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) if snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) => {
+                    Arc::clone(snapshot)
+                }
+                _ => {
+                    return Err(Error::other(
+                        "Object Lock snapshot does not hold valid target bucket generation and configuration fences",
+                    ));
+                }
+            };
+            snapshot.add_lock_fences(&mut opts);
+        }
 
         // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
         // around precondition checks and the final rename/commit.
         if self.single_pool() {
             return self.pools[0]
-                .put_object_with_old_current_size(bucket, object.as_str(), data, opts)
+                .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
                 .await;
         }
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
-            self.select_data_movement_pool_idx(bucket, &object, data.size(), opts, false)
+            self.select_data_movement_pool_idx(bucket, &object, data.size(), &opts, false)
                 .await?
         } else if opts.no_lock {
             self.get_pool_idx_no_lock(bucket, &object, data.size()).await?
@@ -1084,7 +1249,7 @@ impl ECStore {
         }
 
         self.pools[idx]
-            .put_object_with_old_current_size(bucket, &object, data, opts)
+            .put_object_with_old_current_size(bucket, &object, data, &opts)
             .await
     }
 
@@ -1130,6 +1295,60 @@ impl ECStore {
         let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
 
         let mut dst_opts = dst_opts.clone();
+        if !is_meta_bucketname(dst_bucket) && dst_opts.expected_bucket_incarnation_id.is_none() {
+            dst_opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(dst_bucket).await?);
+        }
+        let _bucket_lifecycle_guard = if is_meta_bucketname(dst_bucket) || dst_opts.bucket_lifecycle_lock_fence.is_some() {
+            None
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(dst_bucket).await?)
+        };
+        let current_bucket_incarnation_id = if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
+            dst_opts.add_bucket_lifecycle_lock_guard(guard);
+            let current_incarnation_id = get_bucket_incarnation_id_in(&self.ctx, dst_bucket).await?;
+            if dst_opts
+                .expected_bucket_incarnation_id
+                .is_some_and(|expected| expected != current_incarnation_id)
+            {
+                return Err(StorageError::BucketNotFound(dst_bucket.to_string()));
+            }
+            Some(current_incarnation_id)
+        } else {
+            dst_opts.expected_bucket_incarnation_id
+        };
+        if dst_opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "copy_object_bucket_generation",
+                bucket: dst_bucket.to_string(),
+                object: dst_object.clone(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        if dst_opts.overwrites_existing_version() && !is_meta_bucketname(dst_bucket) {
+            let incarnation_id =
+                current_bucket_incarnation_id.ok_or_else(|| Error::other("copy is missing its bucket incarnation snapshot"))?;
+            let lifecycle_fence = dst_opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("copy is missing its bucket lifecycle fence"))?;
+            let snapshot = match dst_opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(dst_bucket, lifecycle_fence)
+                        .await?
+                }
+            };
+            if !snapshot.is_valid_for_destructive_put(self.id, dst_bucket, incarnation_id) {
+                return Err(Error::other("copy Object Lock snapshot does not match the target bucket generation"));
+            }
+            snapshot.add_lock_fences(&mut dst_opts);
+            dst_opts.object_lock_config_snapshot = Some(snapshot);
+        }
         let _dst_lock_guard = if cp_src_dst_same && dst_opts.expected_current_version_id.is_none() {
             self.acquire_object_write_lock_if_needed("copy_object", dst_bucket, &dst_object, &mut dst_opts)
                 .await?
@@ -1176,6 +1395,10 @@ impl ECStore {
                     mod_time: dst_opts.mod_time,
                     http_preconditions: dst_opts.http_preconditions.clone(),
                     expected_current_version_id: dst_opts.expected_current_version_id.clone(),
+                    expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
+                    namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+                    bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+                    object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                     ..Default::default()
                 };
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
@@ -1206,6 +1429,10 @@ impl ECStore {
                         mod_time: dst_opts.mod_time,
                         http_preconditions: dst_opts.http_preconditions.clone(),
                         expected_current_version_id: dst_opts.expected_current_version_id.clone(),
+                        expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
+                        namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+                        bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+                        object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                         ..Default::default()
                     };
                     return self.pools[pool_idx]
@@ -1233,6 +1460,10 @@ impl ECStore {
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
             expected_current_version_id: dst_opts.expected_current_version_id.clone(),
+            expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
+            namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+            bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+            object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
             ..Default::default()
         };
 
@@ -1322,6 +1553,13 @@ impl ECStore {
     ) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
+        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+            None
+        } else if opts.delete_prefix {
+            Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        };
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
             object.to_owned()
         } else {
@@ -1330,10 +1568,94 @@ impl ECStore {
         let object = object.as_str();
         let mut opts = opts;
         opts.tier_delete_journal_api = tier_journal_api.clone();
+        if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
+
+        if !is_meta_bucketname(bucket) {
+            get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+        }
+        let _object_lock_metadata_guard = if !is_meta_bucketname(bucket) {
+            Some(acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?)
+        } else {
+            None
+        };
+        if let Some(guard) = _object_lock_metadata_guard.as_ref() {
+            opts.add_namespace_lock_guard(guard);
+        }
+        let current_bucket_incarnation_id = if _object_lock_metadata_guard.is_some() {
+            let (state, incarnation_id, config_revision) =
+                get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
+                self.id,
+                bucket,
+                incarnation_id,
+                config_revision,
+                state,
+            )));
+            Some(incarnation_id)
+        } else {
+            None
+        };
+        if let (Some(expected), Some(current)) = (opts.expected_bucket_incarnation_id, current_bucket_incarnation_id)
+            && expected != current
+        {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        #[cfg(test)]
+        if current_bucket_incarnation_id.is_some() {
+            pause_delete_after_object_lock_snapshot(bucket).await;
+        }
 
         if opts.delete_prefix && !opts.delete_prefix_object {
             // Prefix deletes cover multiple object keys; an exact lock on the prefix string
             // would not protect child objects.
+            if !is_meta_bucketname(bucket) {
+                let state = opts
+                    .object_lock_config_snapshot
+                    .as_deref()
+                    .ok_or_else(|| Error::other("recursive delete is missing its Object Lock configuration snapshot"))?
+                    .state();
+                ensure_recursive_force_delete_allowed_for_state(bucket, state)?;
+                let bypass_governance = opts
+                    .object_lock_delete
+                    .as_ref()
+                    .is_some_and(|delete_opts| delete_opts.bypass_governance);
+                for pool in &self.pools {
+                    for set in &pool.disk_set {
+                        let mut marker = None;
+                        let mut version_marker = None;
+                        loop {
+                            let page = set
+                                .clone()
+                                .inner_list_object_versions_for_recursive_delete(
+                                    bucket,
+                                    object,
+                                    marker.clone(),
+                                    version_marker.clone(),
+                                    RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
+                                )
+                                .await?;
+                            for object_info in &page.objects {
+                                if check_object_lock_for_deletion_with_state(state, object_info, bypass_governance)?.is_some() {
+                                    return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object_info.name.clone()));
+                                }
+                            }
+                            if !page.is_truncated {
+                                break;
+                            }
+                            let next_marker = page.next_marker.ok_or_else(|| {
+                                Error::other("recursive delete version scan did not return a continuation marker")
+                            })?;
+                            if marker.as_ref() == Some(&next_marker) && version_marker == page.next_version_idmarker {
+                                return Err(Error::other("recursive delete version scan did not advance"));
+                            }
+                            marker = Some(next_marker);
+                            version_marker = page.next_version_idmarker;
+                        }
+                    }
+                }
+            }
             delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
@@ -1344,7 +1666,6 @@ impl ECStore {
         } else {
             None
         };
-
         if opts.delete_prefix {
             delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
@@ -1531,6 +1852,17 @@ impl ECStore {
 
         let mut opts = opts;
         opts.tier_delete_journal_api = tier_journal_api;
+        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            match self.acquire_bucket_lifecycle_read_lock(bucket).await {
+                Ok(guard) => Some(guard),
+                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+            }
+        };
+        if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
         if opts.delete_replication_config_snapshot.is_none() {
             match ReplicationObjectBridge::delete_request_config_in(&self.ctx, bucket).await {
                 Ok(snapshot) => opts.delete_replication_config_snapshot = Some(Arc::new(snapshot)),
@@ -1541,7 +1873,48 @@ impl ECStore {
                 }
             }
         }
-
+        if !is_meta_bucketname(bucket)
+            && let Err(err) = get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
+        {
+            return return_batch_delete_lock_error(objects.as_slice(), err);
+        }
+        let _object_lock_metadata_guard = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            Some(match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
+                Ok(guard) => guard,
+                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+            })
+        };
+        if let Some(guard) = _object_lock_metadata_guard.as_ref() {
+            opts.add_namespace_lock_guard(guard);
+        }
+        let current_bucket_incarnation_id = if _object_lock_metadata_guard.is_some() {
+            let (state, incarnation_id, config_revision) =
+                match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                };
+            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
+                self.id,
+                bucket,
+                incarnation_id,
+                config_revision,
+                state,
+            )));
+            Some(incarnation_id)
+        } else {
+            None
+        };
+        if let (Some(expected), Some(current)) = (opts.expected_bucket_incarnation_id, current_bucket_incarnation_id)
+            && expected != current
+        {
+            return return_batch_delete_lock_error(objects.as_slice(), StorageError::BucketNotFound(bucket.to_string()));
+        }
+        #[cfg(test)]
+        if current_bucket_incarnation_id.is_some() {
+            pause_delete_after_object_lock_snapshot(bucket).await;
+        }
         let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
             Ok(guards) => guards,
             Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
@@ -1747,6 +2120,45 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let object = encode_dir_object(object);
+        let mut opts = transition_restore_pool_opts(opts);
+        if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
+            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
+        }
+        let bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        };
+        if let Some(guard) = bucket_lifecycle_guard.as_ref() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
+        if !is_meta_bucketname(bucket) {
+            let current_incarnation_id = get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+            if opts.expected_bucket_incarnation_id != Some(current_incarnation_id) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("restore is missing its bucket incarnation snapshot"))?;
+            let lifecycle_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("restore is missing its bucket lifecycle fence"))?;
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(bucket, lifecycle_fence)
+                        .await?
+                }
+            };
+            if !snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) {
+                return Err(Error::other("restore Object Lock snapshot does not match the target bucket generation"));
+            }
+            snapshot.add_lock_fences(&mut opts);
+            opts.object_lock_config_snapshot = Some(snapshot);
+        }
         // Deliberately NOT holding the object write lock across the tier
         // copy-back (backlog#1304): non-SELECT restore-vs-restore is
         // serialized by the accept path's compare-and-set of the ongoing flag
@@ -1762,10 +2174,12 @@ impl ECStore {
         // (#4877) blocked HEAD/get_object_info for the whole copy-back and
         // self-deadlocked on the inner commits.
         if self.single_pool() {
-            return self.pools[0].clone().restore_transitioned_object(bucket, &object, opts).await;
+            return self.pools[0]
+                .clone()
+                .restore_transitioned_object(bucket, &object, &opts)
+                .await;
         }
 
-        let opts = transition_restore_pool_opts(opts);
         let (_, idx) = self
             .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
@@ -1784,18 +2198,38 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         let object = encode_dir_object(object);
-        if self.single_pool() {
-            return self.pools[0].put_object_metadata(bucket, object.as_str(), opts).await;
-        }
-
         let mut opts = opts.clone();
         opts.metadata_chg = true;
+        let bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+            let current_incarnation_id = get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+            if opts
+                .expected_bucket_incarnation_id
+                .is_some_and(|expected| expected != current_incarnation_id)
+            {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+            opts.expected_bucket_incarnation_id = Some(current_incarnation_id);
+            opts.add_bucket_lifecycle_lock_guard(&guard);
+            if guard.is_lock_lost() {
+                return Err(Error::other("bucket lifecycle lock was lost before the metadata update"));
+            }
+            Some(guard)
+        };
+
+        if self.single_pool() {
+            return self.pools[0].put_object_metadata(bucket, object.as_str(), &opts).await;
+        }
 
         let (_, idx) = self
             .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
 
-        self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
+        let result = self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await;
+        drop(bucket_lifecycle_guard);
+        result
     }
 
     #[instrument(skip(self))]
@@ -2885,7 +3319,10 @@ mod tests {
 
         assert_eq!(guards.len(), 2, "duplicate object names should share one namespace lock");
         assert!(opts.no_lock, "set layer should not reacquire locks already held by ECStore");
-        assert!(opts.delete_lock_fence.is_some(), "set layer must receive the outer write-lock loss fence");
+        assert!(
+            opts.namespace_lock_fence.is_some(),
+            "set layer must receive the outer write-lock loss fence"
+        );
 
         let alpha_lock = store
             .handle_new_ns_lock("bucket", "alpha")

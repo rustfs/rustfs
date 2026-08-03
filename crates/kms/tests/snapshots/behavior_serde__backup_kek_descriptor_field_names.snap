@@ -1,0 +1,7 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: field_names(&manifest.backup_kek)
+---
+- aead_algorithm
+- kek_id
+- kek_version

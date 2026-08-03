@@ -321,6 +321,14 @@ fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorK
 
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
+        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) {
+            if error.is_remote_file_not_found() {
+                return DiskError::FileNotFound;
+            }
+            if error.is_remote_volume_not_found() {
+                return DiskError::VolumeNotFound;
+            }
+        }
         match e.downcast::<DiskError>() {
             Ok(disk_error) => disk_error,
             Err(io_error) => DiskError::Io(io_error),
@@ -1042,6 +1050,19 @@ mod tests {
         assert!(too_many_requests.is_internode_http_status(429));
         assert!(!too_many_requests.is_internode_http_status(500));
         assert!(!DiskError::FileNotFound.is_internode_http_status(429));
+    }
+
+    #[test]
+    fn test_internode_missing_errors_preserve_disk_error_types() {
+        let file_missing = DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error());
+        let volume_missing = DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error());
+        let unmarked_server_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
+        ));
+
+        assert_eq!(file_missing, DiskError::FileNotFound);
+        assert_eq!(volume_missing, DiskError::VolumeNotFound);
+        assert!(matches!(unmarked_server_error, DiskError::Io(_)));
     }
 
     #[test]

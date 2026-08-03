@@ -160,6 +160,9 @@ impl Operation for SetBucketDurabilityHandler {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
             .input
@@ -175,7 +178,7 @@ impl Operation for SetBucketDurabilityHandler {
 
         // System buckets are rejected by the metadata layer (and pinned to
         // strict by the disk layer regardless).
-        metadata_sys::update(&bucket, BUCKET_DURABILITY_CONFIG, json)
+        metadata_sys::update_if_incarnation(&bucket, BUCKET_DURABILITY_CONFIG, json, expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to set bucket durability: {}", e))?;
 
@@ -218,8 +221,11 @@ impl Operation for DeleteBucketDurabilityHandler {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
-        metadata_sys::delete(&bucket, BUCKET_DURABILITY_CONFIG)
+        metadata_sys::delete_if_incarnation(&bucket, BUCKET_DURABILITY_CONFIG, expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear bucket durability: {}", e))?;
 

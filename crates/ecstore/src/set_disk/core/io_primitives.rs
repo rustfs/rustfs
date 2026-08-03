@@ -3791,6 +3791,29 @@ impl SetDisks {
         Ok(m)
     }
 
+    fn reduce_delete_prefix_results(results: Vec<disk::error::Result<()>>, write_quorum: usize) -> disk::error::Result<()> {
+        let has_existing_volume = results
+            .iter()
+            .any(|result| matches!(result, Ok(()) | Err(DiskError::FileNotFound)));
+        let volume_not_found_count = results
+            .iter()
+            .filter(|result| matches!(result, Err(DiskError::VolumeNotFound)))
+            .count();
+        let errs = results
+            .into_iter()
+            .map(|result| result.err().filter(|err| !DiskError::is_err_object_not_found(err)))
+            .collect::<Vec<_>>();
+
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
+        }
+        if !has_existing_volume && volume_not_found_count >= write_quorum {
+            return Err(DiskError::VolumeNotFound);
+        }
+
+        Ok(())
+    }
+
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
@@ -3813,18 +3836,12 @@ impl SetDisks {
                     )
                     .await
                 } else {
-                    Ok(())
+                    Err(DiskError::DiskNotFound)
                 }
             });
         }
 
-        let errs = join_all(futures).await.into_iter().map(|v| v.err()).collect::<Vec<_>>();
-
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(err);
-        }
-
-        Ok(())
+        Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
     }
 
     /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
@@ -5744,16 +5761,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_prefix_removes_present_disks_and_ignores_missing_disk_slots() {
+    async fn delete_prefix_succeeds_when_present_disks_reach_quorum() {
         let bucket = "delete-prefix-bucket";
-        let (_dir, disk) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"payload".as_slice())]).await;
-        let set = io_primitives_test_set(vec![Some(disk.clone()), None], 1).await;
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"two".as_slice())]).await;
+        let (_dir3, disk3) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"three".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone()), Some(disk3.clone()), None], 2).await;
 
         set.delete_prefix(bucket, "prefix")
             .await
-            .expect("missing disk slots should not block prefix deletion");
+            .expect("three successful disks should meet a four-disk write quorum");
 
-        assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        for disk in [disk1, disk2, disk3] {
+            assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_counts_confirmed_absence_toward_quorum() {
+        let bucket = "delete-prefix-confirmed-absence";
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"two".as_slice())]).await;
+        let (_dir3, disk3) = read_multiple_test_disk(bucket, &[]).await;
+        let (_dir4, disk4) = read_multiple_test_disk(bucket, &[]).await;
+        disk3
+            .delete_volume(bucket, true)
+            .await
+            .expect("third disk bucket should be absent");
+        disk4
+            .delete_volume(bucket, true)
+            .await
+            .expect("fourth disk bucket should be absent");
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone()), Some(disk3), Some(disk4)], 2).await;
+
+        set.delete_prefix(bucket, "prefix")
+            .await
+            .expect("successful deletes and confirmed absence should jointly meet quorum");
+
+        for disk in [disk1, disk2] {
+            assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        }
+    }
+
+    #[test]
+    fn delete_prefix_result_reduction_preserves_existing_volume_evidence() {
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::DiskNotFound),
+                ],
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                ],
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Ok(()),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                ],
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                ],
+                3,
+            ),
+            Err(DiskError::VolumeNotFound)
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![Ok(()), Ok(()), Err(DiskError::DiskNotFound), Err(DiskError::DiskNotFound)],
+                3,
+            ),
+            Err(DiskError::ErasureWriteQuorum)
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Ok(()),
+                    Err(DiskError::FileAccessDenied),
+                    Err(DiskError::FileAccessDenied),
+                    Err(DiskError::FileAccessDenied),
+                ],
+                3,
+            ),
+            Err(DiskError::FileAccessDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_fails_at_quorum_minus_one() {
+        let bucket = "delete-prefix-quorum-minus-one";
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"two".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone()), None, None], 2).await;
+
+        let err = set
+            .delete_prefix(bucket, "prefix")
+            .await
+            .expect_err("two successful disks must not meet a four-disk write quorum");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+        for disk in [disk1, disk2] {
+            assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_fails_when_all_disk_slots_are_missing() {
+        let set = io_primitives_test_set(vec![None, None, None, None], 2).await;
+
+        let err = set
+            .delete_prefix("delete-prefix-offline", "prefix")
+            .await
+            .expect_err("an entirely offline set must not report a successful deletion");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
     }
 
     #[tokio::test]

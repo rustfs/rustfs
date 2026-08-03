@@ -286,16 +286,39 @@ pub(crate) mod metadata_sys {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
 
-    pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    pub(crate) async fn update_if_incarnation(
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
+    }
+
+    pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {
+        super::ecstore_bucket::metadata_sys::capture_bucket_metadata_incarnation(bucket).await
+    }
+
+    pub(crate) async fn acquire_bucket_metadata_transaction_lock(
+        bucket: &str,
+    ) -> Result<super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
         crate::storage::storage_api::acquire_bucket_metadata_transaction_lock(bucket).await
     }
 
-    pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        crate::storage::storage_api::update_bucket_targets_under_transaction_lock(bucket, data).await
+    pub(crate) async fn update_bucket_targets_under_transaction_lock(
+        guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+        bucket: &str,
+        data: Vec<u8>,
+    ) -> Result<OffsetDateTime> {
+        crate::storage::storage_api::update_bucket_targets_under_transaction_lock(guard, bucket, data).await
     }
 
-    pub(crate) async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-        crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
+    pub(crate) async fn delete_if_incarnation(
+        bucket: &str,
+        config_file: &str,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_if_incarnation(bucket, config_file, expected_incarnation_id).await
     }
 
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {

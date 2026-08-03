@@ -129,6 +129,15 @@ impl NamespaceLockGuard {
         }
     }
 
+    /// Share the loss signal when a caller deliberately forwards a mutation
+    /// under an already-held distributed lock.
+    pub fn lock_lost_signal(&self) -> Option<Arc<crate::distributed_lock::LockLostSignal>> {
+        match self {
+            Self::Standard(guard) => Some(guard.lock_lost()),
+            Self::Fast(_) => None,
+        }
+    }
+
     /// Resolves when a distributed guard loses refresh quorum.
     ///
     /// Local fast locks cannot lose distributed quorum, so their future remains pending.

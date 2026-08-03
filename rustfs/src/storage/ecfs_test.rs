@@ -16,8 +16,11 @@
 mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
-    use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
+    use crate::storage::StorageError;
+    use crate::storage::ecfs::{FS, propagate_object_lock_peer_reload, validate_object_lock_configuration_input};
+    use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+    use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
         apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
@@ -31,7 +34,8 @@ mod tests {
     use rustfs_config::MI_B;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, get_str, insert_str,
+        MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+        SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, get_str, insert_str,
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
@@ -43,6 +47,7 @@ mod tests {
         PutObjectTaggingInput, QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
+    use std::collections::HashMap;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
@@ -409,9 +414,16 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_default_lock_retention_metadata_applies_bucket_default() {
-        use std::collections::HashMap;
+    fn test_object_lock_peer_reload_failure_is_returned_to_the_client() {
+        let err = propagate_object_lock_peer_reload(Err(StorageError::other("peer reload failed")))
+            .expect_err("peer reload failure must prevent a successful Object Lock update response");
 
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(err.message().is_some_and(|message| message.contains("peer reload failed")));
+    }
+
+    #[test]
+    fn test_apply_default_lock_retention_metadata_applies_bucket_default() {
         let cfg = ObjectLockConfiguration {
             object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
             rule: Some(ObjectLockRule {
@@ -422,9 +434,9 @@ mod tests {
                 }),
             }),
         };
-        let mut metadata = HashMap::new();
+        let mut metadata = std::collections::HashMap::new();
 
-        assert!(apply_default_lock_retention_metadata(Some(cfg), &mut metadata));
+        assert!(apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"COMPLIANCE".to_string()));
         let retain_until = metadata
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
@@ -435,6 +447,8 @@ mod tests {
             .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
             .expect("default retention should write a valid internal timestamp");
         assert!(retention_timestamp <= OffsetDateTime::now_utc());
+        assert!(metadata.contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP}")));
+        assert!(metadata.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP}")));
     }
 
     #[test]
@@ -456,7 +470,7 @@ mod tests {
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
         ]);
 
-        assert!(!apply_default_lock_retention_metadata(Some(cfg), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"GOVERNANCE".to_string()));
         assert_eq!(
             metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER),
@@ -466,16 +480,97 @@ mod tests {
 
     #[test]
     fn test_apply_default_lock_retention_metadata_ignores_bucket_without_default() {
-        use std::collections::HashMap;
-
         let cfg = ObjectLockConfiguration {
             object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
             rule: None,
         };
+        let mut metadata = std::collections::HashMap::new();
+
+        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_applies_authoritative_default() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let state = ObjectLockConfigState::Configured {
+            config,
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut metadata = std::collections::HashMap::new();
+
+        apply_bucket_default_lock_retention("locked-bucket", &state, &mut metadata, false)
+            .expect("authoritative bucket default should be applied");
+
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+        assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_preserves_explicit_retention_path() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+        let state = ObjectLockConfigState::Configured {
+            config,
+            updated_at: OffsetDateTime::now_utc(),
+        };
         let mut metadata = HashMap::new();
 
-        assert!(!apply_default_lock_retention_metadata(Some(cfg), &mut metadata));
+        apply_bucket_default_lock_retention("locked-bucket", &state, &mut metadata, true)
+            .expect("explicit retention should suppress only the bucket default");
+
         assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_allows_confirmed_absence() {
+        let mut metadata = HashMap::new();
+
+        apply_bucket_default_lock_retention("legacy-bucket", &ObjectLockConfigState::ConfirmedAbsent, &mut metadata, false)
+            .expect("confirmed absence should keep legacy buckets writable");
+
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_bucket_default_lock_retention_rejects_fabricated_metadata_even_with_explicit_retention() {
+        let mut metadata = std::collections::HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+
+        let err =
+            apply_bucket_default_lock_retention("untrusted-bucket", &ObjectLockConfigState::Fabricated, &mut metadata, true)
+                .expect_err("fabricated metadata must fail closed before accepting explicit retention");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load Object Lock configuration"));
+    }
+
+    #[test]
+    fn test_bucket_object_lock_config_load_error_fails_closed() {
+        let err = map_bucket_object_lock_config_state("corrupt-bucket", Err(StorageError::other("corrupt Object Lock metadata")))
+            .expect_err("metadata read or parse failures must fail closed");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load Object Lock configuration"));
     }
 
     #[test]

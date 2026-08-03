@@ -21,6 +21,7 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use crate::bucket::utils::is_meta_bucketname;
 use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
@@ -39,18 +40,85 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
-use crate::bucket::replication::{DeleteReplicationConfigSnapshot, VersionPurgeStatusType, version_purge_status_to_filemeta};
+use crate::bucket::replication::{
+    DeleteReplicationConfigSnapshot, VersionPurgeStatusType, replication_state_to_filemeta, version_purge_status_to_filemeta,
+};
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
 use crate::error::is_err_invalid_upload_id;
-use crate::object_api::DeleteLockFence;
+use crate::object_api::NamespaceLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
+use crate::store::utils::clean_metadata;
 use futures::FutureExt as _;
 use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
+
+fn is_restore_control_metadata(key: &str) -> bool {
+    key.eq_ignore_ascii_case(X_AMZ_RESTORE.as_str())
+        || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS)
+        || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_REQUEST_DATE)
+        || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_OPERATION_ID)
+            .is_some_and(|remainder| remainder.is_empty())
+}
+
+fn restore_metadata_update_preserves_protected_metadata(
+    existing: &HashMap<String, String>,
+    replacement: &HashMap<String, String>,
+) -> bool {
+    let mut existing = existing.clone();
+    clean_metadata(&mut existing);
+    let mut replacement = replacement.clone();
+    clean_metadata(&mut replacement);
+    let existing_count = existing.keys().filter(|key| !is_restore_control_metadata(key)).count();
+    let replacement_count = replacement.keys().filter(|key| !is_restore_control_metadata(key)).count();
+    existing_count == replacement_count
+        && existing
+            .iter()
+            .filter(|(key, _)| !is_restore_control_metadata(key))
+            .all(|(key, value)| replacement.get(key) == Some(value))
+}
+
+#[cfg(test)]
+mod restore_metadata_update_tests {
+    use super::*;
+
+    #[test]
+    fn restore_metadata_update_cannot_change_retention_or_user_metadata() {
+        let mut existing = HashMap::from([
+            ("etag".to_string(), "etag-value".to_string()),
+            ("x-amz-meta-owner".to_string(), "alice".to_string()),
+            ("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string()),
+        ]);
+        let mut replacement = existing.clone();
+        replacement.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut replacement,
+            SUFFIX_RESTORE_OPERATION_ID,
+            Uuid::new_v4().to_string(),
+        );
+        assert!(restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
+
+        replacement.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        assert!(!restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
+
+        replacement.clone_from(&existing);
+        replacement.insert("x-amz-meta-owner".to_string(), "mallory".to_string());
+        assert!(!restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
+
+        existing.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
+        replacement.clone_from(&existing);
+        replacement.remove(X_AMZ_RESTORE.as_str());
+        assert!(restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
+    }
+}
+
+#[cfg(test)]
+mod delete_replication_transport_tests {
+    use super::*;
+}
 
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
     coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
@@ -868,7 +936,40 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     }
 }
 
+/// `ReplicationState::target_delete_marker_version_ids` is skipped by the
+/// positional `FileInfo` wire form, so a remote disk would otherwise receive a
+/// delete with an empty map and lose the exact per-target version. Copy it into
+/// the object's internal metadata — the durable carrier both sides already
+/// agree on — before the delete is dispatched. Bounds mirror
+/// `persist_target_delete_marker_versions`; anything outside them is dropped
+/// rather than forwarded.
+fn delete_file_info_with_replication_transport_metadata(fi: &FileInfo) -> FileInfo {
+    let mut transported = fi.clone();
+    let Some(state) = transported.replication_state_internal.as_ref() else {
+        return transported;
+    };
+    if state.target_delete_marker_version_ids.len() > 1_000 {
+        return transported;
+    }
+    for (arn, version_id) in &state.target_delete_marker_version_ids {
+        if !arn.starts_with("arn:") || arn.len() > 1_024 || version_id.is_empty() || version_id.len() > 1_024 {
+            continue;
+        }
+        let suffix = format!("{}{}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, arn);
+        rustfs_utils::http::insert_str(&mut transported.metadata, &suffix, version_id.clone());
+    }
+    transported
+}
+
 impl SetDisks {
+    async fn validate_bucket_incarnation(&self, bucket: &str, expected: Uuid) -> Result<()> {
+        let current = metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
+        if current != expected {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        Ok(())
+    }
+
     /// `put_object` plus the destination key's previous current-version size,
     /// quorum-reduced from the dst `xl.meta` copies `rename_data` reads while
     /// committing (rustfs/backlog#1009). `None` means unknown (mixed-version
@@ -891,9 +992,21 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut object_lock_guard = None;
+        let mut bucket_lifecycle_guard = None;
 
         if opts.http_preconditions.is_some() {
             if !opts.no_lock {
+                if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
+                    && opts.bucket_lifecycle_lock_fence.is_none()
+                {
+                    bucket_lifecycle_guard = Some(
+                        metadata_sys::object_store_in(&self.ctx)
+                            .await?
+                            .acquire_bucket_lifecycle_read_lock(bucket)
+                            .await?,
+                    );
+                    self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+                }
                 object_lock_guard = Some(
                     self.acquire_write_lock_diag("put_object_precondition", bucket, object)
                         .await?,
@@ -1220,8 +1333,23 @@ impl SetDisks {
             }
 
             if !opts.no_lock && object_lock_guard.is_none() {
+                #[cfg(test)]
+                pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+                if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
+                    && opts.bucket_lifecycle_lock_fence.is_none()
+                {
+                    bucket_lifecycle_guard = Some(
+                        metadata_sys::object_store_in(&self.ctx)
+                            .await?
+                            .acquire_bucket_lifecycle_read_lock(bucket)
+                            .await?,
+                    );
+                    self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+                }
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
+            #[cfg(test)]
+            pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterNamespace).await;
 
             // Generate ordinary PUT timestamps under the commit lock so version
             // ordering follows durable commit ordering when writers queued on
@@ -1262,12 +1390,42 @@ impl SetDisks {
                 }
             }
 
-            // Phase 2 (backlog#899): fence the commit on lock loss. If the refresh
-            // heartbeat has observed a refresh-quorum loss, another writer may have
-            // re-acquired this object's lock; committing now would race a double-write.
-            // Abort with a retryable error *before* rename_data makes the new version
-            // durable — once rename_data returns Ok the write is committed and must
-            // never be aborted (that would violate "a committed write is not lost").
+            if let Some(version_id) = opts.version_id.as_deref()
+                && !is_meta_bucketname(bucket)
+            {
+                let current = self
+                    .get_object_info(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            version_id: Some(version_id.to_string()),
+                            no_lock: true,
+                            metadata_cache_safe: false,
+                            versioned: opts.versioned,
+                            version_suspended: opts.version_suspended,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                match current {
+                    Ok(existing) => {
+                        let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
+                            Error::other("explicit-version PUT is missing its Object Lock configuration snapshot")
+                        })?;
+                        if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some() {
+                            return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                        }
+                    }
+                    Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+
+            self.require_current_restore_operation_id(bucket, object, opts, expected_restore_operation_id, "put_object_commit")
+                .await?;
+
+            // Fence every commit-time read before entering rename_data. Once
+            // rename_data returns Ok the write is durable and must not be aborted.
             if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
                 return Err(StorageError::NamespaceLockQuorumUnavailable {
                     mode: "put_object_commit",
@@ -1278,8 +1436,34 @@ impl SetDisks {
                 });
             }
 
-            self.require_current_restore_operation_id(bucket, object, opts, expected_restore_operation_id, "put_object_commit")
-                .await?;
+            if opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_outer_lock",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
+
+            if opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+                || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_bucket_generation",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
 
             let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
@@ -2392,6 +2576,170 @@ fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: boo
     requested && fleet_confirmed && fleet_proof_valid
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PutObjectCommitPause {
+    BeforeNamespace,
+    AfterNamespace,
+    BeforeMetadata,
+}
+
+#[cfg(test)]
+struct PutObjectCommitBarrierState {
+    bucket: String,
+    object: String,
+    pause: PutObjectCommitPause,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct PutObjectCommitBarrier {
+    state: Arc<PutObjectCommitBarrierState>,
+}
+
+#[cfg(test)]
+static PUT_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<PutObjectCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl PutObjectCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str, pause: PutObjectCommitPause) -> Self {
+        let state = Arc::new(PutObjectCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            pause,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = PUT_OBJECT_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("put object commit barrier mutex should not poison");
+        assert!(
+            !slot.iter().any(|current| {
+                current.bucket == state.bucket && current.object == state.object && current.pause == state.pause
+            }),
+            "put object commit barrier must be unique for a bucket, object, and pause"
+        );
+        slot.push(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("put object should reach the deterministic commit barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PutObjectCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = PUT_OBJECT_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("put object commit barrier mutex should not poison");
+        slot.retain(|state| !Arc::ptr_eq(state, &self.state));
+    }
+}
+
+#[cfg(test)]
+async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
+    let barrier = PUT_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("put object commit barrier mutex should not poison")
+        .iter()
+        .find(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+struct DeleteObjectCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct DeleteObjectCommitBarrier {
+    state: Arc<DeleteObjectCommitBarrierState>,
+}
+
+#[cfg(test)]
+static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<DeleteObjectCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DeleteObjectCommitBarrier {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(DeleteObjectCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DELETE_OBJECT_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete object commit barrier mutex should not poison");
+        assert!(slot.is_none(), "delete object commit barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("delete object should reach the deterministic commit barrier");
+    }
+
+    fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeleteObjectCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DELETE_OBJECT_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("delete object commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_delete_object_commit(bucket: &str, object: &str) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 fn persisted_transition_version_with_gate(
     remote_version: &str,
     remote_version_state_writer_enabled: bool,
@@ -2926,6 +3274,49 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return Err(to_object_err(Error::MethodNotAllowed, vec![src_bucket, src_object]));
         }
 
+        let restore_metadata_update = src_info.metadata_only
+            && src_bucket == dst_bucket
+            && src_object == dst_object
+            && src_opts.version_id == dst_opts.version_id
+            && src_info
+                .user_defined
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(X_AMZ_RESTORE.as_str()))
+            && restore_metadata_update_preserves_protected_metadata(&fi.metadata, src_info.user_defined.as_ref());
+        if let Some(dst_version_id) = dst_opts.version_id.as_deref()
+            && !is_meta_bucketname(dst_bucket)
+            && !restore_metadata_update
+        {
+            let object_lock_config = dst_opts
+                .object_lock_config_snapshot
+                .as_deref()
+                .ok_or_else(|| Error::other("explicit-version copy is missing its Object Lock configuration snapshot"))?;
+            let current = self
+                .get_object_info(
+                    dst_bucket,
+                    dst_object,
+                    &ObjectOptions {
+                        version_id: Some(dst_version_id.to_string()),
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: dst_opts.versioned,
+                        version_suspended: dst_opts.version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match current {
+                Ok(existing)
+                    if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some() =>
+                {
+                    return Err(StorageError::PrefixAccessDenied(dst_bucket.to_string(), dst_object.to_string()));
+                }
+                Ok(_) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
         let version_id = {
             if src_info.version_only {
                 if let Some(vid) = &dst_opts.version_id {
@@ -2948,6 +3339,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         fi.mod_time = Some(mod_time);
         fi.version_id = version_id;
         fi.versioned = src_opts.versioned || src_opts.version_suspended;
+
+        if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || dst_opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            || dst_opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "copy_object_commit",
+                bucket: dst_bucket.to_string(),
+                object: dst_object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
 
         if src_info.version_only {
             let inline_data = fi.inline_data();
@@ -3001,6 +3411,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        let transported = delete_file_info_with_replication_transport_metadata(fi);
+        let fi = &transported;
         let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
         let rollback_dir = Uuid::new_v4();
@@ -3208,11 +3620,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        // Resolve Object Lock once; replication still reads each matching
-        // object's tags below while the batch write lock is held.
-        let object_lock_checks_required =
-            object_lock_delete_check_required(metadata_sys::get_in(&self.ctx, bucket).await.ok().as_deref());
-
+        let object_lock_config = if is_meta_bucketname(bucket) {
+            Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))
+        } else {
+            match opts.object_lock_config_snapshot.clone() {
+                Some(snapshot) => snapshot,
+                None => match metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await {
+                    Ok(state) => Arc::new(ObjectLockConfigSnapshot::new(state)),
+                    Err(err) => {
+                        let message = err.to_string();
+                        for (index, item) in del_errs.iter_mut().enumerate() {
+                            if locked_objects.contains(&objects[index].object_name) {
+                                *item = Some(Error::other(message.clone()));
+                            }
+                        }
+                        return (del_objects, del_errs);
+                    }
+                },
+            }
+        };
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
         let mut journal_entries: Vec<(usize, Jentry)> = Vec::new();
 
@@ -3228,18 +3654,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .versioning_config()
                 .delete_state(replication_object_name.as_str());
             let check_opts = ObjectOptions {
-                version_id: version_id.map(|version_id| version_id.to_string()),
+                version_id: dobj.version_id.map(|version_id| version_id.to_string()),
                 versioned,
                 version_suspended,
                 object_lock_delete: opts.object_lock_delete.clone(),
+                object_lock_config_snapshot: Some(Arc::clone(&object_lock_config)),
                 no_lock: true,
                 ..Default::default()
             };
+            // A missing bucket Object Lock configuration does not prove that
+            // persisted object metadata is clean: migrated or corrupt data may
+            // still carry an explicit retention or legal hold. Only a real
+            // delete-marker creation can skip the object-level WORM check.
+            let object_lock_check_required = !is_meta_bucketname(bucket) && !set_disk_delete_creates_delete_marker(&check_opts);
             let replicate_delete = delete_config_snapshot.has_active_rule(&replication_object_name);
             let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
             let replication_needs_source = replicate_delete
                 && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (goi, gerr) = if object_lock_checks_required || replication_needs_source || opts.tier_delete_journal_api.is_some()
+            let (goi, gerr) = if object_lock_check_required || replication_needs_source || opts.tier_delete_journal_api.is_some()
             {
                 let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
                 (goi, gerr)
@@ -3249,10 +3681,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
-            let explicit_delete_marker = opts.tier_delete_journal_api.is_some()
-                && dobj.version_id.is_some()
+            // Normalize both sides before comparing. `goi.version_id` is the
+            // client-facing identity, where `from_file_info` synthesizes
+            // `Some(Uuid::nil())` for a null version on a versioned or
+            // versioning-suspended bucket; `version_id` is the storage identity,
+            // where an explicit `?versionId=null` maps to `None`. Comparing them
+            // raw makes an explicit null-version delete of a null delete marker
+            // look like a version mismatch, so the `MethodNotAllowed` from the
+            // lookup below is recorded as a delete failure and the marker is
+            // never purged — the bucket then stays non-empty on disk forever.
+            let explicit_delete_marker = dobj.version_id.is_some()
                 && goi.delete_marker
-                && goi.version_id == version_id
+                && delete_file_info_version_id(goi.version_id) == version_id
                 && matches!(gerr.as_ref(), Some(StorageError::MethodNotAllowed));
             if let Some(err) = gerr.as_ref()
                 && !source_missing
@@ -3261,9 +3701,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 del_errs[i] = Some(err.clone());
                 continue;
             }
-            if object_lock_checks_required
+            if object_lock_check_required
                 && !source_missing
-                && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
+                && let Err(err) = check_object_lock_delete(&self.ctx, bucket, &dobj.object_name, &goi, &check_opts).await
             {
                 del_errs[i] = Some(err);
                 continue;
@@ -3390,7 +3830,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             vers.push(fi_vers);
         }
 
-        if opts.delete_lock_fence.as_ref().is_some_and(DeleteLockFence::is_lock_lost) {
+        let rollback_dir = Uuid::new_v4();
+
+        let disks = self.disks.read().await;
+
+        let disks = disks.clone();
+
+        if opts
+            .namespace_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
             if dist_erasure {
                 self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
             }
@@ -3424,20 +3874,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
         }
         vers.retain(|fi_vers| !fi_vers.versions.is_empty());
-
-        let rollback_dir = Uuid::new_v4();
-
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
-
         let mut futures = Vec::with_capacity(disks.len());
+        let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // let mut errors = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
             let vers = vers.clone();
+            let namespace_lock_fence = opts.namespace_lock_fence.clone();
+            let lock_lost_during_commit = Arc::clone(&lock_lost_during_commit);
             futures.push(async move {
+                if namespace_lock_fence.as_ref().is_some_and(NamespaceLockFence::is_lock_lost) {
+                    lock_lost_during_commit.store(true, std::sync::atomic::Ordering::Release);
+                    return (0..vers.len()).map(|_| Some(DiskError::DiskOngoingReq)).collect();
+                }
                 if let Some(disk) = disk {
                     disk.delete_versions(
                         bucket,
@@ -3505,6 +3955,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     ));
                 } else {
                     del_errs[obj_idx] = Some(to_object_err(err.into(), vec![bucket, &objects[obj_idx].object_name.clone()]));
+                }
+            }
+        }
+
+        if lock_lost_during_commit.load(std::sync::atomic::Ordering::Acquire) {
+            for (index, object) in objects.iter().enumerate() {
+                if del_errs[index].is_none() {
+                    del_errs[index] = Some(Error::NamespaceLockQuorumUnavailable {
+                        mode: "delete_objects_commit",
+                        bucket: bucket.to_string(),
+                        object: decode_dir_object(&object.object_name),
+                        required: 1,
+                        achieved: 0,
+                    });
                 }
             }
         }
@@ -3653,6 +4117,59 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             None
         };
         if opts.delete_prefix {
+            if opts.delete_prefix_object && !is_meta_bucketname(bucket) {
+                let object_lock_config = if opts.data_movement {
+                    None
+                } else {
+                    Some(match opts.object_lock_config_snapshot.as_deref() {
+                        Some(snapshot) => snapshot.state().clone(),
+                        None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
+                    })
+                };
+                if let Some(versions) = self.load_file_info_versions_exact(bucket, object).await? {
+                    let bypass_governance = opts
+                        .object_lock_delete
+                        .as_ref()
+                        .is_some_and(|delete_opts| delete_opts.bypass_governance);
+                    if let Some(object_lock_config) = object_lock_config.as_ref() {
+                        for version in versions.versions.iter().chain(versions.free_versions.iter()) {
+                            let object_info = ObjectInfo::from_file_info(version, bucket, object, true);
+                            if check_object_lock_for_deletion_with_state(object_lock_config, &object_info, bypass_governance)?
+                                .is_some()
+                            {
+                                return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                            }
+                        }
+                    }
+                    for version in &versions.versions {
+                        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                        let mut delete_request = FileInfo {
+                            name: object.to_string(),
+                            version_id: version.version_id,
+                            ..Default::default()
+                        };
+                        delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                        self.delete_object_version(bucket, object, &delete_request, false).await?;
+                    }
+                    for version in &versions.free_versions {
+                        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                        let mut delete_request = FileInfo {
+                            name: object.to_string(),
+                            version_id: version.version_id,
+                            deleted: true,
+                            ..Default::default()
+                        };
+                        delete_request.set_tier_free_version();
+                        self.delete_object_version(bucket, object, &delete_request, false).await?;
+                    }
+                }
+                self.invalidate_get_object_metadata_cache(bucket, object).await;
+                return Ok(ObjectInfo::default());
+            }
+            if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
+                self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+            }
+            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             self.delete_prefix(bucket, object)
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
@@ -3705,7 +4222,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         if version_found {
             opts.precondition_check(&goi)?;
-            check_object_lock_delete(bucket, object, &goi, &opts).await?;
+            check_object_lock_delete(&self.ctx, bucket, object, &goi, &opts).await?;
         }
 
         if opts.transition.expire_restored {
@@ -3726,6 +4243,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 expire_restored: true,
                 ..Default::default()
             };
+            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             self.delete_object_version(bucket, object, &dfi, false)
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -3797,6 +4315,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 None
             };
 
+            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -3828,6 +4347,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             dfi.set_skip_tier_free_version();
         }
 
+        #[cfg(test)]
+        pause_delete_object_commit(bucket, object).await;
+        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -3894,6 +4416,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         // Guard lock for metadata update
+        #[cfg(test)]
+        pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeMetadata).await;
         let _lock_guard = if !opts.no_lock {
             Some(self.acquire_write_lock_diag("put_object_metadata", bucket, object).await?)
         } else {
@@ -3962,6 +4486,28 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         if let Some(ref version_id) = opts.version_id {
             fi.version_id = Uuid::parse_str(version_id).ok();
+        }
+
+        if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
+            self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+        }
+        if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "put_object_metadata_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
         }
 
         self.update_object_meta(bucket, object, fi.clone(), &online_disks)
@@ -4436,15 +4982,42 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         //     _lock_guard = guard_opt;
         // }
         let self_ = self.clone();
+        let restore_header_self = self_.clone();
         let set_restore_header_fn = async move |oi: &mut ObjectInfo, rerr: Option<Error>| -> Result<()> {
             if rerr.is_none() {
                 return Ok(());
             }
-            self.update_restore_metadata(bucket, object, oi, opts).await?;
+            restore_header_self.update_restore_metadata(bucket, object, oi, opts).await?;
             Err(rerr.unwrap())
         };
         let mut oi = ObjectInfo::default();
-        let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true, false).await;
+        let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
+            && opts.bucket_lifecycle_lock_fence.is_none()
+        {
+            let guard = metadata_sys::object_store_in(&self.ctx)
+                .await?
+                .acquire_bucket_lifecycle_read_lock(bucket)
+                .await?;
+            self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
+            Some(guard)
+        } else {
+            None
+        };
+        if opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "restore_object_bucket_generation",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        let fi = self.clone().get_object_fileinfo(bucket, object, opts, true, false).await;
+        drop(bucket_lifecycle_guard);
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
@@ -4484,6 +5057,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // hold and time out. put_restore_opts builds fresh options that default
         // no_lock=false, so propagate it explicitly here.
         ropts.no_lock = opts.no_lock;
+        ropts.expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+        ropts.bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
+        ropts.namespace_lock_fence = opts.namespace_lock_fence.clone();
+        ropts.object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
         if oi.parts.len() == 1 {
             let mut opts = opts.clone();
             opts.part_number = Some(1);
@@ -4578,7 +5155,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 fail_restore_multipart_at(RestoreMultipartFailurePoint::PutPart)?;
                 let p_info = self_
                     .clone()
-                    .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
+                    .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ropts)
                     .await?;
                 #[cfg(test)]
                 let p_info = if restore_multipart_failure_is(RestoreMultipartFailurePoint::SizeMismatch) {
@@ -4622,6 +5199,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     &ObjectOptions {
                         mod_time: oi.mod_time,
                         version_id: oi.version_id.map(|version| version.to_string()),
+                        expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
+                        bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
                         user_defined: restore_commit_metadata,
                         // Inherit the restore write lock (see ropts.no_lock above):
                         // the commit phase re-acquires this object's write lock.
@@ -5070,7 +5649,16 @@ mod metadata_mutation_generation_tests {
         let (_, delete_key) = put_and_prime(&set_disks, bucket, delete_object, b"DELETE body").await;
         let delete_probe = MetadataCacheInvalidationProbe::install(bucket, delete_object);
         set_disks
-            .delete_object(bucket, delete_object, ObjectOptions::default())
+            .delete_object(
+                bucket,
+                delete_object,
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("DELETE should succeed");
         assert_eq!(delete_probe.count(), 2, "DELETE must invalidate before mutation and after commit");
@@ -5325,6 +5913,132 @@ mod transition_commit_failure_tests {
             restore_status.expiry().is_some(),
             "successful multipart restore must retain its expiry date"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn single_part_restore_keeps_object_lock_snapshot_for_versioned_and_suspended_objects() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-single-part-versioned-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        for (case, versioned, version_suspended) in [("versioned", true, false), ("suspended", false, true)] {
+            let object = format!("{case}.bin");
+            let payload = format!("single-part restore must preserve the {case} object identity")
+                .repeat(1024)
+                .into_bytes();
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            let original = set_disks
+                .put_object(
+                    bucket,
+                    &object,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned,
+                        version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("source object should be written");
+            let version_id = original
+                .version_id
+                .expect("versioned and suspended objects should resolve an explicit version");
+            let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+            set_disks
+                .transition_object(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name,
+                            etag: original.etag.clone().unwrap_or_default(),
+                            ..Default::default()
+                        },
+                        version_id: Some(version_id.to_string()),
+                        versioned,
+                        version_suspended,
+                        mod_time: original.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("source object should transition before restore");
+
+            set_disks
+                .clone()
+                .restore_transitioned_object(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            restore_request: RestoreRequest {
+                                days: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        version_id: Some(version_id.to_string()),
+                        versioned,
+                        version_suspended,
+                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                            ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("single-part restore should commit the selected version");
+
+            let restored = set_disks
+                .get_object_info(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        versioned,
+                        version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("restored version should remain readable");
+            assert_eq!(restored.version_id, Some(version_id), "restore must preserve the selected {case} version");
+            let restore_header = restored
+                .user_defined
+                .get(s3s::header::X_AMZ_RESTORE.as_str())
+                .expect("restored version must carry its completed restore status");
+            let restore_status = parse_restore_obj_status(restore_header).expect("restore status must be valid");
+            assert!(!restore_status.on_going(), "restored {case} version must not remain in progress");
+
+            backend.external_remove(&restored.transitioned_object.name).await;
+            let mut restored_body = Vec::new();
+            set_disks
+                .get_object_reader(
+                    bucket,
+                    &object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        versioned,
+                        version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("restored local version should remain readable after the remote copy is removed")
+                .stream
+                .read_to_end(&mut restored_body)
+                .await
+                .expect("restored local body should drain");
+            assert_eq!(restored_body, payload, "restored {case} body must come from the committed local copy");
+        }
     }
 
     #[tokio::test]
@@ -7823,6 +8537,540 @@ mod put_object_tmp_cleanup_tests {
 
         drop(temp_dirs);
     }
+
+    #[tokio::test]
+    async fn put_object_no_lock_aborts_after_outer_namespace_lock_loss() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-lost-outer-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(vec![3u8; 4096]);
+        let err = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a lost outer namespace lock must abort before rename");
+
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+        assert!(
+            set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the object must not become visible after the outer lock is lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_aborts_when_bucket_lifecycle_fence_is_lost_after_commit_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-lost-bucket-lifecycle-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let (fence, loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let put_store = Arc::clone(&set_disks);
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"must-not-commit".to_vec());
+            put_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        bucket_lifecycle_lock_fence: Some(fence),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        loss_handle.store(true, std::sync::atomic::Ordering::Release);
+        barrier.release();
+        let err = put
+            .await
+            .expect("PUT task should join")
+            .expect_err("bucket lifecycle lock loss at commit must abort the PUT");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+        assert!(
+            set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "object must remain absent after bucket lifecycle lock loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_copy_no_lock_aborts_after_outer_namespace_lock_loss() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "copy-lost-outer-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(b"original".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be written");
+        let mut copy_info = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("initial metadata should be readable");
+        copy_info.metadata_only = true;
+        Arc::make_mut(&mut copy_info.user_defined).insert("x-amz-meta-proof".to_string(), "mutated".to_string());
+
+        let err = set_disks
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("metadata copy must not commit after its outer namespace lock is lost");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("original metadata should remain readable");
+        assert!(!current.user_defined.contains_key("x-amz-meta-proof"));
+    }
+
+    #[tokio::test]
+    async fn explicit_version_overwrite_rechecks_object_lock_under_commit_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-explicit-version-object-lock";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let cases = [
+            (
+                "compliance",
+                HashMap::from([
+                    (
+                        X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                        s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                    ),
+                    (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until.clone()),
+                ]),
+            ),
+            (
+                "governance",
+                HashMap::from([
+                    (
+                        X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                        s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
+                    ),
+                    (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+                ]),
+            ),
+            (
+                "legal-hold",
+                HashMap::from([(
+                    X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                    s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
+                )]),
+            ),
+        ];
+
+        for (case, lock_metadata) in cases {
+            let object = format!("{case}-object");
+            let original_body = format!("original-{case}").into_bytes();
+            let mut initial_reader = PutObjReader::from_vec(original_body.clone());
+            let initial = set_disks
+                .put_object(
+                    bucket,
+                    &object,
+                    &mut initial_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("initial version should be written");
+            let version_id = initial
+                .version_id
+                .expect("versioned PUT should return a version ID")
+                .to_string();
+
+            let barrier = PutObjectCommitBarrier::install(bucket, &object, PutObjectCommitPause::BeforeNamespace);
+            let overwrite_store = Arc::clone(&set_disks);
+            let overwrite_object = object.clone();
+            let overwrite_version = version_id.clone();
+            let overwrite = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(format!("replacement-{case}").into_bytes());
+                overwrite_store
+                    .put_object(
+                        bucket,
+                        &overwrite_object,
+                        &mut reader,
+                        &ObjectOptions {
+                            version_id: Some(overwrite_version),
+                            versioned: true,
+                            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                                ObjectLockConfigState::ConfirmedAbsent,
+                            ))),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+
+            barrier.wait_until_paused().await;
+            set_disks
+                .put_object_metadata(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        version_id: Some(version_id.clone()),
+                        versioned: true,
+                        eval_metadata: Some(lock_metadata),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Object Lock metadata should win the race before the overwrite commit lock");
+            barrier.release();
+
+            let err = overwrite
+                .await
+                .expect("overwrite task should not panic")
+                .expect_err("the commit-time Object Lock check must reject the overwrite");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected {case} error: {err}");
+
+            let mut reader = set_disks
+                .get_object_reader(
+                    bucket,
+                    &object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version_id),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the protected version should remain readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("protected body should drain");
+            assert_eq!(body, original_body, "{case} overwrite must not change the protected body");
+            drop(barrier);
+        }
+
+        let object = "commit-lock-proof";
+        let mut initial_reader = PutObjReader::from_vec(b"original".to_vec());
+        let initial = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial lock-proof version should be written");
+        let version_id = initial
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let overwrite_store = Arc::clone(&set_disks);
+        let overwrite_version = version_id.clone();
+        let overwrite = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"replacement".to_vec());
+            overwrite_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        version_id: Some(overwrite_version),
+                        versioned: true,
+                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                            ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        let metadata_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeMetadata);
+        let metadata_store = Arc::clone(&set_disks);
+        let metadata_version = version_id.clone();
+        let mut metadata_update = tokio::spawn(async move {
+            metadata_store
+                .put_object_metadata(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(metadata_version),
+                        versioned: true,
+                        eval_metadata: Some(HashMap::from([("proof".to_string(), "blocked".to_string())])),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        metadata_barrier.wait_until_paused().await;
+        metadata_barrier.release();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut metadata_update)
+                .await
+                .is_err(),
+            "metadata update must block while PUT holds the commit lock"
+        );
+        drop(metadata_barrier);
+        barrier.release();
+        overwrite
+            .await
+            .expect("overwrite task should not panic")
+            .expect("unlocked exact-version overwrite should commit");
+        metadata_update
+            .await
+            .expect("metadata task should not panic")
+            .expect("metadata update should proceed after PUT releases the commit lock");
+        drop(barrier);
+    }
+
+    #[tokio::test]
+    async fn explicit_version_overwrite_honors_bucket_default_compliance() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-default-compliance-object-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let original_body = b"default-compliance-original".to_vec();
+        let mut initial_reader = PutObjReader::from_vec(original_body.clone());
+        let initial = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial version should be written");
+        let version_id = initial
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+        let default_compliance = ObjectLockConfigState::Configured {
+            config: s3s::dto::ObjectLockConfiguration {
+                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
+                rule: Some(s3s::dto::ObjectLockRule {
+                    default_retention: Some(s3s::dto::DefaultRetention {
+                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(
+                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
+                        )),
+                        days: Some(1),
+                        years: None,
+                    }),
+                }),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+        let err = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut replacement,
+                &ObjectOptions {
+                    version_id: Some(version_id.clone()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(default_compliance))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("bucket default COMPLIANCE must block an exact-version overwrite");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let mut reader = set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(version_id),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the default-protected version should remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("protected body should drain");
+        assert_eq!(body, original_body);
+    }
+
+    #[tokio::test]
+    async fn version_only_copy_checks_the_destination_version_object_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "copy-destination-object-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut source_reader = PutObjReader::from_vec(b"source-version".to_vec());
+        let source = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut source_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source version should be written");
+        let source_version = source.version_id.expect("source version ID").to_string();
+
+        let destination_body = b"protected-destination".to_vec();
+        let mut destination_reader = PutObjReader::from_vec(destination_body.clone());
+        let destination = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut destination_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("destination version should be written");
+        let destination_version = destination.version_id.expect("destination version ID").to_string();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(destination_version.clone()),
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([(
+                        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                        s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
+                    )])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("destination legal hold should be written");
+
+        let mut source_info = set_disks
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(source_version.clone()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source version should be readable");
+        source_info.version_only = true;
+        let err = set_disks
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source_info,
+                &ObjectOptions {
+                    version_id: Some(source_version),
+                    versioned: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: Some(destination_version.clone()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("source metadata must not overwrite a locked destination version");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let mut reader = set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(destination_version),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("protected destination should remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("destination body should drain");
+        assert_eq!(body, destination_body);
+    }
 }
 
 #[cfg(test)]
@@ -7985,6 +9233,7 @@ mod object_tagging_namespace_lock_tests {
             versioned: true,
             version_id: Some(version_id),
             delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
         set_disks
@@ -8024,6 +9273,9 @@ mod object_tagging_namespace_lock_tests {
                 let object_opts = ObjectOptions {
                     versioned,
                     delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 };
                 let original_body = b"original body".to_vec();
@@ -8200,7 +9452,18 @@ mod delete_objects_lock_gating_tests {
             },
         ];
 
-        let (deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        let (deleted, errs) = set_disks
+            .delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
 
         assert_eq!(deleted.len(), 3);
         assert_eq!(errs.len(), 3);
@@ -8263,6 +9526,9 @@ mod delete_objects_lock_gating_tests {
                 ObjectOptions {
                     versioned: true,
                     delete_replication_config_snapshot: Some(snapshot),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )
@@ -8364,6 +9630,9 @@ mod delete_objects_lock_gating_tests {
                 ObjectOptions {
                     versioned: true,
                     delete_replication_config_snapshot: Some(snapshot),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )
@@ -8442,6 +9711,9 @@ mod delete_objects_lock_gating_tests {
                 ObjectOptions {
                     versioned: true,
                     delete_replication_config_snapshot: Some(snapshot),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )
@@ -8475,8 +9747,11 @@ mod delete_objects_lock_gating_tests {
                 }],
                 ObjectOptions {
                     no_lock: true,
-                    delete_lock_fence: Some(DeleteLockFence::lost_for_test()),
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
                     delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )
@@ -8491,6 +9766,50 @@ mod delete_objects_lock_gating_tests {
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .expect("object must survive a lost-lock batch");
+    }
+
+    #[tokio::test]
+    async fn delete_object_aborts_when_outer_lock_is_lost_at_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "single-lost-outer-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, object).await;
+
+        let barrier = DeleteObjectCommitBarrier::install(bucket, object);
+        let (fence, loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let delete_store = Arc::clone(&set_disks);
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        no_lock: true,
+                        namespace_lock_fence: Some(fence),
+                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                            ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+        loss_handle.store(true, std::sync::atomic::Ordering::Release);
+        barrier.release();
+
+        let err = delete
+            .await
+            .expect("delete task should join")
+            .expect_err("lock loss at commit must abort the delete");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+        set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("object must survive commit-time lock loss");
     }
 
     #[tokio::test]
@@ -8543,7 +9862,18 @@ mod delete_objects_lock_gating_tests {
             },
         ];
 
-        let (_deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        let (_deleted, errs) = set_disks
+            .delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
 
         let lock_err = errs[0]
             .as_ref()
@@ -8602,7 +9932,18 @@ mod delete_objects_lock_gating_tests {
             object_name: "obj".to_string(),
             ..Default::default()
         }];
-        let (_deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        let (_deleted, errs) = set_disks
+            .delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
 
         assert!(
             errs[0].is_some(),
@@ -8650,6 +9991,9 @@ mod delete_objects_lock_gating_tests {
                 objects,
                 ObjectOptions {
                     no_lock: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             ),

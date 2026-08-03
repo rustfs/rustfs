@@ -37,7 +37,7 @@ impl ReplicationConfigStore {
         com::read_config_no_lock(api, file).await
     }
 
-    pub(crate) async fn read_with_metadata_no_lock<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, ObjectInfo)>
+    pub(crate) async fn read_no_lock_with_metadata<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, ObjectInfo)>
     where
         S: ReplicationObjectIO,
     {
@@ -66,23 +66,22 @@ impl ReplicationConfigStore {
         com::save_config_no_lock(api, file, data).await
     }
 
-    pub(crate) async fn save_no_lock_if_match<S>(
+    pub(crate) async fn save_conditional<S>(
         api: Arc<S>,
         file: &str,
         data: Vec<u8>,
-        preconditions: HTTPPreconditions,
+        http_preconditions: HTTPPreconditions,
     ) -> Result<()>
     where
         S: ReplicationObjectIO,
     {
-        com::save_config_with_opts(
+        com::save_config_with_opts_quiet(
             api,
             file,
             data,
             &ObjectOptions {
                 max_parity: true,
-                no_lock: true,
-                http_preconditions: Some(preconditions),
+                http_preconditions: Some(http_preconditions),
                 ..Default::default()
             },
         )

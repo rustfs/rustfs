@@ -161,7 +161,8 @@ impl PreparedIamAuth {
     /// conditions for the provided request args.
     pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
         match &self.mode {
-            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => false,
+            PreparedIamMode::Opa => true,
+            PreparedIamMode::Owner | PreparedIamMode::Deny => false,
             PreparedIamMode::Regular { combined_policy } => {
                 policy_needs_existing_object_tag_for_args(combined_policy, args).await
             }
@@ -1099,7 +1100,7 @@ impl<T: Store> IamSys<T> {
         match Self::policy_plugin_state().await {
             PolicyPluginState::Ready(_) => {
                 return PreparedIamAuth {
-                    needs_existing_object_tag: false,
+                    needs_existing_object_tag: true,
                     mode: PreparedIamMode::Opa,
                 };
             }
@@ -1766,6 +1767,7 @@ mod tests {
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action, StsAction};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
+    use serial_test::serial;
     use std::{
         collections::{HashMap, HashSet},
         sync::{Arc, Mutex},
@@ -1795,6 +1797,42 @@ mod tests {
         };
 
         assert!(prepared.combined_policy_for_view().is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_prepare_auth_requests_existing_object_tags_in_opa_mode() {
+        let store = StsTestMockStore::new(false);
+        let iam_sys = IamSys::new(IamCache::new(store).await.expect("initialize IAM cache"));
+        let previous_state = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:8181/v1/data/rustfs/authz/allow".to_string(),
+            auth_token: String::new(),
+        }))
+        .await;
+
+        let claims = HashMap::new();
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = Args {
+            account: "opa-tag-test-user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "tagged-object",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        let needs_initial_tags = prepared.needs_existing_object_tag;
+        let needs_secondary_tags = prepared.needs_existing_object_tag_for_args(&args).await;
+        *get_policy_plugin_state().write().await = previous_state;
+
+        assert!(needs_initial_tags, "OPA mode must request existing object tags before evaluation");
+        assert!(needs_secondary_tags, "OPA mode must request existing object tags for secondary actions");
     }
 
     const CUSTOM_STS_CLAIM_POLICY: &str = "custom-sts-claim-getobject";

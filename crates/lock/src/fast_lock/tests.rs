@@ -18,7 +18,7 @@ mod fast_lock_tests {
     use crate::fast_lock::types::{LockConfig, LockMode, LockPriority, LockResult, ObjectKey, ObjectLockRequest};
     use crate::fast_lock::{DEFAULT_SHARD_COUNT, FastObjectLockManager};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::time::sleep;
 
     /// Helper function to create a test lock manager
@@ -468,6 +468,67 @@ mod fast_lock_tests {
         for handle in handles {
             handle.await.expect("lock task should not panic");
         }
+    }
+
+    // Regression for the waiter-preserving exclusive CAS, end to end
+    // (rustfs#5657 same-key write contention).
+    //
+    // `try_acquire_exclusive` used to demand a fully-zero state word, which
+    // includes the waiting counters. Once the slow path's retries register as
+    // waiters — as they must, to hear a release — a lock with waiters becomes
+    // acquirable by no one, each waiter blocked by the others' registration, so
+    // every waiter here sits out its full acquire deadline instead of draining.
+    //
+    // The holder is held long enough for all waiters to be registered before
+    // the single release. After it they only serialize on each other, holding
+    // nothing, so they should drain in tens of milliseconds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contended_writers_drain_promptly_after_release() {
+        let manager = Arc::new(create_test_manager());
+        let key = ObjectKey::new("bucket", "hot-object");
+        const WAITERS: usize = 16;
+        const HOLD: Duration = Duration::from_millis(300);
+        // Generous next to the ~20ms the fixed path needs for these waiters, and
+        // far below the 5s acquire deadline a zero-state CAS makes them all
+        // sit out.
+        const DRAIN_BUDGET: Duration = Duration::from_millis(1000);
+
+        let mut holder = manager
+            .acquire_write_lock(key.clone(), "holder")
+            .await
+            .expect("holder should acquire immediately");
+
+        let mut handles = Vec::new();
+        for i in 0..WAITERS {
+            let manager = manager.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                let request =
+                    ObjectLockRequest::new_write(key, format!("waiter-{i}")).with_acquire_timeout(Duration::from_secs(5));
+                let mut guard = manager
+                    .acquire_lock(request)
+                    .await
+                    .expect("every waiter must acquire once the holder releases");
+                assert!(guard.release());
+            }));
+        }
+
+        // Let every waiter fail its fast path and register in the retry ladder.
+        sleep(HOLD).await;
+
+        let released_at = Instant::now();
+        assert!(holder.release());
+
+        for handle in handles {
+            handle.await.expect("waiter task should not panic");
+        }
+
+        let drain = released_at.elapsed();
+        assert!(
+            drain < DRAIN_BUDGET,
+            "{WAITERS} waiters took {drain:?} to drain after the release (budget {DRAIN_BUDGET:?}) - \
+             registered waiters are blocking acquisition"
+        );
     }
 
     #[tokio::test]

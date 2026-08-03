@@ -1203,12 +1203,19 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
 }
 
 pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
+    let _ = replicate_delete_with_outcome(dobj, storage).await;
+}
+
+pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
+    dobj: DeletedObjectReplicationInfo,
+    storage: Arc<S>,
+) -> bool {
     if dobj.delete_object.force_delete {
-        replicate_force_delete_to_targets(&dobj, storage).await;
-        return;
+        return replicate_force_delete_to_targets(&dobj, storage).await;
     }
 
     let bucket = dobj.bucket.clone();
+    let mut source_state_verified = true;
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         Some(version_id.to_owned())
     } else {
@@ -1245,7 +1252,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     reason = "source_not_delete_marker",
                     "Skipping stale delete-marker replication"
                 );
-                return;
+                return true;
             }
             Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
                 debug!(
@@ -1258,9 +1265,10 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     reason = "source_version_missing",
                     "Skipping stale delete-marker replication"
                 );
-                return;
+                return true;
             }
             Err(err) => {
+                source_state_verified = false;
                 debug!(
                     event = EVENT_REPLICATION_DELETE_SKIPPED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1310,7 +1318,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
     let ns_lock = match storage
@@ -1342,7 +1350,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
 
@@ -1372,7 +1380,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
 
@@ -1386,6 +1394,11 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
 
     // Process each target
     let target_arns = dobj.admitted_target_arns();
+    let expected_targets = dsc
+        .targets_map
+        .values()
+        .filter(|target| target.replicate && (target_arns.is_empty() || target_arns.iter().any(|arn| arn == &target.arn)))
+        .count();
     for tgt_entry in dsc.targets_map.values() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
@@ -1465,7 +1478,8 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
 
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
 
-    if should_retry_delete_marker_purge(&dobj.delete_object) {
+    let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object);
+    if requires_delayed_purge {
         let bucket_clone = bucket.clone();
         let dobj_clone = dobj.clone();
         let dsc_clone = dsc.clone();
@@ -1536,7 +1550,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         EventName::ObjectReplicationFailed.to_string()
     };
 
-    match storage
+    let state_persisted = match storage
         .delete_object(
             &bucket,
             &dobj.delete_object.object_name,
@@ -1558,6 +1572,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 object,
                 ..Default::default()
             });
+            true
         }
         Err(e) => {
             error!(
@@ -1583,8 +1598,16 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 },
                 ..Default::default()
             });
+            false
         }
-    }
+    };
+
+    expected_targets > 0
+        && rinfos.targets.len() == expected_targets
+        && state_persisted
+        && source_state_verified
+        && !requires_delayed_purge
+        && replication_status == ReplicationStatusType::Completed
 }
 
 async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
@@ -1611,6 +1634,29 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
     }
 }
 
+/// Which version a delete-marker purge should address on one target.
+///
+/// `None` means do not purge at all: the recorded mapping disagreed across the
+/// dual internal prefixes, and guessing an id could destroy a live version on
+/// the target. `Some(id)` is the exact version the target reported when it
+/// accepted the marker; falling back to a source-derived id is only correct
+/// when the target mirrors source version ids, which a generic S3 target does
+/// not.
+fn delete_marker_purge_version_id(
+    state: Option<&ReplicationState>,
+    arn: &str,
+    delete_marker_version_id: Uuid,
+) -> Option<Option<String>> {
+    if state.is_some_and(|state| state.target_delete_marker_version_ids_corrupt) {
+        return None;
+    }
+    let recorded = state.and_then(|state| state.target_delete_marker_version_ids.get(arn).cloned());
+    Some(match recorded {
+        Some(version_id) => Some(version_id),
+        None => target_delete_version_id(delete_marker_version_id, true),
+    })
+}
+
 async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo, dsc: &ReplicateDecision) {
     let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
         return;
@@ -1628,18 +1674,34 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
             continue;
         };
 
+        let Some(purge_version_id) = delete_marker_purge_version_id(
+            dobj.delete_object.replication_state.as_ref(),
+            &tgt_entry.arn,
+            delete_marker_version_id,
+        ) else {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket,
+                object = dobj.delete_object.object_name,
+                arn = tgt_entry.arn,
+                "Skipping delete-marker purge: recorded target version metadata is inconsistent"
+            );
+            continue;
+        };
+
         let _ = tgt_client
             .remove_object(
                 &tgt_client.bucket,
                 &dobj.delete_object.object_name,
-                target_delete_version_id(delete_marker_version_id, true),
+                purge_version_id,
                 replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
             )
             .await;
     }
 }
 
-async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
+async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) -> bool {
     let bucket = &dobj.bucket;
     let object_name = &dobj.delete_object.object_name;
     let admitted_target_arns = dobj.admitted_target_arns();
@@ -1727,7 +1789,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
 
@@ -1755,7 +1817,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return;
+            return false;
         }
     };
 
@@ -1764,6 +1826,9 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     } else {
         admitted_target_arns
     };
+    if tgt_arns.is_empty() {
+        return false;
+    }
 
     let mut join_set = JoinSet::new();
     let mut all_succeeded = true;
@@ -1888,7 +1953,10 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
             error = %error,
             "Force-delete replication completed but durable intent cleanup failed"
         );
+        return false;
     }
+
+    all_succeeded
 }
 
 fn target_delete_version_id(version_id: Uuid, version_purge: bool) -> Option<String> {
@@ -1978,16 +2046,24 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         )
         .await
     {
-        Ok(_) => {
+        Ok(assigned_version_id) => {
             debug!(
                 bucket = tgt_client.bucket,
                 object = dobj.delete_object.object_name,
                 version_id = ?version_id,
+                assigned_version_id = ?assigned_version_id,
                 delete_marker = dobj.delete_object.delete_marker,
                 is_version_purge,
                 "replicate_delete_to_target succeeded"
             );
             if !is_version_purge {
+                // Record the version the target actually assigned to the marker it
+                // just created. A later purge addresses that id directly instead of
+                // deriving one from the source uuid, which only holds when the
+                // target mirrors source version ids.
+                if dobj.delete_object.delete_marker {
+                    rinfo.target_delete_marker_version_id = assigned_version_id.filter(|version_id| !version_id.is_empty());
+                }
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
@@ -2034,6 +2110,13 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
 }
 
 pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, storage: Arc<S>) -> ReplicationState {
+    replicate_object_with_outcome(roi, storage).await.0
+}
+
+pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
+    roi: ReplicateObjectInfo,
+    storage: Arc<S>,
+) -> (ReplicationState, bool) {
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
@@ -2062,7 +2145,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return roi.replication_state.unwrap_or_default();
+            return (roi.replication_state.unwrap_or_default(), false);
         }
     };
     let _obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
@@ -2085,7 +2168,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return roi.replication_state.unwrap_or_default();
+            return (roi.replication_state.unwrap_or_default(), false);
         }
     };
 
@@ -2166,6 +2249,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let replication_status = merged_state.composite_replication_status();
     let new_replication_internal = merged_state.replication_status_internal.clone();
     let mut object_info = roi.to_object_info();
+    let mut state_persisted = true;
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
         let mut eval_metadata = HashMap::new();
@@ -2181,6 +2265,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         match storage.put_object_metadata(&bucket, &object, &popts).await {
             Ok(u) => object_info = u,
             Err(e) => {
+                state_persisted = false;
                 // Persisting the resynced replication status failed. Don't swallow
                 // it silently — the object's on-disk status now disagrees with the
                 // resync result and needs operator visibility (backlog#799 B23).
@@ -2234,7 +2319,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         }
     }
 
-    merged_state
+    (merged_state, state_persisted)
 }
 
 trait ReplicateObjectInfoExt {
@@ -3970,5 +4055,36 @@ mod tests {
         assert_eq!(target_delete_version_id(version_id, true), Some(version_id.to_string()));
         assert_eq!(target_delete_version_id(Uuid::nil(), true).as_deref(), Some(NULL_VERSION_ID));
         assert_eq!(target_delete_version_id(Uuid::nil(), false), None);
+    }
+
+    #[test]
+    fn delete_marker_purge_prefers_the_recorded_target_version() {
+        let source = Uuid::new_v4();
+        let arn = "arn:rustfs:replication::target:bucket";
+
+        // No recorded mapping: fall back to deriving from the source uuid.
+        assert_eq!(delete_marker_purge_version_id(None, arn, source), Some(Some(source.to_string())));
+
+        // Recorded mapping wins — a generic S3 target assigns its own id, so the
+        // derived one would purge the wrong version or nothing at all.
+        let mut state = ReplicationState::default();
+        state
+            .target_delete_marker_version_ids
+            .insert(arn.to_string(), "target-assigned-id".to_string());
+        assert_eq!(
+            delete_marker_purge_version_id(Some(&state), arn, source),
+            Some(Some("target-assigned-id".to_string()))
+        );
+
+        // A mapping recorded for a different ARN must not be reused.
+        assert_eq!(
+            delete_marker_purge_version_id(Some(&state), "arn:rustfs:replication::other:bucket", source),
+            Some(Some(source.to_string()))
+        );
+
+        // Inconsistent persisted metadata: refuse to purge rather than guess.
+        let mut corrupt = state.clone();
+        corrupt.target_delete_marker_version_ids_corrupt = true;
+        assert_eq!(delete_marker_purge_version_id(Some(&corrupt), arn, source), None);
     }
 }
