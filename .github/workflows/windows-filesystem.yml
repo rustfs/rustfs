@@ -69,6 +69,10 @@ jobs:
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
 
+      - name: Check production Windows dependencies
+        shell: pwsh
+        run: cargo check -p rustfs-ecstore --lib
+
       - name: Test guarded rename publication
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
