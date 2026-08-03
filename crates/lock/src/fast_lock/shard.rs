@@ -215,12 +215,30 @@ impl LockShard {
             let remaining = deadline - Instant::now();
 
             if retry_count < MAX_RETRIES && remaining > Duration::from_millis(10) {
-                // For early retries, use a brief exponential backoff instead of full notification wait
+                // For early retries, wait for a release notification bounded by
+                // an exponential backoff. The bound (not a bare sleep) matters:
+                // a plain `sleep` subscribes to nothing, so a release during
+                // the backoff wakes nobody — `notify_writer`/`notify_readers`
+                // are gated on the waiter counters, which a sleeper never
+                // increments. Under N-writer same-key contention the lock sits
+                // free while every loser sleeps out its full backoff, and the
+                // ladder compounds superlinearly with N. The backoff cap still
+                // protects against lost/stolen wakeups, exactly as
+                // NOTIFY_WAIT_CAP does for the post-retry wait below.
                 let backoff_ms = std::cmp::min(10 << retry_count, 100); // 10ms, 20ms, 40ms, 80ms, 100ms max
                 let backoff_duration = Duration::from_millis(backoff_ms);
 
                 if backoff_duration < remaining {
-                    tokio::time::sleep(backoff_duration).await;
+                    match request.mode {
+                        LockMode::Shared => {
+                            let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
+                            let _ = timeout(backoff_duration, state.optimized_notify.wait_for_read()).await;
+                        }
+                        LockMode::Exclusive => {
+                            let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
+                            let _ = timeout(backoff_duration, state.optimized_notify.wait_for_write()).await;
+                        }
+                    }
                     retry_count += 1;
                     continue;
                 }

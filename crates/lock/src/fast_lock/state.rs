@@ -110,13 +110,31 @@ impl AtomicLockState {
     pub fn try_acquire_exclusive(&self) -> bool {
         self.update_access_time();
 
-        // Must be completely unlocked to acquire exclusive
-        let expected = 0;
-        let new_state = WRITER_FLAG_MASK;
+        loop {
+            let current = self.state.load(Ordering::Acquire);
 
-        self.state
-            .compare_exchange(expected, new_state, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+            // Only ownership bits may block acquisition: no writer flag, no
+            // active readers. The waiting counters are preserved, not
+            // required to be zero — demanding a fully-zero word means a lock
+            // with registered waiters can be acquired by *no one*, including
+            // the waiters themselves (each sees the others' registration),
+            // so contended acquisition only succeeds in windows where every
+            // waiter happens to be unregistered. `try_acquire_shared` above
+            // already masks correctly; this mirrors it.
+            if (current & (WRITER_FLAG_MASK | READERS_MASK)) != 0 {
+                return false;
+            }
+
+            let new_state = current | WRITER_FLAG_MASK;
+
+            if self
+                .state
+                .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     /// Release shared lock
