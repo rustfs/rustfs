@@ -7806,6 +7806,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_disks_info_preserves_cached_disk_id_after_failed_live_probe() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let cached_disk_id = Uuid::new_v4();
+        disk.set_disk_id_state(Some(cached_disk_id))
+            .await
+            .expect("disk id should be cached before the failed probe");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].runtime_state.as_deref(), Some("suspect"));
+        assert_eq!(info[0].uuid, cached_disk_id.to_string());
+        assert_eq!(
+            info[0].drive_path,
+            temp_dir.path().to_string_lossy(),
+            "failed live probe should still keep the endpoint path"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_disks_info_uses_capacity_snapshot_for_offline_disk() {
         let format = FormatV3::new(1, 1);
         let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
