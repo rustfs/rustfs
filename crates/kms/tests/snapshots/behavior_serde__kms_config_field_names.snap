@@ -1,0 +1,12 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: field_names(&local)
+---
+- allow_insecure_dev_defaults
+- backend
+- backend_config
+- cache_config
+- default_key_id
+- enable_cache
+- retry_attempts
+- timeout

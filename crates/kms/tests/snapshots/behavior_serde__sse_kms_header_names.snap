@@ -1,0 +1,12 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: names(&sse_kms.metadata)
+---
+- x-amz-server-side-encryption
+- x-amz-server-side-encryption-aws-kms-key-id
+- x-rustfs-encryption-algorithm
+- x-rustfs-encryption-context
+- x-rustfs-encryption-iv
+- x-rustfs-encryption-key
+- x-rustfs-encryption-key-id
+- x-rustfs-encryption-tag

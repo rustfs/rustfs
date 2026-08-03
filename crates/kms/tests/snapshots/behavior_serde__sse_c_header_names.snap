@@ -1,0 +1,11 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: names(&sse_c.metadata)
+---
+- x-amz-server-side-encryption
+- x-amz-server-side-encryption-customer-algorithm
+- x-rustfs-encryption-algorithm
+- x-rustfs-encryption-context
+- x-rustfs-encryption-iv
+- x-rustfs-encryption-key
+- x-rustfs-encryption-tag

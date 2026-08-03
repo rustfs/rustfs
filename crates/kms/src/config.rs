@@ -1833,6 +1833,10 @@ mod tests {
                 ("RUSTFS_KMS_BACKEND", Some("vault")),
                 ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
                 (ENV_KMS_VAULT_TOKEN_FILE, Some("/run/vault-agent/token")),
+                // Cleared explicitly: a static token in the ambient environment
+                // outranks the token file, so leaving it up to the caller's shell
+                // would make this assertion depend on who runs the test.
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
             ],
             || {
                 let config = KmsConfig::from_env().expect("kms config should load from env");

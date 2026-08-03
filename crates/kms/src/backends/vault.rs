@@ -857,6 +857,13 @@ impl VaultKmsClient {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
 
+        // NOTE: this comparison is an authorization check, not a cryptographic
+        // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
+        // rides in the envelope unauthenticated: anyone able to rewrite the
+        // stored envelope can rewrite this field and present a matching context.
+        // The Static and Vault Transit backends do bind it (as AEAD AAD and as
+        // the Transit KDF context respectively); closing the gap here needs a
+        // versioned envelope, since existing ciphertext was sealed without AAD.
         // Verify encryption context matches
         // Check that all keys in envelope.encryption_context are present in request.encryption_context
         // and their values match. This ensures the context used for decryption matches what was used for encryption.
@@ -1580,9 +1587,14 @@ impl KmsBackend for VaultKmsBackend {
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         let plaintext = self.client.decrypt(&request, None).await?;
 
+        // The envelope that was just opened names the master key that opened it.
+        // Reporting "unknown" left every caller unable to tell which key was
+        // actually used, which is what audit and key-rotation checks read.
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+
         Ok(DecryptResponse {
             plaintext,
-            key_id: "unknown".to_string(), // Would be extracted from ciphertext metadata
+            key_id: envelope.master_key_id,
             encryption_algorithm: Some("AES-256-GCM".to_string()),
         })
     }
