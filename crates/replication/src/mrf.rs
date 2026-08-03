@@ -129,6 +129,18 @@ impl MrfProtocolCapabilities {
     pub fn negotiate(self, peer: Self) -> std::result::Result<Self, MrfEnvelopeError> {
         MrfCapabilities::from_bits(self.capabilities.bits())?;
         MrfCapabilities::from_bits(peer.capabilities.bits())?;
+        if self.min_reader_version > self.version {
+            return Err(MrfEnvelopeError::InvalidVersionRange {
+                version: self.version,
+                min_reader_version: self.min_reader_version,
+            });
+        }
+        if peer.min_reader_version > peer.version {
+            return Err(MrfEnvelopeError::InvalidVersionRange {
+                version: peer.version,
+                min_reader_version: peer.min_reader_version,
+            });
+        }
         if peer.version != self.version {
             return Err(MrfEnvelopeError::UnsupportedVersion { version: peer.version });
         }
@@ -568,9 +580,21 @@ mod tests {
         let rollback = MrfProtocolCapabilities::new(1, 2, MrfCapabilities::current());
         assert_eq!(
             current.negotiate(rollback),
-            Err(MrfEnvelopeError::RollbackFenced {
+            Err(MrfEnvelopeError::InvalidVersionRange {
+                version: 1,
                 min_reader_version: 2,
-                supported_version: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_negotiation_rejects_invalid_local_version_range() {
+        let invalid = MrfProtocolCapabilities::new(1, 2, MrfCapabilities::current());
+        assert_eq!(
+            invalid.negotiate(MrfProtocolCapabilities::current()),
+            Err(MrfEnvelopeError::InvalidVersionRange {
+                version: 1,
+                min_reader_version: 2,
             })
         );
     }
