@@ -48,6 +48,26 @@ pub struct IlmStats {
     pub versions_scanned: u64,
 }
 
+/// ILM task metrics by action and state.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmActionTaskStats {
+    pub(crate) action: String,
+    pub(crate) state: String,
+    pub(crate) value: u64,
+}
+
+/// ILM statistics with runtime-local node identity and bounded action/state details.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmRuntimeStats {
+    pub(crate) server: String,
+    pub(crate) stats: IlmStats,
+    pub(crate) action_tasks: Vec<IlmActionTaskStats>,
+}
+
+fn is_live_action_task_state(state: &str) -> bool {
+    matches!(state, "pending" | "active" | "compensation_running")
+}
+
 /// Collects ILM metrics from the given stats.
 ///
 /// Uses the metric descriptors from `metrics_type::ilm` module.
@@ -78,6 +98,25 @@ pub fn collect_ilm_metrics(stats: &IlmStats) -> Vec<PrometheusMetric> {
     ]
 }
 
+pub(crate) fn collect_ilm_runtime_metrics(stats: &IlmRuntimeStats) -> Vec<PrometheusMetric> {
+    let mut metrics = collect_ilm_metrics(&stats.stats);
+
+    metrics.extend(
+        stats
+            .action_tasks
+            .iter()
+            .filter(|task| is_live_action_task_state(&task.state))
+            .map(|task| {
+                PrometheusMetric::from_descriptor(&ILM_ACTION_TASKS_MD, task.value as f64)
+                    .with_label_owned(SERVER_LABEL, stats.server.clone())
+                    .with_label_owned(ACTION_LABEL, task.action.clone())
+                    .with_label_owned(STATE_LABEL, task.state.clone())
+            }),
+    );
+
+    metrics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,16 +134,62 @@ mod tests {
             transition_compensation_running_tasks: 1,
             versions_scanned: 1000000,
         };
+        let runtime_stats = IlmRuntimeStats {
+            server: "node1:9000".to_string(),
+            stats,
+            action_tasks: vec![
+                IlmActionTaskStats {
+                    action: "expiry".to_string(),
+                    state: "pending".to_string(),
+                    value: 100,
+                },
+                IlmActionTaskStats {
+                    action: "transition".to_string(),
+                    state: "queue_send_timeout".to_string(),
+                    value: 3,
+                },
+                IlmActionTaskStats {
+                    action: "transition".to_string(),
+                    state: "active".to_string(),
+                    value: 5,
+                },
+            ],
+        };
 
-        let metrics = collect_ilm_metrics(&stats);
+        let metrics = collect_ilm_runtime_metrics(&runtime_stats);
 
-        assert_eq!(metrics.len(), 9);
+        assert_eq!(metrics.len(), 11);
 
         let pending = metrics.iter().find(|m| m.value == 100.0);
         assert!(pending.is_some());
 
         let scanned = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(scanned.is_some());
+
+        let transition_timeout = metrics.iter().find(|m| {
+            m.name == ILM_ACTION_TASKS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "queue_send_timeout")
+        });
+        assert!(transition_timeout.is_none());
+
+        let transition_active = metrics.iter().find(|m| {
+            m.name == ILM_ACTION_TASKS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "active")
+        });
+        assert_eq!(transition_active.map(|m| m.value), Some(5.0));
     }
 
     #[test]

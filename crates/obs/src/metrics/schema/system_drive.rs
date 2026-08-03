@@ -29,9 +29,111 @@ pub const SET_INDEX_LABEL: &str = "set_index";
 pub const DRIVE_INDEX_LABEL: &str = "drive_index";
 /// API label
 pub const API_LABEL: &str = "api";
+/// Disk id label
+pub const DISK_ID_LABEL: &str = "disk_id";
+/// State label
+pub const STATE_LABEL: &str = "state";
 
 /// All drive-related labels
 pub const ALL_DRIVE_LABELS: [&str; 2] = [SERVER_LABEL, DRIVE_LABEL];
+/// Drive labels with erasure-set topology.
+pub const DRIVE_TOPOLOGY_LABELS: [&str; 5] = [
+    SERVER_LABEL,
+    DRIVE_LABEL,
+    POOL_INDEX_LABEL,
+    SET_INDEX_LABEL,
+    DRIVE_INDEX_LABEL,
+];
+/// Drive info labels.
+pub const DRIVE_INFO_LABELS: [&str; 6] = [
+    SERVER_LABEL,
+    DRIVE_LABEL,
+    POOL_INDEX_LABEL,
+    SET_INDEX_LABEL,
+    DRIVE_INDEX_LABEL,
+    DISK_ID_LABEL,
+];
+/// Drive topology labels with a state dimension.
+pub const DRIVE_TOPOLOGY_STATE_LABELS: [&str; 6] = [
+    SERVER_LABEL,
+    DRIVE_LABEL,
+    POOL_INDEX_LABEL,
+    SET_INDEX_LABEL,
+    DRIVE_INDEX_LABEL,
+    STATE_LABEL,
+];
+/// Drive topology labels with an API dimension.
+pub const DRIVE_TOPOLOGY_API_LABELS: [&str; 6] = [
+    SERVER_LABEL,
+    DRIVE_LABEL,
+    POOL_INDEX_LABEL,
+    SET_INDEX_LABEL,
+    DRIVE_INDEX_LABEL,
+    API_LABEL,
+];
+
+pub static DRIVE_INFO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("info".to_string()),
+        "Drive topology and stable disk identity information",
+        &DRIVE_INFO_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_RUNTIME_STATE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("runtime_state".to_string()),
+        "Drive runtime state (1 for the active state label, 0 otherwise)",
+        &DRIVE_TOPOLOGY_STATE_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_HEALING_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("healing".to_string()),
+        "Whether the drive is currently healing",
+        &DRIVE_TOPOLOGY_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_SCANNING_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("scanning".to_string()),
+        "Whether the drive is currently being scanned",
+        &DRIVE_TOPOLOGY_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_OFFLINE_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("offline_duration_seconds".to_string()),
+        "Duration in seconds the drive has been offline",
+        &DRIVE_TOPOLOGY_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_API_CALLS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("api_calls_total".to_string()),
+        "Total drive API calls by operation",
+        &DRIVE_TOPOLOGY_API_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_API_LATENCY_BY_API_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("api_latency_by_api_micros".to_string()),
+        "Average last minute drive API latency in microseconds by operation",
+        &DRIVE_TOPOLOGY_API_LABELS,
+        subsystems::SYSTEM_DRIVE,
+    )
+});
 
 pub static DRIVE_USED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(

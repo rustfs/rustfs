@@ -17,6 +17,19 @@
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
+pub const SERVER_LABEL: &str = "server";
+pub const ACTION_LABEL: &str = "action";
+pub const STATE_LABEL: &str = "state";
+
+pub static ILM_ACTION_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("action_tasks".to_string()),
+        "ILM task counts by server, action, and state",
+        &[SERVER_LABEL, ACTION_LABEL, STATE_LABEL],
+        subsystems::ILM,
+    )
+});
+
 pub static ILM_EXPIRY_PENDING_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::IlmExpiryPendingTasks,

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use rustfs_replication::BucketStats;
 #[cfg(test)]
 pub(crate) use rustfs_replication::FailStats;
 pub(crate) use rustfs_replication::{
-    ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, InQueueMetric, ProxyMetric, ProxyStatsCache, QueueCache,
-    ReplicationMetricScope, SRMetricsSummary, XferStats,
+    ActiveWorkerStat, BucketReplicationStat, InQueueMetric, ProxyMetric, ProxyStatsCache, QueueCache, ReplicationMetricScope,
+    SRMetricsSummary, XferStats,
 };
+pub use rustfs_replication::{BucketReplicationStats, BucketStats};

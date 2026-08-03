@@ -17,6 +17,50 @@
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
+pub const SERVER_LABEL: &str = "server";
+pub const SOURCE_LABEL: &str = "source";
+pub const STATE_LABEL: &str = "state";
+pub const CYCLE_SCOPE_LABEL: &str = "cycle_scope";
+pub const BUCKET_LABEL: &str = "bucket";
+pub const DRIVE_LABEL: &str = "drive";
+pub const RESULT_LABEL: &str = "result";
+
+pub static SCANNER_SOURCE_WORK_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("source_work_total".to_string()),
+        "Total scanner work by source and state since server start",
+        &[SERVER_LABEL, SOURCE_LABEL, STATE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CYCLE_SOURCE_WORK_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("cycle_source_work".to_string()),
+        "Scanner work by cycle scope, source, and state",
+        &[SERVER_LABEL, CYCLE_SCOPE_LABEL, SOURCE_LABEL, STATE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("bucket_drive_result_total".to_string()),
+        "Total scanner bucket-drive scan results by server, bucket, drive, and result",
+        &[SERVER_LABEL, BUCKET_LABEL, DRIVE_LABEL, RESULT_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("cycle_bucket_drive_result".to_string()),
+        "Scanner bucket-drive scan results by cycle scope, server, bucket, drive, and result",
+        &[SERVER_LABEL, CYCLE_SCOPE_LABEL, BUCKET_LABEL, DRIVE_LABEL, RESULT_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
 pub static SCANNER_BUCKET_SCANS_FINISHED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ScannerBucketScansFinished,
