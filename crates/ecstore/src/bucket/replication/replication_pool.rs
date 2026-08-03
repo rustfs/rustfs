@@ -38,7 +38,8 @@ use super::replication_resync_boundary::{
     encode_mrf_file, should_auto_resume_resync,
 };
 use super::replication_resyncer::{
-    ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_object, save_resync_status,
+    ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_delete_with_outcome, replicate_object,
+    replicate_object_with_outcome, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
@@ -1060,7 +1061,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             let Some(operation_id) = entry.force_delete_id else {
                                 continue;
                             };
-                            schedule_replication_delete(DeletedObjectReplicationInfo {
+                            let delete = DeletedObjectReplicationInfo {
                                 delete_object: ReplicationDeletedObject {
                                     object_name: entry.object.clone(),
                                     force_delete: true,
@@ -1073,8 +1074,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 op_type: ReplicationType::Heal,
                                 event_type: REPLICATE_HEAL_DELETE.to_string(),
                                 ..Default::default()
-                            })
-                            .await
+                            };
+                            if replicate_delete_with_outcome(delete, storage.clone()).await {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
                         } else if entry.force_delete_id.is_some() {
                             ReplicationQueueAdmission::Skipped
                         } else {
@@ -1152,7 +1157,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 event_type: REPLICATE_HEAL_DELETE.to_string(),
                                 ..Default::default()
                             };
-                            schedule_replication_delete(dv).await
+                            if replicate_delete_with_outcome(dv, storage.clone()).await {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
                         }
                     }
                     MrfOpKind::Object | MrfOpKind::Heal | MrfOpKind::ExistingObject => {
@@ -1181,13 +1190,15 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             // Legacy entries predate target admission persistence. They cannot
                             // be safely attributed, so retain the old live-config fallback.
                             queue_replication_heal(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
-                        } else if let Some(pool) = runtime_sources::replication_pool() {
+                        } else {
                             let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
                             let mut roi = replicate_object_info_from_object_info(oi, dsc, entry.op.replication_type());
                             roi.retry_count = entry.retry_count.max(0) as u32;
-                            pool.queue_replica_task(roi).await
-                        } else {
-                            ReplicationQueueAdmission::Missed
+                            if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
                         }
                     }
                     MrfOpKind::Metadata => {
@@ -1212,7 +1223,18 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 continue;
                             }
                         };
-                        queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
+                        if entry.target_arns.is_empty() {
+                            queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
+                        } else {
+                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+                            let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata);
+                            roi.retry_count = entry.retry_count.max(0) as u32;
+                            if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
+                        }
                     }
                 };
 
