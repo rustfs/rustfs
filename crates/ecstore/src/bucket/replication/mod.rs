@@ -70,8 +70,9 @@ pub use replication_object_decision_boundary::{
     should_use_existing_delete_replication_source,
 };
 pub use replication_pool::{
-    DurableMrfBacklog, DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
-    init_background_replication, read_durable_mrf_backlog, resync_start_conflict_id,
+    DurableMrfBacklog, DynReplicationPool, ReplicationPoolTrait, commit_force_delete_intent, complete_force_delete_intent,
+    get_global_replication_pool, get_global_replication_stats, init_background_replication, persist_force_delete_intent,
+    read_durable_mrf_backlog, resync_start_conflict_id,
 };
 pub use replication_queue_boundary::{
     DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,

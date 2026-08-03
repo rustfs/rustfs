@@ -30,10 +30,24 @@ impl ReplicationConfigStore {
         com::read_config(api, file).await
     }
 
+    pub(crate) async fn read_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::read_config_no_lock(api, file).await
+    }
+
     pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
     where
         S: ReplicationObjectIO,
     {
         com::save_config(api, file, data).await
+    }
+
+    pub(crate) async fn save_no_lock<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::save_config_no_lock(api, file, data).await
     }
 }

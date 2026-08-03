@@ -1125,6 +1125,7 @@ mod tests {
                     delete_marker: false,
                     delete_marker_mtime: None,
                     target_arns: vec!["arn-a".to_string(), "arn-durable-only".to_string()],
+                    ..Default::default()
                 },
                 MrfReplicateEntry {
                     bucket: "other-bucket".to_string(),
@@ -1138,6 +1139,7 @@ mod tests {
                     delete_marker: false,
                     delete_marker_mtime: None,
                     target_arns: Vec::new(),
+                    ..Default::default()
                 },
             ],
         };
@@ -1197,6 +1199,7 @@ mod tests {
                 delete_marker: false,
                 delete_marker_mtime: None,
                 target_arns: Vec::new(),
+                ..Default::default()
             }],
         };
 

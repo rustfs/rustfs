@@ -572,7 +572,7 @@ impl MrfOpKind {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct MrfReplicateEntry {
     #[serde(rename = "bucket")]
     pub bucket: String,
@@ -619,6 +619,17 @@ pub struct MrfReplicateEntry {
 
     #[serde(rename = "targetARNs", skip_serializing_if = "Vec::is_empty", default)]
     pub target_arns: Vec<String>,
+
+    // Force-delete entries use the target ARN list above as their immutable target set.
+    // The id distinguishes a durable intent from legacy MRF delete entries.
+    #[serde(rename = "forceDeleteID", skip_serializing_if = "Option::is_none", default)]
+    pub force_delete_id: Option<Uuid>,
+    #[serde(rename = "forceDeleteGeneration", skip_serializing_if = "Option::is_none", default)]
+    pub force_delete_generation: Option<i64>,
+
+    // Replay is allowed only after the source-side recursive delete has committed.
+    #[serde(rename = "forceDeleteLocalCommit", default)]
+    pub force_delete_local_commit: bool,
 }
 
 fn retry_count_to_mrf(retry_count: u32) -> i32 {
@@ -865,6 +876,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: self.admitted_target_arns(),
+            ..Default::default()
         }
     }
 
@@ -945,6 +957,7 @@ impl ReplicateObjectInfo {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: self.admitted_target_arns(),
+            ..Default::default()
         }
     }
 }
