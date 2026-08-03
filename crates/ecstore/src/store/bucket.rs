@@ -387,18 +387,24 @@ impl ECStore {
         if confirmed_missing || is_meta_bucketname(bucket) {
             meta.set_created(opts.created_at);
 
-            if opts.lock_enabled {
-                meta.lock_enabled = true;
-                meta.object_lock_config_xml =
-                    crate::bucket::utils::serialize::<ObjectLockConfiguration>(&ENABLED_OBJECT_LOCK_CONFIG)?;
-                meta.versioning_config_xml =
-                    crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
-            }
-
             if opts.versioning_enabled {
                 meta.versioning_config_xml =
                     crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
             }
+        }
+
+        // Object Lock enable is one-way, and it must apply to an existing bucket
+        // too. Site replication replays make-with-versioning carrying the
+        // source's lockEnabled against a destination bucket that already exists;
+        // gating this on `confirmed_missing` returned success while leaving the
+        // replica unlocked, so replicated versions could be deleted without the
+        // retention the source enforces.
+        let lock_newly_enabled = opts.lock_enabled && !meta.lock_enabled;
+        if opts.lock_enabled {
+            meta.lock_enabled = true;
+            meta.object_lock_config_xml =
+                crate::bucket::utils::serialize::<ObjectLockConfiguration>(&ENABLED_OBJECT_LOCK_CONFIG)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
         let metadata_persisted_before_physical = confirmed_missing && !is_meta_bucketname(bucket) && opts.lock_enabled;
@@ -466,7 +472,7 @@ impl ECStore {
             }
             if is_meta_bucketname(bucket) {
                 metadata_sys::set_bucket_metadata_in(&self.ctx, meta).await
-            } else if existing_incarnation_is_authoritative {
+            } else if existing_incarnation_is_authoritative && !lock_newly_enabled {
                 metadata_sys::cache_bucket_metadata_in(&self.ctx, meta).await
             } else {
                 metadata_sys::set_new_bucket_metadata_in(&self.ctx, meta).await
@@ -1402,6 +1408,55 @@ mod tests {
             .expect("retried Purge should remove stale metadata without a bucket volume");
         assert!(!any_disk_path_exists(&disk_paths, &metadata_prefix).await);
         assert!(!any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
+    }
+
+    /// Site replication replays make-with-versioning carrying the source's
+    /// `lockEnabled` against a destination bucket that already exists. Gating the
+    /// lock enable on `confirmed_missing` returned success while leaving the
+    /// replica unlocked, so replicated versions could be deleted without the
+    /// retention the source enforces.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn force_create_enables_object_lock_on_an_existing_bucket() {
+        let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-force-lock-{}", Uuid::new_v4().simple());
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("plain bucket should be created");
+        assert!(
+            !metadata_sys::get_in(&ecstore.ctx, &bucket)
+                .await
+                .expect("metadata should load")
+                .lock_enabled,
+            "test setup: the bucket must start unlocked"
+        );
+
+        ecstore
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    force_create: true,
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("force create with lock_enabled should succeed on an existing bucket");
+
+        let meta = metadata_sys::get_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("metadata should load after the lock enable");
+        assert!(meta.lock_enabled, "Object Lock must be enabled on the existing bucket");
+        assert!(
+            !meta.object_lock_config_xml.is_empty(),
+            "the Object Lock configuration must be persisted, not just the flag"
+        );
+        assert!(
+            !meta.versioning_config_xml.is_empty(),
+            "Object Lock requires versioning, so that must be persisted too"
+        );
     }
 
     /// `DeleteBucket`'s emptiness check is a raw disk scan (`has_xlmeta_files`),
