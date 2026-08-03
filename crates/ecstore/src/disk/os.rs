@@ -592,14 +592,19 @@ async fn reliable_rename_inner(
     base_dir: impl AsRef<Path>,
     warn_on_missing_source: bool,
 ) -> io::Result<()> {
-    let parent_guard = match dst_file_path.as_ref().parent() {
-        Some(parent) => Some(mkdir_all_below_existing_base(parent, base_dir.as_ref()).await?),
-        None => None,
-    };
-
     let mut i = 0;
     loop {
-        if let Err(e) = rename_into_existing_parent(src_file_path.as_ref(), dst_file_path.as_ref(), parent_guard.as_ref()) {
+        let parent_guard = match dst_file_path.as_ref().parent() {
+            Some(parent) => mkdir_all_below_existing_base(parent, base_dir.as_ref()).await.map(Some),
+            None => Ok(None),
+        };
+        let result = match parent_guard {
+            Ok(parent_guard) => {
+                rename_into_existing_parent(src_file_path.as_ref(), dst_file_path.as_ref(), parent_guard.as_ref())
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(e) = result {
             if should_retry_rename(&e, i) {
                 i += 1;
                 continue;
@@ -649,7 +654,117 @@ fn rename_into_existing_parent(
     renameat(&src_parent, src_name, dst_parent, dst_name).map_err(io::Error::from)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+// SAFETY: this helper builds the variable-length FILE_RENAME_INFO buffer with
+// checked sizes and passes borrowed live handles only to synchronous Win32 calls.
+#[allow(unsafe_code)]
+fn rename_into_existing_parent(
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    parent_guard: Option<&ExistingBaseDirectoryGuard>,
+) -> io::Result<()> {
+    use std::{
+        mem::{offset_of, size_of},
+        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY},
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, FileRenameInfoEx, SYNCHRONIZE,
+            SetFileInformationByHandle,
+        },
+        System::WindowsProgramming::{FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS},
+    };
+
+    let Some(parent_guard) = parent_guard else {
+        return super::fs::rename_std(src_file_path, dst_file_path);
+    };
+    let dst_parent = parent_guard
+        .last()
+        .ok_or_else(|| io::Error::other("rename destination parent guard is empty"))?;
+    let dst_name = dst_file_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a file name"))?;
+    let dst_name = dst_name.encode_wide().collect::<Vec<_>>();
+    if dst_name.is_empty() || dst_name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename destination file name is empty or contains a NUL",
+        ));
+    }
+
+    let file_name_bytes = dst_name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination file name is too long"))?;
+    let file_name_length = u32::try_from(file_name_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination file name is too long"))?;
+    let buffer_size = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(file_name_bytes)
+        .and_then(|size| size.checked_add(size_of::<u16>()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename information buffer is too large"))?;
+    let buffer_size_u32 = u32::try_from(buffer_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename information buffer is too large"))?;
+    let words = buffer_size.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0usize; words];
+    let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    let source = std::fs::OpenOptions::new()
+        .access_mode(DELETE | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(src_file_path)?;
+
+    // SAFETY: `buffer` is aligned for FILE_RENAME_INFO and large enough for
+    // its header, the complete UTF-16 name, and trailing zeroed storage.
+    // `dst_parent` and `source` remain live until the synchronous call returns.
+    unsafe {
+        (*rename_info).Anonymous = FILE_RENAME_INFO_0 { ReplaceIfExists: true };
+        (*rename_info).RootDirectory = dst_parent.as_raw_handle();
+        (*rename_info).FileNameLength = file_name_length;
+        std::ptr::copy_nonoverlapping(
+            dst_name.as_ptr(),
+            std::ptr::addr_of_mut!((*rename_info).FileName).cast::<u16>(),
+            dst_name.len(),
+        );
+    }
+
+    // SAFETY: `source` and `buffer` stay live for the synchronous call, and
+    // `buffer_size_u32` describes the initialized FILE_RENAME_INFO payload.
+    let renamed =
+        unsafe { SetFileInformationByHandle(source.as_raw_handle(), FileRenameInfo, rename_info.cast(), buffer_size_u32) };
+    if renamed != 0 {
+        return Ok(());
+    }
+
+    let legacy_error = io::Error::last_os_error();
+    if legacy_error.raw_os_error().and_then(|code| u32::try_from(code).ok()) != Some(ERROR_ACCESS_DENIED) {
+        return Err(legacy_error);
+    }
+
+    // Match std::fs::rename's Windows 10 fallback for read-only or open
+    // destinations while retaining the guarded, handle-relative target.
+    unsafe {
+        (*rename_info).Anonymous = FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        };
+    }
+    let renamed =
+        unsafe { SetFileInformationByHandle(source.as_raw_handle(), FileRenameInfoEx, rename_info.cast(), buffer_size_u32) };
+    if renamed != 0 {
+        return Ok(());
+    }
+
+    let extended_error = io::Error::last_os_error();
+    if extended_error.raw_os_error().and_then(|code| u32::try_from(code).ok()) == Some(ERROR_DIR_NOT_EMPTY) {
+        Err(extended_error)
+    } else {
+        Err(legacy_error)
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn rename_into_existing_parent(
     src_file_path: &Path,
     dst_file_path: &Path,
@@ -675,19 +790,16 @@ pub(crate) type ExistingBaseDirectoryGuard = Vec<std::os::fd::OwnedFd>;
 pub(crate) type ExistingBaseDirectoryGuard = ();
 
 #[cfg(windows)]
-fn lock_windows_directory(path: &Path) -> io::Result<winapi_util::Handle> {
+fn open_windows_directory(path: &Path, share_mode: u32) -> io::Result<winapi_util::Handle> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
     };
 
-    // Relative child publication requires write sharing on every guarded
-    // ancestor. Omitting delete sharing still prevents any directory in the
-    // resolved path from being renamed or removed before the commit finishes.
     let file = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+        .share_mode(share_mode)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let handle = winapi_util::Handle::from_file(file);
@@ -698,6 +810,15 @@ fn lock_windows_directory(path: &Path) -> io::Result<winapi_util::Handle> {
         return Err(io::Error::from(io::ErrorKind::NotADirectory));
     }
     Ok(handle)
+}
+
+#[cfg(windows)]
+fn lock_windows_directory(path: &Path) -> io::Result<winapi_util::Handle> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    // Child creation and handle-relative publication require write sharing.
+    // Omitting delete sharing keeps the opened directory identity anchored.
+    open_windows_directory(path, FILE_SHARE_READ | FILE_SHARE_WRITE)
 }
 
 pub(crate) fn mkdir_all_below_existing_base_std(dir_path: &Path, base_dir: &Path) -> io::Result<ExistingBaseDirectoryGuard> {
@@ -742,7 +863,10 @@ pub(crate) fn mkdir_all_below_existing_base_std(dir_path: &Path, base_dir: &Path
 
     #[cfg(windows)]
     {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
         let mut handles = vec![lock_windows_directory(base_dir)?];
+        let mut paths = vec![base_dir.to_path_buf()];
         let mut current = base_dir.to_path_buf();
         for component in relative.components() {
             let Component::Normal(component) = component else {
@@ -755,6 +879,28 @@ pub(crate) fn mkdir_all_below_existing_base_std(dir_path: &Path, base_dir: &Path
                 Err(err) => return Err(err),
             }
             handles.push(lock_windows_directory(&current)?);
+            paths.push(current.clone());
+        }
+
+        // A short read-only validation pass excludes concurrent writers while
+        // confirming that every pathname still resolves to the anchored
+        // directory opened during creation. The returned handles then allow
+        // child writes but keep delete sharing disabled until publication.
+        let validation_handles = paths
+            .iter()
+            .map(|path| open_windows_directory(path, FILE_SHARE_READ))
+            .collect::<io::Result<Vec<_>>>()?;
+        for (anchored, validated) in handles.iter().zip(&validation_handles) {
+            let anchored_info = winapi_util::file::information(anchored)?;
+            let validated_info = winapi_util::file::information(validated)?;
+            if anchored_info.volume_serial_number() != validated_info.volume_serial_number()
+                || anchored_info.file_index() != validated_info.file_index()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "rename destination parent identity changed during validation",
+                ));
+            }
         }
 
         Ok(handles)
@@ -780,8 +926,9 @@ fn warn_reliable_rename_failure(src_file_path: &Path, dst_file_path: &Path, base
 /// Whether a failed `rename` in [`reliable_rename_inner`] should be retried.
 ///
 /// Only the first failure is retried, and `NotFound` is never retried: the
-/// retry does not recreate the missing source or parent directory, so a second
-/// attempt is guaranteed to fail identically. Skipping it spares speculative
+/// retry does not recreate the missing source or base directory, so a second
+/// attempt is guaranteed to fail identically. Destination-parent preparation
+/// is already part of every attempt. Skipping it spares speculative
 /// cleanup renames (e.g. `move_to_trash` on an already-removed tmp path) a
 /// pointless second syscall. This predicate is shared by the `rename_data`
 /// commit path via `rename_all`, so any relaxation here must keep genuine
@@ -992,6 +1139,117 @@ mod tests {
         (logs, guard)
     }
 
+    #[cfg(windows)]
+    // SAFETY: this test helper passes a valid live directory handle and a
+    // fully initialized mount-point reparse buffer to synchronous DeviceIoControl.
+    #[allow(unsafe_code)]
+    fn try_set_windows_mount_point(directory: &winapi_util::Handle, target: &Path) -> io::Result<()> {
+        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use windows_sys::Win32::System::{
+            IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT, SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
+        };
+
+        const VERBATIM_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        const NT_PREFIX: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+        const REPARSE_HEADER_SIZE: usize = 8;
+        const MOUNT_POINT_HEADER_SIZE: usize = 8;
+
+        let target = std::fs::canonicalize(target)?;
+        let target_name = target.as_os_str().encode_wide().collect::<Vec<_>>();
+        let target_without_prefix = target_name.strip_prefix(&VERBATIM_PREFIX).unwrap_or(&target_name);
+        let substitute_name = NT_PREFIX
+            .into_iter()
+            .chain(target_without_prefix.iter().copied())
+            .collect::<Vec<_>>();
+        let substitute_name_bytes = substitute_name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mount-point target is too long"))?;
+        let print_name_bytes = target_name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mount-point target is too long"))?;
+        let substitute_name_length = u16::try_from(substitute_name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount-point target is too long"))?;
+        let print_name_offset = u16::try_from(substitute_name_bytes + std::mem::size_of::<u16>())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount-point target is too long"))?;
+        let print_name_length = u16::try_from(print_name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount-point target is too long"))?;
+
+        let mut path_buffer = Vec::with_capacity(substitute_name_bytes + print_name_bytes + 2 * std::mem::size_of::<u16>());
+        for unit in substitute_name.into_iter().chain([0]).chain(target_name).chain([0]) {
+            path_buffer.extend_from_slice(&unit.to_le_bytes());
+        }
+        let reparse_data_length = u16::try_from(MOUNT_POINT_HEADER_SIZE + path_buffer.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount-point reparse buffer is too large"))?;
+        let mut buffer = Vec::with_capacity(REPARSE_HEADER_SIZE + usize::from(reparse_data_length));
+        buffer.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buffer.extend_from_slice(&reparse_data_length.to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        buffer.extend_from_slice(&substitute_name_length.to_le_bytes());
+        buffer.extend_from_slice(&print_name_offset.to_le_bytes());
+        buffer.extend_from_slice(&print_name_length.to_le_bytes());
+        buffer.extend_from_slice(&path_buffer);
+        let input_size = u32::try_from(buffer.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount-point reparse buffer is too large"))?;
+        let mut bytes_returned = 0;
+
+        // SAFETY: `directory` and `buffer` remain live for the synchronous
+        // call, and the buffer lengths above match REPARSE_DATA_BUFFER layout.
+        let changed = unsafe {
+            DeviceIoControl(
+                directory.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                input_size,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if changed == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    // SAFETY: this test helper passes a valid live directory handle and the
+    // documented mount-point delete header to synchronous DeviceIoControl.
+    #[allow(unsafe_code)]
+    fn try_delete_windows_mount_point(directory: &winapi_util::Handle) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::{
+            IO::DeviceIoControl, Ioctl::FSCTL_DELETE_REPARSE_POINT, SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
+        };
+
+        let mut buffer = [0u8; 8];
+        buffer[..4].copy_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        let mut bytes_returned = 0;
+        // SAFETY: `directory` and `buffer` remain live for the synchronous
+        // call, and the eight-byte input is the documented delete header.
+        let changed = unsafe {
+            DeviceIoControl(
+                directory.as_raw_handle(),
+                FSCTL_DELETE_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                u32::try_from(buffer.len()).expect("reparse delete header length fits in u32"),
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if changed == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_dir_probe_bounds_unsupported_entries() {
@@ -1090,7 +1348,7 @@ mod tests {
     #[test]
     fn rename_retry_never_retries_not_found() {
         // NotFound is terminal for the retry loop: the retry does not recreate
-        // the missing source/parent, so a second rename would fail identically.
+        // the missing source/base, so a second rename would fail identically.
         let not_found = io::Error::new(io::ErrorKind::NotFound, "missing");
         assert!(!should_retry_rename(&not_found, 0));
         assert!(!should_retry_rename(&not_found, 1));
@@ -1243,6 +1501,124 @@ mod tests {
         drop(guard);
         std::fs::rename(base.join("object"), base.join("replacement-object"))
             .expect("replacement should succeed after the commit guard is released");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_all_publishes_a_direct_child_with_a_short_name() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        std::fs::create_dir(&base).expect("create destination base");
+        let src = temp_dir.path().join("staged-object");
+        let dst = base.join("x");
+        std::fs::write(&src, b"payload").expect("write staged object");
+
+        rename_all(&src, &dst, &base).await.expect("direct-child rename must succeed");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).expect("read published object"), b"payload");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_all_replaces_a_read_only_destination() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        std::fs::create_dir(&base).expect("create destination base");
+        let src = temp_dir.path().join("staged-object");
+        let dst = base.join("xl.meta");
+        std::fs::write(&src, b"new").expect("write staged object");
+        std::fs::write(&dst, b"old").expect("write old destination");
+        let mut permissions = std::fs::metadata(&dst).expect("inspect old destination").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&dst, permissions).expect("make old destination read-only");
+
+        let result = rename_all(&src, &dst, &base).await;
+        if result.is_err() && dst.exists() {
+            let mut permissions = std::fs::metadata(&dst).expect("inspect failed destination").permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&dst, permissions).expect("restore failed destination permissions");
+        }
+        result.expect("read-only destination replacement must match std::fs::rename");
+
+        assert_eq!(std::fs::read(&dst).expect("read replacement"), b"new");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_all_replaces_an_open_destination() {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        std::fs::create_dir(&base).expect("create destination base");
+        let src = temp_dir.path().join("staged-object");
+        let dst = base.join("xl.meta");
+        std::fs::write(&src, b"new").expect("write staged object");
+        std::fs::write(&dst, b"old").expect("write old destination");
+        let mut open_destination = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&dst)
+            .expect("open destination with delete sharing");
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect("an open destination that shares delete must remain replaceable");
+
+        let mut old_contents = Vec::new();
+        open_destination
+            .read_to_end(&mut old_contents)
+            .expect("read replaced file through its retained handle");
+        assert_eq!(old_contents, b"old");
+        assert_eq!(std::fs::read(&dst).expect("read replacement by path"), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_relative_rename_ignores_parent_reparse_mutation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE},
+        };
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        let parent = base.join("object");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&parent).expect("create destination parent");
+        std::fs::create_dir(&outside).expect("create mount-point target");
+        std::fs::write(outside.join("marker"), b"outside").expect("write outside marker");
+        let guard = mkdir_all_below_existing_base_std(&parent, &base).expect("guard destination parent");
+        let writable_parent = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&parent)
+            .map(winapi_util::Handle::from_file)
+            .expect("open guarded parent for reparse mutation");
+        try_set_windows_mount_point(&writable_parent, &outside)
+            .expect("the publication guard must retain Windows write compatibility");
+        assert_eq!(
+            std::fs::read(parent.join("marker")).expect("read marker through mount point"),
+            b"outside",
+            "the test mutation must redirect pathname traversal"
+        );
+
+        let src = temp_dir.path().join("staged-object");
+        std::fs::write(&src, b"payload").expect("write staged object");
+        let result = rename_into_existing_parent(&src, &parent.join("xl.meta"), Some(&guard));
+        let outside_was_untouched = !outside.join("xl.meta").exists();
+        try_delete_windows_mount_point(&writable_parent).expect("remove test mount point without deleting its directory");
+        drop(writable_parent);
+        result.expect("handle-relative publication must survive pathname redirection");
+
+        assert!(outside_was_untouched, "publication must not follow the mutated parent pathname");
+        assert_eq!(std::fs::read(parent.join("xl.meta")).expect("read anchored publication"), b"payload");
+        assert_eq!(std::fs::read(outside.join("marker")).expect("read outside marker"), b"outside");
     }
 
     #[cfg(windows)]
