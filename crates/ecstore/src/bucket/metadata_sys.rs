@@ -373,7 +373,7 @@ pub(crate) async fn inject_object_lock_disk_read_error_in(
 /// See [`acquire_bucket_metadata_transaction_lock`] for why every config
 /// write — not just the replication-targets one — has to hold that lock.
 pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-    update_with_sys(get_bucket_metadata_sys()?, bucket, config_file, data).await
+    Box::pin(update_with_sys(get_bucket_metadata_sys()?, bucket, config_file, data)).await
 }
 
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
@@ -632,7 +632,7 @@ where
     F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
 {
     let sys = get_bucket_metadata_sys()?;
-    let guard = acquire_config_write_guard(sys.clone(), bucket).await?;
+    let guard = Box::pin(acquire_config_write_guard(sys.clone(), bucket)).await?;
     guard.ensure_valid(bucket)?;
     let metadata_sys = sys.read().await.clone();
     let updated = await_bucket_namespace_operation(
@@ -643,7 +643,7 @@ where
             Some(&guard.transaction_guard),
             bucket,
             "bucket config read-modify-write transaction",
-            metadata_sys.update_config_with_checked(bucket, config_file, mutate, guard.incarnation_id),
+            Box::pin(metadata_sys.update_config_with_checked(bucket, config_file, mutate, guard.incarnation_id)),
         ),
     )
     .await?;
@@ -1378,9 +1378,17 @@ impl BucketMetadataSys {
         self.missing_buckets.invalidate_all();
     }
 
+    /// The `Box::pin`s here and in [`Self::update_checked`] are load-bearing, not
+    /// style. A bucket-config write nests incarnation resolution (which can drive
+    /// legacy migration and a peer fan-out), a full metadata load, and `save`,
+    /// which is itself an object PUT that pulls in the whole erasure write path —
+    /// and every request that mutates bucket config is already several futures
+    /// deep. Inlining all of that into one state machine overflows the worker
+    /// stack in debug builds (rustfs#5648: `SIGABRT`, ~780KiB consumed between
+    /// `update` and the config read alone). Keep these boxed.
     pub async fn update(&self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        let incarnation_id = self.get_bucket_incarnation_id(bucket).await?;
-        self.update_checked(bucket, config_file, data, true, incarnation_id).await
+        let incarnation_id = Box::pin(self.get_bucket_incarnation_id(bucket)).await?;
+        Box::pin(self.update_checked(bucket, config_file, data, true, incarnation_id)).await
     }
 
     pub async fn delete(&self, bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
@@ -1401,14 +1409,14 @@ impl BucketMetadataSys {
         // (backlog#1052 S7). Reading from the ambient handle instead made the
         // read and the write of a single read-modify-write able to target
         // different instances.
-        let mut bm = Self::load_bucket_metadata_for_update(self.api.clone(), bucket, parse).await?;
+        let mut bm = Box::pin(Self::load_bucket_metadata_for_update(self.api.clone(), bucket, parse)).await?;
         if !bm.bucket_incarnation_sidecar || bm.bucket_incarnation_id != expected_incarnation_id {
             return Err(Error::BucketNotFound(bucket.to_string()));
         }
 
         let updated = bm.update_config(config_file, data)?;
 
-        self.save(bm).await?;
+        Box::pin(self.save(bm)).await?;
 
         Ok(updated)
     }
@@ -1436,7 +1444,7 @@ impl BucketMetadataSys {
     where
         F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
     {
-        let mut bm = Self::load_bucket_metadata_for_update(self.api.clone(), bucket, true).await?;
+        let mut bm = Box::pin(Self::load_bucket_metadata_for_update(self.api.clone(), bucket, true)).await?;
         if !bm.bucket_incarnation_sidecar || bm.bucket_incarnation_id != expected_incarnation_id {
             return Err(Error::BucketNotFound(bucket.to_string()));
         }
@@ -1444,7 +1452,7 @@ impl BucketMetadataSys {
         let data = mutate(&bm)?;
         let updated = bm.update_config(config_file, data)?;
 
-        self.save(bm).await?;
+        Box::pin(self.save(bm)).await?;
 
         Ok(updated)
     }
