@@ -42,7 +42,8 @@ use super::replication_resyncer::{
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
-    ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+    HTTPPreconditions, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO,
+    ReplicationStorage,
 };
 use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
@@ -404,75 +405,124 @@ pub async fn persist_force_delete_intent<S: ReplicationStorage>(
     mut entry: MrfReplicateEntry,
 ) -> Result<(), EcstoreError> {
     entry.force_delete_local_commit = false;
-    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await?;
-    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
-
-    let mut entries = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
-        Ok(data) => decode_mrf_file(&data)?,
-        Err(EcstoreError::ConfigNotFound) => Vec::new(),
-        Err(err) => return Err(err),
-    };
-
-    if entries
-        .iter()
-        .any(|existing| existing.force_delete_id == entry.force_delete_id)
-    {
-        return Ok(());
-    }
-
-    entries.push(entry);
-    let data = encode_mrf_file(&entries)?;
-    ReplicationConfigStore::save_no_lock(storage, file, data).await
+    update_force_delete_intents(storage, move |entries, _exists| {
+        if entries
+            .iter()
+            .any(|existing| existing.force_delete_id == entry.force_delete_id)
+        {
+            return Ok(false);
+        }
+        entries.push(entry.clone());
+        Ok(true)
+    })
+    .await
 }
 
 pub async fn commit_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
-    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await?;
-    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
-
-    let data = ReplicationConfigStore::read_no_lock(storage.clone(), file).await?;
-    let mut entries = decode_mrf_file(&data)?;
-    let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
-        return Err(EcstoreError::ConfigNotFound);
-    };
-    if entry.force_delete_local_commit {
-        return Ok(());
-    }
-    entry.force_delete_local_commit = true;
-    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+    update_force_delete_intents(storage, move |entries, exists| {
+        if !exists {
+            return Err(EcstoreError::ConfigNotFound);
+        }
+        let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
+            return Err(EcstoreError::ConfigNotFound);
+        };
+        if entry.force_delete_local_commit {
+            return Ok(false);
+        }
+        entry.force_delete_local_commit = true;
+        Ok(true)
+    })
+    .await
 }
 
 pub async fn complete_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
+    update_force_delete_intents(storage, move |entries, exists| {
+        if !exists {
+            return Ok(false);
+        }
+        let original_len = entries.len();
+        entries.retain(|entry| entry.force_delete_id != Some(operation_id));
+        Ok(entries.len() != original_len)
+    })
+    .await
+}
+
+const FORCE_DELETE_INTENT_CAS_RETRIES: usize = 2;
+
+async fn update_force_delete_intents<S, F>(storage: Arc<S>, mut update: F) -> Result<(), EcstoreError>
+where
+    S: ReplicationStorage,
+    F: FnMut(&mut Vec<MrfReplicateEntry>, bool) -> Result<bool, EcstoreError>,
+{
     let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    let lock = storage
-        .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), file)
-        .await?;
-    let _guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
-
-    let data = match ReplicationConfigStore::read_no_lock(storage.clone(), file).await {
-        Ok(data) => data,
-        Err(EcstoreError::ConfigNotFound) => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    let mut entries = decode_mrf_file(&data)?;
-    let original_len = entries.len();
-    entries.retain(|entry| entry.force_delete_id != Some(operation_id));
-    if entries.len() == original_len {
-        return Ok(());
+    for attempt in 0..=FORCE_DELETE_INTENT_CAS_RETRIES {
+        let lock = storage
+            .new_ns_lock(
+                ReplicationMetadataStore::rustfs_meta_bucket(),
+                ReplicationMetadataStore::FORCE_DELETE_REPLICATION_TRANSACTION_LOCK,
+            )
+            .await?;
+        let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+        let (mut entries, preconditions, exists) = read_force_delete_intents(storage.clone(), file).await?;
+        if !update(&mut entries, exists)? {
+            return Ok(());
+        }
+        match save_force_delete_intents(storage.clone(), file, &guard, entries, preconditions).await {
+            Err(EcstoreError::PreconditionFailed) if attempt < FORCE_DELETE_INTENT_CAS_RETRIES => continue,
+            result => return result,
+        }
     }
+    unreachable!("force-delete journal retry loop always returns")
+}
 
-    ReplicationConfigStore::save_no_lock(storage, file, encode_mrf_file(&entries)?).await
+async fn read_force_delete_intents<S: ReplicationObjectIO>(
+    storage: Arc<S>,
+    file: &str,
+) -> Result<(Vec<MrfReplicateEntry>, HTTPPreconditions, bool), EcstoreError> {
+    match ReplicationConfigStore::read_no_lock_with_metadata(storage, file).await {
+        Ok((data, object_info)) => {
+            let etag = object_info
+                .etag
+                .filter(|etag| !etag.trim().is_empty())
+                .ok_or_else(|| EcstoreError::other("force-delete journal has no ETag for conditional update"))?;
+            Ok((
+                decode_mrf_file(&data)?,
+                HTTPPreconditions {
+                    if_match: Some(etag),
+                    ..Default::default()
+                },
+                true,
+            ))
+        }
+        Err(EcstoreError::ConfigNotFound) => Ok((
+            Vec::new(),
+            HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+            false,
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+async fn save_force_delete_intents<S: ReplicationStorage>(
+    storage: Arc<S>,
+    file: &str,
+    guard: &rustfs_lock::NamespaceLockGuard,
+    entries: Vec<MrfReplicateEntry>,
+    preconditions: HTTPPreconditions,
+) -> Result<(), EcstoreError> {
+    if guard.is_lock_lost() {
+        return Err(EcstoreError::other("force-delete journal lock lost before conditional update"));
+    }
+    ReplicationConfigStore::save_conditional(storage, file, encode_mrf_file(&entries)?, preconditions).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2336,6 +2386,11 @@ mod tests {
 
     struct LoadResyncSharedState {
         data: StdMutex<Vec<u8>>,
+        etag_revision: AtomicUsize,
+        last_put_preconditions: StdMutex<Option<HTTPPreconditions>>,
+        last_put_no_lock: AtomicBool,
+        omit_etag: AtomicBool,
+        replace_before_next_conditional_write: StdMutex<Option<Vec<u8>>>,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         first_read_started: Notify,
         delay_first_read: AtomicBool,
@@ -2410,6 +2465,8 @@ mod tests {
                 object_info: ObjectInfo {
                     size,
                     actual_size: size,
+                    etag: (!self.shared.omit_etag.load(Ordering::SeqCst))
+                        .then(|| format!("mrf-{}", self.shared.etag_revision.load(Ordering::SeqCst))),
                     ..Default::default()
                 },
                 buffered_body: None,
@@ -2422,8 +2479,44 @@ mod tests {
             _bucket: &str,
             _object: &str,
             data: &mut Self::PutObjectReader,
-            _opts: &Self::ObjectOptions,
+            opts: &Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            if opts.http_preconditions.is_some()
+                && let Some(replacement) = self
+                    .shared
+                    .replace_before_next_conditional_write
+                    .lock()
+                    .expect("test replacement lock should not be poisoned")
+                    .take()
+            {
+                *self.shared.data.lock().expect("test data lock should not be poisoned") = replacement;
+                self.shared.etag_revision.fetch_add(1, Ordering::SeqCst);
+            }
+            let current_etag = if self
+                .shared
+                .data
+                .lock()
+                .expect("test data lock should not be poisoned")
+                .is_empty()
+            {
+                None
+            } else {
+                Some(format!("mrf-{}", self.shared.etag_revision.load(Ordering::SeqCst)))
+            };
+            if opts.http_preconditions.as_ref().is_some_and(|preconditions| {
+                preconditions.if_none_match_value() == Some("*") && current_etag.is_some()
+                    || preconditions
+                        .if_match_value()
+                        .is_some_and(|expected| current_etag.as_deref() != Some(expected))
+            }) {
+                return Err(EcstoreError::PreconditionFailed);
+            }
+            *self
+                .shared
+                .last_put_preconditions
+                .lock()
+                .expect("test preconditions lock should not be poisoned") = opts.http_preconditions.clone();
+            self.shared.last_put_no_lock.store(opts.no_lock, Ordering::SeqCst);
             if self.shared.fail_next_write.swap(false, Ordering::SeqCst) {
                 return Err(EcstoreError::Unexpected);
             }
@@ -2434,6 +2527,7 @@ mod tests {
             let mut encoded = Vec::new();
             data.stream.read_to_end(&mut encoded).await.map_err(EcstoreError::from)?;
             *self.shared.data.lock().expect("test data lock should not be poisoned") = encoded;
+            self.shared.etag_revision.fetch_add(1, Ordering::SeqCst);
             self.shared.write_count.fetch_add(1, Ordering::SeqCst);
             Ok(ObjectInfo::default())
         }
@@ -2884,6 +2978,11 @@ mod tests {
     fn empty_resync_shared_state() -> Arc<LoadResyncSharedState> {
         Arc::new(LoadResyncSharedState {
             data: StdMutex::new(Vec::new()),
+            etag_revision: AtomicUsize::new(0),
+            last_put_preconditions: StdMutex::new(None),
+            last_put_no_lock: AtomicBool::new(false),
+            omit_etag: AtomicBool::new(false),
+            replace_before_next_conditional_write: StdMutex::new(None),
             lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
             first_read_started: Notify::new(),
             delay_first_read: AtomicBool::new(false),
@@ -3530,6 +3629,11 @@ mod tests {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
             let shared = Arc::new(LoadResyncSharedState {
                 data: StdMutex::new(load_resync_test_metadata()),
+                etag_revision: AtomicUsize::new(1),
+                last_put_preconditions: StdMutex::new(None),
+                last_put_no_lock: AtomicBool::new(false),
+                omit_etag: AtomicBool::new(false),
+                replace_before_next_conditional_write: StdMutex::new(None),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 first_read_started: Notify::new(),
                 delay_first_read: AtomicBool::new(true),
@@ -4021,7 +4125,7 @@ mod tests {
     #[tokio::test]
     async fn force_delete_intent_append_commit_and_cleanup_are_idempotent() {
         let shared = empty_resync_shared_state();
-        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared));
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
         let operation_id = Uuid::new_v4();
         let entry = MrfReplicateEntry {
             bucket: "source".to_string(),
@@ -4036,6 +4140,15 @@ mod tests {
         persist_force_delete_intent(storage.clone(), entry.clone())
             .await
             .expect("first journal append should succeed");
+        let preconditions = shared
+            .last_put_preconditions
+            .lock()
+            .expect("test preconditions lock should not be poisoned")
+            .clone()
+            .expect("first journal append should be conditional");
+        assert_eq!(preconditions.if_none_match_value(), Some("*"));
+        assert_eq!(preconditions.if_match_value(), None);
+        assert!(!shared.last_put_no_lock.load(Ordering::SeqCst));
         persist_force_delete_intent(storage.clone(), entry)
             .await
             .expect("duplicate journal append should be a no-op");
@@ -4051,6 +4164,15 @@ mod tests {
         commit_force_delete_intent(storage.clone(), operation_id)
             .await
             .expect("commit marker should persist");
+        let preconditions = shared
+            .last_put_preconditions
+            .lock()
+            .expect("test preconditions lock should not be poisoned")
+            .clone()
+            .expect("commit marker should be conditional");
+        assert_eq!(preconditions.if_none_match_value(), None);
+        assert_eq!(preconditions.if_match_value(), Some("mrf-1"));
+        assert!(!shared.last_put_no_lock.load(Ordering::SeqCst));
         commit_force_delete_intent(storage.clone(), operation_id)
             .await
             .expect("duplicate commit marker should be a no-op");
@@ -4067,5 +4189,136 @@ mod tests {
         complete_force_delete_intent(storage, operation_id)
             .await
             .expect("duplicate journal cleanup should be a no-op");
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_cleanup_retries_after_a_stale_journal_snapshot() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let mut entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(operation_id),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("journal append should succeed");
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("journal commit should succeed");
+        entry.force_delete_local_commit = true;
+        let concurrent = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "concurrent".to_string(),
+            force_delete_id: Some(Uuid::new_v4()),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        *shared
+            .replace_before_next_conditional_write
+            .lock()
+            .expect("test replacement lock should not be poisoned") =
+            Some(encode_mrf_file(&[entry, concurrent.clone()]).expect("concurrent journal entries should encode"));
+
+        complete_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("cleanup should retry after a concurrent journal update");
+
+        let data = ReplicationConfigStore::read(storage, ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should remain readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1, "cleanup must preserve only the concurrent journal entry");
+        assert_eq!(entries[0].force_delete_id, concurrent.force_delete_id);
+        assert_eq!(entries[0].object, concurrent.object);
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_rejects_existing_journal_without_an_etag() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(operation_id),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        persist_force_delete_intent(storage.clone(), entry)
+            .await
+            .expect("journal append should succeed");
+        let writes_before = shared.write_count.load(Ordering::SeqCst);
+        shared.omit_etag.store(true, Ordering::SeqCst);
+
+        let err = commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect_err("missing ETag must reject journal mutation");
+        assert!(err.to_string().contains("no ETag"));
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), writes_before);
+        let data = ReplicationConfigStore::read(storage, ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should remain readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert!(!entries[0].force_delete_local_commit);
+    }
+
+    #[tokio::test]
+    async fn force_delete_journal_rejects_a_stale_conditional_write() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared));
+        let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+        let original = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(Uuid::new_v4()),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        ReplicationConfigStore::save(
+            storage.clone(),
+            file,
+            encode_mrf_file(&[original]).expect("initial journal entry should encode"),
+        )
+        .await
+        .expect("initial journal write should succeed");
+
+        let (_, object_info) = ReplicationConfigStore::read_no_lock_with_metadata(storage.clone(), file)
+            .await
+            .expect("journal snapshot should include an ETag");
+        let stale_preconditions = HTTPPreconditions {
+            if_match: object_info.etag,
+            ..Default::default()
+        };
+        let replacement = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "replacement".to_string(),
+            force_delete_id: Some(Uuid::new_v4()),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        let replacement_data = encode_mrf_file(&[replacement]).expect("replacement journal entry should encode");
+        ReplicationConfigStore::save(storage.clone(), file, replacement_data.clone())
+            .await
+            .expect("concurrent journal write should succeed");
+
+        let err = ReplicationConfigStore::save_conditional(
+            storage.clone(),
+            file,
+            encode_mrf_file(&[]).expect("empty journal should encode"),
+            stale_preconditions,
+        )
+        .await
+        .expect_err("stale journal snapshot must not overwrite newer data");
+        assert_eq!(err, EcstoreError::PreconditionFailed);
+        assert_eq!(
+            ReplicationConfigStore::read(storage, file)
+                .await
+                .expect("newer journal data should remain readable"),
+            replacement_data
+        );
     }
 }

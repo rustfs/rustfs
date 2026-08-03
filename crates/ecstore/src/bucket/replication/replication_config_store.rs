@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use super::replication_error_boundary::Result;
-use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ReplicationObjectIO};
+use super::replication_storage_boundary::{HTTPPreconditions, ObjectInfo, ObjectOptions, ReplicationObjectIO};
 use crate::config::{com, storageclass};
-use crate::storage_api_contracts::object::HTTPPreconditions;
 use std::sync::Arc;
 
 pub(crate) struct ReplicationConfigStore;
@@ -67,7 +66,7 @@ impl ReplicationConfigStore {
         com::save_config_no_lock(api, file, data).await
     }
 
-    pub(crate) async fn save_no_lock_conditional<S>(
+    pub(crate) async fn save_conditional<S>(
         api: Arc<S>,
         file: &str,
         data: Vec<u8>,
@@ -82,7 +81,6 @@ impl ReplicationConfigStore {
             data,
             &ObjectOptions {
                 max_parity: true,
-                no_lock: true,
                 http_preconditions: Some(http_preconditions),
                 ..Default::default()
             },
