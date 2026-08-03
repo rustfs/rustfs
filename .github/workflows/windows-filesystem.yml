@@ -1,0 +1,86 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Windows Filesystem Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "crates/ecstore/src/disk/**"
+      - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/actions/setup/**"
+      - ".github/workflows/windows-filesystem.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "crates/ecstore/src/disk/**"
+      - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/actions/setup/**"
+      - ".github/workflows/windows-filesystem.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: 1
+
+jobs:
+  rename-safety:
+    name: Rename Safety
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: build-x86_64-pc-windows-msvc
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Test guarded rename publication
+        shell: pwsh
+        run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
+
+      - name: Test Windows handle guards
+        shell: pwsh
+        run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
+
+      - name: Test startup temporary-directory cleanup
+        shell: pwsh
+        run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
+
+      - name: Test fresh format publication
+        shell: pwsh
+        run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
