@@ -340,8 +340,10 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
     let mut user_defined = HashMap::new();
 
     let mut replication_request = false;
+    let mut mod_time = None;
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
+        mod_time = replication_source_mtime(headers);
         if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
             rustfs_utils::http::insert_str(
                 &mut user_defined,
@@ -361,6 +363,7 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
         want_checksum: rustfs_rio::get_content_checksum(headers)?,
         user_defined,
         replication_request,
+        mod_time,
         ..Default::default()
     };
     apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
@@ -408,18 +411,21 @@ pub fn put_opts_from_headers_with_replication_authorization(
     apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
-        if let Some(v) = get_header(headers, SUFFIX_SOURCE_MTIME) {
-            let trimmed_s = v.trim();
-            match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
-                Ok(mtime) => opts.mod_time = Some(mtime),
-                Err(e) => {
-                    tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", trimmed_s, e);
-                    opts.mod_time = None;
-                }
-            }
-        }
+        opts.mod_time = replication_source_mtime(headers);
     }
     Ok(opts)
+}
+
+fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::OffsetDateTime> {
+    let value = get_header(headers, SUFFIX_SOURCE_MTIME)?;
+    let value = value.trim();
+    match time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339) {
+        Ok(mtime) => Some(mtime),
+        Err(err) => {
+            tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", value, err);
+            None
+        }
+    }
 }
 
 fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions, authorized: bool) {
@@ -1473,6 +1479,32 @@ mod tests {
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized replica status header should parse");
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn test_complete_multipart_opts_preserves_authorized_replication_mtime() {
+        let source_mtime = "2024-05-20T10:30:00+08:00";
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, source_mtime);
+
+        let untrusted = get_complete_multipart_upload_opts(&headers)
+            .expect("ordinary multipart completion options should ignore replication headers");
+        assert!(!untrusted.replication_request);
+        assert!(untrusted.mod_time.is_none());
+
+        let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
+            .expect("authorized multipart replication options should parse");
+        let expected = time::OffsetDateTime::parse(source_mtime, &time::format_description::well_known::Rfc3339)
+            .expect("test source mtime should be valid");
+        assert!(authorized.replication_request);
+        assert_eq!(authorized.mod_time, Some(expected));
+
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "invalid-time");
+        let invalid = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
+            .expect("invalid replication mtime should keep existing fallback behavior");
+        assert!(invalid.replication_request);
+        assert!(invalid.mod_time.is_none());
     }
 
     #[test]
