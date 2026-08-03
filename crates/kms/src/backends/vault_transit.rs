@@ -772,7 +772,7 @@ impl VaultTransitKmsClient {
         let metadata = self
             .ensure_key_state_allows(&request.key_id, StateGatedOperation::Encrypt)
             .await?;
-        let ciphertext = match self
+        let encrypted = match self
             .transit_encrypt(&request.key_id, &request.plaintext, &request.encryption_context)
             .await
         {
@@ -783,8 +783,25 @@ impl VaultTransitKmsClient {
             }
         };
 
+        // The ciphertext must be the same envelope `decrypt` parses — it is what
+        // carries the key id and the bound context. Returning the bare Transit
+        // string made every `encrypt` result permanently unopenable.
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: request.key_id.clone(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: encrypted.into_bytes(),
+            nonce: Vec::new(),
+            encryption_context: request.encryption_context.clone(),
+            created_at: Zoned::now(),
+            // Transit ciphertext already self-describes its key version
+            // ("vault:vN:..."), so the envelope never carries one.
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope)?;
+
         Ok(EncryptResponse {
-            ciphertext: ciphertext.into_bytes(),
+            ciphertext,
             key_id: request.key_id.clone(),
             key_version: metadata.current_version,
             algorithm: "vault-transit".to_string(),
@@ -1698,7 +1715,9 @@ mod tests {
             )
             .await
             .expect("encrypt must retry past a transient 429");
-        assert_eq!(response.ciphertext, b"vault:v1:scripted".to_vec());
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("encrypt must return an envelope");
+        assert_eq!(envelope.encrypted_key, b"vault:v1:scripted".to_vec());
+        assert_eq!(envelope.master_key_id, "wired-key");
 
         let requests = vault.requests();
         assert_eq!(requests.len(), 3, "metadata read plus two encrypt attempts: {requests:?}");

@@ -33,7 +33,7 @@
 
 mod common;
 
-use common::{BackendCase, TestKms, assert_context_mismatch, ctx, flip_middle_bit, for_each_backend, payload};
+use common::{BackendCase, BackendKind, TestKms, assert_context_mismatch, ctx, flip_middle_bit, for_each_backend, payload};
 use rustfs_kms::{
     DecryptRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KmsError, ObjectEncryptionContext, is_data_key_envelope,
 };
@@ -260,21 +260,33 @@ async fn data_key_spec_controls_the_length_of_the_generated_key() {
         // returning a different size means the caller builds a cipher from
         // material it did not ask for, and the envelope records a spec its
         // payload does not match.
-        for spec in [KeySpec::Aes256, KeySpec::Aes128] {
-            let generated = manager
+        // ChaCha20 material is 32 random bytes, exactly like AES_256, so a
+        // backend that mints DEKs itself has no technical reason to refuse it.
+        // Static accepts it; Local and both Vault backends route through
+        // `generate_key_material`, which only knows the two AES specs. That
+        // split is pinned per backend rather than tolerated on both sides: a
+        // blanket "honoured or refused" contract would accept a backend
+        // regressing from working into refusing, which is exactly how a
+        // silently dropped spec would ship.
+        for spec in [KeySpec::Aes256, KeySpec::Aes128, KeySpec::ChaCha20] {
+            let must_be_honoured = spec != KeySpec::ChaCha20 || case.kind() == BackendKind::Static;
+            match manager
                 .generate_data_key(GenerateDataKeyRequest {
                     key_id: case.key_id.clone(),
                     key_spec: spec.clone(),
                     encryption_context: context(),
                 })
                 .await
-                .unwrap_or_else(|error| panic!("[{label}] {spec:?} generate should succeed: {error:?}"));
-            assert_eq!(
-                generated.plaintext_key.len(),
-                spec.key_size(),
-                "[{label}] {spec:?} must yield a {}-byte data key",
-                spec.key_size()
-            );
+            {
+                Ok(generated) => assert_eq!(
+                    generated.plaintext_key.len(),
+                    spec.key_size(),
+                    "[{label}] {spec:?} must yield a {}-byte data key",
+                    spec.key_size()
+                ),
+                Err(KmsError::UnsupportedAlgorithm { .. }) if !must_be_honoured => {}
+                Err(error) => panic!("[{label}] {spec:?} must yield a {}-byte data key: {error:?}", spec.key_size()),
+            }
         }
 
         let aes128 = manager

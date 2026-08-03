@@ -1580,9 +1580,14 @@ impl KmsBackend for VaultKmsBackend {
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         let plaintext = self.client.decrypt(&request, None).await?;
 
+        // The envelope that was just opened names the master key that opened it.
+        // Reporting "unknown" left every caller unable to tell which key was
+        // actually used, which is what audit and key-rotation checks read.
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+
         Ok(DecryptResponse {
             plaintext,
-            key_id: "unknown".to_string(), // Would be extracted from ciphertext metadata
+            key_id: envelope.master_key_id,
             encryption_algorithm: Some("AES-256-GCM".to_string()),
         })
     }

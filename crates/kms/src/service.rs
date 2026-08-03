@@ -19,6 +19,7 @@ use crate::api_types::{
 };
 use crate::cache::KmsCacheStats;
 use crate::encryption::ciphers::{create_cipher, generate_iv};
+use crate::encryption::context_aad;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
@@ -81,6 +82,15 @@ fn request_encryption_context(context: &ObjectEncryptionContext) -> HashMap<Stri
 }
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+
+/// Carries the AEAD algorithm the object was sealed with.
+///
+/// The S3 `x-amz-server-side-encryption` header records the *SSE mode*
+/// (`AES256` / `aws:kms`), not the cipher, so it cannot round-trip
+/// `ChaCha20Poly1305`. Without this header a ChaCha-sealed object comes back
+/// from the projection claiming `aws:kms` and is then opened with the wrong
+/// cipher.
+const INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "x-rustfs-encryption-algorithm";
 
 /// Result of object encryption
 #[derive(Debug, Clone)]
@@ -484,7 +494,7 @@ impl ObjectEncryptionService {
         let iv = generate_iv(algorithm);
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&context)?;
+        let aad = context_aad(&context)?;
 
         // Encrypt the data
         let (ciphertext, tag) = cipher.encrypt(&data, &iv, &aad)?;
@@ -558,7 +568,7 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&metadata.encryption_context)?;
+        let aad = context_aad(&metadata.encryption_context)?;
 
         // Get tag from metadata
         let tag = metadata
@@ -634,7 +644,7 @@ impl ObjectEncryptionService {
             ("sse_type".to_string(), "customer".to_string()),
         ]);
 
-        let aad = serde_json::to_vec(&context)?;
+        let aad = context_aad(&context)?;
 
         // Encrypt the data
         let (ciphertext, tag) = cipher.encrypt(&data, &iv, &aad)?;
@@ -702,7 +712,7 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, customer_key)?;
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&metadata.encryption_context)?;
+        let aad = context_aad(&metadata.encryption_context)?;
 
         // Get tag from metadata
         let tag = metadata
@@ -774,6 +784,9 @@ impl ObjectEncryptionService {
             headers.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), metadata.key_id.clone());
         }
 
+        // Record the cipher separately from the SSE mode advertised above.
+        headers.insert(INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), metadata.algorithm.clone());
+
         // Internal headers for decryption
         headers.insert(
             "x-rustfs-encryption-iv".to_string(),
@@ -809,18 +822,27 @@ impl ObjectEncryptionService {
     /// EncryptionMetadata parsed from headers
     ///
     pub fn headers_to_metadata(&self, headers: &HashMap<String, String>) -> Result<EncryptionMetadata> {
-        let algorithm = headers
+        let sse_mode = headers
             .get("x-amz-server-side-encryption")
             .ok_or_else(|| KmsError::validation_error("Missing encryption algorithm header"))?
             .clone();
 
-        let key_id = if algorithm == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
+        // Prefer the recorded cipher; fall back to the SSE mode for objects
+        // written before that header existed, where `AES256`/`aws:kms` was the
+        // only thing stored and AES-256-GCM was the only cipher in use.
+        let algorithm = match headers.get(INTERNAL_ENCRYPTION_ALGORITHM_HEADER) {
+            Some(algorithm) => algorithm.clone(),
+            None if sse_mode == "aws:kms" => EncryptionAlgorithm::Aes256.as_str().to_string(),
+            None => sse_mode.clone(),
+        };
+
+        let key_id = if sse_mode == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
             "sse-c".to_string()
         } else if let Some(key_id) = headers.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER) {
             key_id.clone()
         } else if let Some(kms_key_id) = headers.get("x-amz-server-side-encryption-aws-kms-key-id") {
             kms_key_id.clone()
-        } else if algorithm == "AES256" {
+        } else if sse_mode == "AES256" {
             self.get_default_key_id()
                 .cloned()
                 .ok_or_else(|| KmsError::validation_error("Missing key ID"))?
