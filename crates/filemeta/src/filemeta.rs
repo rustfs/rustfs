@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::replication::{
+    MAX_REPLICATION_TARGET_ARN_LEN, MAX_REPLICATION_TARGET_VERSION_ENTRIES, MAX_REPLICATION_TARGET_VERSION_ID_LEN,
+};
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
     ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
@@ -25,13 +28,14 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
-    SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
-    SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, contains_key_str, has_internal_suffix, insert_bytes,
-    is_internal_key, remove_bytes,
+    SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
+    contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::hash::Hasher;
 use std::io::{Read, Write};
@@ -139,6 +143,50 @@ fn cmp_shallow_versions_for_order(a: &FileMetaShallowVersion, b: &FileMetaShallo
 /// the reset state, and a rustfs-only key was invisible to MinIO-compatible
 /// readers (backlog#799 B16). Normalize every entry to the canonical
 /// `replication-reset-<arn>` suffix and write both prefixes.
+fn valid_target_delete_marker_version(arn: &str, version_id: &str) -> bool {
+    arn.starts_with("arn:")
+        && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+        && !version_id.is_empty()
+        && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+}
+
+/// Merge-only, never destructive.
+///
+/// `ReplicationState::target_delete_marker_version_ids` is skipped by the
+/// positional `FileInfo` wire form, so a delete that arrives over internode RPC
+/// carries an empty map. Treating that as authoritative would let a remote disk
+/// erase an exact target version that the local disk still holds. The key is
+/// included in the quorum hash, so such a divergence does surface — but as a
+/// quorum failure on an otherwise healthy object, which is not a state worth
+/// reaching. Merge the RPC metadata carrier instead, and only ever insert.
+fn persist_target_delete_marker_versions(
+    meta_sys: &mut HashMap<String, Vec<u8>>,
+    versions: &HashMap<String, String>,
+    transport_metadata: &HashMap<String, String>,
+) {
+    let mut bounded = BTreeMap::new();
+    let (transport_versions, _) = rustfs_utils::http::target_delete_marker_versions(transport_metadata);
+    for (arn, version_id) in transport_versions.iter().chain(versions.iter()) {
+        if !valid_target_delete_marker_version(arn, version_id)
+            || (bounded.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES
+                && bounded.last_key_value().is_some_and(|(largest, _)| arn >= *largest))
+        {
+            continue;
+        }
+        bounded.insert(arn, version_id);
+        if bounded.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+            bounded.pop_last();
+        }
+    }
+    for (arn, version_id) in bounded {
+        insert_bytes(
+            meta_sys,
+            &format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}"),
+            version_id.as_bytes().to_vec(),
+        );
+    }
+}
+
 fn persist_reset_statuses(meta_sys: &mut HashMap<String, Vec<u8>>, reset_statuses_map: &HashMap<String, String>) {
     for (k, v) in reset_statuses_map {
         let suffix = k
@@ -521,6 +569,11 @@ impl FileMeta {
                 && let Some(state) = fi.replication_state_internal.as_ref()
             {
                 persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
+                persist_target_delete_marker_versions(
+                    &mut delete_marker.meta_sys,
+                    &state.target_delete_marker_version_ids,
+                    &fi.metadata,
+                );
             }
         }
 
@@ -597,6 +650,11 @@ impl FileMeta {
 
                             if let Some(state) = fi.replication_state_internal.as_ref() {
                                 persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
+                                persist_target_delete_marker_versions(
+                                    &mut delete_marker.meta_sys,
+                                    &state.target_delete_marker_version_ids,
+                                    &fi.metadata,
+                                );
                             }
                         }
 
@@ -1278,6 +1336,90 @@ mod test {
     /// persisted under both internal prefixes, never as a bare ARN. A bare-ARN
     /// key (produced by `ObjectInfo::replication_state`) has no internal prefix,
     /// so read-back — which only recognizes prefixed keys — silently dropped it.
+    #[test]
+    fn persist_target_delete_marker_versions_uses_bounded_dual_prefixed_keys() {
+        let arn = "arn:rustfs:replication::target:bucket";
+        let version_id = "opaque-target-version";
+        let suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let versions = HashMap::from([
+            (arn.to_string(), version_id.to_string()),
+            ("not-an-arn".to_string(), "ignored".to_string()),
+            ("arn:too-long".to_string(), "x".repeat(MAX_REPLICATION_TARGET_VERSION_ID_LEN + 1)),
+        ]);
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &versions, &HashMap::new());
+
+        assert_eq!(
+            meta_sys.get(&format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(
+            meta_sys.get(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(meta_sys.len(), 2, "invalid or oversized mappings must not expand xl.meta");
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_caps_target_count() {
+        let versions = (0..=MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            .map(|index| (format!("arn:rustfs:replication::target:{index:04}"), format!("version-{index}")))
+            .collect();
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &versions, &HashMap::new());
+
+        assert_eq!(meta_sys.len(), MAX_REPLICATION_TARGET_VERSION_ENTRIES * 2);
+        let excluded_suffix = format!(
+            "{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:rustfs:replication::target:{MAX_REPLICATION_TARGET_VERSION_ENTRIES:04}"
+        );
+        assert!(!meta_sys.contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{excluded_suffix}")));
+        assert!(!meta_sys.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{excluded_suffix}")));
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_preserves_existing_targets_on_empty_update() {
+        let stale_suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:rustfs:replication::target:stale");
+        let mut meta_sys = HashMap::from([
+            (format!("{RUSTFS_INTERNAL_PREFIX}{stale_suffix}"), b"stale-rustfs".to_vec()),
+            (format!("{MINIO_INTERNAL_PREFIX}{stale_suffix}"), b"stale-minio".to_vec()),
+            ("unrelated".to_string(), b"kept".to_vec()),
+        ]);
+
+        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            meta_sys,
+            HashMap::from([
+                (format!("{RUSTFS_INTERNAL_PREFIX}{stale_suffix}"), b"stale-rustfs".to_vec()),
+                (format!("{MINIO_INTERNAL_PREFIX}{stale_suffix}"), b"stale-minio".to_vec()),
+                ("unrelated".to_string(), b"kept".to_vec()),
+            ])
+        );
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_reads_rpc_transport_metadata() {
+        let arn = "arn:rustfs:replication::target:remote";
+        let version_id = "opaque-remote-version";
+        let suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let mut transport_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut transport_metadata, &suffix, version_id.to_string());
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new(), &transport_metadata);
+
+        assert_eq!(
+            meta_sys.get(&format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(
+            meta_sys.get(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+    }
+
     #[test]
     fn persist_reset_statuses_normalizes_to_dual_prefixed_keys() {
         let arn = "arn:rustfs:replication::target:bucket";
