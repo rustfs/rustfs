@@ -1429,6 +1429,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let mut dirty = pending_staged_len > 0;
             let mut capped = initial_pending_len >= MRF_PENDING_CAP;
             let mut recovery_applied = false;
+            let mut channel_closed = false;
             let mut capped_payload = None;
             if capped {
                 warn!(
@@ -1445,6 +1446,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                if recovery_applied && channel_closed && !dirty && capped_batch.is_empty() {
+                    break;
+                }
                 if recovery_applied && (pending.len() >= MRF_PENDING_CAP || !capped_batch.is_empty()) {
                     if dirty {
                         if let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
@@ -1486,7 +1490,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     }
                     if !capped_batch.is_empty()
                         && let Some(duration_millis) =
-                            append_mrf_entries_to_disk(&capped_batch, &storage, &mut capped_payload).await
+                            append_mrf_entries_to_disk(&capped_batch, &storage, &mut capped_payload, &pending).await
                     {
                         for entry in &capped_batch {
                             durable_tracker.add_entry(entry);
@@ -1497,14 +1501,14 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         capped_batch.clear();
                         capped_payload = None;
                     }
-                    if rx.is_closed() && rx.is_empty() && capped_batch.is_empty() && !dirty {
+                    if channel_closed && capped_batch.is_empty() && !dirty {
                         break;
                     }
                     interval.tick().await;
                     continue;
                 }
                 tokio::select! {
-                    entry = rx.recv(), if pending.len() < MRF_PENDING_CAP => match entry {
+                    entry = rx.recv(), if !channel_closed && pending.len() < MRF_PENDING_CAP => match entry {
                         Some(e) => {
                             observe_mrf_pending(&e);
                             pending.push(e);
@@ -1515,7 +1519,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             // since the last write (measured against the flushed
                             // set, not the absolute length, so a large backlog is
                             // not rewritten on every single add).
-                            if new_entries_pending_stats >= 1000
+                            if recovery_applied
+                                && new_entries_pending_stats >= 1000
                                 && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
                             {
                                 add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
@@ -1530,18 +1535,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             }
                         }
                         None => {
-                            // Channel closed (pool shutting down) — final flush.
-                            if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
-                                add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
-                                set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
-                                let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
-                                observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
-                                if new_entries_pending_stats > 0 {
-                                    let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
-                                    dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
-                                }
-                            }
-                            break;
+                            channel_closed = true;
                         }
                     },
                     _ = recovery_complete.notified(), if !recovery_applied => {
@@ -1564,7 +1558,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         }
                     },
                     _ = interval.tick() => {
-                        if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                        if recovery_applied
+                            && dirty
+                            && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
+                        {
                             add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
                             set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
                             let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
@@ -2196,10 +2193,69 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
     }
 }
 
+async fn recover_corrupt_mrf_generation<S: ReplicationStorage>(
+    corrupt_generation: &[u8],
+    entries_to_append: &[MrfReplicateEntry],
+    known_pending: &[MrfReplicateEntry],
+    storage: &Arc<S>,
+    pending_payload: &mut Option<PendingMrfAppend>,
+    started: Instant,
+) -> Option<u64> {
+    let quarantine_file = format!("{MRF_CORRUPT_FILE_PREFIX}.{}.bin", OffsetDateTime::now_utc().unix_timestamp_nanos());
+    if let Err(error) = ReplicationConfigStore::save_no_lock(storage.clone(), &quarantine_file, corrupt_generation.to_vec()).await
+    {
+        warn!(
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION,
+            file = %quarantine_file,
+            error = %error,
+            "Failed to quarantine a corrupt active MRF generation before rebuilding it"
+        );
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(known_pending.len().saturating_add(entries_to_append.len()));
+    entries.extend_from_slice(known_pending);
+    entries.extend_from_slice(entries_to_append);
+    let data = match encode_mrf_file(&entries) {
+        Ok(data) => data,
+        Err(error) => {
+            observe_mrf_flush_failure(0);
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                count = entries.len(),
+                error = %error,
+                "Failed to rebuild the active MRF generation after quarantining corruption"
+            );
+            return None;
+        }
+    };
+    *pending_payload = Some(PendingMrfAppend {
+        digest: mrf_payload_digest(&data),
+        entry_count: entries.len(),
+    });
+    if let Err(error) =
+        ReplicationConfigStore::save_no_lock(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, data).await
+    {
+        observe_mrf_flush_failure(duration_millis_u64(started.elapsed()));
+        warn!(
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION,
+            count = entries.len(),
+            error = %error,
+            "Failed to replace the active MRF generation after quarantining corruption"
+        );
+        return None;
+    }
+    Some(duration_millis_u64(started.elapsed()))
+}
+
 async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
     entries_to_append: &[MrfReplicateEntry],
     storage: &Arc<S>,
     pending_payload: &mut Option<PendingMrfAppend>,
+    known_pending: &[MrfReplicateEntry],
 ) -> Option<u64> {
     if entries_to_append.is_empty() {
         return Some(0);
@@ -2251,10 +2307,9 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
             }
         };
 
-    let current_digest = mrf_payload_digest(&current);
     if pending_payload
         .as_ref()
-        .is_some_and(|pending| pending.digest == current_digest)
+        .is_some_and(|pending| pending.digest == mrf_payload_digest(&current))
     {
         return Some(duration_millis_u64(started.elapsed()));
     }
@@ -2269,7 +2324,8 @@ async fn append_mrf_entries_to_disk<S: ReplicationStorage>(
                 error = %error,
                 "Failed to decode MRF backlog before appending a capped entry"
             );
-            return None;
+            return recover_corrupt_mrf_generation(&current, entries_to_append, known_pending, storage, pending_payload, started)
+                .await;
         }
     };
     if let Some(pending) = pending_payload.as_ref()
@@ -2767,6 +2823,8 @@ mod tests {
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         first_read_started: Notify,
         delay_first_read: AtomicBool,
+        hold_first_read: AtomicBool,
+        allow_first_read: Notify,
         read_count: AtomicUsize,
         write_count: AtomicUsize,
         fail_next_write: AtomicBool,
@@ -2824,7 +2882,11 @@ mod tests {
             let read_index = self.shared.read_count.fetch_add(1, Ordering::SeqCst);
             if read_index == 0 && self.shared.delay_first_read.load(Ordering::SeqCst) {
                 self.shared.first_read_started.notify_waiters();
-                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                if self.shared.hold_first_read.load(Ordering::SeqCst) {
+                    self.shared.allow_first_read.notified().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                }
             }
 
             let data = self
@@ -3332,6 +3394,8 @@ mod tests {
             lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
             first_read_started: Notify::new(),
             delay_first_read: AtomicBool::new(false),
+            hold_first_read: AtomicBool::new(false),
+            allow_first_read: Notify::new(),
             read_count: AtomicUsize::new(0),
             write_count: AtomicUsize::new(0),
             fail_next_write: AtomicBool::new(false),
@@ -3980,6 +4044,8 @@ mod tests {
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 first_read_started: Notify::new(),
                 delay_first_read: AtomicBool::new(true),
+                hold_first_read: AtomicBool::new(false),
+                allow_first_read: Notify::new(),
                 read_count: AtomicUsize::new(0),
                 write_count: AtomicUsize::new(0),
                 fail_next_write: AtomicBool::new(false),
@@ -4163,7 +4229,7 @@ mod tests {
     async fn corrupt_mrf_quarantine_retries_without_blocking_new_failures() {
         temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
             let shared = empty_resync_shared_state();
-            shared.block_next_write.store(true, Ordering::SeqCst);
+            shared.fail_next_write.store(true, Ordering::SeqCst);
             *shared.data.lock().expect("test data lock should not be poisoned") = vec![0xde, 0xad, 0xbe, 0xef];
             let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-corrupt-retry", shared.clone()))).await;
 
@@ -4179,9 +4245,6 @@ mod tests {
                 .await
                 .expect("new failure should be staged during corrupt-file recovery");
 
-            tokio::time::timeout(Duration::from_secs(2), shared.write_started.notified())
-                .await
-                .expect("corrupt-file recovery should remain blocked while staging failures");
             pool.mrf_save_tx
                 .send(MrfReplicateEntry {
                     bucket: "mrf-corrupt-retry".to_string(),
@@ -4191,8 +4254,6 @@ mod tests {
                 })
                 .await
                 .expect("persister should drain the first staged failure before recovery completes");
-            shared.allow_write.notify_one();
-
             let processor_handle = pool
                 .task_handles
                 .lock()
@@ -4200,6 +4261,25 @@ mod tests {
                 .pop()
                 .expect("MRF processor task should be registered");
             processor_handle.await.expect("MRF processor should retry quarantine writes");
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
+                    let quarantined = writes
+                        .iter()
+                        .any(|(file, data)| file.starts_with(MRF_CORRUPT_FILE_PREFIX) && data == &[0xde, 0xad, 0xbe, 0xef]);
+                    let cleared = writes
+                        .iter()
+                        .any(|(file, data)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE && data.is_empty());
+                    if quarantined && cleared {
+                        break;
+                    }
+                    drop(writes);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("quarantine should retry after the injected write failure and clear the active path");
 
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -4226,7 +4306,7 @@ mod tests {
 
     #[tokio::test]
     async fn mrf_startup_staging_does_not_publish_entries_before_flush() {
-        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
             let shared = empty_resync_shared_state();
             *shared.data.lock().expect("test data lock should not be poisoned") = encode_mrf_file(&[MrfReplicateEntry {
                 bucket: "mrf-durable-seed".to_string(),
@@ -4256,9 +4336,17 @@ mod tests {
                 })
                 .await
                 .expect("staged MRF entry should be accepted");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                shared.write_count.load(Ordering::SeqCst),
+                0,
+                "staged entries must not flush before startup recovery is applied"
+            );
+            *pool.mrf_recovery_result.lock().await = Some(Vec::new());
+            pool.mrf_recovery_complete.notify_one();
             tokio::time::timeout(Duration::from_secs(3), write_started)
                 .await
-                .expect("first flush should block after seeding the durable backlog");
+                .expect("first flush should block after startup recovery is applied");
 
             let snapshot = durable_mrf_backlog_summary_snapshot();
             assert_eq!(
@@ -4283,6 +4371,76 @@ mod tests {
             handle.abort();
             let _ = handle.await;
             set_durable_mrf_backlog_snapshot(DurableMrfBacklogSnapshot::default());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mrf_persister_does_not_eager_flush_before_recovery_snapshot() {
+        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
+            let shared = empty_resync_shared_state();
+            *shared.data.lock().expect("test data lock should not be poisoned") =
+                encode_mrf_file(&[MrfReplicateEntry::default()]).expect("seed MRF backlog should encode");
+            shared.delay_first_read.store(true, Ordering::SeqCst);
+            shared.hold_first_read.store(true, Ordering::SeqCst);
+            let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-recovery-gate", shared.clone()))).await;
+
+            pool.start_mrf_processor().await;
+            tokio::time::timeout(Duration::from_secs(2), shared.first_read_started.notified())
+                .await
+                .expect("processor startup read should be delayed");
+            pool.start_mrf_persister().await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if shared.read_count.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("persister should finish its startup snapshot while processor is delayed");
+
+            for index in 0..1000 {
+                pool.mrf_save_tx
+                    .send(MrfReplicateEntry {
+                        bucket: "mrf-recovery-gate".to_string(),
+                        object: format!("staged-{index}"),
+                        op: MrfOpKind::Object,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("failure should be accepted before recovery completes");
+            }
+            assert_eq!(
+                shared.write_count.load(Ordering::SeqCst),
+                0,
+                "the eager 1,000-entry threshold must not flush before recovery snapshot completion"
+            );
+
+            shared.allow_first_read.notify_one();
+            let processor_handle = pool.task_handles.lock().await.remove(0);
+            processor_handle.await.expect("processor recovery should complete");
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let data = shared.data.lock().expect("test data lock should not be poisoned").clone();
+                    if decode_mrf_file(&data).is_ok_and(|entries| entries.len() == 1001) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("staged failures should flush after recovery snapshot completion");
+
+            let persister_handle = pool
+                .task_handles
+                .lock()
+                .await
+                .pop()
+                .expect("MRF persister task should be registered");
+            persister_handle.abort();
         })
         .await;
     }
@@ -4456,7 +4614,7 @@ mod tests {
         let mut pending_payload = None;
 
         assert_eq!(
-            append_mrf_entries_to_disk(std::slice::from_ref(&appended), &storage, &mut pending_payload).await,
+            append_mrf_entries_to_disk(std::slice::from_ref(&appended), &storage, &mut pending_payload, &[]).await,
             None,
             "the injected post-commit error should leave the capped batch pending"
         );
@@ -4466,13 +4624,13 @@ mod tests {
         };
         let mut concurrent_payload = None;
         assert!(
-            append_mrf_entries_to_disk(std::slice::from_ref(&concurrent), &storage, &mut concurrent_payload)
+            append_mrf_entries_to_disk(std::slice::from_ref(&concurrent), &storage, &mut concurrent_payload, &[])
                 .await
                 .is_some(),
             "a concurrent node should be able to append after the ambiguous save"
         );
         assert!(
-            append_mrf_entries_to_disk(std::slice::from_ref(&appended), &storage, &mut pending_payload)
+            append_mrf_entries_to_disk(std::slice::from_ref(&appended), &storage, &mut pending_payload, &[])
                 .await
                 .is_some(),
             "retry should recognize the already-committed payload"
@@ -4492,6 +4650,51 @@ mod tests {
             2,
             "retry must not write the appended MRF batch twice"
         );
+    }
+
+    #[tokio::test]
+    async fn mrf_capped_append_recovers_a_late_corrupt_generation() {
+        let shared = empty_resync_shared_state();
+        let retained = MrfReplicateEntry {
+            bucket: "mrf-late-corruption".to_string(),
+            object: "retained".to_string(),
+            op: MrfOpKind::Object,
+            ..Default::default()
+        };
+        let appended = MrfReplicateEntry {
+            bucket: retained.bucket.clone(),
+            object: "appended-after-corruption".to_string(),
+            op: MrfOpKind::Object,
+            ..Default::default()
+        };
+        *shared.data.lock().expect("test data lock should not be poisoned") = vec![0xde, 0xad, 0xbe, 0xef];
+        let storage = Arc::new(LoadResyncNodeStore::new("mrf-late-corruption", shared.clone()));
+        let mut pending_payload = None;
+
+        assert!(
+            append_mrf_entries_to_disk(
+                std::slice::from_ref(&appended),
+                &storage,
+                &mut pending_payload,
+                std::slice::from_ref(&retained),
+            )
+            .await
+            .is_some(),
+            "a corrupt active generation should be quarantined and rebuilt"
+        );
+
+        let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
+        assert!(
+            writes
+                .iter()
+                .any(|(file, data)| file.starts_with(MRF_CORRUPT_FILE_PREFIX) && data == &[0xde, 0xad, 0xbe, 0xef]),
+            "the corrupt active generation should be retained in quarantine"
+        );
+        let recovered = decode_mrf_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("the active MRF generation should be rebuilt");
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].object, retained.object);
+        assert_eq!(recovered[1].object, appended.object);
     }
 
     #[tokio::test]
