@@ -405,7 +405,7 @@ pub async fn persist_force_delete_intent<S: ReplicationStorage>(
     mut entry: MrfReplicateEntry,
 ) -> Result<(), EcstoreError> {
     entry.force_delete_local_commit = false;
-    update_force_delete_intents(storage, move |entries, _exists| {
+    update_force_delete_intents(storage, false, move |entries, _exists| {
         if entries
             .iter()
             .any(|existing| existing.force_delete_id == entry.force_delete_id)
@@ -422,7 +422,7 @@ pub async fn commit_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
-    update_force_delete_intents(storage, move |entries, exists| {
+    update_force_delete_intents(storage, true, move |entries, exists| {
         if !exists {
             return Err(EcstoreError::ConfigNotFound);
         }
@@ -442,7 +442,7 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
     storage: Arc<S>,
     operation_id: uuid::Uuid,
 ) -> Result<(), EcstoreError> {
-    update_force_delete_intents(storage, move |entries, exists| {
+    update_force_delete_intents(storage, false, move |entries, exists| {
         if !exists {
             return Ok(false);
         }
@@ -455,13 +455,20 @@ pub async fn complete_force_delete_intent<S: ReplicationStorage>(
 
 const FORCE_DELETE_INTENT_CAS_RETRIES: usize = 2;
 
-async fn update_force_delete_intents<S, F>(storage: Arc<S>, mut update: F) -> Result<(), EcstoreError>
+async fn update_force_delete_intents<S, F>(
+    storage: Arc<S>,
+    retry_until_committed: bool,
+    mut update: F,
+) -> Result<(), EcstoreError>
 where
     S: ReplicationStorage,
     F: FnMut(&mut Vec<MrfReplicateEntry>, bool) -> Result<bool, EcstoreError>,
 {
     let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
-    for attempt in 0..=FORCE_DELETE_INTENT_CAS_RETRIES {
+    let mut attempt = 0usize;
+    loop {
+        // The transaction lock serializes journal read-modify-write operations. Conditional
+        // persistence then takes the journal object's lock, so this order must remain stable.
         let lock = storage
             .new_ns_lock(
                 ReplicationMetadataStore::rustfs_meta_bucket(),
@@ -474,11 +481,14 @@ where
             return Ok(());
         }
         match save_force_delete_intents(storage.clone(), file, &guard, entries, preconditions).await {
-            Err(EcstoreError::PreconditionFailed) if attempt < FORCE_DELETE_INTENT_CAS_RETRIES => continue,
+            Err(EcstoreError::PreconditionFailed) if retry_until_committed || attempt < FORCE_DELETE_INTENT_CAS_RETRIES => {
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
             result => return result,
         }
     }
-    unreachable!("force-delete journal retry loop always returns")
 }
 
 async fn read_force_delete_intents<S: ReplicationObjectIO>(
@@ -2371,7 +2381,7 @@ mod tests {
         StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageNamespaceLocking, StorageObjectInfoOrErr, WalkOptions,
     };
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::fmt::{Debug, Formatter};
     use std::io::Cursor;
     use std::sync::Mutex as StdMutex;
@@ -2390,7 +2400,7 @@ mod tests {
         last_put_preconditions: StdMutex<Option<HTTPPreconditions>>,
         last_put_no_lock: AtomicBool,
         omit_etag: AtomicBool,
-        replace_before_next_conditional_write: StdMutex<Option<Vec<u8>>>,
+        conditional_write_replacements: StdMutex<VecDeque<Vec<u8>>>,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         first_read_started: Notify,
         delay_first_read: AtomicBool,
@@ -2484,10 +2494,10 @@ mod tests {
             if opts.http_preconditions.is_some()
                 && let Some(replacement) = self
                     .shared
-                    .replace_before_next_conditional_write
+                    .conditional_write_replacements
                     .lock()
                     .expect("test replacement lock should not be poisoned")
-                    .take()
+                    .pop_front()
             {
                 *self.shared.data.lock().expect("test data lock should not be poisoned") = replacement;
                 self.shared.etag_revision.fetch_add(1, Ordering::SeqCst);
@@ -2982,7 +2992,7 @@ mod tests {
             last_put_preconditions: StdMutex::new(None),
             last_put_no_lock: AtomicBool::new(false),
             omit_etag: AtomicBool::new(false),
-            replace_before_next_conditional_write: StdMutex::new(None),
+            conditional_write_replacements: StdMutex::new(VecDeque::new()),
             lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
             first_read_started: Notify::new(),
             delay_first_read: AtomicBool::new(false),
@@ -3633,7 +3643,7 @@ mod tests {
                 last_put_preconditions: StdMutex::new(None),
                 last_put_no_lock: AtomicBool::new(false),
                 omit_etag: AtomicBool::new(false),
-                replace_before_next_conditional_write: StdMutex::new(None),
+                conditional_write_replacements: StdMutex::new(VecDeque::new()),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 first_read_started: Notify::new(),
                 delay_first_read: AtomicBool::new(true),
@@ -4217,11 +4227,11 @@ mod tests {
             op: MrfOpKind::Delete,
             ..Default::default()
         };
-        *shared
-            .replace_before_next_conditional_write
+        shared
+            .conditional_write_replacements
             .lock()
-            .expect("test replacement lock should not be poisoned") =
-            Some(encode_mrf_file(&[entry, concurrent.clone()]).expect("concurrent journal entries should encode"));
+            .expect("test replacement lock should not be poisoned")
+            .push_back(encode_mrf_file(&[entry, concurrent.clone()]).expect("concurrent journal entries should encode"));
 
         complete_force_delete_intent(storage.clone(), operation_id)
             .await
@@ -4234,6 +4244,45 @@ mod tests {
         assert_eq!(entries.len(), 1, "cleanup must preserve only the concurrent journal entry");
         assert_eq!(entries[0].force_delete_id, concurrent.force_delete_id);
         assert_eq!(entries[0].object, concurrent.object);
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_commit_retries_past_the_bounded_cas_conflict_limit() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(operation_id),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("journal append should succeed");
+        let mut replacements = shared
+            .conditional_write_replacements
+            .lock()
+            .expect("test replacement lock should not be poisoned");
+        for object in ["first", "second", "third"] {
+            let mut replacement = entry.clone();
+            replacement.object = object.to_string();
+            replacements.push_back(encode_mrf_file(&[replacement]).expect("concurrent journal entry should encode"));
+        }
+        drop(replacements);
+
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("commit marker must retry until it is durable");
+
+        let data = ReplicationConfigStore::read(storage, ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should remain readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].force_delete_local_commit);
+        assert_eq!(entries[0].force_delete_id, Some(operation_id));
     }
 
     #[tokio::test]

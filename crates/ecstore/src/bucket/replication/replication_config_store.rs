@@ -75,7 +75,7 @@ impl ReplicationConfigStore {
     where
         S: ReplicationObjectIO,
     {
-        com::save_config_with_opts(
+        com::save_config_with_opts_quiet(
             api,
             file,
             data,
