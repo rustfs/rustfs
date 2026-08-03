@@ -54,8 +54,8 @@ use crate::disk::{
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
-    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params, create_bitrot_reader_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled, object_mmap_read_max_length,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -63,6 +63,7 @@ use metrics::counter;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    io::Cursor,
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
@@ -1406,6 +1407,101 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
     }
 }
 
+/// When all online shards are local and mmap-read is enabled, materialize
+/// shard bytes with one `batch_shard_pread` instead of per-shard
+/// `spawn_blocking` via `open_disk_reader`.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> Option<BitrotReaderSetup> {
+    use crate::disk::local::batch_shard_pread;
+
+    let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
+    if adj_len > object_mmap_read_max_length() {
+        return None;
+    }
+
+    let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
+    for (idx, disk_op) in disks.iter().enumerate() {
+        if files.get(idx).is_some_and(|fi| fi.data.is_some()) {
+            return None;
+        }
+        if let Some(disk) = disk_op.as_ref() {
+            let data_dir = files[idx].data_dir.unwrap_or_default();
+            let path_str = format!("{object}/{data_dir}/part.{part_number}");
+            match disk.get_object_path_if_local(bucket, &path_str) {
+                Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
+                _ => return None,
+            }
+        }
+    }
+
+    if batch_items.is_empty() {
+        return None;
+    }
+
+    let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
+    let batch_results = batch_shard_pread(requests).await;
+
+    let mut setup = BitrotReaderSetup::new(disks.len());
+    for (i, (idx, _, _, _)) in batch_items.iter().enumerate() {
+        setup.mark_scheduled(*idx);
+        match &batch_results[i] {
+            Ok(bytes) => {
+                let reader = BitrotReader::new(
+                    ShardReader::InMemory(Cursor::new(bytes.clone())),
+                    shard_size,
+                    checksum_algo.clone(),
+                    skip_verify_bitrot,
+                );
+                setup.apply_reader_result(*idx, Ok(Some(reader)));
+            }
+            Err(e) => {
+                setup.apply_reader_result(*idx, Err(e.clone()));
+            }
+        }
+    }
+
+    for (idx, disk_op) in disks.iter().enumerate() {
+        if setup.scheduled[idx] {
+            continue;
+        }
+        setup.mark_scheduled(idx);
+        if disk_op.is_none() {
+            setup.apply_reader_result(idx, Ok(None));
+        }
+    }
+
+    Some(setup)
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread(
+    _files: &[FileInfo],
+    _disks: &[Option<DiskStore>],
+    _bucket: &str,
+    _object: &str,
+    _part_number: usize,
+    _read_offset: usize,
+    _read_length: usize,
+    _shard_size: usize,
+    _checksum_algo: HashAlgorithm,
+    _skip_verify_bitrot: bool,
+) -> Option<BitrotReaderSetup> {
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     files: &[FileInfo],
@@ -1564,6 +1660,44 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
+
+    if use_mmap_read
+        && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+        )
+        .await
+    {
+        record_bitrot_reader_setup_strategy(strategy, mode, attribution);
+        fill_deferred_bitrot_readers(
+            &mut setup,
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo,
+            skip_verify_bitrot,
+            use_mmap_read,
+            data_shards,
+            parity_shards,
+            mode,
+        );
+        record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
+        return setup;
+    }
+
     if strategy == BitrotReaderSetupStrategy::AllShards {
         return create_bitrot_readers_until_quorum_all_shards(
             files,

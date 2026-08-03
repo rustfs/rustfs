@@ -428,10 +428,20 @@ fn wrap_first_read_metrics(reader: FileReader, metrics_path: Option<&'static str
 }
 
 fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksum_algo: HashAlgorithm) -> (usize, usize) {
-    (
-        offset.div_ceil(shard_size) * checksum_algo.size() + offset,
-        length.div_ceil(shard_size) * checksum_algo.size() + length,
-    )
+    adjust_shard_read_params(offset, length, shard_size, &checksum_algo)
+}
+
+/// Adjusts a raw (offset, length) pair to account for per-shard checksum overhead.
+/// Returns (adjusted_offset, adjusted_length).
+pub(crate) fn adjust_shard_read_params(
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: &HashAlgorithm,
+) -> (usize, usize) {
+    let adj_len = length.div_ceil(shard_size) * checksum_algo.size() + length;
+    let adj_off = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
+    (adj_off, adj_len)
 }
 
 /// Create a BitrotReader from either inline data or disk file stream

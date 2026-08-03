@@ -705,6 +705,10 @@ impl LocalDiskWrapper {
         self.disk.clone()
     }
 
+    pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
+        self.disk.get_object_path(volume, path)
+    }
+
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         self.health.runtime_state()
     }

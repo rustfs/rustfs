@@ -6643,6 +6643,50 @@ impl LocalDisk {
     }
 }
 
+/// Batch positioned reads for local EC shard files in a single `spawn_blocking`.
+///
+/// Collapses per-shard blocking-pool round-trips that dominate warm GET
+/// fan-out on single-node multi-disk topologies.
+#[cfg(unix)]
+pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+    let n = requests.len();
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+
+        let mut results = Vec::with_capacity(n);
+        for (file_path, offset, length) in requests {
+            let r = (|| -> Result<Bytes> {
+                let meta = std::fs::metadata(&file_path).map_err(DiskError::from)?;
+                let end = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+                if meta.len() < end as u64 {
+                    return Err(DiskError::FileCorrupt);
+                }
+
+                let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                let mut buf = vec![0u8; length];
+                let mut total = 0usize;
+                while total < length {
+                    let nbytes = file
+                        .read_at(&mut buf[total..], (offset + total) as u64)
+                        .map_err(DiskError::from)?;
+                    if nbytes == 0 {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    total += nbytes;
+                }
+                Ok(Bytes::from(buf))
+            })();
+            results.push(r);
+        }
+        results
+    })
+    .await
+    .unwrap_or_else(|e| {
+        let msg = format!("spawn_blocking join: {e}");
+        (0..n).map(|_| Err(DiskError::other(msg.clone()))).collect()
+    })
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
     fn to_string(&self) -> String {
@@ -17783,5 +17827,45 @@ mod test {
             mean,
             (reads * shard_mib) as f64 / wall,
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_basic() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let payloads: &[&[u8]] = &[b"aaaaaa", b"bbbbbb", b"cccccc"];
+        let mut requests = Vec::new();
+        for (i, payload) in payloads.iter().enumerate() {
+            let p = dir.path().join(format!("shard-{i}.bin"));
+            std::fs::write(&p, payload).unwrap();
+            requests.push((p, 0usize, payload.len()));
+        }
+
+        let results = batch_shard_pread(requests).await;
+        assert_eq!(results.len(), payloads.len());
+        for (result, expected) in results.iter().zip(payloads.iter()) {
+            assert_eq!(result.as_ref().unwrap().as_ref(), *expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_partial_errors() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let good_path = dir.path().join("good.bin");
+        std::fs::write(&good_path, b"good data").unwrap();
+        let missing_path = dir.path().join("does-not-exist.bin");
+
+        let requests = vec![(good_path, 0usize, 9usize), (missing_path, 0usize, 4usize)];
+
+        let results = batch_shard_pread(requests).await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert_eq!(results[0].as_ref().unwrap().as_ref(), b"good data");
+        assert!(results[1].is_err());
     }
 }
