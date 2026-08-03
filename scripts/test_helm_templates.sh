@@ -362,6 +362,16 @@ if ! grep -q 'svc\.cluster\.local"' <<<"$cert_default"; then
   echo "Default mTLS server cert SANs must use svc.cluster.local" >&2
   exit 1
 fi
+if grep -q 'example\.rustfs\.com' <<<"$cert_default"; then
+  echo "mTLS server cert SANs must not include the default external ingress host" >&2
+  exit 1
+fi
+
+cert_external_host=$(render_server_cert --set ingress.hosts[0].host=storage.example.test)
+if grep -q 'storage\.example\.test' <<<"$cert_external_host"; then
+  echo "mTLS server cert SANs must not include custom external ingress hosts" >&2
+  exit 1
+fi
 
 cert_custom=$(render_server_cert --set clusterDomain=cluster.internal)
 if ! grep -q 'svc\.cluster\.internal"' <<<"$cert_custom"; then
