@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::replication_config_store::ReplicationConfigStore;
-use super::replication_error_boundary::Error as EcstoreError;
+use super::replication_error_boundary::{Error as EcstoreError, is_err_object_not_found, is_err_version_not_found};
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
     ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replicate_decision_for_admitted_targets,
@@ -1147,8 +1147,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                     bucket = %entry.bucket,
                                     object = %entry.object,
                                     error = %e,
-                                    "MRF recovery: object not found, skipping"
+                                    "MRF recovery: source object lookup failed"
                                 );
+                                if !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                                    retry_entries.push(entry.clone());
+                                }
                                 continue;
                             }
                         };
@@ -1179,8 +1182,11 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                     bucket = %entry.bucket,
                                     object = %entry.object,
                                     error = %e,
-                                    "MRF metadata recovery: object not found, skipping"
+                                    "MRF metadata recovery: source object lookup failed"
                                 );
+                                if !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                                    retry_entries.push(entry.clone());
+                                }
                                 continue;
                             }
                         };
