@@ -4415,7 +4415,11 @@ mod tests {
 
         let entries = decode_mrf_file(&shared.data.lock().expect("test data lock should not be poisoned"))
             .expect("persisted MRF backlog should decode");
-        assert_eq!(entries, vec![initial, appended]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].bucket, initial.bucket);
+        assert_eq!(entries[0].object, initial.object);
+        assert_eq!(entries[1].bucket, appended.bucket);
+        assert_eq!(entries[1].object, appended.object);
         assert_eq!(
             shared.write_count.load(Ordering::SeqCst),
             1,
