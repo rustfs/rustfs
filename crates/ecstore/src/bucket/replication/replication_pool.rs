@@ -521,6 +521,7 @@ pub struct ReplicationPool<S: ReplicationStorage> {
     mrf_save_tx: Sender<MrfReplicateEntry>,
     mrf_save_rx: Mutex<Option<Receiver<MrfReplicateEntry>>>,
     mrf_recovery_complete: Arc<Notify>,
+    mrf_recovery_result: Arc<Mutex<Option<Vec<MrfReplicateEntry>>>>,
 
     // Control channels
     mrf_worker_kill_tx: Sender<()>,
@@ -565,6 +566,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
             mrf_recovery_complete: Arc::new(Notify::new()),
+            mrf_recovery_result: Arc::new(Mutex::new(None)),
             mrf_worker_kill_tx,
             mrf_stop_tx,
             mrf_worker_size: AtomicI32::new(0),
@@ -578,9 +580,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         pool.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
 
         // Start background tasks
+        pool.start_mrf_persister().await;
         pool.start_mrf_processor().await;
         pool.start_force_delete_processor().await;
-        pool.start_mrf_persister().await;
 
         pool
     }
@@ -1005,6 +1007,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     async fn start_mrf_processor(&self) {
         let storage = self.storage.clone();
         let recovery_complete = self.mrf_recovery_complete.clone();
+        let recovery_result = self.mrf_recovery_result.clone();
 
         let handle = tokio::spawn(async move {
             let data = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
@@ -1014,6 +1017,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         available: true,
                         buckets: Vec::new(),
                     });
+                    *recovery_result.lock().await = Some(Vec::new());
                     recovery_complete.notify_one();
                     return;
                 }
@@ -1153,7 +1157,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                     error = %e,
                                     "MRF recovery: source object lookup failed"
                                 );
-                                if !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                                if should_retry_mrf_source_lookup(&e) {
                                     retry_entries.push(entry.clone());
                                 }
                                 continue;
@@ -1188,7 +1192,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                     error = %e,
                                     "MRF metadata recovery: source object lookup failed"
                                 );
-                                if !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                                if should_retry_mrf_source_lookup(&e) {
                                     retry_entries.push(entry.clone());
                                 }
                                 continue;
@@ -1205,21 +1209,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 }
             }
 
-            // Retain entries that could not be admitted. A runtime or pool outage must not
-            // turn a durable retry into an in-memory-only admission followed by data loss.
-            let replay_data = encode_mrf_file(&retry_entries).unwrap_or_default();
-            if let Err(e) =
-                ReplicationConfigStore::save(storage, ReplicationMetadataStore::MRF_REPLICATION_FILE, replay_data).await
-            {
-                warn!(
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    error = %e,
-                    "Failed to update MRF recovery file after replay — entries may be replayed again on next restart"
-                );
-            } else {
-                set_durable_mrf_backlog_snapshot(durable_mrf_backlog_summary_from_entries(&retry_entries));
-            }
+            let retained_count = retry_entries.len();
+            *recovery_result.lock().await = Some(retry_entries);
+            recovery_complete.notify_one();
 
             if queued_count > 0 {
                 info!(
@@ -1227,11 +1219,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
                     recovered = queued_count,
                     total,
-                    retained = retry_entries.len(),
+                    retained = retained_count,
                     "Replayed MRF entries admitted for retry"
                 );
             }
-            recovery_complete.notify_one();
         });
         self.task_handles.lock().await.push(handle);
     }
@@ -1312,12 +1303,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
         let stats = self.stats.clone();
         let recovery_complete = self.mrf_recovery_complete.clone();
+        let recovery_result = self.mrf_recovery_result.clone();
 
         let handle = tokio::spawn(async move {
-            // Startup replay rewrites the file with only entries that could not be
-            // admitted. Load that result before accepting new failures so the first
-            // flush cannot erase the retained recovery backlog.
-            recovery_complete.notified().await;
             let mut pending =
                 match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
                     Ok(data) => match decode_mrf_file(&data) {
@@ -1366,6 +1354,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let mut flushed_len = initial_pending_len;
             let mut dirty = false;
             let mut capped = initial_pending_len >= MRF_PENDING_CAP;
+            let mut recovery_applied = false;
+            let mut disk_appended = Vec::new();
             if capped {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
@@ -1381,11 +1371,16 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                if pending.len() >= MRF_PENDING_CAP {
-                    if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                if pending.len() >= MRF_PENDING_CAP && recovery_applied {
+                    let appended_len = disk_appended.len();
+                    if (dirty || !disk_appended.is_empty())
+                        && let Some(duration_millis) = flush_mrf_pending_to_disk(&mut pending, &mut disk_appended, &storage).await
+                    {
                         set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
-                        observe_mrf_pending_flushed(&pending[flushed_len..], duration_millis);
-                        dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
+                        let persisted_start = flushed_len;
+                        let persisted_end = pending.len().saturating_sub(appended_len);
+                        observe_mrf_pending_flushed(&pending[persisted_start..persisted_end], duration_millis);
+                        dec_mrf_entries(stats.as_ref(), &pending[persisted_start..persisted_end]);
                         flushed_len = pending.len();
                         dirty = false;
                     }
@@ -1398,14 +1393,27 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                             "MRF pending backlog reached capacity — applying backpressure"
                         );
                     }
-                    if rx.is_closed() && !dirty {
+                    while let Ok(entry) = rx.try_recv() {
+                        if !dirty && disk_appended.is_empty() && append_mrf_entry_to_disk(&entry, &storage).await {
+                            durable_tracker.add_entry(&entry);
+                            observe_mrf_pending(&entry);
+                            dec_mrf_entries(stats.as_ref(), std::slice::from_ref(&entry));
+                            disk_appended.push(entry);
+                        } else {
+                            durable_tracker.add_entry(&entry);
+                            observe_mrf_pending(&entry);
+                            pending.push(entry);
+                            dirty = true;
+                        }
+                    }
+                    if rx.is_closed() && rx.is_empty() && !dirty && disk_appended.is_empty() {
                         break;
                     }
                     interval.tick().await;
                     continue;
                 }
                 tokio::select! {
-                    entry = rx.recv() => match entry {
+                    entry = rx.recv(), if pending.len() < MRF_PENDING_CAP => match entry {
                         Some(e) => {
                             durable_tracker.add_entry(&e);
                             observe_mrf_pending(&e);
@@ -1433,6 +1441,17 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                 dec_mrf_entries(stats.as_ref(), &pending[flushed_len..]);
                             }
                             break;
+                        }
+                    },
+                    _ = recovery_complete.notified(), if !recovery_applied => {
+                        recovery_applied = true;
+                        if let Some(retry_entries) = recovery_result.lock().await.take() {
+                            let new_entries = pending.split_off(initial_pending_len.min(pending.len()));
+                            let new_entries_len = new_entries.len();
+                            pending = retry_entries;
+                            pending.extend(new_entries);
+                            flushed_len = pending.len().saturating_sub(new_entries_len);
+                            dirty = true;
                         }
                     },
                     _ = interval.tick() => {
@@ -1948,6 +1967,10 @@ async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8
     }
 }
 
+fn should_retry_mrf_source_lookup(error: &EcstoreError) -> bool {
+    !is_err_object_not_found(error) && !is_err_version_not_found(error)
+}
+
 fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
     for entry in entries {
         stats.dec_q(&entry.bucket, entry.size, matches!(entry.op, MrfOpKind::Delete), ReplicationType::Heal);
@@ -1991,6 +2014,53 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
             None
         }
     }
+}
+
+async fn flush_mrf_pending_to_disk<S: ReplicationObjectIO>(
+    pending: &mut Vec<MrfReplicateEntry>,
+    disk_appended: &mut Vec<MrfReplicateEntry>,
+    storage: &Arc<S>,
+) -> Option<u64> {
+    if disk_appended.is_empty() {
+        return flush_mrf_to_disk(pending, storage).await;
+    }
+
+    let mut combined = Vec::with_capacity(pending.len() + disk_appended.len());
+    combined.extend_from_slice(pending);
+    combined.extend(disk_appended.iter().cloned());
+    let duration_millis = flush_mrf_to_disk(&combined, storage).await?;
+    *pending = combined;
+    disk_appended.clear();
+    Some(duration_millis)
+}
+
+async fn append_mrf_entry_to_disk<S: ReplicationObjectIO>(entry: &MrfReplicateEntry, storage: &Arc<S>) -> bool {
+    let mut entries = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
+        Ok(data) => match decode_mrf_file(&data) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = %error,
+                    "Failed to decode MRF backlog before appending a capped entry"
+                );
+                return false;
+            }
+        },
+        Err(EcstoreError::ConfigNotFound) => Vec::new(),
+        Err(error) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                error = %error,
+                "Failed to read MRF backlog before appending a capped entry"
+            );
+            return false;
+        }
+    };
+    entries.push(entry.clone());
+    flush_mrf_to_disk(&entries, storage).await.is_some()
 }
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
@@ -2249,8 +2319,9 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         return ReplicationQueueAdmission::Skipped;
     }
 
-    let rcfg = match ReplicationMetadataStore::replication_config(bucket).await {
-        Ok((config, _)) => config,
+    let rcfg = match ReplicationMetadataStore::optional_replication_config(bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => return ReplicationQueueAdmission::Skipped,
         Err(err) => {
             debug!(
                 event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
@@ -2750,6 +2821,7 @@ mod tests {
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
             mrf_recovery_complete: Arc::new(Notify::new()),
+            mrf_recovery_result: Arc::new(Mutex::new(None)),
             mrf_worker_kill_tx,
             mrf_stop_tx,
             mrf_worker_size: AtomicI32::new(0),
@@ -3722,6 +3794,26 @@ mod tests {
         assert!(!got.delete_marker);
     }
 
+    #[test]
+    fn mrf_object_replay_source_lookup_discards_missing_objects_and_retries_transient_errors() {
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::FileNotFound));
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::FileVersionNotFound));
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::VersionNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+        assert!(should_retry_mrf_source_lookup(&EcstoreError::Unexpected));
+    }
+
+    #[test]
+    fn mrf_metadata_replay_source_lookup_discards_missing_objects_and_retries_transient_errors() {
+        for error in [EcstoreError::FileNotFound, EcstoreError::FileVersionNotFound] {
+            assert!(!should_retry_mrf_source_lookup(&error));
+        }
+        assert!(should_retry_mrf_source_lookup(&EcstoreError::Unexpected));
+    }
+
     #[tokio::test]
     async fn corrupt_mrf_file_is_quarantined_without_overwriting_recovery_data() {
         let shared = empty_resync_shared_state();
@@ -3768,6 +3860,7 @@ mod tests {
                 encode_mrf_file(std::slice::from_ref(&retained)).expect("MRF entry should encode");
             let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-seed", shared.clone()))).await;
 
+            pool.start_mrf_persister().await;
             pool.start_mrf_processor().await;
             let processor_handle = pool
                 .task_handles
@@ -3776,8 +3869,6 @@ mod tests {
                 .pop()
                 .expect("MRF processor task should be registered");
             processor_handle.await.expect("MRF processor should not panic");
-
-            pool.start_mrf_persister().await;
             pool.mrf_save_tx
                 .send(MrfReplicateEntry {
                     bucket: "mrf-replay-seed".to_string(),
@@ -3822,7 +3913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mrf_delete_replay_is_retained_when_runtime_pool_is_unavailable() {
+    async fn mrf_delete_replay_result_is_retained_when_runtime_pool_is_unavailable() {
         assert!(
             runtime_sources::replication_pool().is_none(),
             "test requires the runtime replication pool to be unavailable"
@@ -3847,16 +3938,18 @@ mod tests {
             .pop()
             .expect("MRF processor task should be registered");
         handle.await.expect("MRF processor should not panic");
-
-        let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
-        let (file, data) = writes.last().expect("replay should rewrite the MRF file");
-        assert_eq!(file, ReplicationMetadataStore::MRF_REPLICATION_FILE);
-        let retained = decode_mrf_file(data).expect("retained MRF entry should decode");
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].bucket, entry.bucket);
-        assert_eq!(retained[0].object, entry.object);
-        assert_eq!(retained[0].version_id, entry.version_id);
-        assert_eq!(retained[0].target_arns, entry.target_arns);
+        let retained = pool
+            .mrf_recovery_result
+            .lock()
+            .await
+            .take()
+            .expect("processor should publish retry entries")
+            .pop()
+            .expect("the unavailable runtime pool should retain the entry");
+        assert_eq!(retained.bucket, entry.bucket);
+        assert_eq!(retained.object, entry.object);
+        assert_eq!(retained.version_id, entry.version_id);
+        assert_eq!(retained.target_arns, entry.target_arns);
     }
 
     #[test]

@@ -215,14 +215,17 @@ impl MrfEnvelope {
             return Err(MrfEnvelopeError::UnsupportedFormat { format });
         }
         let version = LittleEndian::read_u16(&data[6..8]);
-        if version != supported.version {
-            return Err(MrfEnvelopeError::UnsupportedVersion { version });
-        }
         let min_reader_version = LittleEndian::read_u16(&data[8..10]);
         if min_reader_version > supported.version {
             return Err(MrfEnvelopeError::RollbackFenced {
                 min_reader_version,
                 supported_version: supported.version,
+            });
+        }
+        if min_reader_version > version {
+            return Err(MrfEnvelopeError::InvalidVersionRange {
+                version,
+                min_reader_version,
             });
         }
         let reserved = LittleEndian::read_u16(&data[10..12]);
@@ -244,14 +247,14 @@ impl MrfEnvelope {
                 actual: actual_len,
             });
         }
-        Self::new(
-            MrfProtocolCapabilities {
+        Ok(Self {
+            protocol: MrfProtocolCapabilities {
                 version,
                 min_reader_version,
                 capabilities,
             },
-            data[MRF_ENVELOPE_HEADER_LEN..].to_vec(),
-        )
+            payload: data[MRF_ENVELOPE_HEADER_LEN..].to_vec(),
+        })
     }
 }
 
@@ -526,16 +529,30 @@ mod tests {
     }
 
     #[test]
-    fn envelope_rejects_unknown_version_and_capability_bits() {
+    fn envelope_accepts_a_forward_compatible_writer_version() {
         let mut version = ENVELOPE_FIXTURE.to_vec();
         version[6..8].copy_from_slice(&2u16.to_le_bytes());
-        assert_eq!(
-            MrfEnvelope::decode(&version, MrfProtocolCapabilities::current()),
-            Err(MrfEnvelopeError::UnsupportedVersion { version: 2 })
-        );
+        let decoded =
+            MrfEnvelope::decode(&version, MrfProtocolCapabilities::current()).expect("compatible v2 envelope should decode");
+        assert_eq!(decoded.protocol().version(), 2);
+        assert_eq!(decoded.protocol().min_reader_version(), 1);
 
+        let mut fenced = version;
+        fenced[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            MrfEnvelope::decode(&fenced, MrfProtocolCapabilities::current()),
+            Err(MrfEnvelopeError::RollbackFenced {
+                min_reader_version: 2,
+                supported_version: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_capability_bits() {
         let mut capabilities = ENVELOPE_FIXTURE.to_vec();
         capabilities[12..20].copy_from_slice(&(1u64 << 63).to_le_bytes());
+
         assert_eq!(
             MrfEnvelope::decode(&capabilities, MrfProtocolCapabilities::current()),
             Err(MrfEnvelopeError::UnknownCapabilities { bits: 1u64 << 63 })
