@@ -47,6 +47,9 @@ consts = "consts"
 Hashi = "Hashi"  # HashiCorp
 # Accept alternate spelling used in parser/XML comments.
 unparseable = "unparseable"
+# Disaster-recovery objectives: recovery time and recovery point.
+RTO = "RTO"
+rto = "rto"
 
 [files]
 extend-exclude = []

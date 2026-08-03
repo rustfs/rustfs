@@ -20,7 +20,9 @@ use rustfs_io_metrics::buffered_write;
 use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
+    PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
+    has_bypass_governance_header, load_bucket_generation_from_store, recursive_force_delete_is_authorized,
+    replication_request_authorized, req_info_mut, req_info_ref,
 };
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 #[cfg(test)]
@@ -31,7 +33,6 @@ use super::storage_api::object_usecase::bucket::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
         lifecycle::{self, TransitionOptions},
-        tier_delete_journal, tier_sweeper,
     },
     metadata_sys,
     object_lock::{
@@ -41,11 +42,11 @@ use super::storage_api::object_usecase::bucket::{
     predict_lifecycle_expiration,
     quota::{QuotaCheckResult, QuotaError, QuotaOperation},
     replication::{
-        REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType, check_replicate_delete,
+        DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
-        must_replicate_object, schedule_object_replication, schedule_replication_delete, set_deleted_object_replication_state,
-        set_object_to_delete_version_purge_status, should_schedule_delete_replication,
-        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+        force_delete_target_set, has_active_delete_rule, load_delete_config_snapshot, must_replicate_object,
+        persist_force_delete_intent, schedule_object_replication, schedule_replication_delete, schedule_replication_deletes,
+        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -68,8 +69,7 @@ use super::storage_api::object_usecase::data_usage::{
 use super::storage_api::object_usecase::deadlock_detector;
 use super::storage_api::object_usecase::ecfs::FS;
 use super::storage_api::object_usecase::error::{
-    DiskError, Error as EcstoreError, StorageError, is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found,
-    is_err_version_not_found,
+    Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
@@ -81,9 +81,10 @@ use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cac
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
-    bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
+    copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
-    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
+    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
+    put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -91,22 +92,23 @@ use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
 };
 use super::storage_api::object_usecase::sse::{
-    DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
-    encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
-    extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
+    DecryptionRequest, EncryptionRequest, SSEType, SseKmsPrincipal, apply_bucket_default_lock_retention,
+    authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
+    extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
+    get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_decryption, sse_encryption,
+    validate_bucket_object_lock_enabled_state,
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
-    RFC1123, check_preconditions, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
-    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
-    validate_bucket_exists, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+    RFC1123, check_preconditions, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
+    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_object_key,
+    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
-    AppContext, current_app_context, current_expiry_state_handle, current_notify_interface_for_context,
-    current_object_data_cache_for_context, current_object_store_handle_for_context,
+    AppContext, current_app_context, current_notify_interface_for_context, current_object_data_cache_for_context,
+    current_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
@@ -114,14 +116,14 @@ use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
 use crate::table_catalog;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
-use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
+use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_status};
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
@@ -196,8 +198,9 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions,
-    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+    BUCKET_LIFECYCLE_LOCK_OBJECT, GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo,
+    StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete,
+    StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
     ColdFillCoordinateOutcome, ColdFillDiskPermitOwner, ColdFillError, ColdFillProducer, GetObjectBodyCacheLookup,
@@ -746,53 +749,6 @@ fn tune_reader_stream_buffer_size(
     }
 
     selected_size
-}
-
-async fn enqueue_transitioned_delete_cleanup(
-    store: Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    opts: &ObjectOptions,
-    existing: Option<&ObjectInfo>,
-) -> std::io::Result<()> {
-    let Some(existing) = existing else {
-        return Ok(());
-    };
-    let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
-
-    let je = if opts.delete_prefix {
-        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object, existing.transition_version_state)
-    } else {
-        let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        tier_sweeper::transitioned_delete_journal_entry(
-            version_id,
-            opts.versioned,
-            opts.version_suspended,
-            &existing.transitioned_object,
-            existing.transition_version_state,
-        )
-    };
-    let Some(mut je) = je else {
-        return Ok(());
-    };
-
-    tier_delete_journal::record_tier_delete_journal_backend_identity(&mut je, &existing.user_defined)?;
-    tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
-
-    let expiry_state = current_expiry_state_handle();
-    let mut expiry_state = expiry_state.write().await;
-    if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je) {
-        warn!(
-            bucket,
-            object,
-            remote_object = %existing.transitioned_object.name,
-            remote_version_id = %existing.transitioned_object.version_id,
-            tier = %existing.transitioned_object.tier,
-            error = ?err,
-            "transitioned object cleanup journal persisted but was not queued"
-        );
-    }
-    Ok(())
 }
 
 pin_project! {
@@ -2518,6 +2474,109 @@ fn normalize_delete_objects_version_id(
     }
 }
 
+#[cfg(test)]
+type DeleteSnapshotTestHook = (String, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
+
+#[cfg(test)]
+static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+#[cfg(test)]
+static DELETE_SOURCE_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+#[cfg(test)]
+static DELETE_OBJECTS_AUTH_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_delete_snapshot_test_hook(
+    bucket: String,
+    loaded: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+) {
+    *DELETE_SNAPSHOT_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("delete snapshot test hook lock should not be poisoned") = Some((bucket, loaded, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_delete_snapshot_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = DELETE_SNAPSHOT_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("delete snapshot test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, loaded, resume)) = hook {
+        loaded.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_delete_source_test_hook(
+    bucket: String,
+    loaded: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+) {
+    *DELETE_SOURCE_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("delete source test hook lock should not be poisoned") = Some((bucket, loaded, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_delete_source_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = DELETE_SOURCE_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("delete source test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, loaded, resume)) = hook {
+        loaded.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_delete_objects_auth_test_hook(
+    bucket: String,
+    loaded: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+) {
+    *DELETE_OBJECTS_AUTH_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("delete objects auth test hook lock should not be poisoned") = Some((bucket, loaded, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_delete_objects_auth_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = DELETE_OBJECTS_AUTH_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("delete objects auth test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, loaded, resume)) = hook {
+        loaded.wait().await;
+        resume.wait().await;
+    }
+}
+
 fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String> {
     if !event.action.delete() {
         return None;
@@ -2533,8 +2592,8 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
-async fn enrich_delete_replication_state_if_needed(
-    bucket: &str,
+fn enrich_delete_replication_state_if_needed(
+    snapshot: &DeleteReplicationConfigSnapshot,
     delete_object: &mut StorageDeletedObject,
     obj_info: &ObjectInfo,
 ) {
@@ -2548,7 +2607,7 @@ async fn enrich_delete_replication_state_if_needed(
         return;
     }
 
-    let Ok((config, _)) = metadata_sys::get_replication_config(bucket).await else {
+    let Some(config) = snapshot.replication_config() else {
         return;
     };
     let version_id = if delete_object.delete_marker {
@@ -2559,7 +2618,7 @@ async fn enrich_delete_replication_state_if_needed(
         delete_object.version_id
     };
     if let Some(local_state) = delete_replication_state_from_config(
-        &config,
+        config,
         obj_info,
         version_id,
         obj_info.replication_status == ReplicationStatusType::Replica,
@@ -2568,16 +2627,16 @@ async fn enrich_delete_replication_state_if_needed(
     }
 }
 
-async fn should_schedule_replica_delete_replication(
-    bucket: &str,
+fn should_schedule_replica_delete_replication(
+    snapshot: &DeleteReplicationConfigSnapshot,
     replication_source: &ObjectInfo,
     version_id: Option<Uuid>,
 ) -> bool {
-    let Ok((config, _)) = metadata_sys::get_replication_config(bucket).await else {
+    let Some(config) = snapshot.replication_config() else {
         return false;
     };
 
-    delete_replication_state_from_config(&config, replication_source, version_id, true).is_some()
+    delete_replication_state_from_config(config, replication_source, version_id, true).is_some()
 }
 
 fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
@@ -2634,21 +2693,46 @@ where
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
 
-fn delete_replication_state_source<'a>(
-    opts: &ObjectOptions,
-    existing_object_info: Option<&'a ObjectInfo>,
-    deleted_object_info: &'a ObjectInfo,
-) -> &'a ObjectInfo {
-    if should_use_existing_delete_replication_source(
-        opts.replication_request,
-        deleted_object_info.delete_marker,
-        existing_object_info.is_some(),
-    ) && let Some(existing) = existing_object_info
-    {
-        return existing;
+pub(crate) async fn acquire_copy_bucket_lifecycle_lock<S>(store: &S, bucket: &str) -> S3Result<NamespaceLockGuard>
+where
+    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
+{
+    let lock = store
+        .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
+        .await
+        .map_err(ApiError::from)?;
+    lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(|err| {
+        ApiError::from(copy_namespace_lock_error(
+            bucket,
+            BUCKET_LIFECYCLE_LOCK_OBJECT,
+            "bucket_lifecycle_read",
+            err,
+        ))
+        .into()
+    })
+}
+
+pub(crate) async fn acquire_copy_bucket_lifecycle_locks<S>(
+    store: &S,
+    source_bucket: &str,
+    destination_bucket: &str,
+) -> S3Result<(NamespaceLockGuard, Option<NamespaceLockGuard>)>
+where
+    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
+{
+    if source_bucket == destination_bucket {
+        return Ok((acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?, None));
     }
 
-    deleted_object_info
+    if source_bucket < destination_bucket {
+        let source_guard = acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?;
+        let destination_guard = acquire_copy_bucket_lifecycle_lock(store, destination_bucket).await?;
+        Ok((source_guard, Some(destination_guard)))
+    } else {
+        let destination_guard = acquire_copy_bucket_lifecycle_lock(store, destination_bucket).await?;
+        let source_guard = acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?;
+        Ok((source_guard, Some(destination_guard)))
+    }
 }
 
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
@@ -2764,37 +2848,124 @@ fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
     s3_error!(InvalidArgument, "Failed to process archive entry: {}", err)
 }
 
+#[derive(Debug, Default)]
+struct ExtractEntryPaxAuthorization {
+    headers: HeaderMap,
+    object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
+    object_lock_mode: Option<ObjectLockMode>,
+    object_lock_retain_until_date: Option<Timestamp>,
+}
+
 async fn apply_extract_entry_pax_extensions<R>(
     entry: &mut tokio_tar::Entry<Archive<R>>,
+    bucket: &str,
+    object_name: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     metadata: &mut HashMap<String, String>,
     opts: &mut ObjectOptions,
-) -> S3Result<()>
+) -> S3Result<ExtractEntryPaxAuthorization>
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
     let Some(extensions) = entry.pax_extensions().await.map_err(map_extract_archive_error)? else {
-        return Ok(());
+        return Ok(ExtractEntryPaxAuthorization::default());
     };
 
+    let mut pax_headers = HeaderMap::new();
+    let mut pax_version_id = None;
     for ext in extensions {
         let ext = ext.map_err(map_extract_archive_error)?;
         let key = ext.key().map_err(map_extract_archive_error)?;
         let value = ext.value().map_err(map_extract_archive_error)?;
 
         if let Some(meta_key) = key.strip_prefix("minio.metadata.") {
-            let meta_key = meta_key.strip_prefix("x-amz-meta-").unwrap_or(meta_key);
             if !meta_key.is_empty() {
-                metadata.insert(meta_key.to_string(), value.to_string());
+                let name = http::HeaderName::from_bytes(meta_key.as_bytes())
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata header"))?;
+                let header_value = HeaderValue::from_str(value)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))?;
+                preserve_unclassified_user_metadata(metadata, name.as_str(), value);
+                pax_headers.insert(name, header_value);
             }
             continue;
         }
 
         if key == "minio.versionId" && !value.is_empty() {
-            opts.version_id = Some(value.to_string());
+            if Uuid::parse_str(value).is_err() {
+                return Err(s3_error!(InvalidArgument, "Invalid Snowball PAX version ID"));
+            }
+            pax_version_id = Some(value.to_string());
         }
     }
 
-    Ok(())
+    let has_replica_status = pax_headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS);
+    if let Some(value) = pax_headers.get(AMZ_BUCKET_REPLICATION_STATUS) {
+        let status = value
+            .to_str()
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball replication status"))?;
+        if !status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()) {
+            return Err(s3_error!(InvalidArgument, "Invalid Snowball replication status"));
+        }
+        pax_headers.insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
+    }
+
+    let authorization_headers = pax_headers.clone();
+
+    let object_lock_mode = pax_headers
+        .remove(AMZ_OBJECT_LOCK_MODE_LOWER)
+        .map(|value| {
+            value
+                .to_str()
+                .map(|value| ObjectLockMode::from(value.to_string()))
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))
+        })
+        .transpose()?;
+    let object_lock_retain_until_date = pax_headers
+        .remove(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
+            OffsetDateTime::parse(value, &Rfc3339)
+                .map(Timestamp::from)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
+        })
+        .transpose()?;
+    let object_lock_legal_hold_status = pax_headers
+        .remove(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
+        .map(|value| {
+            value
+                .to_str()
+                .map(|value| ObjectLockLegalHoldStatus::from(value.to_string()))
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
+        })
+        .transpose()?;
+    opts.version_id = pax_version_id;
+
+    extract_metadata_from_mime_with_object_name(&pax_headers, metadata, false, Some(object_name));
+    if has_replica_status {
+        metadata.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+        metadata.insert(
+            AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+            ReplicationStatusType::Replica.as_str().to_string(),
+        );
+    }
+    if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
+        bucket,
+        object_lock_config_state,
+        object_lock_legal_hold_status.clone(),
+        object_lock_mode.clone(),
+        object_lock_retain_until_date.clone(),
+    )? {
+        metadata.extend(object_lock_metadata);
+    }
+
+    Ok(ExtractEntryPaxAuthorization {
+        headers: authorization_headers,
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
+    })
 }
 
 fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&Timestamp>) -> S3Result<()> {
@@ -2858,6 +3029,7 @@ fn apply_put_request_metadata(
     tagging: Option<TaggingHeader>,
     storage_class: Option<StorageClass>,
 ) -> S3Result<()> {
+    namespace_reserved_user_metadata(metadata);
     apply_standard_object_metadata(
         metadata,
         cache_control.as_deref(),
@@ -2914,8 +3086,9 @@ fn response_storage_class_for_object_attributes(
     ))
 }
 
-async fn apply_put_request_object_lock_opts(
+fn apply_put_request_object_lock_opts(
     bucket: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
     object_lock_mode: Option<ObjectLockMode>,
     object_lock_retain_until_date: Option<Timestamp>,
@@ -2923,12 +3096,11 @@ async fn apply_put_request_object_lock_opts(
 ) -> S3Result<()> {
     if let Some(eval_metadata) = build_put_like_object_lock_metadata(
         bucket,
+        object_lock_config_state,
         object_lock_legal_hold_status,
         object_lock_mode,
         object_lock_retain_until_date,
-    )
-    .await?
-    {
+    )? {
         opts.eval_metadata = Some(eval_metadata);
     }
 
@@ -2940,8 +3112,9 @@ async fn apply_put_request_object_lock_opts(
 pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
-pub(crate) async fn build_put_like_object_lock_metadata(
+pub(crate) fn build_put_like_object_lock_metadata(
     bucket: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
     object_lock_mode: Option<ObjectLockMode>,
     object_lock_retain_until_date: Option<Timestamp>,
@@ -2964,7 +3137,7 @@ pub(crate) async fn build_put_like_object_lock_metadata(
         (None, None) => None,
     };
 
-    validate_bucket_object_lock_enabled(bucket).await?;
+    validate_bucket_object_lock_enabled_state(bucket, object_lock_config_state)?;
 
     let mut eval_metadata = parse_object_lock_retention(retention)?;
     eval_metadata.extend(parse_object_lock_legal_hold(
@@ -3029,8 +3202,8 @@ const DELETE_OBJECTS_PRE_STAT_CONCURRENCY: usize = 16;
 /// - the app-layer object-lock admission check never runs for deletes that
 ///   create a delete marker, and non-lock buckets cannot hold retention or
 ///   legal-hold metadata (`bucket_lock_enabled == false`);
-/// - the replication delete decision is only consulted when the bucket has
-///   active replication rules for the batch (`replicate_deletes == false`);
+/// - replication reads its authoritative source metadata later while the
+///   SetDisks write lock is held, so it does not consume this advisory stat;
 /// - usage accounting for delete-marker creation goes through
 ///   `record_bucket_delete_marker_memory` and never reads the object size
 ///   (`accounting_creates_delete_marker` is computed from the same versioning
@@ -3043,11 +3216,10 @@ const DELETE_OBJECTS_PRE_STAT_CONCURRENCY: usize = 16;
 /// byte-for-byte the pre-#929 one (see PR #4297).
 fn can_skip_delete_objects_pre_stat(
     bucket_lock_enabled: bool,
-    replicate_deletes: bool,
     opts: &ObjectOptions,
     accounting_creates_delete_marker: bool,
 ) -> bool {
-    !bucket_lock_enabled && !replicate_deletes && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
+    !bucket_lock_enabled && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
 }
 
 fn complete_delete_noop(
@@ -3067,6 +3239,16 @@ fn complete_delete_noop(
     let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
     let helper = helper.complete(&result);
     (result, helper)
+}
+
+fn delete_response_version_id(version_id: Option<Uuid>, synthetic_version_id: bool) -> Option<String> {
+    if synthetic_version_id {
+        None
+    } else if version_id == Some(Uuid::nil()) {
+        Some(NULL_VERSION_ID.to_string())
+    } else {
+        version_id.map(|version_id| version_id.to_string())
+    }
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
@@ -4084,12 +4266,14 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key.is_some()
         );
 
+        let read_principal = SseKmsPrincipal::from_request(req);
         let decryption_request = DecryptionRequest {
             bucket,
             key,
             metadata: &info.user_defined,
             sse_customer_key: req.input.sse_customer_key.as_ref(),
             sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
+            principal: read_principal.as_ref(),
         };
 
         let response_content_length = content_length;
@@ -4842,6 +5026,7 @@ impl DefaultObjectUsecase {
 
         let mut metadata = metadata.unwrap_or_default();
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         apply_put_request_metadata(
             &mut metadata,
             &req.headers,
@@ -4856,19 +5041,32 @@ impl DefaultObjectUsecase {
             tagging,
             storage_class.clone(),
         )?;
-        apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
+        apply_bucket_default_lock_retention(
+            &bucket,
+            &object_lock_config_state,
+            &mut metadata,
+            has_explicit_object_lock_retention,
+        )?;
 
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
-            .await
-            .map_err(ApiError::from)?;
+        let mut opts: ObjectOptions = put_opts_with_replication_authorization(
+            &bucket,
+            &key,
+            version_id.clone(),
+            &req.headers,
+            metadata.clone(),
+            replication_request_authorized(&req),
+        )
+        .await
+        .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         apply_put_request_object_lock_opts(
             &bucket,
+            &object_lock_config_state,
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
             &mut opts,
-        )
-        .await?;
+        )?;
 
         // rustfs/backlog#1009: the pre-PUT lookup has exactly two consumers —
         // the existing-object WORM validation and usage accounting's
@@ -4878,7 +5076,7 @@ impl DefaultObjectUsecase {
         // replication), the lookup is skipped and accounting is backfilled from
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
-        let prelookup_required = version_id.is_some() || put_prelookup_worm_gate(&bucket).await;
+        let prelookup_required = version_id.is_some() || object_lock_checks_required(&bucket).await;
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
@@ -5004,6 +5202,7 @@ impl DefaultObjectUsecase {
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
+        let write_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -5014,6 +5213,7 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
+            principal: write_principal.as_ref(),
         };
 
         let encryption_material = match sse_encryption(encryption_request).await {
@@ -6126,10 +6326,19 @@ impl DefaultObjectUsecase {
             version_suspended: src_opts.version_suspended,
             ..Default::default()
         };
+        apply_copy_source_bucket_generation_guard(&req, &src_bucket, &mut src_get_opts)?;
 
-        let mut dst_opts = copy_dst_opts(&bucket, &key, dest_version_id.clone(), &req.headers, HashMap::new())
-            .await
-            .map_err(ApiError::from)?;
+        let mut dst_opts = copy_dst_opts_with_replication_authorization(
+            &bucket,
+            &key,
+            dest_version_id.clone(),
+            &req.headers,
+            HashMap::new(),
+            replication_request_authorized(&req),
+        )
+        .await
+        .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&req, &bucket, &mut dst_opts)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
         let expected_current_version_id = expected_current_version_id(&req.headers)?;
@@ -6145,6 +6354,63 @@ impl DefaultObjectUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
+            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
+        let current_source_incarnation_id = store
+            .bucket_incarnation_id_from_disk(&src_bucket)
+            .await
+            .map_err(ApiError::from)?;
+        if src_get_opts
+            .expected_bucket_incarnation_id
+            .is_some_and(|expected| expected != current_source_incarnation_id)
+        {
+            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
+        }
+        let current_destination_incarnation_id = if src_bucket == bucket {
+            current_source_incarnation_id
+        } else {
+            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
+        };
+        if dst_opts
+            .expected_bucket_incarnation_id
+            .is_some_and(|expected| expected != current_destination_incarnation_id)
+        {
+            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
+        }
+        let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
+            .as_ref()
+            .unwrap_or(&source_bucket_lifecycle_guard);
+        if source_bucket_lifecycle_guard.is_lock_lost() || destination_bucket_lifecycle_guard.is_lock_lost() {
+            return Err(ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "copy_bucket_generation",
+                bucket: bucket.clone(),
+                object: key.clone(),
+                required: 1,
+                achieved: 0,
+            })
+            .into());
+        }
+        src_get_opts.expected_bucket_incarnation_id = Some(current_source_incarnation_id);
+        dst_opts.expected_bucket_incarnation_id = Some(current_destination_incarnation_id);
+        if src_bucket != bucket {
+            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+        }
+        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+
+        // Bucket metadata uses the bucket name as its namespace-lock key. Load
+        // every copy-time bucket snapshot before a same-object key can collide
+        // with that key (for example, copying `bucket/bucket` onto itself).
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        if cp_src_dst_same && key == bucket && expected_current_version_id.is_none() {
+            dst_opts.object_lock_config_snapshot =
+                Some(store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?);
+        }
+        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
 
         let _self_copy_lock_guard = if cp_src_dst_same && expected_current_version_id.is_none() {
             let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
@@ -6155,13 +6421,11 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        if let Some(guard) = _self_copy_lock_guard.as_ref() {
+            dst_opts.add_namespace_lock_guard(guard);
+        }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
-        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
         if _self_copy_lock_guard.is_some() {
             current_opts.no_lock = true;
         }
@@ -6186,7 +6450,6 @@ impl DefaultObjectUsecase {
             }
         };
 
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
             if has_explicit_ssec {
                 return None;
@@ -6222,12 +6485,31 @@ impl DefaultObjectUsecase {
             copy_source_sse_customer_key_md5.as_ref(),
         );
 
+        let copy_principal = SseKmsPrincipal::from_request(&req);
+
+        if source_bucket_lifecycle_guard.is_lock_lost() {
+            return Err(ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "copy_source_bucket_generation",
+                bucket: src_bucket.clone(),
+                object: src_key.clone(),
+                required: 1,
+                achieved: 0,
+            })
+            .into());
+        }
+
         let gr = store
             .get_object_reader(&src_bucket, &src_key, None, h, &src_get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
 
         let mut src_info = gr.object_info.clone();
+
+        // A copy reads the source plaintext, so it needs the source key's decrypt permission
+        // as well as the destination key's generate permission below. The source read resolves
+        // its material inside the object layer, which has no request identity, so the check
+        // happens here.
+        authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
         // Capture the version actually read from the source before src_info is mutated/consumed
         // below. This is the exact source version copied (issue #4976): the response must echo it
@@ -6269,7 +6551,35 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() {
+        // A same-name copy is normally serviced as a metadata-only update: the store layer
+        // rewrites xl.meta in place and leaves the data blocks alone. That shortcut is only sound
+        // when the destination's physical bytes are identical to the source's, and encryption
+        // breaks exactly that. The destination metadata is rebuilt from scratch below —
+        // `strip_managed_encryption_metadata` drops the source DEK and `sse_encryption` mints a
+        // fresh one — so reusing the stored ciphertext would leave a new DEK sitting beside bytes
+        // it cannot decrypt, permanently destroying the object (GET fails with an AEAD tag
+        // mismatch). The mirror case is worse because it is silent: an encrypted source copied
+        // without any destination SSE keeps its ciphertext while losing the key metadata, so GET
+        // hands back raw ciphertext as if it were plaintext. So whenever either side is
+        // encrypted, leave metadata_only = false and let the store layer do a full read/write
+        // rewrite through put_object, the same resolution the versioned historical-restore path
+        // uses (issue #4238, crates/ecstore/src/store/object.rs).
+        //
+        // This mirrors MinIO's `isSourceEncrypted || isTargetEncrypted -> metadataOnly = false`
+        // in CopyObjectHandler, with one deliberate difference: MinIO decides "target encrypted"
+        // from request headers alone, while `effective_sse` here also resolves the bucket default
+        // encryption rule. `sse_encryption` mints a DEK from that resolved value, so a
+        // header-only check would miss a self-copy under a bucket default rule. The source half
+        // deliberately reuses `ObjectInfo::is_encrypted` rather than naming individual headers,
+        // so a future encryption flavour is covered here the moment it is recognised there.
+        //
+        // The zero-copy shortcut is only recoverable for encrypted objects by *preserving* the
+        // DEK that sealed the bytes and re-wrapping it under a new master key (MinIO's
+        // `rotateKey` + `keyRotation` flag, which is why it may keep metadataOnly = true). RustFS
+        // has no such rewrap primitive today; adding one is backlog#1637, and it would enter here
+        // as an explicit exception rather than by relaxing this guard.
+        let copy_changes_encryption = src_info.is_encrypted() || effective_sse.is_some() || has_explicit_ssec;
+        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() && !copy_changes_encryption {
             src_info.metadata_only = true;
         }
 
@@ -6340,15 +6650,19 @@ impl DefaultObjectUsecase {
         remove_object_lock_metadata_for_copy(&mut user_defined);
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
+            &object_lock_config_state,
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
-        )
-        .await?
-        {
+        )? {
             user_defined.extend(object_lock_metadata);
         }
-        apply_bucket_default_lock_retention(&bucket, &mut user_defined, has_explicit_object_lock_retention).await?;
+        apply_bucket_default_lock_retention(
+            &bucket,
+            &object_lock_config_state,
+            &mut user_defined,
+            has_explicit_object_lock_retention,
+        )?;
 
         let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
@@ -6387,6 +6701,7 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
+            principal: copy_principal.as_ref(),
         };
 
         if let Some(material) = sse_encryption(encryption_request).await? {
@@ -6420,6 +6735,7 @@ impl DefaultObjectUsecase {
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
             .map_err(ApiError::from)?;
+        drop(_self_copy_lock_guard);
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
         let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
@@ -6539,47 +6855,38 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        let replicate_deletes = has_replication_rules(
-            &bucket,
-            &delete
-                .objects
-                .iter()
-                .map(|v| ObjectToDelete {
-                    object_name: v.key.clone(),
-                    ..Default::default()
-                })
-                .collect::<Vec<ObjectToDelete>>(),
-        )
-        .await;
+        let is_owner = req_info_ref(&req).map(|info| info.is_owner).unwrap_or(false);
+        if !recursive_force_delete_is_authorized(&req.headers, is_owner, false) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                "Recursive force-delete is restricted to administrative requests",
+            ));
+        }
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        // Capture the bucket generation before per-object authorization, but
+        // do not expose a bucket-state error unless at least one object is authorized.
+        let bucket_generation = load_bucket_generation_from_store(store.as_ref(), &req, &bucket).await;
 
-        let version_cfg = bucket_versioning_config(&bucket).await;
         let bypass_governance = has_bypass_governance_header(&req.headers);
-        let bucket_lock_enabled = bucket_object_locking_enabled(&bucket).await;
 
         #[derive(Default, Clone)]
         struct DeleteResult {
             delete_object: Option<StorageDeletedObject>,
             error: Option<s3s::dto::Error>,
+            synthetic_version_id: bool,
         }
 
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
 
-        struct PreparedDelete {
+        struct AuthorizedDelete {
             idx: usize,
             object: ObjectToDelete,
-            opts: ObjectOptions,
-            version_id: Option<String>,
-            skip_stat: bool,
         }
 
-        // Phase 1 (serial): request-scoped validation and authorization. These
-        // steps mutate the request info between authorization calls, so they
-        // stay sequential; they perform no per-object disk I/O.
-        let mut prepared_deletes: Vec<PreparedDelete> = Vec::with_capacity(delete.objects.len());
+        let mut authorized_deletes = Vec::with_capacity(delete.objects.len());
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -6603,11 +6910,11 @@ impl DefaultObjectUsecase {
             }
 
             let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
-            if let Err(e) = auth_res {
+            if auth_res.is_err() {
                 delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
-                    message: Some(e.to_string()),
+                    message: Some("Access Denied".to_string()),
                     version_id: version_id.clone(),
                 });
                 continue;
@@ -6615,11 +6922,11 @@ impl DefaultObjectUsecase {
 
             if bypass_governance {
                 let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
-                if let Err(e) = auth_res {
+                if auth_res.is_err() {
                     delete_results[idx].error = Some(s3s::dto::Error {
                         code: Some("AccessDenied".to_string()),
                         key: Some(obj_id.key.clone()),
-                        message: Some(e.to_string()),
+                        message: Some("Access Denied".to_string()),
                         version_id: version_id.clone(),
                     });
                     continue;
@@ -6636,22 +6943,65 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
+            let synthetic_version_id = version_id.is_none() && is_dir_object(&obj_id.key);
             let object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
                 version_id: version_uuid,
+                synthetic_version_id,
                 ..Default::default()
             };
+            delete_results[idx].synthetic_version_id = synthetic_version_id;
+
+            authorized_deletes.push(AuthorizedDelete { idx, object });
+        }
+
+        if authorized_deletes.is_empty() {
+            let output = DeleteObjectsOutput {
+                deleted: Some(Vec::new()),
+                errors: Some(delete_results.into_iter().filter_map(|result| result.error).collect()),
+                ..Default::default()
+            };
+            let result = Ok(S3Response::new(output));
+            let _ = helper.complete(&result);
+            return result;
+        }
+        #[cfg(test)]
+        wait_for_delete_objects_auth_test_hook(&bucket).await;
+        req.extensions.insert(bucket_generation?);
+        let bucket_lock_enabled = object_lock_checks_required(&bucket).await;
+
+        let delete_config_snapshot = Arc::new(
+            load_delete_config_snapshot(store.as_ref(), &bucket)
+                .await
+                .map_err(ApiError::from)?,
+        );
+        let version_cfg = delete_config_snapshot.versioning_config();
+        let replicate_deletes = authorized_deletes
+            .iter()
+            .any(|authorized| has_active_delete_rule(&delete_config_snapshot, &authorized.object.object_name));
+
+        struct PreparedDelete {
+            idx: usize,
+            object: ObjectToDelete,
+            opts: ObjectOptions,
+            skip_stat: bool,
+        }
+
+        // Phase 1 (serial): derive storage options from the request-scoped
+        // configuration after every candidate has passed authorization.
+        let mut prepared_deletes: Vec<PreparedDelete> = Vec::with_capacity(authorized_deletes.len());
+        for authorized in authorized_deletes {
+            let AuthorizedDelete { idx, object } = authorized;
 
             let metadata = extract_metadata(&req.headers);
-            // Reuse the request-level versioning config fetched above instead of
-            // re-resolving it per key (up to 1000 identical lookups per request).
             let opts: ObjectOptions = del_opts_with_versioning(
                 &bucket,
                 &object.object_name,
                 object.version_id.map(|f| f.to_string()),
                 &req.headers,
                 metadata,
-                &version_cfg,
+                version_cfg,
+                false,
             )
             .map_err(ApiError::from)?;
 
@@ -6659,17 +7009,13 @@ impl DefaultObjectUsecase {
             // decides delete-marker vs object-delete from this exact snapshot,
             // so evaluate it here with the same inputs to keep the stat-skip
             // decision and the accounting path provably consistent.
-            let accounting_creates_delete_marker = object.version_id.is_none()
-                && version_cfg.prefix_enabled(object.object_name.as_str())
-                && !version_cfg.suspended();
-            let skip_stat =
-                can_skip_delete_objects_pre_stat(bucket_lock_enabled, replicate_deletes, &opts, accounting_creates_delete_marker);
+            let accounting_creates_delete_marker = object.version_id.is_none() && opts.versioned && !opts.version_suspended;
+            let skip_stat = can_skip_delete_objects_pre_stat(bucket_lock_enabled, &opts, accounting_creates_delete_marker);
 
             prepared_deletes.push(PreparedDelete {
                 idx,
                 object,
                 opts,
-                version_id,
                 skip_stat,
             });
         }
@@ -6677,18 +7023,16 @@ impl DefaultObjectUsecase {
         struct AdmittedDelete {
             idx: usize,
             object: ObjectToDelete,
+            versioned: bool,
+            version_suspended: bool,
             size: i64,
             existing: Option<ObjectInfo>,
-            blocked: Option<s3s::dto::Error>,
         }
 
-        // Phase 2 (bounded concurrency, backlog#929 / HP-8): the per-object
-        // pre-delete stat plus the admission checks that consume it. Entries
-        // are independent per key, and `buffered` preserves input order so the
-        // per-key result mapping below is identical to the previous serial
-        // loop. The authoritative object-lock enforcement stays in the
-        // set_disk layer under the held write lock (#4297); the check here is
-        // the same early, advisory rejection as before.
+        // Phase 2 (bounded concurrency, backlog#929 / HP-8): collect the
+        // metadata needed for accounting and tier cleanup. Entries are
+        // independent per key, and `buffered` preserves input order. Object
+        // Lock admission is enforced later in set_disk under the write lock.
         let store_ref = &store;
         let bucket_ref = bucket.as_str();
         let admitted_deletes: Vec<AdmittedDelete> =
@@ -6697,81 +7041,40 @@ impl DefaultObjectUsecase {
                     idx,
                     mut object,
                     opts,
-                    version_id,
                     skip_stat,
                 } = prepared;
-
-                let (goi, gerr) = if skip_stat {
-                    (ObjectInfo::default(), None)
+                let synthetic_version_id = object.version_id.is_none() && is_dir_object(&object.object_name);
+                let (goi, source_missing) = if skip_stat {
+                    (ObjectInfo::default(), false)
                 } else {
                     match store_ref.get_object_info(bucket_ref, &object.object_name, &opts).await {
-                        Ok(res) => (res, None),
-                        Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+                        Ok(res) => (res, false),
+                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+                            (ObjectInfo::default(), true)
+                        }
+                        Err(err) => return Err(ApiError::from(err)),
                     }
                 };
 
-                if !skip_stat
-                    && gerr.is_none()
-                    && !delete_creates_delete_marker(&opts)
-                    && let Some(block_reason) = check_object_lock_for_deletion(bucket_ref, &goi, bypass_governance).await
-                {
-                    let blocked_key = object.object_name.clone();
-                    return AdmittedDelete {
-                        idx,
-                        object,
-                        size: 0,
-                        existing: None,
-                        blocked: Some(s3s::dto::Error {
-                            code: Some("AccessDenied".to_string()),
-                            key: Some(blocked_key),
-                            message: Some(block_reason.error_message()),
-                            version_id,
-                        }),
-                    };
-                }
-
                 let size = goi.size;
 
-                if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                if synthetic_version_id {
                     object.version_id = Some(Uuid::nil());
                 }
 
-                if replicate_deletes {
-                    let dsc = check_replicate_delete(
-                        bucket_ref,
-                        &ObjectToDelete {
-                            object_name: object.object_name.clone(),
-                            version_id: object.version_id,
-                            ..Default::default()
-                        },
-                        &goi,
-                        &opts,
-                        gerr.clone(),
-                    )
-                    .await;
-                    if dsc.replicate_any() {
-                        if object.version_id.is_some() {
-                            set_object_to_delete_version_purge_status(&mut object, VersionPurgeStatusType::Pending);
-                            object.version_purge_statuses = dsc.pending_status();
-                        } else {
-                            object.delete_marker_replication_status = dsc.pending_status();
-                        }
-                        object.replicate_decision_str = Some(dsc.to_string());
-                    }
-                }
-
-                let existing = (!skip_stat && gerr.is_none()).then_some(goi);
-                AdmittedDelete {
+                let existing = (!skip_stat && !source_missing).then_some(goi);
+                Ok::<_, ApiError>(AdmittedDelete {
                     idx,
                     object,
+                    versioned: opts.versioned,
+                    version_suspended: opts.version_suspended,
                     size,
                     existing,
-                    blocked: None,
-                }
+                })
             }))
             .buffered(DELETE_OBJECTS_PRE_STAT_CONCURRENCY)
-            .collect()
-            .await;
+            .try_collect()
+            .await?;
 
         // Phase 3 (serial): apply outcomes in the original request order so
         // per-key success/failure reporting is unchanged.
@@ -6779,18 +7082,14 @@ impl DefaultObjectUsecase {
         let mut object_to_delete_idx = Vec::new();
         let mut object_sizes = Vec::new();
         let mut existing_object_infos = Vec::new();
+        let mut object_versioning = Vec::new();
         for admitted in admitted_deletes {
-            if let Some(err) = admitted.blocked {
-                delete_results[admitted.idx].error = Some(err);
-                continue;
-            }
-
             object_sizes.push(admitted.size);
             object_to_delete_idx.push(admitted.idx);
+            object_versioning.push((admitted.versioned, admitted.version_suspended));
             object_to_delete.push(admitted.object);
             existing_object_infos.push(admitted.existing);
         }
-
         let cache_adapter = self.object_data_cache();
         let cache_keys_before_delete = object_to_delete
             .iter()
@@ -6798,28 +7097,22 @@ impl DefaultObjectUsecase {
             .collect::<Vec<_>>();
         invalidate_object_data_cache_objects_before_mutation(&cache_adapter, &bucket, cache_keys_before_delete.iter()).await;
 
-        let (mut dobjs, errs) = store
-            .delete_objects(
-                &bucket,
-                object_to_delete.clone(),
-                ObjectOptions {
-                    versioned: version_cfg.enabled(),
-                    version_suspended: version_cfg.suspended(),
-                    object_lock_delete: Some(StorageObjectLockDeleteOptions { bypass_governance }),
-                    ..Default::default()
-                },
-            )
+        let mut storage_delete_opts = ObjectOptions {
+            versioned: version_cfg.enabled(),
+            version_suspended: version_cfg.suspended(),
+            delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
+            object_lock_delete: Some(StorageObjectLockDeleteOptions { bypass_governance }),
+            ..Default::default()
+        };
+        apply_bucket_generation_guard(&req, &bucket, &mut storage_delete_opts)?;
+        let (dobjs, errs) = store
+            .delete_objects_with_tier_delete_journal(&bucket, object_to_delete.clone(), storage_delete_opts)
             .await;
 
         let _manager = get_concurrency_manager();
         let _bucket_clone = bucket.clone();
         let _deleted_objects = dobjs.clone();
-        if is_all_buckets_not_found(
-            &errs
-                .iter()
-                .map(|v| v.as_ref().map(|v| v.clone().into()))
-                .collect::<Vec<Option<DiskError>>>() as &[Option<DiskError>],
-        ) {
+        if !errs.is_empty() && errs.iter().all(|err| err.as_ref().is_some_and(is_err_bucket_not_found)) {
             let result = Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
             let _ = helper.complete(&result);
             return result;
@@ -6833,34 +7126,9 @@ impl DefaultObjectUsecase {
                     .clone()
                     .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
             {
-                if replicate_deletes {
-                    dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
-                }
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
-                if let Err(err) = enqueue_transitioned_delete_cleanup(
-                    store.clone(),
-                    &bucket,
-                    &object_to_delete[i].object_name,
-                    &ObjectOptions {
-                        version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
-                        versioned: version_cfg.prefix_enabled(object_to_delete[i].object_name.as_str()),
-                        version_suspended: version_cfg.suspended(),
-                        ..Default::default()
-                    },
-                    existing_object_infos[i].as_ref(),
-                )
-                .await
-                {
-                    warn!(
-                        bucket = %bucket,
-                        object = %object_to_delete[i].object_name,
-                        error = ?err,
-                        "failed to persist transitioned object cleanup journal"
-                    );
-                }
-                let creates_delete_marker = object_to_delete[i].version_id.is_none()
-                    && version_cfg.prefix_enabled(object_to_delete[i].object_name.as_str())
-                    && !version_cfg.suspended();
+                let (versioned, version_suspended) = object_versioning[i];
+                let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
                 if creates_delete_marker {
                     record_bucket_delete_marker_memory(&bucket).await;
                 } else {
@@ -6876,29 +7144,30 @@ impl DefaultObjectUsecase {
             }
 
             if let Some(err) = err.clone() {
+                let api_error = ApiError::from(err);
                 delete_results[didx].error = Some(s3s::dto::Error {
-                    code: Some(err.to_string()),
+                    code: Some(api_error.code.as_str().to_string()),
                     key: Some(object_to_delete[i].object_name.clone()),
-                    message: Some(err.to_string()),
-                    version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
+                    message: Some(api_error.message),
+                    version_id: delete_response_version_id(
+                        object_to_delete[i].version_id,
+                        delete_results[didx].synthetic_version_id,
+                    ),
                 });
             }
         }
 
         let deleted = delete_results
             .iter()
-            .filter_map(|v| v.delete_object.clone())
-            .map(|v| DeletedObject {
-                delete_marker: { if v.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: v.delete_marker_version_id.map(|v| v.to_string()),
-                key: Some(v.object_name.clone()),
-                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
-                    None
-                } else if v.version_id == Some(Uuid::nil()) {
-                    Some("null".to_string())
-                } else {
-                    v.version_id.map(|v| v.to_string())
-                },
+            .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
+            .map(|(result, object)| DeletedObject {
+                delete_marker: { if object.delete_marker { Some(true) } else { None } },
+                delete_marker_version_id: delete_response_version_id(
+                    object.delete_marker_version_id,
+                    result.synthetic_version_id,
+                ),
+                key: Some(object.object_name.clone()),
+                version_id: delete_response_version_id(object.version_id, result.synthetic_version_id),
             })
             .collect();
         let deleted_cache_keys = delete_results
@@ -6917,19 +7186,26 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        for dobjs in &delete_results {
-            if let Some(dobj) = &dobjs.delete_object
-                && replicate_deletes
-                && deleted_object_has_pending_replication_delete(dobj)
-            {
+        let replication_deletes = if replicate_deletes {
+            delete_results
+                .iter()
+                .filter_map(|result| result.delete_object.as_ref())
+                .filter(|dobj| deleted_object_has_pending_replication_delete(dobj))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !replication_deletes.is_empty() {
+            let bucket_for_replication = bucket.clone();
+            let replication_task = tokio::spawn(async move {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-                let mut dobj = dobj.clone();
-                if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
-                    dobj.version_id = Some(Uuid::nil());
-                }
-
-                schedule_replication_delete(dobj, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
-            }
+                schedule_replication_deletes(replication_deletes, bucket_for_replication, REPLICATE_INCOMING_DELETE.to_string())
+                    .await;
+            });
+            // The spawned task owns every locally committed delete. Dropping the
+            // join handle on request cancellation therefore cannot lose the tail.
+            let _ = replication_task.await;
         }
 
         let req_headers = req.headers.clone();
@@ -6953,7 +7229,7 @@ impl DefaultObjectUsecase {
                             ..Default::default()
                         }),
                     )
-                    .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
+                    .version_id(delete_response_version_id(dobj.version_id, res.synthetic_version_id).unwrap_or_default())
                     .req_params(req_params.clone())
                     .resp_elements(resp_elements.clone())
                     .host(get_request_host(&req_headers))
@@ -6989,7 +7265,6 @@ impl DefaultObjectUsecase {
 
         // Validate object key
         validate_object_key(&key, "DELETE")?;
-        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let replica = req
             .headers
@@ -7000,6 +7275,15 @@ impl DefaultObjectUsecase {
         if replica {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
         }
+
+        let is_owner = req_info_ref(&req).map(|info| info.is_owner).unwrap_or(false);
+        if !recursive_force_delete_is_authorized(&req.headers, is_owner, replica) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                "Recursive force-delete is restricted to internal or administrative requests",
+            ));
+        }
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         // Establish bucket existence before any bucket-metadata work (matches
         // PUT/GET): nonexistent buckets fail here instead of paying the
@@ -7014,21 +7298,25 @@ impl DefaultObjectUsecase {
         let metadata = extract_metadata(&req.headers);
         // Clone version_id before it's moved
         let version_id_clone = version_id.clone();
+        let synthetic_version_id = version_id_clone.is_none() && is_dir_object(&key);
 
-        let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
+        let delete_config_snapshot = Arc::new(
+            load_delete_config_snapshot(store.as_ref(), &bucket)
+                .await
+                .map_err(ApiError::from)?,
+        );
+        #[cfg(test)]
+        wait_for_delete_snapshot_test_hook(&bucket).await;
+        let version_cfg = delete_config_snapshot.versioning_config();
+        let mut opts: ObjectOptions =
+            del_opts_with_versioning(&bucket, &key, version_id, &req.headers, metadata, version_cfg, replica)
+                .map_err(ApiError::from)?;
+        opts.delete_replication_config_snapshot = Some(Arc::clone(&delete_config_snapshot));
         opts.object_lock_delete = Some(StorageObjectLockDeleteOptions {
             bypass_governance: has_bypass_governance_header(&req.headers),
         });
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         let force_delete = opts.delete_prefix;
-
-        if opts.delete_prefix && bucket_object_locking_enabled(&bucket).await {
-            return Err(S3Error::with_message(
-                S3ErrorCode::Custom("force-delete is forbidden on Object Locking enabled buckets".into()),
-                "force-delete is forbidden on Object Locking enabled buckets",
-            ));
-        }
 
         // let mut vid = opts.version_id.clone();
 
@@ -7050,36 +7338,12 @@ impl DefaultObjectUsecase {
         validate_undo_delete_version(expected_current_version_id.as_deref(), opts.version_id.as_deref())?;
         opts.expected_current_version_id = expected_current_version_id.clone();
 
-        let replicate_force_delete = force_delete
-            && !replica
-            && has_replication_rules(
-                &bucket,
-                &[ObjectToDelete {
-                    object_name: key.clone(),
-                    ..Default::default()
-                }],
-            )
-            .await;
+        let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
+        let mut force_delete_intent = None;
 
-        // Check Object Lock retention before deletion
-        // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
-        // 1. Add a lightweight get_object_lock_info() that only fetches retention metadata
-        // 2. Or use combined get-and-delete in storage layer with retention check callback
-        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let get_opts = opts.clone();
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
-            Ok(obj_info) => {
-                // Check for bypass governance retention header (permission already verified in access.rs)
-                let bypass_governance = has_bypass_governance_header(&req.headers);
-
-                if !delete_creates_delete_marker(&opts)
-                    && let Some(block_reason) = check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await
-                {
-                    return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
-                }
-                Some(obj_info)
-            }
+            Ok(obj_info) => Some(obj_info),
             Err(err) => {
                 // If object not found, allow deletion to proceed (will return 204 No Content)
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
@@ -7088,6 +7352,8 @@ impl DefaultObjectUsecase {
                 None
             }
         };
+        #[cfg(test)]
+        wait_for_delete_source_test_hook(&bucket).await;
 
         let cache_adapter = self.object_data_cache();
         // A force (delete_prefix) delete removes every object under `key` as a
@@ -7099,10 +7365,36 @@ impl DefaultObjectUsecase {
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
         }
 
+        if replicate_force_delete
+            && let Some((target_arns, generation)) = force_delete_target_set(&delete_config_snapshot, &key)
+            && !target_arns.is_empty()
+        {
+            let operation_id =
+                persist_force_delete_intent(store.clone(), bucket.clone(), key.clone(), target_arns.clone(), generation)
+                    .await
+                    .map_err(ApiError::from)?;
+            force_delete_intent = Some((operation_id, target_arns, generation));
+        }
+
         let obj_info = {
-            match store.delete_object(&bucket, &key, opts.clone()).await {
+            match store
+                .delete_object_with_tier_delete_journal(&bucket, &key, opts.clone())
+                .await
+            {
                 Ok(obj) => obj,
                 Err(err) => {
+                    if let Some((operation_id, _, _)) = force_delete_intent.as_ref()
+                        && let Err(cleanup_error) =
+                            crate::storage::storage_api::complete_force_delete_intent(store.clone(), *operation_id).await
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %key,
+                            operation_id = %operation_id,
+                            error = %cleanup_error,
+                            "failed to remove uncommitted force-delete intent after local delete failure"
+                        );
+                    }
                     if is_err_bucket_not_found(&err) {
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
                     }
@@ -7112,21 +7404,23 @@ impl DefaultObjectUsecase {
                         return result;
                     }
 
+                    if matches!(&err, StorageError::PrefixAccessDenied(_, _))
+                        && let Some(existing_object_info) = existing_object_info.as_ref()
+                        && let Some(reason) = check_object_lock_for_deletion(
+                            &bucket,
+                            existing_object_info,
+                            has_bypass_governance_header(&req.headers),
+                        )
+                        .await
+                    {
+                        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, reason.error_message()));
+                    }
+
                     return Err(ApiError::from(err).into());
                 }
             }
         };
 
-        if let Err(err) =
-            enqueue_transitioned_delete_cleanup(store.clone(), &bucket, &key, &opts, existing_object_info.as_ref()).await
-        {
-            warn!(
-                bucket = %bucket,
-                object = %key,
-                error = ?err,
-                "failed to persist transitioned object cleanup journal"
-            );
-        }
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
         } else {
@@ -7141,17 +7435,51 @@ impl DefaultObjectUsecase {
         }
 
         if obj_info.name.is_empty() {
-            if replicate_force_delete {
+            if let Some((operation_id, target_arns, generation)) = force_delete_intent {
+                if let Err(error) = commit_force_delete_intent(store.clone(), operation_id).await {
+                    warn!(
+                        bucket = %bucket,
+                        object = %key,
+                        operation_id = %operation_id,
+                        error = %error,
+                        "failed to mark force-delete intent committed after local delete"
+                    );
+                }
+                let generation = i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX);
                 schedule_replication_delete(
                     StorageDeletedObject {
                         object_name: key.clone(),
                         force_delete: true,
+                        force_delete_id: Some(operation_id),
+                        force_delete_target_arns: target_arns,
+                        force_delete_generation: Some(generation),
                         ..Default::default()
                     },
                     bucket.clone(),
                     REPLICATE_INCOMING_DELETE.to_string(),
                 )
                 .await;
+            } else if replicate_force_delete {
+                let mut delete_object = StorageDeletedObject {
+                    object_name: key.clone(),
+                    force_delete: true,
+                    ..Default::default()
+                };
+                if let Some(replication_state) = delete_replication_state_from_config(
+                    delete_config_snapshot
+                        .replication_config()
+                        .unwrap_or_else(|| unreachable!("force-delete requires a replication config")),
+                    &ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: key.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                    false,
+                ) {
+                    set_deleted_object_replication_state(&mut delete_object, &replication_state);
+                }
+                schedule_replication_delete(delete_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
@@ -7173,18 +7501,26 @@ impl DefaultObjectUsecase {
 
         let deleted_replication_info = existing_object_info
             .as_ref()
-            .filter(|_| should_use_existing_delete_replication_info(&opts));
+            .filter(|_| should_use_existing_delete_replication_info(&opts, opts.version_id.is_some()));
         let _delete_tail_guard = DeleteTailActivityGuard::new(DeleteTailStage::Tail);
         let deleted_object_source = deleted_replication_info.unwrap_or(&obj_info);
-        let replication_state_source =
-            delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source);
+        let replication_state_source = &obj_info;
         let deleted_delete_marker_version = deleted_replication_info.is_some_and(|info| info.delete_marker);
 
         let delete_replication_version_id = delete_replication_version_id(deleted_object_source, deleted_delete_marker_version);
         let schedule_delete_replication = if opts.replication_request && replica {
-            should_schedule_replica_delete_replication(&bucket, replication_state_source, delete_replication_version_id).await
+            should_schedule_replica_delete_replication(
+                &delete_config_snapshot,
+                replication_state_source,
+                delete_replication_version_id,
+            )
         } else {
-            should_schedule_delete_replication(&opts, deleted_object_source, deleted_delete_marker_version)
+            should_schedule_delete_replication(
+                &opts,
+                replication_state_source,
+                deleted_delete_marker_version,
+                opts.version_id.is_some(),
+            )
         };
 
         if schedule_delete_replication {
@@ -7207,25 +7543,24 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
             set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
-            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object, replication_state_source).await;
+            enrich_delete_replication_state_if_needed(&delete_config_snapshot, &mut deleted_object, replication_state_source);
             schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
         }
 
         let delete_marker = obj_info.delete_marker;
         let version_id = obj_info.version_id;
+        let response_version_id = delete_response_version_id(version_id, synthetic_version_id);
 
         let output = DeleteObjectOutput {
             delete_marker: Some(delete_marker),
-            version_id: version_id.map(|v| v.to_string()),
+            version_id: response_version_id.clone(),
             ..Default::default()
         };
 
         let event_name = delete_event_name_for_marker(delete_marker);
 
         helper = helper.event_name(event_name);
-        helper = helper
-            .object(obj_info)
-            .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
+        helper = helper.object(obj_info).version_id(response_version_id.unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
@@ -7593,6 +7928,20 @@ impl DefaultObjectUsecase {
         let mut opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
             .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+        // `apply_bucket_generation_guard` deliberately tolerates a missing guard
+        // (only the S3 access layer installs one), so this must not hard-require
+        // it. Resolve the current generation instead, exactly as the copy path
+        // does. The fence is unaffected: the value is re-read from disk and
+        // compared below, before the restore is admitted.
+        let restore_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
+            Some(incarnation_id) => incarnation_id,
+            None => {
+                let incarnation_id = store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?;
+                opts.expected_bucket_incarnation_id = Some(incarnation_id);
+                incarnation_id
+            }
+        };
 
         // SELECT-type restores skip both the ongoing check and the metadata
         // write below, so the accept guard would protect nothing for them —
@@ -7609,6 +7958,10 @@ impl DefaultObjectUsecase {
         // in-flight commit on the same object) is transient — answer 503
         // SlowDown so SDK clients back off and retry instead of treating it
         // as a hard failure.
+        let restore_bucket_lifecycle_guard = Some(acquire_copy_bucket_lifecycle_lock(store.as_ref(), &bucket).await?);
+        if store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)? != restore_bucket_incarnation_id {
+            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
+        }
         let accept_guard = if is_select {
             None
         } else {
@@ -7706,6 +8059,19 @@ impl DefaultObjectUsecase {
                 return Err(S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."));
             }
 
+            let mut restore_dst_opts = ObjectOptions {
+                version_id: obj_info_.version_id.map(|v| v.to_string()),
+                mod_time: obj_info_.mod_time,
+                no_lock: true,
+                expected_bucket_incarnation_id: Some(restore_bucket_incarnation_id),
+                ..Default::default()
+            };
+            if let Some(guard) = restore_bucket_lifecycle_guard.as_ref() {
+                restore_dst_opts.add_bucket_lifecycle_lock_guard(guard);
+            }
+            if let Some(guard) = accept_guard.as_ref() {
+                guard.add_namespace_lock_fence(&mut restore_dst_opts);
+            }
             store
                 .clone()
                 .copy_object(
@@ -7720,12 +8086,7 @@ impl DefaultObjectUsecase {
                         no_lock: true,
                         ..Default::default()
                     },
-                    &ObjectOptions {
-                        version_id: obj_info_.version_id.map(|v| v.to_string()),
-                        mod_time: obj_info_.mod_time,
-                        no_lock: true,
-                        ..Default::default()
-                    },
+                    &restore_dst_opts,
                 )
                 .await
                 .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
@@ -7749,6 +8110,7 @@ impl DefaultObjectUsecase {
         // The accept decision is committed; release the object write lock so
         // the background copy-back and concurrent reads are never blocked on it.
         drop(accept_guard);
+        drop(restore_bucket_lifecycle_guard);
 
         // Handle output location for SELECT requests
         if let Some(output_location) = &rreq.output_location
@@ -7792,6 +8154,7 @@ impl DefaultObjectUsecase {
                 version_id: version_id_clone,
                 versioned,
                 version_suspended,
+                expected_bucket_incarnation_id: Some(restore_bucket_incarnation_id),
                 user_defined: restore_operation_metadata,
                 ..Default::default()
             };
@@ -7846,9 +8209,17 @@ impl DefaultObjectUsecase {
         let auth_region = req.region.clone();
         let auth_service = req.service.clone();
         let auth_trailing_headers = req.trailing_headers.clone();
+        // Extract uploads reject SSE-KMS before reaching the SSE layer, so the principal is
+        // only carried for the day that restriction lifts; the NotImplemented answer below
+        // deliberately stays ahead of any key authorization.
+        let extract_principal = SseKmsPrincipal::from_request(&req);
         if is_sse_kms_requested(&req.input, &req.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
+        let replication_authorized = replication_request_authorized(&req);
+        let mut bucket_generation_opts = ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &req.input.bucket, &mut bucket_generation_opts)?;
+        let expected_bucket_incarnation_id = bucket_generation_opts.expected_bucket_incarnation_id;
         let input = req.input;
 
         let PutObjectInput {
@@ -8021,6 +8392,8 @@ impl DefaultObjectUsecase {
         let mut wrote_any_entry = false;
         let mut extracted_entry_count = 0usize;
         let mut total_unpacked_size = 0u64;
+        let object_lock_config_snapshot = store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?;
+        let object_lock_config_state = object_lock_config_snapshot.state();
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -8079,8 +8452,6 @@ impl DefaultObjectUsecase {
                 req_info.object = Some(fpath.clone());
                 req_info.version_id = None;
             }
-            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
-
             let entry_size = f.header().size().unwrap_or_default();
             validate_put_object_extract_entry_size(&fpath, entry_size, extract_limits)?;
             total_unpacked_size = total_unpacked_size
@@ -8119,11 +8490,56 @@ impl DefaultObjectUsecase {
                 tagging.clone(),
                 storage_class.clone(),
             )?;
-            apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
-            let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
-                .await
-                .map_err(ApiError::from)?;
-            apply_extract_entry_pax_extensions(&mut f, &mut metadata, &mut opts).await?;
+            apply_bucket_default_lock_retention(
+                &bucket,
+                object_lock_config_state,
+                &mut metadata,
+                has_explicit_object_lock_retention,
+            )?;
+            let mut opts = put_opts_with_replication_authorization(
+                &bucket,
+                &fpath,
+                None,
+                &req.headers,
+                metadata.clone(),
+                replication_authorized,
+            )
+            .await
+            .map_err(ApiError::from)?;
+            opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
+            opts.object_lock_config_snapshot = Some(Arc::clone(&object_lock_config_snapshot));
+            let pax_authorization =
+                apply_extract_entry_pax_extensions(&mut f, &bucket, &fpath, object_lock_config_state, &mut metadata, &mut opts)
+                    .await?;
+            for (name, value) in &pax_authorization.headers {
+                auth_req.headers.insert(name.clone(), value.clone());
+            }
+            if let Some(version_id) = opts.version_id.as_ref() {
+                req_info_mut(&mut auth_req)?.version_id = Some(version_id.clone());
+            }
+            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            if pax_authorization.object_lock_mode.is_some() || pax_authorization.object_lock_retain_until_date.is_some() {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            }
+            if pax_authorization.object_lock_legal_hold_status.is_some() {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+            if opts.version_id.is_some() || pax_authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS) {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+            }
+            let effective_object_lock_legal_hold_status = pax_authorization
+                .object_lock_legal_hold_status
+                .clone()
+                .or_else(|| object_lock_legal_hold_status.clone());
+            let (effective_object_lock_mode, effective_object_lock_retain_until_date) =
+                if pax_authorization.object_lock_mode.is_some() || pax_authorization.object_lock_retain_until_date.is_some() {
+                    (
+                        pax_authorization.object_lock_mode.clone(),
+                        pax_authorization.object_lock_retain_until_date.clone(),
+                    )
+                } else {
+                    (object_lock_mode.clone(), object_lock_retain_until_date.clone())
+                };
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
             }
@@ -8160,12 +8576,12 @@ impl DefaultObjectUsecase {
             };
             apply_put_request_object_lock_opts(
                 &bucket,
-                object_lock_legal_hold_status.clone(),
-                object_lock_mode.clone(),
-                object_lock_retain_until_date.clone(),
+                object_lock_config_state,
+                effective_object_lock_legal_hold_status,
+                effective_object_lock_mode,
+                effective_object_lock_retain_until_date,
                 &mut opts,
-            )
-            .await?;
+            )?;
             if let Some(material) = sse_encryption(EncryptionRequest {
                 bucket: &bucket,
                 key: &fpath,
@@ -8176,6 +8592,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key: sse_customer_key.clone(),
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
                 content_size: actual_size,
+                principal: extract_principal.as_ref(),
             })
             .await?
             {
@@ -8312,21 +8729,12 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
     })
 }
 
-async fn bucket_object_locking_enabled(bucket: &str) -> bool {
+/// Fail closed when deciding whether an object-lock-sensitive operation may
+/// skip its existing-object lookup.
+pub(super) async fn object_lock_checks_required(bucket: &str) -> bool {
     get_bucket_metadata(bucket)
         .await
-        .is_ok_and(|metadata| metadata.object_locking())
-}
-
-/// Fail-closed WORM gate for skipping the pre-PUT lookup
-/// (rustfs/backlog#1009): a bucket-metadata read failure counts as "locking
-/// enabled" so the existing-object lock validation can never silently
-/// disappear on a degraded metadata subsystem.
-pub(super) async fn put_prelookup_worm_gate(bucket: &str) -> bool {
-    match get_bucket_metadata(bucket).await {
-        Ok(metadata) => metadata.object_locking(),
-        Err(_) => true,
-    }
+        .map_or(true, |metadata| metadata.object_locking())
 }
 
 /// rustfs/backlog#1009: map the rename_data old-size backfill onto the
@@ -8345,8 +8753,9 @@ mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
     use s3s::dto::{
-        Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
-        ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications, ReplicaModificationsStatus,
+        DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
+        DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
         ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, SourceSelectionCriteria,
     };
     use std::pin::Pin;
@@ -8354,6 +8763,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
+    use tokio_tar::{Builder, EntryType, Header};
+
+    #[test]
+    fn delete_response_version_id_preserves_null_and_synthetic_semantics() {
+        let version_id = Uuid::new_v4();
+
+        assert_eq!(delete_response_version_id(Some(version_id), false), Some(version_id.to_string()));
+        assert_eq!(delete_response_version_id(Some(Uuid::nil()), false), Some("null".to_string()));
+        assert_eq!(delete_response_version_id(Some(Uuid::nil()), true), None);
+        assert_eq!(delete_response_version_id(None, false), None);
+    }
 
     #[test]
     fn io_queue_congestion_warn_throttle_emits_once_per_interval() {
@@ -8531,27 +8951,388 @@ mod tests {
         assert!(lookup_opts.no_lock);
     }
 
+    #[test]
+    fn put_request_user_metadata_cannot_suppress_bucket_default_retention() {
+        let mut metadata =
+            HashMap::from([(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::GOVERNANCE.to_string())]);
+        apply_put_request_metadata(
+            &mut metadata,
+            &HeaderMap::new(),
+            "object",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: Some(ObjectLockRule {
+                    default_retention: Some(DefaultRetention {
+                        mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                        days: Some(1),
+                        years: None,
+                    }),
+                }),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        apply_bucket_default_lock_retention("bucket", &state, &mut metadata, false).unwrap();
+
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
+        assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+        assert_eq!(metadata.get("x-amz-meta-x-amz-object-lock-mode").map(String::as_str), Some("GOVERNANCE"));
+    }
+
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body_len = 1 + key.len() + 1 + value.len() + 1;
+        let mut len = body_len + 1;
+        loop {
+            let actual_len = len.to_string().len() + body_len;
+            if actual_len == len {
+                break;
+            }
+            len = actual_len;
+        }
+
+        let mut record = format!("{len} {key}=").into_bytes();
+        record.extend_from_slice(value);
+        record.push(b'\n');
+        assert_eq!(record.len(), len);
+        record
+    }
+
     #[tokio::test]
-    async fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
+    async fn snowball_pax_rejects_unpaired_object_lock_retention() {
+        let record = pax_record("minio.metadata.x-amz-object-lock-mode", b"GOVERNANCE");
+        let mut builder = Builder::new(Vec::new());
+        let mut extension = Header::new_ustar();
+        extension.set_size(record.len() as u64);
+        extension.set_entry_type(EntryType::XHeader);
+        builder.append_data(&mut extension, "pax", &record[..]).await.unwrap();
+
+        let mut file = Header::new_ustar();
+        file.set_size(0);
+        builder.append_data(&mut file, "object", &b""[..]).await.unwrap();
+        let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().await.unwrap().unwrap();
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+        let mut opts = ObjectOptions::default();
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        let err = apply_extract_entry_pax_extensions(&mut entry, "bucket", "object", &state, &mut metadata, &mut opts)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
+    }
+
+    #[tokio::test]
+    async fn snowball_pax_privileged_fields_require_independent_authorization() {
+        let mut retention = pax_record("minio.metadata.X-Amz-Object-Lock-Mode", b"GOVERNANCE");
+        retention.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Retain-Until-Date", b"2099-01-01T00:00:00Z"));
+        let cases = [
+            ("retention", retention, (true, false, false)),
+            (
+                "legal-hold",
+                pax_record("minio.metadata.X-Amz-Object-Lock-Legal-Hold", b"ON"),
+                (false, true, false),
+            ),
+            (
+                "version-id",
+                pax_record("minio.versionId", Uuid::nil().to_string().as_bytes()),
+                (false, false, true),
+            ),
+            (
+                "replication-status",
+                pax_record("minio.metadata.x-amz-replication-status", b"REPLICA"),
+                (false, false, true),
+            ),
+        ];
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        for (case, record, expected) in cases {
+            let mut builder = Builder::new(Vec::new());
+            let mut extension = Header::new_ustar();
+            extension.set_size(record.len() as u64);
+            extension.set_entry_type(EntryType::XHeader);
+            builder.append_data(&mut extension, "pax", &record[..]).await.unwrap();
+            let mut file = Header::new_ustar();
+            file.set_size(0);
+            builder.append_data(&mut file, "object", &b""[..]).await.unwrap();
+            let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
+            let mut entries = archive.entries().unwrap();
+            let mut entry = entries.next().await.unwrap().unwrap();
+
+            let mut opts = ObjectOptions::default();
+            let authorization =
+                apply_extract_entry_pax_extensions(&mut entry, "bucket", "object", &state, &mut HashMap::new(), &mut opts)
+                    .await
+                    .unwrap();
+
+            assert_eq!(
+                (
+                    authorization.object_lock_mode.is_some() || authorization.object_lock_retain_until_date.is_some(),
+                    authorization.object_lock_legal_hold_status.is_some(),
+                    opts.version_id.is_some() || authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS),
+                ),
+                expected,
+                "{case} must request only its own additional authorization"
+            );
+            match case {
+                "retention" => {
+                    assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+                    assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
+                }
+                "legal-hold" => assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)),
+                "version-id" => assert_eq!(opts.version_id.as_deref(), Some(Uuid::nil().to_string().as_str())),
+                "replication-status" => assert_eq!(
+                    authorization
+                        .headers
+                        .get(AMZ_BUCKET_REPLICATION_STATUS)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("REPLICA")
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snowball_pax_rejects_invalid_retention_and_replication_values() {
+        let mut invalid_mode = pax_record("minio.metadata.X-Amz-Object-Lock-Mode", b"INVALID");
+        invalid_mode.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Retain-Until-Date", b"2099-01-01T00:00:00Z"));
+        let mut invalid_date = pax_record("minio.metadata.X-Amz-Object-Lock-Mode", b"COMPLIANCE");
+        invalid_date.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Retain-Until-Date", b"not-a-date"));
+        let cases = [
+            ("invalid-mode", invalid_mode),
+            ("invalid-date", invalid_date),
+            (
+                "invalid-replication-status",
+                pax_record("minio.metadata.x-amz-replication-status", b"INVALID"),
+            ),
+            ("invalid-version-id", pax_record("minio.versionId", b"not-a-uuid")),
+        ];
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        for (case, record) in cases {
+            let mut builder = Builder::new(Vec::new());
+            let mut extension = Header::new_ustar();
+            extension.set_size(record.len() as u64);
+            extension.set_entry_type(EntryType::XHeader);
+            builder.append_data(&mut extension, "pax", &record[..]).await.unwrap();
+            let mut file = Header::new_ustar();
+            file.set_size(0);
+            builder.append_data(&mut file, "object", &b""[..]).await.unwrap();
+            let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
+            let mut entries = archive.entries().unwrap();
+            let mut entry = entries.next().await.unwrap().unwrap();
+
+            let err = apply_extract_entry_pax_extensions(
+                &mut entry,
+                "bucket",
+                "object",
+                &state,
+                &mut HashMap::new(),
+                &mut ObjectOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                err.code() == &S3ErrorCode::InvalidArgument || err.code() == &S3ErrorCode::MalformedXML,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snowball_pax_preserves_canonical_minio_metadata_and_valid_retention() {
+        let mut record = pax_record("minio.metadata.Content-Type", b"text/plain");
+        record.extend(pax_record("minio.metadata.X-Amz-Meta-Owner", b"alice"));
+        record.extend(pax_record("minio.metadata.project", b"alpha-demo"));
+        record.extend(pax_record("minio.versionId", Uuid::nil().to_string().as_bytes()));
+        record.extend(pax_record("minio.metadata.x-amz-replication-status", b"REPLICA"));
+        record.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Mode", b"GOVERNANCE"));
+        record.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Retain-Until-Date", b"2099-01-01T00:00:00Z"));
+        record.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Legal-Hold", b"ON"));
+        let mut builder = Builder::new(Vec::new());
+        let mut extension = Header::new_ustar();
+        extension.set_size(record.len() as u64);
+        extension.set_entry_type(EntryType::XHeader);
+        builder.append_data(&mut extension, "pax", &record[..]).await.unwrap();
+
+        let mut file = Header::new_ustar();
+        file.set_size(0);
+        builder.append_data(&mut file, "object.txt", &b""[..]).await.unwrap();
+        let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().await.unwrap().unwrap();
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
+        ]);
+        let mut opts = ObjectOptions::default();
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        let authorization =
+            apply_extract_entry_pax_extensions(&mut entry, "bucket", "object.txt", &state, &mut metadata, &mut opts)
+                .await
+                .unwrap();
+
+        assert_eq!(metadata.get("content-type").map(String::as_str), Some("text/plain"));
+        assert_eq!(metadata.get("owner").map(String::as_str), Some("alice"));
+        assert_eq!(metadata.get("project").map(String::as_str), Some("alpha-demo"));
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+        assert_eq!(
+            metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str),
+            Some("2099-01-01T00:00:00Z")
+        );
+        assert_eq!(metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
+        assert!(metadata.contains_key("x-rustfs-internal-objectlock-legalhold-timestamp"));
+        assert!(metadata.contains_key("x-minio-internal-objectlock-legalhold-timestamp"));
+        assert_eq!(metadata.get(AMZ_BUCKET_REPLICATION_STATUS).map(String::as_str), Some("REPLICA"));
+        assert_eq!(opts.version_id.as_deref(), Some("00000000-0000-0000-0000-000000000000"));
+        assert!(authorization.object_lock_mode.is_some());
+        assert!(authorization.object_lock_retain_until_date.is_some());
+        assert!(authorization.object_lock_legal_hold_status.is_some());
+        assert!(opts.version_id.is_some());
+        assert!(authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS));
+    }
+
+    #[tokio::test]
+    async fn snowball_pax_rejects_legal_hold_without_bucket_object_lock() {
+        let record = pax_record("minio.metadata.X-Amz-Object-Lock-Legal-Hold", b"ON");
+        let mut builder = Builder::new(Vec::new());
+        let mut extension = Header::new_ustar();
+        extension.set_size(record.len() as u64);
+        extension.set_entry_type(EntryType::XHeader);
+        builder.append_data(&mut extension, "pax", &record[..]).await.unwrap();
+
+        let mut file = Header::new_ustar();
+        file.set_size(0);
+        builder.append_data(&mut file, "object", &b""[..]).await.unwrap();
+        let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().await.unwrap().unwrap();
+        let mut metadata = HashMap::new();
+
+        let err = apply_extract_entry_pax_extensions(
+            &mut entry,
+            "bucket",
+            "object",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            &mut metadata,
+            &mut ObjectOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+    }
+
+    #[tokio::test]
+    async fn snowball_pax_rejects_invalid_legal_hold_status() {
+        let record = pax_record("minio.metadata.X-Amz-Object-Lock-Legal-Hold", b"INVALID");
+        let mut builder = Builder::new(Vec::new());
+        let mut extension = Header::new_ustar();
+        extension.set_size(record.len() as u64);
+        extension.set_entry_type(EntryType::XHeader);
+        builder.append_data(&mut extension, "pax", &record[..]).await.unwrap();
+
+        let mut file = Header::new_ustar();
+        file.set_size(0);
+        builder.append_data(&mut file, "object", &b""[..]).await.unwrap();
+        let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().await.unwrap().unwrap();
+        let mut metadata = HashMap::new();
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        let err = apply_extract_entry_pax_extensions(
+            &mut entry,
+            "bucket",
+            "object",
+            &state,
+            &mut metadata,
+            &mut ObjectOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+        assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+    }
+
+    #[test]
+    fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
         let err = build_put_like_object_lock_metadata(
             "test-bucket",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             None,
             Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
             None,
         )
-        .await
         .unwrap_err();
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
     }
 
-    #[tokio::test]
-    async fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
+    #[test]
+    fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
         let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
-        let err = build_put_like_object_lock_metadata("test-bucket", None, None, Some(retain_until))
-            .await
-            .unwrap_err();
+        let err = build_put_like_object_lock_metadata(
+            "test-bucket",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            None,
+            None,
+            Some(retain_until),
+        )
+        .unwrap_err();
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
@@ -9675,115 +10456,6 @@ mod tests {
         );
         assert!(context.object_data_cache().materialize_fill_enabled());
         (store, context)
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn transitioned_delete_cleanup_persists_known_state_and_rejects_unknown_state() {
-        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-        if current_app_context().is_none() {
-            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
-        }
-        let identity = [11_u8; 32];
-        let mut metadata = HashMap::new();
-        rustfs_utils::http::metadata_compat::insert_str(
-            &mut metadata,
-            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-            rustfs_utils::crypto::hex(identity),
-        );
-        let mut current = ObjectInfo {
-            user_defined: Arc::new(metadata),
-            ..Default::default()
-        };
-        current.transitioned_object.status = lifecycle::TRANSITION_COMPLETE.to_string();
-        current.transitioned_object.tier = "WARM".to_string();
-        current.transitioned_object.name = "remote/identity-bound".to_string();
-        current.transitioned_object.version_id = "remote-version".to_string();
-        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
-
-        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>, version_id_exact: bool| {
-            use sha2::{Digest, Sha256};
-
-            let mut hasher = Sha256::new();
-            hasher.update(b"WARM");
-            hasher.update([0]);
-            hasher.update(remote_object.as_bytes());
-            hasher.update([0]);
-            hasher.update(b"remote-version");
-            if let Some(backend_identity) = backend_identity {
-                hasher.update([0]);
-                hasher.update(backend_identity);
-            }
-            if version_id_exact {
-                hasher.update([0]);
-                hasher.update(b"exact-version-id");
-            }
-            format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
-        };
-
-        enqueue_transitioned_delete_cleanup(store.clone(), "bucket", "identity-bound", &ObjectOptions::default(), Some(&current))
-            .await
-            .expect("normal transitioned delete should persist an identity-bound journal");
-        let mut identity_bound = store
-            .get_object_reader(
-                ".rustfs.sys",
-                &journal_name("remote/identity-bound", Some(identity), true),
-                None,
-                http::HeaderMap::new(),
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("identity-bound journal should be readable");
-        let mut identity_bound_data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut identity_bound.stream, &mut identity_bound_data)
-            .await
-            .expect("identity-bound journal body should be readable");
-        let identity_bound: serde_json::Value =
-            serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
-        assert_eq!(identity_bound["version"], serde_json::json!(4));
-        assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
-        assert_eq!(identity_bound["version_id_exact"], serde_json::json!(true));
-        assert_eq!(identity_bound["version_state"], serde_json::json!("exact"));
-
-        current.user_defined = Arc::new(HashMap::new());
-        current.transitioned_object.name = "remote/legacy".to_string();
-        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
-        enqueue_transitioned_delete_cleanup(
-            store.clone(),
-            "bucket",
-            "legacy",
-            &ObjectOptions {
-                delete_prefix: true,
-                ..Default::default()
-            },
-            Some(&current),
-        )
-        .await
-        .expect("unknown force-delete cleanup should fail closed without a journal");
-        let legacy_err = match store
-            .get_object_reader(
-                ".rustfs.sys",
-                &journal_name("remote/legacy", None, false),
-                None,
-                http::HeaderMap::new(),
-                &ObjectOptions::default(),
-            )
-            .await
-        {
-            Ok(_) => panic!("unknown remote version state must not persist a delete journal"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(
-                &legacy_err,
-                StorageError::FileNotFound
-                    | StorageError::ObjectNotFound(_, _)
-                    | StorageError::FileVersionNotFound
-                    | StorageError::VersionNotFound(_, _, _)
-                    | StorageError::VolumeNotFound
-            ),
-            "unknown remote version state must leave no journal, got {legacy_err:?}"
-        );
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
@@ -13012,6 +13684,91 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_self_copy_when_object_name_equals_bucket_observes_lock_order() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+        use s3s::access::S3Access as _;
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("self-copy lock-order test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let server_ctx = crate::app::runtime_sources::ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::clone(&context)));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        let bucket = format!("self-copy-lock-order-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create self-copy test bucket");
+        let payload = b"object whose key equals its bucket".to_vec();
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        store
+            .put_object(&bucket, &bucket, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put object whose key equals its bucket");
+
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut bucket_metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("self-copy bucket metadata should be cached"))
+        .clone();
+        bucket_metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("self-copy policy should parse"));
+        bucket_metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), bucket_metadata)
+            .await
+            .expect("publish self-copy test policy");
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: bucket.clone().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(bucket.clone())
+            .metadata_directive(Some(MetadataDirective::from_static(MetadataDirective::REPLACE)))
+            .metadata(Some(HashMap::from([("lock-order".to_string(), "verified".to_string())])))
+            .build()
+            .expect("self-copy input should build");
+        let mut req = build_request(input, Method::PUT);
+        req.extensions.insert(crate::storage::access::ReqInfo::default());
+        fs.copy_object(&mut req)
+            .await
+            .expect("authorize self-copy whose object key equals its bucket");
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(req),
+        )
+        .await
+        .expect("lifecycle, authority, and exact object locks must not deadlock")
+        .expect("self-copy whose object key equals its bucket should succeed");
+        assert!(response.output.copy_object_result.is_some());
+        let info = store
+            .get_object_info(&bucket, &bucket, &ObjectOptions::default())
+            .await
+            .expect("self-copied object should remain readable");
+        assert_eq!(info.size, payload.len() as i64);
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up self-copy test bucket");
+    }
+
+    #[tokio::test]
     async fn execute_copy_object_allows_tiered_self_copy_with_storage_class_change() {
         let input = CopyObjectInput::builder()
             .copy_source(CopySource::Bucket {
@@ -13274,6 +14031,111 @@ mod tests {
 
         let err = usecase.execute_delete_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Not init"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_delete_objects_rejects_bucket_recreated_after_authorization() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let context = current_app_context().expect("delete objects generation test requires an AppContext");
+        let bucket = format!("delete-objects-generation-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authorized bucket generation");
+        let mut reader = PutObjReader::from_vec(b"old generation".to_vec());
+        store
+            .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put old-generation object");
+
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("authorized bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("publish test bucket policy");
+
+        let input = DeleteObjectsInput::builder()
+            .bucket(bucket.clone())
+            .delete(Delete {
+                objects: vec![ObjectIdentifier {
+                    key: "object".to_string(),
+                    version_id: None,
+                    ..Default::default()
+                }],
+                quiet: None,
+            })
+            .build()
+            .expect("delete objects input should build");
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(crate::storage::access::ReqInfo::default());
+        let loaded = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_delete_objects_auth_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
+
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let delete = tokio::spawn(async move { usecase.execute_delete_objects(req).await });
+        loaded.wait().await;
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete authorized bucket generation");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate same bucket name");
+        let mut reader = PutObjReader::from_vec(b"new generation".to_vec());
+        store
+            .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put new-generation object");
+        resume.wait().await;
+
+        let err = delete
+            .await
+            .expect("delete objects task should join")
+            .expect_err("old authorization must not delete from the recreated bucket");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        store
+            .get_object_info(&bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("new-generation object must survive the stale batch request");
+    }
+
+    #[tokio::test]
+    async fn execute_delete_object_allows_non_force_request_without_req_info_until_store_lookup() {
+        let input = DeleteObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let err = DefaultObjectUsecase::without_context()
+            .execute_delete_object(build_request(input, Method::DELETE))
+            .await
+            .expect_err("an uninitialized store should be reported after non-force admission");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Not init"));
     }
 
     #[test]
@@ -13283,6 +14145,65 @@ mod tests {
 
         assert_eq!(wire_version_id.as_deref(), Some("null"));
         assert_eq!(internal_version_id, Some(Uuid::nil()));
+
+        let (wire_version_id, internal_version_id) =
+            normalize_delete_objects_version_id(Some(" \t ".to_string())).expect("empty version marker should normalize");
+        assert_eq!(wire_version_id, None);
+        assert_eq!(internal_version_id, None);
+    }
+
+    #[test]
+    fn recursive_force_delete_requires_administrative_or_replica_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+
+        assert!(!recursive_force_delete_is_authorized(&headers, false, false));
+        assert!(recursive_force_delete_is_authorized(&headers, true, false));
+        assert!(recursive_force_delete_is_authorized(&headers, false, true));
+        assert!(recursive_force_delete_is_authorized(&HeaderMap::new(), false, false));
+    }
+
+    #[tokio::test]
+    async fn execute_delete_object_rejects_untrusted_force_delete_before_store_access() {
+        let input = DeleteObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("prefix/object".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::DELETE);
+        req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+        req.extensions.insert(crate::storage::access::ReqInfo::default());
+
+        let err = DefaultObjectUsecase::without_context()
+            .execute_delete_object(req)
+            .await
+            .expect_err("untrusted force-delete must be rejected before storage lookup");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_objects_rejects_untrusted_force_delete_before_store_access() {
+        let input = DeleteObjectsInput::builder()
+            .bucket("test-bucket".to_string())
+            .delete(Delete {
+                objects: vec![ObjectIdentifier {
+                    key: "prefix/object".to_string(),
+                    version_id: None,
+                    ..Default::default()
+                }],
+                quiet: None,
+            })
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::POST);
+        req.headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+        req.extensions.insert(crate::storage::access::ReqInfo::default());
+
+        let err = DefaultObjectUsecase::without_context()
+            .execute_delete_objects(req)
+            .await
+            .expect_err("untrusted force-delete must be rejected before storage lookup");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
     // backlog#929 (HP-8): the pre-delete stat may only be skipped when every
@@ -13299,17 +14220,12 @@ mod tests {
 
     #[test]
     fn delete_objects_pre_stat_skippable_for_delete_marker_on_plain_bucket() {
-        assert!(can_skip_delete_objects_pre_stat(false, false, &delete_marker_creating_opts(), true));
+        assert!(can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), true));
     }
 
     #[test]
     fn delete_objects_pre_stat_kept_for_object_lock_buckets() {
-        assert!(!can_skip_delete_objects_pre_stat(true, false, &delete_marker_creating_opts(), true));
-    }
-
-    #[test]
-    fn delete_objects_pre_stat_kept_when_replication_rules_match() {
-        assert!(!can_skip_delete_objects_pre_stat(false, true, &delete_marker_creating_opts(), true));
+        assert!(!can_skip_delete_objects_pre_stat(true, &delete_marker_creating_opts(), true));
     }
 
     #[test]
@@ -13320,7 +14236,7 @@ mod tests {
             version_suspended: false,
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, false, &opts, true));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, true));
     }
 
     #[test]
@@ -13333,7 +14249,7 @@ mod tests {
             version_suspended: false,
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, false, &opts, false));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false));
     }
 
     #[test]
@@ -13344,7 +14260,7 @@ mod tests {
             version_suspended: true,
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, false, &opts, false));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false));
     }
 
     #[test]
@@ -13352,64 +14268,7 @@ mod tests {
         // If the accounting-side versioning snapshot does not also classify the
         // delete as a delete-marker creation, the stat must stay so usage
         // accounting keeps its size input.
-        assert!(!can_skip_delete_objects_pre_stat(false, false, &delete_marker_creating_opts(), false));
-    }
-
-    #[test]
-    fn should_schedule_delete_replication_skips_replica_requests() {
-        let opts = ObjectOptions {
-            replication_request: true,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let replication_source = ObjectInfo {
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        assert!(
-            !should_schedule_delete_replication(&opts, &replication_source, true),
-            "replica delete requests on target sites must not enqueue a second replication delete task"
-        );
-    }
-
-    #[test]
-    fn should_schedule_delete_replication_keeps_delete_marker_version_purge_from_source() {
-        let opts = ObjectOptions {
-            replication_request: false,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let replication_source = ObjectInfo {
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        assert!(
-            should_schedule_delete_replication(&opts, &replication_source, true),
-            "source-side delete-marker version purge still needs replication scheduling"
-        );
-    }
-
-    #[test]
-    fn should_schedule_delete_replication_keeps_object_version_purge_from_completed_source() {
-        let opts = ObjectOptions {
-            replication_request: false,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let replication_source = ObjectInfo {
-            delete_marker: false,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        assert!(
-            should_schedule_delete_replication(&opts, &replication_source, false),
-            "source-side object version purge must still enqueue delete replication after the original PUT completed"
-        );
+        assert!(!can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), false));
     }
 
     #[tokio::test]
@@ -13668,9 +14527,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_replication_state_from_config_tracks_delete_marker_version_purges() {
+    fn delete_replication_state_from_config_requires_delete_switch_for_marker_version_purges() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let config = ReplicationConfiguration {
+        let mut config = ReplicationConfiguration {
             role: arn.clone(),
             rules: vec![ReplicationRule {
                 delete_marker_replication: Some(DeleteMarkerReplication {
@@ -13701,62 +14560,21 @@ mod tests {
         };
 
         let version_id = Some(Uuid::new_v4());
+        assert!(
+            delete_replication_state_from_config(&config, &obj_info, version_id, false).is_none(),
+            "delete-marker version purge must not use DeleteMarkerReplication"
+        );
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
         let state = delete_replication_state_from_config(&config, &obj_info, version_id, false)
-            .expect("delete-marker version purge should honor delete-marker replication rules");
+            .expect("delete-marker version purge should honor DeleteReplication");
         let pending = format!("{arn}=PENDING;");
 
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.purge_targets.contains_key(&arn));
-    }
-
-    #[test]
-    fn delete_replication_state_source_prefers_existing_replica_for_replication_delete_marker_creation() {
-        let opts = ObjectOptions {
-            replication_request: true,
-            version_id: Some(Uuid::new_v4().to_string()),
-            ..Default::default()
-        };
-        let existing = ObjectInfo {
-            name: "test/object.txt".to_string(),
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-        let deleted = ObjectInfo {
-            name: "test/object.txt".to_string(),
-            delete_marker: true,
-            ..Default::default()
-        };
-
-        let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
-
-        assert_eq!(source.replication_status, ReplicationStatusType::Completed);
-        assert!(
-            !source.delete_marker,
-            "downstream fanout should inherit replica identity from the pre-delete object"
-        );
-    }
-
-    #[test]
-    fn delete_replication_state_source_keeps_deleted_marker_for_non_replication_requests() {
-        let opts = ObjectOptions::default();
-        let existing = ObjectInfo {
-            name: "test/object.txt".to_string(),
-            replication_status: ReplicationStatusType::Replica,
-            ..Default::default()
-        };
-        let deleted = ObjectInfo {
-            name: "test/object.txt".to_string(),
-            delete_marker: true,
-            ..Default::default()
-        };
-
-        let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
-
-        assert!(
-            source.delete_marker,
-            "source-originated deletes should keep using the new delete marker state"
-        );
     }
 
     #[test]
@@ -13826,7 +14644,7 @@ mod tests {
         };
 
         assert!(
-            !should_use_existing_delete_replication_info(&opts),
+            !should_use_existing_delete_replication_info(&opts, true),
             "replicated delete-marker creation carries a source version id header but must not be treated as a version purge"
         );
     }
@@ -13839,7 +14657,7 @@ mod tests {
         };
 
         assert!(
-            should_use_existing_delete_replication_info(&opts),
+            should_use_existing_delete_replication_info(&opts, true),
             "true version-delete requests should keep using the pre-delete object info"
         );
     }

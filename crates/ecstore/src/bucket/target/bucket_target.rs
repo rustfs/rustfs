@@ -531,6 +531,47 @@ mod tests {
     }
 
     #[test]
+    fn historical_bucket_target_options_remain_readable() {
+        let target: BucketTarget = serde_json::from_value(serde_json::json!({
+            "endpoint": "legacy.example:9000",
+            "credentials": {
+                "accessKey": "legacy-access",
+                "secretKey": "legacy-secret",
+                "session_token": "legacy-session-token",
+                "expiration": "2024-12-31T23:59:59Z"
+            },
+            "targetbucket": "legacy-bucket",
+            "api": "s3v2",
+            "healthCheckDuration": 30,
+            "disableProxy": true,
+            "edge": true,
+            "edgeSyncBeforeExpiry": true,
+            "type": "replication"
+        }))
+        .expect("historical remote target should remain readable");
+
+        assert_eq!(target.api, "s3v2");
+        assert_eq!(target.health_check_duration, Duration::from_secs(30));
+        assert!(target.disable_proxy);
+        assert!(target.edge);
+        assert!(target.edge_sync_before_expiry);
+        assert_eq!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.session_token.as_deref()),
+            Some("legacy-session-token")
+        );
+        assert!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.expiration)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn test_bucket_target_type_json_deserialize() {
         // Test BucketTargetType JSON deserialization
         let replication_json = r#""replication""#;

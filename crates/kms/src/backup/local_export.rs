@@ -14,9 +14,9 @@
 
 //! Local backend backup export: sealed, KEK-protected bundle production.
 //!
-//! This is the producer side only; restore lives in a follow-up change. The
-//! admin API is not wired here either — callers construct the request and
-//! supply the backup KEK explicitly.
+//! This is the producer side; the consumer side lives in
+//! [`crate::backup::local_restore`]. The admin API is not wired here —
+//! callers construct the request and supply the backup KEK explicitly.
 //!
 //! # Bundle layout
 //!
@@ -48,7 +48,10 @@
 //! published. A crash at any earlier point leaves a bundle without a
 //! manifest, which decodes as an incomplete bundle and can never be restored.
 
-use crate::backends::local::{LocalKmsClient, StoredKeyProtection};
+use crate::backends::local::{
+    LocalKmsClient, STORED_MASTER_KEY_FORMAT_VERSION, StoredKeyProtection, UNKNOWN_STORED_KEY_PROTECTION,
+    has_unknown_protection_marker, stored_master_key_format_version,
+};
 use crate::backup::capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
 use crate::backup::error::BackupError;
 use crate::backup::manifest::{
@@ -63,6 +66,7 @@ use aes_gcm::{
 use jiff::Zoned;
 use rand::RngExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -73,9 +77,16 @@ pub const LOCAL_BUNDLE_MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIR: &str = "artifacts";
 const KEYS_DIR: &str = "artifacts/keys";
 const SALT_ARTIFACT_PATH: &str = "artifacts/master-key.salt.enc";
-const AEAD_NONCE_LEN: usize = 12;
+const CONFIG_ARTIFACT_PATH: &str = "artifacts/kms-config.json.enc";
+pub(crate) const AEAD_NONCE_LEN: usize = 12;
 /// Domain-separation context for the artifact AAD binding.
 const BUNDLE_AAD_CONTEXT: &str = "rustfs-kms-local-backup:v1";
+/// Domain-separation context for the master-key verifier.
+const MASTER_KEY_VERIFIER_CONTEXT: &str = "rustfs-kms-local-master-key-verifier:v1";
+/// Verifier scheme prefix for the Argon2id (salted) derivation.
+pub(crate) const MASTER_KEY_VERIFIER_ARGON2ID_PREFIX: &str = "argon2id-v1:";
+/// Verifier scheme prefix for the legacy pre-beta.9 SHA-256 derivation.
+pub(crate) const MASTER_KEY_VERIFIER_LEGACY_PREFIX: &str = "legacy-sha256-v1:";
 
 /// Caller-supplied backup KEK: a trust root deliberately separate from the
 /// business KMS hierarchy (it must not be a key that is itself part of the
@@ -111,7 +122,7 @@ impl BackupKek {
         }
     }
 
-    fn cipher(&self) -> Aes256Gcm {
+    pub(crate) fn cipher(&self) -> Aes256Gcm {
         Aes256Gcm::new(&Key::<Aes256Gcm>::from(*self.key))
     }
 }
@@ -134,6 +145,15 @@ pub struct LocalBackupExportRequest {
     pub snapshot_generation: u64,
     /// Bundle output directory; must not exist yet or must be empty.
     pub destination: PathBuf,
+    /// Serialized sanitized KMS configuration to seal into the bundle, if the
+    /// caller produced one.
+    ///
+    /// The persisted `KmsConfig` carries plaintext credentials (Vault token,
+    /// AppRole secret id, Local master key), so the sanitized projection is
+    /// owned by the admin layer and this module only seals the bytes it is
+    /// handed. The artifact is evidence for an operator decision: restore
+    /// verifies it opens but never applies a configuration.
+    pub sanitized_config: Option<Vec<u8>>,
 }
 
 impl LocalBackupExportRequest {
@@ -188,8 +208,7 @@ pub async fn export_local_backup(
     request: &LocalBackupExportRequest,
 ) -> Result<BackupManifest> {
     request.validate()?;
-    prepare_destination(&request.destination).await?;
-
+    validate_destination(&request.destination).await?;
     let snapshot = collect_snapshot(client).await?;
     if snapshot.records.is_empty() {
         return Err(KmsError::invalid_operation(
@@ -208,15 +227,27 @@ pub async fn export_local_backup(
         ));
     }
 
-    let manifest = build_and_write_bundle(kek, request, &snapshot).await?;
+    // The verifier lets a restore detect a wrong operator-supplied master key
+    // before touching any target state; dev-mode directories have no master
+    // key to verify.
+    let master_key_verifier = match client.configured_master_key() {
+        Some(master_key) => Some(compute_master_key_verifier(master_key, snapshot.salt.as_deref(), &request.backup_id)?),
+        None => None,
+    };
+
+    prepare_destination(&request.destination).await?;
+    let manifest = build_and_write_bundle(kek, request, &snapshot, master_key_verifier).await?;
     Ok(manifest)
 }
 
-/// Read and fully validate the manifest of a local bundle directory.
+/// Read and fully validate the manifest of a bundle directory, whatever
+/// backend produced it.
 ///
 /// A directory without a manifest is an interrupted export: the manifest is
-/// written last, so its absence means the bundle never sealed.
-pub async fn read_local_bundle_manifest(bundle_dir: &Path) -> Result<BackupManifest> {
+/// written last, so its absence means the bundle never sealed. The manifest
+/// file name and framing are bundle-wide, not Local-specific, so consumers of
+/// other backends' bundles read them through here too.
+pub async fn read_bundle_manifest(bundle_dir: &Path) -> Result<BackupManifest> {
     let manifest_path = bundle_dir.join(LOCAL_BUNDLE_MANIFEST_FILE);
     let bytes = match fs::read(&manifest_path).await {
         Ok(bytes) => bytes,
@@ -225,7 +256,12 @@ pub async fn read_local_bundle_manifest(bundle_dir: &Path) -> Result<BackupManif
         }
         Err(error) => return Err(error.into()),
     };
-    let manifest = BackupManifest::decode(&bytes)?;
+    Ok(BackupManifest::decode(&bytes)?)
+}
+
+/// Read and fully validate the manifest of a *local* bundle directory.
+pub async fn read_local_bundle_manifest(bundle_dir: &Path) -> Result<BackupManifest> {
+    let manifest = read_bundle_manifest(bundle_dir).await?;
     if manifest.backend != BackupBackendKind::Local {
         return Err(
             BackupError::corrupted(format!("bundle manifest declares backend {:?}, expected Local", manifest.backend)).into(),
@@ -262,6 +298,21 @@ pub async fn decrypt_bundle_artifact(
         Err(error) => return Err(error.into()),
     };
 
+    decrypt_artifact_payload(&manifest.backup_id, manifest.snapshot_generation, descriptor, kek, &payload)
+}
+
+/// Verify and decrypt one artifact payload already read into memory.
+///
+/// Fail-closed order: declared length, encrypted digest, nonce framing, then
+/// AEAD authentication. Shared by [`decrypt_bundle_artifact`] and the export
+/// pre-seal probe so producer and consumer can never drift on the framing.
+fn decrypt_artifact_payload(
+    backup_id: &str,
+    snapshot_generation: u64,
+    descriptor: &ArtifactDescriptor,
+    kek: &BackupKek,
+    payload: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
     if (payload.len() as u64) < descriptor.len {
         return Err(BackupError::truncated(format!(
             "artifact '{}' is {} bytes, manifest declares {}",
@@ -280,7 +331,7 @@ pub async fn decrypt_bundle_artifact(
         ))
         .into());
     }
-    if ContentDigest::sha256_of(&payload) != descriptor.encrypted_digest {
+    if ContentDigest::sha256_of(payload) != descriptor.encrypted_digest {
         return Err(BackupError::corrupted(format!("artifact '{}' does not match its manifest digest", descriptor.path)).into());
     }
     if payload.len() < AEAD_NONCE_LEN {
@@ -290,7 +341,7 @@ pub async fn decrypt_bundle_artifact(
     let (nonce_bytes, ciphertext) = payload.split_at(AEAD_NONCE_LEN);
     let mut nonce = [0u8; AEAD_NONCE_LEN];
     nonce.copy_from_slice(nonce_bytes);
-    let aad = artifact_aad(&manifest.backup_id, manifest.snapshot_generation, &descriptor.path);
+    let aad = artifact_aad(backup_id, snapshot_generation, &descriptor.path);
     let plaintext = kek
         .cipher()
         .decrypt(
@@ -328,7 +379,22 @@ async fn collect_snapshot(client: &LocalKmsClient) -> Result<CollectedSnapshot> 
 
         let raw = Zeroizing::new(fs::read(&path).await?);
         // Any unreadable record aborts the export: a bundle silently missing
-        // one key is worse than no bundle at all.
+        // one key is worse than no bundle at all. The protection marker is
+        // classified first so a record from a newer build keeps its own
+        // verdict — an operator who reads "material corrupt" starts a
+        // disaster recovery for what is only a version mismatch.
+        let format_version = stored_master_key_format_version(&raw).map_err(|error| {
+            KmsError::material_corrupt(&stem, format!("stored key record is not a readable JSON object: {error}"))
+        })?;
+        if format_version > STORED_MASTER_KEY_FORMAT_VERSION {
+            return Err(KmsError::unsupported_format_version(&stem, format_version.to_string()));
+        }
+        let has_unknown_marker = has_unknown_protection_marker(&raw).map_err(|error| {
+            KmsError::material_corrupt(&stem, format!("stored key record is not a readable JSON object: {error}"))
+        })?;
+        if has_unknown_marker {
+            return Err(KmsError::unsupported_format_version(&stem, UNKNOWN_STORED_KEY_PROTECTION));
+        }
         let probe: StoredRecordProbe = serde_json::from_slice(&raw)
             .map_err(|error| KmsError::material_corrupt(&stem, format!("stored key record does not deserialize: {error}")))?;
         if probe.key_id != stem {
@@ -360,6 +426,7 @@ async fn build_and_write_bundle(
     kek: &BackupKek,
     request: &LocalBackupExportRequest,
     snapshot: &CollectedSnapshot,
+    master_key_verifier: Option<String>,
 ) -> Result<BackupManifest> {
     let mut artifacts = Vec::with_capacity(snapshot.records.len() + 1);
     for record in &snapshot.records {
@@ -369,6 +436,10 @@ async fn build_and_write_bundle(
     }
     if let Some(salt) = &snapshot.salt {
         let descriptor = encrypt_and_write_artifact(kek, request, ArtifactKind::MasterKeySalt, SALT_ARTIFACT_PATH, salt).await?;
+        artifacts.push(descriptor);
+    }
+    if let Some(config) = &request.sanitized_config {
+        let descriptor = encrypt_and_write_artifact(kek, request, ArtifactKind::KmsConfig, CONFIG_ARTIFACT_PATH, config).await?;
         artifacts.push(descriptor);
     }
 
@@ -392,7 +463,8 @@ async fn build_and_write_bundle(
         snapshot_generation: request.snapshot_generation,
         backup_kek: kek.descriptor(),
         artifacts,
-        local_kdf: Some(local_kdf_descriptor(snapshot)),
+        local_kdf: Some(local_kdf_descriptor(snapshot, master_key_verifier)),
+        external_references: None,
         key_versions: None,
         capability_discovery: None,
         completeness: CompletenessState::InProgress,
@@ -448,20 +520,55 @@ async fn encrypt_and_write_artifact(
         )));
     }
 
-    Ok(ArtifactDescriptor {
+    let descriptor = ArtifactDescriptor {
         kind,
         path: artifact_path.to_string(),
         len: payload.len() as u64,
         aead_algorithm: AeadAlgorithm::Aes256Gcm,
         encrypted_digest: digest,
-    })
+    };
+
+    // Pre-seal decryption probe: digest equality only proves the ciphertext
+    // landed intact; this proves the stored artifact actually opens under the
+    // backup KEK and AAD binding before the manifest may reference it.
+    let reopened = decrypt_artifact_payload(&request.backup_id, request.snapshot_generation, &descriptor, kek, &written)?;
+    if reopened.as_slice() != plaintext {
+        return Err(KmsError::internal_error(format!(
+            "bundle artifact '{artifact_path}' failed the pre-seal decryption probe"
+        )));
+    }
+
+    Ok(descriptor)
 }
 
 /// AAD binding an artifact to its bundle identity and path. A JSON tuple
 /// gives unambiguous field boundaries without a hand-rolled framing format.
-fn artifact_aad(backup_id: &str, snapshot_generation: u64, artifact_path: &str) -> Vec<u8> {
+pub(crate) fn artifact_aad(backup_id: &str, snapshot_generation: u64, artifact_path: &str) -> Vec<u8> {
     serde_json::to_vec(&(BUNDLE_AAD_CONTEXT, backup_id, snapshot_generation, artifact_path))
         .expect("AAD tuple of strings and integers always serializes")
+}
+
+/// Compute the opaque one-way master-key verifier recorded in the manifest:
+/// `<scheme-prefix>` + `hex(SHA-256(json(context, backup_id) || derived_key))`.
+///
+/// The derivation follows the directory's KDF state: Argon2id over the
+/// persistent salt when one exists, the legacy SHA-256 derivation otherwise.
+/// The verifier is not an offline-guessing oracle: computing a candidate
+/// requires the salt, which exists only inside the KEK-sealed bundle, and a
+/// party holding the KEK already has the strictly stronger oracle of the
+/// artifact AEAD tags — while every guess still pays the full Argon2id cost.
+/// Binding `backup_id` prevents cross-bundle fingerprint correlation.
+pub(crate) fn compute_master_key_verifier(master_key: &str, salt: Option<&[u8]>, backup_id: &str) -> Result<String> {
+    let framing = serde_json::to_vec(&(MASTER_KEY_VERIFIER_CONTEXT, backup_id))
+        .expect("verifier framing tuple of strings always serializes");
+    let (prefix, derived) = match salt {
+        Some(salt) => (MASTER_KEY_VERIFIER_ARGON2ID_PREFIX, LocalKmsClient::derive_master_key(master_key, salt)?),
+        None => (MASTER_KEY_VERIFIER_LEGACY_PREFIX, LocalKmsClient::derive_legacy_master_key(master_key)?),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&framing);
+    hasher.update(derived.as_slice());
+    Ok(format!("{prefix}{}", hex::encode(hasher.finalize())))
 }
 
 /// The bundle-level protection label is the weakest state observed across
@@ -484,7 +591,7 @@ fn weakest_observed_protection(records: &[CollectedRecord]) -> AtRestProtection 
     }
 }
 
-fn local_kdf_descriptor(snapshot: &CollectedSnapshot) -> LocalKdfDescriptor {
+fn local_kdf_descriptor(snapshot: &CollectedSnapshot, master_key_verifier: Option<String>) -> LocalKdfDescriptor {
     let mut modes = Vec::new();
     for (marker, mode) in [
         (StoredKeyProtection::EncryptedMasterKey, AtRestProtection::EncryptedMasterKey),
@@ -508,13 +615,11 @@ fn local_kdf_descriptor(snapshot: &CollectedSnapshot) -> LocalKdfDescriptor {
     LocalKdfDescriptor {
         derivation,
         protection_modes: modes,
-        // The verifier shape is left to the restore change; the schema keeps
-        // it optional so bundles without one stay valid.
-        master_key_verifier: None,
+        master_key_verifier,
     }
 }
 
-async fn prepare_destination(destination: &Path) -> Result<()> {
+async fn validate_destination(destination: &Path) -> Result<()> {
     if fs::try_exists(destination).await? {
         let mut entries = fs::read_dir(destination)
             .await
@@ -525,6 +630,11 @@ async fn prepare_destination(destination: &Path) -> Result<()> {
             ));
         }
     }
+    Ok(())
+}
+
+async fn prepare_destination(destination: &Path) -> Result<()> {
+    validate_destination(destination).await?;
     fs::create_dir_all(destination.join(KEYS_DIR)).await?;
     Ok(())
 }
@@ -543,8 +653,9 @@ async fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Fsync a directory so freshly created bundle entries survive power loss.
 /// No-op on non-Unix platforms where directories cannot be opened for
-/// syncing (mirrors the local backend's durable commit helper).
-async fn fsync_dir(path: &Path) -> Result<()> {
+/// syncing (mirrors the local backend's durable commit helper). Shared with
+/// the restore module for the same durability points on the target side.
+pub(crate) async fn fsync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let path = path.to_path_buf();
@@ -599,6 +710,7 @@ mod tests {
             rustfs_version: "1.0.0-test".to_string(),
             snapshot_generation: 7,
             destination,
+            sanitized_config: None,
         }
     }
 
@@ -723,6 +835,37 @@ mod tests {
             .await
             .expect("artifact should decrypt");
         assert_eq!(decrypted.as_slice(), source_record.as_slice());
+    }
+
+    #[tokio::test]
+    async fn export_records_a_master_key_verifier_matching_recomputation() {
+        let (client, _key_dir) = encrypted_client().await;
+        client.create_key("verified", "AES_256", None).await.expect("create key");
+
+        let bundle = TempDir::new().expect("bundle dir");
+        let manifest = export_local_backup(&client, &test_kek(), &export_request(bundle.path().join("bundle")))
+            .await
+            .expect("export should succeed");
+
+        let verifier = manifest
+            .local_kdf
+            .as_ref()
+            .expect("local kdf descriptor")
+            .master_key_verifier
+            .as_deref()
+            .expect("encrypted bundles must record a verifier");
+        assert!(verifier.starts_with(MASTER_KEY_VERIFIER_ARGON2ID_PREFIX), "got {verifier:?}");
+
+        // The verifier is a pure function of (master key, salt, backup id):
+        // the restore side recomputes it from the operator-supplied key and
+        // the bundled salt.
+        let salt = fs::read(client.master_key_salt_file()).await.expect("salt");
+        let recomputed = compute_master_key_verifier("test-master-key", Some(&salt), "backup-0001").expect("recompute");
+        assert_eq!(recomputed, verifier);
+        let wrong_key = compute_master_key_verifier("wrong-master-key", Some(&salt), "backup-0001").expect("recompute");
+        assert_ne!(wrong_key, verifier, "a different master key must change the verifier");
+        let other_bundle = compute_master_key_verifier("test-master-key", Some(&salt), "backup-0002").expect("recompute");
+        assert_ne!(other_bundle, verifier, "verifiers must be bundle-bound");
     }
 
     #[tokio::test]
@@ -994,5 +1137,67 @@ mod tests {
             .await
             .expect_err("identity mismatch must abort the export");
         assert!(matches!(error, KmsError::InvalidKey { .. }), "got {error:?}");
+    }
+
+    /// A record written by a newer build must abort the export as an
+    /// unsupported format, not as corrupt material: the two verdicts send the
+    /// operator down completely different runbooks, and only one of them is
+    /// true here.
+    #[tokio::test]
+    async fn record_from_a_newer_build_aborts_export_as_unsupported_format() {
+        let (client, _key_dir) = encrypted_client().await;
+        client.create_key("alpha", "AES_256", None).await.expect("create key");
+
+        let record_path = client.key_directory().join("alpha.key");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!("secret-marker-value-must-not-leak");
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode record")).expect("write record");
+
+        let bundle = TempDir::new().expect("bundle dir");
+        let error = export_local_backup(&client, &test_kek(), &export_request(bundle.path().join("bundle")))
+            .await
+            .expect_err("an uninterpretable record must abort the export");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "alpha" && version == UNKNOWN_STORED_KEY_PROTECTION),
+            "got {error:?}"
+        );
+        assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn numeric_record_format_version_from_a_newer_build_aborts_export_as_unsupported_format() {
+        let (client, _key_dir) = encrypted_client().await;
+        client.create_key("alpha", "AES_256", None).await.expect("create key");
+
+        let record_path = client.key_directory().join("alpha.key");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("read record")).expect("decode record");
+        record["format_version"] = serde_json::json!(99);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode record")).expect("write record");
+
+        let bundle = TempDir::new().expect("bundle dir");
+        let destination = bundle.path().join("bundle");
+        let error = export_local_backup(&client, &test_kek(), &export_request(destination.clone()))
+            .await
+            .expect_err("a newer record format must abort the export");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
+                if key_id == "alpha" && version == "99"),
+            "got {error:?}"
+        );
+        assert!(
+            !destination.exists(),
+            "format validation must finish before the export creates its destination"
+        );
+
+        record["format_version"] = serde_json::json!(STORED_MASTER_KEY_FORMAT_VERSION);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).expect("encode supported record"))
+            .expect("write supported record");
+        export_local_backup(&client, &test_kek(), &export_request(destination.clone()))
+            .await
+            .expect("the same destination must remain usable after validation fails");
+        assert!(destination.join(LOCAL_BUNDLE_MANIFEST_FILE).exists());
     }
 }

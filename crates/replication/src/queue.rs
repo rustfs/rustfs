@@ -39,6 +39,32 @@ impl ReplicationQueueAdmission {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplicationBatchAdmission {
+    pub total: usize,
+    pub queued: usize,
+    pub missed: usize,
+}
+
+impl ReplicationBatchAdmission {
+    pub fn record(&mut self, admission: ReplicationQueueAdmission) {
+        self.total += 1;
+        match admission {
+            ReplicationQueueAdmission::Queued => self.queued += 1,
+            ReplicationQueueAdmission::Missed | ReplicationQueueAdmission::Skipped => self.missed += 1,
+        }
+    }
+
+    pub fn outcome(self) -> &'static str {
+        match (self.queued, self.missed) {
+            (0, 0) => "empty",
+            (_, 0) => "all_queued",
+            (0, _) => "all_missed",
+            _ => "partial",
+        }
+    }
+}
+
 pub fn mrf_save_admission(saved: bool) -> ReplicationQueueAdmission {
     if saved {
         ReplicationQueueAdmission::Queued
@@ -206,7 +232,7 @@ impl ReplicationPriority {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReplicationOperation {
     Object(Box<ReplicateObjectInfo>),
     Delete(Box<DeletedObjectReplicationInfo>),
@@ -267,7 +293,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ReplicationHealQueueAction, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue,
+        ReplicationBatchAdmission, ReplicationHealQueueAction, ReplicationOperation, ReplicationPriority,
+        ReplicationQueueAdmission, ReplicationWorkerQueue,
     };
     use crate::storage_api::DeletedObject;
     use crate::{
@@ -295,6 +322,25 @@ mod tests {
     fn mrf_save_admission_maps_send_result() {
         assert_eq!(mrf_save_admission(true), ReplicationQueueAdmission::Queued);
         assert_eq!(mrf_save_admission(false), ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn replication_batch_admission_classifies_all_partial_and_empty_batches() {
+        let mut all = ReplicationBatchAdmission::default();
+        all.record(ReplicationQueueAdmission::Queued);
+        assert_eq!(all.outcome(), "all_queued");
+
+        let mut partial = ReplicationBatchAdmission::default();
+        partial.record(ReplicationQueueAdmission::Queued);
+        partial.record(ReplicationQueueAdmission::Missed);
+        assert_eq!(partial.outcome(), "partial");
+
+        let mut all_missed = ReplicationBatchAdmission::default();
+        all_missed.record(ReplicationQueueAdmission::Missed);
+        assert_eq!(all_missed.outcome(), "all_missed");
+
+        let empty = ReplicationBatchAdmission::default();
+        assert_eq!(empty.outcome(), "empty");
     }
 
     #[test]
@@ -407,6 +453,21 @@ mod tests {
             panic!("expected version purge delete queue action");
         };
         assert_eq!(delete_info.delete_object.version_id, Some(version_id));
+        assert_eq!(delete_info.delete_object.delete_marker_version_id, None);
+    }
+
+    #[test]
+    fn heal_queue_action_preserves_pending_null_version_purge() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+        roi.version_id = Some(Uuid::nil());
+        roi.version_purge_status = VersionPurgeStatusType::Pending;
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        let ReplicationHealQueueAction::QueueDelete(delete_info) = action else {
+            panic!("expected null-version purge delete queue action");
+        };
+        assert_eq!(delete_info.delete_object.version_id, Some(Uuid::nil()));
         assert_eq!(delete_info.delete_object.delete_marker_version_id, None);
     }
 

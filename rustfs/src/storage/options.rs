@@ -109,7 +109,7 @@ pub async fn del_opts(
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
     let versioning_cfg = bucket_versioning_config(bucket).await;
-    del_opts_with_versioning(bucket, object, vid, headers, metadata, &versioning_cfg)
+    del_opts_with_versioning(bucket, object, vid, headers, metadata, &versioning_cfg, false)
 }
 
 /// Like [`del_opts`], but derives versioning state from an already-fetched
@@ -122,15 +122,16 @@ pub fn del_opts_with_versioning(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
     versioning_cfg: &VersioningConfiguration,
+    replication_request_authorized: bool,
 ) -> Result<ObjectOptions> {
-    let versioned = versioning_cfg.prefix_enabled(object);
-    let version_suspended = versioning_cfg.suspended();
+    let (versioned, version_suspended) = versioning_cfg.delete_state(object);
 
-    let vid = if vid.is_none() {
+    let vid = if vid.is_none() && replication_request_authorized {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
     } else {
         vid
     };
+    let synthetic_version_id = is_dir_object(object) && vid.is_none();
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
@@ -152,7 +153,12 @@ pub fn del_opts_with_versioning(
         None
     };
 
-    let mut opts = put_opts_from_headers(headers, metadata).map_err(|err| {
+    let mut opts = if replication_request_authorized {
+        put_opts_from_headers_with_replication_authorization(headers, metadata, replication_request_authorized)
+    } else {
+        get_default_opts(headers, metadata, false)
+    }
+    .map_err(|err| {
         error!("del_opts: invalid argument: {} error: {}", object, err);
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
@@ -161,19 +167,15 @@ pub fn del_opts_with_versioning(
         .map(|v| v.as_ref() == "true")
         .unwrap_or_default();
 
-    opts.version_id = {
-        if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
-        } else {
-            vid
-        }
-    };
+    opts.version_id = synthetic_version_id.then(|| Uuid::nil().to_string()).or(vid);
+    opts.synthetic_version_id = synthetic_version_id;
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
-    opts.delete_marker = get_header(headers, SUFFIX_SOURCE_DELETEMARKER)
-        .map(|v| v.as_ref() == "true")
-        .unwrap_or_default();
+    opts.delete_marker = replication_request_authorized
+        && get_header(headers, SUFFIX_SOURCE_DELETEMARKER)
+            .map(|v| v.as_ref() == "true")
+            .unwrap_or_default();
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
@@ -279,11 +281,22 @@ pub async fn put_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
+    put_opts_with_replication_authorization(bucket, object, vid, headers, metadata, false).await
+}
+
+pub async fn put_opts_with_replication_authorization(
+    bucket: &str,
+    object: &str,
+    vid: Option<String>,
+    headers: &HeaderMap<HeaderValue>,
+    metadata: HashMap<String, String>,
+    replication_request_authorized: bool,
+) -> Result<ObjectOptions> {
     let versioning_cfg = bucket_versioning_config(bucket).await;
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.prefix_suspended(object);
 
-    let vid = if vid.is_none() {
+    let vid = if vid.is_none() && replication_request_authorized {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
     } else {
         vid
@@ -298,7 +311,7 @@ pub async fn put_opts(
         return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
-    let mut opts = put_opts_from_headers(headers, metadata)
+    let mut opts = put_opts_from_headers_with_replication_authorization(headers, metadata, replication_request_authorized)
         .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
@@ -317,11 +330,20 @@ pub async fn put_opts(
 }
 
 pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> std::io::Result<ObjectOptions> {
+    get_complete_multipart_upload_opts_with_replication_authorization(headers, false)
+}
+
+pub fn get_complete_multipart_upload_opts_with_replication_authorization(
+    headers: &HeaderMap<HeaderValue>,
+    replication_request_authorized: bool,
+) -> std::io::Result<ObjectOptions> {
     let mut user_defined = HashMap::new();
 
     let mut replication_request = false;
-    if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
+    let mut mod_time = None;
+    if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
+        mod_time = replication_source_mtime(headers);
         if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
             rustfs_utils::http::insert_str(
                 &mut user_defined,
@@ -333,7 +355,7 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
         }
     }
 
-    if let Some(v) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
+    if replication_request_authorized && let Some(v) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
         insert_header_map(&mut user_defined, SUFFIX_REPLICATION_SSEC_CRC, v.into_owned());
     }
 
@@ -341,9 +363,10 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
         want_checksum: rustfs_rio::get_content_checksum(headers)?,
         user_defined,
         replication_request,
+        mod_time,
         ..Default::default()
     };
-    apply_replica_status_from_headers(headers, &mut opts);
+    apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
@@ -357,7 +380,18 @@ pub async fn copy_dst_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    put_opts(bucket, object, vid, headers, metadata).await
+    copy_dst_opts_with_replication_authorization(bucket, object, vid, headers, metadata, false).await
+}
+
+pub async fn copy_dst_opts_with_replication_authorization(
+    bucket: &str,
+    object: &str,
+    vid: Option<String>,
+    headers: &HeaderMap<HeaderValue>,
+    metadata: HashMap<String, String>,
+    replication_request_authorized: bool,
+) -> Result<ObjectOptions> {
+    put_opts_with_replication_authorization(bucket, object, vid, headers, metadata, replication_request_authorized).await
 }
 
 pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
@@ -365,25 +399,40 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 }
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
+    put_opts_from_headers_with_replication_authorization(headers, metadata, false)
+}
+
+pub fn put_opts_from_headers_with_replication_authorization(
+    headers: &HeaderMap<HeaderValue>,
+    metadata: HashMap<String, String>,
+    replication_request_authorized: bool,
+) -> Result<ObjectOptions> {
     let mut opts = get_default_opts(headers, metadata, false)?;
-    apply_replica_status_from_headers(headers, &mut opts);
-    if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
+    apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
+    if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
-        if let Some(v) = get_header(headers, SUFFIX_SOURCE_MTIME) {
-            let trimmed_s = v.trim();
-            match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
-                Ok(mtime) => opts.mod_time = Some(mtime),
-                Err(e) => {
-                    tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", trimmed_s, e);
-                    opts.mod_time = None;
-                }
-            }
-        }
+        opts.mod_time = replication_source_mtime(headers);
     }
     Ok(opts)
 }
 
-fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) {
+fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::OffsetDateTime> {
+    let value = get_header(headers, SUFFIX_SOURCE_MTIME)?;
+    let value = value.trim();
+    match time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339) {
+        Ok(mtime) => Some(mtime),
+        Err(err) => {
+            tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", value, err);
+            None
+        }
+    }
+}
+
+fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions, authorized: bool) {
+    if !authorized {
+        return;
+    }
+
     if headers
         .get(AMZ_BUCKET_REPLICATION_STATUS)
         .and_then(|value| value.to_str().ok())
@@ -532,6 +581,17 @@ pub(crate) fn namespace_reserved_user_metadata(metadata: &mut HashMap<String, St
         .into_iter()
         .map(|(key, value)| (stored_user_metadata_key(&key), value))
         .collect();
+}
+
+pub(crate) fn preserve_unclassified_user_metadata(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+    let classified_user_metadata = USER_METADATA_PREFIXES
+        .iter()
+        .any(|prefix| key.strip_prefix(prefix).is_some_and(|suffix| !suffix.is_empty()));
+    if classified_user_metadata || SUPPORTED_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header)) {
+        return;
+    }
+
+    metadata.insert(stored_user_metadata_key(key), value.to_owned());
 }
 
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
@@ -924,18 +984,21 @@ mod tests {
     use super::super::StorageError;
     use super::{
         ENV_REJECT_ARCHIVE_CONTENT_ENCODING, ReplicationStatusType, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
-        detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
+        del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_default_opts, get_opts, namespace_reserved_user_metadata, parse_copy_source_range, put_opts, put_opts_from_headers,
+        get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
+        namespace_reserved_user_metadata, parse_copy_source_range, put_opts, put_opts_from_headers,
+        put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
         validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
-        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,
-        insert_header,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME,
+        SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
     };
     use s3s::S3ErrorCode;
+    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -980,6 +1043,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_del_opts_preserves_explicit_null_directory_version() {
+        let headers = create_test_headers();
+
+        let opts = del_opts("test-bucket", "test-dir/", Some("null".to_string()), &headers, HashMap::new())
+            .await
+            .expect("explicit null directory version should be accepted");
+
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+    }
+
+    #[tokio::test]
     async fn test_del_opts_with_valid_version_id() {
         let headers = create_test_headers();
         let valid_uuid = Uuid::new_v4().to_string();
@@ -996,6 +1070,85 @@ mod tests {
                 // Expected if versioning is not enabled
             }
         }
+    }
+
+    #[test]
+    fn test_del_opts_only_trusts_replication_headers_after_authorization() {
+        let source_version_id = Uuid::new_v4().to_string();
+        let source_mtime = "2024-05-20T10:30:00+08:00";
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, source_version_id.clone());
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, source_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
+        headers.insert(
+            AMZ_BUCKET_REPLICATION_STATUS,
+            HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+        );
+
+        let untrusted = del_opts_with_versioning(
+            "test-bucket",
+            "test-object",
+            None,
+            &headers,
+            HashMap::new(),
+            &VersioningConfiguration::default(),
+            false,
+        )
+        .expect("ordinary delete options should ignore internal replication headers");
+
+        assert_eq!(untrusted.version_id, None);
+        assert!(!untrusted.replication_request);
+        assert!(untrusted.mod_time.is_none());
+        assert!(!untrusted.delete_marker);
+        assert!(untrusted.delete_replication.is_none());
+
+        let trusted = del_opts_with_versioning(
+            "test-bucket",
+            "test-object",
+            None,
+            &headers,
+            HashMap::new(),
+            &VersioningConfiguration::default(),
+            true,
+        )
+        .expect("authorized replication delete options should accept internal headers");
+
+        assert_eq!(trusted.version_id.as_deref(), Some(source_version_id.as_str()));
+        assert!(trusted.replication_request);
+        assert!(trusted.mod_time.is_some());
+        assert!(trusted.delete_marker);
+        assert_eq!(trusted.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn test_del_opts_treats_excluded_prefix_as_unversioned() {
+        let versioning = VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            excluded_prefixes: Some(vec![ExcludedPrefix {
+                prefix: Some("archive/".to_string()),
+            }]),
+            ..Default::default()
+        };
+
+        let excluded = del_opts_with_versioning(
+            "test-bucket",
+            "archive/object",
+            None,
+            &HeaderMap::new(),
+            HashMap::new(),
+            &versioning,
+            false,
+        )
+        .expect("excluded-prefix delete options should be derived");
+        assert!(!excluded.versioned);
+        assert!(!excluded.version_suspended);
+
+        let included =
+            del_opts_with_versioning("test-bucket", "live/object", None, &HeaderMap::new(), HashMap::new(), &versioning, false)
+                .expect("included-prefix delete options should be derived");
+        assert!(included.versioned);
+        assert!(!included.version_suspended);
     }
 
     #[tokio::test]
@@ -1237,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_put_opts_from_headers_with_replication_request() {
+    fn test_put_opts_from_headers_ignores_replication_request_without_authorization() {
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         let valid_mtime = "2024-05-20T10:30:00+08:00";
@@ -1250,6 +1403,20 @@ mod tests {
         assert!(result.is_ok());
         let opts = result.unwrap();
 
+        assert!(!opts.replication_request);
+        assert!(opts.mod_time.is_none());
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_accepts_replication_request_after_authorization() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        let valid_mtime = "2024-05-20T10:30:00+08:00";
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
+
+        let opts = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+
         assert!(opts.replication_request);
 
         let expected_mtime = time::OffsetDateTime::parse(valid_mtime, &time::format_description::well_known::Rfc3339).unwrap();
@@ -1258,7 +1425,7 @@ mod tests {
         let mut headers_invalid_mtime = HeaderMap::new();
         insert_header(&mut headers_invalid_mtime, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         insert_header(&mut headers_invalid_mtime, SUFFIX_SOURCE_MTIME, "invalid-time");
-        let result_invalid = put_opts_from_headers(&headers_invalid_mtime, HashMap::new());
+        let result_invalid = put_opts_from_headers_with_replication_authorization(&headers_invalid_mtime, HashMap::new(), true);
         assert!(result_invalid.is_ok());
         let opts_invalid = result_invalid.unwrap();
         assert!(opts_invalid.replication_request);
@@ -1273,9 +1440,39 @@ mod tests {
             HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
         );
 
-        let opts = put_opts_from_headers(&headers, HashMap::new()).expect("replica status header should parse");
+        let opts = put_opts_from_headers(&headers, HashMap::new()).expect("replica status header should be ignored");
 
-        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Empty);
+
+        let authorized = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replica status header should parse");
+        assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[tokio::test]
+    async fn test_put_opts_only_accepts_replication_source_headers_after_authorization() {
+        let source_version_id = Uuid::new_v4().to_string();
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, source_version_id.clone());
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        headers.insert(
+            AMZ_BUCKET_REPLICATION_STATUS,
+            HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+        );
+
+        let untrusted = put_opts("test-bucket", "test-object", None, &headers, HashMap::new())
+            .await
+            .expect("ordinary PUT options should be created");
+        assert_eq!(untrusted.version_id, None);
+        assert!(!untrusted.replication_request);
+        assert_eq!(untrusted.delete_marker_replication_status(), ReplicationStatusType::Empty);
+
+        let trusted = put_opts_with_replication_authorization("test-bucket", "test-object", None, &headers, HashMap::new(), true)
+            .await
+            .expect("authorized replication PUT options should be created");
+        assert_eq!(trusted.version_id.as_deref(), Some(source_version_id.as_str()));
+        assert!(trusted.replication_request);
+        assert_eq!(trusted.delete_marker_replication_status(), ReplicationStatusType::Replica);
     }
 
     #[test]
@@ -1286,9 +1483,39 @@ mod tests {
             HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
         );
 
-        let opts = get_complete_multipart_upload_opts(&headers).expect("replica status header should parse");
+        let opts = get_complete_multipart_upload_opts(&headers).expect("replica status header should be ignored");
 
-        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Empty);
+
+        let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
+            .expect("authorized replica status header should parse");
+        assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn test_complete_multipart_opts_preserves_authorized_replication_mtime() {
+        let source_mtime = "2024-05-20T10:30:00+08:00";
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, source_mtime);
+
+        let untrusted = get_complete_multipart_upload_opts(&headers)
+            .expect("ordinary multipart completion options should ignore replication headers");
+        assert!(!untrusted.replication_request);
+        assert!(untrusted.mod_time.is_none());
+
+        let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
+            .expect("authorized multipart replication options should parse");
+        let expected = time::OffsetDateTime::parse(source_mtime, &time::format_description::well_known::Rfc3339)
+            .expect("test source mtime should be valid");
+        assert!(authorized.replication_request);
+        assert_eq!(authorized.mod_time, Some(expected));
+
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "invalid-time");
+        let invalid = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
+            .expect("invalid replication mtime should keep existing fallback behavior");
+        assert!(invalid.replication_request);
+        assert!(invalid.mod_time.is_none());
     }
 
     #[test]

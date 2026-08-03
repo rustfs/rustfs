@@ -40,7 +40,7 @@ use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
-use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, insert_header};
 use rustfs_utils::path::encode_dir_object;
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
@@ -1495,6 +1495,8 @@ async fn cancelled_transition_waiting_for_prepared_reader_cleans_remote() {
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
+    use super::storage_api::test::ReqInfo;
+
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -1531,6 +1533,11 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         Method::DELETE,
     );
     insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
 
     Box::pin(usecase.execute_delete_object(req))
         .await
@@ -1735,6 +1742,8 @@ async fn compensation_driven_complete_multipart_upload_still_transitions() {
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
+    use super::storage_api::test::ReqInfo;
+
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
 
@@ -1771,6 +1780,11 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
         Method::DELETE,
     );
     insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
 
     Box::pin(usecase.execute_delete_object(req))
         .await
@@ -2498,6 +2512,7 @@ async fn object_lock_handlers_schedule_replication() {
 #[serial]
 #[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
 async fn delete_objects_resolves_bucket_versioning_once_per_request() {
+    use super::storage_api::test::bucket::replication::DELETE_CONFIG_SNAPSHOT_LOADS;
     use super::storage_api::test::{ReqInfo, VERSIONING_CONFIG_LOOKUPS};
     use std::sync::atomic::Ordering;
 
@@ -2536,6 +2551,7 @@ async fn delete_objects_resolves_bucket_versioning_once_per_request() {
     });
 
     let lookups_before = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst);
+    let snapshots_before = DELETE_CONFIG_SNAPSHOT_LOADS.load(Ordering::SeqCst);
     let response = usecase
         .execute_delete_objects(req)
         .await
@@ -2551,12 +2567,573 @@ async fn delete_objects_resolves_bucket_versioning_once_per_request() {
     );
 
     let lookups = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst) - lookups_before;
+    let snapshots = DELETE_CONFIG_SNAPSHOT_LOADS.load(Ordering::SeqCst) - snapshots_before;
     assert_eq!(
-        lookups,
+        snapshots,
         1,
-        "DeleteObjects must resolve bucket versioning exactly once per request; got {lookups} lookups for {} keys",
+        "DeleteObjects must resolve delete admission config exactly once per request; got {snapshots} snapshots for {} keys",
         keys.len()
     );
+    assert_eq!(lookups, 0, "DeleteObjects must not fall back to legacy per-key versioning lookups");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+async fn delete_objects_treats_empty_directory_version_as_absent() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-delobjs-empty-version-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "directory/";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, b"").await;
+
+    let input = DeleteObjectsInput::builder()
+        .bucket(bucket)
+        .delete(Delete {
+            objects: vec![ObjectIdentifier {
+                key: object.to_string(),
+                version_id: Some(" \t ".to_string()),
+                ..Default::default()
+            }],
+            quiet: None,
+        })
+        .build()
+        .expect("delete objects input should build");
+    let mut req = build_request(input, Method::POST);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let response = usecase
+        .execute_delete_objects(req)
+        .await
+        .expect("empty VersionId should be treated as an absent version");
+    let deleted = response
+        .output
+        .deleted
+        .expect("delete response should contain the directory entry");
+
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(
+        deleted[0].delete_marker, None,
+        "the synthetic null version must be purged, not hidden by a new marker"
+    );
+    assert_eq!(deleted[0].version_id, None, "the synthetic null sentinel must stay off the wire");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+async fn delete_objects_preserves_explicit_null_directory_version() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-delobjs-null-version-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "directory/";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, b"").await;
+
+    let input = DeleteObjectsInput::builder()
+        .bucket(bucket)
+        .delete(Delete {
+            objects: vec![ObjectIdentifier {
+                key: object.to_string(),
+                version_id: Some("null".to_string()),
+                ..Default::default()
+            }],
+            quiet: None,
+        })
+        .build()
+        .expect("delete objects input should build");
+    let mut req = build_request(input, Method::POST);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let response = usecase
+        .execute_delete_objects(req)
+        .await
+        .expect("explicit null VersionId should delete the directory's null version");
+    let deleted = response
+        .output
+        .deleted
+        .expect("delete response should contain the directory entry");
+
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].delete_marker, None);
+    assert_eq!(deleted[0].version_id.as_deref(), Some("null"));
+}
+
+async fn install_malformed_versioning_config(bucket: &str) {
+    use super::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+
+    let sys = get_global_bucket_metadata_sys().expect("bucket metadata system should be initialized");
+    let metadata = {
+        let sys = sys.read().await;
+        sys.get(bucket)
+            .await
+            .expect("bucket metadata should be cached before corruption injection")
+    };
+    let mut metadata = (*metadata).clone();
+    metadata.versioning_config_xml = b"<VersioningConfiguration>".to_vec();
+    metadata.versioning_config = None;
+    set_bucket_metadata(bucket.to_string(), metadata)
+        .await
+        .expect("malformed versioning metadata should be installed for the request test");
+}
+
+async fn install_malformed_replication_config(bucket: &str) {
+    use super::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+
+    let sys = get_global_bucket_metadata_sys().expect("bucket metadata system should be initialized");
+    let metadata = {
+        let sys = sys.read().await;
+        sys.get(bucket)
+            .await
+            .expect("bucket metadata should be cached before corruption injection")
+    };
+    let mut metadata = (*metadata).clone();
+    metadata.replication_config_xml = b"<ReplicationConfiguration>".to_vec();
+    metadata.replication_config = None;
+    set_bucket_metadata(bucket.to_string(), metadata)
+        .await
+        .expect("malformed replication metadata should be installed for the request test");
+}
+
+async fn install_delete_replication_config(
+    bucket: &str,
+    delete_enabled: bool,
+    replica_modifications: bool,
+    required_tag: Option<(&str, &str)>,
+) {
+    use super::storage_api::test::{bucket::utils::serialize, get_global_bucket_metadata_sys, set_bucket_metadata};
+
+    let sys = get_global_bucket_metadata_sys().expect("bucket metadata system should be initialized");
+    let metadata = {
+        let sys = sys.read().await;
+        sys.get(bucket)
+            .await
+            .expect("bucket metadata should be cached before replication config injection")
+    };
+    let mut metadata = (*metadata).clone();
+    let target = "arn:aws:s3:::target-bucket";
+    let delete_status = if delete_enabled {
+        DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED)
+    } else {
+        DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED)
+    };
+
+    metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    metadata.versioning_config = Some(VersioningConfiguration {
+        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        ..Default::default()
+    });
+    let filter = required_tag.map(|(key, value)| ReplicationRuleFilter {
+        tag: Some(Tag {
+            key: Some(key.to_string()),
+            value: Some(value.to_string()),
+        }),
+        ..Default::default()
+    });
+    let source_selection_criteria = replica_modifications.then(|| SourceSelectionCriteria {
+        replica_modifications: Some(ReplicaModifications {
+            status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+        }),
+        sse_kms_encrypted_objects: None,
+    });
+    let replication_config = ReplicationConfiguration {
+        role: String::new(),
+        rules: vec![ReplicationRule {
+            delete_marker_replication: Some(DeleteMarkerReplication {
+                status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+            }),
+            delete_replication: Some(DeleteReplication { status: delete_status }),
+            destination: Destination {
+                bucket: target.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: None,
+            filter,
+            id: Some("delete".to_string()),
+            prefix: Some(String::new()),
+            priority: Some(1),
+            source_selection_criteria,
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }],
+    };
+    metadata.replication_config_xml = serialize(&replication_config).expect("replication test config should serialize");
+    metadata.replication_config = Some(replication_config);
+    set_bucket_metadata(bucket.to_string(), metadata)
+        .await
+        .expect("delete replication metadata should be installed for the request test");
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_object_versioning_config_failure_leaves_latest_object_intact() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-delete-versioning-fail-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "object.txt";
+    let payload = b"local delete must not commit before versioning admission";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, payload).await;
+    install_malformed_versioning_config(&bucket).await;
+
+    let input = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .build()
+        .expect("delete input should build");
+    let mut req = build_request(input, Method::DELETE);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let err = usecase
+        .execute_delete_object(req)
+        .await
+        .expect_err("versioning config failure must reject DeleteObject");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_object_replication_config_failure_leaves_latest_object_intact() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-delete-repl-fail-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "object.txt";
+    let payload = b"local delete must not commit before replication admission";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, payload).await;
+    install_malformed_replication_config(&bucket).await;
+
+    let input = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .build()
+        .expect("delete input should build");
+    let mut req = build_request(input, Method::DELETE);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let err = usecase
+        .execute_delete_object(req)
+        .await
+        .expect_err("replication config failure must reject DeleteObject");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn delete_object_uses_one_replication_config_generation() {
+    use super::object_usecase::install_delete_snapshot_test_hook;
+    use super::storage_api::test::ReqInfo;
+    use super::storage_api::test::bucket::replication::take_scheduled_replication_deletes;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-delete-config-generation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "object.txt";
+    create_test_bucket(&ecstore, &bucket).await;
+
+    let mut reader = PutObjReader::from_vec(b"generation-bound delete".to_vec());
+    let uploaded = ecstore
+        .put_object(
+            &bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("versioned object should be uploaded");
+    let version_id = uploaded.version_id.expect("versioned upload should return a version ID");
+    let version_id_string = version_id.to_string();
+
+    install_delete_replication_config(&bucket, true, false, None).await;
+    assert!(take_scheduled_replication_deletes().is_empty());
+
+    let loaded = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    install_delete_snapshot_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
+
+    let input = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .version_id(Some(version_id_string.clone()))
+        .build()
+        .expect("version delete input should build");
+    let mut req = build_request(input, Method::DELETE);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let update_config = async {
+        loaded.wait().await;
+        install_delete_replication_config(&bucket, false, false, None).await;
+        resume.wait().await;
+    };
+    let (response, ()) = tokio::join!(usecase.execute_delete_object(req), update_config);
+    let response = response.expect("delete admitted by the first config generation should succeed");
+
+    assert_eq!(response.output.version_id.as_deref(), Some(version_id_string.as_str()));
+    let scheduled = take_scheduled_replication_deletes();
+    assert_eq!(scheduled.len(), 1, "the first config generation must control post-delete queueing");
+    assert_eq!(scheduled[0].version_id, Some(version_id));
+    let state = scheduled[0]
+        .replication_state
+        .as_ref()
+        .expect("admitted version purge should carry replication state");
+    assert_eq!(
+        state.version_purge_status_internal.as_deref(),
+        Some("arn:aws:s3:::target-bucket=PENDING;")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn replica_delete_uses_authorized_source_version_and_its_tags() {
+    use super::object_usecase::install_delete_source_test_hook;
+    use super::storage_api::test::ReqInfo;
+    use super::storage_api::test::bucket::replication::{ReplicationStatusType, take_scheduled_replication_deletes};
+    use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+    use rustfs_utils::http::{SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID};
+    use std::collections::HashMap;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-replica-source-version-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "object.txt";
+    create_test_bucket(&ecstore, &bucket).await;
+    install_delete_replication_config(&bucket, true, true, Some(("generation", "updated"))).await;
+
+    let mut old_opts = ObjectOptions {
+        versioned: true,
+        user_defined: HashMap::from([(AMZ_OBJECT_TAGGING.to_string(), "generation=old".to_string())]),
+        ..Default::default()
+    };
+    old_opts.set_replica_status(ReplicationStatusType::Replica);
+    let mut old_reader = PutObjReader::from_vec(b"old replica version".to_vec());
+    let old = ecstore
+        .put_object(&bucket, object, &mut old_reader, &old_opts)
+        .await
+        .expect("old replica version should be uploaded");
+    let old_version_id = old.version_id.expect("old replica version should have a version ID");
+    let old_version_id_string = old_version_id.to_string();
+
+    let mut latest_opts = ObjectOptions {
+        versioned: true,
+        user_defined: HashMap::from([(AMZ_OBJECT_TAGGING.to_string(), "generation=latest".to_string())]),
+        ..Default::default()
+    };
+    latest_opts.set_replica_status(ReplicationStatusType::Replica);
+    let mut latest_reader = PutObjReader::from_vec(b"latest replica version".to_vec());
+    let latest = ecstore
+        .put_object(&bucket, object, &mut latest_reader, &latest_opts)
+        .await
+        .expect("latest replica version should be uploaded");
+    assert_ne!(latest.version_id, Some(old_version_id));
+    assert!(take_scheduled_replication_deletes().is_empty());
+
+    let source_loaded = Arc::new(Barrier::new(2));
+    let resume_delete = Arc::new(Barrier::new(2));
+    install_delete_source_test_hook(bucket.clone(), Arc::clone(&source_loaded), Arc::clone(&resume_delete));
+
+    let input = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .build()
+        .expect("replica delete input should build");
+    let mut req = build_request(input, Method::DELETE);
+    req.headers
+        .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
+    insert_header(&mut req.headers, SUFFIX_SOURCE_VERSION_ID, old_version_id_string.clone());
+    insert_header(&mut req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let update_tags = async {
+        source_loaded.wait().await;
+        ecstore
+            .put_object_tags(
+                &bucket,
+                object,
+                "generation=updated",
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(old_version_id_string.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag update ordered before the locked delete should succeed");
+        resume_delete.wait().await;
+    };
+    let (response, ()) = tokio::join!(usecase.execute_delete_object(req), update_tags);
+    let response = response.expect("authorized replica version delete should succeed");
+
+    assert_eq!(response.output.version_id.as_deref(), Some(old_version_id_string.as_str()));
+    let scheduled = take_scheduled_replication_deletes();
+    assert_eq!(
+        scheduled.len(),
+        1,
+        "the tag committed after the advisory pre-read must control downstream fanout"
+    );
+    assert_eq!(scheduled[0].version_id, Some(old_version_id));
+    assert_eq!(
+        scheduled[0]
+            .replication_state
+            .as_ref()
+            .and_then(|state| state.version_purge_status_internal.as_deref()),
+        Some("arn:aws:s3:::target-bucket=PENDING;")
+    );
+    assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, b"latest replica version");
+}
+
+#[tokio::test]
+#[serial]
+async fn force_delete_replication_config_failure_leaves_prefix_intact() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-force-delete-repl-fail-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let prefix = "prefix/";
+    let object = "prefix/object.txt";
+    let payload = b"force delete must validate replication metadata before deleting descendants";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, payload).await;
+    install_malformed_replication_config(&bucket).await;
+
+    let input = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(prefix.to_string())
+        .build()
+        .expect("delete input should build");
+    let mut req = build_request(input, Method::DELETE);
+    insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let err = usecase
+        .execute_delete_object(req)
+        .await
+        .expect_err("replication config failure must reject force delete");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
+}
+
+#[tokio::test]
+#[serial]
+async fn replica_delete_replication_config_failure_leaves_object_intact() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-replica-delete-repl-fail-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "object.txt";
+    let payload = b"incoming replica delete must use the admitted request snapshot";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, payload).await;
+    install_malformed_replication_config(&bucket).await;
+
+    let input = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .build()
+        .expect("delete input should build");
+    let mut req = build_request(input, Method::DELETE);
+    req.headers
+        .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let err = usecase
+        .execute_delete_object(req)
+        .await
+        .expect_err("replication config failure must reject incoming replica delete");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_objects_replication_config_failure_does_not_call_storage_delete() {
+    use super::storage_api::test::ReqInfo;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-delete-repls-fail-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "object.txt";
+    let payload = b"batch delete must fail closed on replication metadata errors";
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, object, payload).await;
+    install_malformed_replication_config(&bucket).await;
+
+    let input = DeleteObjectsInput::builder()
+        .bucket(bucket.clone())
+        .delete(Delete {
+            objects: vec![ObjectIdentifier {
+                key: object.to_string(),
+                version_id: None,
+                ..Default::default()
+            }],
+            quiet: None,
+        })
+        .build()
+        .expect("delete objects input should build");
+    let mut req = build_request(input, Method::POST);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let err = usecase
+        .execute_delete_objects(req)
+        .await
+        .expect_err("replication config failure must reject DeleteObjects");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+    assert_eq!(read_object_bytes(&ecstore, &bucket, object).await, payload);
 }
 
 /// Regression pin for the nonexistent-bucket fast path: GET/HEAD/DeleteObject

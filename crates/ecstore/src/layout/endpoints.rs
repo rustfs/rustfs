@@ -22,6 +22,8 @@ use rustfs_config::{
     ENV_STARTUP_TOPOLOGY_WAIT_MODE, ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, ENV_UNSAFE_BYPASS_DISK_CHECK,
 };
 use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, get_host_ip, is_local_host};
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     future::Future,
@@ -598,6 +600,58 @@ const DNS_RETRY_JITTER_PERCENT: u64 = 20;
 /// wait does not flood the log with one line per backoff tick.
 const TOPOLOGY_WARN_THROTTLE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+static FORCED_LOCAL_HOST_RESOLUTION_TIMEOUTS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+struct LocalHostResolutionTimeoutGuard {
+    hosts: Vec<String>,
+}
+
+#[cfg(test)]
+impl Drop for LocalHostResolutionTimeoutGuard {
+    fn drop(&mut self) {
+        let mut forced_hosts = FORCED_LOCAL_HOST_RESOLUTION_TIMEOUTS
+            .lock()
+            .expect("local-host test resolver mutex poisoned");
+        for host in &self.hosts {
+            forced_hosts.remove(host);
+        }
+    }
+}
+
+#[cfg(test)]
+fn force_local_host_resolution_timeout_for_test(hosts: &[&str]) -> LocalHostResolutionTimeoutGuard {
+    let hosts = hosts.iter().map(|host| (*host).to_string()).collect::<Vec<_>>();
+    let mut forced_hosts = FORCED_LOCAL_HOST_RESOLUTION_TIMEOUTS
+        .lock()
+        .expect("local-host test resolver mutex poisoned");
+    forced_hosts.extend(hosts.iter().cloned());
+    LocalHostResolutionTimeoutGuard { hosts }
+}
+
+#[cfg(test)]
+fn local_host_resolution_timeout_forced(host: &Host<&str>) -> bool {
+    let host = match host {
+        Host::Domain(domain) => (*domain).to_string(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => ip.to_string(),
+    };
+    FORCED_LOCAL_HOST_RESOLUTION_TIMEOUTS
+        .lock()
+        .expect("local-host test resolver mutex poisoned")
+        .contains(&host)
+}
+
+fn endpoint_is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<bool> {
+    #[cfg(test)]
+    if local_host_resolution_timeout_forced(&host) {
+        return Err(Error::new(ErrorKind::TimedOut, "resolver timeout"));
+    }
+
+    is_local_host(host, port, local_port)
+}
+
 struct DnsRetryDeadline {
     started: Instant,
     timeout: Duration,
@@ -694,7 +748,7 @@ async fn resolve_local_host_with_retry(
     retry_dns_operation(
         || {
             let host = host.clone();
-            async move { is_local_host(host, port, local_port) }
+            async move { endpoint_is_local_host(host, port, local_port) }
         },
         async_sleep,
         dns_retry_deadline,
@@ -1690,9 +1744,11 @@ mod test {
 
     #[tokio::test]
     async fn system_resolver_negative_result_reaches_the_dns_allowlist() {
-        let err = get_host_ip(Host::Domain("rustfs-startup-negative.invalid"))
-            .await
-            .expect_err("the reserved .invalid domain must not resolve");
+        let Err(err) = get_host_ip(Host::Domain("rustfs-startup-negative.invalid")).await else {
+            // Some corporate and ISP resolvers synthesize an address for
+            // unknown names, including the reserved .invalid suffix.
+            return;
+        };
         assert!(
             is_retryable_dns_error(&err),
             "system resolver error kind {:?} and message {err:?} must retain retry provenance",
@@ -2231,6 +2287,9 @@ mod test {
     #[serial]
     #[tokio::test]
     async fn create_server_endpoints_bounds_kubernetes_alias_dns_fallback() {
+        let _resolution_timeout =
+            force_local_host_resolution_timeout_for_test(&["unrelated-0.example.invalid", "unrelated-1.example.invalid"]);
+
         async_with_vars(
             [
                 (ENV_LOCAL_ENDPOINT_HOST, None),

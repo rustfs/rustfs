@@ -50,12 +50,18 @@ on:
       - "**/*.svg"
       - ".gitignore"
       - ".dockerignore"
+      - "flake.lock"
   schedule:
     - cron: "0 1 * * 0" # Weekly on Sunday 01:00 UTC (staggered after the ci.yml midnight cron)
   workflow_dispatch:
     inputs:
       build_docker:
-        description: "Build and push Docker images after binary build"
+        # Advisory only. docker.yml triggers on workflow_run and its job-level
+        # condition requires the triggering event to be a tag push, so a manual
+        # dispatch of this workflow never produces images regardless of this
+        # value. Kept because the summary step reports it; wiring it up would
+        # mean teaching docker.yml's version parser a second event shape.
+        description: "Build and push Docker images after binary build (ignored: dispatch runs never reach docker.yml)"
         required: false
         default: true
         type: boolean
@@ -83,6 +89,7 @@ jobs:
   build-check:
     name: Build Strategy Check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
@@ -92,6 +99,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Determine build strategy
         id: check
@@ -164,6 +173,7 @@ jobs:
     name: Prepare Platform Matrix
     needs: build-check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       selected: ${{ steps.select.outputs.selected }}
@@ -171,10 +181,14 @@ jobs:
       - name: Select target platforms
         id: select
         shell: bash
+        env:
+          # via env, not interpolation: a dispatch input is free-form text and
+          # would otherwise be pasted into the script for bash to evaluate.
+          RAW_PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}
         run: |
           set -euo pipefail
 
-          selected="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}"
+          selected="$RAW_PLATFORMS"
           selected="$(echo "${selected}" | tr -d '[:space:]')"
           if [[ -z "${selected}" ]]; then
             selected="all"
@@ -245,6 +259,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Rust environment
@@ -253,9 +268,17 @@ jobs:
           rust-version: stable
           target: ${{ matrix.target }}
           cache-shared-key: build-${{ matrix.target }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+          # main only. A cache saved on refs/tags/X is scoped to that tag: no
+          # other tag, no main run and no PR can restore it, so every release
+          # cycle wrote up to 12 entries of 1-2GB (preview tag plus final tag,
+          # six legs each) that nobody could read, evicting the hot lanes from
+          # the repo-wide 10GB quota. Tag builds still restore the main-scoped
+          # cache, since default-branch caches are readable from every ref.
+          # The one real cost: re-running a failed leg of the same tag no longer
+          # finds that tag's own warm cache and falls back to main's.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-cross-tools: ${{ matrix.cross }}
+          install-test-tools: 'false'
 
       - name: Download static console assets
         shell: bash
@@ -702,9 +725,14 @@ jobs:
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Build completion summary
         shell: bash
+        env:
+          # dispatch input via env: free-form text must not be pasted into the
+          # script for bash to evaluate.
+          INPUT_BUILD_DOCKER: ${{ github.event.inputs.build_docker }}
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
           VERSION="${{ needs.build-check.outputs.version }}"
@@ -746,7 +774,7 @@ jobs:
           echo "🐳 Docker Images:"
           if [[ "$BUILD_TYPE" == "preview" ]]; then
             echo "⏭️  Preview tags do not publish Docker images"
-          elif [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
+          elif [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
           elif [[ "$BUILD_STATUS" == "success" ]]; then
             echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
@@ -760,6 +788,7 @@ jobs:
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     outputs:
@@ -769,6 +798,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Create GitHub Release
@@ -819,12 +849,15 @@ jobs:
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       actions: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Download all build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -910,6 +943,7 @@ jobs:
     needs: [ build-check, publish-release ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Update latest.json
         env:
@@ -969,6 +1003,7 @@ jobs:
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:

@@ -1,0 +1,14 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: shape_of(&transit_backend)
+---
+VaultTransit:
+  address: "<string>"
+  auth_method:
+    Token:
+      token: "<string>"
+  metadata_key_prefix: "<string>"
+  metadata_kv_mount: "<string>"
+  mount_path: "<string>"
+  namespace: "<null>"
+  tls: "<null>"

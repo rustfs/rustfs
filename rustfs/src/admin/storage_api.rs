@@ -286,16 +286,39 @@ pub(crate) mod metadata_sys {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
 
-    pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    pub(crate) async fn update_if_incarnation(
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
+    }
+
+    pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {
+        super::ecstore_bucket::metadata_sys::capture_bucket_metadata_incarnation(bucket).await
+    }
+
+    pub(crate) async fn acquire_bucket_metadata_transaction_lock(
+        bucket: &str,
+    ) -> Result<super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
         crate::storage::storage_api::acquire_bucket_metadata_transaction_lock(bucket).await
     }
 
-    pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        crate::storage::storage_api::update_bucket_targets_under_transaction_lock(bucket, data).await
+    pub(crate) async fn update_bucket_targets_under_transaction_lock(
+        guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+        bucket: &str,
+        data: Vec<u8>,
+    ) -> Result<OffsetDateTime> {
+        crate::storage::storage_api::update_bucket_targets_under_transaction_lock(guard, bucket, data).await
     }
 
-    pub(crate) async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-        crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
+    pub(crate) async fn delete_if_incarnation(
+        bucket: &str,
+        config_file: &str,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_if_incarnation(bucket, config_file, expected_incarnation_id).await
     }
 
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -372,6 +395,10 @@ pub(crate) mod quota {
 }
 
 pub(crate) mod replication {
+    pub(crate) use super::ecstore_bucket::replication::{
+        REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+        REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
     pub(crate) type ReplicationStatusType = super::ecstore_bucket::replication::ReplicationStatusType;
@@ -644,12 +671,17 @@ pub(crate) async fn read_admin_config_without_migrate(api: Arc<ECStore>) -> Resu
     ecstore_config::com::read_config_without_migrate(api).await
 }
 
+pub(crate) async fn read_existing_admin_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
+    ecstore_config::com::read_existing_server_config_no_lock(api).await
+}
+
 #[cfg(test)]
 pub(crate) async fn read_admin_config_without_migrate_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
     ecstore_config::com::read_config_without_migrate_no_lock(api).await
 }
 
 pub(crate) type AdminServerConfigSnapshot = ecstore_config::com::ServerConfigSnapshot;
+pub(crate) type AdminServerConfigSaveResult = ecstore_config::com::ServerConfigSaveResult;
 
 pub(crate) async fn save_admin_config(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
     ecstore_config::com::save_config(api, file, data).await
@@ -690,8 +722,17 @@ pub(crate) async fn save_admin_server_config_snapshot(
     api: Arc<ECStore>,
     cfg: &rustfs_config::server_config::Config,
     snapshot: &AdminServerConfigSnapshot,
-) -> Result<bool> {
-    ecstore_config::com::save_server_config_snapshot(api, cfg, snapshot).await
+) -> Result<AdminServerConfigSaveResult> {
+    ecstore_config::com::save_server_config_snapshot_with_generation(api, cfg, snapshot).await
+}
+
+pub(crate) async fn with_admin_server_config_read_lock<F, Fut, T>(api: Arc<ECStore>, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    ecstore_config::com::with_server_config_read_lock(api, operation).await
 }
 
 pub(crate) fn init_admin_config_defaults() {
@@ -793,9 +834,10 @@ pub(crate) mod cluster {
 pub(crate) mod config {
     pub(crate) use super::storageclass;
     pub(crate) use super::{
-        AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, init_admin_config_defaults,
-        read_admin_config, read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_config,
-        save_admin_server_config_snapshot,
+        AdminServerConfigSaveResult, AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config,
+        init_admin_config_defaults, read_admin_config, read_admin_config_without_migrate, read_admin_server_config_snapshot,
+        read_existing_admin_server_config_no_lock, save_admin_config, save_admin_server_config_snapshot,
+        with_admin_server_config_read_lock,
     };
     #[cfg(test)]
     pub(crate) use super::{

@@ -15,15 +15,15 @@
 use super::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
-    decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
-    get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
-    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
-    update_bucket_metadata_config,
+    decode_tags_to_map, delete_bucket_metadata_config_if_incarnation, encode_tags, get_bucket_accelerate_config,
+    get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config,
+    get_bucket_website_config, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    record_replication_proxy, serialize, update_bucket_metadata_config_if_incarnation,
 };
 use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::ApiError;
-use crate::storage::access::has_bypass_governance_header;
+use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::{self, acl};
@@ -47,6 +47,7 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, insert_str};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{debug, error, instrument, warn};
@@ -58,7 +59,7 @@ const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 use crate::app::storage_api::object_usecase::bucket::replication::{
-    ReplicateDecision, must_replicate_object, schedule_object_replication,
+    ReplicateDecision, must_replicate_metadata, schedule_metadata_replication,
 };
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
@@ -134,19 +135,16 @@ impl FS {
         let tags = match store.get_object_tags(bucket, object, &opts).await {
             Ok(t) => t,
             Err(e) => {
-                if is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                if is_err_object_not_found(&e) || is_err_version_not_found(&e) || is_err_bucket_not_found(&e) {
                     debug!(
                         target: "rustfs::storage::ecfs",
                         bucket = %bucket,
                         object = %object,
                         version_id = ?version_id,
                         error = %e,
-                        "object or version not found when fetching tags for policy; treating as no tags"
+                        "object, version, or bucket not found when fetching tags for policy; treating as no tags"
                     );
                     return Ok(std::collections::HashMap::new());
-                }
-                if is_err_bucket_not_found(&e) {
-                    return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
                 }
                 warn!(
                     target: "rustfs::storage::ecfs",
@@ -191,6 +189,12 @@ const MAXIMUM_RETENTION_YEARS: i32 = 100;
 
 fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::MalformedXML, message.into())
+}
+
+pub(crate) fn propagate_object_lock_peer_reload(result: std::result::Result<(), StorageError>) -> S3Result<()> {
+    result.map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to publish Object Lock metadata: {err}"))
+    })
 }
 
 fn invalid_retention_period(message: impl Into<String>) -> S3Error {
@@ -370,6 +374,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -379,7 +384,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        delete_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
+        delete_bucket_metadata_config_if_incarnation(&req.input.bucket, BUCKET_WEBSITE_CONFIG, expected_incarnation_id)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -408,7 +413,6 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        record_s3_op(S3Operation::DeleteObjectTagging);
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
@@ -431,15 +435,29 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let version_id_for_parse = version_id.clone();
-        let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id_for_parse)?.map(Into::into),
-            ..Default::default()
-        };
+        let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        let existing_object_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
+        let dsc = must_replicate_metadata(
+            &bucket,
+            &object,
+            &existing_object_info.user_defined,
+            String::new(),
+            existing_object_info.replication_status.clone(),
+            opts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            opts.eval_metadata = Some(eval_metadata);
+        }
 
         let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
         Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
-        delete_tags_result.map_err(|e| {
+        let object_info = delete_tags_result.map_err(|e| {
             error!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -452,19 +470,10 @@ impl S3 for FS {
             ApiError::from(e)
         })?;
 
-        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?version_id,
-                    error = %err,
-                    "failed to load object info for delete-object-tagging notification; falling back to request context"
-                );
-                None
-            }
-        };
+        let event_object_info = Some(object_info.clone());
+        if dsc.replicate_any() {
+            schedule_metadata_replication(object_info, store.clone(), dsc).await;
+        }
 
         counter!("rustfs_delete_object_tagging_success").increment(1);
 
@@ -1053,6 +1062,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1063,9 +1073,14 @@ impl S3 for FS {
 
         let accelerate_config = serialize(&req.input.accelerate_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_ACCELERATE_CONFIG,
+            accelerate_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
     }
@@ -1096,6 +1111,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         record_s3_op(S3Operation::PutBucketLogging);
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
@@ -1107,9 +1123,14 @@ impl S3 for FS {
 
         let logging_config = serialize(&req.input.bucket_logging_status)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_LOGGING_CONFIG,
+            logging_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
@@ -1156,6 +1177,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1166,9 +1188,14 @@ impl S3 for FS {
 
         let payment_config = serialize(&req.input.request_payment_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_REQUEST_PAYMENT_CONFIG,
+            payment_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
     }
@@ -1198,6 +1225,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1208,9 +1236,14 @@ impl S3 for FS {
 
         let website_config = serialize(&req.input.website_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_WEBSITE_CONFIG,
+            website_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketWebsiteOutput::default()))
     }
@@ -1223,7 +1256,6 @@ impl S3 for FS {
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        record_s3_op(S3Operation::PutObjectAcl);
         let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let bucket = &req.input.bucket;
         let key = &req.input.key;
@@ -1291,6 +1323,7 @@ impl S3 for FS {
             version_id: opts.version_id.clone(),
             ..Default::default()
         };
+        apply_bucket_generation_guard(&req, &bucket, &mut popts)?;
 
         // PutObjectLegalHold only rewrites metadata, so replication is not scheduled by the
         // object PUT path. Schedule it explicitly, otherwise the legal hold never reaches the
@@ -1302,7 +1335,7 @@ impl S3 for FS {
         // to re-drive. Scheduling without that marker would lose the task silently.
         let dsc = match store.get_object_info(&bucket, &key, &opts).await.ok() {
             Some(info) => {
-                must_replicate_object(
+                must_replicate_metadata(
                     &bucket,
                     &key,
                     &info.user_defined,
@@ -1327,10 +1360,9 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        // This replicates the whole object, not just the changed metadata: metadata-only
-        // replication is not implemented yet, so the lock change triggers a full re-upload.
+        // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_object_replication(info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(info.clone(), store.clone(), dsc).await;
         }
 
         let output = PutObjectLegalHoldOutput {
@@ -1350,6 +1382,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let PutObjectLockConfigurationInput {
             bucket,
             object_lock_configuration,
@@ -1393,7 +1426,7 @@ impl S3 for FS {
         let object_lock_config =
             String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
 
-        let updated_at = update_bucket_metadata_config(&bucket, OBJECT_LOCK_CONFIG, data)
+        let updated_at = update_bucket_metadata_config_if_incarnation(&bucket, OBJECT_LOCK_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1407,9 +1440,20 @@ impl S3 for FS {
             };
             let versioning_data = serialize(&enable_versioning_config)
                 .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-            update_bucket_metadata_config(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
-                .await
-                .map_err(ApiError::from)?;
+            update_bucket_metadata_config_if_incarnation(
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                versioning_data,
+                expected_incarnation_id,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        }
+
+        if let Some(notification_sys) =
+            runtime_sources::current_notification_system_for_context(self.server_ctx.app_context().as_deref())
+        {
+            propagate_object_lock_peer_reload(notification_sys.load_bucket_metadata(&bucket).await)?;
         }
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
@@ -1491,6 +1535,7 @@ impl S3 for FS {
         let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         opts.object_lock_retention = Some(ObjectLockRetentionOptions {
             mode: new_mode,
             retain_until: new_retain_until,
@@ -1508,7 +1553,7 @@ impl S3 for FS {
         // to re-drive. Scheduling without that marker would lose the task silently.
         let dsc = match existing_obj_info.as_ref() {
             Some(info) => {
-                must_replicate_object(
+                must_replicate_metadata(
                     &bucket,
                     &key,
                     &info.user_defined,
@@ -1533,10 +1578,9 @@ impl S3 for FS {
             S3Error::from(ApiError::from(e))
         })?;
 
-        // This replicates the whole object, not just the changed metadata: metadata-only
-        // replication is not implemented yet, so the lock change triggers a full re-upload.
+        // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_object_replication(object_info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(object_info.clone(), store.clone(), dsc).await;
         }
 
         let output = PutObjectRetentionOutput {
@@ -1554,7 +1598,6 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        record_s3_op(S3Operation::PutObjectTagging);
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
@@ -1576,32 +1619,38 @@ impl S3 for FS {
         debug!("Encoded tags: {}", tags);
 
         let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
+        let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        let existing_object_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
+        let dsc = must_replicate_metadata(
+            &bucket,
+            &object,
+            &existing_object_info.user_defined,
+            tags.clone(),
+            existing_object_info.replication_status.clone(),
+            opts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            opts.eval_metadata = Some(eval_metadata);
+        }
 
         let put_tags_result = store.put_object_tags(&bucket, &object, &tags, &opts).await;
         Self::record_replication_tagging_metric(&bucket, &object, "PutObjectTagging", put_tags_result.is_err()).await;
-        put_tags_result.map_err(|e| {
+        let object_info = put_tags_result.map_err(|e| {
             error!("Failed to put object tags: {}", e);
             counter!("rustfs_put_object_tagging_failure").increment(1);
             ApiError::from(e)
         })?;
 
-        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?req.input.version_id,
-                    error = %err,
-                    "failed to load object info for put-object-tagging notification; falling back to request context"
-                );
-                None
-            }
-        };
+        let event_object_info = Some(object_info.clone());
+        if dsc.replicate_any() {
+            schedule_metadata_replication(object_info, store.clone(), dsc).await;
+        }
 
         counter!("rustfs_put_object_tagging_success").increment(1);
 

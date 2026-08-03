@@ -5078,7 +5078,7 @@ impl LocalDisk {
         Ok((buf, mtime))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
@@ -5121,7 +5121,7 @@ impl LocalDisk {
         Ok((data, modtime))
     }
 
-    #[hotpath::measure]
+    #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
         // TODO: timeout support
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
@@ -6640,6 +6640,49 @@ impl LocalDisk {
     ) -> DiskError {
         let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
         restore_delete_rollback_after_error(object_dir, &xl_path, Some(rollback_dir), volume, object, stage, err).await
+    }
+
+    /// Execute every deferred data-dir deletion pending on `volume` right now,
+    /// even while snapshot leases are still held. Bucket deletion requires it:
+    /// a streaming reader defers the physical cleanup of an already-deleted
+    /// version, and a non-force `delete_volume` would otherwise fail closed
+    /// with `VolumeNotEmpty` on those remnants even though the bucket is
+    /// logically empty. The still-active readers keep their open descriptors;
+    /// only path-based reopens observe the removal.
+    async fn settle_pending_snapshot_deletes(&self, volume: &str) {
+        let pending: Vec<(SnapshotLeaseKey, DeleteOptions)> = {
+            let mut registry = self.snapshot_leases.lock().await;
+            registry
+                .entries
+                .iter_mut()
+                .filter(|(key, entry)| key.volume == volume && !entry.deleting && entry.pending_delete.is_some())
+                .map(|(key, entry)| {
+                    entry.deleting = true;
+                    (key.clone(), entry.pending_delete.clone().expect("filtered on Some"))
+                })
+                .collect()
+        };
+
+        for (key, opts) in pending {
+            let result = self.delete_unleased(&key.volume, &key.path, &opts).await;
+            let mut registry = self.snapshot_leases.lock().await;
+            match result {
+                Ok(()) => {
+                    registry.entries.remove(&key);
+                }
+                Err(err) => {
+                    if let Some(entry) = registry.entries.get_mut(&key) {
+                        entry.deleting = false;
+                    }
+                    warn!(
+                        volume = %key.volume,
+                        path = %key.path,
+                        error = %err,
+                        "failed to settle deferred data-dir deletion before volume removal"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -9165,6 +9208,14 @@ impl DiskAPI for LocalDisk {
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
         let _volume_mutation_guard = os::disk_volume_mutation_lock(&self.root, volume).write_owned().await;
+
+        // A streaming reader's snapshot lease defers the physical cleanup of
+        // data dirs whose version delete already committed. Those remnants are
+        // logically deleted, so run the parked cleanups now instead of letting
+        // the non-force removal below fail closed on them (the s3-tests SSE-C
+        // teardown races exactly this way: DeleteObjects, then DeleteBucket
+        // while an abandoned GET body still pins the lease).
+        self.settle_pending_snapshot_deletes(volume).await;
 
         // Non-force removes empty directory remnants children-first with
         // non-recursive rmdir calls. A file that exists during the scan, or
@@ -16023,6 +16074,74 @@ mod test {
             .await
             .expect("snapshot release should run deferred cleanup");
         assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn delete_volume_settles_lease_deferred_cleanup() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "snapshot-lease-bucket-delete";
+        let object = "multipart_enc";
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let rollback_dir = Uuid::new_v4();
+        let data_path = path_join_buf(&[object, &data_dir.to_string()]);
+        let part = path_join_buf(&[&data_path, "part.1"]);
+        ensure_test_volume(&disk, volume).await;
+        disk.write_all(volume, &part, Bytes::from_static(b"payload"))
+            .await
+            .expect("shard should be written");
+        let fi = test_file_info(object, version_id, Some(data_dir), None);
+        disk.write_all(volume, &path_join_buf(&[object, STORAGE_FORMAT_FILE]), test_meta(fi.clone()).into())
+            .await
+            .expect("metadata should be written");
+
+        // An abandoned streaming GET pins the data dir with a snapshot lease.
+        let snapshot = disk
+            .acquire_snapshot_lease(volume, &data_path)
+            .await
+            .expect("snapshot lease should be acquired");
+        disk.delete_version(
+            volume,
+            object,
+            fi.clone(),
+            false,
+            DeleteOptions {
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("version delete should commit metadata");
+        disk.delete(
+            volume,
+            &format!("{object}/{rollback_dir}"),
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("version delete should schedule physical cleanup");
+
+        // The bucket is logically empty; a non-force volume delete must settle
+        // the deferred data-dir cleanup instead of failing with VolumeNotEmpty.
+        disk.delete_volume(volume, false)
+            .await
+            .expect("bucket delete must not observe lease-deferred remnants");
+        assert!(matches!(
+            disk.read_all(volume, &part).await,
+            Err(DiskError::FileNotFound | DiskError::VolumeNotFound)
+        ));
+
+        // The late lease release finds nothing pending and stays idempotent.
+        disk.release_snapshot_lease(volume, &data_path, snapshot)
+            .await
+            .expect("releasing the lease after bucket deletion should be a no-op");
     }
 
     #[tokio::test]

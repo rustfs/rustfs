@@ -51,6 +51,11 @@ pub enum BackupError {
         supplied_kek_version: u32,
     },
 
+    /// A bundled key record declares a format version this build does not
+    /// understand.
+    #[error("bundled key record '{key_id}' declares unsupported format version {version}; this build cannot restore it")]
+    UnsupportedFormatVersion { key_id: String, version: String },
+
     /// Manifest requires an artifact that is not present in the bundle.
     #[error("backup bundle is missing a required artifact: {artifact}")]
     MissingArtifact { artifact: String },
@@ -60,6 +65,13 @@ pub enum BackupError {
     /// restored, regardless of how much of it is readable.
     #[error("backup bundle is incomplete ({reason}); incomplete bundles must never be restored")]
     IncompleteBundle { reason: String },
+
+    /// A bundled key record declares an at-rest protection mode this build
+    /// does not implement. Deliberately distinct from [`Self::Corrupted`]:
+    /// the record is intact and a newer build reads it fine, so the operator
+    /// response is a version change, not a disaster recovery.
+    #[error("bundled key record '{key_id}' declares unsupported at-rest protection {version:?}; this build cannot restore it")]
+    UnsupportedRecordVersion { key_id: String, version: String },
 }
 
 impl BackupError {
@@ -122,12 +134,30 @@ mod tests {
         );
 
         assert_eq!(
+            BackupError::UnsupportedFormatVersion {
+                key_id: "alpha".to_string(),
+                version: "9".to_string(),
+            }
+            .to_string(),
+            "bundled key record 'alpha' declares unsupported format version 9; this build cannot restore it"
+        );
+
+        assert_eq!(
             BackupError::missing_artifact("key-material").to_string(),
             "backup bundle is missing a required artifact: key-material"
         );
         assert_eq!(
             BackupError::incomplete_bundle("manifest has no completeness marker").to_string(),
             "backup bundle is incomplete (manifest has no completeness marker); incomplete bundles must never be restored"
+        );
+
+        let unsupported_record = BackupError::UnsupportedRecordVersion {
+            key_id: "alpha".to_string(),
+            version: "post-quantum-v2".to_string(),
+        };
+        assert_eq!(
+            unsupported_record.to_string(),
+            "bundled key record 'alpha' declares unsupported at-rest protection \"post-quantum-v2\"; this build cannot restore it"
         );
     }
 }

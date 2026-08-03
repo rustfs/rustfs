@@ -37,6 +37,7 @@ jobs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Explain cancellation run
         run: echo "PR closed; this run only cancels older runs in the same concurrency group."
@@ -45,8 +46,11 @@ jobs:
     name: Architecture Migration Rules
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Install ripgrep
         run: |

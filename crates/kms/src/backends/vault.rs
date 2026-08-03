@@ -19,7 +19,8 @@ use crate::backends::vault_credentials::{
     token_source_for,
 };
 use crate::backends::{
-    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits, ensure_key_status_permits,
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, empty_key_page, ensure_key_state_permits,
+    ensure_key_status_permits, ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
 };
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -37,6 +38,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vaultrs::{api::kv2::requests::SetSecretRequestOptions, error::ClientError, kv2};
+use zeroize::Zeroize as _;
 
 /// Vault KMS client implementation
 pub struct VaultKmsClient {
@@ -79,6 +81,19 @@ struct VaultKeyData {
     /// persistence landed, so it must stay optional for backward compatibility.
     #[serde(default)]
     deletion_date: Option<Zoned>,
+    /// When the key's material last became current through a rotation.
+    ///
+    /// Written by [`VaultKmsClient::rotate_key`] as part of the same
+    /// check-and-set that switches the current version, so it can only be set on
+    /// a rotation that actually committed. `None` means "no rotation time on
+    /// record", which covers two cases that are deliberately not distinguished
+    /// here: a key that was never rotated, and a key rotated by a build that
+    /// predates this field. Nothing is back-filled — inventing a timestamp for
+    /// the second case would report a rotation that this node never observed.
+    /// See [`crate::deletion_worker`] for why collapsing the two is safe for the
+    /// rotation-age gauge.
+    #[serde(default)]
+    rotated_at: Option<Zoned>,
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
     /// Version that pre-versioning envelopes (no `master_key_version`) resolve to.
@@ -112,6 +127,29 @@ struct VaultKeyVersionRecord {
 
 /// Sub-path (under each key path) reserved for immutable version records.
 const KEY_VERSIONS_SUBPATH: &str = "versions";
+
+/// Upper bound on read-modify-write attempts for a check-and-set lifecycle
+/// mutation. A lost race means live contention on the key; each retry re-reads
+/// and re-validates, and a small bound keeps a pathologically contended key
+/// from spinning while still absorbing ordinary interleavings.
+const LIFECYCLE_CAS_ATTEMPTS: u32 = 3;
+
+/// Typed error for a lifecycle write that lost its check-and-set race (and, in
+/// the retry loop, kept losing it up to the attempt bound).
+fn concurrent_modification(key_id: &str) -> KmsError {
+    KmsError::invalid_operation(format!("Concurrent modification of key {key_id} detected, retry the operation"))
+}
+
+/// Decision returned by a [`VaultKmsClient::update_key_data_with_cas`]
+/// mutation closure.
+enum CasMutation<T> {
+    /// Persist the mutated record with a check-and-set write, then yield the
+    /// value.
+    Write(T),
+    /// The freshly observed state already settles the operation; yield the
+    /// value without writing.
+    Skip(T),
+}
 
 /// Drop KV2 directory entries from a key listing.
 ///
@@ -189,7 +227,13 @@ impl VaultKmsClient {
             attempt_timeout: kms_config.effective_timeout(),
         };
         let source = token_source_for(&config.auth_method, &settings)?;
-        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &config.auth_method);
+        let policy = VaultCredentialPolicy::from_kms_config(
+            kms_config,
+            &config.auth_method,
+            "vault-kv2",
+            &config.address,
+            config.namespace.as_deref(),
+        );
         let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
 
         info!(address = %config.address, "Vault KMS backend connected");
@@ -199,7 +243,7 @@ impl VaultKmsClient {
             kv_mount: config.kv_mount.clone(),
             key_path_prefix: config.key_path_prefix.clone(),
             dek_crypto: AesDekCrypto::new(),
-            retry: RetryPolicy::from_config(kms_config),
+            retry: RetryPolicy::for_backend(kms_config, "vault-kv2", &config.address, config.namespace.as_deref(), "operations"),
             cancel: CancellationToken::new(),
         })
     }
@@ -293,7 +337,23 @@ impl VaultKmsClient {
         let encrypted_material = if version == key_data.version {
             key_data.encrypted_key_material.clone()
         } else {
-            self.get_key_version_record(key_id, version).await?.encrypted_key_material
+            let record = self.get_key_version_record(key_id, version).await?;
+            if version > key_data.version {
+                // The requested version has an immutable record, yet the
+                // current pointer sits below it. Material for a version is
+                // only requested once an envelope references it, and
+                // envelopes are only stamped after the pointer switch
+                // committed — so the pointer must have regressed (a lost
+                // update rolled back a committed rotation). Fail closed:
+                // serving in this state would keep new encryptions on the
+                // rolled-back material. A version with no record at all still
+                // fails as KeyVersionNotFound above.
+                return Err(KmsError::internal_error(format!(
+                    "current version {} of key {key_id} is behind existing version record {version}; refusing to use an inconsistent key record",
+                    key_data.version
+                )));
+            }
+            record.encrypted_key_material
         };
 
         decode_stored_key_material(key_id, &encrypted_material).inspect_err(|error| {
@@ -345,39 +405,84 @@ impl VaultKmsClient {
         Ok((cas, key_data))
     }
 
-    /// Check-and-set write of the key record.
+    /// Check-and-set write of the key record, reporting a lost race as
+    /// `Ok(None)`.
     ///
     /// `cas` must match the KV2 secret version currently holding the record.
-    /// Returns the secret version created by this write so a caller can chain
-    /// further check-and-set writes.
-    async fn cas_store_key_data(&self, key_id: &str, key_data: &VaultKeyData, cas: u32) -> Result<u32> {
+    /// On success returns the secret version created by this write so a caller
+    /// can chain further check-and-set writes.
+    async fn try_cas_store_key_data(&self, key_id: &str, key_data: &VaultKeyData, cas: u32) -> Result<Option<u32>> {
         let path = self.key_path(key_id);
         let path = path.as_str();
 
         // Single attempt: replaying a lost-response write would double-apply
-        // the mutation, and a CAS conflict is a normal concurrency signal that
-        // must reach the caller untouched.
+        // the mutation, and a CAS conflict is a normal concurrency signal the
+        // caller resolves by re-reading, never by resending the same write.
         let written = self
             .run("vault_kv2_cas_write_key", OpClass::MutatingNonIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
-                kv2::set_with_options(&vault.client, &self.kv_mount, path, key_data, SetSecretRequestOptions { cas })
-                    .await
-                    .map_err(|e| {
-                        AttemptError::from_vaultrs(e, |e| {
-                            if is_cas_conflict(&e) {
-                                KmsError::invalid_operation(format!(
-                                    "Concurrent modification of key {key_id} detected, retry the rotation"
-                                ))
-                            } else {
-                                KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
-                            }
-                        })
-                    })
+                match kv2::set_with_options(&vault.client, &self.kv_mount, path, key_data, SetSecretRequestOptions { cas }).await
+                {
+                    Ok(written) => Ok(Some(written)),
+                    Err(e) if is_cas_conflict(&e) => Ok(None),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
+                    })),
+                }
             })
             .await?;
 
-        u32::try_from(written.version)
-            .map_err(|_| KmsError::backend_error(format!("KV2 secret version for key {key_id} exceeds u32")))
+        written
+            .map(|written| {
+                u32::try_from(written.version)
+                    .map_err(|_| KmsError::backend_error(format!("KV2 secret version for key {key_id} exceeds u32")))
+            })
+            .transpose()
+    }
+
+    /// Check-and-set write of the key record, surfacing a lost race as the
+    /// typed concurrent-modification error.
+    async fn cas_store_key_data(&self, key_id: &str, key_data: &VaultKeyData, cas: u32) -> Result<u32> {
+        self.try_cas_store_key_data(key_id, key_data, cas)
+            .await?
+            .ok_or_else(|| concurrent_modification(key_id))
+    }
+
+    /// Apply a lifecycle mutation to the key record as a check-and-set
+    /// read-modify-write loop.
+    ///
+    /// Every attempt re-reads the record pinned to its current KV2 secret
+    /// version, re-derives the mutation from that fresh snapshot — `mutate`
+    /// must re-run its state gate, so a transition that lost a race against
+    /// e.g. a rotation or a cancellation is re-validated against the committed
+    /// state instead of being replayed — and writes back check-and-set against
+    /// exactly the version it read. A conflict means another writer committed
+    /// in between; after [`LIFECYCLE_CAS_ATTEMPTS`] lost races the typed
+    /// conflict error is surfaced to the caller.
+    ///
+    /// This loop does not bypass the operation policy's single-attempt rule
+    /// for `MutatingNonIdempotent` writes: each individual write is still sent
+    /// at most once and never replayed on a lost response. Only the whole
+    /// read-gate-mutate-write cycle repeats, and every repeat is derived from
+    /// newly observed state, so the two layers compose instead of conflicting.
+    async fn update_key_data_with_cas<T, F>(&self, key_id: &str, mut mutate: F) -> Result<(VaultKeyData, T)>
+    where
+        F: FnMut(&mut VaultKeyData) -> Result<CasMutation<T>>,
+    {
+        for attempt in 1..=LIFECYCLE_CAS_ATTEMPTS {
+            let (cas, mut key_data) = self.get_key_data_versioned(key_id).await?;
+            match mutate(&mut key_data)? {
+                CasMutation::Skip(value) => return Ok((key_data, value)),
+                CasMutation::Write(value) => {
+                    if self.try_cas_store_key_data(key_id, &key_data, cas).await?.is_some() {
+                        return Ok((key_data, value));
+                    }
+                    debug!(key_id, attempt, "Vault KV2 lifecycle write lost a check-and-set race; re-reading");
+                }
+            }
+        }
+
+        Err(concurrent_modification(key_id))
     }
 
     /// Create-only write of an immutable version record (KV2 check-and-set of 0).
@@ -405,14 +510,42 @@ impl VaultKmsClient {
         .await
     }
 
-    /// Store key data in Vault
+    /// Create-only write of the top-level key record (KV2 check-and-set of 0).
+    ///
+    /// Returns `Ok(true)` when this call created the record and `Ok(false)`
+    /// when a record already exists — i.e. a concurrent create committed
+    /// first. An existing record is never overwritten.
+    async fn try_create_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<bool> {
+        let path = self.key_path(key_id);
+        let path = path.as_str();
+
+        // Single attempt: the create-only CAS makes a duplicate replay fail
+        // with a conflict, which create_key reports as the key already
+        // existing, so retrying here would only mask that signal.
+        self.run("vault_kv2_create_key", OpClass::MutatingNonIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            match kv2::set_with_options(&vault.client, &self.kv_mount, path, key_data, SetSecretRequestOptions { cas: 0 }).await {
+                Ok(_) => Ok(true),
+                Err(e) if is_cas_conflict(&e) => Ok(false),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
+                })),
+            }
+        })
+        .await
+    }
+
+    /// Blind, last-writer-wins overwrite of the key record.
+    ///
+    /// Test-only: production writes go through the create-only or
+    /// check-and-set paths so concurrent writers cannot silently clobber each
+    /// other. Kept for tests that need to inject corrupted or downgraded
+    /// records.
+    #[cfg(test)]
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let path = self.key_path(key_id);
         let path = path.as_str();
 
-        // Single attempt: this is a whole-record overwrite without a CAS
-        // precondition, so a replay after a lost response could clobber a
-        // concurrent writer.
         self.run("vault_kv2_write_key", OpClass::MutatingNonIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
             kv2::set(&vault.client, &self.kv_mount, path, key_data)
@@ -431,40 +564,28 @@ impl VaultKmsClient {
     async fn store_key_metadata(&self, key_id: &str, request: &CreateKeyRequest) -> Result<()> {
         debug!("Storing key metadata for {}, input tags: {:?}", key_id, request.tags);
 
-        // Get existing key data to preserve encrypted_key_material and other fields
-        // This is called after create_key, so the key should already exist
-        let existing_key_data = self.get_key_data(key_id).await?;
+        // Read-modify-write under check-and-set: only the request-driven
+        // fields change, everything else — most importantly the key material,
+        // version and status — is carried over from the freshly read record,
+        // so a rotation or state transition landing in between is preserved
+        // instead of clobbered.
+        self.update_key_data_with_cas(key_id, |key_data| {
+            // A key that was just created must already carry material; an empty value means
+            // the create flow failed to persist it. Fail closed instead of minting replacement
+            // material: silently generating a new key here would mask the broken create and
+            // orphan any DEK already wrapped by a different copy of this key.
+            if key_data.encrypted_key_material.is_empty() {
+                warn!(key_id, "Vault KMS key metadata missing encrypted key material");
+                return Err(KmsError::material_missing(key_id));
+            }
 
-        // A key that was just created must already carry material; an empty value means
-        // the create flow failed to persist it. Fail closed instead of minting replacement
-        // material: silently generating a new key here would mask the broken create and
-        // orphan any DEK already wrapped by a different copy of this key.
-        if existing_key_data.encrypted_key_material.is_empty() {
-            warn!(key_id, "Vault KMS key metadata missing encrypted key material");
-            return Err(KmsError::material_missing(key_id));
-        }
-
-        // Update only the metadata fields, preserving the encrypted_key_material
-        let key_data = VaultKeyData {
-            algorithm: existing_key_data.algorithm.clone(),
-            usage: request.key_usage.clone(),
-            created_at: existing_key_data.created_at,
-            status: existing_key_data.status,
-            version: existing_key_data.version,
-            description: request.description.clone(),
-            metadata: existing_key_data.metadata.clone(),
-            tags: request.tags.clone(),
-            deletion_date: existing_key_data.deletion_date.clone(),
-            encrypted_key_material: existing_key_data.encrypted_key_material.clone(), // Preserve the key material
-            baseline_version: existing_key_data.baseline_version,
-        };
-
-        debug!(
-            "VaultKeyData tags before storage: {:?}, encrypted_key_material length: {}",
-            key_data.tags,
-            key_data.encrypted_key_material.len()
-        );
-        self.store_key_data(key_id, &key_data).await
+            key_data.usage = request.key_usage.clone();
+            key_data.description = request.description.clone();
+            key_data.tags = request.tags.clone();
+            Ok(CasMutation::Write(()))
+        })
+        .await?;
+        Ok(())
     }
 
     /// Retrieve key data from Vault
@@ -520,6 +641,86 @@ impl VaultKmsClient {
         }
     }
 
+    /// List the names of a key's immutable version records.
+    ///
+    /// `None` means the versions directory does not exist — the key was never
+    /// rotated and has no version records.
+    async fn list_key_version_records(&self, key_id: &str) -> Result<Option<Vec<String>>> {
+        let versions_dir = self.key_versions_dir(key_id);
+        let versions_dir = versions_dir.as_str();
+        self.run("vault_kv2_list_key_versions", OpClass::ReadIdempotent, move || async move {
+            let vault = self.vault().map_err(AttemptError::fatal)?;
+            match kv2::list(&vault.client, &self.kv_mount, versions_dir).await {
+                Ok(versions) => Ok(Some(versions)),
+                Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Failed to list key version records in Vault: {e}"))
+                })),
+            }
+        })
+        .await
+    }
+
+    /// The version numbers of a key's immutable version records.
+    ///
+    /// Entries that are not version numbers are ignored: the rotation protocol
+    /// only ever creates numeric records under the versions directory, so
+    /// anything else is not part of the history this reasons about.
+    async fn recorded_version_numbers(&self, key_id: &str) -> Result<Vec<u32>> {
+        Ok(self
+            .list_key_version_records(key_id)
+            .await?
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry.trim_end_matches('/').parse::<u32>().ok())
+            .collect())
+    }
+
+    /// Fail closed when the version history contradicts the key record.
+    ///
+    /// Both contradictions below mean the record no longer describes the history
+    /// the rotation protocol produced, and rotating on top of either would make
+    /// the inconsistency permanent.
+    ///
+    /// * **Version records without a baseline.** The first rotation freezes the
+    ///   then-current material as a version record and pins `baseline_version` to
+    ///   it in the same commit, so records can only exist without a baseline if
+    ///   the baseline was dropped afterwards. A node older than versioned rotation
+    ///   does exactly that: it does not know the field, and every lifecycle write
+    ///   rewrites the whole record, so one enable/disable/tag from such a node
+    ///   erases it. Rotating here would freeze a *new* baseline at the current
+    ///   version and permanently resolve every pre-versioning envelope to material
+    ///   that never wrapped it — the point of no return this guard blocks.
+    /// * **A record more than one version above current.** A record exactly one
+    ///   above current is the footprint of an interrupted rotation (material
+    ///   persisted, pointer switch never committed) and is recovered by the next
+    ///   rotation's adopt path. Anything further ahead cannot come from the
+    ///   rotation protocol: it means the top-level record regressed (for example a
+    ///   historical lost update rolled back committed rotations), and extending the
+    ///   history from the rolled-back state would re-mint version numbers that
+    ///   already have immutable records.
+    async fn ensure_version_history_consistent(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
+        let recorded = self.recorded_version_numbers(key_id).await?;
+
+        if key_data.baseline_version.is_none()
+            && let Some(oldest_recorded) = recorded.iter().min().copied()
+        {
+            warn!(
+                key_id,
+                oldest_recorded, "Vault KMS key has version records but no baseline version; refusing to rotate"
+            );
+            return Err(KmsError::baseline_version_lost(key_id, oldest_recorded));
+        }
+
+        let current_version = key_data.version;
+        match recorded.iter().max().copied() {
+            Some(max_recorded) if max_recorded > current_version.saturating_add(1) => Err(KmsError::internal_error(format!(
+                "current version {current_version} of key {key_id} is behind existing version record {max_recorded}; refusing to extend an inconsistent version history"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Physically delete a key from Vault storage
     async fn delete_key(&self, key_id: &str) -> Result<()> {
         let path = self.key_path(key_id);
@@ -531,18 +732,7 @@ impl VaultKmsClient {
         let versions_dir = self.key_versions_dir(key_id);
         let versions_dir = versions_dir.as_str();
         // `None` means no version records exist (the key was never rotated).
-        let versions = self
-            .run("vault_kv2_list_key_versions", OpClass::ReadIdempotent, move || async move {
-                let vault = self.vault().map_err(AttemptError::fatal)?;
-                match kv2::list(&vault.client, &self.kv_mount, versions_dir).await {
-                    Ok(versions) => Ok(Some(versions)),
-                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
-                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                        KmsError::backend_error(format!("Failed to list key version records in Vault: {e}"))
-                    })),
-                }
-            })
-            .await?;
+        let versions = self.list_key_version_records(key_id).await?;
         for version in versions.unwrap_or_default() {
             let version_path = format!("{versions_dir}/{version}");
             let version_path = version_path.as_str();
@@ -667,6 +857,13 @@ impl VaultKmsClient {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
 
+        // NOTE: this comparison is an authorization check, not a cryptographic
+        // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
+        // rides in the envelope unauthenticated: anyone able to rewrite the
+        // stored envelope can rewrite this field and present a matching context.
+        // The Static and Vault Transit backends do bind it (as AEAD AAD and as
+        // the Transit KDF context respectively); closing the gap here needs a
+        // versioned envelope, since existing ciphertext was sealed without AAD.
         // Verify encryption context matches
         // Check that all keys in envelope.encryption_context are present in request.encryption_context
         // and their values match. This ensures the context used for decryption matches what was used for encryption.
@@ -693,13 +890,203 @@ impl VaultKmsClient {
         let key_material = self
             .get_key_material_for_version(&envelope.master_key_id, &key_data, version)
             .await?;
-        let plaintext = self
+        let plaintext = match self
             .dek_crypto
             .decrypt(&key_material, &envelope.encrypted_key, &envelope.nonce)
-            .await?;
+            .await
+        {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                return Err(self
+                    .explain_unwrap_failure(&envelope.master_key_id, &key_data, envelope.master_key_version, error)
+                    .await);
+            }
+        };
 
         debug!("Vault KMS data decrypted");
         Ok(plaintext)
+    }
+
+    /// Report which master key version wraps an envelope, and whether that is
+    /// the key's current version.
+    ///
+    /// Reads the key record only; it never unwraps anything, so it works on keys
+    /// whose state forbids new cryptographic use — which is exactly the
+    /// population a retirement inventory has to cover.
+    pub(crate) async fn describe_data_key_wrapping(
+        &self,
+        request: &DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+        ensure_rewrap_context_matches(&envelope.encryption_context, &request.encryption_context)?;
+
+        let key_data = self.get_key_data(&envelope.master_key_id).await?;
+        let current_version = key_data.version;
+
+        Ok(DescribeDataKeyWrappingResponse {
+            key_id: envelope.master_key_id,
+            key_version: Some(resolve_envelope_master_key_version(
+                envelope.master_key_version,
+                key_data.baseline_version,
+                current_version,
+            )),
+            current_key_version: Some(current_version),
+            // Deliberately not `key_version == current_version`. A
+            // pre-versioning envelope resolves to the current version while
+            // saying nothing, and `rewrap_data_key` rewrites exactly those to
+            // stamp the version — so reporting them as current here would leave
+            // the sweep and the scan permanently disagreeing.
+            is_current: envelope.master_key_version == Some(current_version),
+        })
+    }
+
+    /// Re-wrap an existing envelope with the key's current master key version.
+    ///
+    /// The plaintext data key is unwrapped with the version that actually
+    /// wrapped it and immediately re-wrapped with the current material. It is
+    /// zeroized before this returns, never persisted, never logged and never
+    /// handed to the caller: the whole point of rewrap is that the data key is
+    /// re-protected without anyone above this layer holding it.
+    ///
+    /// Everything except the wrapping is carried over verbatim — the data key's
+    /// own id, its spec, its encryption context and its creation time — so the
+    /// result is the same data key under new wrapping. That keeps the DEK's
+    /// recorded age honest and makes the operation invisible to every consumer
+    /// of the envelope other than the version stamp.
+    ///
+    /// A pre-versioning envelope (no `master_key_version`) is rewrapped even
+    /// when it resolves to the current version and its bytes would be unwrapped
+    /// with the very material they are about to be re-wrapped with. That is not
+    /// wasted work: the version stamp is the only evidence a retirement scan can
+    /// read, and an envelope that does not state its version can never be
+    /// counted as migrated.
+    pub(crate) async fn rewrap_data_key(&self, request: &RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+        ensure_rewrap_context_matches(&envelope.encryption_context, &request.encryption_context)?;
+
+        // Single read of the key record: the version that unwraps, the material
+        // that re-wraps and the version stamped into the result must all come
+        // from one snapshot. Reading them separately would let a concurrent
+        // rotation produce an envelope stamped with a version whose material
+        // never wrapped it — an envelope that then fails to decrypt forever.
+        let key_data = self.get_key_data(&envelope.master_key_id).await?;
+        ensure_key_status_permits(&envelope.master_key_id, &key_data.status, StateGatedOperation::Encrypt)?;
+        let current_version = key_data.version;
+
+        if envelope.master_key_version == Some(current_version) {
+            // Already on the current version and saying so. Hand the input back
+            // untouched rather than producing an equivalent envelope with a
+            // fresh nonce: a re-run of a sweep must converge to zero writes, and
+            // the storage layer keys its write decision off these bytes.
+            return Ok(RewrapDataKeyResponse {
+                ciphertext: request.ciphertext.clone(),
+                key_id: envelope.master_key_id,
+                source_key_version: Some(current_version),
+                destination_key_version: Some(current_version),
+                rewrapped: false,
+            });
+        }
+
+        let source_version =
+            resolve_envelope_master_key_version(envelope.master_key_version, key_data.baseline_version, current_version);
+        // Both materials are resolved before anything is unwrapped, so no
+        // fallible step sits between the plaintext data key coming into
+        // existence and the zeroize that removes it again.
+        let source_material = self
+            .get_key_material_for_version(&envelope.master_key_id, &key_data, source_version)
+            .await?;
+        let destination_material = decode_stored_key_material(&envelope.master_key_id, &key_data.encrypted_key_material)
+            .inspect_err(|error| warn!(key_id = %envelope.master_key_id, %error, "Vault KMS key material failed validation"))?;
+
+        let mut plaintext_key = match self
+            .dek_crypto
+            .decrypt(&source_material, &envelope.encrypted_key, &envelope.nonce)
+            .await
+        {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                return Err(self
+                    .explain_unwrap_failure(&envelope.master_key_id, &key_data, envelope.master_key_version, error)
+                    .await);
+            }
+        };
+        let rewrapped = self.dek_crypto.encrypt(&destination_material, &plaintext_key).await;
+        plaintext_key.zeroize();
+        let (encrypted_key, nonce) = rewrapped?;
+
+        let rewrapped_envelope = DataKeyEnvelope {
+            key_id: envelope.key_id,
+            master_key_id: envelope.master_key_id,
+            key_spec: envelope.key_spec,
+            encrypted_key,
+            nonce,
+            encryption_context: envelope.encryption_context,
+            created_at: envelope.created_at,
+            master_key_version: Some(current_version),
+        };
+        let ciphertext = serde_json::to_vec(&rewrapped_envelope)?;
+
+        debug!(key_id = %rewrapped_envelope.master_key_id, source_version, current_version, "Vault KMS data key rewrapped");
+        Ok(RewrapDataKeyResponse {
+            ciphertext,
+            key_id: rewrapped_envelope.master_key_id,
+            source_key_version: Some(source_version),
+            destination_key_version: Some(current_version),
+            rewrapped: true,
+        })
+    }
+
+    /// Re-report a failure to unwrap a data key as the lost-baseline diagnosis
+    /// when that is what the key record shows.
+    ///
+    /// Only a pre-versioning envelope (no `master_key_version`) read against a key
+    /// with no `baseline_version` can qualify: every other envelope was unwrapped
+    /// with the version it or the baseline named. Such an envelope resolves to the
+    /// *current* version, which is correct for a key that was never rotated and
+    /// wrong for one whose baseline was erased — and the immutable version records
+    /// tell those two apart.
+    ///
+    /// Deliberately runs after the unwrap fails, never before it. A version-less
+    /// envelope written by an old node *after* a rotation is genuinely wrapped with
+    /// the current material and still decrypts, so refusing up front on the same
+    /// evidence would break reads that work today. Nothing is risked by trying
+    /// first: the wrapping is AES-256-GCM, so a wrong master key version cannot
+    /// yield plaintext, only this authentication failure. The extra listing is
+    /// therefore paid once per already-failing read instead of on every read of
+    /// pre-versioning data.
+    async fn explain_unwrap_failure(
+        &self,
+        key_id: &str,
+        key_data: &VaultKeyData,
+        envelope_version: Option<u32>,
+        error: KmsError,
+    ) -> KmsError {
+        if envelope_version.is_some() || key_data.baseline_version.is_some() {
+            return error;
+        }
+
+        match self.recorded_version_numbers(key_id).await {
+            Ok(recorded) => match recorded.iter().min().copied() {
+                Some(oldest_recorded) => {
+                    warn!(
+                        key_id,
+                        oldest_recorded,
+                        "Vault KMS pre-versioning data key failed to unwrap and the key has version records but no baseline version"
+                    );
+                    KmsError::baseline_version_lost(key_id, oldest_recorded)
+                }
+                // No version records: the key was never rotated by a versioning
+                // build, so the current version really is the right one and the
+                // failure has some other cause.
+                None => error,
+            },
+            Err(list_error) => {
+                warn!(key_id, %list_error, "Vault KMS could not list key version records while diagnosing a failed unwrap");
+                error
+            }
+        }
     }
 
     pub(crate) async fn create_key(
@@ -737,7 +1124,7 @@ impl VaultKmsClient {
                         description: existing.description,
                         metadata: existing.metadata,
                         created_at: existing.created_at,
-                        rotated_at: None,
+                        rotated_at: existing.rotated_at,
                         created_by: None,
                         deletion_date: existing.deletion_date,
                     })
@@ -764,12 +1151,19 @@ impl VaultKmsClient {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: None,
+            rotated_at: None,
             encrypted_key_material: encrypted_material,
             baseline_version: None,
         };
 
-        // Store in Vault
-        self.store_key_data(key_id, &key_data).await?;
+        // Create-only write: the not-found pre-check above is only advisory —
+        // another node can create the same key in between — so the write
+        // itself must refuse to overwrite. Exactly one of two concurrent
+        // creates commits; the loser reports the key as already existing
+        // instead of adopting material it did not persist.
+        if !self.try_create_key_data(key_id, &key_data).await? {
+            return Err(KmsError::key_already_exists(key_id));
+        }
 
         let master_key = MasterKeyInfo {
             key_id: key_id.to_string(),
@@ -804,7 +1198,7 @@ impl VaultKmsClient {
             metadata: key_data.metadata,
             tags: key_data.tags,
             created_at: key_data.created_at,
-            rotated_at: None,
+            rotated_at: key_data.rotated_at,
             created_by: None,
         })
     }
@@ -816,47 +1210,54 @@ impl VaultKmsClient {
     ) -> Result<ListKeysResponse> {
         debug!("Listing keys with limit: {:?}", request.limit);
 
-        let all_keys = self.list_vault_keys().await?;
-        let limit = request.limit.unwrap_or(100) as usize;
-
-        // Simple pagination implementation
-        let start_idx = request
-            .marker
-            .as_ref()
-            .and_then(|m| all_keys.iter().position(|k| k == m))
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-
-        let end_idx = std::cmp::min(start_idx + limit, all_keys.len());
-        let keys_page = &all_keys[start_idx..end_idx];
-
-        let mut key_infos = Vec::new();
-        for key_id in keys_page {
-            if let Ok(key_info) = self.describe_key(key_id, None).await {
-                key_infos.push(key_info);
-            }
+        // A caller asking for no keys is answered without reaching Vault.
+        if list_keys_page_size(request.limit).is_none() {
+            return Ok(empty_key_page());
         }
 
-        let next_marker = if end_idx < all_keys.len() {
-            Some(all_keys[end_idx - 1].clone())
-        } else {
-            None
-        };
+        let mut all_keys = self.list_vault_keys().await?;
+        // Vault's own LIST ordering is not part of its contract, so the sort is
+        // what makes the marker a stable cursor across calls.
+        all_keys.sort_unstable();
+        let page = paginate_keys(&all_keys, request, String::as_str);
+
+        let mut key_infos = Vec::with_capacity(page.items.len());
+        for key_id in page.items {
+            // A key that disappeared between the listing and the read is
+            // dropped from the page rather than failing it; the cursor comes
+            // from the identifier list, so the listing still advances past it.
+            let Ok(key_info) = self.describe_key(key_id, None).await else {
+                continue;
+            };
+            if request
+                .status_filter
+                .as_ref()
+                .is_some_and(|status| status != &key_info.status)
+            {
+                continue;
+            }
+            if request.usage_filter.as_ref().is_some_and(|usage| usage != &key_info.usage) {
+                continue;
+            }
+            key_infos.push(key_info);
+        }
 
         Ok(ListKeysResponse {
             keys: key_infos,
-            next_marker,
-            truncated: end_idx < all_keys.len(),
+            next_marker: page.next_marker,
+            truncated: page.truncated,
         })
     }
 
     pub(crate) async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Enabling key: {}", key_id);
 
-        let mut key_data = self.get_key_data(key_id).await?;
-        ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::Enable)?;
-        key_data.status = KeyStatus::Active;
-        self.store_key_data(key_id, &key_data).await?;
+        self.update_key_data_with_cas(key_id, |key_data| {
+            ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::Enable)?;
+            key_data.status = KeyStatus::Active;
+            Ok(CasMutation::Write(()))
+        })
+        .await?;
 
         debug!(key_id, "Vault KMS key enabled");
         Ok(())
@@ -865,12 +1266,75 @@ impl VaultKmsClient {
     pub(crate) async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         debug!("Disabling key: {}", key_id);
 
-        let mut key_data = self.get_key_data(key_id).await?;
-        ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::Disable)?;
-        key_data.status = KeyStatus::Disabled;
-        self.store_key_data(key_id, &key_data).await?;
+        self.update_key_data_with_cas(key_id, |key_data| {
+            ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::Disable)?;
+            key_data.status = KeyStatus::Disabled;
+            Ok(CasMutation::Write(()))
+        })
+        .await?;
 
         debug!(key_id, "Vault KMS key disabled");
+        Ok(())
+    }
+
+    /// Replace the key's description; `None` clears it.
+    ///
+    /// The write goes through the check-and-set read-modify-write loop, so a
+    /// rotation or state transition landing in between is carried over instead
+    /// of clobbered. A description that already matches is not rewritten.
+    pub(crate) async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.update_key_data_with_cas(key_id, |key_data| {
+            if key_data.description.as_deref() == description {
+                return Ok(CasMutation::Skip(()));
+            }
+            key_data.description = description.map(str::to_string);
+            Ok(CasMutation::Write(()))
+        })
+        .await?;
+
+        debug!(key_id, "Vault KMS key description updated");
+        Ok(())
+    }
+
+    /// Add or overwrite tags, leaving every other tag untouched.
+    pub(crate) async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        ensure_tag_keys_are_mutable(tags.keys().map(String::as_str))?;
+
+        self.update_key_data_with_cas(key_id, |key_data| {
+            let mut changed = false;
+            for (tag_key, value) in tags {
+                changed |= key_data.tags.insert(tag_key.clone(), value.clone()).as_ref() != Some(value);
+            }
+            Ok(if changed {
+                CasMutation::Write(())
+            } else {
+                CasMutation::Skip(())
+            })
+        })
+        .await?;
+
+        debug!(key_id, "Vault KMS key tags updated");
+        Ok(())
+    }
+
+    /// Remove tags; tags that are not set are ignored.
+    pub(crate) async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        ensure_tag_keys_are_mutable(tag_keys.iter().map(String::as_str))?;
+
+        self.update_key_data_with_cas(key_id, |key_data| {
+            let mut changed = false;
+            for tag_key in tag_keys {
+                changed |= key_data.tags.remove(tag_key).is_some();
+            }
+            Ok(if changed {
+                CasMutation::Write(())
+            } else {
+                CasMutation::Skip(())
+            })
+        })
+        .await?;
+
+        debug!(key_id, "Vault KMS key tags removed");
         Ok(())
     }
 
@@ -889,6 +1353,10 @@ impl VaultKmsClient {
     /// or interrupted rotation never exposes half-committed material. Concurrent
     /// rotations are serialized by the check-and-set writes: at most one caller
     /// commits each version and the losers fail without side effects on current.
+    ///
+    /// The whole protocol is refused up front, before any write, when the persisted
+    /// version history contradicts the key record — see
+    /// [`Self::ensure_version_history_consistent`].
     pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Rotating master key: {}", key_id);
 
@@ -900,6 +1368,12 @@ impl VaultKmsClient {
         // surfaces the same typed Material* errors as the read path.
         decode_stored_key_material(key_id, &key_data.encrypted_key_material)
             .inspect_err(|error| warn!(key_id, %error, "Vault KMS key material failed validation"))?;
+
+        // The version history must still agree with the key record: a history
+        // that extends past what this rotation would commit means the current
+        // pointer regressed, and a history without a baseline means the baseline
+        // was erased after the fact. Both fail closed before any write.
+        self.ensure_version_history_consistent(key_id, &key_data).await?;
 
         // Step 1: freeze the baseline on first rotation.
         if key_data.baseline_version.is_none() {
@@ -953,8 +1427,15 @@ impl VaultKmsClient {
 
         // Step 3: switch the current pointer. The top-level copy of the material is
         // the fast path for new encryptions and must always match `version`.
+        //
+        // The rotation timestamp rides along on this same write: it marks the
+        // moment the new material became current, and persisting it here means it
+        // commits if and only if the rotation does. A rotation that fails after
+        // freezing the version record leaves the key unrotated and unstamped, so
+        // the recorded time never runs ahead of the current version.
         key_data.version = new_version;
         key_data.encrypted_key_material = new_material;
+        key_data.rotated_at = Some(Zoned::now());
         self.cas_store_key_data(key_id, &key_data, cas).await?;
 
         info!(key_id, version = new_version, "Vault KMS master key rotated");
@@ -968,7 +1449,9 @@ impl VaultKmsClient {
             description: key_data.description.clone(),
             metadata: key_data.metadata.clone(),
             created_at: key_data.created_at.clone(),
-            rotated_at: Some(Zoned::now()),
+            // The persisted value, not a fresh `now()`: what the caller is told
+            // must be what a later describe of the same key reports.
+            rotated_at: key_data.rotated_at.clone(),
             created_by: None,
             deletion_date: key_data.deletion_date.clone(),
         })
@@ -1012,7 +1495,8 @@ impl VaultKmsBackend {
             crate::config::BackendConfig::VaultKv2(vault_config) => (**vault_config).clone(),
             crate::config::BackendConfig::Local(_)
             | crate::config::BackendConfig::VaultTransit(_)
-            | crate::config::BackendConfig::Static(_) => {
+            | crate::config::BackendConfig::Static(_)
+            | crate::config::BackendConfig::Aws(_) => {
                 return Err(KmsError::configuration_error("Expected Vault KV2 backend configuration"));
             }
         };
@@ -1028,31 +1512,27 @@ impl VaultKmsBackend {
         self.client.credentials.spawn_renewal_task()
     }
 
-    /// Update key metadata in Vault storage
-    async fn update_key_metadata_in_storage(&self, key_id: &str, metadata: &KeyMetadata) -> Result<()> {
-        // Get the current key data from Vault
-        let mut key_data = self.client.get_key_data(key_id).await?;
-
-        // This is a read-modify-write of the whole VaultKeyData document. Refuse to write
-        // back a record whose key material is missing: persisting it would cement the
-        // empty-material state under a fresh document version. A damaged key must go
-        // through an explicit repair operation, not a metadata update.
-        if key_data.encrypted_key_material.is_empty() {
-            return Err(KmsError::material_missing(key_id));
-        }
-
-        // Update the status based on the new metadata
-        key_data.status = match metadata.key_state {
-            KeyState::Enabled => KeyStatus::Active,
-            KeyState::Disabled => KeyStatus::Disabled,
-            KeyState::PendingDeletion => KeyStatus::PendingDeletion,
-            KeyState::Unavailable => KeyStatus::Deleted,
-            KeyState::PendingImport => KeyStatus::Disabled, // Treat as disabled until import completes
-        };
-        key_data.deletion_date = metadata.deletion_date.clone();
-
-        // Update the key data in Vault storage
-        self.client.store_key_data(key_id, &key_data).await?;
+    /// Mark a key `PendingDeletion` with the given deadline, under
+    /// check-and-set with per-attempt re-validation.
+    ///
+    /// The state gate re-runs on every attempt, so a transition that lost a
+    /// race (for example against a concurrent schedule or rotation) is
+    /// re-validated against the committed state. Refuses to write back a
+    /// record whose key material is missing: persisting it would cement the
+    /// empty-material state under a fresh document version — a damaged key
+    /// must go through an explicit repair operation, not a lifecycle update.
+    async fn mark_key_pending_deletion(&self, key_id: &str, deletion_date: &Zoned) -> Result<()> {
+        self.client
+            .update_key_data_with_cas(key_id, |key_data| {
+                ensure_key_status_permits(key_id, &key_data.status, StateGatedOperation::ScheduleDeletion)?;
+                if key_data.encrypted_key_material.is_empty() {
+                    return Err(KmsError::material_missing(key_id));
+                }
+                key_data.status = KeyStatus::PendingDeletion;
+                key_data.deletion_date = Some(deletion_date.clone());
+                Ok(CasMutation::Write(()))
+            })
+            .await?;
         Ok(())
     }
 }
@@ -1107,11 +1587,27 @@ impl KmsBackend for VaultKmsBackend {
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
         let plaintext = self.client.decrypt(&request, None).await?;
 
+        // The envelope that was just opened names the master key that opened it.
+        // Reporting "unknown" left every caller unable to tell which key was
+        // actually used, which is what audit and key-rotation checks read.
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+
         Ok(DecryptResponse {
             plaintext,
-            key_id: "unknown".to_string(), // Would be extracted from ciphertext metadata
+            key_id: envelope.master_key_id,
             encryption_algorithm: Some("AES-256-GCM".to_string()),
         })
+    }
+
+    async fn rewrap_data_key(&self, request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        self.client.rewrap_data_key(&request).await
+    }
+
+    async fn describe_data_key_wrapping(
+        &self,
+        request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        self.client.describe_data_key_wrapping(&request).await
     }
 
     async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
@@ -1183,12 +1679,22 @@ impl KmsBackend for VaultKmsBackend {
             if key_metadata.key_state == KeyState::PendingDeletion || key_metadata.key_state == KeyState::Unavailable {
                 // Tombstone first: mark the record Deleted before removing it,
                 // so a crash between the two steps leaves a key that is already
-                // unusable and whose removal can simply be re-run.
-                if key_metadata.key_state == KeyState::PendingDeletion {
-                    let mut key_data = self.client.get_key_data(key_id).await?;
-                    key_data.status = KeyStatus::Deleted;
-                    self.client.store_key_data(key_id, &key_data).await?;
-                }
+                // unusable and whose removal can simply be re-run. Written
+                // check-and-set with re-validation: a concurrent cancellation
+                // that commits first wins and fails this removal instead of
+                // being overwritten.
+                self.client
+                    .update_key_data_with_cas(key_id, |key_data| match key_data.status {
+                        KeyStatus::Deleted => Ok(CasMutation::Skip(())),
+                        KeyStatus::PendingDeletion => {
+                            key_data.status = KeyStatus::Deleted;
+                            Ok(CasMutation::Write(()))
+                        }
+                        KeyStatus::Active | KeyStatus::Disabled => {
+                            Err(KmsError::invalid_key_state(format!("Key {key_id} is no longer pending deletion")))
+                        }
+                    })
+                    .await?;
                 // Force immediate deletion: physically delete the key from Vault storage
                 self.client.delete_key(key_id).await?;
 
@@ -1196,11 +1702,10 @@ impl KmsBackend for VaultKmsBackend {
                 None
             } else {
                 // For non-pending keys, mark as PendingDeletion
+                let marked_at = Zoned::now();
+                self.mark_key_pending_deletion(key_id, &marked_at).await?;
                 key_metadata.key_state = KeyState::PendingDeletion;
-                key_metadata.deletion_date = Some(Zoned::now());
-
-                // Update the key metadata in Vault storage to reflect the new state
-                self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
+                key_metadata.deletion_date = Some(marked_at);
 
                 None
             }
@@ -1208,19 +1713,21 @@ impl KmsBackend for VaultKmsBackend {
             // Schedule for deletion (default 30 days)
             ensure_key_state_permits(key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(crate::error::KmsError::invalid_parameter(
-                    "pending_window_in_days must be between 7 and 30".to_string(),
-                ));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(crate::error::KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
             let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
+            self.mark_key_pending_deletion(key_id, &deletion_date).await?;
             key_metadata.key_state = KeyState::PendingDeletion;
             key_metadata.deletion_date = Some(deletion_date.clone());
-
-            // Update the key metadata in Vault storage to reflect the new state
-            self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
 
             Some(deletion_date.to_string())
         };
@@ -1248,14 +1755,31 @@ impl KmsBackend for VaultKmsBackend {
             return Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
 
+        // Persist the reset state back to Vault. Without this the key stays PendingDeletion in
+        // storage and would still be reaped, so we must fail the request if the write fails
+        // rather than report a false success. Check-and-set with per-attempt
+        // re-validation: once the deletion sweep has tombstoned the record, the
+        // cancellation must fail instead of resurrecting a key whose material
+        // is about to be (or already is) destroyed.
+        self.client
+            .update_key_data_with_cas(key_id, |key_data| match key_data.status {
+                KeyStatus::PendingDeletion => {
+                    if key_data.encrypted_key_material.is_empty() {
+                        return Err(KmsError::material_missing(key_id));
+                    }
+                    key_data.status = KeyStatus::Active;
+                    key_data.deletion_date = None;
+                    Ok(CasMutation::Write(()))
+                }
+                KeyStatus::Active | KeyStatus::Disabled | KeyStatus::Deleted => {
+                    Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")))
+                }
+            })
+            .await?;
+
         // Cancel the deletion by resetting the state
         key_metadata.key_state = KeyState::Enabled;
         key_metadata.deletion_date = None;
-
-        // Persist the reset state back to Vault. Without this the key stays PendingDeletion in
-        // storage and would still be reaped, so we must fail the request if the write fails
-        // rather than report a false success.
-        self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
 
         Ok(CancelKeyDeletionResponse {
             key_id: key_id.clone(),
@@ -1275,6 +1799,18 @@ impl KmsBackend for VaultKmsBackend {
         self.client.rotate_key(key_id, None).await.map(|_| ())
     }
 
+    async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.client.update_key_description(key_id, description).await
+    }
+
+    async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        self.client.tag_key(key_id, tags).await
+    }
+
+    async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        self.client.untag_key(key_id, tag_keys).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
@@ -1283,41 +1819,50 @@ impl KmsBackend for VaultKmsBackend {
         // Rotation freezes the outgoing material as an immutable version
         // record before switching the current pointer, and envelopes resolve
         // their wrapping version on decrypt, so every historical version
-        // stays decryptable after a rotation.
+        // stays decryptable after a rotation. Those same immutable records are
+        // what lets an envelope be unwrapped with the version that wrapped it
+        // and re-wrapped onto the current one.
         BackendCapabilities::minimal()
             .with_rotate(true)
             .with_enable_disable(true)
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(true)
+            .with_update_key_metadata(true)
+            .with_rewrap(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
-        // Vault KV2 offers no compare-and-swap here, so a cancellation racing
-        // the read below can still lose; the window is a single read-write
-        // gap and the sweep re-reads on every pass.
-        let mut key_data = match self.client.get_key_data(key_id).await {
-            Ok(key_data) => key_data,
-            Err(KmsError::KeyNotFound { .. }) => return Ok(ExpiredKeyRemoval::Removed),
-            Err(error) => return Err(error),
-        };
-        match key_data.status {
-            // Tombstone left by a crashed removal: complete it.
-            KeyStatus::Deleted => {}
-            KeyStatus::PendingDeletion => {
-                match &key_data.deletion_date {
-                    Some(deadline) if deadline <= now => {}
+        // Tombstone under check-and-set with per-attempt re-validation: a
+        // cancellation landing between the read and the write makes the write
+        // conflict, and the re-read then observes the cancelled state and
+        // reports StateChanged instead of overwriting it.
+        let settled = self
+            .client
+            .update_key_data_with_cas(key_id, |key_data| match key_data.status {
+                // Tombstone left by a crashed removal: complete it.
+                KeyStatus::Deleted => Ok(CasMutation::Skip(None)),
+                KeyStatus::PendingDeletion => match &key_data.deletion_date {
+                    Some(deadline) if deadline <= now => {
+                        // Tombstone first: mark the record Deleted before
+                        // removing it, so a crash between the two steps leaves
+                        // a key that is already unusable and whose removal can
+                        // simply be re-run.
+                        key_data.status = KeyStatus::Deleted;
+                        Ok(CasMutation::Write(None))
+                    }
                     // Not yet due, or a legacy record without a persisted
                     // deadline — never auto-remove those.
-                    _ => return Ok(ExpiredKeyRemoval::NotExpired),
-                }
-                // Tombstone first: mark the record Deleted before removing it,
-                // so a crash between the two steps leaves a key that is
-                // already unusable and whose removal can simply be re-run.
-                key_data.status = KeyStatus::Deleted;
-                self.client.store_key_data(key_id, &key_data).await?;
-            }
-            KeyStatus::Active | KeyStatus::Disabled => return Ok(ExpiredKeyRemoval::StateChanged),
+                    _ => Ok(CasMutation::Skip(Some(ExpiredKeyRemoval::NotExpired))),
+                },
+                KeyStatus::Active | KeyStatus::Disabled => Ok(CasMutation::Skip(Some(ExpiredKeyRemoval::StateChanged))),
+            })
+            .await;
+        match settled {
+            Ok((_, Some(outcome))) => return Ok(outcome),
+            Ok((_, None)) => {}
+            Err(KmsError::KeyNotFound { .. }) => return Ok(ExpiredKeyRemoval::Removed),
+            Err(error) => return Err(error),
         }
 
         match self.client.delete_key(key_id).await {
@@ -1336,6 +1881,8 @@ mod tests {
     use crate::backends::scripted_vault::{ScriptedResponse, ScriptedVault};
     use crate::config::{VaultAuthMethod, VaultConfig};
 
+    const SCRIPTED_RETRY_ATTEMPTS: u32 = 3;
+
     /// Vault + KMS config pair pointing at a scripted loopback Vault.
     fn scripted_configs(address: &str) -> (VaultConfig, KmsConfig) {
         let vault_config = VaultConfig {
@@ -1351,7 +1898,7 @@ mod tests {
         };
         let kms_config = KmsConfig {
             timeout: Duration::from_secs(5),
-            retry_attempts: 3,
+            retry_attempts: SCRIPTED_RETRY_ATTEMPTS,
             ..KmsConfig::default()
         };
         (vault_config, kms_config)
@@ -1359,6 +1906,19 @@ mod tests {
 
     async fn scripted_client(responses: Vec<ScriptedResponse>) -> (ScriptedVault, VaultKmsClient) {
         let vault = ScriptedVault::serve(responses).await;
+        let (vault_config, kms_config) = scripted_configs(&vault.address);
+        let client = VaultKmsClient::new(vault_config, &kms_config)
+            .await
+            .expect("scripted Vault client");
+        (vault, client)
+    }
+
+    async fn scripted_kv2_client(key_data: &VaultKeyData) -> (ScriptedVault, VaultKmsClient) {
+        let vault = ScriptedVault::serve_kv2(
+            "rustfs/kms/keys/wired-key",
+            serde_json::to_value(key_data).expect("serialize scripted KV2 key"),
+        )
+        .await;
         let (vault_config, kms_config) = scripted_configs(&vault.address);
         let client = VaultKmsClient::new(vault_config, &kms_config)
             .await
@@ -1377,6 +1937,7 @@ mod tests {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: None,
+            rotated_at: None,
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: None,
         }
@@ -1394,6 +1955,35 @@ mod tests {
                 "version": 1,
             },
         })
+    }
+
+    /// A caller asking for no keys gets an empty page, and the page arithmetic
+    /// never reaches for the element before an empty page. The scripted key
+    /// listing stays unused: a request for zero keys has nothing to ask Vault.
+    #[tokio::test]
+    async fn zero_limit_list_returns_an_empty_page_without_calling_vault() {
+        let (vault, client) =
+            scripted_client(vec![ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a", "key-b"] }))]).await;
+
+        let response = client
+            .list_keys(
+                &ListKeysRequest {
+                    limit: Some(0),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("a zero-limit list must succeed");
+
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+        assert!(
+            vault.requests().is_empty(),
+            "a request for no keys must not reach Vault: {:?}",
+            vault.requests()
+        );
     }
 
     #[tokio::test]
@@ -1421,6 +2011,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wired_read_retries_closed_connections_within_budget() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::close(), ScriptedResponse::close()]).await;
+
+        let error = client
+            .get_key_data("wired-key")
+            .await
+            .expect_err("closed connections must exhaust the retry budget");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        let expected_requests = usize::try_from(SCRIPTED_RETRY_ATTEMPTS).expect("retry attempts must fit usize");
+        assert_eq!(
+            requests.len(),
+            expected_requests,
+            "all budgeted retry attempts must reach Vault: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|line| line == "GET /v1/secret/data/rustfs/kms/keys/wired-key"),
+            "all attempts must hit the same read endpoint: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn wired_read_does_not_retry_permission_errors() {
         let (vault, client) = scripted_client(vec![ScriptedResponse::error(403, "permission denied")]).await;
 
@@ -1438,7 +2053,7 @@ mod tests {
         let (vault, client) = scripted_client(vec![ScriptedResponse::error(503, "sealed")]).await;
 
         let error = client
-            .store_key_data("wired-key", &healthy_key_data())
+            .cas_store_key_data("wired-key", &healthy_key_data(), 1)
             .await
             .expect_err("the scripted 503 must fail the write");
         assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
@@ -1668,6 +2283,7 @@ mod tests {
             encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
             baseline_version: Some(1),
             deletion_date: None,
+            rotated_at: None,
         };
 
         let mut value = serde_json::to_value(&key_data).expect("serialize key data");
@@ -1995,6 +2611,7 @@ mod tests {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: Some(false),
+                confirm_key_id: None,
             })
             .await
             .expect("schedule delete");
@@ -2030,6 +2647,7 @@ mod tests {
             metadata: HashMap::new(),
             tags: HashMap::new(),
             deletion_date: Some(deadline.clone()),
+            rotated_at: None,
             encrypted_key_material: "material".to_string(),
             baseline_version: None,
         };
@@ -2167,10 +2785,12 @@ mod tests {
         let mut disabled = healthy_key_data();
         disabled.status = KeyStatus::Disabled;
         let vault = ScriptedVault::serve(vec![
-            // disable: read the Active record, persist it Disabled.
+            // disable: versioned read of the Active record, persist it Disabled.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
             ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
             ScriptedResponse::ok(kv2_write_ack()),
-            // enable: read the Disabled record, persist it Active.
+            // enable: versioned read of the Disabled record, persist it Active.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
             ScriptedResponse::ok(kv2_read_data(&disabled)),
             ScriptedResponse::ok(kv2_write_ack()),
         ])
@@ -2192,8 +2812,1695 @@ mod tests {
             .expect("KmsBackend::enable_key must persist through the client");
 
         let requests = vault.requests();
-        assert_eq!(requests.len(), 4, "each transition is one read plus one write: {requests:?}");
-        assert!(requests[0].starts_with("GET ") && requests[2].starts_with("GET "), "{requests:?}");
-        assert!(requests[1].starts_with("POST ") && requests[3].starts_with("POST "), "{requests:?}");
+        assert_eq!(
+            requests.len(),
+            6,
+            "each transition is one versioned read (metadata + data) plus one write: {requests:?}"
+        );
+        assert!(
+            requests[0].starts_with("GET /v1/secret/metadata/") && requests[3].starts_with("GET /v1/secret/metadata/"),
+            "{requests:?}"
+        );
+        assert!(
+            requests[1].starts_with("GET /v1/secret/data/") && requests[4].starts_with("GET /v1/secret/data/"),
+            "{requests:?}"
+        );
+        assert!(requests[2].starts_with("POST ") && requests[5].starts_with("POST "), "{requests:?}");
+
+        // Both lifecycle writes must carry a check-and-set precondition pinned
+        // to the KV2 secret version they read.
+        let bodies = vault.request_bodies();
+        for (index, cas) in [(2usize, 1u64), (5, 2)] {
+            let body: serde_json::Value = serde_json::from_str(&bodies[index]).expect("lifecycle write body must be JSON");
+            assert_eq!(
+                body["options"]["cas"],
+                serde_json::json!(cas),
+                "write {index} must be check-and-set: {body}"
+            );
+        }
+    }
+
+    /// Parse a captured KV2 write body (`{"data": ..., "options": {"cas": N}}`).
+    fn parse_write_body(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).expect("KV2 write body must be JSON")
+    }
+
+    /// KV2 read payload for an immutable version record.
+    fn kv2_read_version_record_data(record: &VaultKeyVersionRecord) -> serde_json::Value {
+        serde_json::json!({
+            "data": serde_json::to_value(record).expect("serialize version record"),
+            "metadata": {
+                "created_time": "2026-01-01T00:00:00Z",
+                "deletion_time": "",
+                "custom_metadata": null,
+                "destroyed": false,
+                "version": 1,
+            },
+        })
+    }
+
+    const CAS_CONFLICT_MESSAGE: &str = "check-and-set parameter did not match the current version";
+
+    /// Base64 material distinct from `healthy_key_data`'s, standing in for the
+    /// material a concurrent rotation committed.
+    fn rotated_material() -> String {
+        general_purpose::STANDARD.encode([0x43u8; 32])
+    }
+
+    /// The issue's lost-update scenario: node A disables a key while node B's
+    /// rotation commits in between. The blind write this replaces would have
+    /// written A's stale snapshot back — rolling the key from version 2 to
+    /// version 1 and resurrecting the pre-rotation material, which is exactly
+    /// what the final-write assertions below reject. Under check-and-set the
+    /// stale write conflicts, A re-reads, re-passes the state gate against the
+    /// rotated record, and persists only the status change on top of it.
+    #[tokio::test]
+    async fn wired_disable_interleaved_with_rotate_preserves_committed_rotation() {
+        let pre_rotate = healthy_key_data();
+        let mut rotated = healthy_key_data();
+        rotated.version = 2;
+        rotated.baseline_version = Some(1);
+        rotated.encrypted_key_material = rotated_material();
+
+        let (vault, client) = scripted_client(vec![
+            // Attempt 1: versioned read observes the pre-rotation record...
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&pre_rotate)),
+            // ...but the concurrent rotation committed KV2 versions 2 and 3 in
+            // between, so the check-and-set write loses.
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // Attempt 2: the re-read observes the rotated record and the write
+            // pinned to it succeeds.
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&rotated)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        client
+            .disable_key("wired-key", None)
+            .await
+            .expect("the disable must retry past the lost race and commit");
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=1".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=3".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+            ],
+            "a conflict must trigger exactly one full re-read before the retry write"
+        );
+
+        let bodies = vault.request_bodies();
+        let first_write = parse_write_body(&bodies[2]);
+        assert_eq!(first_write["options"]["cas"], serde_json::json!(1), "{first_write}");
+
+        // The committed write must be the *rotated* snapshot with only the
+        // status changed. A blind write would have persisted version 1 and the
+        // pre-rotation material here.
+        let committed = parse_write_body(&bodies[5]);
+        assert_eq!(committed["options"]["cas"], serde_json::json!(3), "{committed}");
+        assert_eq!(committed["data"]["status"], serde_json::json!("Disabled"), "{committed}");
+        assert_eq!(
+            committed["data"]["version"],
+            serde_json::json!(2),
+            "the rotation's version bump must survive: {committed}"
+        );
+        assert_eq!(committed["data"]["baseline_version"], serde_json::json!(1), "{committed}");
+        assert_eq!(
+            committed["data"]["encrypted_key_material"],
+            serde_json::json!(rotated_material()),
+            "the rotation's material must survive the disable: {committed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_create_key_write_is_create_only() {
+        let (vault, client) = scripted_client(vec![
+            // Existence pre-check: not found.
+            ScriptedResponse::error(404, "not found"),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let created = client
+            .create_key("wired-key", "AES_256", None)
+            .await
+            .expect("create against an absent key must succeed");
+        assert_eq!(created.version, 1);
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+            ]
+        );
+
+        // The write must be create-only (check-and-set of 0). A blind
+        // overwrite — the pre-CAS behavior — carries no options at all.
+        let body = parse_write_body(&vault.request_bodies()[1]);
+        assert_eq!(body["options"]["cas"], serde_json::json!(0), "create must be create-only: {body}");
+    }
+
+    /// Concurrent same-name create: both nodes pass the not-found pre-check,
+    /// exactly one create-only write commits, and the loser reports
+    /// KeyAlreadyExists instead of overwriting the winner's material (which
+    /// would permanently orphan every DEK the winner already wrapped).
+    #[tokio::test]
+    async fn wired_concurrent_create_loser_reports_key_already_exists() {
+        let (vault, client) = scripted_client(vec![
+            // Existence pre-check: not found (the racing create has not
+            // committed yet).
+            ScriptedResponse::error(404, "not found"),
+            // The create-only write loses: the racing create committed first.
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+        ])
+        .await;
+
+        let error = client
+            .create_key("wired-key", "AES_256", None)
+            .await
+            .expect_err("the losing create must fail");
+        assert!(matches!(error, KmsError::KeyAlreadyExists { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "the loser must not retry or fall back to a blind write: {requests:?}");
+    }
+
+    /// Deletion sweep racing a cancellation: the sweep's tombstone write loses
+    /// its check-and-set race, the re-read observes the cancelled (Active)
+    /// record, and the sweep reports StateChanged without deleting anything.
+    /// The blind tombstone this replaces would have overwritten the committed
+    /// cancellation and destroyed the key.
+    #[tokio::test]
+    async fn wired_expired_key_sweep_yields_to_concurrent_cancellation() {
+        let now = Zoned::now() + Duration::from_secs(3600);
+        let mut pending = healthy_key_data();
+        pending.status = KeyStatus::PendingDeletion;
+        pending.deletion_date = Some(Zoned::now());
+
+        let vault = ScriptedVault::serve(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&pending)),
+            // The cancellation commits between the read and the tombstone.
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            // The re-read observes the cancelled (Active again) record.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let outcome = backend
+            .remove_expired_key("wired-key", &now)
+            .await
+            .expect("the sweep must settle by observing the cancelled state");
+        assert_eq!(outcome, ExpiredKeyRemoval::StateChanged);
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert!(
+            !requests.iter().any(|line| line.starts_with("DELETE ")),
+            "a sweep that lost to a cancellation must not delete anything: {requests:?}"
+        );
+        // The one write attempt was the check-and-set tombstone.
+        let body = parse_write_body(&vault.request_bodies()[2]);
+        assert_eq!(body["options"]["cas"], serde_json::json!(1), "{body}");
+        assert_eq!(body["data"]["status"], serde_json::json!("Deleted"), "{body}");
+    }
+
+    /// The other half of the cancel × sweep interleaving: once the sweep has
+    /// tombstoned the record, a cancellation re-validates against the fresh
+    /// state and fails instead of resurrecting a key whose material is about
+    /// to be destroyed.
+    #[tokio::test]
+    async fn wired_cancel_deletion_after_sweep_tombstone_fails_closed() {
+        let mut pending = healthy_key_data();
+        pending.status = KeyStatus::PendingDeletion;
+        pending.deletion_date = Some(Zoned::now());
+        let mut tombstoned = healthy_key_data();
+        tombstoned.status = KeyStatus::Deleted;
+
+        let vault = ScriptedVault::serve(vec![
+            // describe_key still observes the pre-sweep PendingDeletion state
+            // (one read for the key info, one for the stored metadata).
+            ScriptedResponse::ok(kv2_read_data(&pending)),
+            ScriptedResponse::ok(kv2_read_data(&pending)),
+            // The check-and-set update re-reads and observes the tombstone.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(kv2_read_data(&tombstoned)),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let error = backend
+            .cancel_key_deletion(CancelKeyDeletionRequest {
+                key_id: "wired-key".to_string(),
+            })
+            .await
+            .expect_err("cancelling after the sweep tombstoned the key must fail");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("not pending deletion")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert!(
+            !requests.iter().any(|line| line.starts_with("POST ")),
+            "a cancellation that lost to the sweep must not write anything: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_schedule_deletion_retries_after_cas_conflict() {
+        let vault = ScriptedVault::serve(vec![
+            // describe_key: key info plus stored metadata.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // Attempt 1 loses its check-and-set race.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // Attempt 2: the re-read re-passes the state gate and commits.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let response = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: Some(7),
+                force_immediate: Some(false),
+                confirm_key_id: None,
+            })
+            .await
+            .expect("the schedule must retry past the lost race and commit");
+        assert!(response.deletion_date.is_some());
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 8, "{requests:?}");
+        let committed = parse_write_body(&vault.request_bodies()[7]);
+        assert_eq!(committed["options"]["cas"], serde_json::json!(2), "{committed}");
+        assert_eq!(committed["data"]["status"], serde_json::json!("PendingDeletion"), "{committed}");
+        assert!(
+            !committed["data"]["deletion_date"].is_null(),
+            "the deadline must be persisted: {committed}"
+        );
+    }
+
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn wired_schedule_deletion_refuses_a_window_outside_the_supported_range() {
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let vault = ScriptedVault::serve(vec![
+                // describe_key: key info plus stored metadata.
+                ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+                ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ])
+            .await;
+            let config = KmsConfig::vault(
+                url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+                "scripted-token".to_string(),
+            )
+            .with_insecure_development_defaults();
+            let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: "wired-key".to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+
+            let requests = vault.requests();
+            assert!(
+                !requests.iter().any(|line| line.starts_with("POST ")),
+                "a refused window must not write anything: {requests:?}"
+            );
+        }
+    }
+
+    /// Conflict semantics are re-read *and* re-gate: when the re-read after a
+    /// lost race shows the key was concurrently scheduled for deletion, the
+    /// state gate rejects the retry instead of blindly re-applying it.
+    #[tokio::test]
+    async fn wired_schedule_deletion_regates_after_conflict() {
+        let mut already_pending = healthy_key_data();
+        already_pending.status = KeyStatus::PendingDeletion;
+        already_pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+
+        let vault = ScriptedVault::serve(vec![
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // A concurrent schedule committed first.
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(kv2_read_data(&already_pending)),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let error = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: Some(7),
+                force_immediate: Some(false),
+                confirm_key_id: None,
+            })
+            .await
+            .expect_err("the retry must re-run the state gate against the fresh record");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("pending deletion")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 7, "{requests:?}");
+        assert_eq!(
+            requests.iter().filter(|line| line.starts_with("POST ")).count(),
+            1,
+            "the rejected retry must not write again: {requests:?}"
+        );
+    }
+
+    /// The read-modify-write loop is bounded: persistent contention surfaces
+    /// the typed conflict error after `LIFECYCLE_CAS_ATTEMPTS` full
+    /// read-gate-write cycles instead of spinning or falling back to a blind
+    /// write.
+    #[tokio::test]
+    async fn wired_lifecycle_cas_retries_are_bounded() {
+        let mut responses = Vec::new();
+        for secret_version in 1..=LIFECYCLE_CAS_ATTEMPTS as u64 {
+            responses.push(ScriptedResponse::ok(kv2_metadata_read_data(secret_version)));
+            responses.push(ScriptedResponse::ok(kv2_read_data(&healthy_key_data())));
+            responses.push(ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE));
+        }
+        let (vault, client) = scripted_client(responses).await;
+
+        let error = client
+            .disable_key("wired-key", None)
+            .await
+            .expect_err("persistent contention must surface the typed conflict error");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("Concurrent modification")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 3 * LIFECYCLE_CAS_ATTEMPTS as usize, "{requests:?}");
+        assert_eq!(
+            requests.iter().filter(|line| line.starts_with("POST ")).count(),
+            LIFECYCLE_CAS_ATTEMPTS as usize,
+            "every attempt must be a fresh read-gate-write cycle: {requests:?}"
+        );
+    }
+
+    /// Concurrent rotations use KV2 create-only records and a CAS pointer
+    /// switch. The stateful scripted Vault applies those preconditions to real
+    /// HTTP requests, so this test proves committed versions are unique and
+    /// contiguous instead of only checking that several calls returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wired_concurrent_kv2_rotations_commit_unique_monotonic_versions() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        const ATTEMPTS: usize = 8;
+        let mut key_data = healthy_key_data();
+        key_data.baseline_version = Some(1);
+        let (vault, client) = scripted_kv2_client(&key_data).await;
+        let client = Arc::new(client);
+        let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
+        let tasks: Vec<_> = (0..ATTEMPTS)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    client.rotate_key("wired-key", None).await
+                })
+            })
+            .collect();
+
+        let mut committed_versions = Vec::new();
+        let mut errors = Vec::new();
+        for task in tasks {
+            match task.await.expect("join concurrent rotation task") {
+                Ok(result) => committed_versions.push(result.version),
+                Err(error) => errors.push(error),
+            }
+        }
+
+        assert!(
+            !committed_versions.is_empty(),
+            "at least one concurrent rotation must commit; errors: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(
+                |error| matches!(error, KmsError::InvalidOperation { message } if message.contains("Concurrent modification"))
+            ),
+            "a lost CAS race must be the only expected failure: {errors:?}"
+        );
+
+        let mut sorted_versions = committed_versions.clone();
+        sorted_versions.sort_unstable();
+        let unique_versions: HashSet<_> = sorted_versions.iter().copied().collect();
+        assert_eq!(
+            unique_versions.len(),
+            sorted_versions.len(),
+            "concurrent rotations must never return a version twice: {committed_versions:?}"
+        );
+
+        let successful_rotations = u32::try_from(sorted_versions.len()).expect("test attempts fit u32");
+        let current_version = 1u32 + successful_rotations;
+        assert_eq!(
+            sorted_versions,
+            (2..=current_version).collect::<Vec<_>>(),
+            "committed versions must form one monotonic sequence: {sorted_versions:?}"
+        );
+
+        let snapshot = vault.kv2_snapshot().expect("stateful KV2 snapshot");
+        let persisted_version = snapshot.current_data["version"]
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .expect("current KV2 record must carry a u32 key version");
+        assert_eq!(persisted_version, current_version);
+        assert!(
+            snapshot.current_secret_version >= u64::from(current_version),
+            "the KV2 secret version must advance with each committed pointer switch"
+        );
+        assert_eq!(
+            snapshot.version_records.keys().copied().collect::<Vec<_>>(),
+            (1..=current_version).collect::<Vec<_>>(),
+            "every committed KMS version must have exactly one immutable record"
+        );
+
+        let mut materials = HashSet::new();
+        for (version, record) in &snapshot.version_records {
+            let material = record["encrypted_key_material"]
+                .as_str()
+                .expect("version record must carry encrypted key material");
+            assert!(materials.insert(material), "version {version} reuses another version's material");
+        }
+        assert_eq!(
+            snapshot.current_data["encrypted_key_material"],
+            snapshot
+                .version_records
+                .get(&current_version)
+                .expect("current version record")["encrypted_key_material"],
+            "the top-level fast path must match the current immutable version record"
+        );
+    }
+
+    /// The tags write-back after a create is a check-and-set read-modify-write
+    /// that carries the key material over from the freshly read record.
+    #[tokio::test]
+    async fn wired_create_key_tags_writeback_is_check_and_set() {
+        let vault = ScriptedVault::serve(vec![
+            // create_key: existence pre-check misses, create-only write lands.
+            ScriptedResponse::error(404, "not found"),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // store_key_metadata: versioned read plus check-and-set write.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let response = backend
+            .create_key(CreateKeyRequest {
+                key_name: Some("wired-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                tags: HashMap::from([("team".to_string(), "storage".to_string())]),
+                ..Default::default()
+            })
+            .await
+            .expect("create with tags must succeed");
+        assert_eq!(response.key_id, "wired-key");
+
+        let bodies = vault.request_bodies();
+        let create = parse_write_body(&bodies[1]);
+        assert_eq!(create["options"]["cas"], serde_json::json!(0), "{create}");
+
+        let writeback = parse_write_body(&bodies[4]);
+        assert_eq!(writeback["options"]["cas"], serde_json::json!(1), "{writeback}");
+        assert_eq!(writeback["data"]["tags"]["team"], serde_json::json!("storage"), "{writeback}");
+        assert_eq!(
+            writeback["data"]["encrypted_key_material"],
+            serde_json::json!(healthy_key_data().encrypted_key_material),
+            "the write-back must preserve the material of the freshly read record: {writeback}"
+        );
+    }
+
+    /// Tag updates are check-and-set read-modify-writes over the live record,
+    /// never blind overwrites: they preserve the material and the tags they did
+    /// not address.
+    #[tokio::test]
+    async fn wired_tag_key_writeback_is_check_and_set() {
+        let mut key_data = healthy_key_data();
+        key_data.tags = HashMap::from([("name".to_string(), "wired-key".to_string())]);
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        client
+            .tag_key("wired-key", &HashMap::from([("team".to_string(), "storage".to_string())]))
+            .await
+            .expect("tagging must succeed");
+
+        let bodies = vault.request_bodies();
+        let writeback = parse_write_body(&bodies[2]);
+        assert_eq!(writeback["options"]["cas"], serde_json::json!(1), "{writeback}");
+        assert_eq!(writeback["data"]["tags"]["team"], serde_json::json!("storage"), "{writeback}");
+        assert_eq!(
+            writeback["data"]["tags"]["name"],
+            serde_json::json!("wired-key"),
+            "a tag update must not drop tags it did not address: {writeback}"
+        );
+        assert_eq!(
+            writeback["data"]["encrypted_key_material"],
+            serde_json::json!(healthy_key_data().encrypted_key_material),
+            "the write-back must preserve the material of the freshly read record: {writeback}"
+        );
+    }
+
+    /// Rejecting the identity tag happens before any Vault call, so a rejected
+    /// request cannot leave a partial write behind.
+    #[tokio::test]
+    async fn wired_identity_tag_update_is_rejected_before_any_vault_call() {
+        let (vault, client) = scripted_client(Vec::new()).await;
+
+        for result in [
+            client
+                .tag_key("wired-key", &HashMap::from([("name".to_string(), "other".to_string())]))
+                .await,
+            client.untag_key("wired-key", &["name".to_string()]).await,
+        ] {
+            let error = result.expect_err("the identity tag must not be writable");
+            assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+        }
+        assert!(
+            vault.request_bodies().is_empty(),
+            "a rejected metadata update must not reach Vault: {:?}",
+            vault.request_bodies()
+        );
+    }
+
+    /// A version record above the current pointer means the top-level record
+    /// regressed (a lost update rolled back a committed rotation). Resolving
+    /// material through such a record must fail closed instead of quietly
+    /// serving it while new encryptions keep using the rolled-back material.
+    #[tokio::test]
+    async fn wired_decrypt_fails_closed_when_current_version_regressed() {
+        let material_v2 = [0x43u8; 32];
+        let record_v2 = VaultKeyVersionRecord {
+            version: 2,
+            encrypted_key_material: general_purpose::STANDARD.encode(material_v2),
+            created_at: Zoned::now(),
+        };
+        // A well-formed envelope wrapped under version 2 — under a reverted
+        // guard this decrypt would *succeed*, which is exactly the masked
+        // rollback this test pins down.
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&material_v2, b"dek-plaintext")
+            .await
+            .expect("wrap test DEK");
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: Some(2),
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        let (vault, client) = scripted_client(vec![
+            // Top-level record: current version rolled back to 1.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // ...yet the immutable record for version 2 exists.
+            ScriptedResponse::ok(kv2_read_version_record_data(&record_v2)),
+        ])
+        .await;
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("a version record above the current pointer must fail the decrypt");
+        assert!(
+            matches!(&error, KmsError::InternalError { message } if message.contains("behind existing version record")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "the inconsistency must be decided from the two reads: {requests:?}");
+    }
+
+    /// Rotation refuses to extend a version history whose records already
+    /// reach more than one step past the current pointer: that state cannot
+    /// come from the rotation protocol and re-minting those version numbers
+    /// would collide with immutable records.
+    #[tokio::test]
+    async fn wired_rotate_fails_closed_when_version_history_regressed() {
+        // The baseline is intact, so this isolates the monotonicity guard from
+        // the lost-baseline guard that also inspects the version listing.
+        let mut key_data = healthy_key_data();
+        key_data.baseline_version = Some(1);
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(4)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            // Version records reach 3 while the current pointer says 1.
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2", "3"] })),
+        ])
+        .await;
+
+        let error = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect_err("a regressed version history must fail the rotation");
+        assert!(
+            matches!(&error, KmsError::InternalError { message } if message.contains("refusing to extend")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(
+            !requests.iter().any(|line| line.starts_with("POST ")),
+            "nothing may be written on a regressed history: {requests:?}"
+        );
+    }
+
+    /// A record exactly one past the current pointer is the footprint of an
+    /// interrupted rotation; the next rotation must adopt its persisted
+    /// material (the monotonicity guard must not misread it as a regression).
+    #[tokio::test]
+    async fn wired_rotate_adopts_interrupted_rotation_record() {
+        let mut key_data = healthy_key_data();
+        key_data.baseline_version = Some(1);
+        let adopted_material = rotated_material();
+        let record_v2 = VaultKeyVersionRecord {
+            version: 2,
+            encrypted_key_material: adopted_material.clone(),
+            created_at: Zoned::now(),
+        };
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(5)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            // The interrupted rotation left a record for version 2.
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+            // The create-only write for version 2 conflicts...
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // ...so the rotation reads the persisted record back and adopts it.
+            ScriptedResponse::ok(kv2_read_version_record_data(&record_v2)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect("an interrupted rotation must be recoverable");
+        assert_eq!(rotated.version, 2);
+
+        // The pointer switch must commit the adopted (persisted) material, not
+        // freshly generated material that no record holds.
+        let committed = parse_write_body(&vault.request_bodies()[5]);
+        assert_eq!(committed["options"]["cas"], serde_json::json!(5), "{committed}");
+        assert_eq!(committed["data"]["version"], serde_json::json!(2), "{committed}");
+        assert_eq!(
+            committed["data"]["encrypted_key_material"],
+            serde_json::json!(adopted_material),
+            "{committed}"
+        );
+    }
+
+    /// The mixed-version corruption path: a node older than versioned rotation
+    /// performed a lifecycle write, which rewrites the whole key record and
+    /// silently drops the `baseline_version` it does not know. Version records
+    /// without a baseline can only mean that, so the next rotation must refuse
+    /// instead of freezing a fresh baseline at the current version — which would
+    /// resolve every pre-versioning envelope to material that never wrapped it.
+    #[tokio::test]
+    async fn wired_rotate_refuses_when_baseline_was_erased() {
+        let mut key_data = healthy_key_data();
+        key_data.version = 2;
+        key_data.baseline_version = None;
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            // The key was rotated once, so records for versions 1 and 2 exist —
+            // the baseline the first rotation pinned is gone from the record.
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+        ])
+        .await;
+
+        let error = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect_err("a key whose baseline was erased must not rotate");
+        assert!(
+            matches!(
+                &error,
+                KmsError::BaselineVersionLost { key_id, oldest_version: 1 } if key_id == "wired-key"
+            ),
+            "the refusal must name the baseline to restore: {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=3".to_string(),
+                "LIST /v1/secret/metadata/rustfs/kms/keys/wired-key/versions".to_string(),
+            ],
+            "the refusal must be decided from reads alone"
+        );
+        assert!(
+            !requests.iter().any(|line| line.starts_with("POST ")),
+            "nothing may be written once the baseline is known lost: {requests:?}"
+        );
+    }
+
+    /// A key whose baseline is intact keeps rotating: the guard must key off the
+    /// contradiction, not off the presence of version records.
+    #[tokio::test]
+    async fn wired_rotate_with_intact_baseline_still_commits() {
+        let mut key_data = healthy_key_data();
+        key_data.version = 2;
+        key_data.baseline_version = Some(1);
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+            // Version 3's material record, then the pointer switch.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect("a key with an intact baseline must still rotate");
+        assert_eq!(rotated.version, 3);
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=3".to_string(),
+                "LIST /v1/secret/metadata/rustfs/kms/keys/wired-key/versions".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key/versions/3".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+            ],
+            "an intact baseline skips the freeze step and commits the usual two writes"
+        );
+
+        let bodies = vault.request_bodies();
+        let record = parse_write_body(&bodies[3]);
+        assert_eq!(
+            record["options"]["cas"],
+            serde_json::json!(0),
+            "version records are create-only: {record}"
+        );
+        let committed = parse_write_body(&bodies[4]);
+        assert_eq!(committed["options"]["cas"], serde_json::json!(3), "{committed}");
+        assert_eq!(committed["data"]["version"], serde_json::json!(3), "{committed}");
+        assert_eq!(
+            committed["data"]["baseline_version"],
+            serde_json::json!(1),
+            "the existing baseline must be carried over untouched: {committed}"
+        );
+    }
+
+    /// A never-rotated key legitimately has no baseline and no version records,
+    /// so its first rotation must still freeze one. The guard must not read this
+    /// state as an erased baseline.
+    #[tokio::test]
+    async fn wired_first_rotate_of_never_rotated_key_still_freezes_baseline() {
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(7)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // The versions directory does not exist yet.
+            ScriptedResponse::error(404, "not found"),
+            // Freeze version 1, persist the baseline, create version 2, switch.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client
+            .rotate_key("wired-key", None)
+            .await
+            .expect("the first rotation of a never-rotated key must commit");
+        assert_eq!(rotated.version, 2);
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/metadata/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key?version=7".to_string(),
+                "LIST /v1/secret/metadata/rustfs/kms/keys/wired-key/versions".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key/versions/1".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key/versions/2".to_string(),
+                "POST /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+            ],
+            "{requests:?}"
+        );
+
+        let bodies = vault.request_bodies();
+        let frozen = parse_write_body(&bodies[3]);
+        assert_eq!(
+            frozen["data"]["encrypted_key_material"],
+            serde_json::json!(healthy_key_data().encrypted_key_material),
+            "the baseline record must freeze the pre-rotation material: {frozen}"
+        );
+        let baseline_commit = parse_write_body(&bodies[4]);
+        assert_eq!(
+            baseline_commit["data"]["baseline_version"],
+            serde_json::json!(1),
+            "the first rotation must pin the baseline: {baseline_commit}"
+        );
+    }
+
+    /// The rotation-age gauge ages a key from `rotated_at`, falling back to
+    /// `created_at`. A rotation that commits without recording its time makes a
+    /// key rotated many times read exactly like one that was never rotated, so
+    /// the commit must carry the timestamp and a later describe must report it.
+    /// Reverting either half turns this test red.
+    #[tokio::test]
+    async fn wired_rotate_persists_rotation_time_and_describe_reports_it() {
+        let created_at = Zoned::now() - Duration::from_secs(365 * 86400);
+        let mut key_data = healthy_key_data();
+        key_data.created_at = created_at.clone();
+        key_data.version = 2;
+        key_data.baseline_version = Some(1);
+        key_data.description = Some("payload key".to_string());
+        key_data.metadata.insert("owner".to_string(), "platform".to_string());
+        key_data.tags.insert("env".to_string(), "prod".to_string());
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(3)),
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+            // Version 3's material record, then the pointer switch.
+            ScriptedResponse::ok(kv2_write_ack()),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        let rotated = client.rotate_key("wired-key", None).await.expect("rotate a healthy key");
+        let reported = rotated.rotated_at.clone().expect("a committed rotation must report its time");
+
+        let bodies = vault.request_bodies();
+        let committed = parse_write_body(&bodies[4]);
+        let persisted: VaultKeyData =
+            serde_json::from_value(committed["data"].clone()).expect("the committed record must deserialize");
+        assert_eq!(
+            persisted.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(reported.timestamp()),
+            "the rotation must persist the time it reports: {committed}"
+        );
+
+        // The rest of the record rides through the read-modify-write untouched;
+        // a rotation that dropped any of it would corrupt the key.
+        assert_eq!(persisted.version, 3, "{committed}");
+        assert_eq!(persisted.created_at.timestamp(), created_at.timestamp(), "{committed}");
+        assert_eq!(persisted.baseline_version, Some(1), "{committed}");
+        assert_eq!(persisted.description.as_deref(), Some("payload key"), "{committed}");
+        assert_eq!(persisted.metadata.get("owner").map(String::as_str), Some("platform"), "{committed}");
+        assert_eq!(persisted.tags.get("env").map(String::as_str), Some("prod"), "{committed}");
+
+        // Describing the committed record must report the rotation, not the
+        // creation a year earlier that the gauge would otherwise fall back to.
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&persisted))]).await;
+        let described = client
+            .describe_key("wired-key", None)
+            .await
+            .expect("describe the rotated key");
+        assert_eq!(
+            described.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(reported.timestamp()),
+            "describe must report the persisted rotation time"
+        );
+        assert_ne!(
+            described.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(created_at.timestamp()),
+            "a rotated key must not be aged from its creation"
+        );
+    }
+
+    /// A record written before rotation timestamps were persisted carries no
+    /// rotation time. Reporting one anyway — the current time, the read time —
+    /// would tell the rotation-age gauge the key was just rotated and silence a
+    /// genuinely overdue key, so the absence has to travel as `None`.
+    #[tokio::test]
+    async fn wired_describe_key_invents_no_rotation_time_for_legacy_records() {
+        let mut key_data = healthy_key_data();
+        key_data.created_at = Zoned::now() - Duration::from_secs(365 * 86400);
+        key_data.version = 4;
+        key_data.baseline_version = Some(1);
+
+        let mut record = kv2_read_data(&key_data);
+        record["data"]
+            .as_object_mut()
+            .expect("key record must be a JSON object")
+            .remove("rotated_at")
+            .expect("current records must carry the field");
+
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(record)]).await;
+        let described = client
+            .describe_key("wired-key", None)
+            .await
+            .expect("a record without the field must still describe");
+        assert!(
+            described.rotated_at.is_none(),
+            "an unstamped record must not be reported as freshly rotated, got {:?}",
+            described.rotated_at
+        );
+        assert_eq!(
+            described.created_at.timestamp(),
+            key_data.created_at.timestamp(),
+            "the rest of the legacy record must survive the read"
+        );
+        assert_eq!(described.version, 4);
+    }
+
+    /// The persisted KV2 record round-trips its rotation time, and records
+    /// written before the field existed keep deserializing (as None) with the
+    /// rest of their contents intact.
+    #[test]
+    fn vault_key_data_rotated_at_round_trips_and_stays_backward_compatible() {
+        let rotated_at = Zoned::now();
+        let mut key_data = healthy_key_data();
+        key_data.rotated_at = Some(rotated_at.clone());
+        key_data.baseline_version = Some(1);
+        key_data.version = 2;
+        key_data.tags.insert("env".to_string(), "prod".to_string());
+
+        let mut value = serde_json::to_value(&key_data).expect("serialize");
+        let restored: VaultKeyData = serde_json::from_value(value.clone()).expect("round trip");
+        assert_eq!(
+            restored.rotated_at.as_ref().map(Zoned::timestamp),
+            Some(rotated_at.timestamp()),
+            "the rotation time must survive the KV2 round trip"
+        );
+
+        value
+            .as_object_mut()
+            .expect("record must be a JSON object")
+            .remove("rotated_at")
+            .expect("current records must carry the field");
+        let legacy: VaultKeyData = serde_json::from_value(value).expect("legacy record must deserialize");
+        assert!(legacy.rotated_at.is_none());
+        assert_eq!(legacy.version, 2);
+        assert_eq!(legacy.baseline_version, Some(1));
+        assert_eq!(legacy.tags.get("env").map(String::as_str), Some("prod"));
+    }
+
+    /// Reading a pre-versioning envelope against a key whose baseline was erased
+    /// resolves to the current version, whose material never wrapped it. The
+    /// unwrap therefore fails (AES-GCM cannot yield plaintext under the wrong
+    /// key); the failure must name the erased baseline instead of surfacing an
+    /// undiagnosable authentication error.
+    #[tokio::test]
+    async fn wired_decrypt_reports_erased_baseline_for_pre_versioning_envelope() {
+        let baseline_material = [0x41u8; 32];
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&baseline_material, b"dek-plaintext")
+            .await
+            .expect("wrap test DEK under the baseline material");
+        // A pre-versioning envelope: no master_key_version field.
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        // The key has been rotated (current material differs from the baseline's)
+        // and its baseline pointer was erased by an older node.
+        let mut key_data = healthy_key_data();
+        key_data.version = 2;
+        key_data.baseline_version = None;
+        key_data.encrypted_key_material = rotated_material();
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_read_data(&key_data)),
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["1", "2"] })),
+        ])
+        .await;
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("the wrong master key version cannot unwrap the data key");
+        assert!(
+            matches!(
+                &error,
+                KmsError::BaselineVersionLost { key_id, oldest_version: 1 } if key_id == "wired-key"
+            ),
+            "the failure must point at the erased baseline: {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 2, "the diagnosis costs one listing after the failure: {requests:?}");
+        assert!(requests[1].contains("/versions"), "{requests:?}");
+    }
+
+    /// Without version records the key was never rotated by a versioning build,
+    /// so the current version really is the right one for a pre-versioning
+    /// envelope and an unwrap failure has some other cause. Misreporting it as a
+    /// lost baseline would send operators after a baseline that never existed.
+    #[tokio::test]
+    async fn wired_decrypt_keeps_original_error_when_key_was_never_rotated() {
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&[0x41u8; 32], b"dek-plaintext")
+            .await
+            .expect("wrap test DEK");
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        let (vault, client) = scripted_client(vec![
+            // The key record holds different material than the envelope was
+            // wrapped with, but has no version history at all.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::error(404, "not found"),
+        ])
+        .await;
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("the mismatched material must still fail the unwrap");
+        assert!(
+            matches!(error, KmsError::CryptographicError { .. }),
+            "a key with no version records must keep its original failure: {error:?}"
+        );
+        assert_eq!(vault.requests().len(), 2);
+    }
+
+    /// The common upgrade shape — pre-versioning envelopes against a key that was
+    /// never rotated — must keep decrypting with exactly one Vault read. The
+    /// diagnosis above may not add a listing to reads that succeed.
+    #[tokio::test]
+    async fn wired_decrypt_of_pre_versioning_envelope_adds_no_request() {
+        let key_data = healthy_key_data();
+        let key_material = general_purpose::STANDARD
+            .decode(&key_data.encrypted_key_material)
+            .expect("decode fixture material");
+        let (encrypted_key, nonce) = AesDekCrypto::new()
+            .encrypt(&key_material, b"dek-plaintext")
+            .await
+            .expect("wrap test DEK under the current material");
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key,
+            nonce,
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope).expect("serialize envelope");
+
+        let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&key_data))]).await;
+
+        let plaintext = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext,
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("a pre-versioning envelope on a never-rotated key must decrypt");
+        assert_eq!(plaintext, b"dek-plaintext".to_vec());
+        assert_eq!(
+            vault.requests(),
+            vec!["GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string()],
+            "a successful read must not pay for the lost-baseline diagnosis"
+        );
+    }
+
+    /// The Vault-side state of one KV2 key: the top-level record plus the
+    /// immutable version records rotations froze.
+    ///
+    /// The scripted responder serves canned responses, so a multi-operation
+    /// scenario has to carry the state between operations itself. Rotations
+    /// fold what they *wrote* back into this state (see [`Self::apply_writes`]),
+    /// which is what makes the rotation regressions below real: the material a
+    /// later decrypt resolves is the material the rotation persisted, not a
+    /// fixture the test invented.
+    struct KeyState {
+        key_data: VaultKeyData,
+        version_records: Vec<VaultKeyVersionRecord>,
+    }
+
+    impl KeyState {
+        /// A never-rotated key: no version records exist yet.
+        fn new(key_data: VaultKeyData) -> Self {
+            Self {
+                key_data,
+                version_records: Vec::new(),
+            }
+        }
+
+        fn version_record(&self, version: u32) -> &VaultKeyVersionRecord {
+            self.version_records
+                .iter()
+                .find(|record| record.version == version)
+                .unwrap_or_else(|| panic!("no version record was frozen for version {version}"))
+        }
+
+        /// The versions-directory listing; a key with no records has no
+        /// directory at all.
+        fn versions_listing(&self) -> ScriptedResponse {
+            if self.version_records.is_empty() {
+                return ScriptedResponse::error(404, "not found");
+            }
+            let keys: Vec<String> = self.version_records.iter().map(|record| record.version.to_string()).collect();
+            ScriptedResponse::ok(serde_json::json!({ "keys": keys }))
+        }
+
+        /// Fold the writes an operation made into the state, so the next
+        /// operation reads exactly what Vault would now hold.
+        fn apply_writes(&mut self, requests: &[String], bodies: &[String]) {
+            for (line, body) in requests.iter().zip(bodies) {
+                let Some(path) = line.strip_prefix("POST ") else {
+                    continue;
+                };
+                let data = parse_write_body(body)["data"].clone();
+                if path.contains("/versions/") {
+                    let record: VaultKeyVersionRecord = serde_json::from_value(data).expect("version record write body");
+                    self.version_records.retain(|existing| existing.version != record.version);
+                    self.version_records.push(record);
+                } else {
+                    self.key_data = serde_json::from_value(data).expect("key record write body");
+                }
+            }
+        }
+    }
+
+    /// Encrypt against a scripted Vault serving `state`.
+    async fn encrypt_scripted(state: &KeyState, plaintext: &[u8]) -> EncryptResponse {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: plaintext.to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("encrypt must produce an envelope")
+    }
+
+    /// Rotate against a scripted Vault seeded with `state`, and return the state
+    /// Vault holds afterwards.
+    ///
+    /// The first rotation freezes the baseline before creating the next version
+    /// (four writes); later rotations skip that step (two writes).
+    async fn rotate_scripted(state: &KeyState) -> KeyState {
+        let writes = if state.key_data.baseline_version.is_none() { 4 } else { 2 };
+        let mut responses = vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&state.key_data)),
+            state.versions_listing(),
+        ];
+        responses.extend((0..writes).map(|_| ScriptedResponse::ok(kv2_write_ack())));
+        let (vault, client) = scripted_client(responses).await;
+
+        let rotated = client.rotate_key("wired-key", None).await.expect("rotation must commit");
+        assert_eq!(rotated.version, state.key_data.version + 1, "a rotation must advance the version");
+
+        let mut next = KeyState {
+            key_data: state.key_data.clone(),
+            version_records: state.version_records.clone(),
+        };
+        next.apply_writes(&vault.requests(), &vault.request_bodies());
+        next
+    }
+
+    /// Decrypt against a scripted Vault serving `state`, scripting the
+    /// version-record read the envelope's own version calls for. Returns the
+    /// plaintext together with the requests the decrypt made.
+    async fn decrypt_scripted(state: &KeyState, ciphertext: &[u8]) -> (Vec<u8>, Vec<String>) {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(ciphertext).expect("envelope must parse");
+        let mut responses = vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))];
+        if let Some(version) = envelope.master_key_version
+            && version != state.key_data.version
+        {
+            responses.push(ScriptedResponse::ok(kv2_read_version_record_data(state.version_record(version))));
+        }
+        let (vault, client) = scripted_client(responses).await;
+
+        let plaintext = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: ciphertext.to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("the envelope must decrypt against the rotated key");
+        (plaintext, vault.requests())
+    }
+
+    /// The forward half of the rotation contract: data written before a rotation
+    /// stays readable after it, with no live Vault involved.
+    ///
+    /// The negative half (a regressed pointer must fail closed) is covered by
+    /// `wired_decrypt_fails_closed_when_current_version_regressed`; this pins the
+    /// path that must keep working, which the fail-closed guards could otherwise
+    /// tighten into a rotation that orphans every existing object.
+    #[tokio::test]
+    async fn wired_kv2_envelope_from_before_rotation_still_decrypts() {
+        const PLAINTEXT: &[u8] = b"written-before-the-rotation";
+        let state_v1 = KeyState::new(healthy_key_data());
+
+        let encrypted_v1 = encrypt_scripted(&state_v1, PLAINTEXT).await;
+        let envelope_v1: DataKeyEnvelope = serde_json::from_slice(&encrypted_v1.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope_v1.master_key_version, Some(1));
+
+        let state_v2 = rotate_scripted(&state_v1).await;
+        assert_eq!(state_v2.key_data.version, 2);
+        assert_eq!(state_v2.key_data.baseline_version, Some(1));
+        assert_ne!(
+            state_v2.key_data.encrypted_key_material, state_v1.key_data.encrypted_key_material,
+            "the rotation must have replaced the current material, or the decrypt below proves nothing"
+        );
+
+        let (plaintext, requests) = decrypt_scripted(&state_v2, &encrypted_v1.ciphertext).await;
+        assert_eq!(
+            plaintext, PLAINTEXT,
+            "the pre-rotation envelope must yield its original plaintext, not merely avoid an error"
+        );
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key/versions/1".to_string(),
+            ],
+            "the old envelope must resolve through the immutable v1 record"
+        );
+
+        // The rotation is not cosmetic: new writes go to the rotated version and
+        // still round-trip, so both generations are live at once.
+        let encrypted_v2 = encrypt_scripted(&state_v2, b"written-after-the-rotation").await;
+        let envelope_v2: DataKeyEnvelope = serde_json::from_slice(&encrypted_v2.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope_v2.master_key_version, Some(2), "new envelopes must carry the rotated version");
+        assert_eq!(encrypted_v2.key_version, 2);
+        let (plaintext_v2, requests_v2) = decrypt_scripted(&state_v2, &encrypted_v2.ciphertext).await;
+        assert_eq!(plaintext_v2, b"written-after-the-rotation".to_vec());
+        assert_eq!(
+            requests_v2.len(),
+            1,
+            "an envelope on the current version must not read a version record: {requests_v2:?}"
+        );
+    }
+
+    /// Old envelopes must survive more than one generation: the baseline is
+    /// frozen once and every intermediate version keeps its own record, so both
+    /// a pre-rotation envelope and one written between the two rotations still
+    /// decrypt after the second.
+    #[tokio::test]
+    async fn wired_kv2_envelopes_survive_consecutive_rotations() {
+        let state_v1 = KeyState::new(healthy_key_data());
+        let encrypted_v1 = encrypt_scripted(&state_v1, b"generation-1").await;
+
+        let state_v2 = rotate_scripted(&state_v1).await;
+        let encrypted_v2 = encrypt_scripted(&state_v2, b"generation-2").await;
+        assert_eq!(encrypted_v2.key_version, 2);
+
+        let state_v3 = rotate_scripted(&state_v2).await;
+        assert_eq!(state_v3.key_data.version, 3);
+        assert_eq!(
+            state_v3.key_data.baseline_version,
+            Some(1),
+            "the baseline is frozen once and carried through later rotations"
+        );
+        let mut recorded: Vec<u32> = state_v3.version_records.iter().map(|record| record.version).collect();
+        recorded.sort_unstable();
+        assert_eq!(recorded, vec![1, 2, 3], "every version that ever wrapped a DEK must keep a record");
+
+        for (ciphertext, expected, version) in [
+            (&encrypted_v1.ciphertext, b"generation-1".as_slice(), 1u32),
+            (&encrypted_v2.ciphertext, b"generation-2".as_slice(), 2),
+        ] {
+            let (plaintext, requests) = decrypt_scripted(&state_v3, ciphertext).await;
+            assert_eq!(
+                plaintext, expected,
+                "an envelope from version {version} must survive two rotations intact"
+            );
+            assert!(
+                requests[1].ends_with(&format!("/versions/{version}")),
+                "the decrypt must resolve the version that wrapped it: {requests:?}"
+            );
+        }
+    }
+
+    /// Rewrap against a scripted Vault serving `state`, scripting the key record
+    /// plus every version record the state holds, so the implementation — not
+    /// the harness — decides which of them it needs. Returns the response
+    /// together with the requests the rewrap made.
+    async fn rewrap_scripted(state: &KeyState, ciphertext: &[u8]) -> (RewrapDataKeyResponse, Vec<String>) {
+        let mut responses = vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))];
+        responses.extend(
+            state
+                .version_records
+                .iter()
+                .map(|record| ScriptedResponse::ok(kv2_read_version_record_data(record))),
+        );
+        let (vault, client) = scripted_client(responses).await;
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: ciphertext.to_vec(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("rewrap must produce an envelope on the current version");
+        (response, vault.requests())
+    }
+
+    /// Describe the wrapping of `ciphertext` against a scripted Vault serving
+    /// `state`.
+    async fn describe_wrapping_scripted(state: &KeyState, ciphertext: &[u8]) -> DescribeDataKeyWrappingResponse {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&state.key_data))]).await;
+        client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: ciphertext.to_vec(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("describing an envelope's wrapping must succeed")
+    }
+
+    /// The whole point of the primitive: an envelope wrapped by a superseded
+    /// master key version comes back wrapped by the current one, carrying the
+    /// same data key.
+    ///
+    /// Two independent things pin that the *old* material did the unwrapping.
+    /// The frozen version-1 record is read — an implementation that reached for
+    /// the current material would never ask for it — and the wrapping is
+    /// AES-256-GCM, so unwrapping with the wrong material cannot yield the
+    /// original data key at all, only an authentication failure. The closing
+    /// decrypt then shows the result is genuinely bound to version 2: it
+    /// resolves on the key record alone, with no version record in sight.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_moves_an_old_envelope_onto_the_current_version() {
+        const PLAINTEXT: &[u8] = b"data-key-material-that-must-survive";
+
+        let state_v1 = KeyState::new(healthy_key_data());
+        let encrypted_v1 = encrypt_scripted(&state_v1, PLAINTEXT).await;
+        let state_v2 = rotate_scripted(&state_v1).await;
+        assert_ne!(
+            state_v2.key_data.encrypted_key_material, state_v1.key_data.encrypted_key_material,
+            "the rotation must have replaced the current material, or this test proves nothing"
+        );
+
+        let before = describe_wrapping_scripted(&state_v2, &encrypted_v1.ciphertext).await;
+        assert_eq!(before.key_version, Some(1));
+        assert_eq!(before.current_key_version, Some(2));
+        assert!(!before.is_current, "a version-1 envelope on a version-2 key is not current");
+
+        let (response, requests) = rewrap_scripted(&state_v2, &encrypted_v1.ciphertext).await;
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(2));
+        assert_eq!(
+            requests,
+            vec![
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key".to_string(),
+                "GET /v1/secret/data/rustfs/kms/keys/wired-key/versions/1".to_string(),
+            ],
+            "the unwrap must resolve the frozen version-1 material: {requests:?}"
+        );
+
+        let original: DataKeyEnvelope = serde_json::from_slice(&encrypted_v1.ciphertext).expect("envelope must parse");
+        let rewrapped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("rewrapped envelope must parse");
+        assert_eq!(rewrapped.master_key_version, Some(2), "the result must name the current version");
+        assert_ne!(rewrapped.encrypted_key, original.encrypted_key, "the wrapping must actually change");
+        // Everything but the wrapping is carried over, so the data key keeps its
+        // identity and its recorded age.
+        assert_eq!(rewrapped.key_id, original.key_id);
+        assert_eq!(rewrapped.key_spec, original.key_spec);
+        assert_eq!(rewrapped.encryption_context, original.encryption_context);
+        assert_eq!(rewrapped.created_at, original.created_at);
+
+        let (plaintext, decrypt_requests) = decrypt_scripted(&state_v2, &response.ciphertext).await;
+        assert_eq!(
+            plaintext, PLAINTEXT,
+            "the rewrapped envelope must yield the original data key byte for byte"
+        );
+        assert_eq!(
+            decrypt_requests.len(),
+            1,
+            "the rewrapped envelope must resolve on the current record alone: {decrypt_requests:?}"
+        );
+
+        let after = describe_wrapping_scripted(&state_v2, &response.ciphertext).await;
+        assert!(after.is_current, "the scan must agree the envelope no longer needs rewrapping");
+    }
+
+    /// Re-running a sweep must converge. An envelope already on the current
+    /// version comes back byte for byte with nothing to persist, rather than as
+    /// an equivalent envelope with a fresh nonce that would make every pass
+    /// rewrite every object's metadata forever.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_of_a_current_envelope_is_a_no_op() {
+        let state_v1 = KeyState::new(healthy_key_data());
+        let state_v2 = rotate_scripted(&state_v1).await;
+        let encrypted_v2 = encrypt_scripted(&state_v2, b"written-after-the-rotation").await;
+
+        let described = describe_wrapping_scripted(&state_v2, &encrypted_v2.ciphertext).await;
+        assert!(described.is_current);
+
+        let (response, requests) = rewrap_scripted(&state_v2, &encrypted_v2.ciphertext).await;
+        assert!(!response.rewrapped, "an already-current envelope has nothing to rewrap");
+        assert_eq!(
+            response.ciphertext, encrypted_v2.ciphertext,
+            "a no-op rewrap must hand the input back unchanged"
+        );
+        assert_eq!(response.source_key_version, Some(2));
+        assert_eq!(response.destination_key_version, Some(2));
+        assert_eq!(requests.len(), 1, "a no-op must not reach for any version record: {requests:?}");
+
+        // Idempotence in the literal sense: feeding the result back in changes
+        // nothing again.
+        let (again, _) = rewrap_scripted(&state_v2, &response.ciphertext).await;
+        assert!(!again.rewrapped);
+        assert_eq!(again.ciphertext, encrypted_v2.ciphertext);
+    }
+
+    /// A pre-versioning envelope carries no version at all, so it can never
+    /// satisfy a retirement scan however current its material happens to be.
+    /// Rewrap therefore rewrites it to stamp the version — including on a
+    /// never-rotated key, where the material it is unwrapped with and the
+    /// material it is re-wrapped with are the same bytes.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_stamps_a_pre_versioning_envelope() {
+        const PLAINTEXT: &[u8] = b"written-before-versioning-existed";
+
+        let state_v1 = KeyState::new(healthy_key_data());
+        let encrypted_v1 = encrypt_scripted(&state_v1, PLAINTEXT).await;
+        let legacy = strip_master_key_version(&encrypted_v1.ciphertext);
+        let legacy_envelope: DataKeyEnvelope = serde_json::from_slice(&legacy).expect("legacy envelope must parse");
+        assert_eq!(legacy_envelope.master_key_version, None);
+
+        // Never rotated: the resolved version is already the current one, and
+        // the envelope is still rewritten purely to record it.
+        let described = describe_wrapping_scripted(&state_v1, &legacy).await;
+        assert_eq!(described.key_version, Some(1));
+        assert_eq!(described.current_key_version, Some(1));
+        assert!(
+            !described.is_current,
+            "an envelope that does not state its version can never count as migrated"
+        );
+
+        let (response, requests) = rewrap_scripted(&state_v1, &legacy).await;
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(1));
+        assert_eq!(requests.len(), 1, "a never-rotated key has no version record to read: {requests:?}");
+        let stamped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("stamped envelope must parse");
+        assert_eq!(stamped.master_key_version, Some(1));
+        let (plaintext, _) = decrypt_scripted(&state_v1, &response.ciphertext).await;
+        assert_eq!(plaintext, PLAINTEXT);
+
+        // After a rotation the same legacy envelope resolves through the frozen
+        // baseline instead, and lands on the rotated version.
+        let state_v2 = rotate_scripted(&state_v1).await;
+        assert_eq!(state_v2.key_data.baseline_version, Some(1));
+        let (rotated_response, rotated_requests) = rewrap_scripted(&state_v2, &legacy).await;
+        assert_eq!(rotated_response.source_key_version, Some(1), "the baseline is what wrapped it");
+        assert_eq!(rotated_response.destination_key_version, Some(2));
+        assert!(
+            rotated_requests[1].ends_with("/versions/1"),
+            "the unwrap must resolve the baseline material: {rotated_requests:?}"
+        );
+        let (rotated_plaintext, _) = decrypt_scripted(&state_v2, &rotated_response.ciphertext).await;
+        assert_eq!(rotated_plaintext, PLAINTEXT);
+    }
+
+    /// Drop the `master_key_version` field to produce the envelope shape a
+    /// pre-versioning build wrote.
+    fn strip_master_key_version(ciphertext: &[u8]) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(ciphertext).expect("envelope must parse");
+        value
+            .as_object_mut()
+            .expect("envelope is a JSON object")
+            .remove("master_key_version");
+        serde_json::to_vec(&value).expect("serialize legacy envelope")
+    }
+
+    /// The encryption context binds an envelope to one object. A caller that
+    /// cannot reproduce it is refused before any Vault read, so rewrap cannot be
+    /// used to launder an envelope onto a fresh wrapping.
+    #[tokio::test]
+    async fn wired_kv2_rewrap_rejects_a_tampered_encryption_context() {
+        let context = HashMap::from([("bucket".to_string(), "photos/cat.jpg".to_string())]);
+        let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&healthy_key_data()))]).await;
+
+        let encrypted = client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: b"bound-to-one-object".to_vec(),
+                    encryption_context: context.clone(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("encrypt must produce an envelope");
+
+        let error = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: encrypted.ciphertext.clone(),
+                encryption_context: HashMap::from([("bucket".to_string(), "photos/other.jpg".to_string())]),
+            })
+            .await
+            .expect_err("a context that does not match the envelope must be refused");
+        assert!(matches!(error, KmsError::ContextMismatch { .. }), "got {error:?}");
+
+        let error = client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: encrypted.ciphertext,
+                encryption_context: HashMap::from([("bucket".to_string(), "photos/other.jpg".to_string())]),
+            })
+            .await
+            .expect_err("the read-only accessor must apply the same guard");
+        assert!(matches!(error, KmsError::ContextMismatch { .. }), "got {error:?}");
+
+        assert_eq!(
+            vault.requests().len(),
+            1,
+            "the context guard must run before any Vault read: {:?}",
+            vault.requests()
+        );
     }
 }

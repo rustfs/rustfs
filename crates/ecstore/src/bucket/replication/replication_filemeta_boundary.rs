@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) use rustfs_filemeta::NULL_VERSION_ID;
 pub use rustfs_replication::{MrfOpKind, MrfReplicateEntry};
 pub(crate) use rustfs_replication::{
     REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL_DELETE, ReplicateTargetDecision, ReplicatedInfos,
     ReplicatedTargetInfo, ReplicationAction, ReplicationWorkerOperation, ResyncDecision, get_replication_state,
-    parse_replicate_decision, target_reset_header, version_purge_statuses_map,
+    parse_replicate_decision, replicate_decision_for_admitted_targets, target_reset_header, version_purge_statuses_map,
 };
 pub use rustfs_replication::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState, ReplicationStatusType, ReplicationType,
@@ -51,6 +52,8 @@ pub(crate) fn replication_state_from_filemeta(state: &rustfs_filemeta::Replicati
             .map(|(arn, status)| (arn.clone(), version_purge_status_from_filemeta(status.clone())))
             .collect(),
         reset_statuses_map: state.reset_statuses_map.clone(),
+        target_delete_marker_version_ids: state.target_delete_marker_version_ids.clone(),
+        target_delete_marker_version_ids_corrupt: state.target_delete_marker_version_ids_corrupt,
     }
 }
 
@@ -82,5 +85,7 @@ pub fn replication_state_to_filemeta(state: &ReplicationState) -> rustfs_filemet
             .map(|(arn, status)| (arn.clone(), version_purge_status_to_filemeta(status.clone())))
             .collect(),
         reset_statuses_map: state.reset_statuses_map.clone(),
+        target_delete_marker_version_ids: state.target_delete_marker_version_ids.clone(),
+        target_delete_marker_version_ids_corrupt: state.target_delete_marker_version_ids_corrupt,
     }
 }

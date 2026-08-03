@@ -16,9 +16,13 @@
 //!
 //! The contract side defines the versioned backup manifest, the per-backend
 //! responsibility matrix, typed failure modes, and the restore dry-run
-//! report. [`local_export`] implements the producer side for the Local
-//! backend as a crate-internal API; restore orchestration and the admin API
-//! build on these pieces in follow-up changes.
+//! report. [`local_export`] implements the producer side and
+//! [`local_restore`] the consumer side for the Local backend;
+//! [`vault_restore`] orchestrates the consumer side for the Vault backends,
+//! whose cryptographic root is restored by Vault's own disaster-recovery
+//! flow. All are crate-internal APIs; the admin API builds on these pieces in
+//! follow-up changes. [`drill`] rehearses the whole loop end to end and turns
+//! it into machine-readable evidence.
 //!
 //! # Bundle model
 //!
@@ -48,21 +52,38 @@
 //! format version.
 
 mod capability;
+pub mod drill;
 mod dry_run;
 mod error;
 pub mod local_export;
+pub mod local_restore;
 mod manifest;
+pub mod vault_restore;
 
 pub use capability::{AtRestProtection, BackupBackendKind, BackupResponsibility};
+pub use drill::{
+    DRILL_EVIDENCE_FORMAT_VERSION, DrillBundleEvidence, DrillDataset, DrillDisaster, DrillEvidence, DrillPhase, DrillPhaseTiming,
+    DrillRecoveryEvidence, DrillRequest, DrillRpoEvidence, DrillVerdict, EnvelopeProbe, run_local_drill,
+};
 pub use dry_run::{
     ExternalDependencyMismatch, RestoreBlocker, RestoreBlockerCode, RestoreConflict, RestoreConflictKind, RestoreDryRunReport,
 };
 pub use error::BackupError;
 pub use local_export::{
     BackupKek, LOCAL_BUNDLE_MANIFEST_FILE, LocalBackupExportRequest, decrypt_bundle_artifact, export_local_backup,
-    read_local_bundle_manifest,
+    read_bundle_manifest, read_local_bundle_manifest,
+};
+pub use local_restore::{
+    LocalRestoreReport, LocalRestoreRequest, RestoreConflictPolicy, abort_local_restore, dry_run_local_restore,
+    restore_local_backup,
 };
 pub use manifest::{
     AeadAlgorithm, ArtifactDescriptor, ArtifactKind, BackupKekDescriptor, BackupManifest, CompletenessState, ContentDigest,
-    DigestAlgorithm, LocalKdfDescriptor, LocalKeyDerivation, ReservedSlot,
+    DigestAlgorithm, LocalKdfDescriptor, LocalKeyDerivation, ReservedSlot, VaultExternalReferences, VaultKvRecordReference,
+    VaultTransitReference,
+};
+pub use vault_restore::{
+    VaultRestoreAbortReport, VaultRestoreAbortSkip, VaultRestoreAbortSkipReason, VaultRestoreClient, VaultRestoreMismatch,
+    VaultRestoreReport, VaultRestoreRequest, VaultRestoreSequence, VaultRestoreStage, VaultRestoreTarget, abort_vault_restore,
+    dry_run_vault_restore, restore_vault_backup,
 };

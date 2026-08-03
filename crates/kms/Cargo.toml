@@ -64,6 +64,10 @@ md-5 = { workspace = true }
 arc-swap = { workspace = true }
 rustfs-utils = { workspace = true }
 rustfs-security-governance = { workspace = true }
+# `EventName` for KMS audit records. A leaf crate with no rustfs dependencies,
+# so the audit sink can live outside this crate without a second, drifting
+# copy of the event vocabulary.
+rustfs-s3-types = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
@@ -72,6 +76,16 @@ vaultrs = { workspace = true }
 # operation policy needs the concrete type to classify them for retry decisions.
 rustify = { workspace = true }
 tokio-util = { workspace = true }
+
+# AWS KMS backend. Credentials come from the standard aws-config provider chain
+# (environment, shared profile, IMDS/container roles); this crate never handles
+# AWS credential material itself.
+aws-config = { workspace = true }
+aws-sdk-kms = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
+# SdkError variants and raw HTTP status are needed to classify AWS failures for
+# the operation policy's retry decisions.
+aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
+aws-smithy-types = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -82,6 +96,12 @@ tempfile = { workspace = true }
 temp-env = { workspace = true }
 # "net" backs the scripted loopback Vault used by the policy wiring tests.
 tokio = { workspace = true, features = ["net", "test-util"] }
+# Replays canned AWS KMS HTTP exchanges so the AWS backend tests stay offline.
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
+http = { workspace = true }
+# Captures warning events in format-compatibility tests without installing a
+# process-wide subscriber.
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [features]
 default = []

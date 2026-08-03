@@ -9,6 +9,8 @@
 #   * bucket_lifecycle_ops::tests::concurrent_resend_same_part_commits_one_generation
 #     uses the shared multipart fixture and a deterministic uploadId-lock
 #     handoff, so it must not overlap another process mutating that fixture.
+#   * bucket::metadata_sys::tests::concurrent_config_writes_from_separate_nodes_do_not_lose_writes
+#     uses the shared transaction lock and must not overlap other ecstore tests.
 #
 # serial_test's #[serial] attribute does NOT serialize these across runs:
 # nextest executes each test in its own process, where the in-process
@@ -40,7 +42,7 @@ e2e-inline-boundaries = { max-threads = 1 }
 
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
-filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
+filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the multipart crash-consistency scenarios (dist-2, backlog#1150):
@@ -56,6 +58,16 @@ test-group = 'ecstore-serial-flaky'
 # process boundary; it mutates bucket lifecycle metadata and is not quarantined.
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the bucket-incarnation / lifecycle-fence tests. They drive
+# init_bucket_metadata_sys and bucket_metadata_sys_of, i.e. process-global
+# OnceLock state that serial_test's #[serial] cannot protect across nextest's
+# process boundary, and they delete+recreate buckets — the same shape that
+# raced into InsufficientWriteQuorum in backlog#937. Preventive only, no
+# retries. The matching ci-profile override is after [profile.ci].
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & (test(bucket_delete_waits_for_config_mutation_fence) | test(stale_config_request_cannot_mutate_a_recreated_bucket) | test(disk_incarnation_read_detects_stale_cache_until_peer_reload) | test(lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata) | test(expiry_configs_are_resolved_from_the_owning_store))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the 4-disk reliability / degraded-read e2e tests (see the
@@ -104,9 +116,9 @@ filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(
 test-group = 'ecstore-serial-flaky'
 retries = 2
 
-# Keep the deterministic multipart handoff isolated across nextest processes.
+# Keep deterministic ECStore write handoffs isolated across nextest processes.
 [[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(concurrent_resend_same_part_commits_one_generation)'
+filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes))'
 test-group = 'ecstore-serial-flaky'
 
 # QUARANTINE: OPEN rustfs#4690 — walk_dir stall-budget accounting test depends
@@ -135,6 +147,12 @@ test-group = 'ecstore-serial-flaky'
 # too. No retries: failures stay visible.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
+# too (see the matching default-profile override near the top). No retries.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & (test(bucket_delete_waits_for_config_mutation_fence) | test(stale_config_request_cannot_mutate_a_recreated_bucket) | test(disk_incarnation_read_detects_stale_cache_until_peer_reload) | test(lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata) | test(expiry_configs_are_resolved_from_the_owning_store))'
 test-group = 'ecstore-serial-flaky'
 
 # ---------------------------------------------------------------------------
@@ -211,6 +229,17 @@ default-filter = """
     )
 """
 fail-fast = false
+
+[profile.e2e-smoke.junit]
+path = "junit.xml"
+
+# The pagination boundary cases can stall when a server/listing regression
+# prevents the continuation request from completing. Keep the timeout scoped
+# to those known failure modes so legitimate lifecycle/tiering waits retain
+# their test-level timing budget.
+[[profile.e2e-smoke.overrides]]
+filter = 'package(e2e_test) & test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/)'
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 
 # ---------------------------------------------------------------------------
 # e2e-repl-nightly profile — scheduled full replication e2e lane (repl-1)
@@ -300,9 +329,6 @@ path = "junit.xml"
 # negative-path siblings of each family stay in as regression guards.
 #   * rustfs#4843 — over-limit archive entry paths hard-reject the whole
 #     archive even under ignore-errors semantics.
-#   * rustfs#4846 — distributed-lock quorum tests misclassify as timeout
-#     under parallel load (multi-node in-process clusters; natural home is
-#     ci-7's nightly cluster lane).
 [profile.e2e-full]
 default-filter = """
     package(e2e_test)
@@ -311,7 +337,6 @@ default-filter = """
     & !test(/^replication_extension_test::/)
     & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
     & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)
-    & !test(/^reliant::lock::test_distributed_lock_(2_nodes_grpc_read_survives_failed_node|4_nodes_grpc_read_write_quorum_split_with_two_failed_nodes)$/)
 """
 fail-fast = false
 

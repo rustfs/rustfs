@@ -239,6 +239,13 @@ pub struct ReplicationState {
     pub targets: HashMap<String, ReplicationStatusType>,
     pub purge_targets: HashMap<String, VersionPurgeStatusType>,
     pub reset_statuses_map: HashMap<String, String>,
+    /// Skipped by serde: this state has a positional wire form, so the map
+    /// travels in the object's internal metadata and is re-derived on read.
+    /// Kept in step with the filemeta crate's copy of the same state.
+    #[serde(skip)]
+    pub target_delete_marker_version_ids: HashMap<String, String>,
+    #[serde(skip)]
+    pub target_delete_marker_version_ids_corrupt: bool,
 }
 
 impl ReplicationState {
@@ -311,6 +318,7 @@ impl ReplicationState {
             arn: arn.to_string(),
             prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
             version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
+            target_delete_marker_version_id: self.target_delete_marker_version_ids.get(arn).cloned(),
             resync_timestamp,
             ..Default::default()
         }
@@ -414,6 +422,9 @@ pub struct ReplicatedTargetInfo {
     pub endpoint: String,
     pub secure: bool,
     pub error: Option<String>,
+    /// Version the target assigned to the delete marker it just created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_delete_marker_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
@@ -550,11 +561,29 @@ pub enum MrfOpKind {
     #[default]
     #[serde(rename = "object")]
     Object,
+    #[serde(rename = "metadata")]
+    Metadata,
+    #[serde(rename = "heal")]
+    Heal,
+    #[serde(rename = "existingObject")]
+    ExistingObject,
     #[serde(rename = "delete")]
     Delete,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+impl MrfOpKind {
+    pub fn replication_type(self) -> ReplicationType {
+        match self {
+            Self::Object => ReplicationType::Object,
+            Self::Metadata => ReplicationType::Metadata,
+            Self::Heal => ReplicationType::Heal,
+            Self::ExistingObject => ReplicationType::ExistingObject,
+            Self::Delete => ReplicationType::Delete,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct MrfReplicateEntry {
     #[serde(rename = "bucket")]
     pub bucket: String,
@@ -577,6 +606,11 @@ pub struct MrfReplicateEntry {
     #[serde(rename = "op", default)]
     pub op: MrfOpKind,
 
+    // For delete entries: whether the source operation was a force-delete. Old files lack
+    // this key; default=false preserves the pre-existing replay contract.
+    #[serde(rename = "forceDelete", default)]
+    pub force_delete: bool,
+
     // For delete entries: the delete-marker version id (distinct from version_id, which is
     // the version being purged). Old files lack this; default=None is correct.
     #[serde(rename = "deleteMarkerVersionID", skip_serializing_if = "Option::is_none", default)]
@@ -593,6 +627,20 @@ pub struct MrfReplicateEntry {
     // to preserve pre-existing behaviour (backlog#867).
     #[serde(rename = "deleteMarkerMtime", skip_serializing_if = "Option::is_none", default)]
     pub delete_marker_mtime: Option<i64>,
+
+    #[serde(rename = "targetARNs", skip_serializing_if = "Vec::is_empty", default)]
+    pub target_arns: Vec<String>,
+
+    // Force-delete entries use the target ARN list above as their immutable target set.
+    // The id distinguishes a durable intent from legacy MRF delete entries.
+    #[serde(rename = "forceDeleteID", skip_serializing_if = "Option::is_none", default)]
+    pub force_delete_id: Option<Uuid>,
+    #[serde(rename = "forceDeleteGeneration", skip_serializing_if = "Option::is_none", default)]
+    pub force_delete_generation: Option<i64>,
+
+    // Replay is allowed only after the source-side recursive delete has committed.
+    #[serde(rename = "forceDeleteLocalCommit", default)]
+    pub force_delete_local_commit: bool,
 }
 
 fn retry_count_to_mrf(retry_count: u32) -> i32 {
@@ -657,6 +705,27 @@ impl ReplicateDecision {
         self.targets_map.values().any(|t| t.synchronous)
     }
 
+    /// Split admitted targets by their configured delivery mode.
+    ///
+    /// Non-replicating entries are intentionally omitted from both decisions.
+    /// Callers must not promote an async target merely because another target is
+    /// synchronous, and unsupported operation paths can keep both partitions
+    /// empty or explicitly async.
+    pub fn partition_by_sync(&self) -> (Self, Self) {
+        let mut synchronous = Self::new();
+        let mut asynchronous = Self::new();
+
+        for target in self.targets_map.values().filter(|target| target.replicate) {
+            if target.synchronous {
+                synchronous.set(target.clone());
+            } else {
+                asynchronous.set(target.clone());
+            }
+        }
+
+        (synchronous, asynchronous)
+    }
+
     /// Updates ReplicateDecision with target's replication decision
     pub fn set(&mut self, target: ReplicateTargetDecision) {
         self.targets_map.insert(target.arn.clone(), target);
@@ -671,6 +740,18 @@ impl ReplicateDecision {
             }
         }
         if result.is_empty() { None } else { Some(result) }
+    }
+
+    pub fn replicate_target_arns(&self) -> Vec<String> {
+        let mut arns = self
+            .targets_map
+            .values()
+            .filter(|target| target.replicate && !target.arn.is_empty())
+            .map(|target| target.arn.clone())
+            .collect::<Vec<_>>();
+        arns.sort();
+        arns.dedup();
+        arns
     }
 }
 
@@ -795,10 +876,18 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: retry_count_to_mrf(self.retry_count),
             size: self.size,
-            op: MrfOpKind::Object,
+            op: match self.op_type {
+                ReplicationType::Metadata => MrfOpKind::Metadata,
+                ReplicationType::Heal => MrfOpKind::Heal,
+                ReplicationType::ExistingObject => MrfOpKind::ExistingObject,
+                _ => MrfOpKind::Object,
+            },
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: self.admitted_target_arns(),
+            ..Default::default()
         }
     }
 
@@ -829,6 +918,25 @@ static REPL_STATUS_REGEX: LazyLock<Regex> = LazyLock::new(|| match Regex::new(r"
 });
 
 impl ReplicateObjectInfo {
+    /// Returns the target set captured when this queued operation was admitted.
+    /// Resync decisions are more specific than the general heal decision and must
+    /// win for ExistingObject work.
+    pub fn admitted_target_arns(&self) -> Vec<String> {
+        if self.op_type == ReplicationType::ExistingObject && !self.existing_obj_resync.is_empty() {
+            let mut arns = self
+                .existing_obj_resync
+                .targets
+                .iter()
+                .filter(|(_, decision)| decision.replicate)
+                .map(|(arn, _)| arn.clone())
+                .collect::<Vec<_>>();
+            arns.sort();
+            arns.dedup();
+            return arns;
+        }
+        self.dsc.replicate_target_arns()
+    }
+
     /// Returns replication status of a target
     pub fn target_replication_status(&self, arn: &str) -> ReplicationStatusType {
         let binding = self.replication_status_internal.clone().unwrap_or_default();
@@ -849,12 +957,30 @@ impl ReplicateObjectInfo {
             version_id: self.version_id,
             retry_count: retry_count_to_mrf(self.retry_count),
             size: self.size,
-            op: MrfOpKind::Object,
+            op: match self.op_type {
+                ReplicationType::Metadata => MrfOpKind::Metadata,
+                ReplicationType::Heal => MrfOpKind::Heal,
+                ReplicationType::ExistingObject => MrfOpKind::ExistingObject,
+                _ => MrfOpKind::Object,
+            },
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: self.admitted_target_arns(),
+            ..Default::default()
         }
     }
+}
+
+pub fn replicate_decision_for_admitted_targets(target_arns: &[String]) -> ReplicateDecision {
+    let mut decision = ReplicateDecision::new();
+    for arn in target_arns {
+        if !arn.is_empty() {
+            decision.set(ReplicateTargetDecision::new(arn.clone(), true, false));
+        }
+    }
+    decision
 }
 
 // constructs a replication status map from string representation
@@ -907,6 +1033,11 @@ fn version_purge_statuses_string(targets: &HashMap<String, VersionPurgeStatusTyp
     if result.is_empty() { None } else { Some(result) }
 }
 
+/// Kept in step with the bounds used by the filemeta crate's copy.
+const MAX_REPLICATION_TARGET_VERSION_ENTRIES: usize = 1_000;
+const MAX_REPLICATION_TARGET_ARN_LEN: usize = 1_024;
+const MAX_REPLICATION_TARGET_VERSION_ID_LEN: usize = 1_024;
+
 pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationState, _vid: Option<String>) -> ReplicationState {
     let reset_status_map: Vec<(String, String)> = rinfos
         .targets
@@ -933,6 +1064,35 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map.insert(key, value);
     }
 
+    // Carry forward the recorded per-target delete-marker versions, dropping
+    // anything outside the bounds, then fold in what this round's targets
+    // reported. A map already past the cap is discarded rather than trusted.
+    let mut target_delete_marker_version_ids = prev_state.target_delete_marker_version_ids.clone();
+    target_delete_marker_version_ids.retain(|arn, version_id| {
+        !arn.is_empty()
+            && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+            && !version_id.is_empty()
+            && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+    });
+    if target_delete_marker_version_ids.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+        target_delete_marker_version_ids.clear();
+    }
+    for target in &rinfos.targets {
+        let Some(version_id) = target.target_delete_marker_version_id.as_ref() else {
+            continue;
+        };
+        if (!target_delete_marker_version_ids.contains_key(&target.arn)
+            && target_delete_marker_version_ids.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            || target.arn.is_empty()
+            || target.arn.len() > MAX_REPLICATION_TARGET_ARN_LEN
+            || version_id.is_empty()
+            || version_id.len() > MAX_REPLICATION_TARGET_VERSION_ID_LEN
+        {
+            continue;
+        }
+        target_delete_marker_version_ids.insert(target.arn.clone(), version_id.clone());
+    }
+
     ReplicationState {
         replicate_decision_str: prev_state.replicate_decision_str.clone(),
         reset_statuses_map,
@@ -943,6 +1103,8 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         replication_timestamp: rinfos.replication_timestamp,
         purge_targets,
         version_purge_status_internal: vpurge_statuses,
+        target_delete_marker_version_ids,
+        target_delete_marker_version_ids_corrupt: prev_state.target_delete_marker_version_ids_corrupt,
 
         ..Default::default()
     }
@@ -993,6 +1155,130 @@ impl Default for ResyncDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replicate_decision_returns_sorted_unique_replicating_target_arns() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-b".to_string(),
+            replicate: true,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-a".to_string(),
+            replicate: true,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-c".to_string(),
+            replicate: false,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: String::new(),
+            replicate: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            decision.replicate_target_arns(),
+            vec!["arn:target-a".to_string(), "arn:target-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn replicate_object_info_mrf_entry_carries_replicating_targets() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-a".to_string(),
+            replicate: true,
+            ..Default::default()
+        });
+        decision.set(ReplicateTargetDecision {
+            arn: "arn:target-b".to_string(),
+            replicate: false,
+            ..Default::default()
+        });
+        let info = ReplicateObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 42,
+            dsc: decision,
+            ..Default::default()
+        };
+
+        let entry = info.to_mrf_entry();
+
+        assert_eq!(entry.target_arns, vec!["arn:target-a".to_string()]);
+    }
+
+    #[test]
+    fn partition_by_sync_keeps_mixed_targets_independent() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision::new("arn:sync".to_string(), true, true));
+        decision.set(ReplicateTargetDecision::new("arn:async".to_string(), true, false));
+        decision.set(ReplicateTargetDecision::new("arn:disabled".to_string(), false, true));
+
+        let (synchronous, asynchronous) = decision.partition_by_sync();
+
+        assert_eq!(synchronous.replicate_target_arns(), vec!["arn:sync".to_string()]);
+        assert_eq!(asynchronous.replicate_target_arns(), vec!["arn:async".to_string()]);
+        assert!(synchronous.is_synchronous());
+        assert!(!asynchronous.is_synchronous());
+    }
+
+    #[test]
+    fn partition_by_sync_does_not_promote_async_targets() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision::new("arn:async".to_string(), true, false));
+
+        let (synchronous, asynchronous) = decision.partition_by_sync();
+
+        assert!(!synchronous.replicate_any());
+        assert_eq!(asynchronous.replicate_target_arns(), vec!["arn:async".to_string()]);
+    }
+
+    #[test]
+    fn metadata_replication_mrf_entry_preserves_operation_kind() {
+        let info = ReplicateObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            op_type: ReplicationType::Metadata,
+            ..Default::default()
+        };
+
+        assert_eq!(info.to_mrf_entry().op, MrfOpKind::Metadata);
+    }
+
+    #[test]
+    fn admission_snapshot_prefers_resync_targets_for_existing_objects() {
+        let mut decision = ReplicateDecision::new();
+        decision.set(ReplicateTargetDecision::new("arn:live".to_string(), true, false));
+        let mut resync = ResyncDecision::new();
+        resync.targets.insert(
+            "arn:admitted".to_string(),
+            ResyncTargetDecision {
+                replicate: true,
+                reset_id: "reset-1".to_string(),
+                ..Default::default()
+            },
+        );
+        let info = ReplicateObjectInfo {
+            op_type: ReplicationType::ExistingObject,
+            dsc: decision,
+            existing_obj_resync: resync,
+            ..Default::default()
+        };
+
+        assert_eq!(info.admitted_target_arns(), vec!["arn:admitted".to_string()]);
+        assert_eq!(info.to_mrf_entry().op, MrfOpKind::ExistingObject);
+    }
+
+    #[test]
+    fn mrf_operation_kind_round_trips_heal_and_existing_object_intent() {
+        assert_eq!(MrfOpKind::Heal.replication_type(), ReplicationType::Heal);
+        assert_eq!(MrfOpKind::ExistingObject.replication_type(), ReplicationType::ExistingObject);
+    }
 
     #[test]
     fn target_state_reads_resync_timestamp_from_target_reset_header_key() {

@@ -19,6 +19,7 @@ use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOpera
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
+use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
 use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
@@ -290,6 +291,7 @@ fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
             file_permissions: Some(0o600),
         }),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
@@ -327,6 +329,7 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
             tls: None,
         })),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
@@ -362,6 +365,7 @@ fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustf
             ..rustfs_kms::config::VaultTransitConfig::default()
         })),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
@@ -416,12 +420,44 @@ fn build_static_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::
         default_key_id: cfg.kms_default_key_id.clone().or(Some(key_id)),
         backend_config: rustfs_kms::config::BackendConfig::Static(static_config),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         ..Default::default()
     };
 
     kms_config
         .validate()
         .map_err(|e| Error::other(format!("Static KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
+}
+
+/// Build KMS configuration for the AWS KMS backend
+///
+/// No credential material is read here: AWS credentials are resolved by the
+/// standard `aws-config` provider chain (environment, shared profile,
+/// container/IMDS role), so only the two non-credential settings are taken
+/// from the environment. An unresolvable region fails the backend closed when
+/// the service starts.
+fn build_aws_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    use rustfs_kms::config::{AwsKmsConfig, ENV_KMS_AWS_ENDPOINT_URL, ENV_KMS_AWS_REGION};
+
+    let kms_config = rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Aws,
+        backend_config: rustfs_kms::config::BackendConfig::Aws(Box::new(AwsKmsConfig {
+            region: rustfs_utils::get_env_opt_str(ENV_KMS_AWS_REGION),
+            endpoint_url: rustfs_utils::get_env_opt_str(ENV_KMS_AWS_ENDPOINT_URL),
+        })),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
+        // Keys are never auto-created on this backend: it refuses
+        // caller-named creation because AWS assigns identifiers, so the
+        // default key must already exist in AWS and be named by key id or ARN.
+        default_key_id: cfg.kms_default_key_id.clone(),
+        ..Default::default()
+    };
+
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("AWS KMS configuration validation failed: {e}")))?;
     Ok(kms_config)
 }
 
@@ -468,12 +504,20 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
 
+    log_sse_kms_key_policy_mode();
+
     // A key referenced by any bucket's encryption configuration must never be
     // deleted. Register the gate before the service can start so every
     // deletion-worker spawn observes it; the gate fails closed while the
     // object store is not ready.
     service_manager
         .set_deletion_reference_checker(std::sync::Arc::new(crate::kms_deletion_gate::BucketEncryptionReferenceChecker));
+
+    // Route KMS management records into the server's audit pipeline. Installed
+    // before the service can start so every service version built afterwards
+    // carries it; with no audit target configured the records are dropped and
+    // KMS operations are unaffected.
+    service_manager.set_audit_sink(std::sync::Arc::new(crate::admin::handlers::kms_audit::KmsAdminAuditSink));
 
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
@@ -493,6 +537,7 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
             "vault" | "vault-kv2" | "vault_kv2" => build_vault_kms_config(config)?,
             "vault-transit" | "vault_transit" => build_vault_transit_kms_config(config)?,
             "static" => build_static_kms_config(config)?,
+            "aws" | "aws-kms" | "aws_kms" => build_aws_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 
@@ -1360,7 +1405,7 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 
 #[cfg(test)]
 mod tests {
-    use super::{notification_config_to_event_rules, resolve_buffer_profile_config};
+    use super::{build_aws_kms_config, notification_config_to_event_rules, resolve_buffer_profile_config};
     use crate::config::{BufferConfig, WorkloadProfile};
     use rustfs_config::KI_B;
     use rustfs_s3_types::EventName;
@@ -1452,5 +1497,58 @@ mod tests {
         let err = notification_config_to_event_rules(&cfg).expect_err("invalid ARN partition must fail");
 
         assert!(err.to_string().contains("Invalid ARN"), "unexpected error: {err}");
+    }
+
+    fn aws_kms_test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-aws-kms".to_string()]);
+        config.kms_enable = true;
+        config.kms_backend = "aws".to_string();
+        config.kms_default_key_id = Some("arn:aws:kms:us-east-1:111122223333:key/1234abcd".to_string());
+        config
+    }
+
+    /// Startup takes only the two non-credential AWS settings from the
+    /// environment; credentials stay with the `aws-config` provider chain.
+    #[test]
+    fn build_aws_kms_config_reads_only_non_credential_settings() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_AWS_REGION", Some("eu-central-1")),
+                ("RUSTFS_KMS_AWS_ENDPOINT_URL", None),
+            ],
+            || build_aws_kms_config(&aws_kms_test_config()).expect("aws KMS configuration should build"),
+        );
+
+        assert_eq!(config.backend, rustfs_kms::config::KmsBackend::Aws);
+        let aws = config.aws_kms_config().expect("aws backend config");
+        assert_eq!(aws.region.as_deref(), Some("eu-central-1"));
+        assert_eq!(aws.endpoint_url, None);
+        assert_eq!(config.default_key_id.as_deref(), Some("arn:aws:kms:us-east-1:111122223333:key/1234abcd"));
+    }
+
+    /// A plaintext endpoint override exposes every KMS request, plaintext data
+    /// keys included, so startup refuses it without the development opt-in.
+    #[test]
+    fn build_aws_kms_config_refuses_a_plaintext_endpoint_without_opt_in() {
+        let vars = [
+            ("RUSTFS_KMS_AWS_REGION", Some("us-east-1")),
+            ("RUSTFS_KMS_AWS_ENDPOINT_URL", Some("http://localhost:4566")),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let error =
+                build_aws_kms_config(&aws_kms_test_config()).expect_err("a plaintext AWS endpoint must not start the server");
+            assert!(error.to_string().contains("https"), "unexpected error: {error}");
+        });
+
+        temp_env::with_vars(vars, || {
+            let mut config = aws_kms_test_config();
+            config.kms_allow_insecure_dev_defaults = true;
+            let config = build_aws_kms_config(&config).expect("the development opt-in should accept a plaintext endpoint");
+            assert_eq!(
+                config.aws_kms_config().expect("aws backend config").endpoint_url.as_deref(),
+                Some("http://localhost:4566")
+            );
+        });
     }
 }

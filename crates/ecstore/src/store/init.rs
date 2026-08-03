@@ -593,11 +593,7 @@ mod tests {
             tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
             warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
-        storage_api_contracts::{
-            bucket::{BucketOperations as _, MakeBucketOptions},
-            list::ListOperations as _,
-            object::ObjectOperations as _,
-        },
+        storage_api_contracts::list::ListOperations as _,
     };
     use crate::{
         core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
@@ -606,13 +602,19 @@ mod tests {
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
         services::rebalance::RebalanceMeta,
-        storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec},
+        storage_api_contracts::{
+            bucket::{BucketOperations as _, MakeBucketOptions},
+            multipart::MultipartOperations as _,
+            object::{ObjectIO, ObjectOperations as _},
+            range::HTTPRangeSpec,
+        },
     };
     use http::HeaderMap;
     use rustfs_config::server_config::KVS;
     #[cfg(feature = "test-util")]
     use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use std::{
+        collections::HashMap,
         future::Future,
         io::Cursor,
         sync::{
@@ -622,6 +624,7 @@ mod tests {
         time::Duration,
     };
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
@@ -1336,6 +1339,1226 @@ mod tests {
         assert!(!Arc::ptr_eq(&sys_a, &sys_b), "each store must own a distinct bucket metadata system");
     }
 
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn same_name_bucket_recursive_delete_uses_owning_instance_object_lock_state() {
+        let temp_a = tempfile::tempdir().expect("create temp store dir a");
+        let temp_b = tempfile::tempdir().expect("create temp store dir b");
+        let (_ctx_a, store_a, _shutdown_a) =
+            without_storage_class_env(build_isolated_test_store(temp_a.path(), "delete-scope-a", &[4])).await;
+        let (_ctx_b, store_b, _shutdown_b) =
+            without_storage_class_env(build_isolated_test_store(temp_b.path(), "delete-scope-b", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_b.clone(), Vec::new()).await;
+
+        let bucket = format!("same-name-delete-scope-{}", uuid::Uuid::new_v4());
+        store_a
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create plain bucket in store A");
+        store_b
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object Lock bucket in store B");
+
+        for store in [&store_a, &store_b] {
+            let mut reader = PutObjReader::from_vec(b"payload".to_vec());
+            store
+                .put_object(
+                    &bucket,
+                    "prefix/object.bin",
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: Arc::ptr_eq(store, &store_b),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("put same-name object");
+        }
+
+        store_a
+            .delete_object(
+                &bucket,
+                "prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("plain store prefix delete should remain allowed");
+
+        let err = store_b
+            .delete_object(
+                &bucket,
+                "prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("store B must not consult store A's plain bucket metadata");
+        assert!(matches!(err, StorageError::InvalidArgument(_, _, _)));
+        store_b
+            .get_object_info(&bucket, "prefix/object.bin", &ObjectOptions::default())
+            .await
+            .expect("locked store object must survive the rejected prefix delete");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn recursive_delete_checks_object_lock_on_every_version_page() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "recursive-delete-pagination", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("recursive-page-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create plain bucket");
+        for object in ["prefix/a.bin", "prefix/b.bin"] {
+            let mut reader = PutObjReader::from_vec(b"plain".to_vec());
+            store
+                .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("write first-page object");
+        }
+        let locked_object = "prefix/z-locked.bin";
+        let mut reader = PutObjReader::from_vec(b"locked".to_vec());
+        store
+            .put_object(
+                &bucket,
+                locked_object,
+                &mut reader,
+                &ObjectOptions {
+                    user_defined: HashMap::from([
+                        (
+                            s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                        ),
+                        (
+                            s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                            "2099-01-01T00:00:00Z".to_string(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write second-page locked object");
+
+        let first_page = store.pools[0].disk_set[0]
+            .clone()
+            .inner_list_object_versions_for_recursive_delete(&bucket, "prefix/", None, None, 2)
+            .await
+            .expect("list the first recursive-delete validation page");
+        assert!(first_page.is_truncated, "the fixture must require a continuation page");
+        assert!(
+            first_page.objects.iter().all(|object| object.name != locked_object),
+            "the locked object must not be visible on the first page"
+        );
+        let second_page = store.pools[0].disk_set[0]
+            .clone()
+            .inner_list_object_versions_for_recursive_delete(
+                &bucket,
+                "prefix/",
+                first_page.next_marker,
+                first_page.next_version_idmarker,
+                2,
+            )
+            .await
+            .expect("list the recursive-delete continuation page");
+        assert!(
+            second_page.objects.iter().any(|object| object.name == locked_object),
+            "the continuation page must contain the locked object"
+        );
+
+        let err = store
+            .delete_object(
+                &bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("recursive delete must scan the continuation page and find the locked object");
+        assert!(
+            matches!(err, StorageError::PrefixAccessDenied(ref name, ref object) if name == &bucket && object == locked_object),
+            "unexpected recursive delete error: {err:?}"
+        );
+        for object in ["prefix/a.bin", "prefix/b.bin", locked_object] {
+            store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("a rejected recursive delete must leave every page intact");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_holds_bucket_incarnation_sentinel_through_object_commit() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "delete-bucket-incarnation", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("delete-bucket-incarnation-{}", uuid::Uuid::new_v4());
+        let object = "same-key.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create initial plain bucket");
+        let old_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read initial bucket incarnation");
+        let mut reader = PutObjReader::from_vec(b"old generation".to_vec());
+        store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put old-generation object");
+
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(&delete_bucket, object, ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let recreate_store = Arc::clone(&store);
+        let recreate_bucket = bucket.clone();
+        let mut recreate = tokio::spawn(async move {
+            recreate_store
+                .delete_bucket(
+                    &recreate_bucket,
+                    &crate::storage_api_contracts::bucket::DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            recreate_store
+                .make_bucket(
+                    &recreate_bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let mut reader = PutObjReader::from_vec(b"new protected generation".to_vec());
+            recreate_store
+                .put_object(
+                    &recreate_bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok::<_, Error>(())
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut recreate).await.is_err(),
+            "bucket delete and same-name recreation must wait for the in-flight object delete"
+        );
+        barrier.release();
+        delete
+            .await
+            .expect("delete task should join")
+            .expect("old-generation delete should complete");
+        tokio::time::timeout(Duration::from_secs(10), recreate)
+            .await
+            .expect("bucket recreation should finish after delete releases the sentinel")
+            .expect("bucket recreation task should join")
+            .expect("bucket recreation should succeed");
+
+        let stale_delete_err = store
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    expected_bucket_incarnation_id: Some(old_incarnation),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an authorization snapshot from the old bucket incarnation must be rejected");
+        assert!(matches!(stale_delete_err, StorageError::BucketNotFound(name) if name == bucket));
+
+        let (_deleted, stale_batch_errors) = store
+            .delete_objects(
+                &bucket,
+                vec![crate::storage_api_contracts::object::ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    expected_bucket_incarnation_id: Some(old_incarnation),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(stale_batch_errors.as_slice(), [Some(StorageError::BucketNotFound(name))] if name.as_str() == bucket),
+            "batch delete must reject an authorization snapshot from the old bucket incarnation"
+        );
+
+        store
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the new locked-bucket object must survive the old-generation delete");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_objects_holds_bucket_incarnation_sentinel_through_commit() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "batch-delete-bucket-incarnation", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("batch-incarnation-{}", uuid::Uuid::new_v4());
+        let object = "same-key.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create initial bucket");
+        let mut reader = PutObjReader::from_vec(b"old generation".to_vec());
+        store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put old-generation object");
+
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_objects(
+                    &delete_bucket,
+                    vec![crate::storage_api_contracts::object::ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions::default(),
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let recreate_store = Arc::clone(&store);
+        let recreate_bucket = bucket.clone();
+        let mut recreate = tokio::spawn(async move {
+            recreate_store
+                .delete_bucket(
+                    &recreate_bucket,
+                    &crate::storage_api_contracts::bucket::DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            recreate_store
+                .make_bucket(&recreate_bucket, &MakeBucketOptions::default())
+                .await?;
+            let mut reader = PutObjReader::from_vec(b"new generation".to_vec());
+            recreate_store
+                .put_object(&recreate_bucket, object, &mut reader, &ObjectOptions::default())
+                .await?;
+            Ok::<_, Error>(())
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut recreate).await.is_err(),
+            "bucket recreation must wait for the in-flight batch delete"
+        );
+        barrier.release();
+        let (_deleted, errors) = delete.await.expect("batch delete task should join");
+        assert!(
+            errors.iter().all(Option::is_none),
+            "old-generation batch delete should complete: {errors:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), recreate)
+            .await
+            .expect("bucket recreation should finish after batch delete releases the sentinel")
+            .expect("bucket recreation task should join")
+            .expect("bucket recreation should succeed");
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("new-generation object must survive the old batch delete");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn prefix_delete_serializes_with_concurrent_object_lock_metadata_updates() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "prefix-delete-lock-metadata", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let cases = [
+            (
+                "compliance",
+                HashMap::from([
+                    ("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string()),
+                    ("x-amz-object-lock-retain-until-date".to_string(), "2099-01-01T00:00:00Z".to_string()),
+                ]),
+            ),
+            (
+                "legal-hold",
+                HashMap::from([("x-amz-object-lock-legal-hold".to_string(), "ON".to_string())]),
+            ),
+        ];
+
+        for (case, eval_metadata) in cases {
+            let bucket = format!("prefix-lock-{case}-{}", uuid::Uuid::new_v4());
+            let object = "protected-after-scan.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create Object Lock bucket");
+            let mut reader = PutObjReader::from_vec(b"body".to_vec());
+            let object_info = store
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write unprotected version");
+            let version_id = object_info.version_id.expect("versioned PUT should return an ID").to_string();
+
+            let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+            let delete_store = Arc::clone(&store);
+            let delete_bucket = bucket.clone();
+            let delete = tokio::spawn(async move {
+                delete_store
+                    .delete_object(
+                        &delete_bucket,
+                        object,
+                        ObjectOptions {
+                            delete_prefix: true,
+                            delete_prefix_object: true,
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            barrier.wait_until_paused().await;
+
+            let update_store = Arc::clone(&store);
+            let update_bucket = bucket.clone();
+            let mut update = tokio::spawn(async move {
+                update_store
+                    .put_object_metadata(
+                        &update_bucket,
+                        object,
+                        &ObjectOptions {
+                            version_id: Some(version_id),
+                            versioned: true,
+                            eval_metadata: Some(eval_metadata),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut update).await.is_err(),
+                "{case} metadata update must wait behind the prefix-delete lifecycle write fence"
+            );
+
+            barrier.release();
+            delete
+                .await
+                .expect("prefix delete task should join")
+                .expect("prefix delete should remove the unprotected version");
+            update
+                .await
+                .expect("metadata update task should join")
+                .expect_err("metadata update must not succeed after the version was deleted");
+            assert!(
+                store
+                    .get_object_info(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .is_err(),
+                "{case} case must not report a successful protected write followed by deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn put_rejects_same_name_bucket_recreated_after_request_snapshot() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "put-bucket-incarnation", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("put-bucket-incarnation-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create initial bucket");
+        let old_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read initial bucket incarnation");
+
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"old generation".to_vec());
+            put_store
+                .put_object(
+                    &put_bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        store
+            .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete initial empty bucket while PUT is staged");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate same-name bucket");
+        let new_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read recreated bucket incarnation");
+        assert_ne!(old_incarnation, new_incarnation);
+
+        barrier.release();
+        let err = put
+            .await
+            .expect("PUT task should join")
+            .expect_err("old-generation PUT must not commit into the recreated bucket");
+        assert!(
+            matches!(err, StorageError::BucketNotFound(ref name) if name == &bucket),
+            "unexpected stale PUT error: {err:?}"
+        );
+        assert!(
+            store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the recreated bucket must not contain the staged old-generation object"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn exact_version_put_uses_only_its_own_bucket_object_lock_snapshot() {
+        let target_temp = tempfile::tempdir().expect("create target store dir");
+        let foreign_temp = tempfile::tempdir().expect("create foreign store dir");
+        let (target_ctx, target_store, _target_shutdown) =
+            without_storage_class_env(build_isolated_test_store(target_temp.path(), "put-object-lock-target", &[4])).await;
+        let (_foreign_ctx, foreign_store, _foreign_shutdown) =
+            without_storage_class_env(build_isolated_test_store(foreign_temp.path(), "put-object-lock-foreign", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(target_store.clone(), Vec::new()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(foreign_store.clone(), Vec::new()).await;
+
+        let bucket = format!("put-object-lock-snapshot-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        target_store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create target Object Lock bucket");
+        foreign_store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create same-name plain bucket in foreign store");
+        let stale_snapshot = target_store
+            .object_lock_config_snapshot(&bucket)
+            .await
+            .expect("load target snapshot before changing its default retention");
+
+        let mut metadata = crate::bucket::metadata_sys::get_in(&target_ctx, &bucket)
+            .await
+            .expect("load target bucket metadata")
+            .as_ref()
+            .clone();
+        metadata
+            .update_config(
+                crate::bucket::metadata::OBJECT_LOCK_CONFIG,
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec(),
+            )
+            .expect("set default COMPLIANCE metadata");
+        let update_started = Arc::new(tokio::sync::Barrier::new(2));
+        let update_ctx = Arc::clone(&target_ctx);
+        let update_started_task = Arc::clone(&update_started);
+        let mut update = tokio::spawn(async move {
+            update_started_task.wait().await;
+            let _transaction_guard =
+                crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&update_ctx, &metadata.name).await?;
+            crate::bucket::metadata_sys::set_bucket_metadata_in(&update_ctx, metadata).await
+        });
+        update_started.wait().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut update).await.is_err(),
+            "an active Object Lock snapshot must hold the metadata revision read fence"
+        );
+        drop(stale_snapshot);
+        update
+            .await
+            .expect("Object Lock metadata update task should join")
+            .expect("persist target Object Lock metadata after snapshot release");
+
+        let original_body = b"protected body".to_vec();
+        let mut original_reader = PutObjReader::from_vec(original_body.clone());
+        let original = target_store
+            .put_object(
+                &bucket,
+                object,
+                &mut original_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write protected target version");
+        let version_id = original
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+
+        let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+        let err = target_store
+            .put_object(
+                &bucket,
+                object,
+                &mut replacement,
+                &ObjectOptions {
+                    version_id: Some(version_id.clone()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("ECStore must load default COMPLIANCE before an exact-version overwrite");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let foreign_snapshot = foreign_store
+            .object_lock_config_snapshot(&bucket)
+            .await
+            .expect("load same-name foreign bucket snapshot");
+        let mut foreign_replacement = PutObjReader::from_vec(b"foreign replacement".to_vec());
+        target_store
+            .put_object(
+                &bucket,
+                object,
+                &mut foreign_replacement,
+                &ObjectOptions {
+                    version_id: Some(version_id.clone()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(foreign_snapshot),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a snapshot from another store must fail closed");
+
+        let mut reader = target_store
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(version_id),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("protected target version should remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("protected body should drain");
+        assert_eq!(body, original_body);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn force_create_existing_bucket_preserves_incarnation_and_inflight_request() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "force-create-incarnation", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("force-create-incarnation-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create initial bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("read initial incarnation");
+
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    force_create: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("idempotent force-create should succeed");
+        assert_eq!(
+            store.bucket_incarnation_id(&bucket).await.unwrap(),
+            incarnation,
+            "idempotent force-create must not rotate the bucket generation"
+        );
+
+        let mut reader = PutObjReader::from_vec(b"authorized before force-create".to_vec());
+        store
+            .put_object(
+                &bucket,
+                "inflight.bin",
+                &mut reader,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a request authorized before idempotent force-create must still commit");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn lock_enabled_create_retries_metadata_intent_without_unlocking() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-create-intent-retry", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("lock-create-intent-retry-{}", uuid::Uuid::new_v4());
+        let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
+        intent.lock_enabled = true;
+        crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
+            .await
+            .expect("persist pre-visibility lock intent");
+        assert!(
+            store
+                .peer_sys
+                .get_bucket_info(&bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                .await
+                .is_err(),
+            "the intent must not make the physical bucket visible"
+        );
+
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retry lock-enabled creation");
+        assert!(matches!(
+            crate::bucket::metadata_sys::get_object_lock_config_state_in(&ctx, &bucket)
+                .await
+                .expect("read retried lock state"),
+            crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn physical_lock_bucket_with_incomplete_metadata_fails_closed() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-create-incomplete-metadata", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("lock-create-incomplete-metadata-{}", uuid::Uuid::new_v4());
+        let mut metadata = crate::bucket::metadata::BucketMetadata::new(&bucket);
+        metadata.lock_enabled = true;
+        metadata
+            .save_with_store(store.clone())
+            .await
+            .expect("persist lock metadata before sidecar");
+        store
+            .peer_sys
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("expose physical bucket after metadata phase");
+
+        let err = crate::bucket::metadata_sys::get_object_lock_config_state_in(&ctx, &bucket)
+            .await
+            .expect_err("missing sidecar must not fabricate an unlocked bucket");
+        assert!(err.to_string().contains("sidecar is missing"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn successful_lock_enabled_create_has_complete_metadata_intent() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lock-create-complete-metadata", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("lock-create-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create lock-enabled bucket");
+        let (metadata, persisted) = crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&ctx, &bucket)
+            .await
+            .expect("read completed metadata intent");
+        assert!(persisted && metadata.bucket_incarnation_sidecar && metadata.lock_enabled);
+        assert!(matches!(
+            crate::bucket::metadata_sys::get_object_lock_config_state_in(&ctx, &bucket)
+                .await
+                .expect("read completed lock state"),
+            crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn lifecycle_expiry_rejects_task_from_recreated_bucket_incarnation() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "lifecycle-expiry-incarnation", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("lifecycle-incarnation-{}", uuid::Uuid::new_v4());
+        let object = "same-key.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create initial bucket");
+        let old_incarnation = store.bucket_incarnation_id(&bucket).await.expect("read old incarnation");
+        let mut old_reader = PutObjReader::from_vec(b"old-generation".to_vec());
+        store
+            .put_object(&bucket, object, &mut old_reader, &ObjectOptions::default())
+            .await
+            .expect("put old-generation object");
+        let old_object = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("snapshot old-generation object");
+
+        store
+            .delete_object(&bucket, object, ObjectOptions::default())
+            .await
+            .expect("delete old-generation object");
+        store
+            .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete old bucket");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        let mut new_reader = PutObjReader::from_vec(b"new-generation".to_vec());
+        store
+            .put_object(&bucket, object, &mut new_reader, &ObjectOptions::default())
+            .await
+            .expect("put replacement object");
+
+        let applied = crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+            store.clone(),
+            &old_object,
+            &crate::bucket::lifecycle::lifecycle::Event {
+                action: crate::bucket::lifecycle::lifecycle::IlmAction::DeleteAction,
+                ..Default::default()
+            },
+            &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+            old_incarnation,
+        )
+        .await;
+        assert!(!applied, "an expiry task from the old bucket incarnation must fail closed");
+
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("new-generation object must survive stale expiry");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("read replacement object");
+        assert_eq!(body, b"new-generation");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn pre_upgrade_multipart_upload_can_complete_and_abort_in_the_same_bucket_lifetime() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-upgrade-compat", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("multipart-upgrade-compat-{}", uuid::Uuid::new_v4());
+        let created = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed timestamp should be valid");
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    created_at: Some(created),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create bucket");
+
+        let complete_object = "complete.bin";
+        let complete_upload = store.pools[0]
+            .new_multipart_upload(
+                &bucket,
+                complete_object,
+                &ObjectOptions {
+                    mod_time: Some(created + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create a pre-upgrade multipart upload without an incarnation stamp");
+        let mut part_reader = PutObjReader::from_vec(b"pre-upgrade multipart body".to_vec());
+        let part = store.pools[0]
+            .put_object_part(
+                &bucket,
+                complete_object,
+                &complete_upload.upload_id,
+                1,
+                &mut part_reader,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("stage a pre-upgrade multipart part");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                complete_object,
+                &complete_upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("a pre-upgrade upload from the current bucket lifetime should complete");
+        store
+            .get_object_info(&bucket, complete_object, &ObjectOptions::default())
+            .await
+            .expect("completed pre-upgrade upload should be visible");
+
+        let abort_object = "abort.bin";
+        let abort_upload = store.pools[0]
+            .new_multipart_upload(
+                &bucket,
+                abort_object,
+                &ObjectOptions {
+                    mod_time: Some(created + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create another pre-upgrade multipart upload");
+        store
+            .abort_multipart_upload(&bucket, abort_object, &abort_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("a pre-upgrade upload from the current bucket lifetime should abort");
+        let err = store
+            .get_multipart_info(&bucket, abort_object, &abort_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("aborted pre-upgrade upload should be removed");
+        assert!(matches!(err, StorageError::InvalidUploadID(..)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn complete_multipart_rejects_legacy_upload_from_recreated_bucket_incarnation() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-bucket-incarnation", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("multipart-incarnation-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        let created = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed timestamp should be valid");
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    created_at: Some(created),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create initial bucket");
+        let old_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read initial bucket incarnation");
+        let upload = store.pools[0]
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(created + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create old-generation legacy multipart upload");
+
+        store
+            .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete bucket with an incomplete multipart upload");
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    created_at: Some(created + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recreate same-name bucket");
+        let new_incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read recreated bucket incarnation");
+        assert_ne!(old_incarnation, new_incarnation);
+
+        let err = store
+            .clone()
+            .complete_multipart_upload(&bucket, object, &upload.upload_id, Vec::new(), &ObjectOptions::default())
+            .await
+            .expect_err("an upload initiated in the old bucket incarnation must not commit into the replacement");
+        assert!(
+            match &err {
+                StorageError::BucketNotFound(name) => name == &bucket,
+                StorageError::InvalidUploadID(name, key, _) => name == &bucket && key == object,
+                _ => false,
+            },
+            "unexpected stale multipart completion error: {err:?}"
+        );
+        assert!(
+            store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the recreated bucket must not contain the old-generation multipart upload"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_after_bucket_validation_preserves_bucket_not_found() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "delete-missing-bucket", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("delete-missing-bucket-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket before validation");
+        store
+            .get_bucket_info(&bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+            .await
+            .expect("request-level bucket validation should succeed");
+        store
+            .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete bucket after validation");
+
+        let err = store
+            .delete_object(&bucket, "missing.bin", ObjectOptions::default())
+            .await
+            .expect_err("post-validation bucket deletion must not become an object-not-found error");
+
+        assert!(matches!(err, StorageError::BucketNotFound(name) if name == bucket));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn object_lock_metadata_read_error_blocks_every_destructive_delete_shape() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "delete-config-read-error", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("delete-config-read-error-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for object in ["single.bin", "batch.bin", "prefix/child.bin", "lifecycle.bin"] {
+            let mut reader = PutObjReader::from_vec(b"must survive".to_vec());
+            store
+                .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("put object before metadata corruption");
+        }
+
+        crate::bucket::metadata_sys::inject_object_lock_disk_read_error_in(&ctx, &bucket)
+            .await
+            .expect("inject single-delete metadata read failure");
+
+        let single_err = store
+            .delete_object(&bucket, "single.bin", ObjectOptions::default())
+            .await
+            .expect_err("single delete must propagate the metadata read failure");
+        assert!(
+            single_err
+                .to_string()
+                .contains("injected Object Lock metadata disk read failure")
+        );
+
+        crate::bucket::metadata_sys::inject_object_lock_disk_read_error_in(&ctx, &bucket)
+            .await
+            .expect("inject batch-delete metadata read failure");
+        let (_deleted, batch_errs) = store
+            .delete_objects(
+                &bucket,
+                vec![crate::storage_api_contracts::object::ObjectToDelete {
+                    object_name: "batch.bin".to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(
+            batch_errs[0]
+                .as_ref()
+                .is_some_and(|err| err.to_string().contains("injected Object Lock metadata disk read failure"))
+        );
+
+        crate::bucket::metadata_sys::inject_object_lock_disk_read_error_in(&ctx, &bucket)
+            .await
+            .expect("inject prefix-delete metadata read failure");
+        let prefix_err = store
+            .delete_object(
+                &bucket,
+                "prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("prefix delete must propagate the metadata read failure");
+        assert!(
+            prefix_err
+                .to_string()
+                .contains("injected Object Lock metadata disk read failure")
+        );
+
+        crate::bucket::metadata_sys::inject_object_lock_disk_read_error_in(&ctx, &bucket)
+            .await
+            .expect("inject lifecycle-style delete-all metadata read failure");
+        let lifecycle_err = store
+            .delete_object(
+                &bucket,
+                "lifecycle.bin",
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("lifecycle-style delete-all must propagate the metadata read failure");
+        assert!(
+            lifecycle_err
+                .to_string()
+                .contains("injected Object Lock metadata disk read failure")
+        );
+
+        for object in ["single.bin", "batch.bin", "prefix/child.bin", "lifecycle.bin"] {
+            store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("metadata failure must preserve every object");
+        }
+    }
+
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
@@ -1379,6 +2602,8 @@ mod tests {
             backend_identity: Some(identity_a),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
         let entry_b = Jentry {
             obj_name: "remote-b".to_string(),
@@ -1387,6 +2612,8 @@ mod tests {
             backend_identity: Some(identity_b),
             version_id_exact: true,
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
+            source: None,
         };
         let remove_a = backend_a.arm_failing_remove_barrier().await;
         persist_tier_delete_journal_entry(store_a.clone(), &entry_a)

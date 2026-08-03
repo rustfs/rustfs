@@ -18,6 +18,8 @@ use aws_sdk_s3::{Client, Config};
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 use rustfs_notify::{NotificationRuntimeState, notification_system};
 
+mod common;
+
 fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     let credentials = Credentials::new(access_key, secret_key, None, None, "test");
     let config = Config::builder()
@@ -30,8 +32,12 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     Client::from_conf(config)
 }
 
-#[tokio::test]
-async fn notification_runtime_stays_enabled_until_the_last_embedded_owner_drains() {
+#[test]
+fn notification_runtime_stays_enabled_until_the_last_embedded_owner_drains() {
+    common::run_embedded_test(notification_runtime_stays_enabled_until_the_last_embedded_owner_drains_body);
+}
+
+async fn notification_runtime_stays_enabled_until_the_last_embedded_owner_drains_body() {
     temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"))], async {
         let port_a = match find_available_port() {
             Ok(port) => port,

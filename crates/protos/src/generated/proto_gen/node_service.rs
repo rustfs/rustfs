@@ -1171,6 +1171,12 @@ pub struct SignalServiceResponse {
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint32, tag = "3")]
     pub protocol_version: u32,
+    /// Redacted fingerprint of the KMS configuration this node is running.
+    /// Only set for the "kms" dynamic config subsystem, and left unset when the
+    /// responder has no KMS configuration. Peers built before that subsystem
+    /// reject the signal outright rather than answering without this field.
+    #[prost(string, optional, tag = "4")]
+    pub config_fingerprint: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerActivityRequest {

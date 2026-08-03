@@ -19,7 +19,9 @@ use crate::types::*;
 use async_trait::async_trait;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+pub mod aws;
 #[cfg(test)]
 mod contract_tests;
 pub mod local;
@@ -98,6 +100,155 @@ pub(crate) fn ensure_key_status_permits(key_id: &str, status: &KeyStatus, operat
     ensure_key_state_permits(key_id, &state, operation)
 }
 
+/// Tag key that carries the key's identity rather than user metadata.
+///
+/// The key-creation path lifts `name` out of the caller's tag map and uses it
+/// as the key id, so a key's `name` tag and its id are the same string.
+/// Rewriting or dropping it after creation would leave the key addressable
+/// under an id its own metadata no longer states. Metadata updates therefore
+/// reject it; only creation may set it.
+pub const RESERVED_KEY_NAME_TAG: &str = "name";
+
+/// Reject a metadata update that would rewrite or remove
+/// [`RESERVED_KEY_NAME_TAG`].
+///
+/// Enforced by every backend that implements tag updates, so no call path —
+/// including a direct [`KmsBackend`] user that bypasses the manager — can
+/// detach a key from its identity.
+pub(crate) fn ensure_tag_keys_are_mutable<'a>(tag_keys: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    for tag_key in tag_keys {
+        if tag_key == RESERVED_KEY_NAME_TAG {
+            return Err(KmsError::invalid_parameter(format!(
+                "Tag '{RESERVED_KEY_NAME_TAG}' identifies the key and cannot be updated or removed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a rewrap whose caller cannot reproduce the envelope's encryption
+/// context.
+///
+/// Deliberately the same rule the decrypt paths apply — every context entry the
+/// envelope carries must be matched, and an entirely empty request context is
+/// accepted for envelopes written before contexts were recorded. Rewrap must
+/// never be *stricter* than decrypt: a retirement sweep has to be able to
+/// rewrap every envelope that still reads, or the old master key version it is
+/// trying to retire stays referenced forever by objects that are perfectly
+/// readable.
+///
+/// It must not be *laxer* either. The context binds an envelope to one
+/// bucket/object pair, and a rewrap that skipped the check would let a caller
+/// launder an envelope it has no claim on into a freshly wrapped one.
+pub(crate) fn ensure_rewrap_context_matches(
+    envelope_context: &HashMap<String, String>,
+    request_context: &HashMap<String, String>,
+) -> Result<()> {
+    for (key, expected_value) in envelope_context {
+        match request_context.get(key) {
+            Some(actual_value) if actual_value == expected_value => {}
+            Some(actual_value) => {
+                return Err(KmsError::context_mismatch(format!(
+                    "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
+                )));
+            }
+            None if request_context.is_empty() => {}
+            None => return Err(KmsError::context_mismatch(format!("Missing context key '{key}'"))),
+        }
+    }
+    Ok(())
+}
+
+/// Page size used when a [`ListKeysRequest`] does not ask for one.
+pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = 100;
+
+/// One page of a key set the backend has to slice itself.
+pub(crate) struct KeyPage<'a, T> {
+    /// The identifiers this page covers, in listing order.
+    pub(crate) items: &'a [T],
+    /// Where the next page resumes; `None` when this page is the last one.
+    pub(crate) next_marker: Option<String>,
+    /// Whether keys remain beyond this page.
+    pub(crate) truncated: bool,
+}
+
+/// Cut the page `request` asks for out of `sorted`.
+///
+/// `sorted` must be ordered by the identifier `key_id_of` returns, and the
+/// marker is an *exclusive lower bound* on that identifier rather than an index
+/// into the sequence. That is what makes paging survive concurrent mutation:
+/// the next page resumes at the first identifier greater than the marker, so a
+/// key added or removed elsewhere in the ordering — including the marker key
+/// itself, which the deletion sweep routinely destroys — cannot make the
+/// listing skip keys or restart from the beginning.
+///
+/// A `limit` of zero is honoured as written: the caller asked for no keys and
+/// gets an empty, non-truncated page (see [`list_keys_page_size`]).
+///
+/// Filters are applied by the caller to `items` after this slice, so a filtered
+/// page can be shorter than `limit` — and even empty — while more keys remain.
+/// Callers must page until `truncated` is false rather than until a page comes
+/// back short.
+pub(crate) fn paginate_keys<'a, T>(sorted: &'a [T], request: &ListKeysRequest, key_id_of: impl Fn(&T) -> &str) -> KeyPage<'a, T> {
+    let Some(limit) = list_keys_page_size(request.limit) else {
+        return KeyPage {
+            items: &[],
+            next_marker: None,
+            truncated: false,
+        };
+    };
+
+    let start = match request.marker.as_deref() {
+        Some(marker) => sorted.partition_point(|item| key_id_of(item) <= marker),
+        None => 0,
+    };
+    // `partition_point` never exceeds the length, so both bounds stay in range
+    // however large `limit` is.
+    let end = start.saturating_add(limit).min(sorted.len());
+    let items = &sorted[start..end];
+    let truncated = end < sorted.len();
+
+    KeyPage {
+        items,
+        // Resuming from the last identifier on the page, not from an index,
+        // keeps the cursor meaningful after the key it names disappears.
+        next_marker: if truncated {
+            items.last().map(|item| key_id_of(item).to_string())
+        } else {
+            None
+        },
+        truncated,
+    }
+}
+
+/// Resolve the page size of a [`ListKeysRequest`]; `None` means the caller
+/// asked for no keys at all.
+///
+/// `Some(0)` is a well-formed request for an empty page — the reading rustfs
+/// already gives `max-keys=0` on the S3 listing path — not a malformed one and
+/// not an omitted value. Rounding it up to a default would hand back a full
+/// page of keys to a caller that explicitly asked for none.
+pub(crate) fn list_keys_page_size(limit: Option<u32>) -> Option<usize> {
+    match limit.unwrap_or(DEFAULT_LIST_KEYS_PAGE_SIZE) {
+        0 => None,
+        size => Some(size as usize),
+    }
+}
+
+/// The response to a request for zero keys.
+///
+/// `truncated` is false even when keys exist: a zero-length page carries no
+/// identifier to resume from, so claiming more results would hand back a cursor
+/// the caller can never advance and turn a `while truncated` loop into a
+/// non-terminating one.
+pub(crate) fn empty_key_page() -> ListKeysResponse {
+    ListKeysResponse {
+        keys: Vec::new(),
+        next_marker: None,
+        truncated: false,
+    }
+}
+
 /// Simplified KMS backend interface for manager
 #[async_trait]
 pub trait KmsBackend: Send + Sync {
@@ -116,7 +267,18 @@ pub trait KmsBackend: Send + Sync {
     /// Describe a key
     async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse>;
 
-    /// List keys
+    /// List keys.
+    ///
+    /// `status_filter` and `usage_filter` narrow a page after it has been cut,
+    /// so a filtered page can be shorter than the requested limit — and even
+    /// empty — while keys remain: a caller must page until `truncated` is false
+    /// rather than until a page comes back short. Every backend applies both
+    /// filters; a backend that cannot answer a filter must fail rather than
+    /// return the unfiltered set.
+    ///
+    /// Backends that slice their own key set do so with [`paginate_keys`],
+    /// which fixes the ordering and the marker semantics; a backend paging
+    /// through a remote API passes that API's own cursor through instead.
     async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse>;
 
     /// Delete a key
@@ -153,6 +315,107 @@ pub trait KmsBackend: Send + Sync {
         Err(KmsError::unsupported_capability("backend without rotation support", "rotate_key"))
     }
 
+    /// Re-wrap an existing data key envelope under the key's current version,
+    /// returning an envelope that protects the same data key.
+    ///
+    /// This is the primitive that makes retiring an old master key version
+    /// possible at all: until every envelope a version wrapped has been moved
+    /// onto the current version, destroying that version's material orphans
+    /// every object whose data key it wrapped. Rotation alone does not shrink
+    /// the blast radius of a leaked master key version, because envelopes
+    /// written before it stay decryptable under the leaked material forever.
+    ///
+    /// Contract for implementations:
+    ///
+    /// - The plaintext data key must not be persisted, logged, or returned. It
+    ///   is either never materialized at all (backends with a native rewrap) or
+    ///   held only for the length of the re-wrap.
+    /// - The destination version is always the key's *current* version. Wrapping
+    ///   to any older version would create objects that nodes which resolve
+    ///   envelopes to the current version cannot read.
+    /// - Everything except the wrapping is carried over verbatim, encryption
+    ///   context included, so the result is the same data key rewrapped and not
+    ///   a new one. An envelope must never be moved between objects.
+    /// - Idempotence: an envelope already wrapped by the current version comes
+    ///   back byte for byte with [`RewrapDataKeyResponse::rewrapped`] false, so
+    ///   re-running a sweep converges and performs no metadata writes.
+    ///
+    /// Only backends that advertise [`BackendCapabilities::rewrap`] may override
+    /// this method; the default rejects the operation. A backend without
+    /// retained version history has nothing to rewrap *to*, so it reports the
+    /// capability gap rather than performing a re-wrap that changes no version
+    /// and buys no security.
+    async fn rewrap_data_key(&self, _request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        Err(KmsError::unsupported_capability(
+            "backend without versioned key material to rewrap onto",
+            "rewrap_data_key",
+        ))
+    }
+
+    /// Report which master key version wraps an existing data key envelope, and
+    /// whether that is the key's current version.
+    ///
+    /// The read-only counterpart of [`Self::rewrap_data_key`], and the only
+    /// supported way to ask the question: each rotating backend records the
+    /// version somewhere else, so every caller that parsed envelopes itself
+    /// would carry its own copy of that knowledge outside the KMS boundary.
+    ///
+    /// [`DescribeDataKeyWrappingResponse::is_current`] must be the exact
+    /// negation of what [`RewrapDataKeyResponse::rewrapped`] would report for
+    /// the same envelope. The two answers drive a single loop — scan to find
+    /// work, rewrap to do it, scan again to prove it is done — and a
+    /// disagreement would make that loop either never terminate or declare
+    /// success while envelopes still reference a version somebody is about to
+    /// destroy.
+    ///
+    /// Deliberately not gated on key state: an inventory has to be able to
+    /// count envelopes under keys that are disabled or already scheduled for
+    /// deletion, which are precisely the keys whose retirement is in question.
+    ///
+    /// Gated by the same [`BackendCapabilities::rewrap`] flag, because a backend
+    /// that cannot rewrap has no version to report progress against.
+    async fn describe_data_key_wrapping(
+        &self,
+        _request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        Err(KmsError::unsupported_capability(
+            "backend without versioned key material to rewrap onto",
+            "describe_data_key_wrapping",
+        ))
+    }
+
+    /// Replace a key's free-form description; `None` clears it.
+    ///
+    /// Backends that advertise [`BackendCapabilities::update_key_metadata`]
+    /// must override this method; the default rejects the operation.
+    async fn update_key_description(&self, _key_id: &str, _description: Option<&str>) -> Result<()> {
+        Err(KmsError::unsupported_capability(
+            "backend without key metadata updates",
+            "update_key_description",
+        ))
+    }
+
+    /// Add or overwrite the given tags, leaving every other tag untouched.
+    ///
+    /// Implementations must run [`ensure_tag_keys_are_mutable`] before
+    /// persisting anything. Backends that advertise
+    /// [`BackendCapabilities::update_key_metadata`] must override this method;
+    /// the default rejects the operation.
+    async fn tag_key(&self, _key_id: &str, _tags: &HashMap<String, String>) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without key metadata updates", "tag_key"))
+    }
+
+    /// Remove the given tags.
+    ///
+    /// Tags that are not set are ignored, so repeating the call is a no-op
+    /// rather than an error. Implementations must run
+    /// [`ensure_tag_keys_are_mutable`] before persisting anything. Backends
+    /// that advertise [`BackendCapabilities::update_key_metadata`] must
+    /// override this method; the default rejects the operation.
+    async fn untag_key(&self, _key_id: &str, _tag_keys: &[String]) -> Result<()> {
+        Err(KmsError::unsupported_capability("backend without key metadata updates", "untag_key"))
+    }
+
     /// Health check
     async fn health_check(&self) -> Result<bool>;
 
@@ -180,6 +443,19 @@ pub trait KmsBackend: Send + Sync {
     /// support.
     async fn remove_expired_key(&self, _key_id: &str, _now: &Zoned) -> Result<ExpiredKeyRemoval> {
         Err(KmsError::unsupported_capability("backend without deletion support", "remove_expired_key"))
+    }
+
+    /// The running client to export a full-material backup bundle from.
+    ///
+    /// Only the Local backend owns key material RustFS is allowed to export in
+    /// full (see [`crate::backup::BackupResponsibility`]); every other backend
+    /// keeps its cryptographic root outside RustFS and returns `None` here.
+    ///
+    /// The export must run against the *running* client so that its fence
+    /// actually blocks concurrent create/delete work — a second client opened
+    /// on the same key directory would fence nothing.
+    fn local_backup_client(&self) -> Option<&local::LocalKmsClient> {
+        None
     }
 }
 
@@ -222,6 +498,10 @@ pub struct BackendCapabilities {
     pub versioning: bool,
     /// Irreversible physical deletion of key material
     pub physical_delete: bool,
+    /// Updating a key's description and tags after creation
+    pub update_key_metadata: bool,
+    /// Re-wrapping an existing data key envelope onto the key's current version
+    pub rewrap: bool,
 }
 
 impl BackendCapabilities {
@@ -238,6 +518,8 @@ impl BackendCapabilities {
             schedule_deletion: false,
             versioning: false,
             physical_delete: false,
+            update_key_metadata: false,
+            rewrap: false,
         }
     }
 
@@ -286,6 +568,18 @@ impl BackendCapabilities {
     /// Set whether physical deletion of key material is supported
     pub const fn with_physical_delete(mut self, physical_delete: bool) -> Self {
         self.physical_delete = physical_delete;
+        self
+    }
+
+    /// Set whether description and tag updates are supported
+    pub const fn with_update_key_metadata(mut self, update_key_metadata: bool) -> Self {
+        self.update_key_metadata = update_key_metadata;
+        self
+    }
+
+    /// Set whether envelope rewrap onto the current key version is supported
+    pub const fn with_rewrap(mut self, rewrap: bool) -> Self {
+        self.rewrap = rewrap;
         self
     }
 }
@@ -366,6 +660,8 @@ mod tests {
         assert!(!capabilities.schedule_deletion);
         assert!(!capabilities.versioning);
         assert!(!capabilities.physical_delete);
+        assert!(!capabilities.update_key_metadata);
+        assert!(!capabilities.rewrap);
     }
 
     #[tokio::test]
@@ -374,6 +670,32 @@ mod tests {
             ("enable_key", MinimalBackend.enable_key("any-key").await),
             ("disable_key", MinimalBackend.disable_key("any-key").await),
             ("rotate_key", MinimalBackend.rotate_key("any-key").await),
+            (
+                "update_key_description",
+                MinimalBackend.update_key_description("any-key", Some("new")).await,
+            ),
+            ("tag_key", MinimalBackend.tag_key("any-key", &HashMap::new()).await),
+            ("untag_key", MinimalBackend.untag_key("any-key", &[]).await),
+            (
+                "rewrap_data_key",
+                MinimalBackend
+                    .rewrap_data_key(RewrapDataKeyRequest {
+                        ciphertext: b"{}".to_vec(),
+                        encryption_context: HashMap::new(),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "describe_data_key_wrapping",
+                MinimalBackend
+                    .describe_data_key_wrapping(DescribeDataKeyWrappingRequest {
+                        ciphertext: b"{}".to_vec(),
+                        encryption_context: HashMap::new(),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err("backends must opt in to lifecycle operations by overriding them");
             assert!(
@@ -393,6 +715,54 @@ mod tests {
             matches!(error, KmsError::UnsupportedCapability { .. }),
             "expected UnsupportedCapability, got {error:?}"
         );
+    }
+
+    /// The rewrap context guard has to sit exactly where the decrypt guard
+    /// sits: strict enough that an envelope cannot be laundered under a
+    /// different context, lax enough that everything decrypt accepts can still
+    /// be rewrapped — otherwise a retirement sweep stalls on readable objects.
+    #[test]
+    fn rewrap_context_guard_matches_the_decrypt_rule() {
+        let envelope = HashMap::from([
+            ("bucket".to_string(), "b/o".to_string()),
+            ("tenant".to_string(), "acme".to_string()),
+        ]);
+
+        ensure_rewrap_context_matches(&envelope, &envelope).expect("an exact context must be accepted");
+        // An empty request context is the pre-context-recording compatibility
+        // case decrypt allows; rewrap must not be stricter.
+        ensure_rewrap_context_matches(&envelope, &HashMap::new()).expect("an empty request context must stay accepted");
+        // Extra entries the envelope does not carry are ignored, as on decrypt.
+        let mut superset = envelope.clone();
+        superset.insert("extra".to_string(), "ignored".to_string());
+        ensure_rewrap_context_matches(&envelope, &superset).expect("extra request context entries must be ignored");
+
+        let mut tampered = envelope.clone();
+        tampered.insert("bucket".to_string(), "other/o".to_string());
+        assert!(
+            matches!(ensure_rewrap_context_matches(&envelope, &tampered), Err(KmsError::ContextMismatch { .. })),
+            "a tampered context value must be rejected"
+        );
+
+        let partial = HashMap::from([("tenant".to_string(), "acme".to_string())]);
+        assert!(
+            matches!(ensure_rewrap_context_matches(&envelope, &partial), Err(KmsError::ContextMismatch { .. })),
+            "a non-empty context missing an envelope entry must be rejected"
+        );
+    }
+
+    #[test]
+    fn identity_tag_is_rejected_by_metadata_updates() {
+        let error = ensure_tag_keys_are_mutable([RESERVED_KEY_NAME_TAG])
+            .expect_err("the identity tag must not be writable through a metadata update");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains(RESERVED_KEY_NAME_TAG)),
+            "expected a typed rejection naming the tag, got {error:?}"
+        );
+
+        // Ordinary tags — including ones that merely contain the reserved name
+        // — stay writable.
+        ensure_tag_keys_are_mutable(["team", "nickname", "Name"]).expect("ordinary tags must remain writable");
     }
 
     #[tokio::test]
@@ -442,5 +812,85 @@ mod tests {
             .expect("static backend should build");
 
         insta::assert_json_snapshot!("static_backend_capabilities", capabilities_snapshot(backend.capabilities()));
+    }
+
+    // -- Pagination boundaries ----------------------------------------------
+
+    fn key_ids(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("key-{index:02}")).collect()
+    }
+
+    fn page_request(limit: Option<u32>, marker: Option<&str>) -> ListKeysRequest {
+        ListKeysRequest {
+            limit,
+            marker: marker.map(str::to_string),
+            usage_filter: None,
+            status_filter: None,
+        }
+    }
+
+    fn page_of(keys: &[String], limit: Option<u32>, marker: Option<&str>) -> (Vec<String>, Option<String>, bool) {
+        let page = paginate_keys(keys, &page_request(limit, marker), String::as_str);
+        (page.items.to_vec(), page.next_marker, page.truncated)
+    }
+
+    /// Zero keys requested, zero keys returned — and no cursor, so a caller
+    /// looping on `truncated` terminates instead of asking forever. Slicing a
+    /// zero-length page out of a non-empty key set must not reach for the
+    /// element before the page either.
+    #[test]
+    fn zero_limit_returns_an_empty_untruncated_page() {
+        let keys = key_ids(3);
+        assert_eq!(page_of(&keys, Some(0), None), (Vec::new(), None, false));
+        assert_eq!(page_of(&keys, Some(0), Some("key-01")), (Vec::new(), None, false));
+        // Also at the ends of the key set, where a page has no predecessor.
+        assert_eq!(page_of(&[], Some(0), None), (Vec::new(), None, false));
+        assert_eq!(page_of(&keys, Some(0), Some("key-02")), (Vec::new(), None, false));
+
+        assert_eq!(list_keys_page_size(Some(0)), None);
+        assert_eq!(list_keys_page_size(None), Some(DEFAULT_LIST_KEYS_PAGE_SIZE as usize));
+        assert_eq!(list_keys_page_size(Some(7)), Some(7));
+    }
+
+    /// A limit past the end of the key set is not an overflow.
+    #[test]
+    fn oversized_limit_returns_the_whole_key_set_once() {
+        let keys = key_ids(3);
+        assert_eq!(page_of(&keys, Some(u32::MAX), None), (keys.clone(), None, false));
+        assert_eq!(page_of(&keys, Some(u32::MAX), Some("key-01")), (vec![keys[2].clone()], None, false));
+    }
+
+    /// The cursor is an identifier, so a marker naming a key that no longer
+    /// exists resumes after where it would have been instead of restarting.
+    #[test]
+    fn marker_for_a_removed_key_resumes_after_it() {
+        let keys = vec!["key-00".to_string(), "key-02".to_string()];
+        assert_eq!(page_of(&keys, Some(10), Some("key-01")), (vec!["key-02".to_string()], None, false));
+        // A marker past every key ends the listing rather than wrapping.
+        assert_eq!(page_of(&keys, Some(10), Some("key-99")), (Vec::new(), None, false));
+        // A marker before every key yields the whole set.
+        assert_eq!(page_of(&keys, Some(10), Some("key")), (keys.clone(), None, false));
+    }
+
+    /// Truncation flips exactly at the page boundary, and paging covers the
+    /// key set once end to end.
+    #[test]
+    fn pages_tile_the_key_set_exactly_at_the_limit_boundary() {
+        let keys = key_ids(4);
+        assert_eq!(page_of(&keys, Some(4), None), (keys.clone(), None, false));
+        assert_eq!(page_of(&keys, Some(3), None), (keys[..3].to_vec(), Some("key-02".to_string()), true));
+
+        let mut seen = Vec::new();
+        let mut marker = None;
+        loop {
+            let (items, next_marker, truncated) = page_of(&keys, Some(2), marker.as_deref());
+            seen.extend(items);
+            if !truncated {
+                assert!(next_marker.is_none(), "a final page must not offer a cursor");
+                break;
+            }
+            marker = Some(next_marker.expect("a truncated page must offer a cursor"));
+        }
+        assert_eq!(seen, keys, "paging must tile the key set exactly once");
     }
 }

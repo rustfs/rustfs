@@ -183,6 +183,7 @@ pub enum WalkVersionsSortOrder {
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,
+    pub synthetic_version_id: bool,
     pub delete_marker_replication_status: Option<String>,
     pub version_purge_status: Option<VersionPurgeStatusType>,
     pub version_purge_statuses: Option<String>,
@@ -212,6 +213,9 @@ pub struct DeletedObject {
     pub replication_state: Option<ReplicationState>,
     pub found: bool,
     pub force_delete: bool,
+    pub force_delete_id: Option<Uuid>,
+    pub force_delete_target_arns: Vec<String>,
+    pub force_delete_generation: Option<i64>,
 }
 
 impl DeletedObject {

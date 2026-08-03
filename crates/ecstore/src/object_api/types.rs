@@ -20,6 +20,197 @@ use crate::storage_api_contracts::{
     },
 };
 
+#[derive(Clone)]
+pub struct NamespaceLockFence {
+    signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
+    #[cfg(test)]
+    forced_lost: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Debug for NamespaceLockFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamespaceLockFence")
+            .field("signal_count", &self.signals.len())
+            .finish()
+    }
+}
+
+impl NamespaceLockFence {
+    fn new() -> Self {
+        Self {
+            signals: Arc::default(),
+            #[cfg(test)]
+            forced_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        #[cfg(test)]
+        if self.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        self.signals.iter().any(|signal| signal.is_lost())
+    }
+
+    pub(crate) fn add_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+        Arc::make_mut(&mut self.signals).push(signal);
+    }
+
+    fn extend(&mut self, other: &Self) {
+        if Arc::ptr_eq(&self.signals, &other.signals) {
+            return;
+        }
+        Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
+        #[cfg(test)]
+        if other.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
+            self.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lost_for_test() -> Self {
+        let fence = Self::new();
+        fence.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        fence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loss_handle_for_test() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let fence = Self::new();
+        (fence.clone(), Arc::clone(&fence.forced_lost))
+    }
+}
+
+#[derive(Debug)]
+pub struct ObjectLockConfigSnapshot {
+    store_id: Option<Uuid>,
+    bucket: Option<String>,
+    bucket_incarnation_id: Option<Uuid>,
+    config_revision: Option<OffsetDateTime>,
+    state: crate::bucket::metadata_sys::ObjectLockConfigState,
+    lifecycle_fence: NamespaceLockFence,
+    _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    metadata_transaction_guard: Option<rustfs_lock::NamespaceLockGuard>,
+}
+
+impl ObjectLockConfigSnapshot {
+    pub(crate) fn new(state: crate::bucket::metadata_sys::ObjectLockConfigState) -> Self {
+        Self {
+            store_id: None,
+            bucket: None,
+            bucket_incarnation_id: None,
+            config_revision: None,
+            state,
+            lifecycle_fence: NamespaceLockFence::new(),
+            _lifecycle_guard: None,
+            metadata_transaction_guard: None,
+        }
+    }
+
+    pub(crate) fn for_store_bucket(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+    ) -> Self {
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_string()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence: NamespaceLockFence::new(),
+            _lifecycle_guard: None,
+            metadata_transaction_guard: None,
+        }
+    }
+
+    pub(crate) fn for_guarded_store_bucket(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+        lifecycle_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+    ) -> Self {
+        let mut lifecycle_fence = NamespaceLockFence::new();
+        if let Some(signal) = lifecycle_guard.lock_lost_signal() {
+            lifecycle_fence.add_signal(signal);
+        }
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_string()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence,
+            _lifecycle_guard: Some(lifecycle_guard),
+            metadata_transaction_guard: Some(metadata_transaction_guard),
+        }
+    }
+
+    pub(crate) fn for_store_bucket_under_lifecycle_fence(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+        lifecycle_fence: NamespaceLockFence,
+        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+    ) -> Self {
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_string()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence,
+            _lifecycle_guard: None,
+            metadata_transaction_guard: Some(metadata_transaction_guard),
+        }
+    }
+
+    pub(crate) fn is_for_store_bucket(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+    ) -> bool {
+        self.store_id == Some(store_id)
+            && self.bucket.as_deref() == Some(bucket)
+            && self.bucket_incarnation_id == Some(bucket_incarnation_id)
+            && self.config_revision == Some(config_revision)
+    }
+
+    pub fn state(&self) -> &crate::bucket::metadata_sys::ObjectLockConfigState {
+        &self.state
+    }
+
+    pub(crate) fn is_valid_for_destructive_put(&self, store_id: Uuid, bucket: &str, bucket_incarnation_id: Uuid) -> bool {
+        self.store_id == Some(store_id)
+            && self.bucket.as_deref() == Some(bucket)
+            && self.bucket_incarnation_id == Some(bucket_incarnation_id)
+            && self.config_revision.is_some()
+            && !self.lifecycle_fence.is_lock_lost()
+            && self
+                .metadata_transaction_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.is_lock_lost())
+    }
+
+    pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {
+        opts.bucket_lifecycle_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(&self.lifecycle_fence);
+        if let Some(guard) = self.metadata_transaction_guard.as_ref() {
+            opts.add_namespace_lock_guard(guard);
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -32,6 +223,8 @@ pub struct ObjectOptions {
     pub version_id: Option<String>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
+    /// Persisted bucket incarnation observed before authorization.
+    pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
@@ -54,8 +247,14 @@ pub struct ObjectOptions {
     pub http_preconditions: Option<HTTPPreconditions>,
 
     pub delete_replication: Option<ReplicationState>,
+    pub delete_replication_config_snapshot: Option<Arc<DeleteReplicationConfigSnapshot>>,
+    pub namespace_lock_fence: Option<NamespaceLockFence>,
+    /// Proves an upper layer holds the bucket lifecycle sentinel. A separate
+    /// fence avoids recursively acquiring the read lock behind a queued writer.
+    pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     pub replication_request: bool,
     pub delete_marker: bool,
+    pub synthetic_version_id: bool,
 
     pub transition: TransitionOptions,
     pub expiration: ExpirationOptions,
@@ -64,13 +263,46 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
     pub object_lock_retention: Option<ObjectLockRetentionOptions>,
     pub object_lock_delete: Option<crate::storage_api_contracts::object::ObjectLockDeleteOptions>,
+    /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
+    /// before a destructive commit reaches the set layer.
+    pub object_lock_config_snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+    /// Storage-owned journal writer used by the atomic delete path. This is
+    /// populated only by the `ECStore` wrapper that holds the namespace locks.
+    pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
 impl ObjectOptions {
+    pub(crate) fn overwrites_existing_version(&self) -> bool {
+        self.version_id.is_some() || !self.versioned || self.version_suspended
+    }
+
+    pub(crate) fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .add_signal(signal);
+    }
+
+    pub(crate) fn ensure_namespace_lock_fence(&mut self) {
+        self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+    }
+
+    pub fn add_namespace_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        if let Some(signal) = guard.lock_lost_signal() {
+            self.add_namespace_lock_lost_signal(signal);
+        }
+    }
+
+    pub fn add_bucket_lifecycle_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        let fence = self.bucket_lifecycle_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+        if let Some(signal) = guard.lock_lost_signal() {
+            fence.add_signal(signal);
+        }
+    }
+
     pub fn set_delete_replication_state(&mut self, dsc: ReplicateDecision) {
         let mut rs = ReplicationState {
             replicate_decision_str: dsc.to_string(),
@@ -518,8 +750,17 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
-        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, false)
-            .await
+        Self::from_meta_cache_entries_sorted_versions_with_purge(
+            entries,
+            bucket,
+            prefix,
+            delimiter,
+            after_version_marker,
+            false,
+            false,
+        )
+        .await
+        .0
     }
 
     pub(crate) async fn from_meta_cache_entries_sorted_versions_for_lifecycle(
@@ -529,8 +770,40 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
-        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, true)
-            .await
+        Self::from_meta_cache_entries_sorted_versions_with_purge(
+            entries,
+            bucket,
+            prefix,
+            delimiter,
+            after_version_marker,
+            true,
+            false,
+        )
+        .await
+        .0
+    }
+
+    pub(crate) async fn from_meta_cache_entries_sorted_versions_for_recursive_delete(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+    ) -> Result<Vec<ObjectInfo>> {
+        let (objects, error) = Self::from_meta_cache_entries_sorted_versions_with_purge(
+            entries,
+            bucket,
+            prefix,
+            delimiter,
+            after_version_marker,
+            true,
+            true,
+        )
+        .await;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(objects),
+        }
     }
 
     async fn from_meta_cache_entries_sorted_versions_with_purge(
@@ -540,7 +813,8 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
         include_version_purge: bool,
-    ) -> Vec<ObjectInfo> {
+        fail_on_decode_error: bool,
+    ) -> (Vec<ObjectInfo>, Option<Error>) {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
@@ -576,6 +850,9 @@ impl ObjectInfo {
                 let file_infos = match entry.file_info_versions(bucket) {
                     Ok(res) => res,
                     Err(err) => {
+                        if fail_on_decode_error {
+                            return (objects, Some(err.into()));
+                        }
                         warn!("file_info_versions err {:?}", err);
                         continue;
                     }
@@ -627,7 +904,7 @@ impl ObjectInfo {
             }
         }
 
-        objects
+        (objects, None)
     }
 
     pub async fn from_meta_cache_entries_sorted_infos(
@@ -715,6 +992,10 @@ impl ObjectInfo {
     }
 
     pub fn replication_state(&self) -> ReplicationState {
+        // Derived from the durable internal keys, not from the wire form: the
+        // state's positional encoding skips this map.
+        let (target_delete_marker_version_ids, target_delete_marker_version_ids_corrupt) =
+            rustfs_utils::http::target_delete_marker_versions(&self.user_defined);
         ReplicationState {
             replication_status_internal: self.replication_status_internal.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
@@ -732,6 +1013,8 @@ impl ObjectInfo {
                     .map(|arn| (arn, v.clone()))
                 })
                 .collect(),
+            target_delete_marker_version_ids,
+            target_delete_marker_version_ids_corrupt,
             ..Default::default()
         }
     }
@@ -783,6 +1066,25 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_lock_config_snapshot_is_bound_to_store_bucket_and_incarnation() {
+        let store_id = Uuid::new_v4();
+        let incarnation_id = Uuid::new_v4();
+        let snapshot = ObjectLockConfigSnapshot::for_store_bucket(
+            store_id,
+            "source-bucket",
+            incarnation_id,
+            OffsetDateTime::UNIX_EPOCH,
+            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+        );
+
+        assert!(snapshot.is_for_store_bucket(store_id, "source-bucket", incarnation_id, OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(Uuid::new_v4(), "source-bucket", incarnation_id, OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(store_id, "other-bucket", incarnation_id, OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(store_id, "source-bucket", Uuid::new_v4(), OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(store_id, "source-bucket", incarnation_id, OffsetDateTime::now_utc()));
+    }
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
 
     fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
@@ -898,10 +1200,11 @@ mod tests {
     #[test]
     fn object_info_replication_helpers_parse_target_status_and_reset_headers() {
         let reset_key = rustfs_utils::http::internal_key_rustfs("replication-reset-arn:target-a");
+        let user_defined = HashMap::from([(reset_key, "reset-id".to_string())]);
         let object = ObjectInfo {
             replication_status_internal: Some("arn:target-a=COMPLETED;arn:target-b=FAILED;".to_string()),
             version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
-            user_defined: Arc::new(HashMap::from([(reset_key, "reset-id".to_string())])),
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 

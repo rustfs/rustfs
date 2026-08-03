@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Regression coverage for rustfs/backlog#1009: the PUT path skips its
-//! pre-PUT `get_object_info` only when `put_prelookup_worm_gate` proves the
+//! pre-PUT `get_object_info` only when `object_lock_checks_required` proves the
 //! existing-object WORM validation is a no-op. These tests pin the gate's
 //! truth table against a real 4-disk `ECStore` with the bucket metadata sys
 //! initialized, mirroring the HP-8 delete-gating fixture:
@@ -24,7 +24,7 @@
 //!   so a degraded metadata subsystem can never silently drop the WORM check.
 
 use super::gating_test_env::shared_gating_ecstore;
-use super::object_usecase::put_prelookup_worm_gate;
+use super::object_usecase::object_lock_checks_required;
 use super::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use serial_test::serial;
 use uuid::Uuid;
@@ -47,7 +47,7 @@ async fn worm_gate_keeps_prelookup_for_object_lock_bucket() {
         .expect("create object-lock bucket");
 
     assert!(
-        put_prelookup_worm_gate(&bucket).await,
+        object_lock_checks_required(&bucket).await,
         "an object-lock bucket must keep the pre-PUT lookup"
     );
 }
@@ -64,7 +64,7 @@ async fn worm_gate_allows_skip_for_plain_bucket() {
         .expect("create plain bucket");
 
     assert!(
-        !put_prelookup_worm_gate(&bucket).await,
+        !object_lock_checks_required(&bucket).await,
         "a bucket without object locking must take the prelookup-skip path"
     );
 }
@@ -76,7 +76,7 @@ async fn worm_gate_fails_closed_when_bucket_metadata_is_unavailable() {
     let missing_bucket = format!("put-gate-missing-{}", Uuid::new_v4());
 
     assert!(
-        put_prelookup_worm_gate(&missing_bucket).await,
+        object_lock_checks_required(&missing_bucket).await,
         "a bucket-metadata lookup failure must fail closed and keep the pre-PUT lookup"
     );
 }

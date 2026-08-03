@@ -53,12 +53,14 @@ use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
 
 pub const CONFIG_PREFIX: &str = "config";
 const SERVER_CONFIG_OBJECT: &str = "config/config.json";
+const CONFIG_TRANSACTION_LOCK_SUFFIX: &str = ".transaction.lock";
 
-// Server-config lock order: SERVER_CONFIG_LOCK -> distributed namespace lock
-// for SERVER_CONFIG_OBJECT. Readers and writers must never reverse this order.
+// Server-config lock order: SERVER_CONFIG_LOCK -> transaction lock ->
+// SERVER_CONFIG_OBJECT. Readers and writers must never reverse this order.
 static SERVER_CONFIG_LOCK: LazyLock<Arc<AsyncRwLock<()>>> = LazyLock::new(|| Arc::new(AsyncRwLock::new(())));
 
 fn config_task_join_error(operation: &'static str, error: tokio::task::JoinError) -> Error {
@@ -76,8 +78,11 @@ where
     T: Send + 'static,
 {
     tokio::spawn(async move {
-        // Lock order: SERVER_CONFIG_LOCK -> namespace write lock.
+        // Lock order: SERVER_CONFIG_LOCK -> transaction lock -> object lock.
         let _local_guard = SERVER_CONFIG_LOCK.write().await;
+        let transaction_lock = server_config_transaction_lock_path();
+        let transaction_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
+        let _transaction_guard = transaction_lock.get_write_lock(get_lock_acquire_timeout()).await?;
         let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, SERVER_CONFIG_OBJECT).await?;
         let _write_guard = namespace_lock.get_write_lock(get_lock_acquire_timeout()).await?;
         Ok(operation().await)
@@ -96,8 +101,11 @@ where
     T: Send + 'static,
 {
     tokio::spawn(async move {
-        // Lock order: SERVER_CONFIG_LOCK -> namespace read lock.
+        // Lock order: SERVER_CONFIG_LOCK -> transaction lock -> object lock.
         let _local_guard = SERVER_CONFIG_LOCK.read().await;
+        let transaction_lock = server_config_transaction_lock_path();
+        let transaction_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
+        let _transaction_guard = transaction_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, SERVER_CONFIG_OBJECT).await?;
         let _read_guard = namespace_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         Ok(operation().await)
@@ -427,6 +435,22 @@ where
     Ok(data)
 }
 
+pub(crate) async fn read_config_no_lock_preserve_empty_with_metadata<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(
+        api,
+        file,
+        &ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+}
+
 pub async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
 where
     S: ObjectIO<
@@ -578,12 +602,68 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
+    save_config_with_opts_inner(api, file, data, opts, true).await.map(|_| ())
+}
+
+/// Saves a configuration object without logging an error for a retryable caller-owned failure.
+pub async fn save_config_with_opts_quiet<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts_inner(api, file, data, opts, false).await.map(|_| ())
+}
+
+async fn save_config_with_opts_and_metadata<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<ObjectInfo>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts_inner(api, file, data, opts, true).await
+}
+
+async fn save_config_with_opts_inner<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    opts: &ObjectOptions,
+    log_error: bool,
+) -> Result<ObjectInfo>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let mut put_data = PutObjReader::from_vec(data);
-    if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
-        error!("save_config_with_opts: err: {:?}, file: {}", err, file);
-        return Err(err);
+    match api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
+        Ok(object_info) => Ok(object_info),
+        Err(err) => {
+            if log_error {
+                error!("save_config_with_opts: err: {:?}, file: {}", err, file);
+            }
+            Err(err)
+        }
     }
-    Ok(())
 }
 
 fn new_server_config() -> Config {
@@ -594,8 +674,12 @@ async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
+    let snapshot = read_server_config_snapshot(api.clone()).await?;
+    if snapshot.object_exists() {
+        return Ok(snapshot.config.clone());
+    }
     let cfg = new_server_config();
-    save_server_config(api, &cfg).await?;
+    save_server_config_snapshot(api, &cfg, &snapshot).await?;
 
     Ok(cfg)
 }
@@ -615,6 +699,10 @@ fn get_config_file() -> String {
 
 pub fn server_config_path() -> String {
     SERVER_CONFIG_OBJECT.to_string()
+}
+
+fn server_config_transaction_lock_path() -> String {
+    format!("{}{CONFIG_TRANSACTION_LOCK_SUFFIX}", server_config_path())
 }
 
 fn storage_class_kvs_mut(cfg: &mut Config) -> &mut KVS {
@@ -819,6 +907,9 @@ fn apply_external_scalar_config_map(
     let Some(config_value) = root.get(descriptor.subsystem_key) else {
         return Ok(false);
     };
+    if descriptor.subsystem_key == HEAL_SUB_SYS && config_value.is_null() {
+        return Ok(false);
+    }
     let overrides = decode_scalar_config_value(config_value, descriptor)?;
 
     if overrides.is_empty() {
@@ -1463,21 +1554,142 @@ fn build_audit_object(cfg: &Config) -> Map<String, Value> {
     build_target_object(cfg, &audit_target_descriptors())
 }
 
+fn sync_rendered_target_instance(existing: Value, rendered: Option<&Value>, valid_keys: &[&str]) -> Option<Value> {
+    match existing {
+        Value::Object(mut instance) => {
+            for key in valid_keys {
+                instance.remove(*key);
+            }
+            if let Some(Value::Object(rendered)) = rendered {
+                instance.extend(rendered.clone());
+            }
+            (!instance.is_empty()).then_some(Value::Object(instance))
+        }
+        Value::Array(entries) => {
+            let mut pending = rendered
+                .and_then(Value::as_object)
+                .map(|rendered| {
+                    rendered
+                        .iter()
+                        .filter_map(|(key, value)| parse_target_scalar_value(key, value).map(|value| (key.clone(), value)))
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let mut updated = Vec::with_capacity(entries.len().saturating_add(pending.len()));
+            for entry in entries {
+                let Some(entry_obj) = entry.as_object() else {
+                    updated.push(entry);
+                    continue;
+                };
+                let Some(key) = entry_obj.get("key").and_then(Value::as_str) else {
+                    updated.push(entry);
+                    continue;
+                };
+                if !valid_keys.contains(&key) {
+                    updated.push(entry);
+                    continue;
+                }
+                let Some(value) = pending.remove(key) else {
+                    continue;
+                };
+                let mut entry_obj = entry_obj.clone();
+                entry_obj.insert("value".to_string(), Value::String(value));
+                updated.push(Value::Object(entry_obj));
+            }
+            updated.extend(rendered_scalar_config_kvs_entries(&pending));
+            (!updated.is_empty()).then_some(Value::Array(updated))
+        }
+        value if rendered.is_none() => Some(value),
+        _ => rendered.cloned(),
+    }
+}
+
 fn sync_rendered_target_object(
     target_obj: &mut Map<String, Value>,
     rendered_target: &Map<String, Value>,
     descriptors: &[TargetConfigDescriptor],
 ) {
     for descriptor in descriptors {
-        match rendered_target.get(descriptor.external_key) {
-            Some(Value::Object(v)) => {
-                target_obj.insert(descriptor.external_key.to_string(), Value::Object(v.clone()));
-                target_obj.remove(descriptor.subsystem_key);
+        let existing = target_obj.remove(descriptor.external_key);
+        let alias = target_obj.remove(descriptor.subsystem_key);
+        let mut section = existing
+            .or(alias)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let rendered = rendered_target.get(descriptor.external_key).and_then(Value::as_object);
+
+        if is_target_instance_shorthand(&section, descriptor.valid_keys) {
+            let has_named_instances = rendered.is_some_and(|instances| instances.keys().any(|name| name != "default"));
+            if !has_named_instances {
+                if let Some(section) = sync_rendered_target_instance(
+                    Value::Object(section),
+                    rendered.and_then(|instances| instances.get("default")),
+                    descriptor.valid_keys,
+                ) {
+                    target_obj.insert(descriptor.external_key.to_string(), section);
+                }
+                continue;
             }
-            _ => {
-                target_obj.remove(descriptor.external_key);
-                target_obj.remove(descriptor.subsystem_key);
+
+            let mut nested = Map::new();
+            if let Some(default) = sync_rendered_target_instance(
+                Value::Object(section),
+                rendered.and_then(|instances| instances.get("default")),
+                descriptor.valid_keys,
+            ) {
+                nested.insert("default".to_string(), default);
             }
+            if let Some(rendered) = rendered {
+                for (instance_name, instance) in rendered {
+                    if instance_name != "default" {
+                        nested.insert(instance_name.clone(), instance.clone());
+                    }
+                }
+            }
+            if !nested.is_empty() {
+                target_obj.insert(descriptor.external_key.to_string(), Value::Object(nested));
+            }
+            continue;
+        }
+
+        if let Some(default_alias) = section.remove(DEFAULT_DELIMITER) {
+            if let Some(default) = section.get_mut("default") {
+                if let Some(alias) = sync_rendered_target_instance(default_alias, None, descriptor.valid_keys) {
+                    match (default, alias) {
+                        (Value::Object(default), Value::Object(alias)) => {
+                            for (key, value) in alias {
+                                default.entry(key).or_insert(value);
+                            }
+                        }
+                        (Value::Array(default), Value::Array(alias)) => default.extend(alias),
+                        _ => {}
+                    }
+                }
+            } else {
+                section.insert("default".to_string(), default_alias);
+            }
+        }
+
+        let mut merged = Map::new();
+        for (instance_name, instance) in section {
+            if let Some(instance) = sync_rendered_target_instance(
+                instance,
+                rendered.and_then(|instances| instances.get(&instance_name)),
+                descriptor.valid_keys,
+            ) {
+                merged.insert(instance_name, instance);
+            }
+        }
+        if let Some(rendered) = rendered {
+            for (instance_name, instance) in rendered {
+                if !merged.contains_key(instance_name) {
+                    merged.insert(instance_name.clone(), instance.clone());
+                }
+            }
+        }
+
+        if !merged.is_empty() {
+            target_obj.insert(descriptor.external_key.to_string(), Value::Object(merged));
         }
     }
 }
@@ -1496,6 +1708,14 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
         Some(Value::Object(v)) => v,
         _ => Map::new(),
     };
+    for key in [
+        storageclass::CLASS_STANDARD,
+        storageclass::CLASS_RRS,
+        storageclass::OPTIMIZE,
+        storageclass::INLINE_BLOCK,
+    ] {
+        sc_obj.remove(key);
+    }
     for (k, v) in build_storageclass_object(cfg) {
         sc_obj.insert(k, v);
     }
@@ -1503,7 +1723,10 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
     root.remove("storage_class");
 
     for descriptor in [scanner_config_descriptor(), heal_config_descriptor()] {
-        let existing = root.remove(descriptor.subsystem_key);
+        let mut existing = root.remove(descriptor.subsystem_key);
+        if descriptor.subsystem_key == HEAL_SUB_SYS && existing.as_ref().is_some_and(Value::is_null) {
+            existing = None;
+        }
         let rendered = build_scalar_config_object(cfg, descriptor);
         if let Some(config_value) = sync_rendered_scalar_config_value(existing, &rendered, descriptor)? {
             root.insert(descriptor.subsystem_key.to_string(), config_value);
@@ -1560,6 +1783,7 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
     matches!(root.get("version"), Some(Value::String(v)) if !v.trim().is_empty())
         && matches!(root.get("storageclass"), Some(Value::Object(_)))
         && !root.contains_key("storage_class")
+        && !matches!(root.get(HEAL_SUB_SYS), Some(Value::Null))
 }
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
@@ -1593,7 +1817,7 @@ where
             FileInfo = FileInfo,
             ObjectToDelete = ObjectToDelete,
             DeletedObject = DeletedObject,
-        >,
+        > + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
     if let Some(decrypt) = &decrypt_fn {
         register_server_config_decrypt_fn(decrypt.clone());
@@ -1601,14 +1825,7 @@ where
 
     let config_file = server_config_path();
     match api
-        .get_object_info(
-            RUSTFS_META_BUCKET,
-            &config_file,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
+        .get_object_info(RUSTFS_META_BUCKET, &config_file, &ObjectOptions::default())
         .await
     {
         Ok(_) => {
@@ -1624,7 +1841,6 @@ where
 
     let opts = ObjectOptions {
         max_parity: true,
-        no_lock: true,
         ..Default::default()
     };
 
@@ -1677,7 +1893,33 @@ where
         }
     };
 
-    match save_config(api, &config_file, normalized).await {
+    let snapshot = match read_server_config_snapshot(api.clone()).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            warn!("recheck target server config failed, skip migration: {:?}", err);
+            return;
+        }
+    };
+    if snapshot.object_exists() {
+        debug!("server config was created while legacy migration was preparing, skip migration");
+        return;
+    }
+
+    match save_config_with_opts(
+        api,
+        &config_file,
+        normalized,
+        &ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    {
         Ok(()) => {
             info!("Migrated compatible server config from legacy metadata bucket");
         }
@@ -1769,8 +2011,13 @@ where
 {
     let config_file = server_config_path();
 
-    // Try to read the configuration file
-    match read_config_no_lock(api.clone(), &config_file).await {
+    // Try to read the configuration file.
+    let data = if namespace_lock_held {
+        read_config_no_lock(api.clone(), &config_file).await
+    } else {
+        read_config(api.clone(), &config_file).await
+    };
+    match data {
         Ok(data) => read_server_config(api, &data, namespace_lock_held).await,
         Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration", namespace_lock_held).await,
         Err(err) => handle_config_read_error(err, &config_file),
@@ -1787,7 +2034,12 @@ where
         warn!("Received empty configuration data, try to reread from '{}'", config_file);
 
         // Try to read the configuration again
-        match read_config_no_lock(api.clone(), &config_file).await {
+        let data = if namespace_lock_held {
+            read_config_no_lock(api.clone(), &config_file).await
+        } else {
+            read_config(api.clone(), &config_file).await
+        };
+        match data {
             Ok(cfg_data) => {
                 let cfg = decode_persisted_server_config(&cfg_data)?;
                 return Ok(cfg.merge());
@@ -2036,11 +2288,16 @@ pub struct ServerConfigSnapshot {
     raw: Option<Vec<u8>>,
     seed: Option<Vec<u8>>,
     etag: Option<String>,
+    generation: Option<Uuid>,
     _local_guard: OwnedRwLockWriteGuard<()>,
     _guard: rustfs_lock::NamespaceLockGuard,
 }
 
 impl ServerConfigSnapshot {
+    pub fn object_exists(&self) -> bool {
+        self.raw.is_some()
+    }
+
     pub fn ensure_lock_held(&self) -> Result<()> {
         if self._guard.is_lock_lost() {
             return Err(Error::other("server config transaction lock was lost"));
@@ -2051,12 +2308,34 @@ impl ServerConfigSnapshot {
     pub fn is_lock_lost(&self) -> bool {
         self._guard.is_lock_lost()
     }
+
+    pub fn generation(&self) -> Option<Uuid> {
+        self.generation
+    }
 }
 
-/// Read a server config transaction snapshot while holding the same local and
-/// distributed write locks used by every other server-config writer. Internal
-/// reads and the later conditional write use no-lock object I/O; the guards
-/// remain live until the snapshot is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfigSaveResult {
+    persisted: bool,
+    generation: Option<Uuid>,
+}
+
+impl ServerConfigSaveResult {
+    pub fn persisted(&self) -> bool {
+        self.persisted
+    }
+
+    pub fn generation(&self) -> Option<Uuid> {
+        self.generation
+    }
+}
+
+/// Read a server config transaction snapshot while holding a dedicated
+/// transaction lock. The config object's normal namespace lock remains
+/// available to fence reads and the conditional write at commit time.
+/// The transaction guard remains live until the snapshot is dropped,
+/// serializing persistence and history ordering across admin nodes. Runtime
+/// state is reloaded from the durable object after this guard is released.
 pub async fn read_server_config_snapshot<S>(api: Arc<S>) -> Result<ServerConfigSnapshot>
 where
     S: ObjectIO<
@@ -2071,12 +2350,10 @@ where
 {
     let config_file = server_config_path();
     let local_guard = SERVER_CONFIG_LOCK.clone().write_owned().await;
-    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &config_file).await?;
+    let transaction_lock = server_config_transaction_lock_path();
+    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
     let guard = lock.get_write_lock(get_lock_acquire_timeout()).await?;
-    let read_options = ObjectOptions {
-        no_lock: true,
-        ..Default::default()
-    };
+    let read_options = ObjectOptions::default();
     match read_config_with_metadata_inner(api, &config_file, &read_options, true).await {
         Ok((raw, object_info)) => {
             let (config, seed) = decode_persisted_server_config_with_seed(&raw)?;
@@ -2085,6 +2362,7 @@ where
                 raw: Some(raw),
                 seed: Some(seed),
                 etag: object_info.etag,
+                generation: object_info.data_dir.filter(|generation| !generation.is_nil()),
                 _local_guard: local_guard,
                 _guard: guard,
             })
@@ -2094,6 +2372,7 @@ where
             raw: None,
             seed: None,
             etag: None,
+            generation: None,
             _local_guard: local_guard,
             _guard: guard,
         }),
@@ -2119,6 +2398,27 @@ where
             PutObjectReader = PutObjReader,
         > + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
+    save_server_config_snapshot_with_generation(api, cfg, snapshot)
+        .await
+        .map(|result| result.persisted())
+}
+
+pub async fn save_server_config_snapshot_with_generation<S>(
+    api: Arc<S>,
+    cfg: &Config,
+    snapshot: &ServerConfigSnapshot,
+) -> Result<ServerConfigSaveResult>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+{
     snapshot.ensure_lock_held()?;
     let config_file = server_config_path();
     if let Some(seed) = snapshot.seed.as_deref()
@@ -2126,13 +2426,19 @@ where
         && configs_semantically_equal(&snapshot.config, cfg)
     {
         debug!("server config unchanged and already in standard object shape, skip write");
-        return Ok(false);
+        return Ok(ServerConfigSaveResult {
+            persisted: false,
+            generation: snapshot.generation(),
+        });
     }
 
     let data = encode_server_config_blob(cfg, snapshot.seed.as_deref())?;
     if snapshot.raw.as_deref().is_some_and(|current| current == data.as_slice()) {
         debug!("server config bytes unchanged after encode, skip write");
-        return Ok(false);
+        return Ok(ServerConfigSaveResult {
+            persisted: false,
+            generation: snapshot.generation(),
+        });
     }
 
     let http_preconditions = if snapshot.raw.is_some() {
@@ -2152,19 +2458,22 @@ where
         }
     };
 
-    save_config_with_opts(
+    snapshot.ensure_lock_held()?;
+    let object_info = save_config_with_opts_and_metadata(
         api,
         &config_file,
         data,
         &ObjectOptions {
             max_parity: true,
-            no_lock: true,
             http_preconditions: Some(http_preconditions),
             ..Default::default()
         },
     )
     .await?;
-    Ok(true)
+    Ok(ServerConfigSaveResult {
+        persisted: true,
+        generation: object_info.data_dir.filter(|generation| !generation.is_nil()),
+    })
 }
 
 /// Saves the server config while an upper layer holds the namespace write
@@ -2301,8 +2610,10 @@ mod tests {
     use super::{
         SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error,
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        lookup_configs, read_config, read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate,
-        read_server_config_snapshot, save_server_config, save_server_config_snapshot, server_config_path, storage_class_kvs_mut,
+        lookup_configs, new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata,
+        read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
+        save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+        server_config_transaction_lock_path, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::endpoint::Endpoint;
@@ -2311,7 +2622,9 @@ mod tests {
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::runtime::sources as runtime_sources;
     use crate::set_disk::SetDisks;
-    use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, range::HTTPRangeSpec};
+    use crate::storage_api_contracts::{
+        admin::StorageAdminApi, namespace::NamespaceLocking as _, object::HTTPPreconditions, range::HTTPRangeSpec,
+    };
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{
@@ -3105,6 +3418,85 @@ mod tests {
     }
 
     #[test]
+    fn root_heal_null_decodes_as_no_override_and_is_canonicalized_on_save() {
+        let seed = br#"{
+          "version":"33",
+          "storageclass":{"standard":"","rrs":""},
+          "heal":null,
+          "future_root":{"mode":"keep"},
+          "openid":{"default":{
+            "config_url":"https://issuer.example/.well-known/openid-configuration",
+            "client_id":"console",
+            "client_secret":"oidc-secret",
+            "future_provider_control":"keep"
+          }},
+          "notify":{"webhook":{"primary":{
+            "enable":true,
+            "endpoint":"https://notify.example/hook",
+            "auth_token":"notify-secret",
+            "future_notify_control":"keep"
+          }}},
+          "logger":{"webhook":{"primary":{
+            "enable":true,
+            "endpoint":"https://audit.example/hook",
+            "auth_token":"audit-secret",
+            "future_audit_control":"keep"
+          }}}
+        }"#;
+
+        let cfg = decode_server_config_blob(seed).expect("root heal null should mean no persisted override");
+        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_none());
+        assert!(!is_standard_object_server_config(seed));
+
+        let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("legacy seed should canonicalize on an authorized save");
+        let value: Value = serde_json::from_slice(&encoded).expect("canonical config should be valid JSON");
+        assert!(value.get(HEAL_SUB_SYS).is_none());
+        assert_eq!(value["future_root"]["mode"].as_str(), Some("keep"));
+        assert_eq!(value["openid"]["default"]["client_secret"].as_str(), Some("oidc-secret"));
+        assert_eq!(value["openid"]["default"]["future_provider_control"].as_str(), Some("keep"));
+        assert_eq!(value["notify"]["webhook"]["primary"]["auth_token"].as_str(), Some("notify-secret"));
+        assert_eq!(value["notify"]["webhook"]["primary"]["future_notify_control"].as_str(), Some("keep"));
+        assert_eq!(value["logger"]["webhook"]["primary"]["auth_token"].as_str(), Some("audit-secret"));
+        assert_eq!(value["logger"]["webhook"]["primary"]["future_audit_control"].as_str(), Some("keep"));
+        assert!(is_standard_object_server_config(&encoded));
+    }
+
+    #[test]
+    fn invalid_scalar_and_nested_null_config_shapes_remain_rejected() {
+        let invalid_sections = [
+            r#""scanner":null"#,
+            r#""heal":"""#,
+            r#""heal":false"#,
+            r#""heal":0"#,
+            r#""heal":{"default":null}"#,
+            r#""heal":{"_":null}"#,
+            r#""heal":{"bitrot_cycle":null}"#,
+            r#""heal":[{"key":"bitrot_cycle","value":null}]"#,
+        ];
+
+        for section in invalid_sections {
+            let input = format!(r#"{{"version":"33","storageclass":{{"standard":"","rrs":""}},{section}}}"#);
+            let err = decode_server_config_blob(input.as_bytes()).expect_err("invalid scalar shape must remain rejected");
+            assert!(
+                err.to_string().contains("expected"),
+                "invalid section {section} returned an unrelated error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_heal_object_and_kvs_array_shapes_remain_accepted() {
+        let empty_object = br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":{}}"#;
+        let cfg = decode_server_config_blob(empty_object).expect("empty heal object should decode as no override");
+        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_none());
+
+        let kvs_array =
+            br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":[{"key":"bitrot_cycle","value":"off"}]}"#;
+        let cfg = decode_server_config_blob(kvs_array).expect("heal KVS array should decode");
+        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_some());
+    }
+
+    #[test]
     fn scanner_update_preserves_unknown_root_and_oidc_provider_fields() {
         let seed = br#"{
           "version":"33",
@@ -3129,6 +3521,171 @@ mod tests {
         assert_eq!(value["future_root"]["mode"].as_str(), Some("keep"));
         assert_eq!(value["openid"]["default"]["future_provider_control"].as_str(), Some("keep"));
         assert_eq!(value["openid"]["default"]["client_id"].as_str(), Some("console"));
+    }
+
+    #[test]
+    fn storageclass_reset_removes_stale_inline_block_from_seed() {
+        let seed = br#"{
+          "version":"33",
+          "storageclass":{
+            "standard":"EC:2",
+            "rrs":"EC:1",
+            "optimize":"availability",
+            "inline_block":"64KiB",
+            "future_storage_control":"keep"
+          }
+        }"#;
+
+        let encoded = encode_server_config_blob(&Config::new(), Some(seed)).expect("storageclass reset should encode");
+        let value: Value = serde_json::from_slice(&encoded).expect("encoded config should be valid json");
+        let storageclass = value["storageclass"].as_object().expect("storageclass object");
+
+        assert!(storageclass.get(crate::config::storageclass::INLINE_BLOCK).is_none());
+        assert_eq!(storageclass["future_storage_control"].as_str(), Some("keep"));
+    }
+
+    #[test]
+    fn target_update_preserves_unknown_fields_without_restoring_removed_instances() {
+        let seed = br#"{
+          "version":"33",
+          "storageclass":{"standard":"","rrs":""},
+          "notify":{"webhook":{
+            "primary":{
+              "enable":true,
+              "endpoint":"https://notify.example/old",
+              "auth_token":"notify-secret",
+              "future_control":"keep"
+            },
+            "removed":{"enable":true,"endpoint":"https://notify.example/removed"},
+            "retained":{"enable":true,"endpoint":"https://notify.example/retained","future_control":"keep"},
+            "enable":{"enable":true,"endpoint":"https://notify.example/named-enable","future_control":"keep"}
+          }}
+        }"#;
+        let mut cfg = decode_server_config_blob(seed).expect("target seed should decode");
+        let webhook = cfg
+            .0
+            .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+            .expect("notify webhook subsystem should exist");
+        webhook
+            .get_mut("primary")
+            .expect("primary target should exist")
+            .insert(rustfs_config::WEBHOOK_ENDPOINT.to_string(), "https://notify.example/new".to_string());
+        webhook.remove("removed");
+        webhook.remove("retained");
+
+        let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("target update should encode");
+        let value: Value = serde_json::from_slice(&encoded).expect("encoded config should be valid json");
+        let webhook = value["notify"]["webhook"].as_object().expect("webhook section");
+
+        assert_eq!(webhook["primary"]["endpoint"].as_str(), Some("https://notify.example/new"));
+        assert_eq!(webhook["primary"]["auth_token"].as_str(), Some("notify-secret"));
+        assert_eq!(webhook["primary"]["future_control"].as_str(), Some("keep"));
+        assert!(webhook.get("removed").is_none());
+        assert_eq!(webhook["retained"]["future_control"].as_str(), Some("keep"));
+        assert!(webhook["retained"].get("enable").is_none());
+        assert!(webhook["retained"].get("endpoint").is_none());
+        assert_eq!(webhook["enable"]["endpoint"].as_str(), Some("https://notify.example/named-enable"));
+        assert_eq!(webhook["enable"]["future_control"].as_str(), Some("keep"));
+    }
+
+    #[test]
+    fn shorthand_target_update_preserves_shape_and_unknown_nested_fields() {
+        let seed = br#"{
+          "version":"33",
+          "storageclass":{"standard":"","rrs":""},
+          "notify":{"webhook":{
+            "enable":true,
+            "endpoint":"https://notify.example/old",
+            "future_control":{"endpoint":"leave-untouched","mode":"keep"}
+          }}
+        }"#;
+        let mut cfg = decode_server_config_blob(seed).expect("shorthand target should decode");
+        cfg.0
+            .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+            .and_then(|targets| targets.get_mut(DEFAULT_DELIMITER))
+            .expect("default webhook target should exist")
+            .insert(rustfs_config::WEBHOOK_ENDPOINT.to_string(), "https://notify.example/new".to_string());
+
+        let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("shorthand target update should encode");
+        let value: Value = serde_json::from_slice(&encoded).expect("encoded config should be valid json");
+        let webhook = value["notify"]["webhook"].as_object().expect("webhook shorthand object");
+
+        assert_eq!(webhook["endpoint"].as_str(), Some("https://notify.example/new"));
+        assert!(webhook.get("default").is_none());
+        assert_eq!(webhook["future_control"]["endpoint"].as_str(), Some("leave-untouched"));
+        assert_eq!(webhook["future_control"]["mode"].as_str(), Some("keep"));
+        let decoded = decode_server_config_blob(&encoded).expect("updated shorthand target should remain decodable");
+        assert_eq!(
+            decoded
+                .get_value(NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+                .expect("updated default webhook target")
+                .get(rustfs_config::WEBHOOK_ENDPOINT),
+            "https://notify.example/new"
+        );
+    }
+
+    #[test]
+    fn target_kvs_update_preserves_unknown_entries_and_attributes() {
+        let seed = br#"{
+          "version":"33",
+          "storageclass":{"standard":"","rrs":""},
+          "notify":{"webhook":{"primary":[
+            {"key":"enable","value":"on","hidden_if_empty":false},
+            {"key":"endpoint","value":"https://notify.example/old","future_attribute":"keep-endpoint"},
+            {"key":"future_control","value":"keep","future_attribute":"keep-control"}
+          ]}}
+        }"#;
+        let mut cfg = decode_server_config_blob(seed).expect("target KVS seed should decode");
+        cfg.0
+            .get_mut(NOTIFY_WEBHOOK_SUB_SYS)
+            .and_then(|targets| targets.get_mut("primary"))
+            .expect("primary webhook target should exist")
+            .insert(rustfs_config::WEBHOOK_ENDPOINT.to_string(), "https://notify.example/new".to_string());
+
+        let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("target KVS update should encode");
+        let value: Value = serde_json::from_slice(&encoded).expect("encoded config should be valid json");
+        let entries = value["notify"]["webhook"]["primary"]
+            .as_array()
+            .expect("target KVS shape should be preserved");
+        let endpoint = entries
+            .iter()
+            .find(|entry| entry["key"].as_str() == Some(rustfs_config::WEBHOOK_ENDPOINT))
+            .expect("endpoint entry should remain");
+        let future = entries
+            .iter()
+            .find(|entry| entry["key"].as_str() == Some("future_control"))
+            .expect("unknown target entry should remain");
+
+        assert_eq!(endpoint["value"].as_str(), Some("https://notify.example/new"));
+        assert_eq!(endpoint["future_attribute"].as_str(), Some("keep-endpoint"));
+        assert_eq!(future["value"].as_str(), Some("keep"));
+        assert_eq!(future["future_attribute"].as_str(), Some("keep-control"));
+    }
+
+    #[test]
+    fn target_default_alias_is_canonicalized_without_losing_unknown_fields() {
+        let seed = br#"{
+          "version":"33",
+          "storageclass":{"standard":"","rrs":""},
+          "notify":{"webhook":{
+            "_":{"enable":false,"endpoint":"https://notify.example/alias","future_alias":"keep"},
+            "default":{"enable":true,"endpoint":"https://notify.example/default","future_default":"keep"}
+          }}
+        }"#;
+        let cfg = decode_server_config_blob(seed).expect("dual default aliases should decode");
+        let expected_endpoint = cfg
+            .get_value(NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("default webhook target should exist")
+            .get(rustfs_config::WEBHOOK_ENDPOINT);
+
+        let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("default alias should canonicalize");
+        let value: Value = serde_json::from_slice(&encoded).expect("encoded config should be valid json");
+        let webhook = value["notify"]["webhook"].as_object().expect("webhook section");
+
+        assert!(webhook.get(DEFAULT_DELIMITER).is_none());
+        assert_eq!(webhook["default"]["endpoint"].as_str(), Some(expected_endpoint.as_str()));
+        assert_eq!(webhook["default"]["future_alias"].as_str(), Some("keep"));
+        assert_eq!(webhook["default"]["future_default"].as_str(), Some("keep"));
     }
 
     #[test]
@@ -4124,6 +4681,7 @@ mod tests {
 
     /// What reads of the config object currently return.
     enum RecoveryReadState {
+        Missing,
         Blob(Vec<u8>),
         QuorumError,
     }
@@ -4136,6 +4694,7 @@ mod tests {
         heal_calls: AtomicUsize,
         write_calls: AtomicUsize,
         last_put_no_lock: AtomicBool,
+        last_put_preconditions: Mutex<Option<HTTPPreconditions>>,
         revision: AtomicUsize,
         drive_counts: Vec<usize>,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
@@ -4150,6 +4709,7 @@ mod tests {
                 heal_calls: AtomicUsize::new(0),
                 write_calls: AtomicUsize::new(0),
                 last_put_no_lock: AtomicBool::new(false),
+                last_put_preconditions: Mutex::new(None),
                 revision: AtomicUsize::new(1),
                 drive_counts: vec![2],
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
@@ -4206,6 +4766,7 @@ mod tests {
             _opts: &ObjectOptions,
         ) -> Result<GetObjectReader> {
             let data = match &*self.state.lock().expect("state lock poisoned") {
+                RecoveryReadState::Missing => return Err(Error::ConfigNotFound),
                 RecoveryReadState::Blob(data) => data.clone(),
                 RecoveryReadState::QuorumError => return Err(Error::ErasureReadQuorum),
             };
@@ -4213,6 +4774,9 @@ mod tests {
                 size: data.len() as i64,
                 actual_size: data.len() as i64,
                 etag: Some(format!("config-{}", self.revision.load(Ordering::SeqCst))),
+                data_dir: Some(uuid::Uuid::from_u128(
+                    u128::try_from(self.revision.load(Ordering::SeqCst)).expect("test revision should fit in u128"),
+                )),
                 ..Default::default()
             };
             Ok(GetObjectReader {
@@ -4231,15 +4795,19 @@ mod tests {
             opts: &ObjectOptions,
         ) -> Result<ObjectInfo> {
             let current_etag = format!("config-{}", self.revision.load(Ordering::SeqCst));
+            let object_exists = matches!(&*self.state.lock().expect("state lock poisoned"), RecoveryReadState::Blob(_));
             if let Some(preconditions) = &opts.http_preconditions
-                && (preconditions.if_match_value().is_some_and(|etag| etag != current_etag)
-                    || preconditions.if_none_match_value() == Some("*"))
+                && (preconditions
+                    .if_match_value()
+                    .is_some_and(|etag| !object_exists || etag != current_etag)
+                    || (object_exists && preconditions.if_none_match_value() == Some("*")))
             {
                 return Err(Error::PreconditionFailed);
             }
             let mut body = Vec::new();
             data.stream.read_to_end(&mut body).await?;
             self.last_put_no_lock.store(opts.no_lock, Ordering::SeqCst);
+            *self.last_put_preconditions.lock().expect("preconditions lock poisoned") = opts.http_preconditions.clone();
             self.write_calls.fetch_add(1, Ordering::SeqCst);
             *self.state.lock().expect("state lock poisoned") = RecoveryReadState::Blob(body.clone());
             let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4247,6 +4815,7 @@ mod tests {
                 size: i64::try_from(body.len()).expect("test config should fit in i64"),
                 actual_size: i64::try_from(body.len()).expect("test config should fit in i64"),
                 etag: Some(format!("config-{revision}")),
+                data_dir: Some(uuid::Uuid::from_u128(u128::try_from(revision).expect("test revision should fit in u128"))),
                 ..Default::default()
             })
         }
@@ -4284,10 +4853,18 @@ mod tests {
             .expect("scanner-only config change should be persisted");
 
         assert_eq!(store.write_calls.load(Ordering::SeqCst), 1);
-        assert!(store.last_put_no_lock.load(Ordering::SeqCst));
+        assert!(!store.last_put_no_lock.load(Ordering::SeqCst));
+        let preconditions = store
+            .last_put_preconditions
+            .lock()
+            .expect("preconditions lock poisoned")
+            .clone()
+            .expect("existing config update must be conditional");
+        assert_eq!(preconditions.if_match_value(), Some("config-1"));
+        assert_eq!(preconditions.if_none_match_value(), None);
         assert_eq!(
             store.lock_resources.lock().expect("lock resources mutex poisoned").as_slice(),
-            &[server_config_path()]
+            &[server_config_transaction_lock_path()]
         );
         let decoded = read_config_without_migrate(store)
             .await
@@ -4298,6 +4875,73 @@ mod tests {
                 .expect("persisted config should contain scanner settings")
                 .get(SCANNER_CYCLE),
             "61"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_config_snapshot_save_returns_committed_generation() {
+        let baseline = encode_server_config_blob(&Config::new(), None).expect("baseline config should encode");
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline), None));
+        let snapshot = read_server_config_snapshot(store.clone())
+            .await
+            .expect("server config snapshot");
+
+        let result = save_server_config_snapshot_with_generation(store, &config_with_scanner_cycle("61"), &snapshot)
+            .await
+            .expect("conditional config save");
+
+        assert!(result.persisted());
+        assert_eq!(result.generation(), Some(uuid::Uuid::from_u128(2)));
+    }
+
+    #[tokio::test]
+    async fn missing_server_config_is_created_with_if_none_match() {
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Missing, None));
+        let cfg = config_with_scanner_cycle("61");
+
+        save_server_config(store.clone(), &cfg)
+            .await
+            .expect("missing config should be created conditionally");
+
+        assert_eq!(store.write_calls.load(Ordering::SeqCst), 1);
+        assert!(!store.last_put_no_lock.load(Ordering::SeqCst));
+        let preconditions = store
+            .last_put_preconditions
+            .lock()
+            .expect("preconditions lock poisoned")
+            .clone()
+            .expect("missing config create must be conditional");
+        assert_eq!(preconditions.if_match_value(), None);
+        assert_eq!(preconditions.if_none_match_value(), Some("*"));
+        let persisted = read_config_without_migrate(store)
+            .await
+            .expect("created config should reload");
+        assert_eq!(
+            persisted
+                .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                .expect("persisted scanner config")
+                .get(SCANNER_CYCLE),
+            "61"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_config_initialization_recheck_preserves_concurrent_config() {
+        let existing = config_with_scanner_cycle("73");
+        let baseline = encode_server_config_blob(&existing, None).expect("existing config should encode");
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline), None));
+
+        let observed = new_and_save_server_config(store.clone())
+            .await
+            .expect("initialization recheck should return the config created by another writer");
+
+        assert_eq!(store.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observed
+                .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                .expect("concurrent scanner config")
+                .get(SCANNER_CYCLE),
+            "73"
         );
     }
 
@@ -4357,7 +5001,7 @@ mod tests {
         let lock = rustfs_lock::NamespaceLock::new("server-config-lease-loss".to_string(), client.clone());
         let guard = lock
             .lock_guard(
-                rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, server_config_path()),
+                rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, server_config_transaction_lock_path()),
                 "server-config-lease-loss",
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_millis(120),
@@ -4372,6 +5016,7 @@ mod tests {
             raw: Some(baseline.clone()),
             seed: None,
             etag: Some("config-0".to_string()),
+            generation: Some(uuid::Uuid::from_u128(1)),
             _local_guard: local_guard,
             _guard: guard,
         };
@@ -4399,9 +5044,14 @@ mod tests {
             .expect_err("the existing config contract treats empty objects as missing");
         assert!(matches!(err, Error::ConfigNotFound));
 
-        let data = read_config_preserve_empty(store, "config/empty.json")
+        let data = read_config_preserve_empty(store.clone(), "config/empty.json")
             .await
             .expect("payload-validating callers must observe the empty object");
+        assert!(data.is_empty());
+
+        let (data, _) = read_config_no_lock_preserve_empty_with_metadata(store, "config/empty.json")
+            .await
+            .expect("no-lock payload-validating callers must observe the empty object");
         assert!(data.is_empty());
     }
 

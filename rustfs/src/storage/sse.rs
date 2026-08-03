@@ -74,6 +74,7 @@ use super::storage_api::ecstore_object::{
     EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
     ReadEncryptionMode, ReadEncryptionRequest,
 };
+use crate::storage::access::{ReqInfo, request_context_from_req, resource_free_condition_values};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -92,15 +93,20 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
+use rustfs_config::{DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY, ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY};
 use rustfs_kms::{DataKey, KmsUnavailableError, is_data_key_envelope, types::ObjectEncryptionContext};
-use rustfs_utils::get_env_opt_str;
+use rustfs_policy::policy::Args;
+use rustfs_policy::policy::action::{Action, KmsAction};
+use rustfs_utils::{get_env_bool, get_env_opt_str};
 use s3s::S3ErrorCode;
+use s3s::S3Request;
 use s3s::dto::ServerSideEncryption;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 #[cfg(feature = "rio-v2")]
 use sha2::Sha256;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
@@ -428,6 +434,8 @@ pub struct EncryptionRequest<'a> {
     pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     /// Content size (for metadata)
     pub content_size: i64,
+    /// Caller the SSE-KMS key usage is authorized as. `None` marks an internal caller.
+    pub principal: Option<&'a SseKmsPrincipal>,
 }
 
 impl EncryptionRequest<'_> {
@@ -729,6 +737,8 @@ pub struct DecryptionRequest<'a> {
     pub sse_customer_key: Option<&'a SSECustomerKey>,
     /// SSE-C key MD5 (Base64-encoded) - required if object was encrypted with SSE-C
     pub sse_customer_key_md5: Option<&'a SSECustomerKeyMD5>,
+    /// Caller the SSE-KMS key usage is authorized as. `None` marks an internal caller.
+    pub principal: Option<&'a SseKmsPrincipal>,
 }
 
 /// Encryption material returned by `sse_encryption()` / `sse_prepare_encryption()`.
@@ -790,10 +800,518 @@ pub enum SSEType {
     SseC,
 }
 
+impl SSEType {
+    /// Stable scheme name for audit consumers.
+    fn audit_label(self) -> &'static str {
+        match self {
+            SSEType::SseS3 => "SSE-S3",
+            SSEType::SseKms => "SSE-KMS",
+            SSEType::SseC => "SSE-C",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionKeyKind {
     Direct,
     Object,
+}
+
+// ============================================================================
+// Per-key KMS authorization (SSE-KMS data path)
+// ============================================================================
+
+/// Identity a data-path KMS key operation is attributed to.
+///
+/// Only requests that crossed the S3 authorization boundary carry one. Internal
+/// callers — replication, lifecycle transition, heal, scanner — enter the object
+/// layer directly and run with server credentials, so they never build a principal
+/// and are exempt by construction; `None` therefore means "system principal".
+#[derive(Debug, Clone)]
+pub struct SseKmsPrincipal {
+    account: String,
+    groups: Option<Vec<String>>,
+    is_owner: bool,
+    claims: HashMap<String, Value>,
+    conditions: HashMap<String, Vec<String>>,
+    /// Audit slot of the S3 request this principal was built for, when the request
+    /// is being audited. The principal is the only request-derived value that reaches
+    /// the managed-SSE code paths, so it doubles as the carrier for the slot.
+    request_audit: Option<Arc<KmsRequestAudit>>,
+    /// Test-only decision overrides. Carried per principal rather than in a global slot so
+    /// concurrent tests cannot observe each other's injection.
+    #[cfg(test)]
+    test_hooks: Option<TestAuthorizationHooks>,
+}
+
+impl SseKmsPrincipal {
+    /// Build a principal from an authenticated S3 request.
+    ///
+    /// Returns `None` for unauthenticated requests: an anonymous caller has no identity
+    /// policy to evaluate, and denying it outright would break public buckets holding
+    /// SSE-KMS objects. Such requests remain governed by bucket policy alone.
+    pub(crate) fn from_request<T>(req: &S3Request<T>) -> Option<Self> {
+        let req_info = req.extensions.get::<ReqInfo>()?;
+        let cred = req_info.cred.as_ref()?;
+
+        Some(Self {
+            account: cred.access_key.clone(),
+            groups: cred.groups.clone(),
+            is_owner: req_info.is_owner,
+            claims: cred.claims_or_empty().clone(),
+            conditions: resource_free_condition_values(req, cred),
+            request_audit: request_context_from_req(req).and_then(|context| kms_request_audit(&context.request_id)),
+            #[cfg(test)]
+            test_hooks: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(account: &str, enforced: bool, authorizer: Arc<dyn KmsKeyAuthorizer>) -> Self {
+        Self {
+            account: account.to_string(),
+            groups: None,
+            is_owner: false,
+            claims: HashMap::new(),
+            conditions: HashMap::new(),
+            request_audit: None,
+            test_hooks: Some(TestAuthorizationHooks { enforced, authorizer }),
+        }
+    }
+
+    /// Bind this principal to `audit` so managed-SSE operations performed for it are
+    /// summarised onto the request's S3 audit entry.
+    #[cfg(test)]
+    fn with_request_audit(mut self, audit: Arc<KmsRequestAudit>) -> Self {
+        self.request_audit = Some(audit);
+        self
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestAuthorizationHooks {
+    enforced: bool,
+    authorizer: Arc<dyn KmsKeyAuthorizer>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestAuthorizationHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestAuthorizationHooks")
+            .field("enforced", &self.enforced)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Decides whether a principal may use a specific KMS key on the data path.
+///
+/// Behind a trait so tests can pin the allow/deny contract of the SSE call sites
+/// without a running IAM subsystem.
+#[async_trait]
+pub(crate) trait KmsKeyAuthorizer: Send + Sync {
+    async fn is_allowed(&self, principal: &SseKmsPrincipal, action: KmsAction, key_id: &str) -> Result<bool, ApiError>;
+}
+
+struct IamKmsKeyAuthorizer;
+
+#[async_trait]
+impl KmsKeyAuthorizer for IamKmsKeyAuthorizer {
+    async fn is_allowed(&self, principal: &SseKmsPrincipal, action: KmsAction, key_id: &str) -> Result<bool, ApiError> {
+        let iam_store = runtime_sources::current_ready_iam_handle()
+            .map_err(|err| ApiError::from(StorageError::other(format!("KMS key authorization requires IAM: {err:?}"))))?;
+
+        Ok(iam_store
+            .is_allowed(&Args {
+                account: &principal.account,
+                groups: &principal.groups,
+                action: Action::KmsAction(action),
+                // Call-site contract of `Statement::kms_key_scope_matches`: the requested key
+                // identifier travels in `object` with `bucket` left empty.
+                bucket: "",
+                object: key_id,
+                conditions: &principal.conditions,
+                is_owner: principal.is_owner,
+                claims: &principal.claims,
+                deny_only: false,
+            })
+            .await)
+    }
+}
+
+fn kms_key_authorizer(principal: &SseKmsPrincipal) -> Arc<dyn KmsKeyAuthorizer> {
+    #[cfg(test)]
+    if let Some(hooks) = principal.test_hooks.as_ref() {
+        return hooks.authorizer.clone();
+    }
+    #[cfg(not(test))]
+    let _ = principal;
+
+    static DEFAULT: LazyLock<Arc<dyn KmsKeyAuthorizer>> = LazyLock::new(|| Arc::new(IamKmsKeyAuthorizer));
+    DEFAULT.clone()
+}
+
+/// Whether per-key KMS authorization is enforced on the SSE-KMS data path.
+fn sse_kms_key_policy_enforced(principal: Option<&SseKmsPrincipal>) -> bool {
+    #[cfg(test)]
+    if let Some(hooks) = principal.and_then(|candidate| candidate.test_hooks.as_ref()) {
+        return hooks.enforced;
+    }
+    #[cfg(not(test))]
+    let _ = principal;
+
+    static ENFORCED: LazyLock<bool> =
+        LazyLock::new(|| get_env_bool(ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY, DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY));
+    *ENFORCED
+}
+
+/// Report the configured SSE-KMS authorization mode once, at startup.
+///
+/// The disabled case warns rather than logs: it is the compatibility default for this
+/// release only, and operators need the lead time to grant the kms actions before the
+/// default flips.
+pub(crate) fn log_sse_kms_key_policy_mode() {
+    if sse_kms_key_policy_enforced(None) {
+        tracing::info!(
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_SSE,
+            event = "sse_kms_key_policy_mode",
+            enforced = true,
+            "SSE-KMS requests are authorized against the resolved KMS key (kms:GenerateDataKey / kms:Decrypt)"
+        );
+        return;
+    }
+
+    tracing::warn!(
+        component = LOG_COMPONENT_STORAGE,
+        subsystem = LOG_SUBSYSTEM_SSE,
+        event = "sse_kms_key_policy_mode",
+        enforced = false,
+        "SSE-KMS requests are not authorized against the KMS key they name; any identity allowed to \
+         write an object may encrypt it under any key, and any identity allowed to read it may have it \
+         decrypted. Grant kms:GenerateDataKey and kms:Decrypt on the keys your workloads use, then set \
+         {ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY}=true. A later release defaults this to enabled."
+    );
+}
+
+/// The principal whose KMS key permissions this operation must satisfy, if any.
+///
+/// Scoping is limited to SSE-KMS, matching AWS: SSE-S3 wraps its data key with a
+/// server-owned key the caller never names, and SSE-C never reaches KMS at all.
+fn kms_authorization_subject(enforced: bool, principal: Option<&SseKmsPrincipal>, sse_type: SSEType) -> Option<&SseKmsPrincipal> {
+    if !enforced || !matches!(sse_type, SSEType::SseKms) {
+        return None;
+    }
+
+    principal
+}
+
+/// Authorize `action` against `key_id` for the caller behind this SSE operation.
+///
+/// Runs before the key is used, so a denied request cannot distinguish an unauthorized
+/// key from a disabled or pending-deletion one.
+async fn authorize_sse_kms_key(
+    principal: Option<&SseKmsPrincipal>,
+    sse_type: SSEType,
+    action: KmsAction,
+    key_id: &str,
+) -> Result<(), ApiError> {
+    let Some(principal) = kms_authorization_subject(sse_kms_key_policy_enforced(principal), principal, sse_type) else {
+        return Ok(());
+    };
+
+    if kms_key_authorizer(principal).is_allowed(principal, action, key_id).await? {
+        return Ok(());
+    }
+
+    debug!(
+        component = LOG_COMPONENT_STORAGE,
+        subsystem = LOG_SUBSYSTEM_SSE,
+        event = "sse_kms_key_authorization_denied",
+        account = %principal.account,
+        action = ?action,
+        "Principal is not authorized for the KMS key resolved for this request"
+    );
+
+    Err(ApiError {
+        code: S3ErrorCode::AccessDenied,
+        message: "Access Denied".to_string(),
+        source: None,
+    })
+}
+
+/// Authorize `kms:Decrypt` for an object whose stored encryption material is unwrapped
+/// outside [`sse_decryption`].
+///
+/// The copy-source read resolves its material inside the object layer, which has no
+/// request identity, so the S3 layer has to run the check itself.
+pub async fn authorize_sse_kms_object_read(
+    principal: Option<&SseKmsPrincipal>,
+    metadata: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) else {
+        return Ok(());
+    };
+
+    let result = authorize_sse_kms_key(principal, sse_type, KmsAction::DecryptAction, &key_id).await;
+    // Only a denial is recorded here: an allowed read goes on to unwrap the key,
+    // and that operation reports its own outcome.
+    if let Err(error) = &result {
+        record_managed_kms_outcome(principal, sse_type, Some(&key_id), Err(error));
+    }
+
+    result
+}
+
+/// Resolve the scheme and KMS key a stored managed-SSE object was wrapped with.
+///
+/// Mirrors the lookup `apply_managed_decryption_material` performs, so both agree on
+/// which key a read is authorized against.
+fn stored_managed_encryption_key(metadata: &HashMap<String, String>) -> Option<(SSEType, String)> {
+    if !contains_managed_encryption_metadata(metadata) {
+        return None;
+    }
+
+    let sse_type = match metadata.get("x-amz-server-side-encryption")?.as_str() {
+        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
+        _ => SSEType::SseS3,
+    };
+    let key_id = normalize_managed_metadata(metadata)
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    Some((sse_type, key_id))
+}
+
+// ============================================================================
+// Data-plane KMS audit attachment (SSE-S3 / SSE-KMS)
+// ============================================================================
+
+/// Tag keys carrying the KMS summary on an S3 audit entry.
+///
+/// Audit consumers key off these strings, so they are a wire contract: append
+/// new keys rather than renaming existing ones.
+const KMS_AUDIT_TAG_SSE_TYPE: &str = "sseType";
+const KMS_AUDIT_TAG_KEY_ID: &str = "kmsKeyId";
+const KMS_AUDIT_TAG_KEY_VERSION: &str = "kmsKeyVersion";
+const KMS_AUDIT_TAG_OUTCOME: &str = "kmsOutcome";
+const KMS_AUDIT_TAG_ERROR_CLASS: &str = "kmsErrorClass";
+
+/// Separator for the rare request that touched more than one key or scheme.
+const KMS_AUDIT_VALUE_SEPARATOR: &str = ",";
+
+/// What the data path did with KMS while serving one S3 request.
+///
+/// This rides on the request's existing S3 audit entry instead of becoming its
+/// own event: the entry already carries the principal, request ID and API, so
+/// attaching the KMS outcome costs no extra event volume and needs no second
+/// correlation key.
+///
+/// # Redaction
+///
+/// Only the fields below may ever be recorded. The S3 audit entry fans out to
+/// every configured target, several of which sit outside the KMS trust
+/// boundary, so nothing derived from a data key — plaintext, ciphertext,
+/// envelope, nonce — nor any caller-supplied encryption-context value belongs
+/// here. Key identifiers and scheme names are configuration, not secrets.
+#[derive(Debug, Default)]
+struct KmsRequestAuditState {
+    sse_types: BTreeSet<&'static str>,
+    key_ids: BTreeSet<String>,
+    key_versions: BTreeSet<u32>,
+    /// Set by the first failure. A request that failed any KMS interaction is
+    /// reported as failed even if others succeeded: a partially completed
+    /// envelope operation is not a success for an audit reader.
+    error_class: Option<&'static str>,
+    recorded: bool,
+}
+
+/// Shared accumulator for one request's KMS summary.
+///
+/// Written by the managed-SSE code paths through the request's principal, read
+/// once by the [`OperationHelper`](crate::storage::helper::OperationHelper) that
+/// owns the request's audit entry.
+#[derive(Debug, Default)]
+pub(crate) struct KmsRequestAudit(Mutex<KmsRequestAuditState>);
+
+impl KmsRequestAudit {
+    fn record(&self, sse_type: SSEType, key_id: Option<&str>, key_version: Option<u32>, error_class: Option<&'static str>) {
+        // A poisoned lock costs the audit entry its KMS tags; it must never cost
+        // the request its result.
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+
+        state.recorded = true;
+        state.sse_types.insert(sse_type.audit_label());
+        if let Some(key_id) = key_id.filter(|value| !value.is_empty()) {
+            state.key_ids.insert(key_id.to_string());
+        }
+        if let Some(key_version) = key_version {
+            state.key_versions.insert(key_version);
+        }
+        if state.error_class.is_none() {
+            state.error_class = error_class;
+        }
+    }
+
+    /// Render the summary as audit tags, or nothing when the request performed
+    /// no KMS work at all (SSE-C and unencrypted objects never reach KMS).
+    pub(crate) fn audit_tags(&self) -> Vec<(&'static str, Value)> {
+        let Ok(state) = self.0.lock() else {
+            return Vec::new();
+        };
+        if !state.recorded {
+            return Vec::new();
+        }
+
+        let mut tags = Vec::with_capacity(5);
+        tags.push((KMS_AUDIT_TAG_SSE_TYPE, join_audit_values(state.sse_types.iter().copied())));
+        if !state.key_ids.is_empty() {
+            tags.push((KMS_AUDIT_TAG_KEY_ID, join_audit_values(state.key_ids.iter().map(String::as_str))));
+        }
+        if !state.key_versions.is_empty() {
+            tags.push((
+                KMS_AUDIT_TAG_KEY_VERSION,
+                join_audit_values(state.key_versions.iter().map(u32::to_string)),
+            ));
+        }
+        let outcome = if state.error_class.is_some() { "failure" } else { "success" };
+        tags.push((KMS_AUDIT_TAG_OUTCOME, Value::String(outcome.to_string())));
+        if let Some(error_class) = state.error_class {
+            tags.push((KMS_AUDIT_TAG_ERROR_CLASS, Value::String(error_class.to_string())));
+        }
+
+        tags
+    }
+}
+
+/// Render a set of values as one tag value.
+///
+/// Always a string, including for the single-value case: a consumer that would
+/// have to branch on the JSON type of a tag is a consumer that will get it
+/// wrong for the request that happens to touch two keys.
+fn join_audit_values(values: impl Iterator<Item = impl AsRef<str>>) -> Value {
+    let joined = values.map(|value| value.as_ref().to_string()).collect::<Vec<_>>();
+    Value::String(joined.join(KMS_AUDIT_VALUE_SEPARATOR))
+}
+
+/// Slots of the requests currently being audited, keyed by canonical request ID.
+///
+/// Only a weak reference is held: the owning [`KmsRequestAuditScope`] decides the
+/// lifetime, so a scope that is somehow not dropped cannot keep a slot alive.
+static KMS_REQUEST_AUDITS: LazyLock<Mutex<HashMap<String, Weak<KmsRequestAudit>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Registration of one request's KMS audit slot, dropped with the request's
+/// audit entry.
+pub(crate) struct KmsRequestAuditScope {
+    request_id: String,
+    audit: Arc<KmsRequestAudit>,
+}
+
+impl KmsRequestAuditScope {
+    /// Open a slot for `request_id`, so managed-SSE operations served under it can
+    /// be summarised onto its audit entry.
+    pub(crate) fn register(request_id: &str) -> Self {
+        let audit = Arc::new(KmsRequestAudit::default());
+        if let Ok(mut registry) = KMS_REQUEST_AUDITS.lock() {
+            registry.insert(request_id.to_string(), Arc::downgrade(&audit));
+        }
+
+        Self {
+            request_id: request_id.to_string(),
+            audit,
+        }
+    }
+
+    /// Tags describing the KMS work recorded under this request.
+    pub(crate) fn audit_tags(&self) -> Vec<(&'static str, Value)> {
+        self.audit.audit_tags()
+    }
+}
+
+impl Drop for KmsRequestAuditScope {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = KMS_REQUEST_AUDITS.lock() {
+            registry.remove(&self.request_id);
+        }
+    }
+}
+
+/// Resolve the audit slot opened for `request_id`, if the request is being audited.
+fn kms_request_audit(request_id: &str) -> Option<Arc<KmsRequestAudit>> {
+    KMS_REQUEST_AUDITS.lock().ok()?.get(request_id)?.upgrade()
+}
+
+/// Failure classes for data-path failures that never reached a KMS backend.
+///
+/// Backend failures carry the classification defined by the KMS audit contract;
+/// everything else is classified at the S3 boundary it surfaced through.
+fn kms_data_plane_error_class(error: &ApiError) -> &'static str {
+    if let Some(failure) = error
+        .source
+        .as_ref()
+        .and_then(|source| source.downcast_ref::<KmsDataPlaneFailure>())
+    {
+        return failure.class;
+    }
+
+    match error.code {
+        S3ErrorCode::AccessDenied => "access_denied",
+        S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => "invalid_argument",
+        _ => "sse_internal",
+    }
+}
+
+/// Carries a KMS failure class across the conversion to an S3-facing error.
+///
+/// The class is decided while the `KmsError` is still typed; re-deriving it from
+/// a rendered message downstream would be guesswork.
+#[derive(Debug)]
+struct KmsDataPlaneFailure {
+    class: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for KmsDataPlaneFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => source.fmt(formatter),
+            None => formatter.write_str(self.class),
+        }
+    }
+}
+
+impl std::error::Error for KmsDataPlaneFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Record the outcome of one managed-SSE operation on the request's audit entry.
+///
+/// A `None` principal marks an internal caller — replication, lifecycle, heal —
+/// which has no S3 audit entry to attach to.
+fn record_managed_kms_outcome(
+    principal: Option<&SseKmsPrincipal>,
+    sse_type: SSEType,
+    key_id: Option<&str>,
+    result: Result<(), &ApiError>,
+) {
+    let Some(audit) = principal.and_then(|principal| principal.request_audit.as_ref()) else {
+        return;
+    };
+
+    // The KMS key version is not observable on the data path: neither the
+    // generated data key nor the stored envelope surfaces the master-key version
+    // that wrapped it. Recording a fabricated version would be worse than
+    // omitting the tag, so it stays absent until KMS reports it.
+    audit.record(sse_type, key_id, None, result.err().map(kms_data_plane_error_class));
 }
 
 pub(crate) struct SseObjectEncryptionResolver;
@@ -826,6 +1344,11 @@ impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
             metadata: &metadata,
             sse_customer_key: customer_key.as_ref(),
             sse_customer_key_md5: customer_key_md5.as_ref(),
+            // The object layer resolves read material for internal readers too (replication,
+            // lifecycle transition, heal, scanner) and carries no request identity, so this hook
+            // never authorizes. Callers that cross the S3 boundary are authorized by the S3 layer
+            // before their bytes are served.
+            principal: None,
         })
         .await
         .map_err(map_encryption_resolution_error)?;
@@ -1405,6 +1928,7 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
             sse_config.effective_kms_key_id,
             request.ssekms_context,
             request.content_size,
+            request.principal,
         )
         .await
         .map(Some);
@@ -1434,6 +1958,12 @@ pub struct PrepareEncryptionRequest<'a> {
     pub sse_customer_key: Option<SSECustomerKey>,
     /// SSE-C key MD5 (Base64-encoded)
     pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    /// Caller the SSE-KMS key usage is authorized as. `None` marks an internal caller.
+    ///
+    /// This is the only point at which a multipart upload evaluates KMS key permissions:
+    /// it is where the session data key is generated. `UploadPart`, `UploadPartCopy` and
+    /// `CompleteMultipartUpload` reuse that envelope and are not re-authorized.
+    pub principal: Option<&'a SseKmsPrincipal>,
 }
 
 pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
@@ -1460,10 +1990,28 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
     // apply encryption material
     let material = match sse_type {
         Some(SseTypeV2::SseS3(sse)) => {
-            apply_managed_encryption_material(request.bucket, request.key, sse, None, request.ssekms_context, 0).await?
+            apply_managed_encryption_material(
+                request.bucket,
+                request.key,
+                sse,
+                None,
+                request.ssekms_context,
+                0,
+                request.principal,
+            )
+            .await?
         }
         Some(SseTypeV2::SseKms(sse, kms_key_id)) => {
-            apply_managed_encryption_material(request.bucket, request.key, sse, kms_key_id, request.ssekms_context, 0).await?
+            apply_managed_encryption_material(
+                request.bucket,
+                request.key,
+                sse,
+                kms_key_id,
+                request.ssekms_context,
+                0,
+                request.principal,
+            )
+            .await?
         }
         Some(SseTypeV2::SseC(algorithm, _, key_md5)) => {
             apply_ssec_prepare_encryption_material(request.bucket, request.key, algorithm, request.sse_customer_key, key_md5)
@@ -1531,7 +2079,7 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 
     // Check for managed SSE encryption
     if contains_managed_encryption_metadata(request.metadata) {
-        return apply_managed_decryption_material(request.bucket, request.key, request.metadata).await;
+        return apply_managed_decryption_material(request.bucket, request.key, request.metadata, request.principal).await;
     }
 
     // No encryption detected
@@ -1726,6 +2274,49 @@ async fn apply_managed_encryption_material(
     kms_key_id: Option<SSEKMSKeyId>,
     ssekms_context: Option<HashMap<String, String>>,
     content_size: i64,
+    principal: Option<&SseKmsPrincipal>,
+) -> Result<EncryptionMaterial, ApiError> {
+    let requested_sse_type = managed_sse_type(server_side_encryption.as_str());
+    let requested_key_id = kms_key_id.clone();
+    let result = apply_managed_encryption_material_inner(
+        bucket,
+        key,
+        server_side_encryption,
+        kms_key_id,
+        ssekms_context,
+        content_size,
+        principal,
+    )
+    .await;
+
+    match &result {
+        // The resolved key is only known on success: it may come from the request,
+        // the bucket default or the KMS service default. On failure the audit entry
+        // records what the caller asked for, which is what a reader needs to see.
+        Ok(material) => record_managed_kms_outcome(principal, material.sse_type, material.kms_key_id.as_deref(), Ok(())),
+        Err(error) => record_managed_kms_outcome(principal, requested_sse_type, requested_key_id.as_deref(), Err(error)),
+    }
+
+    result
+}
+
+/// Scheme a managed-SSE header names, defaulting to SSE-S3 the same way the
+/// encryption and decryption paths do.
+fn managed_sse_type(server_side_encryption: &str) -> SSEType {
+    match server_side_encryption {
+        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
+        _ => SSEType::SseS3,
+    }
+}
+
+async fn apply_managed_encryption_material_inner(
+    bucket: &str,
+    key: &str,
+    server_side_encryption: ServerSideEncryption,
+    kms_key_id: Option<SSEKMSKeyId>,
+    ssekms_context: Option<HashMap<String, String>>,
+    content_size: i64,
+    principal: Option<&SseKmsPrincipal>,
 ) -> Result<EncryptionMaterial, ApiError> {
     if !is_managed_sse(&server_side_encryption) {
         return Err(ApiError::from(StorageError::other(format!(
@@ -1770,6 +2361,11 @@ async fn apply_managed_encryption_material(
         _ => unreachable!("managed SSE branch only supports SSE-S3 or SSE-KMS"),
     };
 
+    // The key is fully resolved here (request header, then bucket default, then the KMS
+    // service default), so this is the first point at which the caller can be held to the
+    // key it will actually be encrypted under.
+    authorize_sse_kms_key(principal, encryption_type, KmsAction::GenerateDataKeyAction, &kms_key_to_use).await?;
+
     let provider = get_sse_dek_provider().await?;
     let object_context = build_object_encryption_context(bucket, key, ssekms_context.as_ref());
     let (data_key, encrypted_data_key) = provider.generate_sse_dek(&object_context, &kms_key_to_use).await?;
@@ -1806,6 +2402,30 @@ async fn apply_managed_decryption_material(
     bucket: &str,
     key: &str,
     metadata: &HashMap<String, String>,
+    principal: Option<&SseKmsPrincipal>,
+) -> Result<Option<DecryptionMaterial>, ApiError> {
+    let result = apply_managed_decryption_material_inner(bucket, key, metadata, principal).await;
+
+    match &result {
+        // `None` means the object carries no managed-SSE metadata — SSE-C and
+        // plaintext objects never reach KMS and must not appear in the summary.
+        Ok(None) => {}
+        Ok(Some(material)) => record_managed_kms_outcome(principal, material.sse_type, material.kms_key_id.as_deref(), Ok(())),
+        Err(error) => {
+            if let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) {
+                record_managed_kms_outcome(principal, sse_type, Some(&key_id), Err(error));
+            }
+        }
+    }
+
+    result
+}
+
+async fn apply_managed_decryption_material_inner(
+    bucket: &str,
+    key: &str,
+    metadata: &HashMap<String, String>,
+    principal: Option<&SseKmsPrincipal>,
 ) -> Result<Option<DecryptionMaterial>, ApiError> {
     #[cfg(not(feature = "rio-v2"))]
     let _ = (bucket, key);
@@ -1822,6 +2442,18 @@ async fn apply_managed_decryption_material(
         ServerSideEncryption::AWS_KMS => SSEType::SseKms,
         _ => SSEType::SseS3,
     };
+
+    // Extract KMS key ID from metadata (optional, used for provider context)
+    let kms_key_id = normalized_metadata
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    // Ahead of every other failure mode below, so a denied caller learns nothing about the
+    // key beyond "not yours" — not whether it is disabled, pending deletion, or unreadable.
+    authorize_sse_kms_key(principal, encryption_type, KmsAction::DecryptAction, &kms_key_id).await?;
+
     #[cfg(feature = "rio-v2")]
     let minio_sealed_key = parse_minio_managed_sealed_key(metadata, encryption_type)?;
     #[cfg(not(feature = "rio-v2"))]
@@ -1882,12 +2514,6 @@ async fn apply_managed_decryption_material(
         (encrypted_data_key, iv, algorithm)
     };
 
-    // Extract KMS key ID from metadata (optional, used for provider context)
-    let kms_key_id = normalized_metadata
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
     let kms_context = if matches!(encryption_type, SSEType::SseKms) {
         decode_minio_kms_context(metadata)?
     } else {
@@ -2031,7 +2657,13 @@ struct KmsSseDekProvider {
 }
 
 fn kms_operation_error(error: rustfs_kms::KmsError) -> ApiError {
-    ApiError::from(StorageError::other(error))
+    let class = rustfs_kms::audit::error_class(&error);
+    let mut api_error = ApiError::from(StorageError::other(error));
+    // Wrap rather than replace the source so the original chain stays intact for
+    // logging; the wrapper only adds the class the audit attachment needs.
+    let source = api_error.source.take();
+    api_error.source = Some(Box::new(KmsDataPlaneFailure { class, source }));
+    api_error
 }
 
 impl KmsSseDekProvider {
@@ -2512,12 +3144,14 @@ pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
 /// Encryption metadata describes the physical source representation and must never be
 /// inherited by a plaintext destination or by a destination using a different key.
 pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>) {
-    const KEYS: [&str; 19] = [
+    const KEYS: [&str; 21] = [
         "x-amz-server-side-encryption",
         "x-amz-server-side-encryption-aws-kms-key-id",
         "x-amz-server-side-encryption-customer-algorithm",
         "x-amz-server-side-encryption-customer-key-md5",
         SSEC_ORIGINAL_SIZE_HEADER,
+        INTERNAL_ENCRYPTION_KEY_ID_HEADER,
+        INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
         INTERNAL_ENCRYPTION_IV_HEADER,
         "x-rustfs-encryption-tag",
         INTERNAL_ENCRYPTION_KEY_HEADER,
@@ -2776,25 +3410,27 @@ mod tests {
     use super::{
         ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
         EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
-        INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider, KmsUnavailableError,
-        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsAction, KmsKeyAuthorizer, KmsSseDekProvider,
+        KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
         MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
         MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
         MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
         ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
-        SSEType, SseDekProvider, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
-        apply_managed_decryption_material, apply_managed_encryption_material, encryption_material_to_metadata,
-        extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-        generate_ssec_nonce, is_managed_sse, kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata,
-        md5_base64, normalize_managed_metadata, reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption,
-        sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
-        validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
+        SSEType, SseDekProvider, SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
+        apply_managed_decryption_material, apply_managed_encryption_material, authorize_sse_kms_object_read,
+        encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
+        extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse, kms_operation_error,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64, normalize_managed_metadata,
+        reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption,
+        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
         DARE_CIPHER_AES_256_GCM, DARE_CIPHER_CHACHA20_POLY1305, MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM, SEALED_KEY_IV_SIZE,
         SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
     };
+    use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
 
     #[test]
     fn parse_simple_sse_cmk_rejects_bad_keys_without_crashing() {
@@ -2830,6 +3466,7 @@ mod tests {
     }
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use async_trait::async_trait;
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use http::{HeaderMap, HeaderValue};
     use rustfs_kms::types::ObjectEncryptionContext;
@@ -3247,6 +3884,7 @@ mod tests {
             sse_customer_key: Some(sse_key.clone()),
             sse_customer_key_md5: None,
             content_size,
+            principal: None,
         };
 
         let err = sse_encryption(request_missing_md5).await.unwrap_err();
@@ -3262,6 +3900,7 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: Some(sse_key_md5.clone()),
             content_size,
+            principal: None,
         };
 
         let err = sse_encryption(request_missing_key).await.unwrap_err();
@@ -3277,6 +3916,7 @@ mod tests {
             sse_customer_key: Some(sse_key),
             sse_customer_key_md5: Some(sse_key_md5),
             content_size,
+            principal: None,
         };
 
         let err = sse_encryption(request_missing_algorithm).await.unwrap_err();
@@ -3298,6 +3938,7 @@ mod tests {
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: Some(sse_key_md5),
+            principal: None,
         };
 
         let err = sse_prepare_encryption(request_missing_algorithm).await.unwrap_err();
@@ -3328,6 +3969,7 @@ mod tests {
             sse_customer_algorithm: Some("AES256".to_string()),
             sse_customer_key: None,
             sse_customer_key_md5: Some(sse_key_md5),
+            principal: None,
         };
 
         let error = sse_prepare_encryption(request)
@@ -3357,6 +3999,7 @@ mod tests {
             sse_customer_key: Some(customer_key.to_string()),
             sse_customer_key_md5: Some(customer_key_md5.to_string()),
             content_size: 128,
+            principal: None,
         })
         .await
         .expect("sse-c encryption")
@@ -3498,6 +4141,7 @@ mod tests {
             sse_customer_algorithm: Some("AES256".to_string()),
             sse_customer_key: Some(customer_key.clone()),
             sse_customer_key_md5: Some(customer_key_md5.clone()),
+            principal: None,
         })
         .await
         .expect("prepare ssec")
@@ -3527,6 +4171,7 @@ mod tests {
                     metadata: &session_metadata,
                     sse_customer_key: Some(&customer_key),
                     sse_customer_key_md5: Some(&customer_key_md5),
+                    principal: None,
                 })
                 .await
                 .expect("part decryption")
@@ -3560,6 +4205,7 @@ mod tests {
             sse_customer_algorithm: Some("AES256".to_string()),
             sse_customer_key: Some(customer_key),
             sse_customer_key_md5: Some(sse_key_md5),
+            principal: None,
         };
 
         let material = sse_prepare_encryption(request)
@@ -3610,6 +4256,7 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size,
+            principal: None,
         };
 
         let err = sse_encryption(request).await.unwrap_err();
@@ -3632,6 +4279,7 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size,
+            principal: None,
         };
 
         let err = sse_encryption(request).await.unwrap_err();
@@ -3656,6 +4304,7 @@ mod tests {
             sse_customer_key: Some(sse_key),
             sse_customer_key_md5: Some(sse_key_md5),
             content_size,
+            principal: None,
         };
 
         let err = sse_encryption(request).await.unwrap_err();
@@ -3746,6 +4395,7 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size: 4096,
+            principal: None,
         };
 
         let material = sse_encryption(request)
@@ -3767,6 +4417,7 @@ mod tests {
             metadata: &metadata,
             sse_customer_key: None,
             sse_customer_key_md5: None,
+            principal: None,
         })
         .await
         .expect("sse-kms decryption should succeed")
@@ -3784,6 +4435,7 @@ mod tests {
             metadata: &wrong_metadata,
             sse_customer_key: None,
             sse_customer_key_md5: None,
+            principal: None,
         })
         .await
         .expect_err("mismatched kms context should fail");
@@ -3860,6 +4512,7 @@ mod tests {
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
                     content_size: 1024,
+                    principal: None,
                 };
 
                 let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
@@ -3897,6 +4550,121 @@ mod tests {
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER));
         assert!(metadata.contains_key("content-type"));
+    }
+
+    /// A copy destination must not inherit any key that `is_object_encryption_marker`
+    /// accepts as proof the payload is encrypted.
+    ///
+    /// Guards this chain: `ObjectInfo::is_encrypted` is keyed on that predicate, so a
+    /// single leftover marker makes a plaintext destination report itself encrypted.
+    /// `object_api::readers` then takes its encrypted branch and demands read material,
+    /// but the material itself was stripped, so `sse_decryption` reports no encryption
+    /// and the read fails with "encrypted object metadata is incomplete" — a destination
+    /// that CopyObject wrote successfully becomes permanently unreadable.
+    #[test]
+    fn test_strip_managed_encryption_metadata_clears_encryption_markers() {
+        let mut metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "source-key".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "source-key".to_string()),
+            (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "wrapped-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "base-nonce".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ]);
+
+        strip_managed_encryption_metadata(&mut metadata);
+
+        let inherited: Vec<&str> = metadata
+            .keys()
+            .filter(|key| rustfs_utils::http::is_object_encryption_marker(key))
+            .map(String::as_str)
+            .collect();
+        assert!(inherited.is_empty(), "copy destination inherited encryption markers: {inherited:?}");
+        assert!(metadata.contains_key("content-type"));
+    }
+
+    /// A same-name CopyObject is normally serviced as a metadata-only update that reuses the
+    /// stored ciphertext, while the handler rebuilds the destination metadata around a *fresh*
+    /// DEK. `ObjectInfo::is_encrypted` — i.e. `is_object_encryption_marker` — is the guard that
+    /// keeps that shortcut away from encrypted objects (see the `metadata_only` decision in
+    /// `rustfs/src/app/object_usecase.rs`). Any encryption flavour whose headers
+    /// `strip_managed_encryption_metadata` drops must therefore also be *detected* there — a
+    /// flavour that is stripped but not detected would resurrect "new DEK + old ciphertext",
+    /// which leaves the object permanently undecryptable.
+    #[test]
+    fn every_strippable_encryption_shape_is_detected_as_encrypted() {
+        let shapes: [(&str, Vec<(&str, &str)>); 4] = [
+            (
+                "sse-s3",
+                vec![
+                    ("x-amz-server-side-encryption", "AES256"),
+                    (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, "sealed"),
+                    (MINIO_INTERNAL_ENCRYPTION_IV_HEADER, "iv"),
+                ],
+            ),
+            (
+                "sse-kms",
+                vec![
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    (MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, "sealed"),
+                    (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, "key-1"),
+                ],
+            ),
+            (
+                "legacy rustfs managed",
+                vec![
+                    ("x-amz-server-side-encryption", "AES256"),
+                    (INTERNAL_ENCRYPTION_KEY_HEADER, "wrapped"),
+                    (INTERNAL_ENCRYPTION_IV_HEADER, "iv"),
+                ],
+            ),
+            (
+                "sse-c",
+                vec![
+                    (SSEC_ALGORITHM_HEADER, "AES256"),
+                    (MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, "sealed"),
+                ],
+            ),
+        ];
+
+        for (label, entries) in shapes {
+            let metadata: HashMap<String, String> = entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+
+            assert!(
+                metadata
+                    .keys()
+                    .any(|key| rustfs_utils::http::is_object_encryption_marker(key)),
+                "{label}: an encrypted object must be detected, otherwise a same-name copy would re-key it \
+                 without rewriting the ciphertext"
+            );
+
+            let mut stripped = metadata.clone();
+            strip_managed_encryption_metadata(&mut stripped);
+            assert_ne!(
+                stripped, metadata,
+                "{label}: the copy path strips this shape's encryption metadata, so the destination cannot \
+                 reuse the source ciphertext"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_object_metadata_is_not_flagged_as_encrypted() {
+        // The metadata-only self-copy shortcut must stay available for unencrypted objects.
+        let metadata: HashMap<String, String> = [("content-type", "text/plain"), ("x-amz-meta-stage", "before")]
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+
+        assert!(
+            !metadata
+                .keys()
+                .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+        );
     }
 
     #[cfg(feature = "rio-v2")]
@@ -3972,6 +4740,7 @@ mod tests {
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
                     content_size: 4096,
+                    principal: None,
                 };
 
                 let material = sse_encryption(request)
@@ -3999,6 +4768,7 @@ mod tests {
                     metadata: &metadata,
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
+                    principal: None,
                 })
                 .await
                 .expect("managed sse decryption")
@@ -4051,6 +4821,7 @@ mod tests {
             sse_customer_key: Some(customer_key.clone()),
             sse_customer_key_md5: Some(customer_key_md5.clone()),
             content_size: 4096,
+            principal: None,
         })
         .await
         .expect("sse-c encryption")
@@ -4072,6 +4843,7 @@ mod tests {
             metadata: &metadata,
             sse_customer_key: Some(&customer_key),
             sse_customer_key_md5: Some(&customer_key_md5),
+            principal: None,
         })
         .await
         .expect("sse-c decryption")
@@ -4144,6 +4916,7 @@ mod tests {
             sse_customer_key: Some(BASE64_STANDARD.encode(key_bytes)),
             sse_customer_key_md5: Some(md5_base64(key_bytes)),
             content_size: 1,
+            principal: None,
         }
     }
 
@@ -4460,6 +5233,7 @@ mod tests {
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
                     content_size: 1024,
+                    principal: None,
                 })
                 .await
                 .expect_err("SSE-S3 should fail closed without a configured local master key");
@@ -4496,6 +5270,7 @@ mod tests {
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
                     content_size: 1024,
+                    principal: None,
                 })
                 .await
                 .expect_err("SSE-S3 should fail closed with an invalid local master key");
@@ -4601,7 +5376,7 @@ mod tests {
                     (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "legacy-local-key".to_string()),
                 ]);
 
-                let material = apply_managed_decryption_material("bucket", "object", &metadata)
+                let material = apply_managed_decryption_material("bucket", "object", &metadata, None)
                     .await
                     .expect("legacy local DEK should not be routed to the running KMS")
                     .expect("managed metadata should produce decryption material");
@@ -4629,7 +5404,7 @@ mod tests {
             (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([0x14; 12])),
             (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key-id".to_string()),
         ]);
-        let error = match apply_managed_decryption_material("bucket", "object", &metadata).await {
+        let error = match apply_managed_decryption_material("bucket", "object", &metadata, None).await {
             Ok(_) => panic!("KMS envelope must not fall back to the local provider"),
             Err(error) => error,
         };
@@ -4683,7 +5458,7 @@ mod tests {
         //    which fails because the envelope contains dummy encrypted bytes that the
         //    test KMS cannot decrypt — but crucially the error code is NOT a local-
         //    provider error.
-        let error = match apply_managed_decryption_material("bucket", "object", &metadata).await {
+        let error = match apply_managed_decryption_material("bucket", "object", &metadata, None).await {
             Ok(_) => panic!("dummy KMS envelope must not produce valid decryption material"),
             Err(error) => error,
         };
@@ -4716,6 +5491,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         )
         .await
         {
@@ -4733,7 +5509,7 @@ mod tests {
             (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([0x14; 12])),
             (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key-id".to_string()),
         ]);
-        let error = match apply_managed_decryption_material("bucket", "object", &metadata).await {
+        let error = match apply_managed_decryption_material("bucket", "object", &metadata, None).await {
             Ok(_) => panic!("provider unavailability must fail managed decryption"),
             Err(error) => error,
         };
@@ -5042,6 +5818,7 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size: 1024,
+            principal: None,
         };
         let result = sse_encryption(request).await;
         match &result {
@@ -5075,6 +5852,7 @@ mod tests {
             sse_customer_key: Some(sse_key.clone()),
             sse_customer_key_md5: Some(wrong_md5),
             content_size: 1024,
+            principal: None,
         };
         let err = sse_encryption(request_wrong_md5).await.unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
@@ -5089,6 +5867,7 @@ mod tests {
             sse_customer_key: Some(sse_key),
             sse_customer_key_md5: Some(md5_base64([42u8; 32])),
             content_size: 1024,
+            principal: None,
         };
         let err = sse_encryption(request_unsupported_algorithm).await.unwrap_err();
         assert!(err.code == S3ErrorCode::InvalidRequest || err.code == S3ErrorCode::InvalidArgument);
@@ -5107,6 +5886,7 @@ mod tests {
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: None,
+            principal: None,
         };
         let result = sse_prepare_encryption(request).await;
         match &result {
@@ -5120,5 +5900,453 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Per-key KMS authorization on the SSE-KMS data path (rustfs/backlog#1582)
+    // ------------------------------------------------------------------------
+
+    struct RecordingKmsKeyAuthorizer {
+        allowed: bool,
+        calls: std::sync::Mutex<Vec<(KmsAction, String)>>,
+    }
+
+    impl RecordingKmsKeyAuthorizer {
+        fn new(allowed: bool) -> Arc<Self> {
+            Arc::new(Self {
+                allowed,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(KmsAction, String)> {
+            self.calls.lock().expect("authorizer call log").clone()
+        }
+    }
+
+    #[async_trait]
+    impl KmsKeyAuthorizer for RecordingKmsKeyAuthorizer {
+        async fn is_allowed(&self, _principal: &SseKmsPrincipal, action: KmsAction, key_id: &str) -> Result<bool, ApiError> {
+            self.calls
+                .lock()
+                .expect("authorizer call log")
+                .push((action, key_id.to_string()));
+            Ok(self.allowed)
+        }
+    }
+
+    fn enforcing_principal(allowed: bool) -> (SseKmsPrincipal, Arc<RecordingKmsKeyAuthorizer>) {
+        let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
+        (SseKmsPrincipal::for_test("analyst", true, authorizer.clone()), authorizer)
+    }
+
+    fn permissive_principal_with_enforcement_off() -> (SseKmsPrincipal, Arc<RecordingKmsKeyAuthorizer>) {
+        let authorizer = RecordingKmsKeyAuthorizer::new(false);
+        (SseKmsPrincipal::for_test("analyst", false, authorizer.clone()), authorizer)
+    }
+
+    fn sse_kms_write(principal: Option<&SseKmsPrincipal>) -> EncryptionRequest<'_> {
+        EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("finance-key".to_string()),
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 128,
+            principal,
+        }
+    }
+
+    fn sse_kms_object_metadata() -> HashMap<String, String> {
+        HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
+            ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "finance-key".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "finance-key".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode([7u8; 48])),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([9u8; 12])),
+            (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "aws:kms".to_string()),
+        ])
+    }
+
+    fn sse_s3_object_metadata() -> HashMap<String, String> {
+        HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode([7u8; 48])),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([9u8; 12])),
+            (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+        ])
+    }
+
+    #[test]
+    fn kms_authorization_subject_scopes_to_enforced_sse_kms_requests_only() {
+        let (principal, _) = enforcing_principal(true);
+
+        assert!(super::kms_authorization_subject(true, Some(&principal), SSEType::SseKms).is_some());
+        // Compatibility switch off keeps the pre-enforcement behaviour.
+        assert!(super::kms_authorization_subject(false, Some(&principal), SSEType::SseKms).is_none());
+        // SSE-S3 and SSE-C are exempt, matching AWS.
+        assert!(super::kms_authorization_subject(true, Some(&principal), SSEType::SseS3).is_none());
+        assert!(super::kms_authorization_subject(true, Some(&principal), SSEType::SseC).is_none());
+        // No principal means an internal caller.
+        assert!(super::kms_authorization_subject(true, None, SSEType::SseKms).is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_kms_write_without_generate_data_key_is_denied() {
+        let (principal, authorizer) = enforcing_principal(false);
+
+        let error = sse_encryption(sse_kms_write(Some(&principal)))
+            .await
+            .expect_err("SSE-KMS write must fail without kms:GenerateDataKey on the key");
+
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(authorizer.calls(), vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn sse_kms_write_with_generate_data_key_clears_the_gate() {
+        let (principal, authorizer) = enforcing_principal(true);
+
+        let outcome = sse_encryption(sse_kms_write(Some(&principal))).await;
+
+        assert!(
+            !matches!(&outcome, Err(error) if error.code == S3ErrorCode::AccessDenied),
+            "granting kms:GenerateDataKey on the key must clear the authorization gate"
+        );
+        assert_eq!(authorizer.calls(), vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn sse_kms_read_without_decrypt_is_denied() {
+        let (principal, authorizer) = enforcing_principal(false);
+        let metadata = sse_kms_object_metadata();
+
+        let error = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&principal),
+        })
+        .await
+        .expect_err("SSE-KMS read must fail without kms:Decrypt on the key");
+
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn sse_s3_objects_are_exempt_from_kms_key_authorization() {
+        let (principal, authorizer) = enforcing_principal(false);
+        let metadata = sse_s3_object_metadata();
+
+        let write = sse_encryption(EncryptionRequest {
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            ssekms_key_id: None,
+            ..sse_kms_write(Some(&principal))
+        })
+        .await;
+        let read = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&principal),
+        })
+        .await;
+
+        assert!(!matches!(&write, Err(error) if error.code == S3ErrorCode::AccessDenied));
+        assert!(!matches!(&read, Err(error) if error.code == S3ErrorCode::AccessDenied));
+        assert!(authorizer.calls().is_empty(), "SSE-S3 must never consult KMS key policy");
+    }
+
+    #[tokio::test]
+    async fn ssec_requests_are_exempt_from_kms_key_authorization() {
+        let (principal, authorizer) = enforcing_principal(false);
+        let customer_key = BASE64_STANDARD.encode([42u8; 32]);
+        let customer_key_md5 = md5_base64([42u8; 32]);
+
+        let outcome = sse_encryption(EncryptionRequest {
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key),
+            sse_customer_key_md5: Some(customer_key_md5),
+            ..sse_kms_write(Some(&principal))
+        })
+        .await;
+
+        assert!(outcome.is_ok(), "SSE-C must not be gated on KMS key policy");
+        assert!(authorizer.calls().is_empty(), "SSE-C never reaches KMS");
+    }
+
+    #[tokio::test]
+    async fn internal_callers_bypass_kms_key_authorization() {
+        let metadata = sse_kms_object_metadata();
+
+        // No principal: replication, lifecycle transition, heal and scanner reach the SSE
+        // layer below the S3 authorization boundary and must not be interrupted.
+        let write = sse_encryption(sse_kms_write(None)).await;
+        let read = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await;
+
+        assert!(!matches!(&write, Err(error) if error.code == S3ErrorCode::AccessDenied));
+        assert!(!matches!(&read, Err(error) if error.code == S3ErrorCode::AccessDenied));
+    }
+
+    #[tokio::test]
+    async fn enforcement_switch_off_preserves_current_behaviour() {
+        let (principal, authorizer) = permissive_principal_with_enforcement_off();
+        let metadata = sse_kms_object_metadata();
+
+        let write = sse_encryption(sse_kms_write(Some(&principal))).await;
+        let read = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&principal),
+        })
+        .await;
+
+        assert!(!matches!(&write, Err(error) if error.code == S3ErrorCode::AccessDenied));
+        assert!(!matches!(&read, Err(error) if error.code == S3ErrorCode::AccessDenied));
+        assert!(
+            authorizer.calls().is_empty(),
+            "with the switch off the data path must not evaluate KMS key policy at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_source_read_authorization_targets_the_source_key() {
+        let (denied, denied_authorizer) = enforcing_principal(false);
+        let (allowed, allowed_authorizer) = enforcing_principal(true);
+        let metadata = sse_kms_object_metadata();
+
+        let error = authorize_sse_kms_object_read(Some(&denied), &metadata)
+            .await
+            .expect_err("copying an SSE-KMS source must require kms:Decrypt on the source key");
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(denied_authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+
+        authorize_sse_kms_object_read(Some(&allowed), &metadata)
+            .await
+            .expect("kms:Decrypt on the source key must allow the copy");
+        assert_eq!(allowed_authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn copy_source_read_authorization_skips_unencrypted_and_sse_s3_sources() {
+        let (principal, authorizer) = enforcing_principal(false);
+
+        authorize_sse_kms_object_read(Some(&principal), &HashMap::new())
+            .await
+            .expect("plaintext sources are not gated");
+        authorize_sse_kms_object_read(Some(&principal), &sse_s3_object_metadata())
+            .await
+            .expect("SSE-S3 sources are not gated");
+
+        assert!(authorizer.calls().is_empty());
+    }
+
+    // ========================================================================
+    // Data-plane KMS audit attachment
+    // ========================================================================
+
+    fn audited_principal(enforced: bool, allowed: bool) -> (SseKmsPrincipal, Arc<super::KmsRequestAudit>) {
+        let audit = Arc::new(super::KmsRequestAudit::default());
+        let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
+        let principal = SseKmsPrincipal::for_test("analyst", enforced, authorizer).with_request_audit(audit.clone());
+        (principal, audit)
+    }
+
+    fn audit_tag(tags: &[(&'static str, serde_json::Value)], key: &str) -> Option<String> {
+        tags.iter()
+            .find(|(candidate, _)| *candidate == key)
+            .and_then(|(_, value)| value.as_str().map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn sse_kms_write_and_read_summarise_key_id_and_outcome_for_the_audit_entry() {
+        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+        let _guard = lock_sse_test_state().await;
+
+        reset_sse_dek_provider();
+        let manager = configure_test_global_local_kms().await;
+        manager
+            .get_encryption_service()
+            .await
+            .expect("encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some("audit-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("kms test key should be created");
+        let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+        super::set_sse_dek_provider_for_test(Arc::new(provider));
+
+        let (write_principal, write_audit) = audited_principal(false, true);
+        let material = sse_encryption(EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("audit-key".to_string()),
+            ssekms_context: Some(HashMap::from([("tenant".to_string(), "acct-4711".to_string())])),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 128,
+            principal: Some(&write_principal),
+        })
+        .await
+        .expect("sse-kms encryption should succeed")
+        .expect("managed sse-kms material");
+
+        let write_tags = write_audit.audit_tags();
+        assert_eq!(audit_tag(&write_tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&write_tags, "kmsKeyId").as_deref(), Some("audit-key"));
+        assert_eq!(audit_tag(&write_tags, "kmsOutcome").as_deref(), Some("success"));
+        assert_eq!(audit_tag(&write_tags, "kmsErrorClass"), None, "a successful request has no error class");
+
+        // The audit entry reaches every configured target: no encoding of the data
+        // key, and no caller-supplied encryption-context value, may appear in it.
+        let rendered = format!("{write_tags:?}");
+        let encrypted_data_key = material.encrypted_data_key.clone().expect("managed sse wraps a data key");
+        for secret in [
+            BASE64_STANDARD.encode(&encrypted_data_key),
+            BASE64_STANDARD.encode(material.key_bytes),
+            format!("{:?}", material.key_bytes),
+            format!("{encrypted_data_key:?}"),
+            "acct-4711".to_string(),
+        ] {
+            assert!(!rendered.contains(&secret), "audit tags must not carry key material: {rendered}");
+        }
+
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+        let (read_principal, read_audit) = audited_principal(false, true);
+        sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&read_principal),
+        })
+        .await
+        .expect("sse-kms decryption should succeed")
+        .expect("managed sse-kms material");
+
+        let read_tags = read_audit.audit_tags();
+        assert_eq!(audit_tag(&read_tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&read_tags, "kmsKeyId").as_deref(), Some("audit-key"));
+        assert_eq!(audit_tag(&read_tags, "kmsOutcome").as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn sse_c_requests_produce_no_kms_audit_summary() {
+        let key = [0x21u8; 32];
+        let (principal, audit) = audited_principal(false, true);
+
+        sse_encryption(EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some(SSECustomerAlgorithm::from("AES256".to_string())),
+            sse_customer_key: Some(SSECustomerKey::from(BASE64_STANDARD.encode(key))),
+            sse_customer_key_md5: Some(SSECustomerKeyMD5::from(md5_base64(key))),
+            content_size: 128,
+            principal: Some(&principal),
+        })
+        .await
+        .expect("sse-c encryption should succeed")
+        .expect("sse-c material");
+
+        assert!(
+            audit.audit_tags().is_empty(),
+            "SSE-C keys never reach KMS, so the request has no KMS outcome to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_sse_kms_read_is_summarised_as_an_access_denied_failure() {
+        let (principal, audit) = audited_principal(true, false);
+
+        authorize_sse_kms_object_read(Some(&principal), &sse_kms_object_metadata())
+            .await
+            .expect_err("an unauthorized principal must not read the source key");
+
+        let tags = audit.audit_tags();
+        assert_eq!(audit_tag(&tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&tags, "kmsKeyId").as_deref(), Some("finance-key"));
+        assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("failure"));
+        assert_eq!(audit_tag(&tags, "kmsErrorClass").as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn kms_backend_failures_keep_the_kms_audit_error_class() {
+        assert_eq!(
+            super::kms_data_plane_error_class(&kms_operation_error(rustfs_kms::KmsError::key_not_found("finance-key"))),
+            "key_not_found"
+        );
+        assert_eq!(
+            super::kms_data_plane_error_class(&kms_operation_error(rustfs_kms::KmsError::access_denied("nope"))),
+            "access_denied"
+        );
+        // Failures raised by the SSE layer itself never saw a KmsError; they are
+        // classified by the boundary they surfaced through.
+        assert_eq!(
+            super::kms_data_plane_error_class(&ApiError {
+                code: S3ErrorCode::AccessDenied,
+                message: "Access Denied".to_string(),
+                source: None,
+            }),
+            "access_denied"
+        );
+        assert_eq!(
+            super::kms_data_plane_error_class(&ApiError::from(StorageError::other("no KMS key available"))),
+            "sse_internal"
+        );
+    }
+
+    #[test]
+    fn a_request_audit_slot_is_reachable_only_while_its_scope_lives() {
+        let scope = super::KmsRequestAuditScope::register("request-under-audit");
+        let slot = super::kms_request_audit("request-under-audit").expect("a registered request must resolve its slot");
+        slot.record(SSEType::SseKms, Some("finance-key"), None, None);
+        assert_eq!(audit_tag(&scope.audit_tags(), "kmsKeyId").as_deref(), Some("finance-key"));
+
+        drop(scope);
+        assert!(
+            super::kms_request_audit("request-under-audit").is_none(),
+            "the slot must not outlive the audit entry it belongs to"
+        );
+    }
+
+    #[test]
+    fn a_request_that_did_no_kms_work_reports_no_tags() {
+        let scope = super::KmsRequestAuditScope::register("quiet-request");
+        assert!(scope.audit_tags().is_empty());
     }
 }

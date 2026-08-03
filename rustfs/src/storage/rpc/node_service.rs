@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::kms_dynamic::{current_kms_config_fingerprint, reload_persisted_kms_config};
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
@@ -22,7 +23,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_S
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+    DiskStore, ECStore, Error, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
     reload_transition_tier_config,
@@ -87,6 +88,29 @@ fn signal_service_response(success: bool, error_info: Option<String>) -> Respons
         success,
         error_info,
         protocol_version: rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION,
+        config_fingerprint: None,
+    })
+}
+
+/// Answer a KMS dynamic config signal.
+///
+/// A dry run doubles as the cluster fingerprint probe: it reports what this
+/// node is running without touching its configuration. A real signal reloads
+/// the cluster-persisted configuration first, and still answers with the
+/// fingerprint of whatever it ends up running so a failed reload is visible as
+/// divergence rather than only as an error string.
+async fn kms_dynamic_config_signal_response(dry_run: bool) -> Response<SignalServiceResponse> {
+    let outcome = if dry_run {
+        Ok(())
+    } else {
+        reload_persisted_kms_config().await
+    };
+    let fingerprint = current_kms_config_fingerprint().await;
+    Response::new(SignalServiceResponse {
+        success: outcome.is_ok(),
+        error_info: outcome.err(),
+        protocol_version: rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION,
+        config_fingerprint: fingerprint,
     })
 }
 
@@ -1736,6 +1760,12 @@ impl Node for NodeService {
                 Err(_) => Ok(signal_service_response(false, Some("runtime config snapshot reload failed".to_string()))),
             },
             Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => {
+                // KMS configuration is persisted outside the server config
+                // document, so it converges through its own reload rather than
+                // through the server config publication fence.
+                if sub_system == KMS_SIGNAL_SUBSYSTEM {
+                    return Ok(kms_dynamic_config_signal_response(dry_run).await);
+                }
                 let supported = sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM || supports_dynamic_config_rpc(sub_system);
                 if !supported {
                     return Ok(signal_service_response(
@@ -2130,8 +2160,8 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService,
-        PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, KMS_SIGNAL_SUBSYSTEM, MetricType, Node as _,
+        NodeService, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
         STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
         execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint,
@@ -5363,6 +5393,39 @@ mod tests {
             assert!(super::supports_dynamic_config_rpc(sub_system));
         }
         assert!(!super::supports_dynamic_config_rpc("identity_openid"));
+        // KMS configuration is not a server config subsystem: it converges
+        // through its own branch, so it must stay out of this allow-list.
+        assert!(!super::supports_dynamic_config_rpc(KMS_SIGNAL_SUBSYSTEM));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_signal_service_kms_dry_run_reports_without_reconfiguring() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), KMS_SIGNAL_SUBSYSTEM.to_string());
+        vars.insert(PEER_RESTDRY_RUN.to_string(), true.to_string());
+
+        let response = service
+            .signal_service(Request::new(SignalServiceRequest {
+                vars: Some(Mss { value: vars }),
+            }))
+            .await
+            .expect("KMS capability probe should return a response")
+            .into_inner();
+
+        // A probe must answer even where no configuration was ever applied:
+        // that answer is what makes an unconfigured node visible as divergent.
+        assert!(response.success, "new nodes must advertise KMS config convergence support");
+        assert!(response.error_info.is_none());
+        assert_eq!(response.protocol_version, rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION);
+        assert_eq!(
+            response.config_fingerprint,
+            super::current_kms_config_fingerprint().await,
+            "a probe must report the configuration this node is running"
+        );
     }
 
     #[tokio::test]

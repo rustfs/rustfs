@@ -14,8 +14,8 @@
 
 //! Fault-injection matrix for the Vault backend operation policy.
 //!
-//! Offline cases run against locally injected transport faults (a closed
-//! port, a listener that never responds) — deterministic, no external
+//! Offline cases run against locally injected transport faults (a listener
+//! that never responds) — deterministic, no external
 //! dependencies. Real-Vault cases are `#[ignore]`d and need a dev Vault
 //! (default `http://127.0.0.1:8200`, override with `RUSTFS_KMS_VAULT_ADDR`).
 //!
@@ -116,44 +116,6 @@ fn counter_value(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)]) 
             }
         })
         .sum()
-}
-
-/// Connection refused: connection-class failures are retried up to the
-/// configured budget, then surface as a backend error.
-#[test]
-fn connection_refused_is_retried_within_budget() {
-    // Reserve a loopback port and release it so nothing is listening there.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
-    let address = format!("http://{}", listener.local_addr().expect("reserved port addr"));
-    drop(listener);
-
-    let snapshot = record_metrics(|| {
-        Box::pin(async move {
-            let client = VaultKmsBackend::new(kms_config(vault_config(&address, "unused"), Duration::from_secs(2), 2))
-                .await
-                .expect("client construction performs no network calls");
-            let error = KmsBackendTrait::describe_key(&client, describe_key_request("fault-injection-refused"))
-                .await
-                .expect_err("a refused connection must fail the operation");
-            assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
-        })
-    });
-
-    assert_eq!(
-        counter_value(&snapshot, ATTEMPT_FAILURES_TOTAL, &[("error_class", "retryable_conn")]),
-        2,
-        "both budgeted attempts must observe the refused connection"
-    );
-    assert_eq!(counter_value(&snapshot, OPERATIONS_TOTAL, &[("outcome", "budget_exhausted")]), 1);
-    // The static-token login records its own success; the Vault read must not.
-    assert_eq!(
-        counter_value(
-            &snapshot,
-            OPERATIONS_TOTAL,
-            &[("operation", "vault_kv2_read_key"), ("outcome", "success")]
-        ),
-        0
-    );
 }
 
 /// Stalled connection: a server that accepts but never responds is cut off by

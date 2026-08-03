@@ -130,13 +130,15 @@ pub mod bucket {
 
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataSys, acquire_bucket_metadata_transaction_lock, delete, get, get_accelerate_config, get_bucket_policy,
+            BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
+            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
-            get_object_lock_config, get_public_access_block_config, get_quota_config, get_replication_config,
-            get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
-            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
-            update, update_bucket_targets_under_transaction_lock, update_config_with, update_under_transaction_lock,
+            get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
+            get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config,
+            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
+            set_bucket_metadata, update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
+            update_under_transaction_lock,
         };
     }
 
@@ -172,20 +174,30 @@ pub mod bucket {
     }
 
     pub mod replication {
+        pub use crate::bucket::replication::replication_pool::{
+            DurableMrfBacklogSummary, DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBacklogObservabilitySummary,
+            MrfBucketBacklogObservability, durable_mrf_backlog_summary_snapshot, durable_mrf_target_backlog_snapshot,
+            mrf_backlog_observability_snapshot,
+        };
         pub use crate::bucket::replication::{
-            BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool,
-            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
-            ReplicateObjectInfo, ReplicationConfig, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
+            BucketReplicationResyncStatus, BucketReplicationStats, BucketStats, DeleteReplicationConfigSnapshot,
+            DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, MrfOpKind, MrfReplicateEntry,
+            MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
+            REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION,
+            REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo,
+            ReplicationBatchAdmission, ReplicationConfig, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
             ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
             ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
             ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
-            ReplicationType, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType,
+            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
+            VersionPurgeStatusType, commit_force_delete_intent, complete_force_delete_intent,
             delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
-            get_global_replication_stats, init_background_replication, read_durable_mrf_backlog, replication_state_to_filemeta,
-            replication_status_to_filemeta, replication_statuses_map, replication_target_arns, resync_start_conflict_id,
-            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
-            should_use_existing_delete_replication_source, validate_replication_config_target_arns,
-            version_purge_status_to_filemeta,
+            get_global_replication_stats, init_background_replication, invalid_replication_config_status_field,
+            persist_force_delete_intent, read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta,
+            replication_statuses_map, replication_target_arns, resync_start_conflict_id, should_remove_replication_target,
+            should_schedule_delete_replication, should_use_existing_delete_replication_info,
+            should_use_existing_delete_replication_source, unsupported_replication_config_field,
+            validate_replication_config_target_arns, version_purge_status_to_filemeta,
         };
     }
 
@@ -267,12 +279,13 @@ pub mod config {
     pub mod com {
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
-            ServerConfigCorruptError, ServerConfigSnapshot, delete_config, is_server_config_corrupt_error, lookup_configs,
-            read_config, read_config_no_lock, read_config_with_metadata, read_config_without_migrate,
-            read_config_without_migrate_no_lock, read_existing_server_config_no_lock, read_server_config_snapshot, save_config,
-            save_config_no_lock, save_config_with_opts, save_server_config, save_server_config_no_lock,
-            save_server_config_snapshot, server_config_path, try_migrate_server_config, with_config_object_read_lock,
-            with_config_object_write_lock, with_server_config_read_lock, with_server_config_write_lock,
+            ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config,
+            is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
+            read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
+            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_server_config,
+            save_server_config_no_lock, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+            server_config_path, try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock,
+            with_server_config_read_lock, with_server_config_write_lock,
         };
     }
 
@@ -392,11 +405,11 @@ pub mod notification {
 pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
-        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, ObjectEncryptionResolver, ObjectInfo,
-        ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode,
-        ReadEncryptionRequest, StreamConsumer, get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook,
-        register_get_object_body_cache_hook, register_object_mutation_hook, unregister_get_object_body_cache_hook,
-        unregister_object_mutation_hook,
+        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver,
+        ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader,
+        ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, StreamConsumer, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::PreparedGetObjectReader;
 }
@@ -418,15 +431,15 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::{
-        AuthenticatedChannel, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
-        PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing,
-        ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers, gen_tonic_replay_scope_headers,
-        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
-        verify_tonic_rpc_signature_with_bootstrap,
+        AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
+        tonic_boot_epoch_response_headers, verify_rpc_signature, verify_tonic_boot_epoch_response,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 

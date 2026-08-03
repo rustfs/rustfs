@@ -39,7 +39,12 @@ on:
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
-    - cron: '0 3 * * 0' # Weekly on Sunday 03:00 UTC (staggered after the midnight ci/build crons)
+    # Daily, not weekly. This schedule exists to catch RustSec advisories
+    # published against an unchanged dependency tree; at weekly cadence a new
+    # advisory could sit unnoticed for seven days. The check list is unchanged —
+    # splitting it into a light daily advisories-only run and a weekly full run
+    # would create runs where sources/bans/licenses go unverified.
+    - cron: '0 3 * * *' # Daily 03:00 UTC (staggered after the midnight ci/build crons)
   workflow_dispatch:
 
 permissions:
@@ -59,6 +64,7 @@ jobs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Explain cancellation run
         run: echo "PR closed; this run only cancels older runs in the same concurrency group."
@@ -74,11 +80,32 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
         with:
-          cache-shared-key: rustfs-cargo-deny
+          persist-credentials: false
+
+      # cargo-deny compiles nothing, so the full setup composite (apt packages,
+      # protoc, flatc, nextest, rustfmt/clippy) was pure overhead here. It does
+      # still need a real cargo: `cargo deny check` runs `cargo metadata`, and
+      # Cargo.toml pins datafusion and s3s as git dependencies, which must be
+      # materialised into ~/.cargo/git — a cold clone is hundreds of MB, so the
+      # cache stays.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Was relying on the composite's default, which used to be "true": every
+      # PR touching Cargo.toml/Cargo.lock saved a second, PR-scoped copy of this
+      # cache and pushed the main-scoped lanes out of the 10GB quota. The
+      # default is now "false", but state it explicitly — see
+      # scripts/security/check_cache_save_if.sh.
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Same reasoning as the setup composite: true archives every
+          # dependency's unpacked source tree.
+          cache-all-crates: false
+          cache-on-failure: true
+          shared-key: rustfs-cargo-deny
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
@@ -96,9 +123,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Report unpinned GitHub Actions
         run: ./scripts/security/check_workflow_pins.sh --enforce
+
+      - name: Check setup cache-save-if is explicit
+        run: ./scripts/security/check_cache_save_if.sh
+
+      - name: Check every job declares a timeout
+        run: ./scripts/security/check_job_timeouts.sh
+
+      - name: Check checkouts clear their credentials
+        run: ./scripts/security/check_persist_credentials.sh
 
       - name: Check preview release workflow policy
         run: ./scripts/security/check_preview_release_workflow.sh
@@ -106,6 +144,7 @@ jobs:
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     permissions:
       contents: read
@@ -113,6 +152,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
@@ -125,3 +166,28 @@ jobs:
           # conscious re-review of the license/provenance claim (backlog#1181).
           allow-dependencies-licenses: pkg:cargo/rustfs-uring@0.1.0
           comment-summary-in-pr: always
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    # dependency-review is deliberately excluded: it only runs on pull_request,
+    # so it can never contribute a failure to a scheduled run.
+    needs: [cargo-deny, workflow-pin-report]
+    # A scheduled cargo-deny failure usually means the dependency tree just
+    # matched a newly published advisory — the single most important signal this
+    # workflow produces, and until now it was only visible to whoever happened to
+    # open the Actions tab. Same ci-8 mechanism coverage.yml and
+    # e2e-replication-nightly.yml already use.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

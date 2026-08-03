@@ -60,6 +60,16 @@ The file `prometheus-rules/rustfs-get-optimization-alerts.yaml` contains pre-con
 | `CodecStreamingFallbackSpike` | Warning | Codec streaming fallback > 10x baseline for 10m |
 | `IoQueueSaturation` | Warning | IO queue utilization > 90% for 5m |
 
+The file `prometheus-rules/rustfs-kms-alerts.yml` contains alerting rules for the KMS backend operation metrics. Thresholds are conservative defaults pending staging baseline calibration; response procedures live in `docs/operations/kms-observability-runbook.md`, and the matching dashboard is `deploy/observability/grafana/rustfs-kms-observability.json`.
+
+| Alert | Severity | Condition |
+|-------|----------|-----------|
+| `KmsBackendFatalErrors` | Critical | Fatal (non-retryable) attempt failures > 0 for 5m |
+| `KmsBackendHighErrorRate` | Critical | Non-success operation ratio > 5% for 10m (with traffic guard) |
+| `KmsBackendP99LatencyHigh` | Warning | Operation p99 duration (incl. retries) > 2s for 10m |
+| `KmsBackendAttemptFailureSpike` | Warning | Attempt failure rate > 0.5/s for 10m |
+| `KmsBackendRetryBudgetExhausted` | Warning | budget_exhausted / deadline_exceeded outcomes > 0.05/s for 10m |
+
 ### Enabling Alert Rules
 
 Add the alert rules file to your Prometheus configuration:

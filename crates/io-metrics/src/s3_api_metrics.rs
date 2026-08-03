@@ -14,8 +14,25 @@
 
 use rustfs_s3_ops::S3Operation;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const S3_OPS_METRIC: &str = "rustfs_s3_operations_total";
+static S3_OP_COUNTERS: OnceLock<Box<[AtomicU64]>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3OperationMetricSnapshot {
+    pub op: &'static str,
+    pub total: u64,
+}
+
+fn s3_op_counters() -> &'static [AtomicU64] {
+    S3_OP_COUNTERS.get_or_init(|| {
+        std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(S3Operation::ALL.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
 
 /// Record a handled S3 API operation.
 ///
@@ -26,7 +43,20 @@ const S3_OPS_METRIC: &str = "rustfs_s3_operations_total";
 /// This mirrors MinIO, which never labels its default operation counters with
 /// bucket. The `op` dimension is bounded (<= 122 variants).
 pub fn record_s3_op(op: S3Operation) {
+    if let Some(counter) = s3_op_counters().get(op.metric_index()) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
     counter!(S3_OPS_METRIC, "op" => op.as_str()).increment(1);
+}
+
+pub fn s3_op_metrics_snapshot() -> Vec<S3OperationMetricSnapshot> {
+    S3Operation::ALL
+        .iter()
+        .filter_map(|op| {
+            let total = s3_op_counters().get(op.metric_index())?.load(Ordering::Relaxed);
+            (total > 0).then_some(S3OperationMetricSnapshot { op: op.as_str(), total })
+        })
+        .collect()
 }
 
 pub fn init_s3_metrics() {
@@ -42,6 +72,9 @@ mod tests {
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
     use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    static S3_OP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Collect the label-key sets recorded against `rustfs_s3_operations_total`.
     fn ops_metric_label_key_sets(recorder: &DebuggingRecorder) -> Vec<HashSet<String>> {
@@ -60,6 +93,7 @@ mod tests {
 
     #[test]
     fn record_s3_op_labels_by_op_only_no_bucket() {
+        let _guard = S3_OP_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let recorder = DebuggingRecorder::new();
         let label_key_sets = ops_metric_label_key_sets(&recorder);
 
@@ -75,6 +109,7 @@ mod tests {
 
     #[test]
     fn record_s3_op_cardinality_bounded_by_distinct_ops() {
+        let _guard = S3_OP_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
@@ -112,5 +147,25 @@ mod tests {
             distinct_ops.len(),
             "series count must equal the number of distinct ops, never the bucket count"
         );
+    }
+
+    #[test]
+    fn s3_op_metrics_snapshot_reports_recorded_totals() {
+        let _guard = S3_OP_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.op == S3Operation::GetObject.as_str())
+            .map(|snapshot| snapshot.total)
+            .unwrap_or_default();
+
+        record_s3_op(S3Operation::GetObject);
+        record_s3_op(S3Operation::GetObject);
+
+        let after = s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.op == S3Operation::GetObject.as_str())
+            .map(|snapshot| snapshot.total)
+            .expect("GetObject snapshot should be present after recording");
+        assert_eq!(after, before + 2);
     }
 }

@@ -57,6 +57,42 @@ const DEFAULT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// Default seconds between token file re-reads for [`TokenFileSource`].
 const DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS: u64 = 30;
 
+// ---------------------------------------------------------------------------
+// Metrics
+//
+// Both gauges describe the one credential generation currently installed, so
+// they carry no labels: the Vault address, mount, auth path and token are all
+// off limits as label values, and there is exactly one generation to describe.
+// The renewal loop republishes them on a bounded cadence while it waits, so a
+// scrape landing between refresh cycles never reads a TTL frozen at the last
+// refresh, or a fail-closed state that flipped after it.
+// ---------------------------------------------------------------------------
+
+/// Gauge: seconds left before the active Vault token expires; `0` once it has.
+const METRIC_TOKEN_TTL_SECONDS: &str = "rustfs_kms_vault_token_ttl_seconds";
+/// Gauge: `1` while [`VaultCredentialProvider::current`] refuses to hand out
+/// the token because it is inside the fail-closed safety window, `0` otherwise.
+const METRIC_CREDENTIALS_FAIL_CLOSED: &str = "rustfs_kms_vault_credentials_fail_closed";
+
+/// How often the renewal loop republishes the credential gauges while waiting.
+/// Bounds how stale a scrape can be, without any additional Vault traffic.
+const CREDENTIAL_GAUGE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Register metric descriptions once per process.
+fn describe_credential_metrics() {
+    static DESCRIBE: std::sync::Once = std::sync::Once::new();
+    DESCRIBE.call_once(|| {
+        metrics::describe_gauge!(
+            METRIC_TOKEN_TTL_SECONDS,
+            "Seconds remaining before the Vault token backing the KMS backend expires"
+        );
+        metrics::describe_gauge!(
+            METRIC_CREDENTIALS_FAIL_CLOSED,
+            "1 while the Vault credential provider refuses to serve its token because the token is inside the fail-closed safety window"
+        );
+    });
+}
+
 /// A crate-owned secret value, zeroized on drop and redacted in Debug output.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct SecretString(String);
@@ -484,8 +520,10 @@ impl VaultConnectionSettings {
 /// Refresh and fail-closed tuning for a [`VaultCredentialProvider`].
 #[derive(Debug, Clone)]
 pub(crate) struct VaultCredentialPolicy {
-    /// Retry budget for one login/renewal cycle.
+    /// Retry budget for one login cycle.
     pub(crate) retry: RetryPolicy,
+    /// Retry budget for one token-renewal cycle.
+    pub(crate) renew_retry: RetryPolicy,
     /// Fail-closed margin: once the current token is within this window of
     /// expiry without a successful refresh, [`VaultCredentialProvider::current`]
     /// refuses to hand it out.
@@ -500,8 +538,14 @@ impl VaultCredentialPolicy {
     /// The default safety window equals the per-attempt timeout: a request
     /// issued now can stay in flight for up to one attempt timeout, so the
     /// token must outlive at least that.
-    pub(crate) fn from_kms_config(config: &KmsConfig, auth_method: &VaultAuthMethod) -> Self {
-        let retry = RetryPolicy::from_config(config);
+    pub(crate) fn from_kms_config(
+        config: &KmsConfig,
+        auth_method: &VaultAuthMethod,
+        backend: &'static str,
+        endpoint: &str,
+        namespace: Option<&str>,
+    ) -> Self {
+        let retry = RetryPolicy::for_credentials(config, backend, endpoint, namespace, "credentials-login");
         let safety_window = match auth_method {
             VaultAuthMethod::AppRole {
                 refresh_safety_window_secs: Some(secs),
@@ -515,6 +559,7 @@ impl VaultCredentialPolicy {
         };
         Self {
             retry,
+            renew_retry: RetryPolicy::for_credentials(config, backend, endpoint, namespace, "credentials-renew"),
             safety_window,
             retry_interval: DEFAULT_REFRESH_RETRY_INTERVAL,
         }
@@ -627,6 +672,45 @@ impl VaultCredentialProvider {
         Ok(handle)
     }
 
+    /// Publish the credential gauges for the generation currently installed.
+    ///
+    /// The fail-closed gauge re-evaluates the very gate
+    /// [`VaultCredentialProvider::current`] applies, so what operators see and
+    /// what the request path does cannot drift apart.
+    fn record_credential_gauges(&self) {
+        let handle = self.current.load();
+        let now = Instant::now();
+        let fail_closed = match handle.expires_at() {
+            Some(expires_at) => {
+                metrics::gauge!(METRIC_TOKEN_TTL_SECONDS).set(expires_at.saturating_duration_since(now).as_secs_f64());
+                now + self.policy.safety_window >= expires_at
+            }
+            // A generation without an expiry has no remaining TTL to report
+            // and can never lapse, so it can never fail closed either.
+            None => false,
+        };
+        metrics::gauge!(METRIC_CREDENTIALS_FAIL_CLOSED).set(if fail_closed { 1.0 } else { 0.0 });
+    }
+
+    /// Wait until `deadline`, republishing the credential gauges on the
+    /// observation cadence. Reports `false` when cancellation cut the wait
+    /// short.
+    async fn wait_publishing_gauges(&self, deadline: Instant, cancel: &CancellationToken) -> bool {
+        loop {
+            self.record_credential_gauges();
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            let slice = (deadline - now).min(CREDENTIAL_GAUGE_INTERVAL);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                _ = tokio::time::sleep(slice) => {}
+            }
+        }
+    }
+
     /// Refresh the credentials if generation `observed` is still current.
     ///
     /// Single-flight: concurrent callers serialize on the refresh lock, and a
@@ -642,7 +726,7 @@ impl VaultCredentialProvider {
 
         let renewable = current.lease.map(|lease| lease.renewable).unwrap_or(false);
         let renewed = if renewable {
-            match policy::execute("vault_token_renew", OpClass::Auth, &self.policy.retry, cancel, || {
+            match policy::execute("vault_token_renew", OpClass::Auth, &self.policy.renew_retry, cancel, || {
                 self.source.renew(&current.client)
             })
             .await
@@ -711,17 +795,22 @@ impl fmt::Debug for VaultCredentialProvider {
 /// again immediately (the renewal point is already in the past), so the
 /// provider keeps trying to recover even after the fail-closed window has
 /// been reached.
+///
+/// Both waits run through [`VaultCredentialProvider::wait_publishing_gauges`],
+/// which is the only place the credential gauges are published: the loop is
+/// already the component that tracks token expiry, and doing it here keeps the
+/// request path free of any metric work.
 async fn renewal_loop(provider: Arc<VaultCredentialProvider>, cancel: CancellationToken) {
+    describe_credential_metrics();
     loop {
         let handle = provider.snapshot();
         let Some(renew_at) = handle.renew_at() else {
             // The current generation never expires; nothing left to schedule.
+            provider.record_credential_gauges();
             return;
         };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep_until(renew_at) => {}
+        if !provider.wait_publishing_gauges(renew_at, &cancel).await {
+            return;
         }
 
         match provider.refresh(handle.generation, &cancel).await {
@@ -733,10 +822,9 @@ async fn renewal_loop(provider: Arc<VaultCredentialProvider>, cancel: Cancellati
                     error = %error,
                     "Vault credential refresh failed; retrying until the credentials recover"
                 );
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(provider.policy.retry_interval) => {}
+                let retry_at = Instant::now() + provider.policy.retry_interval;
+                if !provider.wait_publishing_gauges(retry_at, &cancel).await {
+                    return;
                 }
             }
         }
@@ -789,17 +877,54 @@ mod tests {
     /// Tight retry budget so paused-clock tests stay deterministic: one
     /// attempt per cycle, failed cycles spaced by `retry_interval`.
     fn test_policy(safety_window: Duration, retry_interval: Duration) -> VaultCredentialPolicy {
+        let retry = RetryPolicy::for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let renew_retry = RetryPolicy::for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
         VaultCredentialPolicy {
-            retry: RetryPolicy {
-                attempt_timeout: Duration::from_secs(1),
-                op_deadline: Duration::from_secs(1),
-                max_attempts: 1,
-                base_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(10),
-            },
+            retry,
+            renew_retry,
             safety_window,
             retry_interval,
         }
+    }
+
+    #[test]
+    fn configured_login_and_renewal_use_reserved_credential_capacity() {
+        let config = KmsConfig::default();
+        let auth_method = VaultAuthMethod::Token {
+            token: TEST_TOKEN.to_string(),
+        };
+        let credentials = VaultCredentialPolicy::from_kms_config(
+            &config,
+            &auth_method,
+            "vault-kv2",
+            "https://credential-policy.example.invalid",
+            Some("team-namespace"),
+        );
+        let operations = RetryPolicy::for_backend(
+            &config,
+            "vault-kv2",
+            "https://credential-policy.example.invalid",
+            Some("team-namespace"),
+            "operations",
+        );
+
+        assert!(credentials.retry.uses_credential_reserve());
+        assert!(credentials.renew_retry.uses_credential_reserve());
+        assert!(!operations.uses_credential_reserve());
+        assert!(credentials.retry.shares_active_capacity_with(&credentials.renew_retry));
+        assert!(credentials.retry.shares_active_capacity_with(&operations));
     }
 
     /// Shared observable state of a [`ScriptedSource`].
@@ -1005,11 +1130,12 @@ mod tests {
             "expected CredentialsUnavailable, got {error:?}"
         );
 
-        // Recovery: the next retry cycle succeeds, installs a fresh
-        // generation, and the provider serves requests again.
+        // Recovery: after the failed-refresh circuit's cool-down, its single
+        // half-open probe succeeds, installs a fresh generation, and the
+        // provider serves requests again.
         state.fail_renew.store(false, Ordering::SeqCst);
         state.fail_login.store(false, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_secs(31)).await;
         let handle = provider.current().expect("provider must recover after a successful refresh");
         assert!(handle.generation >= 1);
 
@@ -1353,5 +1479,126 @@ mod tests {
         let rendered = format!("{source:?}");
         assert!(!rendered.contains(TEST_TOKEN), "debug output must not leak the vault token: {rendered}");
         assert!(rendered.contains("vault-token"), "the file path is not a secret");
+    }
+
+    // -- Metric emission ----------------------------------------------------
+    //
+    // Each test installs a thread-local debugging recorder and drives a
+    // paused-clock current-thread runtime inside it, so the renewal loop's
+    // gauge publications land on exact virtual timestamps.
+
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    type MetricEntry = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
+
+    /// Run `test` on a paused current-thread runtime under a debugging
+    /// recorder and return one snapshot of everything it emitted.
+    ///
+    /// A single snapshot per test on purpose: `Snapshotter::snapshot` drains
+    /// the recorded state, so taking it per assertion would only show the
+    /// first assertion any data.
+    fn record_metrics<Out>(
+        test: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Out>>>,
+    ) -> (Vec<MetricEntry>, Out) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let out = metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("current-thread runtime must build");
+            runtime.block_on(test())
+        });
+        (snapshotter.snapshot().into_vec(), out)
+    }
+
+    /// Last value of a gauge, plus the labels it was published with.
+    fn gauge(snapshot: &[MetricEntry], name: &str) -> Option<(f64, Vec<String>)> {
+        snapshot.iter().find_map(|(composite, _unit, _description, value)| {
+            let matches = composite.kind() == MetricKind::Gauge && composite.key().name() == name;
+            match (matches, value) {
+                (true, DebugValue::Gauge(value)) => Some((
+                    value.into_inner(),
+                    composite.key().labels().map(|label| label.key().to_string()).collect(),
+                )),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn renewal_loop_republishes_token_ttl_while_it_waits() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                let (provider, _state) = scripted_provider(
+                    Duration::from_secs(60),
+                    true,
+                    test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+                )
+                .await;
+                let task = provider.spawn_renewal_task().expect("lease-bound tokens need renewal");
+
+                // Well inside the first half of the lease: nothing has been
+                // renewed yet, so only the observation cadence can have moved
+                // the gauge off its initial 60s.
+                tokio::time::sleep(Duration::from_secs(25)).await;
+                task.shutdown().await;
+            })
+        });
+
+        let (ttl, labels) = gauge(&snapshot, METRIC_TOKEN_TTL_SECONDS).expect("token TTL gauge must be published");
+        assert!(
+            (ttl - 40.0).abs() < 1.0,
+            "expected ~40s left of a 60s lease at the last observation, got {ttl}"
+        );
+        assert!(labels.is_empty(), "credential gauges must carry no labels, got {labels:?}");
+        assert_eq!(
+            gauge(&snapshot, METRIC_CREDENTIALS_FAIL_CLOSED).map(|(value, _)| value),
+            Some(0.0),
+            "a token outside its safety window must not report fail-closed"
+        );
+    }
+
+    #[test]
+    fn fail_closed_gauge_tracks_the_gate_the_request_path_applies() {
+        let (snapshot, refused) = record_metrics(|| {
+            Box::pin(async {
+                let (provider, state) = scripted_provider(
+                    Duration::from_secs(60),
+                    true,
+                    test_policy(Duration::from_secs(10), Duration::from_secs(5)),
+                )
+                .await;
+                state.fail_renew.store(true, Ordering::SeqCst);
+                state.fail_login.store(true, Ordering::SeqCst);
+                let task = provider.spawn_renewal_task().expect("renewal task");
+
+                // 60s lease minus the 10s safety window: by 51s the provider
+                // is refusing the token, and the gauge must already say so.
+                tokio::time::sleep(Duration::from_secs(51)).await;
+                let refused = provider.current().is_err();
+                task.shutdown().await;
+                refused
+            })
+        });
+
+        assert!(refused, "a token inside the safety window must be refused");
+        assert_eq!(
+            gauge(&snapshot, METRIC_CREDENTIALS_FAIL_CLOSED).map(|(value, _)| value),
+            Some(1.0),
+            "the gauge must report the same fail-closed state the request path enforces"
+        );
+        let (ttl, _labels) = gauge(&snapshot, METRIC_TOKEN_TTL_SECONDS).expect("token TTL gauge must be published");
+        assert!(
+            (ttl - 10.0).abs() < 1.0,
+            "expected the TTL gauge to track the lease down into its safety window, got {ttl}"
+        );
     }
 }

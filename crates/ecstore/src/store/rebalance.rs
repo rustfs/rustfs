@@ -202,13 +202,35 @@ impl ECStore {
     }
 
     pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let mut first_error = None;
+        let mut first_volume_error = None;
+        let mut has_success = false;
         for pool in self.pools.iter() {
             let mut opts = opts.clone();
             opts.delete_prefix = true;
-            pool.delete_object(bucket, object, opts).await?;
+            match pool.delete_object(bucket, object, opts).await {
+                Ok(_) => has_success = true,
+                Err(err) if is_err_strict_volume_not_found(&err) => {
+                    if first_volume_error.is_none() {
+                        first_volume_error = Some(err);
+                    }
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
         }
 
-        Ok(())
+        match first_error {
+            Some(err) => Err(err),
+            None if has_success => Ok(()),
+            None => match first_volume_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            },
+        }
     }
 
     pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
@@ -748,9 +770,148 @@ impl ECStore {
 mod tests {
     use super::*;
     use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
+    use crate::disk::error::DiskError;
+    use crate::layout::endpoint::Endpoint;
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use arc_swap::ArcSwap;
     use rustfs_config::server_config::KVS;
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn delete_prefix_attempts_later_pools_after_an_earlier_pool_error() {
+        let temp_dir = tempfile::tempdir().expect("multi-pool delete test directory should be created");
+        let mut pools = Vec::with_capacity(2);
+        for (pool_index, drives_per_set) in [2, 4].into_iter().enumerate() {
+            let mut endpoints = Vec::with_capacity(drives_per_set);
+            for disk_index in 0..drives_per_set {
+                let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
+                tokio::fs::create_dir_all(&disk_path)
+                    .await
+                    .expect("multi-pool delete test disk should be created");
+                let mut endpoint =
+                    Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("delete-prefix-pool-{pool_index}"),
+                platform: "test".to_string(),
+            });
+        }
+
+        let endpoint_pools = EndpointServerPools(pools);
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("multi-pool local disks should initialize");
+        let shutdown = CancellationToken::new();
+        let store = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address should parse"),
+            endpoint_pools,
+            shutdown.clone(),
+            instance_ctx,
+        )
+        .await
+        .expect("multi-pool store should initialize");
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in both pools");
+
+        let first_pool_disks = store.pools[0].disk_set[0].disks.read().await.clone();
+        for disk in first_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, "blocked", bytes::Bytes::from_static(b"not-a-directory"))
+                .await
+                .expect("first pool should contain a blocking parent file");
+        }
+        let later_pool_disks = store.pools[1].disk_set[0].disks.read().await.clone();
+        let later_data_disk = later_pool_disks[0].clone().expect("later pool should have its first disk");
+        later_data_disk
+            .write_all(&bucket, "blocked/prefix/object", bytes::Bytes::from_static(b"data"))
+            .await
+            .expect("later pool should contain the prefix on its available disk");
+        *store.pools[1].disk_set[0].disks.write().await = vec![Some(later_data_disk.clone()), None, None, None];
+
+        let err = store
+            .delete_prefix(&bucket, "blocked/prefix", &ObjectOptions::default())
+            .await
+            .expect_err("the first pool's hard error must be returned");
+
+        assert!(
+            matches!(err, StorageError::PrefixAccessDenied(ref error_bucket, ref error_prefix)
+                if error_bucket == &bucket && error_prefix == "blocked/prefix"),
+            "unexpected multi-pool delete error: {err:?}"
+        );
+        assert!(matches!(
+            later_data_disk.read_all(&bucket, "blocked/prefix/object").await,
+            Err(DiskError::FileNotFound)
+        ));
+
+        *store.pools[1].disk_set[0].disks.write().await = later_pool_disks.clone();
+        for disk in first_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, "second-blocked", bytes::Bytes::from_static(b"not-a-directory"))
+                .await
+                .expect("first pool should contain a second blocking parent file");
+        }
+        for disk in later_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, "second-blocked/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("later pool should contain the second prefix");
+        }
+        let err = store
+            .delete_prefix(&bucket, "second-blocked/prefix", &ObjectOptions::default())
+            .await
+            .expect_err("a successful later pool must not override the first pool's hard error");
+        assert!(
+            matches!(err, StorageError::PrefixAccessDenied(ref error_bucket, ref error_prefix)
+                if error_bucket == &bucket && error_prefix == "second-blocked/prefix"),
+            "unexpected hard-error plus success result: {err:?}"
+        );
+        for disk in later_pool_disks.iter().flatten() {
+            assert!(matches!(
+                disk.read_all(&bucket, "second-blocked/prefix/object").await,
+                Err(DiskError::FileNotFound)
+            ));
+        }
+
+        for disk in later_pool_disks.iter().flatten() {
+            disk.delete_volume(&bucket, true)
+                .await
+                .expect("the bucket should be absent from the later pool");
+        }
+        let healthy_object = "healthy/prefix/object";
+        for disk in first_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, healthy_object, bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("the first pool should contain the healthy prefix");
+        }
+        store
+            .delete_prefix(&bucket, "healthy/prefix", &ObjectOptions::default())
+            .await
+            .expect("one successful pool should make a partially missing bucket idempotent");
+        for disk in first_pool_disks.iter().flatten() {
+            assert!(matches!(disk.read_all(&bucket, healthy_object).await, Err(DiskError::FileNotFound)));
+        }
+
+        let missing_bucket = format!("delete-prefix-missing-{}", Uuid::new_v4().simple());
+        let err = store
+            .delete_prefix(&missing_bucket, "missing/prefix", &ObjectOptions::default())
+            .await
+            .expect_err("a bucket missing from every pool must remain an error");
+        assert_eq!(err, StorageError::BucketNotFound(missing_bucket));
+
+        shutdown.cancel();
+    }
 
     fn assert_backend_layout_empty(info: &rustfs_madmin::BackendInfo) {
         assert!(info.standard_sc_parities.is_empty());

@@ -17,6 +17,8 @@ mod instance;
 mod loader;
 mod target_args;
 
+pub use common::format_outbound_http_url_error;
+
 pub use instance::{
     LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, TargetInstanceSourceHints, TargetPluginInstance,
     TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, normalize_legacy_target_instances,

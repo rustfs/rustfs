@@ -703,7 +703,11 @@ mod serial_tests {
             action: IlmAction::DeleteAction,
             ..Default::default()
         };
-        expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner)
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
+        expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
             .await
             .expect("expire_transitioned_object should succeed");
 
@@ -2186,7 +2190,11 @@ mod serial_tests {
             action: IlmAction::DeleteRestoredAction,
             ..Default::default()
         };
-        expire_transitioned_object(ecstore.clone(), &restored, &lc_event, &LcEventSrc::Scanner)
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
+        expire_transitioned_object(ecstore.clone(), &restored, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
             .await
             .expect("restore-expiry cleanup should succeed");
 

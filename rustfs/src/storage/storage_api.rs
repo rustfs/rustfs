@@ -49,8 +49,12 @@ pub(crate) mod contract {
 
     pub(crate) mod bucket {
         pub(crate) use super::super::storage_contracts::{
-            BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+            BUCKET_LIFECYCLE_LOCK_OBJECT, BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
         };
+    }
+
+    pub(crate) mod namespace {
+        pub(crate) use super::super::storage_contracts::NamespaceLocking;
     }
 
     pub(crate) mod list {
@@ -61,7 +65,7 @@ pub(crate) mod contract {
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{MultipartInfo, PartInfo};
+        pub(crate) use super::super::storage_contracts::{MultipartInfo, MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -89,27 +93,23 @@ pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, get_buffer_size_opt_in,
-    get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
+    get_validated_store, load_bucket_object_lock_config_state, parse_object_lock_legal_hold, parse_object_lock_retention,
     parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled,
+    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
     validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
 pub(crate) use super::sse::{
-    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers, sse_decryption,
-    sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read,
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, authorize_sse_kms_object_read,
+    extract_server_side_encryption_from_headers, sse_decryption, sse_encryption, sse_prepare_encryption,
+    strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
 };
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,
+        PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
+        recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
     };
-
-    pub(crate) mod contract {
-        pub(crate) mod bucket {
-            pub(crate) use super::super::super::contract::bucket::BucketOperations;
-        }
-    }
 }
 
 pub(crate) mod concurrency_consumer {
@@ -151,10 +151,6 @@ pub(crate) mod ecfs_extend_consumer {
             pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
         }
 
-        pub(crate) mod object {
-            pub(crate) use super::super::super::contract::object::ObjectToDelete;
-        }
-
         pub(crate) mod multipart {
             pub(crate) use super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
@@ -183,10 +179,11 @@ pub(crate) mod options_consumer {
     #[cfg(test)]
     pub(crate) use super::super::options::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use super::super::options::{
-        bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
+        copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
         extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
-        get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
-        normalize_content_encoding_for_storage, parse_copy_source_range, put_opts, validate_archive_content_encoding,
+        get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
+        namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
+        preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
     };
 
     pub(crate) mod contract {
@@ -231,11 +228,11 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore,
-            ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-            ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-            StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata, validate_batch_read_version_item_count,
+            ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN,
+            PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
+            SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path,
+            collect_local_metrics, find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata,
+            reload_transition_tier_config, remove_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -263,7 +260,10 @@ pub(crate) mod rpc_consumer {
 pub(crate) mod runtime_sources_consumer {
     pub(crate) type ECStore = super::ECStore;
     pub(crate) type EndpointServerPools = super::EndpointServerPools;
+    pub(crate) type ServerContextSlot = super::ServerContextSlot;
     pub(crate) use crate::storage::runtime_sources;
+    #[cfg(test)]
+    pub(crate) use crate::storage::runtime_sources::{AppContext, IamInterface, KmsInterface};
 }
 
 pub(crate) mod heal_control_startup_consumer {
@@ -331,12 +331,14 @@ pub(crate) mod s3_api_consumer {
 pub(crate) mod sse_consumer {
     pub(crate) use super::super::sse::{
         EncryptionKeyKind, SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
-        extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+        extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode, map_get_object_reader_error,
+        mark_encrypted_multipart_metadata,
     };
     pub(crate) use super::{
-        DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
-        extract_server_side_encryption_from_headers, get_buffer_size_opt_in, sse_decryption, sse_encryption,
-        sse_prepare_encryption,
+        DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
+        authorize_sse_kms_object_read, extract_server_side_encryption_from_headers, get_buffer_size_opt_in,
+        load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
+        validate_bucket_object_lock_enabled_state,
     };
 }
 
@@ -493,11 +495,11 @@ pub(crate) mod ecstore_rio {
 
 pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
-        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
-        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
-        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
-        verify_tonic_rpc_signature_with_bootstrap,
+        KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
+        PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX,
+        normalize_tonic_rpc_audience, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
+        tonic_boot_epoch_response_headers, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -561,6 +563,7 @@ pub(crate) const OBJECT_LOCK_CONFIG: &str = ecstore_bucket::metadata::OBJECT_LOC
 pub(crate) const PEER_RESTDRY_RUN: &str = ecstore_rpc::PEER_RESTDRY_RUN;
 pub(crate) const PEER_RESTSIGNAL: &str = ecstore_rpc::PEER_RESTSIGNAL;
 pub(crate) const PEER_RESTSUB_SYS: &str = ecstore_rpc::PEER_RESTSUB_SYS;
+pub(crate) const KMS_SIGNAL_SUBSYSTEM: &str = ecstore_rpc::KMS_SIGNAL_SUBSYSTEM;
 pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNAL_REFRESH_CONFIG;
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
@@ -844,7 +847,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
     };
 
     for bucket in buckets {
-        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
+        let transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
         let status = pool.get_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
@@ -859,7 +862,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
             continue;
         }
         let encoded = serde_json::to_vec(&targets).map_err(Error::other)?;
-        ecstore_bucket::metadata_sys::update_bucket_targets_under_transaction_lock(bucket, encoded).await?;
+        ecstore_bucket::metadata_sys::update_bucket_targets_under_transaction_lock(&transaction_guard, bucket, encoded).await?;
     }
 
     Ok(())
@@ -1396,7 +1399,18 @@ pub(crate) fn get_global_bucket_metadata_sys() -> Option<Arc<tokio::sync::RwLock
 }
 
 pub(crate) async fn delete_bucket_metadata_config(bucket: &str, config_file: &str) -> Result<time::OffsetDateTime> {
-    let updated_at = ecstore_bucket::metadata_sys::delete(bucket, config_file).await?;
+    delete_bucket_metadata_config_if_incarnation(bucket, config_file, None).await
+}
+
+pub(crate) async fn delete_bucket_metadata_config_if_incarnation(
+    bucket: &str,
+    config_file: &str,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> Result<time::OffsetDateTime> {
+    let updated_at = match expected_incarnation_id {
+        Some(incarnation_id) => ecstore_bucket::metadata_sys::delete_if_incarnation(bucket, config_file, incarnation_id).await?,
+        None => ecstore_bucket::metadata_sys::delete(bucket, config_file).await?,
+    };
     record_scanner_maintenance_config_change(bucket, config_file);
     Ok(updated_at)
 }
@@ -1441,6 +1455,21 @@ pub(crate) async fn get_bucket_replication_config(
     ecstore_bucket::metadata_sys::get_replication_config(bucket).await
 }
 
+pub(crate) async fn persist_force_delete_intent(
+    api: Arc<ECStore>,
+    entry: ecstore_bucket::replication::MrfReplicateEntry,
+) -> Result<()> {
+    ecstore_bucket::replication::persist_force_delete_intent(api, entry).await
+}
+
+pub(crate) async fn commit_force_delete_intent(api: Arc<ECStore>, operation_id: uuid::Uuid) -> Result<()> {
+    ecstore_bucket::replication::commit_force_delete_intent(api, operation_id).await
+}
+
+pub(crate) async fn complete_force_delete_intent(api: Arc<ECStore>, operation_id: uuid::Uuid) -> Result<()> {
+    ecstore_bucket::replication::complete_force_delete_intent(api, operation_id).await
+}
+
 pub(crate) async fn get_bucket_request_payment_config(
     bucket: &str,
 ) -> Result<(s3s::dto::RequestPaymentConfiguration, time::OffsetDateTime)> {
@@ -1475,17 +1504,37 @@ pub(crate) async fn update_bucket_metadata_config(
     config_file: &str,
     data: Vec<u8>,
 ) -> Result<time::OffsetDateTime> {
-    let updated_at = ecstore_bucket::metadata_sys::update(bucket, config_file, data).await?;
+    update_bucket_metadata_config_if_incarnation(bucket, config_file, data, None).await
+}
+
+pub(crate) async fn update_bucket_metadata_config_if_incarnation(
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> Result<time::OffsetDateTime> {
+    let updated_at = match expected_incarnation_id {
+        Some(incarnation_id) => {
+            ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, incarnation_id).await?
+        }
+        None => ecstore_bucket::metadata_sys::update(bucket, config_file, data).await?,
+    };
     record_scanner_maintenance_config_change(bucket, config_file);
     Ok(updated_at)
 }
 
-pub(crate) async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+pub(crate) async fn acquire_bucket_metadata_transaction_lock(
+    bucket: &str,
+) -> Result<ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
     ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
 }
 
-pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {
-    ecstore_bucket::metadata_sys::update_bucket_targets_under_transaction_lock(bucket, data).await
+pub(crate) async fn update_bucket_targets_under_transaction_lock(
+    guard: &ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+    bucket: &str,
+    data: Vec<u8>,
+) -> Result<time::OffsetDateTime> {
+    ecstore_bucket::metadata_sys::update_bucket_targets_under_transaction_lock(guard, bucket, data).await
 }
 
 fn record_scanner_maintenance_config_change(bucket: &str, config_file: &str) {
@@ -1551,10 +1600,6 @@ pub(crate) fn is_err_object_not_found(err: &Error) -> bool {
 
 pub(crate) fn is_err_version_not_found(err: &Error) -> bool {
     ecstore_error::is_err_version_not_found(err)
-}
-
-pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
-    ecstore_disk::error_reduce::is_all_buckets_not_found(errs)
 }
 
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {

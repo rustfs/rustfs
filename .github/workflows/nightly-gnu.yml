@@ -1,0 +1,57 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nightly GNU Build
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-gnu-build-main-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build x86_64 GNU
+    runs-on: sm-standard-2
+    timeout-minutes: 150
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: build-x86_64-unknown-linux-gnu
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Build RustFS
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p rustfs --bins

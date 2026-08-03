@@ -288,6 +288,7 @@ atoi = { workspace = true }
 atomic_enum = { workspace = true }
 async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }
 base64 = { workspace = true }
+zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rsa = { workspace = true, features = ["sha2"] }
@@ -330,7 +331,7 @@ mimalloc = { workspace = true }
 libsystemd.workspace = true
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+libmimalloc-sys.workspace = true
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }

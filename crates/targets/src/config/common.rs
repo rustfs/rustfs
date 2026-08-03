@@ -23,7 +23,7 @@ use rustfs_config::{
     NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_TLS_CA,
     PULSAR_TOPIC, PULSAR_USERNAME,
 };
-use rustfs_utils::egress::OutboundPolicy;
+use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy, OutboundPolicyError};
 use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
@@ -223,7 +223,22 @@ pub(super) fn validate_outbound_http_url(value: &Url, field_label: &str) -> Resu
         OutboundPolicy::from_env_cached().map_err(|err| TargetError::Configuration(format!("invalid outbound policy: {err}")))?;
     policy
         .validate_url(value)
-        .map_err(|e| TargetError::Configuration(format!("{field_label} is not allowed: {e}")))
+        .map_err(|err| TargetError::Configuration(format_outbound_http_url_error(field_label, value, &err)))
+}
+
+/// Formats an outbound-policy rejection and adds an exact-origin hint only when that origin can override the rejection.
+pub fn format_outbound_http_url_error(field_label: &str, value: &Url, err: &OutboundPolicyError) -> String {
+    let base = format!("{field_label} is not allowed: {err}");
+    let origin = value.origin().ascii_serialization();
+    let can_allow_origin =
+        OutboundPolicy::from_allowed_origins(&origin).is_ok_and(|allowlisted| allowlisted.validate_url(value).is_ok());
+    if can_allow_origin {
+        format!(
+            "{base}; add {origin} to {ENV_OUTBOUND_ALLOW_ORIGINS} (comma-separated) and restart RustFS to allow this operator-owned endpoint (origin only, no path)"
+        )
+    } else {
+        base
+    }
 }
 
 #[cfg(test)]

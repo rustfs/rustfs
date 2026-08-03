@@ -13,22 +13,24 @@
 // limitations under the License.
 
 use super::replication_config_store::ReplicationConfigStore;
-use super::replication_error_boundary::Error as EcstoreError;
+use super::replication_error_boundary::{Error as EcstoreError, is_err_object_not_found, is_err_version_not_found};
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
-    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replicate_decision_for_admitted_targets,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
-use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
+use super::replication_object_config::{ReplicationConfig, check_replicate_delete_strict, must_replicate};
+use super::replication_object_decision_boundary::MustReplicateOptions;
 use super::replication_queue_boundary::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
-    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
-    ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, WORKER_MAX_LIMIT,
-    initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count, replication_backpressure_recommendation,
-    replication_heal_queue_action, resized_worker_counts, should_queue_large_object, worker_queue_for_replication_type,
+    ReplicationBatchAdmission, ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes,
+    ReplicationOperation, ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue,
+    WORKER_MAX_LIMIT, initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count,
+    replication_backpressure_recommendation, replication_heal_queue_action, resized_worker_counts, should_queue_large_object,
+    worker_queue_for_replication_type,
 };
 use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
@@ -36,22 +38,32 @@ use super::replication_resync_boundary::{
     encode_mrf_file, should_auto_resume_resync,
 };
 use super::replication_resyncer::{
-    ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_object, save_resync_status,
+    ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_delete_with_outcome, replicate_object,
+    replicate_object_with_outcome, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
-    ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+    HTTPPreconditions, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO,
+    ReplicationStorage,
 };
 use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
+use futures_util::stream::{self, StreamExt};
+use metrics::{counter, histogram};
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
@@ -67,11 +79,304 @@ const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
+const DELETE_BATCH_ADMISSION_CONCURRENCY: usize = 16;
+const METRIC_DELETE_BATCH_ITEMS_TOTAL: &str = "rustfs_replication_delete_batch_items_total";
+const METRIC_DELETE_BATCH_SIZE: &str = "rustfs_replication_delete_batch_size";
+const MRF_CORRUPT_FILE_PREFIX: &str = "config/replication/mrf.corrupt";
 
 #[derive(Debug, Default)]
 pub struct DurableMrfBacklog {
     pub available: bool,
     pub entries: Vec<MrfReplicateEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurableMrfBucketBacklog {
+    pub bucket: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurableMrfTargetBacklog {
+    pub bucket: String,
+    pub target_arn: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurableMrfBacklogSummary {
+    pub available: bool,
+    pub buckets: Vec<DurableMrfBucketBacklog>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DurableMrfBacklogSnapshot {
+    summary: DurableMrfBacklogSummary,
+    targets: Vec<DurableMrfTargetBacklog>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MrfBucketBacklogObservability {
+    pub bucket: String,
+    pub pending_count: u64,
+    pub pending_bytes: u64,
+    pub dropped_count: u64,
+    pub missed_count: u64,
+    pub flush_failure_count: u64,
+    pub last_flush_duration_millis: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MrfBacklogObservabilitySummary {
+    pub buckets: Vec<MrfBucketBacklogObservability>,
+}
+
+static DURABLE_MRF_BACKLOG_SUMMARY: LazyLock<StdRwLock<DurableMrfBacklogSummary>> =
+    LazyLock::new(|| StdRwLock::new(DurableMrfBacklogSummary::default()));
+static DURABLE_MRF_TARGET_BACKLOG: LazyLock<StdRwLock<Vec<DurableMrfTargetBacklog>>> =
+    LazyLock::new(|| StdRwLock::new(Vec::new()));
+static MRF_BACKLOG_OBSERVABILITY: LazyLock<StdRwLock<MrfBacklogObservabilityTracker>> =
+    LazyLock::new(|| StdRwLock::new(MrfBacklogObservabilityTracker::default()));
+
+fn should_replay_force_delete_intent(entry: &MrfReplicateEntry) -> bool {
+    entry.force_delete_id.is_some() && entry.force_delete_local_commit && !entry.target_arns.is_empty()
+}
+
+#[derive(Debug, Clone, Default)]
+struct DurableMrfBacklogTracker {
+    available: bool,
+    buckets: HashMap<String, DurableMrfBucketBacklog>,
+    targets: HashMap<(String, String), DurableMrfTargetBacklog>,
+}
+
+impl DurableMrfBacklogTracker {
+    fn add_entry(&mut self, entry: &MrfReplicateEntry) {
+        let Ok(size) = u64::try_from(entry.size) else {
+            self.available = false;
+            self.buckets.clear();
+            self.targets.clear();
+            return;
+        };
+
+        if !self.available {
+            return;
+        }
+
+        let bucket_name = entry.bucket.clone();
+        let bucket = match self.buckets.entry(bucket_name) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let bucket = entry.key().clone();
+                entry.insert(DurableMrfBucketBacklog {
+                    bucket,
+                    ..Default::default()
+                })
+            }
+        };
+        bucket.count = bucket.count.saturating_add(1);
+        bucket.bytes = bucket.bytes.saturating_add(size);
+
+        for target_arn in &entry.target_arns {
+            if target_arn.is_empty() {
+                continue;
+            }
+            let key = (entry.bucket.clone(), target_arn.clone());
+            let target = match self.targets.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let (bucket, target_arn) = entry.key().clone();
+                    entry.insert(DurableMrfTargetBacklog {
+                        bucket,
+                        target_arn,
+                        ..Default::default()
+                    })
+                }
+            };
+            target.count = target.count.saturating_add(1);
+            target.bytes = target.bytes.saturating_add(size);
+        }
+    }
+
+    fn into_snapshot(self) -> DurableMrfBacklogSnapshot {
+        if !self.available {
+            return DurableMrfBacklogSnapshot::default();
+        }
+
+        DurableMrfBacklogSnapshot {
+            summary: DurableMrfBacklogSummary {
+                available: true,
+                buckets: self.buckets.into_values().collect(),
+            },
+            targets: self.targets.into_values().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MrfBacklogObservabilityTracker {
+    buckets: HashMap<String, MrfBucketBacklogObservability>,
+}
+
+impl MrfBacklogObservabilityTracker {
+    fn bucket_mut(&mut self, bucket_name: &str) -> &mut MrfBucketBacklogObservability {
+        match self.buckets.entry(bucket_name.to_string()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(MrfBucketBacklogObservability {
+                bucket: bucket_name.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn add_pending(&mut self, entry: &MrfReplicateEntry) {
+        let Ok(size) = u64::try_from(entry.size) else {
+            return;
+        };
+        let bucket = self.bucket_mut(&entry.bucket);
+        bucket.pending_count = bucket.pending_count.saturating_add(1);
+        bucket.pending_bytes = bucket.pending_bytes.saturating_add(size);
+    }
+
+    fn flush_pending_entries<'a>(&mut self, entries: impl IntoIterator<Item = &'a MrfReplicateEntry>, duration_millis: u64) {
+        for entry in entries {
+            let Ok(size) = u64::try_from(entry.size) else {
+                continue;
+            };
+            let bucket = self.bucket_mut(&entry.bucket);
+            bucket.pending_count = bucket.pending_count.saturating_sub(1);
+            bucket.pending_bytes = bucket.pending_bytes.saturating_sub(size);
+            bucket.last_flush_duration_millis = duration_millis;
+        }
+    }
+
+    #[cfg(test)]
+    fn record_drop(&mut self, entry: &MrfReplicateEntry) {
+        let bucket = self.bucket_mut(&entry.bucket);
+        bucket.dropped_count = bucket.dropped_count.saturating_add(1);
+    }
+
+    fn record_missed(&mut self, bucket_name: &str) {
+        let bucket = self.bucket_mut(bucket_name);
+        bucket.missed_count = bucket.missed_count.saturating_add(1);
+    }
+
+    fn record_flush_failure(&mut self, duration_millis: u64) {
+        for bucket in self.buckets.values_mut().filter(|bucket| bucket.pending_count > 0) {
+            bucket.flush_failure_count = bucket.flush_failure_count.saturating_add(1);
+            bucket.last_flush_duration_millis = duration_millis;
+        }
+    }
+
+    fn snapshot(&self) -> MrfBacklogObservabilitySummary {
+        MrfBacklogObservabilitySummary {
+            buckets: self.buckets.values().cloned().collect(),
+        }
+    }
+}
+
+fn durable_mrf_backlog_summary_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a MrfReplicateEntry>,
+) -> DurableMrfBacklogSnapshot {
+    let mut tracker = DurableMrfBacklogTracker {
+        available: true,
+        ..Default::default()
+    };
+    for entry in entries {
+        tracker.add_entry(entry);
+    }
+    tracker.into_snapshot()
+}
+
+#[cfg(test)]
+fn durable_mrf_backlog_summary_from_sizes<I>(entries: I) -> DurableMrfBacklogSnapshot
+where
+    I: IntoIterator<Item = (String, i64)>,
+{
+    let mut tracker = DurableMrfBacklogTracker {
+        available: true,
+        ..Default::default()
+    };
+    for (bucket_name, entry_size) in entries {
+        tracker.add_entry(&MrfReplicateEntry {
+            bucket: bucket_name,
+            object: String::new(),
+            version_id: None,
+            retry_count: 0,
+            size: entry_size,
+            op: MrfOpKind::Object,
+            force_delete: false,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
+        });
+    }
+    tracker.into_snapshot()
+}
+
+fn set_durable_mrf_backlog_snapshot(snapshot: DurableMrfBacklogSnapshot) {
+    match DURABLE_MRF_BACKLOG_SUMMARY.write() {
+        Ok(mut guard) => *guard = snapshot.summary,
+        Err(poisoned) => *poisoned.into_inner() = snapshot.summary,
+    }
+    match DURABLE_MRF_TARGET_BACKLOG.write() {
+        Ok(mut guard) => *guard = snapshot.targets,
+        Err(poisoned) => *poisoned.into_inner() = snapshot.targets,
+    }
+}
+
+fn set_durable_mrf_backlog_summary(summary: DurableMrfBacklogSummary) {
+    set_durable_mrf_backlog_snapshot(DurableMrfBacklogSnapshot {
+        summary,
+        targets: Vec::new(),
+    });
+}
+
+pub fn durable_mrf_backlog_summary_snapshot() -> DurableMrfBacklogSummary {
+    match DURABLE_MRF_BACKLOG_SUMMARY.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+pub fn durable_mrf_target_backlog_snapshot() -> Vec<DurableMrfTargetBacklog> {
+    match DURABLE_MRF_TARGET_BACKLOG.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+pub fn mrf_backlog_observability_snapshot() -> MrfBacklogObservabilitySummary {
+    match MRF_BACKLOG_OBSERVABILITY.read() {
+        Ok(guard) => guard.snapshot(),
+        Err(poisoned) => poisoned.into_inner().snapshot(),
+    }
+}
+
+fn update_mrf_backlog_observability(mut update: impl FnMut(&mut MrfBacklogObservabilityTracker)) {
+    match MRF_BACKLOG_OBSERVABILITY.write() {
+        Ok(mut guard) => update(&mut guard),
+        Err(poisoned) => update(&mut poisoned.into_inner()),
+    }
+}
+
+fn observe_mrf_pending(entry: &MrfReplicateEntry) {
+    update_mrf_backlog_observability(|tracker| tracker.add_pending(entry));
+}
+
+fn observe_mrf_pending_flushed(entries: &[MrfReplicateEntry], duration_millis: u64) {
+    update_mrf_backlog_observability(|tracker| tracker.flush_pending_entries(entries, duration_millis));
+}
+
+fn observe_mrf_missed(bucket: &str) {
+    update_mrf_backlog_observability(|tracker| tracker.record_missed(bucket));
+}
+
+fn observe_mrf_flush_failure(duration_millis: u64) {
+    update_mrf_backlog_observability(|tracker| tracker.record_flush_failure(duration_millis));
 }
 
 fn durable_mrf_backlog_from_read(result: Result<Vec<u8>, EcstoreError>) -> DurableMrfBacklog {
@@ -93,6 +398,150 @@ fn durable_mrf_backlog_from_read(result: Result<Vec<u8>, EcstoreError>) -> Durab
 
 pub async fn read_durable_mrf_backlog<S: ReplicationObjectIO>(storage: Arc<S>) -> DurableMrfBacklog {
     durable_mrf_backlog_from_read(ReplicationConfigStore::read(storage, ReplicationMetadataStore::MRF_REPLICATION_FILE).await)
+}
+
+pub async fn persist_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    mut entry: MrfReplicateEntry,
+) -> Result<(), EcstoreError> {
+    entry.force_delete_local_commit = false;
+    update_force_delete_intents(storage, move |entries, _exists| {
+        if entries
+            .iter()
+            .any(|existing| existing.force_delete_id == entry.force_delete_id)
+        {
+            return Ok(false);
+        }
+        entries.push(entry.clone());
+        Ok(true)
+    })
+    .await
+}
+
+pub async fn commit_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    operation_id: uuid::Uuid,
+) -> Result<(), EcstoreError> {
+    update_force_delete_intents(storage, move |entries, exists| {
+        if !exists {
+            return Err(EcstoreError::ConfigNotFound);
+        }
+        let Some(entry) = entries.iter_mut().find(|entry| entry.force_delete_id == Some(operation_id)) else {
+            return Err(EcstoreError::ConfigNotFound);
+        };
+        if entry.force_delete_local_commit {
+            return Ok(false);
+        }
+        entry.force_delete_local_commit = true;
+        Ok(true)
+    })
+    .await
+}
+
+pub async fn complete_force_delete_intent<S: ReplicationStorage>(
+    storage: Arc<S>,
+    operation_id: uuid::Uuid,
+) -> Result<(), EcstoreError> {
+    update_force_delete_intents(storage, move |entries, exists| {
+        if !exists {
+            return Ok(false);
+        }
+        let original_len = entries.len();
+        entries.retain(|entry| entry.force_delete_id != Some(operation_id));
+        Ok(entries.len() != original_len)
+    })
+    .await
+}
+
+const FORCE_DELETE_INTENT_CAS_RETRIES: usize = 3;
+
+fn is_retryable_force_delete_error(error: &EcstoreError) -> bool {
+    matches!(error, EcstoreError::PreconditionFailed) || error.to_string().contains("force-delete journal lock lost")
+}
+
+async fn update_force_delete_intents<S, F>(storage: Arc<S>, mut update: F) -> Result<(), EcstoreError>
+where
+    S: ReplicationStorage,
+    F: FnMut(&mut Vec<MrfReplicateEntry>, bool) -> Result<bool, EcstoreError>,
+{
+    let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+    for attempt in 0..=FORCE_DELETE_INTENT_CAS_RETRIES {
+        let result = {
+            let lock = storage
+                .new_ns_lock(
+                    ReplicationMetadataStore::rustfs_meta_bucket(),
+                    ReplicationMetadataStore::FORCE_DELETE_REPLICATION_TRANSACTION_LOCK,
+                )
+                .await?;
+            // Lock order is transaction namespace lock -> force-delete journal object lock.
+            // Keep the transaction guard alive through the conditional write so legacy
+            // writers cannot interleave a read-modify-write transition within this process.
+            let guard = lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await?;
+            let (mut entries, preconditions, exists) = read_force_delete_intents(storage.clone(), file).await?;
+            if !update(&mut entries, exists)? {
+                return Ok(());
+            }
+            save_force_delete_intents(storage.clone(), file, &guard, entries, preconditions).await
+        };
+
+        match result {
+            Err(error) if is_retryable_force_delete_error(&error) && attempt < FORCE_DELETE_INTENT_CAS_RETRIES => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            result => return result,
+        }
+    }
+
+    Err(EcstoreError::other("force-delete journal update retries exhausted"))
+}
+
+async fn read_force_delete_intents<S: ReplicationObjectIO>(
+    storage: Arc<S>,
+    file: &str,
+) -> Result<(Vec<MrfReplicateEntry>, HTTPPreconditions, bool), EcstoreError> {
+    match ReplicationConfigStore::read_no_lock_with_metadata(storage, file).await {
+        Ok((data, object_info)) => {
+            let etag = object_info
+                .etag
+                .filter(|etag| !etag.trim().is_empty())
+                .ok_or_else(|| EcstoreError::other("force-delete journal has no ETag for conditional update"))?;
+            Ok((
+                decode_mrf_file(&data)?,
+                HTTPPreconditions {
+                    if_match: Some(etag),
+                    ..Default::default()
+                },
+                true,
+            ))
+        }
+        Err(EcstoreError::ConfigNotFound) => Ok((
+            Vec::new(),
+            HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+            false,
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+async fn save_force_delete_intents<S: ReplicationStorage>(
+    storage: Arc<S>,
+    file: &str,
+    guard: &rustfs_lock::NamespaceLockGuard,
+    entries: Vec<MrfReplicateEntry>,
+    preconditions: HTTPPreconditions,
+) -> Result<(), EcstoreError> {
+    ensure_force_delete_journal_lock_held(guard.is_lock_lost())?;
+    ReplicationConfigStore::save_conditional(storage, file, encode_mrf_file(&entries)?, preconditions).await
+}
+
+fn ensure_force_delete_journal_lock_held(lock_lost: bool) -> Result<(), EcstoreError> {
+    if lock_lost {
+        return Err(EcstoreError::other("force-delete journal lock lost before conditional update"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +590,8 @@ pub struct ReplicationPool<S: ReplicationStorage> {
     mrf_replica_rx: Arc<Mutex<Receiver<ReplicationOperation>>>,
     mrf_save_tx: Sender<MrfReplicateEntry>,
     mrf_save_rx: Mutex<Option<Receiver<MrfReplicateEntry>>>,
+    mrf_recovery_complete: Arc<Notify>,
+    mrf_recovery_result: Arc<Mutex<Option<Vec<MrfReplicateEntry>>>>,
 
     // Control channels
     mrf_worker_kill_tx: Sender<()>,
@@ -184,6 +635,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
+            mrf_recovery_complete: Arc::new(Notify::new()),
+            mrf_recovery_result: Arc::new(Mutex::new(None)),
             mrf_worker_kill_tx,
             mrf_stop_tx,
             mrf_worker_size: AtomicI32::new(0),
@@ -197,8 +650,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         pool.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
 
         // Start background tasks
-        pool.start_mrf_processor().await;
         pool.start_mrf_persister().await;
+        pool.start_mrf_processor().await;
+        pool.start_force_delete_processor().await;
 
         pool
     }
@@ -233,22 +687,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             let active_counter = self.active_lrg_workers.clone();
             let storage = self.storage.clone();
+            let stats = self.stats.clone();
 
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
-                    active_counter.fetch_add(1, Ordering::SeqCst);
-
-                    match operation {
-                        ReplicationOperation::Object(obj_info) => {
-                            replicate_object(*obj_info, storage.clone()).await;
-                        }
-                        ReplicationOperation::Delete(del_info) => {
-                            replicate_delete(*del_info, storage.clone()).await;
-                        }
-                    }
-
-                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let _active = ActiveWorkerGuard::new(active_counter.clone());
+                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
                 }
             });
 
@@ -306,31 +751,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
-                    active_counter.fetch_add(1, Ordering::SeqCst);
-
-                    match operation {
-                        ReplicationOperation::Object(obj_info) => {
-                            stats
-                                .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
-
-                            // Perform actual replication (placeholder)
-                            replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
-
-                            stats
-                                .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
-                        }
-                        ReplicationOperation::Delete(del_info) => {
-                            stats.inc_q(&del_info.bucket, 0, true, del_info.op_type).await;
-                            // Perform actual delete replication (placeholder)
-                            replicate_delete(del_info.as_ref().clone(), storage.clone()).await;
-
-                            stats.dec_q(&del_info.bucket, 0, true, del_info.op_type).await;
-                        }
-                    }
-
-                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let _active = ActiveWorkerGuard::new(active_counter.clone());
+                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
                 }
             });
 
@@ -376,22 +798,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     let operation = { mrf_rx.lock().await.recv().await };
                     let Some(operation) = operation else { break };
 
-                    active_counter.fetch_add(1, Ordering::SeqCst);
-                    match operation {
-                        ReplicationOperation::Object(obj_info) => {
-                            stats
-                                .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
-                            replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
-                            stats
-                                .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                                .await;
-                        }
-                        ReplicationOperation::Delete(del_info) => {
-                            replicate_delete(*del_info, storage.clone()).await;
-                        }
-                    }
-                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                    let _active = ActiveWorkerGuard::new(active_counter.clone());
+                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
                 }
             });
             self.task_handles.lock().await.push(handle);
@@ -515,6 +923,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
+        let target_arns = ri.dsc.replicate_target_arns();
         // If object is large, queue it to a static set of large workers
         if should_queue_large_object(ri.size) {
             use std::collections::hash_map::DefaultHasher;
@@ -529,9 +938,15 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             if !lrg_workers.is_empty() {
                 let index = (hash as usize) % lrg_workers.len();
 
-                if let Some(worker) = lrg_workers.get(index)
-                    && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
-                {
+                if let Some(worker) = lrg_workers.get(index) {
+                    self.stats.inc_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+                    self.stats.inc_target_q(&ri.bucket, &target_arns, ri.size);
+                    if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
+                        return ReplicationQueueAdmission::Queued;
+                    }
+                    self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+                    self.stats.dec_target_q(&ri.bucket, &target_arns, ri.size);
+
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
                     let existing = lrg_workers.len();
@@ -539,17 +954,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     drop(lrg_workers);
 
                     // Queue to MRF if worker is busy.
-                    let admission =
-                        queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "large_object")
-                            .await;
+                    let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "large_object").await;
 
                     if let Some(resize) = resize {
                         self.resize_lrg_workers(resize.new_count, resize.existing_count).await;
                     }
                     return admission;
                 }
-
-                return ReplicationQueueAdmission::Queued;
             }
             return ReplicationQueueAdmission::Missed;
         }
@@ -562,12 +973,16 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Missed;
         };
 
+        self.stats.inc_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+        self.stats.inc_target_q(&ri.bucket, &target_arns, ri.size);
         if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_ok() {
             return ReplicationQueueAdmission::Queued;
         }
+        self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
+        self.stats.dec_target_q(&ri.bucket, &target_arns, ri.size);
 
         // Queue to MRF if all workers are busy.
-        let admission = queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "object").await;
+        let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "object").await;
 
         // Try to scale up workers based on priority
         self.apply_queue_backpressure("object", true, "Replication queue is backpressured")
@@ -578,6 +993,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica delete task
     pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
+        let target_arns = doi.admitted_target_arns();
         let ch = self
             .worker_queue_channel(&doi.op_type, &doi.bucket, &doi.delete_object.object_name, 0)
             .await;
@@ -586,18 +1002,15 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Missed;
         };
 
+        self.stats.inc_q(&doi.bucket, 0, true, doi.op_type);
+        self.stats.inc_target_q(&doi.bucket, &target_arns, 0);
         if channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_ok() {
             return ReplicationQueueAdmission::Queued;
         }
+        self.stats.dec_q(&doi.bucket, 0, true, doi.op_type);
+        self.stats.dec_target_q(&doi.bucket, &target_arns, 0);
 
-        let admission = queue_mrf_save_admission(
-            &self.mrf_save_tx,
-            doi.to_mrf_entry(),
-            &doi.bucket,
-            &doi.delete_object.object_name,
-            "delete",
-        )
-        .await;
+        let admission = self.queue_mrf_save_admission(doi.to_mrf_entry(), "delete").await;
 
         self.apply_queue_backpressure("delete", false, "Replication delete queue is backpressured")
             .await;
@@ -605,24 +1018,79 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         admission
     }
 
+    /// Queues a DeleteObjects replication tail with a fixed concurrency window.
+    /// Each item retains the existing regular-worker to MRF fallback contract.
+    pub async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission {
+        let mut summary = ReplicationBatchAdmission::default();
+        let mut admissions = stream::iter(
+            deletes
+                .iter()
+                .cloned()
+                .map(|delete| async move { self.queue_replica_delete_task(delete).await }),
+        )
+        .buffer_unordered(DELETE_BATCH_ADMISSION_CONCURRENCY);
+
+        while let Some(admission) = admissions.next().await {
+            summary.record(admission);
+        }
+
+        let outcome = summary.outcome();
+        let total = u64::try_from(summary.total).unwrap_or(u64::MAX);
+        let queued = u64::try_from(summary.queued).unwrap_or(u64::MAX);
+        let missed = u64::try_from(summary.missed).unwrap_or(u64::MAX);
+        histogram!(METRIC_DELETE_BATCH_SIZE).record(total as f64);
+        counter!(METRIC_DELETE_BATCH_ITEMS_TOTAL, "outcome" => outcome, "state" => "queued").increment(queued);
+        counter!(METRIC_DELETE_BATCH_ITEMS_TOTAL, "outcome" => outcome, "state" => "missed").increment(missed);
+        debug!(
+            event = "replication_delete_batch_admission",
+            batch_size = summary.total,
+            queued = summary.queued,
+            missed = summary.missed,
+            outcome,
+            "Admitted DeleteObjects replication batch"
+        );
+        summary
+    }
+
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        let _ = queue_mrf_save_admission(&self.mrf_save_tx, entry, "", "", "mrf_worker").await;
+        let _ = self.queue_mrf_save_admission(entry, "mrf_worker").await;
+    }
+
+    async fn queue_mrf_save_admission(&self, entry: MrfReplicateEntry, queue_type: &'static str) -> ReplicationQueueAdmission {
+        let bucket = entry.bucket.clone();
+        let size = entry.size;
+        let is_delete = matches!(entry.op, MrfOpKind::Delete);
+        let target_arns = entry.target_arns.clone();
+        let admission = queue_mrf_save_entry(&self.mrf_save_tx, entry, queue_type).await;
+        if admission == ReplicationQueueAdmission::Queued {
+            self.stats.inc_q(&bucket, size, is_delete, ReplicationType::Heal);
+            self.stats.inc_target_q(&bucket, &target_arns, size);
+        }
+        admission
     }
 
     /// Starts the MRF processor — one-shot at startup.
     ///
-    /// Reads the on-disk MRF file, re-injects every entry into `mrf_replica_tx` as a
-    /// Heal operation, then clears the file.  The file is cleared AFTER all entries are
-    /// successfully queued so a crash mid-replay results in at-most-twice delivery
-    /// (safe — replication is idempotent) rather than entry loss.
+    /// Reads the on-disk MRF file, re-injects admitted entries as Heal operations, and
+    /// rewrites any entries that could not be admitted for a later startup retry.
     async fn start_mrf_processor(&self) {
         let storage = self.storage.clone();
+        let recovery_complete = self.mrf_recovery_complete.clone();
+        let recovery_result = self.mrf_recovery_result.clone();
 
         let handle = tokio::spawn(async move {
             let data = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
                 Ok(d) => d,
-                Err(EcstoreError::ConfigNotFound) => return, // no file yet — normal on first start
+                Err(EcstoreError::ConfigNotFound) => {
+                    set_durable_mrf_backlog_summary(DurableMrfBacklogSummary {
+                        available: true,
+                        buckets: Vec::new(),
+                    });
+                    *recovery_result.lock().await = Some(Vec::new());
+                    recovery_complete.notify_one();
+                    return;
+                }
                 Err(e) => {
                     warn!(
                         component = LOG_COMPONENT_ECSTORE,
@@ -630,6 +1098,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         error = %e,
                         "Failed to load MRF recovery file"
                     );
+                    recovery_complete.notify_one();
                     return;
                 }
             };
@@ -641,89 +1110,130 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REPLICATION,
                         error = %e,
-                        "Failed to decode MRF recovery file — discarding corrupt data"
+                        "Failed to decode MRF recovery file — preserving corrupt data"
                     );
-                    // Overwrite the corrupt file so we don't fail again on next restart.
-                    let _ = ReplicationConfigStore::save(
-                        storage,
-                        ReplicationMetadataStore::MRF_REPLICATION_FILE,
-                        encode_mrf_file(&[]).unwrap_or_default(),
-                    )
-                    .await;
+                    quarantine_mrf_file(&storage, &data).await;
+                    recovery_complete.notify_one();
                     return;
                 }
             };
+            set_durable_mrf_backlog_snapshot(durable_mrf_backlog_summary_from_entries(&entries));
 
             let total = entries.len();
             let mut queued_count = 0usize;
+            let mut retry_entries = Vec::new();
 
             for entry in entries.iter() {
-                match entry.op {
+                let admission = match entry.op {
                     MrfOpKind::Delete => {
-                        // Reconstruct a heal delete and re-queue it.  We do NOT call
-                        // get_object_info here because the delete-marker or version may
-                        // already be absent from the local store — that is expected.
-                        //
-                        // The MRF entry does not persist the replication decision and the
-                        // source object is gone, so re-derive the decision from the live
-                        // bucket config (mirroring get_heal_replicate_object_info) and set
-                        // it on the reconstructed delete. Without this the decision string
-                        // is empty and the delete replicates to zero targets — a silent
-                        // no-op that leaves replicas diverged (backlog#858 / #799 B9).
-                        let versioned = ReplicationVersioningStore::prefix_enabled(&entry.bucket, &entry.object).await;
-                        let oi = ObjectInfo {
-                            bucket: entry.bucket.clone(),
-                            name: entry.object.clone(),
-                            version_id: entry.version_id,
-                            delete_marker: entry.delete_marker,
-                            ..Default::default()
-                        };
-                        let dsc = check_replicate_delete(
-                            &entry.bucket,
-                            &ObjectToDelete {
-                                object_name: entry.object.clone(),
-                                version_id: entry.version_id,
+                        if should_replay_force_delete_intent(entry) {
+                            let Some(operation_id) = entry.force_delete_id else {
+                                continue;
+                            };
+                            let delete = DeletedObjectReplicationInfo {
+                                delete_object: ReplicationDeletedObject {
+                                    object_name: entry.object.clone(),
+                                    force_delete: true,
+                                    force_delete_id: Some(operation_id),
+                                    force_delete_target_arns: entry.target_arns.clone(),
+                                    force_delete_generation: entry.force_delete_generation,
+                                    ..Default::default()
+                                },
+                                bucket: entry.bucket.clone(),
+                                op_type: ReplicationType::Heal,
+                                event_type: REPLICATE_HEAL_DELETE.to_string(),
                                 ..Default::default()
-                            },
-                            &oi,
-                            &ObjectOptions {
-                                versioned,
-                                ..Default::default()
-                            },
-                            None,
-                        )
-                        .await;
-                        let mut rstate = oi.replication_state();
-                        rstate.replicate_decision_str = dsc.to_string();
-
-                        // Restore the original delete-marker mtime persisted with the entry so
-                        // the replica keeps the source timestamp. Old MRF files lack this field
-                        // (delete_marker_mtime = None) — fall back to None so the replica is
-                        // stamped with the current time, preserving pre-#867 behaviour
-                        // (backlog#867).
-                        let delete_marker_mtime = entry
-                            .delete_marker_mtime
-                            .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok());
-
-                        let dv = DeletedObjectReplicationInfo {
-                            delete_object: ReplicationDeletedObject {
-                                object_name: entry.object.clone(),
+                            };
+                            if replicate_delete_with_outcome(delete, storage.clone()).await {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
+                        } else if entry.force_delete_id.is_some() {
+                            ReplicationQueueAdmission::Skipped
+                        } else {
+                            // Reconstruct a heal delete and re-queue it.  We do NOT call
+                            // get_object_info here because the delete-marker or version may
+                            // already be absent from the local store — that is expected.
+                            //
+                            // The MRF entry does not persist the replication decision and the
+                            // source object is gone, so re-derive the decision from the live
+                            // bucket config (mirroring get_heal_replicate_object_info) and set
+                            // it on the reconstructed delete. Without this the decision string
+                            // is empty and the delete replicates to zero targets — a silent
+                            // no-op that leaves replicas diverged (backlog#858 / #799 B9).
+                            let versioned = ReplicationVersioningStore::prefix_enabled(&entry.bucket, &entry.object).await;
+                            let oi = ObjectInfo {
+                                bucket: entry.bucket.clone(),
+                                name: entry.object.clone(),
                                 version_id: entry.version_id,
-                                delete_marker_version_id: entry.delete_marker_version_id,
                                 delete_marker: entry.delete_marker,
-                                delete_marker_mtime,
-                                replication_state: Some(rstate),
                                 ..Default::default()
-                            },
-                            bucket: entry.bucket.clone(),
-                            op_type: ReplicationType::Heal,
-                            event_type: REPLICATE_HEAL_DELETE.to_string(),
-                            ..Default::default()
-                        };
-                        schedule_replication_delete(dv).await;
-                        queued_count += 1;
+                            };
+                            let dsc = if entry.target_arns.is_empty() {
+                                match ReplicationMetadataStore::optional_replication_config(&entry.bucket).await {
+                                    Ok(None) => continue,
+                                    Err(_) => {
+                                        retry_entries.push(entry.clone());
+                                        continue;
+                                    }
+                                    Ok(Some(_)) => match check_replicate_delete_strict(
+                                        &entry.bucket,
+                                        &ObjectToDelete {
+                                            object_name: entry.object.clone(),
+                                            version_id: entry.version_id,
+                                            ..Default::default()
+                                        },
+                                        &oi,
+                                        &ObjectOptions {
+                                            versioned,
+                                            ..Default::default()
+                                        },
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        Ok(dsc) => dsc,
+                                        Err(_) => {
+                                            retry_entries.push(entry.clone());
+                                            continue;
+                                        }
+                                    },
+                                }
+                            } else {
+                                replicate_decision_for_admitted_targets(&entry.target_arns)
+                            };
+                            let mut rstate = oi.replication_state();
+                            rstate.replicate_decision_str = dsc.to_string();
+
+                            let delete_marker_mtime = entry
+                                .delete_marker_mtime
+                                .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).ok());
+
+                            let dv = DeletedObjectReplicationInfo {
+                                delete_object: ReplicationDeletedObject {
+                                    object_name: entry.object.clone(),
+                                    version_id: entry.version_id,
+                                    delete_marker_version_id: entry.delete_marker_version_id,
+                                    delete_marker: entry.delete_marker,
+                                    delete_marker_mtime,
+                                    force_delete: entry.force_delete,
+                                    replication_state: Some(rstate),
+                                    ..Default::default()
+                                },
+                                bucket: entry.bucket.clone(),
+                                op_type: ReplicationType::Heal,
+                                event_type: REPLICATE_HEAL_DELETE.to_string(),
+                                ..Default::default()
+                            };
+                            if replicate_delete_with_outcome(dv, storage.clone()).await {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
+                        }
                     }
-                    MrfOpKind::Object => {
+                    MrfOpKind::Object | MrfOpKind::Heal | MrfOpKind::ExistingObject => {
                         let opts = ObjectOptions {
                             version_id: entry.version_id.map(|u| u.to_string()),
                             ..Default::default()
@@ -737,35 +1247,76 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                                     bucket = %entry.bucket,
                                     object = %entry.object,
                                     error = %e,
-                                    "MRF recovery: object not found, skipping"
+                                    "MRF recovery: source object lookup failed"
                                 );
+                                if should_retry_mrf_source_lookup(&e) {
+                                    retry_entries.push(entry.clone());
+                                }
                                 continue;
                             }
                         };
-                        // Route through queue_replication_heal so the replication decision (dsc)
-                        // is computed from the live config — required for replicate_object.
-                        queue_replication_heal(&entry.bucket, oi, entry.retry_count as u32).await;
-                        queued_count += 1;
+                        if entry.target_arns.is_empty() {
+                            // Legacy entries predate target admission persistence. They cannot
+                            // be safely attributed, so retain the old live-config fallback.
+                            queue_replication_heal(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
+                        } else {
+                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+                            let mut roi = replicate_object_info_from_object_info(oi, dsc, entry.op.replication_type());
+                            roi.retry_count = entry.retry_count.max(0) as u32;
+                            if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
+                        }
                     }
+                    MrfOpKind::Metadata => {
+                        let opts = ObjectOptions {
+                            version_id: entry.version_id.map(|u| u.to_string()),
+                            ..Default::default()
+                        };
+                        let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
+                            Ok(oi) => oi,
+                            Err(e) => {
+                                debug!(
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                    bucket = %entry.bucket,
+                                    object = %entry.object,
+                                    error = %e,
+                                    "MRF metadata recovery: source object lookup failed"
+                                );
+                                if should_retry_mrf_source_lookup(&e) {
+                                    retry_entries.push(entry.clone());
+                                }
+                                continue;
+                            }
+                        };
+                        if entry.target_arns.is_empty() {
+                            queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
+                        } else {
+                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+                            let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata);
+                            roi.retry_count = entry.retry_count.max(0) as u32;
+                            if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+                                ReplicationQueueAdmission::Queued
+                            } else {
+                                ReplicationQueueAdmission::Missed
+                            }
+                        }
+                    }
+                };
+
+                if admission == ReplicationQueueAdmission::Missed {
+                    retry_entries.push(entry.clone());
+                } else if admission == ReplicationQueueAdmission::Queued {
+                    queued_count += 1;
                 }
             }
 
-            // Clear AFTER all entries are processed so a crash mid-replay causes at-most-twice
-            // delivery (idempotent) rather than entry loss.
-            if let Err(e) = ReplicationConfigStore::save(
-                storage,
-                ReplicationMetadataStore::MRF_REPLICATION_FILE,
-                encode_mrf_file(&[]).unwrap_or_default(),
-            )
-            .await
-            {
-                warn!(
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    error = %e,
-                    "Failed to clear MRF recovery file after replay — entries may be replayed again on next restart"
-                );
-            }
+            let retained_count = retry_entries.len();
+            *recovery_result.lock().await = Some(retry_entries);
+            recovery_complete.notify_one();
 
             if queued_count > 0 {
                 info!(
@@ -773,10 +1324,72 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
                     recovered = queued_count,
                     total,
-                    "Recovered MRF entries from disk and queued for retry"
+                    retained = retained_count,
+                    "Replayed MRF entries admitted for retry"
                 );
             }
         });
+        self.task_handles.lock().await.push(handle);
+    }
+
+    async fn start_force_delete_processor(&self) {
+        let storage = self.storage.clone();
+        let handle =
+            tokio::spawn(async move {
+                let data =
+                    match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(EcstoreError::ConfigNotFound) => return,
+                        Err(error) => {
+                            warn!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                error = %error,
+                                "Failed to load durable force-delete intents"
+                            );
+                            return;
+                        }
+                    };
+
+                let entries = match decode_mrf_file(&data) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            error = %error,
+                            "Failed to decode durable force-delete intents"
+                        );
+                        return;
+                    }
+                };
+
+                for entry in entries {
+                    if !should_replay_force_delete_intent(&entry) {
+                        continue;
+                    }
+                    let Some(operation_id) = entry.force_delete_id else {
+                        continue;
+                    };
+                    schedule_replication_delete(DeletedObjectReplicationInfo {
+                        delete_object: ReplicationDeletedObject {
+                            object_name: entry.object,
+                            force_delete: true,
+                            force_delete_id: Some(operation_id),
+                            force_delete_target_arns: entry.target_arns,
+                            force_delete_generation: entry.force_delete_generation,
+                            ..Default::default()
+                        },
+                        bucket: entry.bucket,
+                        op_type: ReplicationType::Heal,
+                        event_type: REPLICATE_HEAL_DELETE.to_string(),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            });
         self.task_handles.lock().await.push(handle);
     }
 
@@ -793,8 +1406,38 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return;
         };
         let storage = self.storage.clone();
+        let stats = self.stats.clone();
+        let recovery_complete = self.mrf_recovery_complete.clone();
+        let recovery_result = self.mrf_recovery_result.clone();
 
         let handle = tokio::spawn(async move {
+            let mut pending = loop {
+                match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
+                    Ok(data) => match decode_mrf_file(&data) {
+                        Ok(entries) => break entries,
+                        Err(error) => {
+                            warn!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                error = %error,
+                                "Failed to seed MRF persister from the startup recovery file; retrying without overwriting it"
+                            );
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    },
+                    Err(EcstoreError::ConfigNotFound) => break Vec::new(),
+                    Err(error) => {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            error = %error,
+                            "Failed to read the startup MRF backlog for persister seeding; retrying without overwriting it"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            };
+            let initial_pending_len = pending.len();
             // The on-disk MRF file is a restart-recovery backstop: entries are
             // only replayed (and the file cleared) at startup, never during the
             // run. So the file must hold the *cumulative* set of overflow entries
@@ -804,53 +1447,159 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             // earlier (backlog#859 / #799 B10). Bounded by `MRF_PENDING_CAP` so a
             // sustained failure storm can't grow it without limit.
             const MRF_PENDING_CAP: usize = 200_000;
-            let mut pending: Vec<MrfReplicateEntry> = Vec::new();
-            let mut flushed_len = 0usize;
+            let mut durable_tracker = DurableMrfBacklogTracker {
+                available: true,
+                ..Default::default()
+            };
+            for entry in &pending {
+                durable_tracker.add_entry(entry);
+            }
+            if initial_pending_len > 0 {
+                set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+            }
+            let mut new_entries_pending_stats = 0usize;
+            let mut new_entries_pending_observability = 0usize;
             let mut dirty = false;
-            let mut capped = false;
+            let mut capped = initial_pending_len >= MRF_PENDING_CAP;
+            let mut recovery_applied = false;
+            if capped {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    cap = MRF_PENDING_CAP,
+                    pending = initial_pending_len,
+                    "MRF pending backlog is at capacity — applying backpressure"
+                );
+            }
             // Flush interval: `RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS` (default 10000ms,
             // clamped to >=10ms), read once when the persister task starts.
             let mut interval = tokio::time::interval(super::replication_timing::mrf_flush_interval());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                tokio::select! {
-                    entry = rx.recv() => match entry {
-                        Some(e) => {
-                            if pending.len() >= MRF_PENDING_CAP {
-                                if !capped {
-                                    capped = true;
-                                    warn!(
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_REPLICATION,
-                                        cap = MRF_PENDING_CAP,
-                                        "MRF pending backlog hit cap — dropping further recovery entries for this run"
-                                    );
-                                }
-                                continue;
+                if pending.len() >= MRF_PENDING_CAP && recovery_applied {
+                    if dirty {
+                        if let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                            set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                            let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                            observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                            new_entries_pending_observability = 0;
+                            if new_entries_pending_stats > 0 {
+                                let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                new_entries_pending_stats = 0;
                             }
+                            dirty = false;
+                        } else {
+                            // Keep the channel bounded while the current backlog
+                            // cannot be persisted; draining it here would turn a
+                            // failed flush into unbounded in-memory growth.
+                            interval.tick().await;
+                            continue;
+                        }
+                    }
+                    if !capped {
+                        capped = true;
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REPLICATION,
+                            cap = MRF_PENDING_CAP,
+                            "MRF pending backlog reached capacity — applying backpressure"
+                        );
+                    }
+                    let mut batch = Vec::new();
+                    while let Ok(entry) = rx.try_recv() {
+                        batch.push(entry);
+                    }
+                    if !batch.is_empty() {
+                        for entry in &batch {
+                            durable_tracker.add_entry(entry);
+                            observe_mrf_pending(entry);
+                        }
+                        if !dirty && let Some(duration_millis) = append_mrf_entries_to_disk(&batch, &storage).await {
+                            set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                            observe_mrf_pending_flushed(&batch, duration_millis);
+                            dec_mrf_entries(stats.as_ref(), &batch);
+                        } else {
+                            new_entries_pending_stats += batch.len();
+                            new_entries_pending_observability += batch.len();
+                            pending.extend(batch);
+                            dirty = true;
+                        }
+                    }
+                    if rx.is_closed() && rx.is_empty() && !dirty {
+                        break;
+                    }
+                    interval.tick().await;
+                    continue;
+                }
+                tokio::select! {
+                    entry = rx.recv(), if pending.len() < MRF_PENDING_CAP => match entry {
+                        Some(e) => {
+                            durable_tracker.add_entry(&e);
+                            observe_mrf_pending(&e);
                             pending.push(e);
+                            new_entries_pending_stats += 1;
+                            new_entries_pending_observability += 1;
                             dirty = true;
                             // Flush eagerly once enough new entries have accumulated
                             // since the last write (measured against the flushed
                             // set, not the absolute length, so a large backlog is
                             // not rewritten on every single add).
-                            if pending.len() - flushed_len >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
-                                flushed_len = pending.len();
+                            if new_entries_pending_stats >= 1000
+                                && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await
+                            {
+                                set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                                let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                                observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                                new_entries_pending_observability = 0;
+                                let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                new_entries_pending_stats = 0;
                                 dirty = false;
                             }
                         }
                         None => {
                             // Channel closed (pool shutting down) — final flush.
-                            if dirty {
-                                flush_mrf_to_disk(&pending, &storage).await;
+                            if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                                set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                                let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                                observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                                if new_entries_pending_stats > 0 {
+                                    let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                    dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                }
                             }
                             break;
                         }
                     },
+                    _ = recovery_complete.notified(), if !recovery_applied => {
+                        recovery_applied = true;
+                        if let Some(retry_entries) = recovery_result.lock().await.take() {
+                            let new_entries = pending.split_off(initial_pending_len.min(pending.len()));
+                            pending = retry_entries;
+                            pending.extend(new_entries);
+                            durable_tracker = DurableMrfBacklogTracker {
+                                available: true,
+                                ..Default::default()
+                            };
+                            for entry in &pending {
+                                durable_tracker.add_entry(entry);
+                            }
+                            dirty = true;
+                        }
+                    },
                     _ = interval.tick() => {
-                        if dirty && flush_mrf_to_disk(&pending, &storage).await {
-                            flushed_len = pending.len();
+                        if dirty && let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
+                            set_durable_mrf_backlog_snapshot(durable_tracker.clone().into_snapshot());
+                            let observe_start = pending.len().saturating_sub(new_entries_pending_observability);
+                            observe_mrf_pending_flushed(&pending[observe_start..], duration_millis);
+                            new_entries_pending_observability = 0;
+                            if new_entries_pending_stats > 0 {
+                                let stats_start = pending.len().saturating_sub(new_entries_pending_stats);
+                                dec_mrf_entries(stats.as_ref(), &pending[stats_start..]);
+                                new_entries_pending_stats = 0;
+                            }
                             dirty = false;
                         }
                     }
@@ -868,50 +1617,22 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         stats: Arc<ReplicationStats>,
     ) {
         while let Some(operation) = rx.recv().await {
-            active_counter.fetch_add(1, Ordering::SeqCst);
-
-            match operation {
-                ReplicationOperation::Object(obj_info) => {
-                    stats
-                        .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
-
-                    // Perform actual replication (placeholder)
-                    replicate_object(obj_info.as_ref().clone(), self.storage.clone()).await;
-
-                    stats
-                        .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
-                }
-                ReplicationOperation::Delete(del_info) => {
-                    stats.inc_q(&del_info.bucket, 0, true, del_info.op_type).await;
-
-                    // Perform actual delete replication (placeholder)
-                    replicate_delete(del_info.as_ref().clone(), self.storage.clone()).await;
-
-                    stats.dec_q(&del_info.bucket, 0, true, del_info.op_type).await;
-                }
-            }
-
-            active_counter.fetch_sub(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard::new(active_counter.clone());
+            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
         }
     }
 
     /// Worker function for handling large object replication operations
-    async fn add_large_worker(&self, mut rx: Receiver<ReplicationOperation>, active_counter: Arc<AtomicI32>, storage: Arc<S>) {
+    async fn add_large_worker(
+        &self,
+        mut rx: Receiver<ReplicationOperation>,
+        active_counter: Arc<AtomicI32>,
+        stats: Arc<ReplicationStats>,
+        storage: Arc<S>,
+    ) {
         while let Some(operation) = rx.recv().await {
-            active_counter.fetch_add(1, Ordering::SeqCst);
-
-            match operation {
-                ReplicationOperation::Object(obj_info) => {
-                    replicate_object(*obj_info, storage.clone()).await;
-                }
-                ReplicationOperation::Delete(del_info) => {
-                    replicate_delete(*del_info, storage.clone()).await;
-                }
-            }
-
-            active_counter.fetch_sub(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard::new(active_counter.clone());
+            process_replication_operation(operation, stats.clone(), storage.clone()).await;
         }
     }
 
@@ -923,26 +1644,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         stats: Arc<ReplicationStats>,
     ) {
         while let Some(operation) = rx.recv().await {
-            active_counter.fetch_add(1, Ordering::SeqCst);
-
-            match operation {
-                ReplicationOperation::Object(obj_info) => {
-                    stats
-                        .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
-
-                    replicate_object(obj_info.as_ref().clone(), self.storage.clone()).await;
-
-                    stats
-                        .dec_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
-                        .await;
-                }
-                ReplicationOperation::Delete(del_info) => {
-                    replicate_delete(*del_info, self.storage.clone()).await;
-                }
-            }
-
-            active_counter.fetch_sub(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard::new(active_counter.clone());
+            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
         }
     }
 
@@ -1273,39 +1976,161 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 }
 
-async fn queue_mrf_save_admission(
+struct ActiveWorkerGuard {
+    counter: Arc<AtomicI32>,
+}
+
+impl ActiveWorkerGuard {
+    fn new(counter: Arc<AtomicI32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ReplicationBacklogGuard {
+    stats: Arc<ReplicationStats>,
+    bucket: String,
+    size: i64,
+    is_delete_marker: bool,
+    op_type: ReplicationType,
+    target_arns: Vec<String>,
+}
+
+impl ReplicationBacklogGuard {
+    fn for_object(stats: Arc<ReplicationStats>, object: &ReplicateObjectInfo) -> Self {
+        Self {
+            stats,
+            bucket: object.bucket.clone(),
+            size: object.size,
+            is_delete_marker: object.delete_marker,
+            op_type: object.op_type,
+            target_arns: object.dsc.replicate_target_arns(),
+        }
+    }
+
+    fn for_delete(stats: Arc<ReplicationStats>, delete: &DeletedObjectReplicationInfo) -> Self {
+        Self {
+            stats,
+            bucket: delete.bucket.clone(),
+            size: 0,
+            is_delete_marker: true,
+            op_type: delete.op_type,
+            target_arns: delete.admitted_target_arns(),
+        }
+    }
+}
+
+impl Drop for ReplicationBacklogGuard {
+    fn drop(&mut self) {
+        self.stats.dec_q(&self.bucket, self.size, self.is_delete_marker, self.op_type);
+        self.stats.dec_target_q(&self.bucket, &self.target_arns, self.size);
+    }
+}
+
+async fn process_replication_operation<S: ReplicationStorage>(
+    operation: ReplicationOperation,
+    stats: Arc<ReplicationStats>,
+    storage: Arc<S>,
+) {
+    match operation {
+        ReplicationOperation::Object(obj_info) => {
+            let _backlog = ReplicationBacklogGuard::for_object(stats, obj_info.as_ref());
+            replicate_object(*obj_info, storage).await;
+        }
+        ReplicationOperation::Delete(del_info) => {
+            let _backlog = ReplicationBacklogGuard::for_delete(stats, del_info.as_ref());
+            replicate_delete(*del_info, storage).await;
+        }
+    }
+}
+
+async fn queue_mrf_save_entry(
     tx: &Sender<MrfReplicateEntry>,
     entry: MrfReplicateEntry,
-    bucket: &str,
-    object: &str,
     queue_type: &'static str,
 ) -> ReplicationQueueAdmission {
-    if tx.send(entry).await.is_ok() {
+    let Err(error) = tx.send(entry).await else {
         return ReplicationQueueAdmission::Queued;
-    }
+    };
+    let entry = error.0;
 
     warn!(
         event = EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE,
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_REPLICATION,
-        bucket = %bucket,
-        object = %object,
+        bucket = %entry.bucket,
+        object = %entry.object,
         queue_type = queue_type,
         "MRF save channel unavailable — replication failure entry could not be persisted for retry"
     );
+    observe_mrf_missed(&entry.bucket);
     ReplicationQueueAdmission::Missed
 }
 
+async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8]) {
+    let quarantine_file = format!("{MRF_CORRUPT_FILE_PREFIX}.{}.bin", OffsetDateTime::now_utc().unix_timestamp_nanos());
+    match ReplicationConfigStore::save(storage.clone(), &quarantine_file, data.to_vec()).await {
+        Ok(()) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                file = %quarantine_file,
+                "Quarantined corrupt MRF recovery file"
+            );
+            // Clear the active path only after the quarantine copy succeeds. An empty
+            // config is treated as absent, preventing the same corrupt bytes from being
+            // quarantined again on every restart while preserving the forensic copy.
+            if let Err(error) =
+                ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, Vec::new()).await
+            {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = %error,
+                    "Failed to clear the corrupt MRF recovery path after quarantine"
+                );
+            }
+        }
+        Err(error) => warn!(
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION,
+            file = %quarantine_file,
+            error = %error,
+            "Failed to quarantine corrupt MRF recovery file; original was preserved"
+        ),
+    }
+}
+
+fn should_retry_mrf_source_lookup(error: &EcstoreError) -> bool {
+    !is_err_object_not_found(error) && !is_err_version_not_found(error)
+}
+
+fn dec_mrf_entries(stats: &ReplicationStats, entries: &[MrfReplicateEntry]) {
+    for entry in entries {
+        stats.dec_q(&entry.bucket, entry.size, matches!(entry.op, MrfOpKind::Delete), ReplicationType::Heal);
+        stats.dec_target_q(&entry.bucket, &entry.target_arns, entry.size);
+    }
+}
+
 /// Encodes `entries` and overwrites the MRF persistence file.
-/// Returns `true` on success; on failure logs the error and returns `false`.
-/// Callers must NOT clear their in-memory buffer on `false` so the next tick
+/// Returns the flush duration on success; on failure logs the error and returns `None`.
+/// Callers must NOT clear their in-memory buffer on `None` so the next tick
 /// can retry — otherwise a transient storage error permanently drops the batch.
-async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
+async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> Option<u64> {
+    let started = Instant::now();
     match encode_mrf_file(entries) {
         Ok(data) => {
             if let Err(e) =
                 ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, data).await
             {
+                let duration_millis = duration_millis_u64(started.elapsed());
+                observe_mrf_flush_failure(duration_millis);
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1313,11 +2138,12 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
                     error = %e,
                     "Failed to flush MRF entries to disk"
                 );
-                return false;
+                return None;
             }
-            true
+            Some(duration_millis_u64(started.elapsed()))
         }
         Err(e) => {
+            observe_mrf_flush_failure(0);
             warn!(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1325,9 +2151,48 @@ async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry]
                 error = %e,
                 "Failed to encode MRF entries for disk flush"
             );
-            false
+            None
         }
     }
+}
+
+async fn append_mrf_entries_to_disk<S: ReplicationObjectIO>(
+    entries_to_append: &[MrfReplicateEntry],
+    storage: &Arc<S>,
+) -> Option<u64> {
+    if entries_to_append.is_empty() {
+        return Some(0);
+    }
+    let mut entries = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
+        Ok(data) => match decode_mrf_file(&data) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = %error,
+                    "Failed to decode MRF backlog before appending a capped entry"
+                );
+                return None;
+            }
+        },
+        Err(EcstoreError::ConfigNotFound) => Vec::new(),
+        Err(error) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                error = %error,
+                "Failed to read MRF backlog before appending a capped entry"
+            );
+            return None;
+        }
+    };
+    entries.extend_from_slice(entries_to_append);
+    flush_mrf_to_disk(&entries, storage).await
+}
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Load bucket resync metadata from disk
@@ -1366,6 +2231,7 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     fn active_lrg_workers(&self) -> i32;
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission;
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission;
+    async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission;
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
@@ -1400,6 +2266,10 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
         self.queue_replica_delete_task(ri).await
+    }
+
+    async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission {
+        self.queue_replica_delete_batch(deletes).await
     }
 
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize) {
@@ -1477,12 +2347,20 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     dsc: ReplicateDecision,
     op_type: ReplicationType,
 ) {
-    let synchronous = dsc.is_synchronous();
-    let ri = replicate_object_info_from_object_info(oi, dsc, op_type);
+    let (synchronous, asynchronous) = dsc.partition_by_sync();
+    let mut async_oi = oi;
 
-    if synchronous {
-        replicate_object(ri, o).await
-    } else if let Some(pool) = runtime_sources::replication_pool() {
+    if synchronous.replicate_any() {
+        let ri = replicate_object_info_from_object_info(async_oi.clone(), synchronous, op_type);
+        let state = replicate_object(ri, o.clone()).await;
+        async_oi.replication_status_internal = state.replication_status_internal;
+        async_oi.version_purge_status_internal = state.version_purge_status_internal;
+    }
+
+    if asynchronous.replicate_any()
+        && let Some(pool) = runtime_sources::replication_pool()
+    {
+        let ri = replicate_object_info_from_object_info(async_oi, asynchronous, op_type);
         let _ = pool.queue_replica_task(ri).await;
     }
 }
@@ -1531,36 +2409,47 @@ fn replicate_object_info_from_object_info(
     }
 }
 
-pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
-    if let Some(pool) = runtime_sources::replication_pool() {
-        let _ = pool.queue_replica_delete_task(dv.clone()).await;
-    }
+pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
+    let admission = if let Some(pool) = runtime_sources::replication_pool() {
+        pool.queue_replica_delete_task(dv.clone()).await
+    } else {
+        ReplicationQueueAdmission::Missed
+    };
 
-    if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, runtime_sources::replication_stats()) {
-        for k in rs.targets.keys() {
-            let ri = ReplicatedTargetInfo {
-                arn: k.clone(),
-                size: 0,
-                duration: Duration::default(),
-                op_type: ReplicationType::Delete,
-                ..Default::default()
-            };
-            stats
-                .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
-                .await;
+    if let Some(stats) = runtime_sources::replication_stats() {
+        let target_arns = dv.admitted_target_arns();
+        if let Some(rs) = dv.delete_object.replication_state.as_ref() {
+            for k in target_arns
+                .iter()
+                .filter(|target_arn| rs.targets.contains_key(*target_arn) || rs.purge_targets.contains_key(*target_arn))
+            {
+                let ri = ReplicatedTargetInfo {
+                    arn: k.clone(),
+                    size: 0,
+                    duration: Duration::default(),
+                    op_type: ReplicationType::Delete,
+                    ..Default::default()
+                };
+                stats
+                    .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
+                    .await;
+            }
         }
     }
+
+    admission
 }
 
 /// QueueReplicationHeal is a wrapper for queue_replication_heal_internal
-pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u32) {
+pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u32) -> ReplicationQueueAdmission {
     // ignore modtime zero objects
     if oi.mod_time.is_none() || oi.mod_time == Some(OffsetDateTime::UNIX_EPOCH) {
-        return;
+        return ReplicationQueueAdmission::Skipped;
     }
 
-    let rcfg = match ReplicationMetadataStore::replication_config(bucket).await {
-        Ok((config, _)) => config,
+    let rcfg = match ReplicationMetadataStore::optional_replication_config(bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => return ReplicationQueueAdmission::Skipped,
         Err(err) => {
             debug!(
                 event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
@@ -1572,7 +2461,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
                 "Skipped replication heal queue due to missing replication config"
             );
 
-            return;
+            return ReplicationQueueAdmission::Missed;
         }
     };
 
@@ -1593,7 +2482,31 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     };
 
     let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
-    queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count).await;
+    queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count)
+        .await
+        .admission
+}
+
+pub async fn queue_replication_metadata(bucket: &str, oi: ObjectInfo, retry_count: u32) -> ReplicationQueueAdmission {
+    let dsc = must_replicate(
+        bucket,
+        &oi.name,
+        MustReplicateOptions::new(&oi.user_defined, (*oi.user_tags).clone(), ReplicationType::Metadata, false)
+            .with_replication_status(oi.replication_status.clone()),
+    )
+    .await;
+
+    if !dsc.replicate_any() {
+        return ReplicationQueueAdmission::Skipped;
+    }
+
+    let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata);
+    roi.retry_count = retry_count;
+    if let Some(pool) = runtime_sources::replication_pool() {
+        pool.queue_replica_task(roi).await
+    } else {
+        ReplicationQueueAdmission::Missed
+    }
 }
 
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
@@ -1621,7 +2534,24 @@ pub(crate) async fn queue_replication_heal_internal(
         };
     }
 
-    roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+    roi = match get_heal_replicate_object_info(&oi, &rcfg).await {
+        Ok(roi) => roi,
+        Err(err) => {
+            warn!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                error = %err,
+                "Failed to classify object for replication heal"
+            );
+            return ReplicationHealQueueResult {
+                object_info: roi,
+                admission: ReplicationQueueAdmission::Missed,
+            };
+        }
+    };
     roi.retry_count = retry_count;
 
     match replication_heal_queue_action(&mut roi) {
@@ -1676,13 +2606,14 @@ async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> Replica
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
     use super::super::replication_resync_boundary::{decode_mrf_file, encode_mrf_file, encode_resync_file};
     use super::super::replication_storage_boundary::{
         DeletedObject, FileInfo, GetObjectReader, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, PutObjReader,
         StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageNamespaceLocking, StorageObjectInfoOrErr, WalkOptions,
     };
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::fmt::{Debug, Formatter};
     use std::io::Cursor;
     use std::sync::Mutex as StdMutex;
@@ -1697,6 +2628,12 @@ mod tests {
 
     struct LoadResyncSharedState {
         data: StdMutex<Vec<u8>>,
+        etag_revision: AtomicUsize,
+        last_put_preconditions: StdMutex<Option<HTTPPreconditions>>,
+        last_put_no_lock: AtomicBool,
+        omit_etag: AtomicBool,
+        conditional_write_replacements: StdMutex<VecDeque<Vec<u8>>>,
+        writes: StdMutex<Vec<(String, Vec<u8>)>>,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         first_read_started: Notify,
         delay_first_read: AtomicBool,
@@ -1746,7 +2683,10 @@ mod tests {
             _h: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
-            if !object.ends_with("/.replication/resync.bin") {
+            if !object.ends_with("/.replication/resync.bin")
+                && !object.ends_with("config/replication/mrf.bin")
+                && !object.ends_with("config/replication/force-delete.bin")
+            {
                 return Err(EcstoreError::FileNotFound);
             }
 
@@ -1771,6 +2711,8 @@ mod tests {
                 object_info: ObjectInfo {
                     size,
                     actual_size: size,
+                    etag: (!self.shared.omit_etag.load(Ordering::SeqCst))
+                        .then(|| format!("mrf-{}", self.shared.etag_revision.load(Ordering::SeqCst))),
                     ..Default::default()
                 },
                 buffered_body: None,
@@ -1781,10 +2723,46 @@ mod tests {
         async fn put_object(
             &self,
             _bucket: &str,
-            _object: &str,
+            object: &str,
             data: &mut Self::PutObjectReader,
-            _opts: &Self::ObjectOptions,
+            opts: &Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            if opts.http_preconditions.is_some()
+                && let Some(replacement) = self
+                    .shared
+                    .conditional_write_replacements
+                    .lock()
+                    .expect("test replacement lock should not be poisoned")
+                    .pop_front()
+            {
+                *self.shared.data.lock().expect("test data lock should not be poisoned") = replacement;
+                self.shared.etag_revision.fetch_add(1, Ordering::SeqCst);
+            }
+            let current_etag = if self
+                .shared
+                .data
+                .lock()
+                .expect("test data lock should not be poisoned")
+                .is_empty()
+            {
+                None
+            } else {
+                Some(format!("mrf-{}", self.shared.etag_revision.load(Ordering::SeqCst)))
+            };
+            if opts.http_preconditions.as_ref().is_some_and(|preconditions| {
+                preconditions.if_none_match_value() == Some("*") && current_etag.is_some()
+                    || preconditions
+                        .if_match_value()
+                        .is_some_and(|expected| current_etag.as_deref() != Some(expected))
+            }) {
+                return Err(EcstoreError::PreconditionFailed);
+            }
+            *self
+                .shared
+                .last_put_preconditions
+                .lock()
+                .expect("test preconditions lock should not be poisoned") = opts.http_preconditions.clone();
+            self.shared.last_put_no_lock.store(opts.no_lock, Ordering::SeqCst);
             if self.shared.fail_next_write.swap(false, Ordering::SeqCst) {
                 return Err(EcstoreError::Unexpected);
             }
@@ -1794,7 +2772,13 @@ mod tests {
             }
             let mut encoded = Vec::new();
             data.stream.read_to_end(&mut encoded).await.map_err(EcstoreError::from)?;
+            self.shared
+                .writes
+                .lock()
+                .expect("test writes lock should not be poisoned")
+                .push((object.to_string(), encoded.clone()));
             *self.shared.data.lock().expect("test data lock should not be poisoned") = encoded;
+            self.shared.etag_revision.fetch_add(1, Ordering::SeqCst);
             self.shared.write_count.fetch_add(1, Ordering::SeqCst);
             Ok(ObjectInfo::default())
         }
@@ -2008,12 +2992,227 @@ mod tests {
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
+            mrf_recovery_complete: Arc::new(Notify::new()),
+            mrf_recovery_result: Arc::new(Mutex::new(None)),
             mrf_worker_kill_tx,
             mrf_stop_tx,
             mrf_worker_size: AtomicI32::new(0),
             task_handles: Mutex::new(Vec::new()),
             resyncer: Arc::new(ReplicationResyncer::new().await),
         })
+    }
+
+    async fn current_queue(pool: &ReplicationPool<LoadResyncNodeStore>, bucket: &str) -> (i64, i64) {
+        let stats = pool.stats.get_latest_replication_stats(bucket).await;
+        (stats.replication_stats.q_stat.curr.count, stats.replication_stats.q_stat.curr.bytes)
+    }
+
+    fn current_target_queue(pool: &ReplicationPool<LoadResyncNodeStore>, bucket: &str, target_arn: &str) -> Option<(u64, u64)> {
+        pool.stats
+            .runtime_target_backlog_snapshot()
+            .into_iter()
+            .find(|target| target.bucket == bucket && target.target_arn == target_arn)
+            .map(|target| (target.count, target.bytes))
+    }
+
+    fn test_replicate_decision(target_arns: &[&str]) -> ReplicateDecision {
+        let mut decision = ReplicateDecision::default();
+        for target_arn in target_arns {
+            decision.set(ReplicateTargetDecision::new((*target_arn).to_string(), true, false));
+        }
+        decision
+    }
+
+    async fn wait_for_current_queue(pool: &ReplicationPool<LoadResyncNodeStore>, bucket: &str, expected: (i64, i64)) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if current_queue(pool, bucket).await == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replication queue should reach the expected state");
+    }
+
+    #[tokio::test]
+    async fn regular_worker_admission_counts_channel_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "admission-bucket".to_string(),
+                name: "object".to_string(),
+                size: 4096,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "admission-bucket").await, (1, 4096));
+    }
+
+    #[tokio::test]
+    async fn regular_worker_admission_counts_target_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "target-admission-bucket".to_string(),
+                name: "object".to_string(),
+                size: 4096,
+                op_type: ReplicationType::Object,
+                dsc: test_replicate_decision(&["arn:rustfs:replication:target-b", "arn:rustfs:replication:target-a"]),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "target-admission-bucket").await, (1, 4096));
+        assert_eq!(
+            current_target_queue(&pool, "target-admission-bucket", "arn:rustfs:replication:target-a"),
+            Some((1, 4096))
+        );
+        assert_eq!(
+            current_target_queue(&pool, "target-admission-bucket", "arn:rustfs:replication:target-b"),
+            Some((1, 4096))
+        );
+    }
+
+    #[tokio::test]
+    async fn large_worker_admission_counts_channel_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.lrg_workers.write().await.push(tx);
+        let size = 128 * 1024 * 1024;
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "large-admission-bucket".to_string(),
+                name: "large-object".to_string(),
+                size,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "large-admission-bucket").await, (1, size));
+    }
+
+    #[tokio::test]
+    async fn delete_admission_counts_channel_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_delete_task(DeletedObjectReplicationInfo {
+                bucket: "delete-admission-bucket".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "deleted-object".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "delete-admission-bucket").await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn delete_admission_counts_target_backlog_before_receive() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_delete_task(DeletedObjectReplicationInfo {
+                bucket: "delete-target-admission-bucket".to_string(),
+                target_arn: "arn:rustfs:replication:target-a".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "deleted-object".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "delete-target-admission-bucket").await, (1, 0));
+        assert_eq!(
+            current_target_queue(&pool, "delete-target-admission-bucket", "arn:rustfs:replication:target-a"),
+            Some((1, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_worker_drains_current_backlog_after_processing() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        pool.resize_workers(1, 0).await;
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "regular-drain-bucket".to_string(),
+                name: "object".to_string(),
+                size: 4096,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        wait_for_current_queue(&pool, "regular-drain-bucket", (0, 0)).await;
+    }
+
+    #[tokio::test]
+    async fn large_worker_drains_current_backlog_after_processing() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        pool.resize_lrg_workers(1, 0).await;
+        let size = 128 * 1024 * 1024;
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "large-drain-bucket".to_string(),
+                name: "large-object".to_string(),
+                size,
+                op_type: ReplicationType::Object,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        wait_for_current_queue(&pool, "large-drain-bucket", (0, 0)).await;
+    }
+
+    #[tokio::test]
+    async fn regular_delete_worker_drains_current_backlog_after_processing() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        pool.resize_workers(1, 0).await;
+
+        let admission = pool
+            .queue_replica_delete_task(DeletedObjectReplicationInfo {
+                bucket: "delete-drain-bucket".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "deleted-object".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        wait_for_current_queue(&pool, "delete-drain-bucket", (0, 0)).await;
     }
 
     fn load_resync_test_metadata() -> Vec<u8> {
@@ -2032,6 +3231,12 @@ mod tests {
     fn empty_resync_shared_state() -> Arc<LoadResyncSharedState> {
         Arc::new(LoadResyncSharedState {
             data: StdMutex::new(Vec::new()),
+            etag_revision: AtomicUsize::new(0),
+            last_put_preconditions: StdMutex::new(None),
+            last_put_no_lock: AtomicBool::new(false),
+            omit_etag: AtomicBool::new(false),
+            conditional_write_replacements: StdMutex::new(VecDeque::new()),
+            writes: StdMutex::new(Vec::new()),
             lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
             first_read_started: Notify::new(),
             delay_first_read: AtomicBool::new(false),
@@ -2301,6 +3506,91 @@ mod tests {
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
     }
 
+    #[tokio::test]
+    async fn heal_queue_marks_missing_versioning_state_as_missed() {
+        use super::super::replication_target_boundary::BucketTargets;
+        use s3s::dto::{
+            DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule,
+            ReplicationRuleStatus,
+        };
+
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let result = queue_replication_heal_internal(
+            "missing-versioning-state",
+            ObjectInfo {
+                bucket: "missing-versioning-state".to_string(),
+                name: "object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                version_purge_status: super::super::replication_filemeta_boundary::VersionPurgeStatusType::Pending,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            },
+            ReplicationConfig::new(
+                Some(ReplicationConfiguration {
+                    role: String::new(),
+                    rules: vec![ReplicationRule {
+                        delete_marker_replication: None,
+                        delete_replication: Some(DeleteReplication {
+                            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                        }),
+                        destination: Destination {
+                            bucket: arn.to_string(),
+                            ..Default::default()
+                        },
+                        existing_object_replication: None,
+                        filter: None,
+                        id: Some("delete".to_string()),
+                        prefix: Some(String::new()),
+                        priority: Some(1),
+                        source_selection_criteria: None,
+                        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    }],
+                }),
+                Some(BucketTargets::default()),
+            ),
+            0,
+        )
+        .await;
+
+        assert_eq!(result.admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_counts_mrf_pending_backlog_when_worker_queue_is_full() {
+        let shared = empty_resync_shared_state();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared))).await;
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(ReplicationOperation::Object(Box::new(ReplicateObjectInfo {
+            bucket: "runtime-backlog".to_string(),
+            name: "already-buffered".to_string(),
+            size: 1,
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        })))
+        .expect("test setup should fill the worker queue");
+        pool.workers.write().await.push(tx);
+
+        let admission = pool
+            .queue_replica_task(ReplicateObjectInfo {
+                bucket: "runtime-backlog".to_string(),
+                name: "fallback-object".to_string(),
+                size: 2048,
+                op_type: ReplicationType::Object,
+                dsc: test_replicate_decision(&["arn:rustfs:replication:target-a"]),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+        let queued = pool.stats.get_latest_replication_stats("runtime-backlog").await;
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 2048);
+        assert_eq!(
+            current_target_queue(&pool, "runtime-backlog", "arn:rustfs:replication:target-a"),
+            Some((1, 2048))
+        );
+    }
+
     #[test]
     fn replicate_object_info_from_object_info_preserves_ssec_checksum() {
         let checksum = bytes::Bytes::from_static(b"ssec-checksum");
@@ -2331,9 +3621,12 @@ mod tests {
             retry_count: 1,
             size: 1,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -2342,7 +3635,7 @@ mod tests {
 
         tx.try_send(first).expect("first MRF entry should fill the test channel");
 
-        let admission = queue_mrf_save_admission(&tx, second, "bucket", "second", "test");
+        let admission = queue_mrf_save_entry(&tx, second, "test");
         tokio::pin!(admission);
 
         assert!(
@@ -2365,6 +3658,216 @@ mod tests {
         assert_eq!(received.object, "second");
     }
 
+    #[tokio::test]
+    async fn delete_batch_admission_reports_mrf_fallback_items() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (worker_tx, worker_rx) = mpsc::channel(1);
+        worker_tx
+            .try_send(ReplicationOperation::Delete(Box::new(DeletedObjectReplicationInfo {
+                bucket: "batch-backpressure".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "already-queued".to_string(),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })))
+            .expect("test worker channel should be full");
+        pool.workers.write().await.push(worker_tx);
+
+        let mut mrf_rx = pool
+            .mrf_save_rx
+            .lock()
+            .await
+            .take()
+            .expect("test should own the MRF save receiver");
+        let deletes = (0..1)
+            .map(|index| DeletedObjectReplicationInfo {
+                bucket: "batch-backpressure".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: format!("object-{index}"),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let summary = pool.queue_replica_delete_batch(&deletes).await;
+        let entry = mrf_rx
+            .recv()
+            .await
+            .expect("MRF fallback entry should be queued after batch admission");
+        assert_eq!(entry.object, "object-0");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.queued, 1);
+        assert_eq!(summary.missed, 0);
+        assert_eq!(summary.outcome(), "all_queued");
+        drop(worker_rx);
+    }
+
+    #[tokio::test]
+    async fn mrf_save_admission_records_missed_when_channel_is_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let bucket = "mrf-missed-hook-bucket";
+
+        let admission = queue_mrf_save_entry(
+            &tx,
+            MrfReplicateEntry {
+                bucket: bucket.to_string(),
+                object: "missed".to_string(),
+                version_id: None,
+                retry_count: 1,
+                size: 1,
+                op: MrfOpKind::Object,
+                force_delete: false,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: Vec::new(),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await;
+
+        assert_eq!(admission, ReplicationQueueAdmission::Missed);
+        let snapshot = mrf_backlog_observability_snapshot();
+        let bucket = snapshot
+            .buckets
+            .iter()
+            .find(|stats| stats.bucket == "mrf-missed-hook-bucket")
+            .expect("missed MRF admission should be observable");
+        assert_eq!(bucket.missed_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mrf_flush_failure_keeps_pending_backlog_observable() {
+        let shared = empty_resync_shared_state();
+        shared.fail_next_write.store(true, Ordering::SeqCst);
+        let storage = Arc::new(LoadResyncNodeStore::new("mrf-flush-failure", shared));
+        let entry = MrfReplicateEntry {
+            bucket: "mrf-flush-failure-bucket".to_string(),
+            object: "pending".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 2048,
+            op: MrfOpKind::Object,
+            force_delete: false,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
+        };
+        observe_mrf_pending(&entry);
+
+        let result = flush_mrf_to_disk(std::slice::from_ref(&entry), &storage).await;
+
+        assert_eq!(result, None);
+        let snapshot = mrf_backlog_observability_snapshot();
+        let bucket = snapshot
+            .buckets
+            .iter()
+            .find(|stats| stats.bucket == "mrf-flush-failure-bucket")
+            .expect("failed MRF flush should keep the bucket observable");
+        assert_eq!(bucket.pending_count, 1);
+        assert_eq!(bucket.pending_bytes, 2048);
+        assert_eq!(bucket.flush_failure_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replication_backlog_guard_decrements_on_drop() {
+        let stats = Arc::new(ReplicationStats::new());
+        stats.inc_q("guard-bucket", 256, false, ReplicationType::Object);
+        stats.inc_target_q("guard-bucket", &["arn:rustfs:replication:target-a".to_string()], 256);
+
+        {
+            let object = ReplicateObjectInfo {
+                bucket: "guard-bucket".to_string(),
+                size: 256,
+                op_type: ReplicationType::Object,
+                dsc: test_replicate_decision(&["arn:rustfs:replication:target-a"]),
+                ..Default::default()
+            };
+            let _guard = ReplicationBacklogGuard::for_object(stats.clone(), &object);
+        }
+
+        let queued = stats.get_latest_replication_stats("guard-bucket").await;
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 0);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 0);
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn dec_mrf_entries_decrements_target_backlog() {
+        let stats = ReplicationStats::new();
+        let entry = MrfReplicateEntry {
+            bucket: "mrf-target-drain-bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 1024,
+            op: MrfOpKind::Object,
+            force_delete: false,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: vec!["arn:rustfs:replication:target-a".to_string()],
+            ..Default::default()
+        };
+
+        stats.inc_q(&entry.bucket, entry.size, false, ReplicationType::Heal);
+        stats.inc_target_q(&entry.bucket, &entry.target_arns, entry.size);
+        dec_mrf_entries(&stats, std::slice::from_ref(&entry));
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn mrf_observability_tracker_separates_pending_drop_miss_and_flush_failure() {
+        let first = MrfReplicateEntry {
+            bucket: "tracker-bucket".to_string(),
+            object: "first".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 1024,
+            op: MrfOpKind::Object,
+            force_delete: false,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
+        };
+        let second = MrfReplicateEntry {
+            object: "second".to_string(),
+            size: 512,
+            ..first.clone()
+        };
+        let mut tracker = MrfBacklogObservabilityTracker::default();
+
+        tracker.add_pending(&first);
+        tracker.add_pending(&second);
+        tracker.record_drop(&second);
+        tracker.record_missed("tracker-bucket");
+        tracker.record_flush_failure(7);
+        tracker.flush_pending_entries([&first], 11);
+
+        let snapshot = tracker.snapshot();
+        let bucket = snapshot
+            .buckets
+            .iter()
+            .find(|stats| stats.bucket == "tracker-bucket")
+            .expect("tracker bucket should be present");
+        assert_eq!(bucket.pending_count, 1);
+        assert_eq!(bucket.pending_bytes, 512);
+        assert_eq!(bucket.dropped_count, 1);
+        assert_eq!(bucket.missed_count, 1);
+        assert_eq!(bucket.flush_failure_count, 1);
+        assert_eq!(bucket.last_flush_duration_millis, 11);
+    }
+
     #[test]
     fn auto_resume_resync_only_for_inflight_states() {
         assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
@@ -2380,6 +3883,12 @@ mod tests {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
             let shared = Arc::new(LoadResyncSharedState {
                 data: StdMutex::new(load_resync_test_metadata()),
+                etag_revision: AtomicUsize::new(1),
+                last_put_preconditions: StdMutex::new(None),
+                last_put_no_lock: AtomicBool::new(false),
+                omit_etag: AtomicBool::new(false),
+                conditional_write_replacements: StdMutex::new(VecDeque::new()),
+                writes: StdMutex::new(Vec::new()),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 first_read_started: Notify::new(),
                 delay_first_read: AtomicBool::new(true),
@@ -2444,9 +3953,12 @@ mod tests {
             retry_count: 3,
             size: 1024,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -2465,6 +3977,164 @@ mod tests {
     }
 
     #[test]
+    fn mrf_object_replay_source_lookup_discards_missing_objects_and_retries_transient_errors() {
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::FileNotFound));
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::FileVersionNotFound));
+        assert!(!should_retry_mrf_source_lookup(&EcstoreError::VersionNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+        assert!(should_retry_mrf_source_lookup(&EcstoreError::Unexpected));
+    }
+
+    #[test]
+    fn mrf_metadata_replay_source_lookup_discards_missing_objects_and_retries_transient_errors() {
+        for error in [EcstoreError::FileNotFound, EcstoreError::FileVersionNotFound] {
+            assert!(!should_retry_mrf_source_lookup(&error));
+        }
+        assert!(should_retry_mrf_source_lookup(&EcstoreError::Unexpected));
+    }
+
+    #[tokio::test]
+    async fn corrupt_mrf_file_is_quarantined_without_overwriting_recovery_data() {
+        let shared = empty_resync_shared_state();
+        let corrupt = vec![0xde, 0xad, 0xbe, 0xef];
+        *shared.data.lock().expect("test data lock should not be poisoned") = corrupt.clone();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-corrupt", shared.clone()))).await;
+
+        pool.start_mrf_processor().await;
+        let handle = pool
+            .task_handles
+            .lock()
+            .await
+            .pop()
+            .expect("MRF processor task should be registered");
+        handle.await.expect("MRF processor should not panic");
+
+        let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
+        let (file, data) = writes.first().expect("corrupt MRF data should be quarantined");
+        assert!(file.starts_with(MRF_CORRUPT_FILE_PREFIX));
+        assert_eq!(data, &corrupt);
+        let marker = writes
+            .iter()
+            .find(|(file, _)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE)
+            .expect("active MRF path should be cleared after quarantine");
+        assert!(marker.1.is_empty(), "the active MRF path should be marked absent");
+    }
+
+    #[tokio::test]
+    async fn mrf_persister_seeds_retained_startup_entries() {
+        assert!(
+            runtime_sources::replication_pool().is_none(),
+            "test requires the runtime replication pool to be unavailable"
+        );
+        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
+            let shared = empty_resync_shared_state();
+            let retained = MrfReplicateEntry {
+                bucket: "mrf-replay-seed".to_string(),
+                object: "retained-delete".to_string(),
+                op: MrfOpKind::Delete,
+                target_arns: vec!["arn:rustfs:replication:target-a".to_string()],
+                ..Default::default()
+            };
+            *shared.data.lock().expect("test data lock should not be poisoned") =
+                encode_mrf_file(std::slice::from_ref(&retained)).expect("MRF entry should encode");
+            let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-seed", shared.clone()))).await;
+
+            pool.start_mrf_persister().await;
+            pool.start_mrf_processor().await;
+            let processor_handle = pool
+                .task_handles
+                .lock()
+                .await
+                .pop()
+                .expect("MRF processor task should be registered");
+            processor_handle.await.expect("MRF processor should not panic");
+            pool.mrf_save_tx
+                .send(MrfReplicateEntry {
+                    bucket: "mrf-replay-seed".to_string(),
+                    object: "new-failure".to_string(),
+                    op: MrfOpKind::Object,
+                    ..Default::default()
+                })
+                .await
+                .expect("new MRF failure should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let persisted = {
+                        let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
+                        writes
+                            .iter()
+                            .rev()
+                            .find(|(file, _)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE)
+                            .map(|(_, data)| decode_mrf_file(data).expect("persisted MRF data should decode"))
+                    };
+                    if let Some(entries) = persisted
+                        && entries.iter().any(|entry| entry.object == retained.object)
+                        && entries.iter().any(|entry| entry.object == "new-failure")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("persister flush should retain startup entries");
+
+            let persister_handle = pool
+                .task_handles
+                .lock()
+                .await
+                .pop()
+                .expect("MRF persister task should be registered");
+            persister_handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mrf_delete_replay_result_is_retained_when_runtime_pool_is_unavailable() {
+        assert!(
+            runtime_sources::replication_pool().is_none(),
+            "test requires the runtime replication pool to be unavailable"
+        );
+        let shared = empty_resync_shared_state();
+        let entry = MrfReplicateEntry {
+            bucket: "mrf-replay-retry".to_string(),
+            object: "destructive-delete".to_string(),
+            op: MrfOpKind::Delete,
+            target_arns: vec!["arn:rustfs:replication:target-a".to_string()],
+            ..Default::default()
+        };
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            encode_mrf_file(std::slice::from_ref(&entry)).expect("MRF entry should encode");
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-retry", shared.clone()))).await;
+
+        pool.start_mrf_processor().await;
+        let handle = pool
+            .task_handles
+            .lock()
+            .await
+            .pop()
+            .expect("MRF processor task should be registered");
+        handle.await.expect("MRF processor should not panic");
+        let retained = pool
+            .mrf_recovery_result
+            .lock()
+            .await
+            .take()
+            .expect("processor should publish retry entries")
+            .pop()
+            .expect("the unavailable runtime pool should retain the entry");
+        assert_eq!(retained.bucket, entry.bucket);
+        assert_eq!(retained.object, entry.object);
+        assert_eq!(retained.version_id, entry.version_id);
+        assert_eq!(retained.target_arns, entry.target_arns);
+    }
+
+    #[test]
     fn mrf_entry_delete_marker_roundtrip() {
         let dm_vid = Uuid::new_v4();
         // A specific, non-now() nanosecond timestamp: replay must preserve this exact value
@@ -2477,9 +4147,12 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: Some(dm_vid),
             delete_marker: true,
             delete_marker_mtime: Some(mtime_nanos),
+            target_arns: Vec::new(),
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -2510,9 +4183,12 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         };
 
         let encoded = encode_mrf_file(&[entry]).expect("encode");
@@ -2538,9 +4214,12 @@ mod tests {
                 retry_count: 1,
                 size: 512,
                 op: MrfOpKind::Object,
+                force_delete: false,
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
+                target_arns: Vec::new(),
+                ..Default::default()
             },
             MrfReplicateEntry {
                 bucket: "b".to_string(),
@@ -2549,9 +4228,12 @@ mod tests {
                 retry_count: 0,
                 size: 0,
                 op: MrfOpKind::Delete,
+                force_delete: false,
                 delete_marker_version_id: Some(del_dm_vid),
                 delete_marker: true,
                 delete_marker_mtime: None,
+                target_arns: Vec::new(),
+                ..Default::default()
             },
         ];
 
@@ -2578,9 +4260,12 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
 
@@ -2592,9 +4277,12 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::Delete,
+            force_delete: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
 
@@ -2607,9 +4295,12 @@ mod tests {
             retry_count: 0,
             size: 0,
             op: MrfOpKind::default(),
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
     }
@@ -2659,6 +4350,7 @@ mod tests {
         // The "deleteMarkerMtime" key was absent in old files — #[serde(default)] must fill in
         // None so replay falls back to the current time (backlog#867 backward compatibility).
         assert_eq!(entry.delete_marker_mtime, None, "missing deleteMarkerMtime key must default to None");
+        assert!(entry.target_arns.is_empty(), "old MRF entries must not be attributed to a target");
     }
 
     #[test]
@@ -2670,9 +4362,12 @@ mod tests {
             retry_count: 1,
             size: 512,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         }];
         let encoded = encode_mrf_file(&entries).expect("durable MRF backlog should encode");
 
@@ -2688,6 +4383,106 @@ mod tests {
     }
 
     #[test]
+    fn durable_mrf_summary_aggregates_entries_by_bucket_for_obs() {
+        let snapshot =
+            durable_mrf_backlog_summary_from_sizes([("b1".to_string(), 1024), ("b1".to_string(), 512), ("b2".to_string(), 0)]);
+
+        let summary = snapshot.summary;
+        assert!(summary.available);
+        let buckets = summary
+            .buckets
+            .into_iter()
+            .map(|bucket| (bucket.bucket.clone(), bucket))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(buckets["b1"].count, 2);
+        assert_eq!(buckets["b1"].bytes, 1536);
+        assert_eq!(buckets["b2"].count, 1);
+        assert_eq!(buckets["b2"].bytes, 0);
+        assert!(snapshot.targets.is_empty());
+    }
+
+    #[test]
+    fn durable_mrf_summary_aggregates_target_backlog_without_attributing_legacy_entries() {
+        let entries = vec![
+            MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "object-a".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 1024,
+                op: MrfOpKind::Object,
+                force_delete: false,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
+                ..Default::default()
+            },
+            MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "object-b".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 512,
+                op: MrfOpKind::Object,
+                force_delete: false,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: vec!["arn:target-a".to_string()],
+                ..Default::default()
+            },
+            MrfReplicateEntry {
+                bucket: "b1".to_string(),
+                object: "legacy-object".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 256,
+                op: MrfOpKind::Object,
+                force_delete: false,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: Vec::new(),
+                ..Default::default()
+            },
+        ];
+
+        let snapshot = durable_mrf_backlog_summary_from_entries(&entries);
+
+        let summary = snapshot.summary;
+        assert!(summary.available);
+        let buckets = summary
+            .buckets
+            .into_iter()
+            .map(|bucket| (bucket.bucket.clone(), bucket))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(buckets["b1"].count, 3);
+        assert_eq!(buckets["b1"].bytes, 1792);
+
+        let targets = snapshot
+            .targets
+            .into_iter()
+            .map(|target| ((target.bucket.clone(), target.target_arn.clone()), target))
+            .collect::<HashMap<_, _>>();
+        let target_a = &targets[&("b1".to_string(), "arn:target-a".to_string())];
+        assert_eq!(target_a.count, 2);
+        assert_eq!(target_a.bytes, 1536);
+        let target_b = &targets[&("b1".to_string(), "arn:target-b".to_string())];
+        assert_eq!(target_b.count, 1);
+        assert_eq!(target_b.bytes, 1024);
+    }
+
+    #[test]
+    fn durable_mrf_summary_marks_invalid_sizes_unavailable() {
+        let invalid = durable_mrf_backlog_summary_from_sizes([("bucket".to_string(), -1)]);
+        let summary = invalid.summary;
+        assert!(!summary.available);
+        assert!(summary.buckets.is_empty());
+        assert!(invalid.targets.is_empty());
+    }
+
+    #[test]
     fn durable_mrf_snapshot_marks_corrupt_or_invalid_data_unavailable() {
         let corrupt = durable_mrf_backlog_from_read(Ok(vec![0, 1, 2]));
         assert!(!corrupt.available);
@@ -2700,13 +4495,290 @@ mod tests {
             retry_count: 0,
             size: -1,
             op: MrfOpKind::Object,
+            force_delete: false,
             delete_marker_version_id: None,
             delete_marker: false,
             delete_marker_mtime: None,
+            target_arns: Vec::new(),
+            ..Default::default()
         }])
         .expect("invalid persisted entry should still encode for boundary testing");
         let invalid = durable_mrf_backlog_from_read(Ok(negative));
         assert!(!invalid.available);
         assert!(invalid.entries.is_empty());
+    }
+
+    #[test]
+    fn force_delete_replay_requires_local_commit_and_keeps_persisted_targets() {
+        let operation_id = Uuid::new_v4();
+        let pending = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "logs/".to_string(),
+            target_arns: vec!["arn:target:old-generation".to_string()],
+            force_delete_id: Some(operation_id),
+            force_delete_generation: Some(11),
+            force_delete_local_commit: false,
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        assert!(!should_replay_force_delete_intent(&pending));
+
+        let mut committed = pending;
+        committed.force_delete_local_commit = true;
+        let recovered = decode_mrf_file(&encode_mrf_file(&[committed.clone()]).expect("force-delete intent should encode"))
+            .expect("force-delete intent should decode");
+        assert!(should_replay_force_delete_intent(&recovered[0]));
+        assert_eq!(recovered[0].target_arns, vec!["arn:target:old-generation"]);
+        assert_eq!(recovered[0].force_delete_generation, Some(11));
+
+        committed.target_arns.clear();
+        assert!(!should_replay_force_delete_intent(&committed));
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_append_commit_and_cleanup_are_idempotent() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "logs/".to_string(),
+            target_arns: vec!["arn:target:stable".to_string()],
+            force_delete_id: Some(operation_id),
+            force_delete_generation: Some(12),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("first journal append should succeed");
+        let preconditions = shared
+            .last_put_preconditions
+            .lock()
+            .expect("test preconditions lock should not be poisoned")
+            .clone()
+            .expect("first journal append should be conditional");
+        assert_eq!(preconditions.if_none_match_value(), Some("*"));
+        assert_eq!(preconditions.if_match_value(), None);
+        assert!(!shared.last_put_no_lock.load(Ordering::SeqCst));
+        persist_force_delete_intent(storage.clone(), entry)
+            .await
+            .expect("duplicate journal append should be a no-op");
+
+        let data = ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should be readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].force_delete_local_commit);
+        assert!(!should_replay_force_delete_intent(&entries[0]));
+
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("commit marker should persist");
+        let preconditions = shared
+            .last_put_preconditions
+            .lock()
+            .expect("test preconditions lock should not be poisoned")
+            .clone()
+            .expect("commit marker should be conditional");
+        assert_eq!(preconditions.if_none_match_value(), None);
+        assert_eq!(preconditions.if_match_value(), Some("mrf-1"));
+        assert!(!shared.last_put_no_lock.load(Ordering::SeqCst));
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("duplicate commit marker should be a no-op");
+        let data = ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("committed journal should be readable");
+        let entries = decode_mrf_file(&data).expect("committed journal should decode");
+        assert!(should_replay_force_delete_intent(&entries[0]));
+        assert_eq!(entries[0].target_arns, vec!["arn:target:stable"]);
+
+        complete_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("journal cleanup should succeed");
+        complete_force_delete_intent(storage, operation_id)
+            .await
+            .expect("duplicate journal cleanup should be a no-op");
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_cleanup_retries_after_a_stale_journal_snapshot() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let mut entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(operation_id),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("journal append should succeed");
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("journal commit should succeed");
+        entry.force_delete_local_commit = true;
+        let concurrent = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "concurrent".to_string(),
+            force_delete_id: Some(Uuid::new_v4()),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        shared
+            .conditional_write_replacements
+            .lock()
+            .expect("test replacement lock should not be poisoned")
+            .push_back(encode_mrf_file(&[entry, concurrent.clone()]).expect("concurrent journal entries should encode"));
+
+        complete_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("cleanup should retry after a concurrent journal update");
+
+        let data = ReplicationConfigStore::read(storage, ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should remain readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1, "cleanup must preserve only the concurrent journal entry");
+        assert_eq!(entries[0].force_delete_id, concurrent.force_delete_id);
+        assert_eq!(entries[0].object, concurrent.object);
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_commit_retries_past_the_bounded_cas_conflict_limit() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(operation_id),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        persist_force_delete_intent(storage.clone(), entry.clone())
+            .await
+            .expect("journal append should succeed");
+        {
+            let mut replacements = shared
+                .conditional_write_replacements
+                .lock()
+                .expect("test replacement lock should not be poisoned");
+            for object in ["first", "second", "third"] {
+                let mut replacement = entry.clone();
+                replacement.object = object.to_string();
+                replacements.push_back(encode_mrf_file(&[replacement]).expect("concurrent journal entry should encode"));
+            }
+        }
+
+        commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect("commit marker must retry until it is durable");
+
+        let data = ReplicationConfigStore::read(storage, ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should remain readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].force_delete_local_commit);
+        assert_eq!(entries[0].force_delete_id, Some(operation_id));
+    }
+
+    #[tokio::test]
+    async fn force_delete_intent_rejects_existing_journal_without_an_etag() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared.clone()));
+        let operation_id = Uuid::new_v4();
+        let entry = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(operation_id),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        persist_force_delete_intent(storage.clone(), entry)
+            .await
+            .expect("journal append should succeed");
+        let writes_before = shared.write_count.load(Ordering::SeqCst);
+        shared.omit_etag.store(true, Ordering::SeqCst);
+
+        let err = commit_force_delete_intent(storage.clone(), operation_id)
+            .await
+            .expect_err("missing ETag must reject journal mutation");
+        assert!(err.to_string().contains("no ETag"));
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), writes_before);
+        let data = ReplicationConfigStore::read(storage, ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE)
+            .await
+            .expect("journal should remain readable");
+        let entries = decode_mrf_file(&data).expect("journal should decode");
+        assert!(!entries[0].force_delete_local_commit);
+    }
+
+    #[test]
+    fn force_delete_journal_rejects_a_lost_transaction_lease() {
+        let err = ensure_force_delete_journal_lock_held(true).expect_err("lost transaction lease must fence the journal write");
+
+        assert!(err.to_string().contains("lock lost"));
+    }
+
+    #[tokio::test]
+    async fn force_delete_journal_rejects_a_stale_conditional_write() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("force-delete-journal", shared));
+        let file = ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE;
+        let original = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "original".to_string(),
+            force_delete_id: Some(Uuid::new_v4()),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        ReplicationConfigStore::save(
+            storage.clone(),
+            file,
+            encode_mrf_file(&[original]).expect("initial journal entry should encode"),
+        )
+        .await
+        .expect("initial journal write should succeed");
+
+        let (_, object_info) = ReplicationConfigStore::read_no_lock_with_metadata(storage.clone(), file)
+            .await
+            .expect("journal snapshot should include an ETag");
+        let stale_preconditions = HTTPPreconditions {
+            if_match: object_info.etag,
+            ..Default::default()
+        };
+        let replacement = MrfReplicateEntry {
+            bucket: "source".to_string(),
+            object: "replacement".to_string(),
+            force_delete_id: Some(Uuid::new_v4()),
+            op: MrfOpKind::Delete,
+            ..Default::default()
+        };
+        let replacement_data = encode_mrf_file(&[replacement]).expect("replacement journal entry should encode");
+        ReplicationConfigStore::save(storage.clone(), file, replacement_data.clone())
+            .await
+            .expect("concurrent journal write should succeed");
+
+        let err = ReplicationConfigStore::save_conditional(
+            storage.clone(),
+            file,
+            encode_mrf_file(&[]).expect("empty journal should encode"),
+            stale_preconditions,
+        )
+        .await
+        .expect_err("stale journal snapshot must not overwrite newer data");
+        assert_eq!(err, EcstoreError::PreconditionFailed);
+        assert_eq!(
+            ReplicationConfigStore::read(storage, file)
+                .await
+                .expect("newer journal data should remain readable"),
+            replacement_data
+        );
     }
 }

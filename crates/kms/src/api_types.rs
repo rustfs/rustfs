@@ -15,12 +15,12 @@
 //! API types for KMS dynamic configuration
 
 use crate::config::{
-    BackendConfig, CacheConfig, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend,
-    KmsConfig, LocalConfig, StaticConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, redacted_secret,
-    redacted_secret_option,
+    AwsKmsConfig, BackendConfig, CacheConfig, DEFAULT_CACHE_TTL, DEFAULT_MAX_CACHED_KEYS,
+    DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend, KmsConfig, LocalConfig,
+    StaticConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, allow_immediate_deletion_from_env,
+    redacted_secret, redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
-use crate::types::{KeyMetadata, KeyUsage};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -165,6 +165,47 @@ pub struct ConfigureStaticKmsRequest {
     pub allow_insecure_dev_defaults: Option<bool>,
 }
 
+/// Request to configure KMS with the AWS KMS backend.
+///
+/// Accepts no credential material by design: every node resolves AWS
+/// credentials through the standard `aws-config` provider chain, so nothing
+/// secret is submitted here, persisted with the cluster configuration, or
+/// echoed back by the status API.
+///
+/// Keys are not created by this path. The backend refuses caller-named key
+/// creation because AWS assigns identifiers itself, so `default_key_id` must
+/// name a key that already exists in AWS, by key id or ARN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigureAwsKmsRequest {
+    /// AWS region hosting the keys.
+    ///
+    /// Mandatory here, unlike the environment-variable path: this
+    /// configuration is persisted once and replayed on every node, so leaving
+    /// the region to each node's ambient provider chain would let nodes
+    /// silently address different regions — and therefore different keys —
+    /// while reporting the same configuration.
+    pub region: String,
+    /// Endpoint override for local emulators and private endpoints. Unset in
+    /// production, where the SDK derives the regional endpoint; a plaintext
+    /// endpoint stays gated behind the development opt-in.
+    pub endpoint_url: Option<String>,
+    /// Default master key ID for auto-encryption, as an AWS key id or ARN
+    pub default_key_id: Option<String>,
+    /// Operation timeout in seconds
+    pub timeout_seconds: Option<u64>,
+    /// Number of retry attempts
+    pub retry_attempts: Option<u32>,
+    /// Enable caching
+    pub enable_cache: Option<bool>,
+    /// Maximum number of keys to cache
+    pub max_cached_keys: Option<usize>,
+    /// Cache TTL in seconds
+    pub cache_ttl_seconds: Option<u64>,
+    /// Allow development-only insecure defaults
+    pub allow_insecure_dev_defaults: Option<bool>,
+}
+
 impl Drop for ConfigureStaticKmsRequest {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -211,6 +252,9 @@ pub enum ConfigureKmsRequest {
     /// Configure with Static single-key backend
     #[serde(rename = "Static", alias = "static")]
     Static(ConfigureStaticKmsRequest),
+    /// Configure with the AWS KMS backend
+    #[serde(rename = "AWS", alias = "AwsKms", alias = "aws", alias = "aws-kms", alias = "aws_kms")]
+    Aws(ConfigureAwsKmsRequest),
 }
 
 /// KMS configuration response
@@ -418,14 +462,26 @@ pub enum BackendSummary {
         /// Configured key identifier
         key_id: String,
     },
+    /// AWS KMS backend summary
+    Aws {
+        /// Configured region, when pinned instead of resolved by the AWS chain
+        region: Option<String>,
+        /// Endpoint override, when set for an emulator or private endpoint
+        endpoint_url: Option<String>,
+    },
 }
 
 impl From<&KmsConfig> for KmsConfigSummary {
     fn from(config: &KmsConfig) -> Self {
+        // Report the lifetime the cache was built with, not the raw configured
+        // value: an oversized `ttl` is clamped rather than rejected, and this
+        // response is what operators check the cache against.
+        let cache_ttl_seconds = config.cache_config.effective_ttl().as_secs();
+
         let cache_summary = if config.enable_cache {
             Some(CacheSummary {
                 max_keys: config.cache_config.max_keys,
-                ttl_seconds: config.cache_config.ttl.as_secs(),
+                ttl_seconds: cache_ttl_seconds,
                 enable_metrics: config.cache_config.enable_metrics,
             })
         } else {
@@ -467,6 +523,10 @@ impl From<&KmsConfig> for KmsConfigSummary {
             BackendConfig::Static(static_config) => BackendSummary::Static {
                 key_id: static_config.key_id.clone(),
             },
+            BackendConfig::Aws(aws_config) => BackendSummary::Aws {
+                region: aws_config.region.clone(),
+                endpoint_url: aws_config.endpoint_url.clone(),
+            },
         };
 
         Self {
@@ -476,7 +536,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
             retry_attempts: config.retry_attempts,
             enable_cache: config.enable_cache,
             max_cached_keys: config.cache_config.max_keys,
-            cache_ttl_seconds: config.cache_config.ttl.as_secs(),
+            cache_ttl_seconds,
             cache_summary,
             backend_summary,
         }
@@ -495,13 +555,17 @@ impl ConfigureLocalKmsRequest {
                 file_permissions: self.file_permissions,
             }),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -532,13 +596,17 @@ impl ConfigureVaultKmsRequest {
                 },
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -569,13 +637,17 @@ impl ConfigureVaultTransitKmsRequest {
                 },
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -592,13 +664,44 @@ impl ConfigureStaticKmsRequest {
                 secret_key: self.secret_key.clone(),
             }),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
             cache_config: CacheConfig {
-                max_keys: self.max_cached_keys.unwrap_or(1000),
-                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
-                enable_metrics: true,
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
+            },
+        }
+    }
+}
+
+impl ConfigureAwsKmsRequest {
+    /// Convert to KmsConfig
+    pub fn to_kms_config(&self) -> KmsConfig {
+        KmsConfig {
+            backend: KmsBackend::Aws,
+            default_key_id: self.default_key_id.clone(),
+            backend_config: BackendConfig::Aws(Box::new(AwsKmsConfig {
+                region: Some(self.region.clone()),
+                endpoint_url: self.endpoint_url.clone(),
+            })),
+            allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            // Read from server configuration, never from the request body: the
+            // gate must mean the same thing whether KMS was configured at
+            // startup or through this endpoint.
+            allow_immediate_deletion: allow_immediate_deletion_from_env(),
+            timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
+            retry_attempts: self.retry_attempts.unwrap_or(3),
+            enable_cache: self.enable_cache.unwrap_or(true),
+            cache_config: CacheConfig {
+                max_keys: self.max_cached_keys.unwrap_or(DEFAULT_MAX_CACHED_KEYS),
+                ttl: self.cache_ttl_seconds.map_or(DEFAULT_CACHE_TTL, Duration::from_secs),
+                ..CacheConfig::default()
             },
         }
     }
@@ -612,6 +715,7 @@ impl ConfigureKmsRequest {
             ConfigureKmsRequest::VaultKv2(req) => req.to_kms_config(),
             ConfigureKmsRequest::VaultTransit(req) => req.to_kms_config(),
             ConfigureKmsRequest::Static(req) => req.to_kms_config(),
+            ConfigureKmsRequest::Aws(req) => req.to_kms_config(),
         }
     }
 }
@@ -798,6 +902,108 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_aws_configure_request_accepts_type_aliases() {
+        for backend_type in ["AWS", "AwsKms", "aws", "aws-kms", "aws_kms"] {
+            let raw = serde_json::json!({
+                "backend_type": backend_type,
+                "region": "eu-central-1",
+                "default_key_id": "arn:aws:kms:eu-central-1:111122223333:key/1234abcd"
+            });
+
+            let request: ConfigureKmsRequest = serde_json::from_value(raw).unwrap_or_else(|e| panic!("{backend_type}: {e}"));
+            let config = request.to_kms_config();
+            assert_eq!(config.backend, KmsBackend::Aws, "backend_type={backend_type}");
+            let aws = config.aws_kms_config().expect("aws backend config");
+            assert_eq!(aws.region.as_deref(), Some("eu-central-1"));
+            assert_eq!(aws.endpoint_url, None);
+            assert!(config.validate().is_ok(), "backend_type={backend_type}");
+        }
+    }
+
+    /// A cluster-persisted AWS configuration must pin its own region: a
+    /// request that leaves it to each node's ambient provider chain is refused
+    /// rather than accepted into a configuration every node interprets
+    /// differently.
+    #[test]
+    fn test_aws_configure_request_requires_an_explicit_region() {
+        let missing = serde_json::json!({
+            "backend_type": "AWS",
+            "default_key_id": "arn:aws:kms:eu-central-1:111122223333:key/1234abcd"
+        });
+        let err = serde_json::from_value::<ConfigureKmsRequest>(missing).expect_err("a region-less AWS request must be refused");
+        assert!(err.to_string().contains("region"), "{err}");
+
+        let empty = serde_json::json!({ "backend_type": "AWS", "region": "" });
+        let request: ConfigureKmsRequest = serde_json::from_value(empty).expect("an empty region deserializes");
+        assert!(request.to_kms_config().validate().is_err(), "an empty region must not validate");
+    }
+
+    #[test]
+    fn test_aws_configure_request_rejects_plaintext_endpoint_without_opt_in() {
+        let raw = serde_json::json!({
+            "backend_type": "AWS",
+            "region": "us-east-1",
+            "endpoint_url": "http://localhost:4566"
+        });
+        let request: ConfigureKmsRequest = serde_json::from_value(raw).expect("aws request should deserialize");
+        assert!(request.to_kms_config().validate().is_err());
+
+        let opt_in = serde_json::json!({
+            "backend_type": "AWS",
+            "region": "us-east-1",
+            "endpoint_url": "http://localhost:4566",
+            "allow_insecure_dev_defaults": true
+        });
+        let request: ConfigureKmsRequest = serde_json::from_value(opt_in).expect("aws request should deserialize");
+        assert!(request.to_kms_config().validate().is_ok());
+    }
+
+    /// The AWS summary carries only non-credential settings, because the
+    /// backend never holds AWS credential material to begin with.
+    #[test]
+    fn test_aws_status_summary_reports_only_non_credential_settings() {
+        let config = ConfigureAwsKmsRequest {
+            region: "us-east-1".to_string(),
+            endpoint_url: None,
+            default_key_id: Some("arn:aws:kms:us-east-1:111122223333:key/1234abcd".to_string()),
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
+        }
+        .to_kms_config();
+
+        let summary = KmsConfigSummary::from(&config);
+        assert_eq!(summary.backend_type, KmsBackend::Aws);
+        match &summary.backend_summary {
+            BackendSummary::Aws { region, endpoint_url } => {
+                assert_eq!(region.as_deref(), Some("us-east-1"));
+                assert_eq!(endpoint_url.as_deref(), None);
+            }
+            other => panic!("expected aws summary, got {other:?}"),
+        }
+
+        let response = KmsStatusResponse {
+            status: KmsServiceStatus::Running,
+            backend_type: Some(config.backend),
+            healthy: Some(true),
+            config_summary: Some(summary),
+        };
+        let rendered = format!(
+            "{}\n{response:?}",
+            serde_json::to_string(&response).expect("kms status response should serialize")
+        );
+        for credential_field in ["access_key", "secret_key", "session_token", "has_stored_credentials"] {
+            assert!(
+                !rendered.contains(credential_field),
+                "aws status output must not describe credential material: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn test_configure_request_rejects_unknown_fields() {
         let raw = serde_json::json!({
             "backend_type": "local",
@@ -820,6 +1026,17 @@ mod tests {
         });
 
         let err = serde_json::from_value::<ConfigureKmsRequest>(raw).expect_err("unknown auth field should fail");
+        assert!(err.to_string().contains("unknown field"));
+
+        // AWS credentials belong to the provider chain: a request that tries to
+        // smuggle them in must be refused, not silently ignored.
+        let raw = serde_json::json!({
+            "backend_type": "AWS",
+            "region": "us-east-1",
+            "secret_access_key": "AKIA-not-accepted-here"
+        });
+
+        let err = serde_json::from_value::<ConfigureKmsRequest>(raw).expect_err("unknown aws field should fail");
         assert!(err.to_string().contains("unknown field"));
     }
 
@@ -847,6 +1064,7 @@ mod tests {
                 tls: None,
             })),
             allow_insecure_dev_defaults: true,
+            allow_immediate_deletion: false,
             timeout: Duration::from_secs(30),
             retry_attempts: 3,
             enable_cache: true,
@@ -858,8 +1076,8 @@ mod tests {
         assert_eq!(summary.backend_type, KmsBackend::VaultTransit);
         assert_eq!(summary.timeout_seconds, 30);
         assert_eq!(summary.retry_attempts, 3);
-        assert_eq!(summary.max_cached_keys, 1000);
-        assert_eq!(summary.cache_ttl_seconds, 3600);
+        assert_eq!(summary.max_cached_keys, DEFAULT_MAX_CACHED_KEYS);
+        assert_eq!(summary.cache_ttl_seconds, DEFAULT_CACHE_TTL.as_secs());
 
         match summary.backend_summary {
             BackendSummary::VaultTransit {
@@ -980,6 +1198,19 @@ mod tests {
         }
     }
 
+    /// The shapes this crate owns, and only those.
+    ///
+    /// The first four are served verbatim by the dynamic-configuration admin
+    /// handlers, so pinning them here pins the wire. The last three never
+    /// reach a socket: `ObjectEncryptionService` returns them and the admin
+    /// layer answers with its own `KmsKeyMetadataResponse` instead, so what
+    /// they pin is this crate's public API, not the wire.
+    ///
+    /// No key-management response belongs in this test. Those endpoints are
+    /// served from types defined in the `rustfs` crate, and a copy here could
+    /// only ever agree with them by accident — see
+    /// `kms_key_admin_responses_have_stable_json_shapes` in
+    /// `rustfs/src/admin/handlers/kms_keys.rs`.
     #[test]
     fn kms_management_responses_have_stable_json_shapes() {
         insta::assert_json_snapshot!(
@@ -1016,41 +1247,6 @@ mod tests {
             })
         );
         insta::assert_json_snapshot!(
-            "kms_delete_key_response",
-            stable_json_value(DeleteKeyResponse {
-                success: true,
-                message: "key scheduled for deletion".to_string(),
-                key_id: "key-a".to_string(),
-                deletion_date: Some("2026-07-01T00:00:00Z".to_string()),
-            })
-        );
-        insta::assert_json_snapshot!(
-            "kms_list_keys_response",
-            stable_json_value(ListKeysResponse {
-                success: true,
-                message: "keys listed".to_string(),
-                keys: vec!["key-a".to_string(), "key-b".to_string()],
-                truncated: true,
-                next_marker: Some("key-b".to_string()),
-            })
-        );
-        insta::assert_json_snapshot!(
-            "kms_describe_key_response_missing",
-            stable_json_value(DescribeKeyResponse {
-                success: false,
-                message: "key not found".to_string(),
-                key_metadata: None,
-            })
-        );
-        insta::assert_json_snapshot!(
-            "kms_cancel_key_deletion_response",
-            stable_json_value(CancelKeyDeletionResponse {
-                success: true,
-                message: "key deletion canceled".to_string(),
-                key_id: "key-a".to_string(),
-            })
-        );
-        insta::assert_json_snapshot!(
             "kms_update_key_description_response",
             stable_json_value(UpdateKeyDescriptionResponse {
                 success: true,
@@ -1080,133 +1276,18 @@ mod tests {
 // ========================================
 // Key Management API Types
 // ========================================
-
-/// Request to create a new key with optional custom name
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateKeyRequest {
-    /// Custom key name (optional, will auto-generate UUID if not provided)
-    pub key_name: Option<String>,
-    /// Key usage type
-    pub key_usage: KeyUsage,
-    /// Key description
-    pub description: Option<String>,
-    /// Key policy JSON string
-    pub policy: Option<String>,
-    /// Tags for the key
-    pub tags: HashMap<String, String>,
-    /// Origin of the key
-    pub origin: Option<String>,
-}
-
-impl Default for CreateKeyRequest {
-    fn default() -> Self {
-        Self {
-            key_name: None,
-            key_usage: KeyUsage::EncryptDecrypt,
-            description: None,
-            policy: None,
-            tags: HashMap::new(),
-            origin: None,
-        }
-    }
-}
-
-/// Response from create key operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateKeyResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Created key ID (either custom name or auto-generated UUID)
-    pub key_id: String,
-    /// Key metadata
-    pub key_metadata: KeyMetadata,
-}
-
-/// Request to delete a key
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteKeyRequest {
-    /// Key ID to delete
-    pub key_id: String,
-    /// Number of days to wait before deletion (7-30 days, optional)
-    pub pending_window_in_days: Option<u32>,
-    /// Force immediate deletion (for development/testing only)
-    pub force_immediate: Option<bool>,
-}
-
-/// Response from delete key operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteKeyResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Key ID that was deleted or scheduled for deletion
-    pub key_id: String,
-    /// Deletion date (if scheduled)
-    pub deletion_date: Option<String>,
-}
-
-/// Request to list all keys
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListKeysRequest {
-    /// Maximum number of keys to return (1-1000)
-    pub limit: Option<u32>,
-    /// Pagination marker
-    pub marker: Option<String>,
-}
-
-/// Response from list keys operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListKeysResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// List of key IDs
-    pub keys: Vec<String>,
-    /// Whether more keys are available
-    pub truncated: bool,
-    /// Next marker for pagination
-    pub next_marker: Option<String>,
-}
-
-/// Request to describe a key
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DescribeKeyRequest {
-    /// Key ID to describe
-    pub key_id: String,
-}
-
-/// Response from describe key operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DescribeKeyResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Key metadata
-    pub key_metadata: Option<KeyMetadata>,
-}
-
-/// Request to cancel key deletion
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelKeyDeletionRequest {
-    /// Key ID to cancel deletion for
-    pub key_id: String,
-}
-
-/// Response from cancel key deletion operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelKeyDeletionResponse {
-    /// Success flag
-    pub success: bool,
-    /// Status message
-    pub message: String,
-    /// Key ID
-    pub key_id: String,
-}
+//
+// What remains here is the key-metadata trio, and nothing else belongs.
+// Create, delete, list, describe and cancel-deletion are served from types
+// defined in the `rustfs` crate (`rustfs/src/admin/handlers/kms_keys.rs`)
+// carrying fields this crate knows nothing about, so a copy here would shadow
+// `crate::types` under the same name while agreeing with the wire only by
+// accident.
+//
+// The same holds for `DeleteKeyRequest`: it lives in `crate::types` alone, so
+// the immediate-deletion gate (`force_immediate` + `confirm_key_id`) has
+// exactly one definition and cannot be silently dropped by deserializing into
+// a copy that lacks it.
 
 /// Request to update key description
 #[derive(Debug, Clone, Serialize, Deserialize)]

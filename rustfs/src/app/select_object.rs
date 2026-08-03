@@ -54,6 +54,11 @@ enum SelectOutputFormat {
     Json(JSONOutput),
 }
 
+enum SelectProducerOutcome {
+    Terminal(S3Result<SelectObjectContentEvent>),
+    ReceiverClosed,
+}
+
 pub async fn execute_select_object_content(
     req: S3Request<SelectObjectContentInput>,
 ) -> S3Result<S3Response<SelectObjectContentOutput>> {
@@ -100,16 +105,17 @@ async fn send_select_events_until_deadline(
     deadline: Instant,
     timeout_seconds: u64,
 ) {
-    if timeout_at(deadline, send_select_events(output, &tx, validation))
-        .await
-        .is_err()
-    {
-        terminal_permit.send(Err(map_query_error_to_s3(
+    let outcome = match timeout_at(deadline, send_select_events(output, &tx, validation)).await {
+        Ok(outcome) => outcome,
+        Err(_) => SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(
             S3SelectPolicyError::QueryTimeout {
                 seconds: timeout_seconds,
             }
             .into(),
-        )));
+        ))),
+    };
+    if let SelectProducerOutcome::Terminal(event) = outcome {
+        terminal_permit.send(event);
     }
 }
 
@@ -117,7 +123,7 @@ async fn send_select_events(
     mut output: SendableRecordBatchStream,
     tx: &mpsc::Sender<S3Result<SelectObjectContentEvent>>,
     validation: SelectValidation,
-) {
+) -> SelectProducerOutcome {
     let mut encoder = SelectOutputEncoder::new(validation.output_format);
     let mut progress = SelectProgress::default();
 
@@ -126,15 +132,20 @@ async fn send_select_events(
         .await
         .is_err()
     {
-        return;
+        return SelectProducerOutcome::ReceiverClosed;
     }
 
-    while let Some(result) = output.next().await {
+    let receiver_closed = tx.closed();
+    tokio::pin!(receiver_closed);
+    while let Some(result) = tokio::select! {
+        biased;
+        _ = &mut receiver_closed => return SelectProducerOutcome::ReceiverClosed,
+        result = output.next() => result,
+    } {
         let batch = match result {
             Ok(batch) => batch,
             Err(err) => {
-                let _ = tx.send(Err(map_query_error_to_s3(err.into()))).await;
-                return;
+                return SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(err.into())));
             }
         };
 
@@ -147,7 +158,7 @@ async fn send_select_events(
                         .await
                         .is_err()
                     {
-                        return;
+                        return SelectProducerOutcome::ReceiverClosed;
                     }
                     if validation.progress_enabled
                         && tx
@@ -157,13 +168,12 @@ async fn send_select_events(
                             .await
                             .is_err()
                     {
-                        return;
+                        return SelectProducerOutcome::ReceiverClosed;
                     }
                 }
             }
             Err(err) => {
-                let _ = tx.send(Err(err)).await;
-                return;
+                return SelectProducerOutcome::Terminal(Err(err));
             }
         }
     }
@@ -172,9 +182,9 @@ async fn send_select_events(
         details: Some(progress.to_stats()),
     });
     if tx.send(Ok(stats)).await.is_err() {
-        return;
+        return SelectProducerOutcome::ReceiverClosed;
     }
-    let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+    SelectProducerOutcome::Terminal(Ok(SelectObjectContentEvent::End(EndEvent::default())))
 }
 
 fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectContentInput) -> S3Result<SelectValidation> {
@@ -240,7 +250,8 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         validate_single_byte(csv.comments.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
-        validate_record_delimiter(csv.record_delimiter.as_deref())?;
+        validate_input_record_delimiter(csv.record_delimiter.as_deref())?;
+        validate_input_delimiter_pair(csv.field_delimiter.as_deref(), csv.record_delimiter.as_deref())?;
     }
 
     if let Some(json) = input.json.as_mut() {
@@ -266,7 +277,7 @@ fn normalize_output_serialization(output: &mut OutputSerialization) -> S3Result<
         validate_single_byte(csv.field_delimiter.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
-        validate_record_delimiter(csv.record_delimiter.as_deref())?;
+        validate_output_record_delimiter(csv.record_delimiter.as_deref())?;
         if let Some(quote_fields) = csv.quote_fields.as_ref()
             && !matches!(quote_fields.as_str(), QuoteFields::ALWAYS | QuoteFields::ASNEEDED)
         {
@@ -341,11 +352,35 @@ fn validate_single_byte(value: Option<&str>, code: S3ErrorCode) -> S3Result<()> 
     Ok(())
 }
 
-fn validate_record_delimiter(value: Option<&str>) -> S3Result<()> {
+fn validate_output_record_delimiter(value: Option<&str>) -> S3Result<()> {
     if let Some(value) = value
         && value.len() != 1
         && value != "\r\n"
     {
+        return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
+    }
+    Ok(())
+}
+
+fn validate_input_record_delimiter(value: Option<&str>) -> S3Result<()> {
+    if let Some(value) = value
+        && !(1..=2).contains(&value.len())
+    {
+        return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
+    }
+    Ok(())
+}
+
+fn validate_input_delimiter_pair(field_delimiter: Option<&str>, record_delimiter: Option<&str>) -> S3Result<()> {
+    let field_delimiter = field_delimiter.unwrap_or(",");
+    let record_delimiter = record_delimiter.unwrap_or("\n");
+    let normalized_field_delimiter = if field_delimiter.len() > 1 { "," } else { field_delimiter };
+    let normalized_record_delimiter = if record_delimiter.len() == 2 {
+        "\r\n"
+    } else {
+        record_delimiter
+    };
+    if record_delimiter.starts_with(field_delimiter) || normalized_record_delimiter.contains(normalized_field_delimiter) {
         return Err(S3Error::new(S3ErrorCode::InvalidRequestParameter));
     }
     Ok(())
@@ -643,7 +678,12 @@ fn is_json_document(json: &JSONInput) -> bool {
 mod tests {
     use super::*;
     use datafusion::{
-        arrow::datatypes::Schema, physical_plan::stream::RecordBatchStreamAdapter, sql::sqlparser::parser::ParserError,
+        arrow::{
+            array::{Array, ListArray},
+            datatypes::{Field, Int32Type, Schema},
+        },
+        physical_plan::stream::RecordBatchStreamAdapter,
+        sql::sqlparser::parser::ParserError,
     };
     use http::HeaderMap;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
@@ -688,6 +728,33 @@ mod tests {
                 scan_range: None,
             },
         }
+    }
+
+    fn csv_validation() -> SelectValidation {
+        SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        }
+    }
+
+    fn spawn_test_producer(
+        output: SendableRecordBatchStream,
+        channel_capacity: usize,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<S3Result<SelectObjectContentEvent>>) {
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let terminal_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("test channel should reserve terminal capacity");
+        let producer = tokio::spawn(send_select_events_until_deadline(
+            output,
+            tx,
+            terminal_permit,
+            csv_validation(),
+            Instant::now() + std::time::Duration::from_secs(1),
+            300,
+        ));
+        (producer, rx)
     }
 
     #[test]
@@ -793,16 +860,11 @@ mod tests {
         tx.send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
             .await
             .expect("test channel should accept the prefilled event");
-        let validation = SelectValidation {
-            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
-            progress_enabled: false,
-        };
-
         let producer = tokio::spawn(send_select_events_until_deadline(
             output,
             tx,
             terminal_permit,
-            validation,
+            csv_validation(),
             Instant::now() + std::time::Duration::from_secs(1),
             300,
         ));
@@ -820,6 +882,173 @@ mod tests {
             .expect_err("terminal event should be an error");
         assert_eq!(timeout_error.code(), &S3ErrorCode::Busy);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn producer_preserves_finite_stream_terminal_events() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![datafusion::arrow::datatypes::Field::new(
+            "value",
+            datafusion::arrow::datatypes::DataType::Utf8,
+            false,
+        )]));
+        let batch = |value| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::StringArray::from(vec![value]))])
+                .expect("test record batch should be valid")
+        };
+        let batches = [Ok(batch("a")), Ok(batch("b"))];
+        let output = Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::iter(batches)));
+        let (producer, mut rx) = spawn_test_producer(output, 8);
+
+        producer.await.expect("producer should finish at query EOF");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        for expected in [b"a\n".as_slice(), b"b\n".as_slice()] {
+            let Some(Ok(SelectObjectContentEvent::Records(records))) = rx.recv().await else {
+                panic!("producer should emit a records event for each batch");
+            };
+            assert_eq!(records.payload.as_deref(), Some(expected));
+        }
+        let Some(Ok(SelectObjectContentEvent::Stats(stats))) = rx.recv().await else {
+            panic!("producer should emit final stats");
+        };
+        assert_eq!(stats.details.and_then(|details| details.bytes_returned), Some(4));
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::End(_)))));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_at_deadline_uses_reserved_slot_for_stats_then_end() {
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::unfold((), |_| async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                None::<(Result<RecordBatch, DataFusionError>, ())>
+            }),
+        ));
+        let (producer, mut rx) = spawn_test_producer(output, 3);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        producer.await.expect("producer should finish at the shared deadline");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let stats = rx
+            .recv()
+            .await
+            .expect("successful Select should send stats")
+            .expect("stats event should not be an error");
+        assert!(matches!(stats, SelectObjectContentEvent::Stats(_)));
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::End(_)))));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_error_at_deadline_uses_reserved_terminal_slot() {
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Err(DataFusionError::External(Box::new(S3SelectPolicyError::QueryConcurrencyLimit)))
+            }),
+        ));
+        let (producer, mut rx) = spawn_test_producer(output, 2);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        producer.await.expect("producer should finish at the shared deadline");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let stream_error = rx
+            .recv()
+            .await
+            .expect("stream failure should send one terminal error")
+            .expect_err("terminal event should be an error");
+        assert_eq!(stream_error.code(), &S3ErrorCode::SlowDown);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn encoder_error_uses_reserved_terminal_slot() {
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([Some([Some(1)])]);
+        let schema = Arc::new(Schema::new(vec![Field::new("items", values.data_type().clone(), false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).expect("test batch should be valid");
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok::<_, DataFusionError>(batch) }),
+        ));
+        let (producer, mut rx) = spawn_test_producer(output, 2);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        producer.await.expect("producer should not block on a terminal encoder error");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let encoder_error = rx
+            .recv()
+            .await
+            .expect("encoder failure should send one terminal error")
+            .expect_err("terminal event should be an error");
+        assert_eq!(encoder_error.code(), &S3ErrorCode::InternalError);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn producer_drops_query_stream_when_receiver_closes() {
+        let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::once(async move {
+                let _stream_dropped = stream_dropped_tx;
+                futures::future::pending::<Result<RecordBatch, DataFusionError>>().await
+            }),
+        ));
+        let (tx, mut rx) = mpsc::channel(2);
+        let producer = send_select_events(output, &tx, csv_validation());
+        tokio::pin!(producer);
+
+        assert!(futures::poll!(producer.as_mut()).is_pending());
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        drop(rx);
+
+        assert!(
+            futures::poll!(producer.as_mut()).is_ready(),
+            "producer should observe the closed receiver"
+        );
+        assert!(
+            stream_dropped_rx.await.is_err(),
+            "query stream should be dropped when the receiver closes"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn producer_prefers_closed_receiver_over_ready_query_stream() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stream_polled_tx, stream_polled_rx) = tokio::sync::oneshot::channel::<()>();
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::once(async move {
+                ready_rx.await.expect("test should release the query stream");
+                let _ = stream_polled_tx.send(());
+                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+            }),
+        ));
+        let (tx, mut rx) = mpsc::channel(2);
+        let producer = send_select_events(output, &tx, csv_validation());
+        tokio::pin!(producer);
+
+        assert!(futures::poll!(producer.as_mut()).is_pending());
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        drop(rx);
+        ready_tx.send(()).expect("test should make the query stream ready");
+
+        assert!(
+            futures::poll!(producer.as_mut()).is_ready(),
+            "producer should prioritize the closed receiver"
+        );
+        assert!(
+            stream_polled_rx.await.is_err(),
+            "closed receiver should win before the ready query stream is consumed"
+        );
     }
 
     #[test]
@@ -846,6 +1075,120 @@ mod tests {
                 .map(|value| value.as_str()),
             Some(CompressionType::NONE)
         );
+    }
+
+    #[test]
+    fn validate_accepts_two_byte_csv_input_record_delimiter() {
+        let mut input = base_input();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("base input should use CSV")
+            .record_delimiter = Some("^Y".to_string());
+
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_supported_multibyte_csv_delimiter_pairs() {
+        let mut input = base_input();
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("base input should use CSV");
+        csv.field_delimiter = Some("\r\n".to_string());
+        csv.record_delimiter = Some("^Y".to_string());
+
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("input should still use CSV");
+        csv.field_delimiter = Some("\nX".to_string());
+        csv.record_delimiter = None;
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+
+        let csv = input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("input should still use CSV");
+        csv.field_delimiter = Some("aa".to_string());
+        csv.record_delimiter = Some("a".to_string());
+        assert!(validate_select_request(&HeaderMap::new(), &mut input).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_csv_input_record_delimiter_outside_one_to_two_bytes() {
+        for delimiter in ["", "^YZ"] {
+            let mut input = base_input();
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("base input should use CSV")
+                .record_delimiter = Some(delimiter.to_string());
+
+            let err = validate_select_request(&HeaderMap::new(), &mut input)
+                .expect_err("record delimiter outside the supported length must be rejected");
+
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_overlapping_csv_input_delimiters() {
+        for (field_delimiter, record_delimiter) in [
+            (Some("^"), Some("^")),
+            (Some("\r"), Some("\r\n")),
+            (Some("a"), Some("aa")),
+            (None, Some(",")),
+            (Some("\n"), None),
+            (Some("||"), Some(",")),
+            (Some("\n"), Some("^Y")),
+            (Some("\r"), Some("^Y")),
+        ] {
+            let mut input = base_input();
+            let csv = input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("base input should use CSV");
+            csv.field_delimiter = field_delimiter.map(str::to_string);
+            csv.record_delimiter = record_delimiter.map(str::to_string);
+
+            let err = validate_select_request(&HeaderMap::new(), &mut input)
+                .expect_err("overlapping field and record delimiters must be rejected");
+
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
+        }
+    }
+
+    #[test]
+    fn validate_keeps_csv_output_record_delimiter_restriction() {
+        let mut input = base_input();
+        input
+            .request
+            .output_serialization
+            .csv
+            .as_mut()
+            .expect("base output should use CSV")
+            .record_delimiter = Some("^Y".to_string());
+
+        let err =
+            validate_select_request(&HeaderMap::new(), &mut input).expect_err("multi-byte output delimiter must remain rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
     }
 
     #[test]

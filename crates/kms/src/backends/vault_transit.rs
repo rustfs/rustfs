@@ -18,7 +18,10 @@ use crate::backends::vault_credentials::{
     CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
     token_source_for,
 };
-use crate::backends::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_state_permits};
+use crate::backends::{
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, empty_key_page, ensure_key_state_permits,
+    ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
+};
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
@@ -27,24 +30,73 @@ use crate::types::*;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jiff::Zoned;
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use vaultrs::{
+    api::kv2::requests::SetSecretRequestOptions,
     api::transit::{
         KeyType,
         requests::{
             CreateKeyRequestBuilder, DecryptDataRequestBuilder, EncryptDataRequestBuilder, UpdateKeyConfigurationRequestBuilder,
         },
+        responses::ReadKeyData,
     },
+    error::ClientError,
     kv2,
     transit::{data, key},
 };
+
+/// Attempt budget for metadata read-modify-write cycles: every check-and-set
+/// conflict triggers a fresh read plus state-gate re-validation, never a blind
+/// replay of the stale snapshot.
+const METADATA_CAS_ATTEMPTS: usize = 3;
+
+/// TTL bound on cached metadata records. This caps how long one node can keep
+/// acting on lifecycle state another node has since changed (disable,
+/// schedule-deletion): the divergence window is one TTL instead of "until
+/// process restart".
+///
+/// Deliberately fixed rather than derived from `CacheConfig`: this cache gates
+/// cryptographic operations through `ensure_key_state_allows`, so its staleness
+/// window must not follow a knob an operator turns to tune the manager-level
+/// describe cache. It happens to equal `config::DEFAULT_CACHE_TTL` today, but
+/// that is a coincidence rather than a contract, and binding the two would let
+/// a later change to the operator-facing default silently widen this window.
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Capacity bound on the metadata cache so an unbounded key namespace cannot
+/// grow process memory without limit.
+const METADATA_CACHE_CAPACITY: u64 = 1024;
+
+/// Read the key version out of a Transit ciphertext's `vault:vN:` prefix.
+///
+/// Transit ciphertext self-describes the version that wrapped it, which is why
+/// [`DataKeyEnvelope::master_key_version`] stays `None` on this backend. The
+/// prefix is therefore the only place a rewrap can learn whether it changed
+/// anything. `None` means the ciphertext is not in a shape this backend
+/// produced, and callers must treat the version as unknown rather than assume
+/// one.
+fn transit_ciphertext_version(ciphertext: &str) -> Option<u32> {
+    let (version, _) = ciphertext.strip_prefix("vault:v")?.split_once(':')?;
+    version.parse().ok()
+}
+
+/// Whether a KV2 write failed its check-and-set precondition.
+///
+/// Mirrors the helper of the same name in `vault.rs`; the two backends keep
+/// separate copies because they share no private module.
+fn is_cas_conflict(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::APIError { code: 400, errors } if errors.iter().any(|message| message.contains("check-and-set"))
+    )
+}
 
 #[derive(Debug, Clone)]
 struct TransitKeyMetadata {
@@ -88,12 +140,16 @@ impl TransitKeyMetadata {
         }
     }
 
-    // KNOWN RISK (rustfs/backlog#1571, residual of rustfs/backlog#808): this
-    // fallback defaults to Enabled, so a key whose KV metadata read fails is
-    // treated as usable — a disabled or pending-deletion key can transiently
-    // "revive" on that path. State gates therefore only hold as strongly as
-    // metadata reads do. Changing the fallback is out of scope here; the
-    // synthesized_metadata_defaults_to_enabled test pins the current behavior.
+    // Fallback record for transit keys created before metadata persistence
+    // existed (rustfs#4256 / rustfs#4262): those keys have no KV record at
+    // all, and failing closed on the missing record would brick every one of
+    // them, so the record defaults to Enabled to match their pre-persistence
+    // behavior. The historical fail-open around it (rustfs/backlog#808,
+    // rustfs/backlog#1571: any metadata read failure yielded a usable Enabled
+    // key) is resolved for rustfs/backlog#1581: `get_key_metadata` only serves
+    // this record after durably persisting it with a create-only
+    // check-and-set, and any read or persist failure on that path fails
+    // closed.
     fn synthesized() -> Self {
         Self {
             key_usage: KeyUsage::EncryptDecrypt,
@@ -148,7 +204,10 @@ pub struct VaultTransitKmsClient {
     metadata_kv_mount: String,
     /// Path prefix under metadata_kv_mount for storing transit key metadata records
     metadata_key_prefix: String,
-    metadata_cache: RwLock<HashMap<String, TransitKeyMetadata>>,
+    /// Process-local metadata cache, TTL- and capacity-bounded (see
+    /// [`METADATA_CACHE_TTL`]): a lifecycle change made by another node
+    /// becomes visible here within one TTL window at the latest.
+    metadata_cache: Cache<String, TransitKeyMetadata>,
     /// Budgets wrapping every outbound Vault call (see `crate::policy`).
     retry: RetryPolicy,
     /// Cancellation point for the operation executor: aborts in-flight
@@ -171,16 +230,27 @@ impl VaultTransitKmsClient {
             attempt_timeout: kms_config.effective_timeout(),
         };
         let source = token_source_for(&config.auth_method, &settings)?;
-        let policy = VaultCredentialPolicy::from_kms_config(kms_config, &config.auth_method);
+        let policy = VaultCredentialPolicy::from_kms_config(
+            kms_config,
+            &config.auth_method,
+            "vault-transit",
+            &config.address,
+            config.namespace.as_deref(),
+        );
         let credentials = Arc::new(VaultCredentialProvider::new(settings, source, policy).await?);
+        let retry =
+            RetryPolicy::for_backend(kms_config, "vault-transit", &config.address, config.namespace.as_deref(), "operations");
 
         Ok(Self {
             credentials,
             metadata_kv_mount: config.metadata_kv_mount.clone(),
             metadata_key_prefix: config.metadata_key_prefix.clone(),
             config,
-            metadata_cache: RwLock::new(HashMap::new()),
-            retry: RetryPolicy::from_config(kms_config),
+            metadata_cache: Cache::builder()
+                .max_capacity(METADATA_CACHE_CAPACITY)
+                .time_to_live(METADATA_CACHE_TTL)
+                .build(),
+            retry,
             cancel: CancellationToken::new(),
         })
     }
@@ -276,11 +346,7 @@ impl VaultTransitKmsClient {
                 }
                 data::encrypt(&vault.client, &self.config.mount_path, key_id, plaintext_b64, Some(&mut builder))
                     .await
-                    .map_err(|e| {
-                        AttemptError::from_vaultrs(e, |e| {
-                            KmsError::backend_error(format!("Failed to encrypt data with Vault Transit key {key_id}: {e}"))
-                        })
-                    })
+                    .map_err(|e| AttemptError::from_vaultrs(e, |e| Self::map_vault_error(key_id, e, "encrypt")))
             })
             .await?;
 
@@ -305,17 +371,54 @@ impl VaultTransitKmsClient {
                 }
                 data::decrypt(&vault.client, &self.config.mount_path, key_id, ciphertext, Some(&mut builder))
                     .await
-                    .map_err(|e| {
-                        AttemptError::from_vaultrs(e, |e| {
-                            KmsError::backend_error(format!("Failed to decrypt data with Vault Transit key {key_id}: {e}"))
-                        })
-                    })
+                    .map_err(|e| AttemptError::from_vaultrs(e, |e| Self::map_vault_error(key_id, e, "decrypt")))
             })
             .await?;
 
         BASE64
             .decode(response.plaintext)
             .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))
+    }
+
+    /// Re-encrypt a Transit ciphertext under the key's latest version without
+    /// the plaintext ever leaving Vault.
+    ///
+    /// Classified as an idempotent read because it is one: Vault mutates
+    /// nothing, and a replayed attempt only produces another ciphertext of the
+    /// same data key under the same version.
+    async fn transit_rewrap(&self, key_id: &str, ciphertext: &str) -> Result<String> {
+        let response = self
+            .run("vault_transit_rewrap", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                data::rewrap(&vault.client, &self.config.mount_path, key_id, ciphertext, None)
+                    .await
+                    .map_err(|e| AttemptError::from_vaultrs(e, |e| Self::map_vault_error(key_id, e, "rewrap")))
+            })
+            .await?;
+
+        Ok(response.ciphertext)
+    }
+
+    /// Vault's own newest version of a transit key.
+    ///
+    /// `transit/keys/:name` reports retained versions as a version-number to
+    /// creation-time map rather than as a single "latest" field, so the newest
+    /// version is the largest entry in it.
+    ///
+    /// Read from Vault rather than taken from the RustFS metadata record's
+    /// `current_version` counter: that counter only advances when a rotation
+    /// goes through this process, while `transit/rewrap` always targets Vault's
+    /// notion of latest. The scan that decides whether a rewrap is still needed
+    /// and the rewrap that acts on it must answer to the same authority, or an
+    /// operator-side `vault write -f transit/keys/x/rotate` would leave the two
+    /// permanently disagreeing.
+    async fn latest_transit_key_version(&self, key_id: &str) -> Result<Option<u32>> {
+        let response = self.read_transit_key(key_id).await?;
+        let latest = match &response.keys {
+            ReadKeyData::Symmetric(versions) => versions.keys().filter_map(|version| version.parse::<u32>().ok()).max(),
+            ReadKeyData::Asymmetric(versions) => versions.keys().filter_map(|version| version.parse::<u32>().ok()).max(),
+        };
+        Ok(latest)
     }
 
     fn metadata_key_path(&self, key_id: &str) -> String {
@@ -339,26 +442,85 @@ impl VaultTransitKmsClient {
         .await
     }
 
-    async fn write_metadata_to_kv(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<()> {
+    /// Read the persisted metadata record together with the KV2 secret version
+    /// holding it, so a later write can be check-and-set against exactly this
+    /// snapshot. `None` means no record exists (a pre-persistence key).
+    async fn read_metadata_from_kv_versioned(&self, key_id: &str) -> Result<Option<(u32, TransitKeyMetadata)>> {
+        let path = self.metadata_key_path(key_id);
+        let path = path.as_str();
+
+        let kv_metadata = self
+            .run("vault_transit_read_metadata_version", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::read_metadata(&vault.client, &self.metadata_kv_mount, path).await {
+                    Ok(metadata) => Ok(Some(metadata)),
+                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to read transit key metadata version from Vault KV: {e}"))
+                    })),
+                }
+            })
+            .await?;
+        let Some(kv_metadata) = kv_metadata else {
+            return Ok(None);
+        };
+        let cas = u32::try_from(kv_metadata.current_version)
+            .map_err(|_| KmsError::backend_error(format!("KV2 secret version for transit key {key_id} metadata exceeds u32")))?;
+
+        // Read the exact secret version named by the metadata so the
+        // (cas, record) pair stays consistent even if another writer lands in
+        // between the two reads.
+        let secret_version = kv_metadata.current_version;
+        let record: Option<TransitKeyMetadataPersisted> = self
+            .run("vault_transit_read_metadata_at_version", OpClass::ReadIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::read_version(&vault.client, &self.metadata_kv_mount, path, secret_version).await {
+                    Ok(persisted) => Ok(Some(persisted)),
+                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to read transit key metadata from Vault KV: {e}"))
+                    })),
+                }
+            })
+            .await?;
+
+        Ok(record.map(|persisted| (cas, persisted.into())))
+    }
+
+    /// Check-and-set write of the metadata record.
+    ///
+    /// `cas` must match the KV2 secret version currently holding the record
+    /// (0 = create-only). Returns `Ok(false)` when the precondition failed — a
+    /// concurrent writer landed first — so the caller re-reads instead of
+    /// clobbering. Single attempt: replaying a lost-response write would
+    /// double-apply the mutation, and a CAS conflict is a normal concurrency
+    /// signal, not a backend failure.
+    async fn cas_write_metadata_to_kv(&self, key_id: &str, metadata: &TransitKeyMetadata, cas: u32) -> Result<bool> {
         let path = self.metadata_key_path(key_id);
         let path = path.as_str();
         let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
         let persisted = &persisted;
-        // Single attempt: this is a whole-record overwrite without a CAS
-        // precondition, so a replay after a lost response could clobber a
-        // concurrent writer.
-        self.run("vault_transit_write_metadata", OpClass::MutatingNonIdempotent, move || async move {
+        self.run("vault_transit_cas_write_metadata", OpClass::MutatingNonIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
-            kv2::set(&vault.client, &self.metadata_kv_mount, path, persisted)
+            match kv2::set_with_options(&vault.client, &self.metadata_kv_mount, path, persisted, SetSecretRequestOptions { cas })
                 .await
-                .map(|_| ())
-                .map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| {
-                        KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}"))
-                    })
-                })
+            {
+                Ok(_) => Ok(true),
+                Err(e) if is_cas_conflict(&e) => Ok(false),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}"))
+                })),
+            }
         })
         .await
+    }
+
+    /// The error surfaced when a metadata read-modify-write exhausts its
+    /// [`METADATA_CAS_ATTEMPTS`] budget without winning a check-and-set write.
+    fn metadata_cas_conflict(key_id: &str) -> KmsError {
+        KmsError::invalid_operation(format!(
+            "Concurrent modification of transit key {key_id} metadata detected; retry the operation"
+        ))
     }
 
     async fn delete_metadata_from_kv(&self, key_id: &str) -> Result<()> {
@@ -414,45 +576,103 @@ impl VaultTransitKmsClient {
     }
 
     async fn get_key_metadata(&self, key_id: &str) -> Result<TransitKeyMetadata> {
-        // Check in-memory cache first.
-        if let Some(metadata) = self.metadata_cache.read().await.get(key_id).cloned() {
+        // Check in-memory cache first (TTL-bounded, so a stale entry can only
+        // survive one TTL window).
+        if let Some(metadata) = self.metadata_cache.get(key_id).await {
             return Ok(metadata);
         }
 
-        // On cache miss, try reading from the persistent KV store.
-        if let Some(persisted) = self.read_metadata_from_kv(key_id).await? {
-            self.metadata_cache
-                .write()
-                .await
-                .insert(key_id.to_string(), persisted.clone());
-            return Ok(persisted);
-        }
+        for _ in 0..METADATA_CAS_ATTEMPTS {
+            // On cache miss, try reading from the persistent KV store.
+            if let Some(persisted) = self.read_metadata_from_kv(key_id).await? {
+                self.metadata_cache.insert(key_id.to_string(), persisted.clone()).await;
+                return Ok(persisted);
+            }
 
-        // Deliberate exemption from the "read paths never write" rule (rustfs#4256 /
-        // rustfs#4262): transit keys created before metadata persistence existed have no
-        // KV record at all, so failing closed here would brick every pre-existing transit
-        // key. The synthesised record only describes metadata — key material lives solely
-        // inside Vault's transit engine and is never generated or written by this path.
-        //
-        // Verify the transit key actually exists in Vault before synthesising.
-        self.read_transit_key(key_id).await?;
-        let metadata = TransitKeyMetadata::synthesized();
-        // Persist the synthesised metadata so future cache misses pick it up (best
-        // effort: the KV write failing must not fail the read).
-        let _ = self.write_metadata_to_kv(key_id, &metadata).await;
-        self.metadata_cache.write().await.insert(key_id.to_string(), metadata.clone());
-        Ok(metadata)
+            // Deliberate exemption from the "read paths never write" rule (rustfs#4256 /
+            // rustfs#4262): transit keys created before metadata persistence existed have no
+            // KV record at all, so failing closed here would brick every pre-existing transit
+            // key. The synthesised record only describes metadata — key material lives solely
+            // inside Vault's transit engine and is never generated or written by this path.
+            //
+            // Verify the transit key actually exists in Vault before synthesising.
+            self.read_transit_key(key_id).await?;
+            let metadata = TransitKeyMetadata::synthesized();
+            // Fail closed on the persist (rustfs/backlog#1581): the synthesised record is
+            // only served once it is durable, so every node gates on the same stored
+            // state; a failed KV write must fail the read instead of minting a usable
+            // Enabled record out of thin air. The create-only check-and-set keeps two
+            // nodes from fabricating divergent records — losing that race loops back to
+            // re-read the winner's record.
+            if self.cas_write_metadata_to_kv(key_id, &metadata, 0).await? {
+                self.metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
+                return Ok(metadata);
+            }
+        }
+        Err(Self::metadata_cas_conflict(key_id))
     }
 
-    async fn store_key_metadata(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<()> {
-        self.write_metadata_to_kv(key_id, metadata).await?;
-        self.metadata_cache.write().await.insert(key_id.to_string(), metadata.clone());
-        Ok(())
+    /// Create-only write of the metadata record (check-and-set of 0).
+    ///
+    /// Returns `Ok(false)` when a record already exists — a concurrent creator
+    /// won the race — and never overwrites it; the caller reconciles by
+    /// reading the stored record back.
+    async fn create_key_metadata(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<bool> {
+        if self.cas_write_metadata_to_kv(key_id, metadata, 0).await? {
+            self.metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Read-modify-write of the persisted metadata record under KV2
+    /// check-and-set.
+    ///
+    /// Every attempt re-reads the authoritative record, re-runs `apply` —
+    /// which owns state-gate validation — against that fresh snapshot, and
+    /// writes back with the snapshot's KV2 secret version as the check-and-set
+    /// precondition, so a concurrent writer is never clobbered blind. Losing
+    /// the race drops the (now stale) cache entry and retries with a fresh
+    /// read; exhausting the budget surfaces the conflict to the caller.
+    async fn mutate_key_metadata<F>(&self, key_id: &str, mut apply: F) -> Result<TransitKeyMetadata>
+    where
+        F: FnMut(&mut TransitKeyMetadata) -> Result<()>,
+    {
+        for _ in 0..METADATA_CAS_ATTEMPTS {
+            let (cas, mut metadata) = match self.read_metadata_from_kv_versioned(key_id).await? {
+                Some(snapshot) => snapshot,
+                None => {
+                    // Pre-persistence key without a KV record (see
+                    // get_key_metadata): mutate the synthesised record and
+                    // create it with a create-only check-and-set so two nodes
+                    // cannot fabricate divergent records.
+                    self.read_transit_key(key_id).await?;
+                    (0, TransitKeyMetadata::synthesized())
+                }
+            };
+            apply(&mut metadata)?;
+            if self.cas_write_metadata_to_kv(key_id, &metadata, cas).await? {
+                self.metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
+                return Ok(metadata);
+            }
+            self.metadata_cache.invalidate(key_id).await;
+        }
+        Err(Self::metadata_cas_conflict(key_id))
+    }
+
+    /// Drop the cached metadata record when a transit data-path call failed in
+    /// a way that signals the cached lifecycle state diverged from Vault (the
+    /// key is gone server-side), so the next state gate re-reads the
+    /// authoritative record instead of trusting the stale entry until its TTL.
+    async fn invalidate_metadata_on_state_error(&self, key_id: &str, error: &KmsError) {
+        if matches!(error, KmsError::KeyNotFound { .. }) {
+            self.metadata_cache.invalidate(key_id).await;
+        }
     }
 
     async fn delete_key_metadata(&self, key_id: &str) -> Result<()> {
         self.delete_metadata_from_kv(key_id).await?;
-        self.metadata_cache.write().await.remove(key_id);
+        self.metadata_cache.invalidate(key_id).await;
         Ok(())
     }
 
@@ -514,9 +734,16 @@ impl VaultTransitKmsClient {
             .await?;
 
         let plaintext_key = generate_key_material(&request.key_spec)?;
-        let encrypted_key = self
+        let encrypted_key = match self
             .transit_encrypt(&request.master_key_id, &plaintext_key, &request.encryption_context)
-            .await?;
+            .await
+        {
+            Ok(encrypted_key) => encrypted_key,
+            Err(error) => {
+                self.invalidate_metadata_on_state_error(&request.master_key_id, &error).await;
+                return Err(error);
+            }
+        };
 
         let envelope = DataKeyEnvelope {
             key_id: uuid::Uuid::new_v4().to_string(),
@@ -545,12 +772,36 @@ impl VaultTransitKmsClient {
         let metadata = self
             .ensure_key_state_allows(&request.key_id, StateGatedOperation::Encrypt)
             .await?;
-        let ciphertext = self
+        let encrypted = match self
             .transit_encrypt(&request.key_id, &request.plaintext, &request.encryption_context)
-            .await?;
+            .await
+        {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => {
+                self.invalidate_metadata_on_state_error(&request.key_id, &error).await;
+                return Err(error);
+            }
+        };
+
+        // The ciphertext must be the same envelope `decrypt` parses — it is what
+        // carries the key id and the bound context. Returning the bare Transit
+        // string made every `encrypt` result permanently unopenable.
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: request.key_id.clone(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: encrypted.into_bytes(),
+            nonce: Vec::new(),
+            encryption_context: request.encryption_context.clone(),
+            created_at: Zoned::now(),
+            // Transit ciphertext already self-describes its key version
+            // ("vault:vN:..."), so the envelope never carries one.
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&envelope)?;
 
         Ok(EncryptResponse {
-            ciphertext: ciphertext.into_bytes(),
+            ciphertext,
             key_id: request.key_id.clone(),
             key_version: metadata.current_version,
             algorithm: "vault-transit".to_string(),
@@ -575,8 +826,135 @@ impl VaultTransitKmsClient {
 
         let encrypted_key = std::str::from_utf8(&envelope.encrypted_key)
             .map_err(|e| KmsError::cryptographic_error("utf8", format!("Invalid Transit ciphertext: {e}")))?;
-        self.transit_decrypt(&envelope.master_key_id, encrypted_key, &envelope.encryption_context)
+        match self
+            .transit_decrypt(&envelope.master_key_id, encrypted_key, &envelope.encryption_context)
             .await
+        {
+            Ok(plaintext) => Ok(plaintext),
+            Err(error) => {
+                self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Report which transit key version wraps an envelope, and whether that is
+    /// the key's latest version.
+    ///
+    /// Reads only key metadata, never the ciphertext's contents, so it answers
+    /// for AAD-bound envelopes that [`Self::rewrap_data_key`] has to refuse — an
+    /// inventory must be able to count exactly the envelopes that are stuck.
+    pub(crate) async fn describe_data_key_wrapping(
+        &self,
+        request: &DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+        ensure_rewrap_context_matches(&envelope.encryption_context, &request.encryption_context)?;
+
+        let source_ciphertext = std::str::from_utf8(&envelope.encrypted_key)
+            .map_err(|e| KmsError::cryptographic_error("utf8", format!("Invalid Transit ciphertext: {e}")))?;
+        let key_version = transit_ciphertext_version(source_ciphertext);
+        let current_key_version = self.latest_transit_key_version(&envelope.master_key_id).await?;
+
+        Ok(DescribeDataKeyWrappingResponse {
+            key_id: envelope.master_key_id,
+            key_version,
+            current_key_version,
+            // An unreadable prefix on either side means the version is unknown,
+            // and unknown must never read as "already current" — that is the
+            // answer that lets an operator destroy a version still in use.
+            is_current: key_version.is_some() && key_version == current_key_version,
+        })
+    }
+
+    /// Re-wrap an existing envelope onto the transit key's latest version using
+    /// Vault's native rewrap endpoint.
+    ///
+    /// The data key is never decrypted into this process: Vault re-encrypts the
+    /// ciphertext internally and hands back only the new ciphertext, so no
+    /// `transit/decrypt` is issued and no plaintext data key exists here to
+    /// leak, log or persist.
+    ///
+    /// # Envelopes bound to an encryption context cannot be rewrapped
+    ///
+    /// This backend binds the encryption context into the wrapping as AEAD
+    /// associated data ([`Self::transit_encrypt`]), and Vault's `transit/rewrap`
+    /// endpoint accepts no `associated_data` parameter — the only way to move
+    /// such a ciphertext onto a newer version is `transit/decrypt` followed by
+    /// `transit/encrypt`, which materializes the plaintext data key inside
+    /// RustFS. That trade is refused here rather than made silently: it would
+    /// hand back a valid envelope while dropping the very property that makes a
+    /// backend-side rewrap worth having. Every object-level envelope carries a
+    /// bucket/object context, so in practice this rejects them all until the
+    /// context binding or the endpoint changes.
+    ///
+    /// The context guard still runs first, so a caller that cannot reproduce the
+    /// envelope's context is told that rather than being told about the AAD
+    /// limitation of an envelope it has no claim on.
+    pub(crate) async fn rewrap_data_key(&self, request: &RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+        ensure_rewrap_context_matches(&envelope.encryption_context, &request.encryption_context)?;
+        self.ensure_key_state_allows(&envelope.master_key_id, StateGatedOperation::Encrypt)
+            .await?;
+
+        if !envelope.encryption_context.is_empty() {
+            return Err(KmsError::rewrap_would_expose_plaintext(
+                &envelope.master_key_id,
+                "the envelope binds its encryption context as AEAD associated data, which Vault Transit's rewrap endpoint \
+                 cannot carry; rewrapping it would require decrypting the data key inside RustFS",
+            ));
+        }
+
+        let source_ciphertext = std::str::from_utf8(&envelope.encrypted_key)
+            .map_err(|e| KmsError::cryptographic_error("utf8", format!("Invalid Transit ciphertext: {e}")))?;
+        let source_key_version = transit_ciphertext_version(source_ciphertext);
+
+        let rewrapped_ciphertext = match self.transit_rewrap(&envelope.master_key_id, source_ciphertext).await {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => {
+                self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                return Err(error);
+            }
+        };
+        let destination_key_version = transit_ciphertext_version(&rewrapped_ciphertext);
+
+        // Vault re-encrypts unconditionally, so an already-current ciphertext
+        // comes back changed but no newer. Report that as "nothing to persist"
+        // and hand the input back untouched, or a repeated sweep would rewrite
+        // every object's metadata on every pass forever.
+        if source_key_version.is_some() && source_key_version == destination_key_version {
+            return Ok(RewrapDataKeyResponse {
+                ciphertext: request.ciphertext.clone(),
+                key_id: envelope.master_key_id,
+                source_key_version,
+                destination_key_version,
+                rewrapped: false,
+            });
+        }
+
+        let rewrapped_envelope = DataKeyEnvelope {
+            key_id: envelope.key_id,
+            master_key_id: envelope.master_key_id,
+            key_spec: envelope.key_spec,
+            encrypted_key: rewrapped_ciphertext.into_bytes(),
+            nonce: envelope.nonce,
+            encryption_context: envelope.encryption_context,
+            created_at: envelope.created_at,
+            // Transit ciphertext still self-describes its version, so the
+            // envelope field stays absent exactly as generate_data_key leaves it.
+            master_key_version: None,
+        };
+        let ciphertext = serde_json::to_vec(&rewrapped_envelope)?;
+
+        Ok(RewrapDataKeyResponse {
+            ciphertext,
+            key_id: rewrapped_envelope.master_key_id,
+            source_key_version,
+            destination_key_version,
+            rewrapped: true,
+        })
     }
 
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
@@ -598,59 +976,68 @@ impl VaultTransitKmsClient {
         // this create would have produced; report it as the create result.
         // Anything else keeps failing. A failed pre-check read must fail the
         // create rather than fall through to re-creating over an unknown key.
-        match self.read_transit_key(key_id).await {
-            Ok(_) => {
-                let existing = self.get_key_metadata(key_id).await?;
-                return if existing.key_state == KeyState::Enabled && existing.key_usage == KeyUsage::EncryptDecrypt {
-                    info!(
-                        key_id,
-                        "Vault Transit create found an identical enabled key; treating it as a recovered create"
-                    );
-                    Ok(MasterKeyInfo {
-                        key_id: key_id.to_string(),
-                        version: existing.current_version,
-                        algorithm: algorithm.to_string(),
-                        usage: existing.key_usage,
-                        status: KeyStatus::Active,
-                        description: existing.description,
-                        metadata: existing.tags.clone(),
-                        created_at: existing.created_at,
-                        rotated_at: None,
-                        created_by: existing.created_by,
-                        deletion_date: None,
-                    })
-                } else {
-                    Err(KmsError::key_already_exists(key_id))
-                };
+        //
+        // Two passes: losing the create-only metadata check-and-set race loops
+        // back here so the pre-check read-confirms the winning record.
+        for _ in 0..2 {
+            match self.read_transit_key(key_id).await {
+                Ok(_) => {
+                    let existing = self.get_key_metadata(key_id).await?;
+                    return if existing.key_state == KeyState::Enabled && existing.key_usage == KeyUsage::EncryptDecrypt {
+                        info!(
+                            key_id,
+                            "Vault Transit create found an identical enabled key; treating it as a recovered create"
+                        );
+                        Ok(MasterKeyInfo {
+                            key_id: key_id.to_string(),
+                            version: existing.current_version,
+                            algorithm: algorithm.to_string(),
+                            usage: existing.key_usage,
+                            status: KeyStatus::Active,
+                            description: existing.description,
+                            metadata: existing.tags.clone(),
+                            created_at: existing.created_at,
+                            rotated_at: None,
+                            created_by: existing.created_by,
+                            deletion_date: None,
+                        })
+                    } else {
+                        Err(KmsError::key_already_exists(key_id))
+                    };
+                }
+                Err(KmsError::KeyNotFound { .. }) => {}
+                Err(error) => return Err(error),
             }
-            Err(KmsError::KeyNotFound { .. }) => {}
-            Err(error) => return Err(error),
+
+            self.create_transit_key(key_id).await?;
+
+            let metadata = TransitKeyMetadata {
+                created_by: Some("vault-transit".to_string()),
+                ..TransitKeyMetadata::from_create_request(&CreateKeyRequest {
+                    key_name: Some(key_id.to_string()),
+                    ..Default::default()
+                })
+            };
+            if self.create_key_metadata(key_id, &metadata).await? {
+                return Ok(MasterKeyInfo {
+                    key_id: key_id.to_string(),
+                    version: metadata.current_version,
+                    algorithm: algorithm.to_string(),
+                    usage: metadata.key_usage,
+                    status: KeyStatus::Active,
+                    description: metadata.description,
+                    metadata: metadata.tags,
+                    created_at: metadata.created_at,
+                    rotated_at: None,
+                    created_by: metadata.created_by,
+                    deletion_date: None,
+                });
+            }
+            // A concurrent creator persisted metadata first; make sure the
+            // pre-check reads their record, not a stale cache entry.
+            self.metadata_cache.invalidate(key_id).await;
         }
-
-        self.create_transit_key(key_id).await?;
-
-        let metadata = TransitKeyMetadata {
-            created_by: Some("vault-transit".to_string()),
-            ..TransitKeyMetadata::from_create_request(&CreateKeyRequest {
-                key_name: Some(key_id.to_string()),
-                ..Default::default()
-            })
-        };
-        self.store_key_metadata(key_id, &metadata).await?;
-
-        Ok(MasterKeyInfo {
-            key_id: key_id.to_string(),
-            version: metadata.current_version,
-            algorithm: algorithm.to_string(),
-            usage: metadata.key_usage,
-            status: KeyStatus::Active,
-            description: metadata.description,
-            metadata: metadata.tags,
-            created_at: metadata.created_at,
-            rotated_at: None,
-            created_by: metadata.created_by,
-            deletion_date: None,
-        })
+        Err(KmsError::key_already_exists(key_id))
     }
 
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
@@ -664,7 +1051,12 @@ impl VaultTransitKmsClient {
         request: &ListKeysRequest,
         _context: Option<&OperationContext>,
     ) -> Result<ListKeysResponse> {
-        let all_keys = self
+        // A caller asking for no keys is answered without reaching Vault.
+        if list_keys_page_size(request.limit).is_none() {
+            return Ok(empty_key_page());
+        }
+
+        let mut all_keys = self
             .run("vault_transit_list_keys", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
                 key::list(&vault.client, &self.config.mount_path).await.map_err(|e| {
@@ -673,52 +1065,92 @@ impl VaultTransitKmsClient {
             })
             .await?
             .keys;
+        // Vault's own LIST ordering is not part of its contract, so the sort is
+        // what makes the marker a stable cursor across calls.
+        all_keys.sort_unstable();
+        let page = paginate_keys(&all_keys, request, String::as_str);
 
-        let mut filtered = Vec::new();
-        for key_id in all_keys {
-            let key_info = self.key_info(&key_id).await?;
+        // Reading metadata only for the page keeps a list bounded by the
+        // requested limit instead of by the size of the transit mount.
+        let mut keys = Vec::with_capacity(page.items.len());
+        for key_id in page.items {
+            let key_info = self.key_info(key_id).await?;
             let usage_matches = request.usage_filter.as_ref().is_none_or(|usage| usage == &key_info.usage);
             let status_matches = request.status_filter.as_ref().is_none_or(|status| status == &key_info.status);
             if usage_matches && status_matches {
-                filtered.push(key_info);
+                keys.push(key_info);
             }
         }
 
-        let start_idx = request
-            .marker
-            .as_ref()
-            .and_then(|marker| filtered.iter().position(|info| &info.key_id == marker))
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let limit = request.limit.unwrap_or(100) as usize;
-        let end_idx = std::cmp::min(start_idx + limit, filtered.len());
-        let keys = filtered[start_idx..end_idx].to_vec();
-        let next_marker = if end_idx < filtered.len() {
-            Some(filtered[end_idx - 1].key_id.clone())
-        } else {
-            None
-        };
-
         Ok(ListKeysResponse {
             keys,
-            next_marker,
-            truncated: end_idx < filtered.len(),
+            next_marker: page.next_marker,
+            truncated: page.truncated,
         })
     }
 
     pub(crate) async fn enable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
         // A pending deletion must be reverted through cancel_key_deletion, not
-        // silently by enabling, so the gate rejects PendingDeletion here.
-        let mut metadata = self.ensure_key_state_allows(key_id, StateGatedOperation::Enable).await?;
-        metadata.key_state = KeyState::Enabled;
-        metadata.deletion_date = None;
-        self.store_key_metadata(key_id, &metadata).await
+        // silently by enabling, so the gate rejects PendingDeletion here. The
+        // gate runs inside the check-and-set loop against every fresh snapshot.
+        self.mutate_key_metadata(key_id, |metadata| {
+            ensure_key_state_permits(key_id, &metadata.key_state, StateGatedOperation::Enable)?;
+            metadata.key_state = KeyState::Enabled;
+            metadata.deletion_date = None;
+            Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn disable_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {
-        let mut metadata = self.ensure_key_state_allows(key_id, StateGatedOperation::Disable).await?;
-        metadata.key_state = KeyState::Disabled;
-        self.store_key_metadata(key_id, &metadata).await
+        self.mutate_key_metadata(key_id, |metadata| {
+            ensure_key_state_permits(key_id, &metadata.key_state, StateGatedOperation::Disable)?;
+            metadata.key_state = KeyState::Disabled;
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Replace the key's description; `None` clears it.
+    ///
+    /// Metadata edits carry no state gate: they neither use nor invalidate key
+    /// material, so they stay available for whatever lifecycle state the key
+    /// is in.
+    pub(crate) async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.mutate_key_metadata(key_id, |metadata| {
+            metadata.description = description.map(str::to_string);
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Add or overwrite tags, leaving every other tag untouched.
+    pub(crate) async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        ensure_tag_keys_are_mutable(tags.keys().map(String::as_str))?;
+        self.mutate_key_metadata(key_id, |metadata| {
+            metadata
+                .tags
+                .extend(tags.iter().map(|(key, value)| (key.clone(), value.clone())));
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Remove tags; tags that are not set are ignored.
+    pub(crate) async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        ensure_tag_keys_are_mutable(tag_keys.iter().map(String::as_str))?;
+        self.mutate_key_metadata(key_id, |metadata| {
+            for tag_key in tag_keys {
+                metadata.tags.remove(tag_key);
+            }
+            Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
@@ -729,12 +1161,15 @@ impl VaultTransitKmsClient {
         pending_window_days: u32,
         _context: Option<&OperationContext>,
     ) -> Result<()> {
-        let mut metadata = self
-            .ensure_key_state_allows(key_id, StateGatedOperation::ScheduleDeletion)
-            .await?;
-        metadata.key_state = KeyState::PendingDeletion;
-        metadata.deletion_date = Some(Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400));
-        self.store_key_metadata(key_id, &metadata).await
+        let deletion_date = Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400);
+        self.mutate_key_metadata(key_id, |metadata| {
+            ensure_key_state_permits(key_id, &metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
+            metadata.key_state = KeyState::PendingDeletion;
+            metadata.deletion_date = Some(deletion_date.clone());
+            Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
@@ -755,9 +1190,15 @@ impl VaultTransitKmsClient {
         })
         .await?;
 
-        let mut metadata = self.get_key_metadata(key_id).await?;
-        metadata.current_version += 1;
-        self.store_key_metadata(key_id, &metadata).await?;
+        let metadata = self
+            .mutate_key_metadata(key_id, |metadata| {
+                // The transit rotation above has already happened; recording
+                // the version bump must not be blocked by a concurrent
+                // lifecycle transition, so no state gate here.
+                metadata.current_version += 1;
+                Ok(())
+            })
+            .await?;
 
         Ok(MasterKeyInfo {
             key_id: key_id.to_string(),
@@ -788,6 +1229,15 @@ impl VaultTransitKmsClient {
     }
 }
 
+#[cfg(test)]
+impl VaultTransitKmsClient {
+    /// Rebuild the metadata cache with test-controlled bounds so TTL and
+    /// capacity behavior can be exercised without real sleeps.
+    fn rebuild_metadata_cache_for_tests(&mut self, capacity: u64, ttl: Duration) {
+        self.metadata_cache = Cache::builder().max_capacity(capacity).time_to_live(ttl).build();
+    }
+}
+
 pub struct VaultTransitKmsBackend {
     client: VaultTransitKmsClient,
 }
@@ -807,7 +1257,9 @@ impl VaultTransitKmsBackend {
                 metadata_key_prefix: vault_config.key_path_prefix.clone(),
                 tls: vault_config.tls.clone(),
             },
-            crate::config::BackendConfig::Local(_) | crate::config::BackendConfig::Static(_) => {
+            crate::config::BackendConfig::Local(_)
+            | crate::config::BackendConfig::Static(_)
+            | crate::config::BackendConfig::Aws(_) => {
                 return Err(KmsError::configuration_error("Expected Vault Transit backend configuration"));
             }
         };
@@ -835,59 +1287,68 @@ impl KmsBackend for VaultTransitKmsBackend {
         // what this request would have written, report it as the create
         // result; any divergence keeps failing so a create can never adopt or
         // reshape a key it would not have produced.
-        match self.client.read_transit_key(&key_id).await {
-            Ok(_) => {
-                let existing = self.client.get_key_metadata(&key_id).await?;
-                let requested = TransitKeyMetadata::from_create_request(&request);
-                return if existing.key_state == KeyState::Enabled
-                    && existing.key_usage == requested.key_usage
-                    && existing.description == requested.description
-                    && existing.tags == requested.tags
-                {
-                    info!(
-                        key_id,
-                        "Vault Transit create found an identical enabled key; treating it as a recovered create"
-                    );
-                    Ok(CreateKeyResponse {
-                        key_id: key_id.clone(),
-                        key_metadata: KeyMetadata {
+        //
+        // Two passes: losing the create-only metadata check-and-set race loops
+        // back here so the pre-check read-confirms the winning record.
+        for _ in 0..2 {
+            match self.client.read_transit_key(&key_id).await {
+                Ok(_) => {
+                    let existing = self.client.get_key_metadata(&key_id).await?;
+                    let requested = TransitKeyMetadata::from_create_request(&request);
+                    return if existing.key_state == KeyState::Enabled
+                        && existing.key_usage == requested.key_usage
+                        && existing.description == requested.description
+                        && existing.tags == requested.tags
+                    {
+                        info!(
                             key_id,
-                            key_state: existing.key_state,
-                            key_usage: existing.key_usage,
-                            description: existing.description,
-                            creation_date: existing.created_at,
-                            deletion_date: existing.deletion_date,
-                            origin: existing.origin,
-                            key_manager: "VAULT_TRANSIT".to_string(),
-                            tags: existing.tags,
-                        },
-                    })
-                } else {
-                    Err(KmsError::key_already_exists(&key_id))
-                };
+                            "Vault Transit create found an identical enabled key; treating it as a recovered create"
+                        );
+                        Ok(CreateKeyResponse {
+                            key_id: key_id.clone(),
+                            key_metadata: KeyMetadata {
+                                key_id,
+                                key_state: existing.key_state,
+                                key_usage: existing.key_usage,
+                                description: existing.description,
+                                creation_date: existing.created_at,
+                                deletion_date: existing.deletion_date,
+                                origin: existing.origin,
+                                key_manager: "VAULT_TRANSIT".to_string(),
+                                tags: existing.tags,
+                            },
+                        })
+                    } else {
+                        Err(KmsError::key_already_exists(&key_id))
+                    };
+                }
+                Err(KmsError::KeyNotFound { .. }) => {}
+                Err(error) => return Err(error),
             }
-            Err(KmsError::KeyNotFound { .. }) => {}
-            Err(error) => return Err(error),
+
+            self.client.create_transit_key(&key_id).await?;
+            let metadata = TransitKeyMetadata::from_create_request(&request);
+            if self.client.create_key_metadata(&key_id, &metadata).await? {
+                return Ok(CreateKeyResponse {
+                    key_id: key_id.clone(),
+                    key_metadata: KeyMetadata {
+                        key_id,
+                        key_state: metadata.key_state,
+                        key_usage: metadata.key_usage,
+                        description: metadata.description,
+                        creation_date: metadata.created_at,
+                        deletion_date: metadata.deletion_date,
+                        origin: metadata.origin,
+                        key_manager: "VAULT_TRANSIT".to_string(),
+                        tags: metadata.tags,
+                    },
+                });
+            }
+            // A concurrent creator persisted metadata first; make sure the
+            // pre-check reads their record, not a stale cache entry.
+            self.client.metadata_cache.invalidate(&key_id).await;
         }
-
-        self.client.create_transit_key(&key_id).await?;
-        let metadata = TransitKeyMetadata::from_create_request(&request);
-        self.client.store_key_metadata(&key_id, &metadata).await?;
-
-        Ok(CreateKeyResponse {
-            key_id: key_id.clone(),
-            key_metadata: KeyMetadata {
-                key_id,
-                key_state: metadata.key_state,
-                key_usage: metadata.key_usage,
-                description: metadata.description,
-                creation_date: metadata.created_at,
-                deletion_date: metadata.deletion_date,
-                origin: metadata.origin,
-                key_manager: "VAULT_TRANSIT".to_string(),
-                tags: metadata.tags,
-            },
-        })
+        Err(KmsError::key_already_exists(&key_id))
     }
 
     async fn encrypt(&self, request: EncryptRequest) -> Result<EncryptResponse> {
@@ -902,6 +1363,17 @@ impl KmsBackend for VaultTransitKmsBackend {
             key_id: envelope.master_key_id,
             encryption_algorithm: Some("vault-transit".to_string()),
         })
+    }
+
+    async fn rewrap_data_key(&self, request: RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
+        self.client.rewrap_data_key(&request).await
+    }
+
+    async fn describe_data_key_wrapping(
+        &self,
+        request: DescribeDataKeyWrappingRequest,
+    ) -> Result<DescribeDataKeyWrappingResponse> {
+        self.client.describe_data_key_wrapping(&request).await
     }
 
     async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
@@ -946,26 +1418,42 @@ impl KmsBackend for VaultTransitKmsBackend {
                 self.client.delete_key_metadata(&key_id).await?;
                 None
             } else {
-                let mut metadata = self.client.get_key_metadata(&key_id).await?;
-                metadata.key_state = KeyState::PendingDeletion;
-                metadata.deletion_date = Some(Zoned::now());
-                self.client.store_key_metadata(&key_id, &metadata).await?;
+                let now = Zoned::now();
+                self.client
+                    .mutate_key_metadata(&key_id, |metadata| {
+                        metadata.key_state = KeyState::PendingDeletion;
+                        metadata.deletion_date = Some(now.clone());
+                        Ok(())
+                    })
+                    .await?;
                 key_metadata = self.client.key_metadata_response(&key_id).await?;
                 None
             }
         } else {
             ensure_key_state_permits(&key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
-            let days = request.pending_window_in_days.unwrap_or(30);
-            if !(7..=30).contains(&days) {
-                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30"));
+            // Defensive: KmsManager::delete_key is the enforcement point for the
+            // waiting window and rejects out-of-range requests before any
+            // backend runs. This repeats the bound for callers holding a backend
+            // handle directly (tests, maintenance tasks).
+            let days = request.pending_window_in_days.unwrap_or(DEFAULT_PENDING_DELETION_WINDOW_DAYS);
+            if !(MIN_PENDING_DELETION_WINDOW_DAYS..=MAX_PENDING_DELETION_WINDOW_DAYS).contains(&days) {
+                return Err(KmsError::invalid_parameter(format!(
+                    "pending_window_in_days must be between {MIN_PENDING_DELETION_WINDOW_DAYS} and {MAX_PENDING_DELETION_WINDOW_DAYS}"
+                )));
             }
 
-            let mut metadata = self.client.get_key_metadata(&key_id).await?;
             let scheduled = Zoned::now() + Duration::from_secs(days as u64 * 86400);
-            metadata.key_state = KeyState::PendingDeletion;
-            metadata.deletion_date = Some(scheduled.clone());
-            self.client.store_key_metadata(&key_id, &metadata).await?;
+            self.client
+                .mutate_key_metadata(&key_id, |metadata| {
+                    // Re-run the gate against every fresh snapshot: the check
+                    // above used a possibly cached record.
+                    ensure_key_state_permits(&key_id, &metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
+                    metadata.key_state = KeyState::PendingDeletion;
+                    metadata.deletion_date = Some(scheduled.clone());
+                    Ok(())
+                })
+                .await?;
             key_metadata = self.client.key_metadata_response(&key_id).await?;
             Some(scheduled.to_string())
         };
@@ -978,14 +1466,20 @@ impl KmsBackend for VaultTransitKmsBackend {
     }
 
     async fn cancel_key_deletion(&self, request: CancelKeyDeletionRequest) -> Result<CancelKeyDeletionResponse> {
-        let mut metadata = self.client.get_key_metadata(&request.key_id).await?;
-        if metadata.key_state != KeyState::PendingDeletion {
-            return Err(KmsError::invalid_key_state(format!("Key {} is not pending deletion", request.key_id)));
-        }
-
-        metadata.key_state = KeyState::Enabled;
-        metadata.deletion_date = None;
-        self.client.store_key_metadata(&request.key_id, &metadata).await?;
+        let key_id = request.key_id.as_str();
+        self.client
+            .mutate_key_metadata(key_id, |metadata| {
+                // Re-checked against every fresh snapshot: a concurrent sweep
+                // that tombstoned the key must fail this cancel, not be
+                // overwritten blind.
+                if metadata.key_state != KeyState::PendingDeletion {
+                    return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
+                }
+                metadata.key_state = KeyState::Enabled;
+                metadata.deletion_date = None;
+                Ok(())
+            })
+            .await?;
 
         Ok(CancelKeyDeletionResponse {
             key_id: request.key_id.clone(),
@@ -1005,6 +1499,18 @@ impl KmsBackend for VaultTransitKmsBackend {
         self.client.rotate_key(key_id, None).await.map(|_| ())
     }
 
+    async fn update_key_description(&self, key_id: &str, description: Option<&str>) -> Result<()> {
+        self.client.update_key_description(key_id, description).await
+    }
+
+    async fn tag_key(&self, key_id: &str, tags: &HashMap<String, String>) -> Result<()> {
+        self.client.tag_key(key_id, tags).await
+    }
+
+    async fn untag_key(&self, key_id: &str, tag_keys: &[String]) -> Result<()> {
+        self.client.untag_key(key_id, tag_keys).await
+    }
+
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
     }
@@ -1012,13 +1518,19 @@ impl KmsBackend for VaultTransitKmsBackend {
     fn capabilities(&self) -> BackendCapabilities {
         // Vault Transit natively supports version-retaining rotation, keeps
         // prior versions addressable for decryption, and allows physical
-        // deletion once a key is pending deletion.
+        // deletion once a key is pending deletion. Rewrap is advertised because
+        // the endpoint exists and works; envelopes whose encryption context is
+        // bound as associated data are still refused per envelope (see
+        // `VaultTransitKmsClient::rewrap_data_key`), which is a property of the
+        // envelope rather than of the backend.
         BackendCapabilities::minimal()
             .with_rotate(true)
             .with_enable_disable(true)
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(true)
+            .with_update_key_metadata(true)
+            .with_rewrap(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
@@ -1033,27 +1545,51 @@ impl KmsBackend for VaultTransitKmsBackend {
             Err(error) => return Err(error),
         }
 
-        // A metadata read failure synthesizes an Enabled record (see
-        // TransitKeyMetadata::synthesized), which lands in StateChanged below:
-        // the worker never destroys material based on synthesized state.
-        let mut metadata = self.client.get_key_metadata(key_id).await?;
-        match metadata.key_state {
-            // Tombstone left by a crashed removal: complete it.
-            KeyState::Unavailable => {}
-            KeyState::PendingDeletion => {
-                match &metadata.deletion_date {
-                    Some(deadline) if deadline <= now => {}
-                    // Not yet due, or no persisted deadline — never auto-remove.
-                    _ => return Ok(ExpiredKeyRemoval::NotExpired),
-                }
-                // Tombstone first: an Unavailable record is rejected by every
-                // state gate, and a crashed removal can simply be re-run.
-                metadata.key_state = KeyState::Unavailable;
-                self.client.store_key_metadata(key_id, &metadata).await?;
-            }
-            KeyState::Enabled | KeyState::Disabled | KeyState::PendingImport => {
+        // Tombstone under check-and-set: every attempt re-reads the record and
+        // re-validates state and due-ness, so a cancel_key_deletion racing the
+        // sweep either lands before the tombstone (the re-read sees Enabled
+        // and the sweep backs off) or after it (the cancel's own
+        // check-and-set write fails).
+        let mut tombstoned = false;
+        for _ in 0..METADATA_CAS_ATTEMPTS {
+            let Some((cas, mut metadata)) = self.client.read_metadata_from_kv_versioned(key_id).await? else {
+                // No persisted lifecycle record (pre-persistence key): the
+                // worker never destroys material whose scheduling state was
+                // never recorded.
                 return Ok(ExpiredKeyRemoval::StateChanged);
+            };
+            match metadata.key_state {
+                // Tombstone left by a crashed removal: complete it.
+                KeyState::Unavailable => {
+                    tombstoned = true;
+                }
+                KeyState::PendingDeletion => {
+                    match &metadata.deletion_date {
+                        Some(deadline) if deadline <= now => {}
+                        // Not yet due, or no persisted deadline — never auto-remove.
+                        _ => return Ok(ExpiredKeyRemoval::NotExpired),
+                    }
+                    // Tombstone first: an Unavailable record is rejected by every
+                    // state gate, and a crashed removal can simply be re-run.
+                    metadata.key_state = KeyState::Unavailable;
+                    if self.client.cas_write_metadata_to_kv(key_id, &metadata, cas).await? {
+                        self.client.metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
+                        tombstoned = true;
+                    } else {
+                        // Lost the check-and-set race — most likely a
+                        // concurrent cancel; re-read and re-decide.
+                        self.client.metadata_cache.invalidate(key_id).await;
+                        continue;
+                    }
+                }
+                KeyState::Enabled | KeyState::Disabled | KeyState::PendingImport => {
+                    return Ok(ExpiredKeyRemoval::StateChanged);
+                }
             }
+            break;
+        }
+        if !tombstoned {
+            return Err(VaultTransitKmsClient::metadata_cas_conflict(key_id));
         }
 
         if !self.client.read_transit_key(key_id).await?.deletion_allowed {
@@ -1128,6 +1664,35 @@ mod tests {
         serde_json::to_value(&response).expect("serialize transit key read response")
     }
 
+    /// A caller asking for no keys gets an empty page, and the page arithmetic
+    /// never reaches for the element before an empty page. The scripted key
+    /// listing stays unused: a request for zero keys has nothing to ask Vault.
+    #[tokio::test]
+    async fn zero_limit_list_returns_an_empty_page_without_calling_vault() {
+        let (vault, client) =
+            scripted_client(vec![ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a", "key-b"] }))]).await;
+
+        let response = client
+            .list_keys(
+                &ListKeysRequest {
+                    limit: Some(0),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("a zero-limit list must succeed");
+
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+        assert!(
+            vault.requests().is_empty(),
+            "a request for no keys must not reach Vault: {:?}",
+            vault.requests()
+        );
+    }
+
     #[tokio::test]
     async fn wired_transit_encrypt_retries_transient_status() {
         let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
@@ -1150,7 +1715,9 @@ mod tests {
             )
             .await
             .expect("encrypt must retry past a transient 429");
-        assert_eq!(response.ciphertext, b"vault:v1:scripted".to_vec());
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("encrypt must return an envelope");
+        assert_eq!(envelope.encrypted_key, b"vault:v1:scripted".to_vec());
+        assert_eq!(envelope.master_key_id, "wired-key");
 
         let requests = vault.requests();
         assert_eq!(requests.len(), 3, "metadata read plus two encrypt attempts: {requests:?}");
@@ -1432,10 +1999,14 @@ mod tests {
         let _ = client.schedule_key_deletion(&key_id, 7, None).await;
     }
 
-    /// Pins the known-risk fallback documented on `TransitKeyMetadata::synthesized`:
-    /// when KV metadata cannot be read, the synthesized record defaults to Enabled,
-    /// which weakens every state gate on that path. If this test turns red the
-    /// fallback semantics changed on purpose — update the comment there as well.
+    /// The persistence fallback for pre-metadata keys deliberately fabricates
+    /// an Enabled record (rustfs#4256 / rustfs#4262): those keys were usable
+    /// before metadata persistence existed and must stay usable once the
+    /// record is durably persisted. The old fail-open this test used to pin —
+    /// a failed metadata read or persist still yielded a usable Enabled key —
+    /// was flipped to fail closed for rustfs/backlog#1581; that side is
+    /// covered by `wired_encrypt_fails_closed_when_the_metadata_read_fails`
+    /// and `wired_synthesized_metadata_is_not_served_when_the_persist_fails`.
     #[test]
     fn synthesized_metadata_defaults_to_enabled() {
         let metadata = TransitKeyMetadata::synthesized();
@@ -1457,15 +2028,21 @@ mod tests {
     #[tokio::test]
     async fn wired_backend_lifecycle_overrides_reach_the_client() {
         let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut disabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        disabled.key_state = KeyState::Disabled;
         let vault = ScriptedVault::serve(vec![
-            // disable: metadata cache miss reads KV, then persists Disabled.
+            // disable: versioned read (secret metadata + pinned version), then
+            // the check-and-set write persisting Disabled.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
             ScriptedResponse::ok(metadata_read_data(&metadata)),
             ScriptedResponse::ok(kv2_write_ack()),
-            // enable: the state gate hits the metadata cache, so only the
-            // persisting write goes out.
+            // enable: another versioned read against the Disabled record, then
+            // the check-and-set write persisting Enabled.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(metadata_read_data(&disabled)),
             ScriptedResponse::ok(kv2_write_ack()),
-            // rotate: the gate hits the cache again; the single rotate
-            // attempt fails and must not be retried.
+            // rotate: the state gate hits the metadata cache; the single
+            // rotate attempt fails and must not be retried.
             ScriptedResponse::error(503, "standby"),
         ])
         .await;
@@ -1493,7 +2070,757 @@ mod tests {
         assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
 
         let requests = vault.requests();
-        assert_eq!(requests.len(), 4, "gated reads, two writes and one rotate attempt: {requests:?}");
-        assert_eq!(requests[3], "POST /v1/transit/keys/wired-key/rotate", "{requests:?}");
+        assert_eq!(requests.len(), 7, "two versioned read+write cycles plus one rotate attempt: {requests:?}");
+        assert_eq!(requests[6], "POST /v1/transit/keys/wired-key/rotate", "{requests:?}");
+    }
+
+    /// KmsManager::delete_key is the enforcement point for the waiting window;
+    /// this pins the backend's defensive copy of the same bound, which is all
+    /// that stands between a direct backend caller and a one-day window.
+    #[tokio::test]
+    async fn wired_backend_delete_refuses_a_window_outside_the_supported_range() {
+        for days in [MIN_PENDING_DELETION_WINDOW_DAYS - 1, MAX_PENDING_DELETION_WINDOW_DAYS + 1] {
+            let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+            let vault = ScriptedVault::serve(vec![
+                // The state gate reads the transit key, then its metadata record.
+                ScriptedResponse::ok(transit_key_read_data("wired-key")),
+                ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ])
+            .await;
+            let config = KmsConfig::vault_transit(
+                url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+                "scripted-token".to_string(),
+            )
+            .with_insecure_development_defaults();
+            let backend = VaultTransitKmsBackend::new(config)
+                .await
+                .expect("vault transit backend should build");
+
+            let result = backend
+                .delete_key(DeleteKeyRequest {
+                    key_id: "wired-key".to_string(),
+                    pending_window_in_days: Some(days),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(KmsError::InvalidOperation { .. })),
+                "a {days}-day window must be refused, got {result:?}"
+            );
+
+            let requests = vault.requests();
+            assert!(
+                !requests.iter().any(|line| line.starts_with("POST ")),
+                "a refused window must not write anything: {requests:?}"
+            );
+        }
+    }
+
+    /// KV2 secret-metadata read payload (`kv2::read_metadata`) pinning the
+    /// current secret version used as the check-and-set base.
+    fn kv2_metadata_read_data(current_version: u64) -> serde_json::Value {
+        serde_json::json!({
+            "cas_required": false,
+            "created_time": "2026-01-01T00:00:00Z",
+            "current_version": current_version,
+            "delete_version_after": "0s",
+            "max_versions": 0,
+            "oldest_version": 0,
+            "updated_time": "2026-01-01T00:00:00Z",
+            "custom_metadata": null,
+            "versions": {},
+        })
+    }
+
+    const CAS_CONFLICT_MESSAGE: &str = "check-and-set parameter did not match the current version";
+
+    const METADATA_PATH: &str = "/v1/secret/data/rustfs/kms/transit-metadata/wired-key";
+    const METADATA_VERSION_PATH: &str = "/v1/secret/metadata/rustfs/kms/transit-metadata/wired-key";
+
+    #[tokio::test]
+    async fn wired_disable_retries_past_a_cas_conflict_with_a_fresh_read() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // The conflict must trigger a fresh versioned read, then the
+            // write is check-and-set against the new snapshot.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+
+        client
+            .disable_key("wired-key", None)
+            .await
+            .expect("a single check-and-set conflict must be absorbed by a re-read");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 6, "two read+read+write cycles: {requests:?}");
+        assert_eq!(requests[0], format!("GET {METADATA_VERSION_PATH}"));
+        assert_eq!(requests[1], format!("GET {METADATA_PATH}?version=1"));
+        assert_eq!(requests[2], format!("POST {METADATA_PATH}"));
+        assert_eq!(requests[3], format!("GET {METADATA_VERSION_PATH}"), "conflict must re-read: {requests:?}");
+        assert_eq!(requests[4], format!("GET {METADATA_PATH}?version=2"));
+        assert_eq!(requests[5], format!("POST {METADATA_PATH}"));
+    }
+
+    #[tokio::test]
+    async fn wired_disable_cas_conflict_budget_is_bounded() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut responses = Vec::new();
+        for cycle in 0..3u64 {
+            responses.push(ScriptedResponse::ok(kv2_metadata_read_data(cycle + 1)));
+            responses.push(ScriptedResponse::ok(metadata_read_data(&enabled)));
+            responses.push(ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE));
+        }
+        let (vault, client) = scripted_client(responses).await;
+
+        let error = client
+            .disable_key("wired-key", None)
+            .await
+            .expect_err("exhausting the check-and-set budget must surface the conflict");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+        assert!(
+            error.to_string().contains("Concurrent modification"),
+            "the error must name the conflict: {error}"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 9, "exactly three read+read+write cycles, no blind replays: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_cas_conflict_reread_revalidates_the_state_gate() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut pending = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        pending.key_state = KeyState::PendingDeletion;
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // The concurrent writer scheduled the key for deletion; the
+            // re-read must re-run the state gate and reject the disable.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(metadata_read_data(&pending)),
+        ])
+        .await;
+
+        let error = client
+            .disable_key("wired-key", None)
+            .await
+            .expect_err("the re-read state gate must reject a pending-deletion key");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+        assert!(error.to_string().contains("pending deletion"), "got {error}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 5, "the gate rejection must not issue another write: {requests:?}");
+        assert!(requests[4].starts_with("GET "), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_encrypt_key_not_found_invalidates_the_cached_metadata() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut disabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        disabled.key_state = KeyState::Disabled;
+        let (vault, client) = scripted_client(vec![
+            // First encrypt: gate reads Enabled and caches it, then the
+            // transit call reports the key gone server-side.
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::error(404, "encryption key not found"),
+            // Second encrypt: the state error must have dropped the cache
+            // entry, so the gate re-reads and sees the Disabled record.
+            ScriptedResponse::ok(metadata_read_data(&disabled)),
+        ])
+        .await;
+
+        let request = EncryptRequest {
+            key_id: "wired-key".to_string(),
+            plaintext: b"plaintext".to_vec(),
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+        let error = client
+            .encrypt(&request, None)
+            .await
+            .expect_err("the scripted 404 must fail the encrypt");
+        assert!(matches!(error, KmsError::KeyNotFound { .. }), "got {error:?}");
+
+        let error = client
+            .encrypt(&request, None)
+            .await
+            .expect_err("the re-read Disabled record must reject the encrypt");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the second gate must re-read instead of trusting the stale Enabled entry, \
+             and must not reach the encrypt endpoint: {requests:?}"
+        );
+        assert_eq!(requests[2], format!("GET {METADATA_PATH}"), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_metadata_cache_ttl_expiry_forces_a_fresh_read() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let mut disabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        disabled.key_state = KeyState::Disabled;
+        let (vault, mut client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Post-expiry gate read observes the disable another node
+            // persisted in the meantime.
+            ScriptedResponse::ok(metadata_read_data(&disabled)),
+        ])
+        .await;
+        // A 1ns TTL expires between any two awaits, standing in for the real
+        // 300s bound without a wall-clock sleep.
+        client.rebuild_metadata_cache_for_tests(METADATA_CACHE_CAPACITY, Duration::from_nanos(1));
+
+        let request = EncryptRequest {
+            key_id: "wired-key".to_string(),
+            plaintext: b"plaintext".to_vec(),
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+        client
+            .encrypt(&request, None)
+            .await
+            .expect("the first encrypt must pass the Enabled gate");
+
+        let error = client
+            .encrypt(&request, None)
+            .await
+            .expect_err("after TTL expiry the gate must see the remote disable");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 3, "the expired entry must force a fresh KV read: {requests:?}");
+        assert_eq!(requests[2], format!("GET {METADATA_PATH}"), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_capacity_is_bounded() {
+        let records: Vec<_> = (0..3)
+            .map(|_| {
+                ScriptedResponse::ok(metadata_read_data(&TransitKeyMetadata::from_create_request(&CreateKeyRequest::default())))
+            })
+            .collect();
+        let (_vault, mut client) = scripted_client(records).await;
+        client.rebuild_metadata_cache_for_tests(2, METADATA_CACHE_TTL);
+
+        for key_id in ["key-a", "key-b", "key-c"] {
+            client
+                .get_key_metadata(key_id)
+                .await
+                .expect("each scripted metadata read must succeed");
+        }
+
+        client.metadata_cache.run_pending_tasks().await;
+        assert!(
+            client.metadata_cache.entry_count() <= 2,
+            "the cache must not hold more entries than its capacity, got {}",
+            client.metadata_cache.entry_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_encrypt_fails_closed_when_the_metadata_read_fails() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(403, "permission denied")]).await;
+
+        let error = client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: b"plaintext".to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("a failed metadata read must fail the encrypt, not synthesize Enabled");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 1, "the gate failure must never reach the encrypt endpoint: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_synthesized_metadata_is_not_served_when_the_persist_fails() {
+        // Regression for the rustfs/backlog#1581 fail-open flip: a missing
+        // metadata record used to synthesize a usable Enabled record even when
+        // persisting it failed, letting encrypt proceed on state no other node
+        // could observe. The persist failure must now fail the read.
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::error(404, "no value found"),
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::error(500, "kv write failed"),
+        ])
+        .await;
+
+        let error = client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: b"plaintext".to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("an unpersisted synthesized record must never gate an encrypt open");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 3, "read, existence check, failed persist — and no encrypt: {requests:?}");
+        assert_eq!(requests[2], format!("POST {METADATA_PATH}"), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_synthesized_metadata_create_race_adopts_the_winning_record() {
+        let mut disabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        disabled.key_state = KeyState::Disabled;
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::error(404, "no value found"),
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            // Another node persisted a record first; the create-only
+            // check-and-set loses and the re-read adopts the winner.
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            ScriptedResponse::ok(metadata_read_data(&disabled)),
+        ])
+        .await;
+
+        let error = client
+            .encrypt(
+                &EncryptRequest {
+                    key_id: "wired-key".to_string(),
+                    plaintext: b"plaintext".to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("the winner's Disabled record must gate the encrypt, not the loser's Enabled one");
+        assert!(matches!(error, KmsError::InvalidOperation { .. }), "got {error:?}");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 4, "the lost create race must re-read, never overwrite: {requests:?}");
+        assert_eq!(requests[3], format!("GET {METADATA_PATH}"), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn wired_backend_create_loses_the_metadata_create_race_and_read_confirms() {
+        let winner = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let vault = ScriptedVault::serve(vec![
+            // Pre-check: the transit key does not exist yet.
+            ScriptedResponse::error(404, "not found"),
+            // Transit create succeeds, but a concurrent creator persists the
+            // metadata record first.
+            ScriptedResponse::ok(serde_json::json!({})),
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // Second pass: the pre-check now read-confirms the winner.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&winner)),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        let response = backend
+            .create_key(CreateKeyRequest {
+                key_name: Some("wired-key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("losing the metadata create race to an identical record must recover the create");
+        assert_eq!(response.key_metadata.key_state, KeyState::Enabled);
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 5, "one lost create pass plus one read-confirm pass: {requests:?}");
+        assert!(
+            requests[3].starts_with("GET ") && requests[4].starts_with("GET "),
+            "the recovery pass must be reads only: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_expired_sweep_backs_off_when_cancel_wins_the_cas_race() {
+        let mut pending = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        pending.key_state = KeyState::PendingDeletion;
+        pending.deletion_date = Some(Zoned::now());
+        let cancelled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let vault = ScriptedVault::serve(vec![
+            // The transit key still exists.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            // Versioned read finds a due pending-deletion record, but the
+            // tombstone write loses the check-and-set race to a cancel.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&pending)),
+            ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE),
+            // The re-read sees the cancelled (Enabled) record: back off.
+            ScriptedResponse::ok(kv2_metadata_read_data(2)),
+            ScriptedResponse::ok(metadata_read_data(&cancelled)),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        let now = Zoned::now() + Duration::from_secs(3600);
+        let outcome = backend
+            .remove_expired_key("wired-key", &now)
+            .await
+            .expect("losing the tombstone race to a cancel must back off cleanly");
+        assert_eq!(outcome, ExpiredKeyRemoval::StateChanged);
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 6, "no delete may follow a lost tombstone race: {requests:?}");
+        assert!(
+            !requests
+                .iter()
+                .any(|line| line.contains("/transit/keys/wired-key/config") || line.starts_with("DELETE ")),
+            "the sweep must not touch the transit key after backing off: {requests:?}"
+        );
+    }
+
+    /// The forward half of the rotation contract on the Transit path: a data key
+    /// generated before a rotation must still be decryptable after it.
+    ///
+    /// Transit key material never leaves Vault, so an offline responder cannot
+    /// prove the cryptographic round trip — `test_transit_old_ciphertext_decrypts_after_rotate`
+    /// keeps that against a live Vault. What this pins is the wiring the client
+    /// owns and could regress on its own: the historical `vault:v1:` ciphertext
+    /// is forwarded to Vault byte for byte after the rotation bumped the
+    /// recorded version, and nothing on the decrypt path gates on that version.
+    #[tokio::test]
+    async fn wired_transit_pre_rotation_data_key_is_decrypted_unchanged() {
+        const CIPHERTEXT_V1: &str = "vault:v1:scripted-pre-rotation";
+        const RECOVERED_DEK: [u8; 32] = [0x37u8; 32];
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            // generate_data_key: state gate reads the metadata record, then the
+            // transit encrypt returns first-version ciphertext.
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": CIPHERTEXT_V1 })),
+            // rotate: the state gate hits the metadata cache, the rotation
+            // commits, and the versioned read+write records the version bump.
+            ScriptedResponse::ok(serde_json::json!({})),
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // decrypt of the pre-rotation envelope; Vault owns the transit
+            // crypto, so the recovered material is the responder's to hand back.
+            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode(RECOVERED_DEK) })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(
+                &GenerateKeyRequest {
+                    master_key_id: "wired-key".to_string(),
+                    key_spec: "AES_256".to_string(),
+                    key_length: Some(32),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("generate_data_key must produce an envelope");
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&data_key.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope.encrypted_key, CIPHERTEXT_V1.as_bytes());
+
+        let rotated = client.rotate_key("wired-key", None).await.expect("rotation must commit");
+        assert_eq!(rotated.version, 2, "the rotation must record the version bump");
+
+        let plaintext = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: data_key.ciphertext.clone(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("a pre-rotation data key must stay decryptable");
+        assert_eq!(
+            plaintext,
+            RECOVERED_DEK.to_vec(),
+            "the decrypt must hand back the recovered material, not merely avoid an error"
+        );
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 7, "{requests:?}");
+        assert_eq!(requests[6], "POST /v1/transit/decrypt/wired-key", "{requests:?}");
+
+        // The version the rotation recorded, and the ciphertext the decrypt sent:
+        // the client must forward the historical version verbatim instead of
+        // re-stamping it to (or pinning the request at) the current one.
+        let bodies = vault.request_bodies();
+        let recorded: serde_json::Value = serde_json::from_str(&bodies[5]).expect("metadata write body must be JSON");
+        assert_eq!(recorded["data"]["current_version"], serde_json::json!(2), "{recorded}");
+        let decrypt_body: serde_json::Value = serde_json::from_str(&bodies[6]).expect("decrypt body must be JSON");
+        assert_eq!(
+            decrypt_body["ciphertext"],
+            serde_json::json!(CIPHERTEXT_V1),
+            "the pre-rotation ciphertext must reach Vault unchanged: {decrypt_body}"
+        );
+    }
+
+    /// Transit read-key payload for a key that has been rotated up to `latest`.
+    fn transit_key_read_data_up_to(key_id: &str, latest: u32) -> serde_json::Value {
+        let mut response: serde_json::Value = transit_key_read_data(key_id);
+        let keys: serde_json::Map<String, serde_json::Value> = (1..=latest)
+            .map(|version| (version.to_string(), serde_json::json!(1_700_000_000_u64 + u64::from(version))))
+            .collect();
+        response["keys"] = serde_json::Value::Object(keys);
+        response
+    }
+
+    fn wired_key_request(context: HashMap<String, String>) -> GenerateKeyRequest {
+        GenerateKeyRequest {
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            key_length: Some(32),
+            encryption_context: context,
+            grant_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transit_ciphertext_version_reads_only_a_well_formed_prefix() {
+        assert_eq!(transit_ciphertext_version("vault:v1:abc"), Some(1));
+        assert_eq!(transit_ciphertext_version("vault:v27:abc"), Some(27));
+        // Anything else leaves the version unknown rather than guessing one; an
+        // invented version is what would let a still-referenced key version be
+        // reported as retired.
+        assert_eq!(transit_ciphertext_version("vault:v:abc"), None);
+        assert_eq!(transit_ciphertext_version("vault:vx:abc"), None);
+        assert_eq!(transit_ciphertext_version("vault:v1"), None);
+        assert_eq!(transit_ciphertext_version("v1:abc"), None);
+        assert_eq!(transit_ciphertext_version(""), None);
+    }
+
+    /// The property that justifies having a Transit-specific rewrap at all: the
+    /// data key is re-encrypted by Vault, so no `transit/decrypt` is issued and
+    /// no plaintext data key ever exists inside this process.
+    #[tokio::test]
+    async fn wired_transit_rewrap_uses_the_native_endpoint_and_never_decrypts() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            // generate_data_key: metadata state gate, then the transit encrypt.
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // rewrap: the state gate hits the metadata cache, so the only call
+            // is the native rewrap.
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v3:rewrapped" })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(HashMap::new()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+        let original: DataKeyEnvelope = serde_json::from_slice(&data_key.ciphertext).expect("envelope must parse");
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("rewrap must move the ciphertext onto the latest version");
+
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(3));
+
+        let rewrapped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("rewrapped envelope must parse");
+        assert_eq!(rewrapped.encrypted_key, b"vault:v3:rewrapped".to_vec());
+        assert_eq!(
+            rewrapped.master_key_version, None,
+            "Transit ciphertext self-describes its version, so the envelope field must stay absent"
+        );
+        assert_eq!(rewrapped.key_id, original.key_id);
+        assert_eq!(rewrapped.created_at, original.created_at);
+        assert_eq!(rewrapped.encryption_context, original.encryption_context);
+
+        let requests = vault.requests();
+        assert!(
+            requests.contains(&"POST /v1/transit/rewrap/wired-key".to_string()),
+            "the native rewrap endpoint must be used: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/decrypt/")),
+            "no decrypt may be issued: the plaintext data key must never enter this process: {requests:?}"
+        );
+
+        // The ciphertext Vault was asked to rewrap is the one that was stored,
+        // byte for byte.
+        let bodies = vault.request_bodies();
+        let rewrap_index = requests
+            .iter()
+            .position(|request| request == "POST /v1/transit/rewrap/wired-key")
+            .expect("the rewrap request must be recorded");
+        let body: serde_json::Value = serde_json::from_str(&bodies[rewrap_index]).expect("rewrap body must be JSON");
+        assert_eq!(body["ciphertext"], serde_json::json!("vault:v1:scripted"), "{body}");
+    }
+
+    /// Vault re-encrypts unconditionally, so an already-latest ciphertext comes
+    /// back different but no newer. That must report as "nothing to persist", or
+    /// every sweep pass would rewrite every object's metadata forever.
+    #[tokio::test]
+    async fn wired_transit_rewrap_of_a_current_ciphertext_is_a_no_op() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (_vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Same version back, different bytes.
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:re-encrypted" })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(HashMap::new()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("rewrap must succeed");
+
+        assert!(!response.rewrapped, "a ciphertext already on the latest version is a no-op");
+        assert_eq!(
+            response.ciphertext, data_key.ciphertext,
+            "a no-op must hand the stored envelope back unchanged, not Vault's fresh re-encryption"
+        );
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(1));
+    }
+
+    /// Vault's `transit/rewrap` endpoint takes no `associated_data` parameter,
+    /// and this backend binds the encryption context as exactly that. The only
+    /// remaining route would decrypt the data key inside RustFS, so the request
+    /// is refused rather than silently downgraded — and refused without any call
+    /// to Vault at all.
+    #[tokio::test]
+    async fn wired_transit_rewrap_refuses_an_aad_bound_envelope() {
+        let context = HashMap::from([("bucket".to_string(), "photos/cat.jpg".to_string())]);
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Only the read-only accessor below is allowed to consume this.
+            ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 2)),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(context.clone()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let error = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: context.clone(),
+            })
+            .await
+            .expect_err("an AAD-bound envelope must not be rewrapped by decrypting it here");
+        assert!(
+            matches!(&error, KmsError::RewrapWouldExposePlaintext { key_id, .. } if key_id == "wired-key"),
+            "got {error:?}"
+        );
+
+        // The stuck envelope must still be countable, or an inventory could not
+        // report how much of the key version is unmigratable.
+        let described = client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: context,
+            })
+            .await
+            .expect("describing the wrapping must work even when rewrapping it cannot");
+        assert_eq!(described.key_version, Some(1));
+        assert_eq!(described.current_key_version, Some(2));
+        assert!(!described.is_current);
+
+        let requests = vault.requests();
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/rewrap/")),
+            "the refusal must happen before any rewrap call: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/decrypt/")),
+            "and above all before any decrypt: {requests:?}"
+        );
+    }
+
+    /// The current version comes from Vault's own key record rather than from
+    /// the RustFS metadata counter, which only advances on rotations this
+    /// process performed.
+    #[tokio::test]
+    async fn wired_transit_describe_wrapping_reads_vaults_latest_version() {
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        assert_eq!(metadata.current_version, 1, "the RustFS counter still says version 1");
+
+        let (vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // Vault has been rotated behind RustFS's back.
+            ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 4)),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(HashMap::new()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let described = client
+            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: HashMap::new(),
+            })
+            .await
+            .expect("describing the wrapping must succeed");
+
+        assert_eq!(described.key_id, "wired-key");
+        assert_eq!(described.key_version, Some(1));
+        assert_eq!(
+            described.current_key_version,
+            Some(4),
+            "the latest version must come from Vault, not from the RustFS metadata counter"
+        );
+        assert!(!described.is_current);
+
+        let requests = vault.requests();
+        assert!(
+            requests.contains(&"GET /v1/transit/keys/wired-key".to_string()),
+            "the latest version must be read from the transit key record: {requests:?}"
+        );
     }
 }

@@ -19,11 +19,14 @@
 //!
 //! ## Ciphertext format
 //!
-//! encrypted_data(plaintext_len+16) || nonce (12 bytes)
+//! A JSON-serialized `DataKeyEnvelope` carrying the AES-256-GCM ciphertext, the
+//! 12-byte nonce and the authenticated encryption context. This is a
+//! RustFS-internal format; it is not interchangeable with MinIO's KMS
+//! ciphertext (see the note on `StaticConfig`).
 
-use crate::backends::{BackendCapabilities, KmsBackend};
+use crate::backends::{BackendCapabilities, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
-use crate::encryption::DataKeyEnvelope;
+use crate::encryption::{DataKeyEnvelope, context_aad};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
@@ -33,7 +36,7 @@ use aes_gcm::{
 use async_trait::async_trait;
 use jiff::Zoned;
 use rand::RngExt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use tracing::debug;
 use zeroize::Zeroizing;
 
@@ -41,11 +44,6 @@ use zeroize::Zeroizing;
 const NONCE_SIZE: usize = 12;
 /// AES-256 key size in bytes.
 const KEY_SIZE: usize = 32;
-
-fn context_aad(context: &HashMap<String, String>) -> Result<Vec<u8>> {
-    let canonical: BTreeMap<&str, &str> = context.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
-    serde_json::to_vec(&canonical).map_err(Into::into)
-}
 
 /// Static single-key KMS backend.
 ///
@@ -110,8 +108,18 @@ impl StaticKmsBackend {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         rand::rng().fill(&mut nonce_bytes[..]);
 
-        // Generate 32 random bytes as plaintext DEK
-        let mut plaintext = [0u8; KEY_SIZE];
+        // The requested spec decides the DEK length; a caller that asked for
+        // AES_128 and silently got 256 bits would build objects whose recorded
+        // spec does not match their key material.
+        // Lengths track `KeySpec::key_size`; the request carries the spec as a
+        // string, so the mapping is repeated here rather than shared.
+        let key_length = match request.key_spec.as_str() {
+            "AES_256" | "ChaCha20" => 32,
+            "AES_128" => 16,
+            _ => return Err(KmsError::unsupported_algorithm(&request.key_spec)),
+        };
+
+        let mut plaintext = vec![0u8; key_length];
         rand::rng().fill(&mut plaintext[..]);
 
         // Encrypt DEK with AES-256-GCM using the static key directly
@@ -124,7 +132,7 @@ impl StaticKmsBackend {
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: plaintext.as_ref(),
+                    msg: plaintext.as_slice(),
                     aad: &aad,
                 },
             )
@@ -260,8 +268,15 @@ impl StaticKmsBackend {
         })
     }
 
-    /// List the single configured key, honouring the pagination marker.
+    /// List the single configured key, honouring the pagination marker and the
+    /// status and usage filters.
     pub(crate) fn list_configured_key(&self, request: &ListKeysRequest) -> Result<ListKeysResponse> {
+        // A caller asking for no keys gets none, even from a backend whose
+        // whole key set is one key.
+        if list_keys_page_size(request.limit).is_none() {
+            return Ok(empty_key_page());
+        }
+
         let key_info = KeyInfo {
             key_id: self.key_id.clone(),
             description: Some("Static single-key KMS backend".to_string()),
@@ -276,15 +291,25 @@ impl StaticKmsBackend {
             created_by: None,
         };
 
-        // Apply prefix filter if provided
+        // The marker is an exclusive lower bound on the identifier, as it is
+        // for every other backend.
         if let Some(ref marker) = request.marker
             && self.key_id <= *marker
         {
-            return Ok(ListKeysResponse {
-                keys: vec![],
-                next_marker: None,
-                truncated: false,
-            });
+            return Ok(empty_key_page());
+        }
+
+        // The configured key is filtered like any other: a caller narrowing the
+        // listing to disabled or signing keys must get an empty page rather
+        // than this active encryption key, which it would otherwise have to
+        // recognise as a non-match on its own.
+        if request
+            .status_filter
+            .as_ref()
+            .is_some_and(|status| status != &key_info.status)
+            || request.usage_filter.as_ref().is_some_and(|usage| usage != &key_info.usage)
+        {
+            return Ok(empty_key_page());
         }
 
         Ok(ListKeysResponse {
@@ -429,6 +454,32 @@ mod tests {
             .await
             .expect("Failed to create backend");
         (backend, key_id, key)
+    }
+
+    #[tokio::test]
+    async fn metadata_updates_report_the_capability_gap() {
+        let (backend, key_id, _key) = create_test_backend().await;
+        assert!(
+            !backend.capabilities().update_key_metadata,
+            "Static KMS owns no mutable key record, so it must not advertise metadata updates"
+        );
+
+        for (operation, result) in [
+            ("update_key_description", backend.update_key_description(&key_id, Some("new")).await),
+            (
+                "tag_key",
+                backend
+                    .tag_key(&key_id, &HashMap::from([("team".to_string(), "storage".to_string())]))
+                    .await,
+            ),
+            ("untag_key", backend.untag_key(&key_id, &["team".to_string()]).await),
+        ] {
+            let error = result.expect_err("Static KMS is read-only: metadata updates must be rejected");
+            assert!(
+                matches!(error, KmsError::UnsupportedCapability { .. }),
+                "expected UnsupportedCapability for {operation}, got {error:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -631,6 +682,59 @@ mod tests {
         assert!(!response.truncated);
     }
 
+    /// A zero limit means zero keys, even for a backend whose whole key set is
+    /// a single configured key.
+    #[tokio::test]
+    async fn zero_limit_list_returns_an_empty_page() {
+        let (backend, _key_id, _key) = create_test_backend().await;
+
+        let response = backend
+            .list_configured_key(&ListKeysRequest {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .expect("a zero-limit list must succeed");
+        assert!(response.keys.is_empty());
+        assert!(!response.truncated);
+        assert!(response.next_marker.is_none());
+    }
+
+    /// A filter that excludes the configured key must empty the page. Handing
+    /// the key back regardless would answer "list the disabled keys" with an
+    /// active one, and the response says nothing about the filter having been
+    /// dropped.
+    #[tokio::test]
+    async fn a_filter_the_configured_key_does_not_match_empties_the_page() {
+        let (backend, key_id, _key) = create_test_backend().await;
+
+        for request in [
+            ListKeysRequest {
+                status_filter: Some(KeyStatus::Disabled),
+                ..Default::default()
+            },
+            ListKeysRequest {
+                usage_filter: Some(KeyUsage::SignVerify),
+                ..Default::default()
+            },
+        ] {
+            let response = backend.list_configured_key(&request).expect("a filtered list must succeed");
+            assert!(response.keys.is_empty(), "excluded key was listed for {request:?}");
+            assert!(!response.truncated);
+            assert!(response.next_marker.is_none());
+        }
+
+        // The filters the key does match still list it.
+        let response = backend
+            .list_configured_key(&ListKeysRequest {
+                status_filter: Some(KeyStatus::Active),
+                usage_filter: Some(KeyUsage::EncryptDecrypt),
+                ..Default::default()
+            })
+            .expect("a matching list must succeed");
+        assert_eq!(response.keys.len(), 1);
+        assert_eq!(response.keys[0].key_id, key_id);
+    }
+
     #[tokio::test]
     async fn lifecycle_mutations_are_unsupported_at_the_product_surface() {
         let (backend, key_id, _key) = create_test_backend().await;
@@ -657,6 +761,7 @@ mod tests {
                 key_id: key_id.clone(),
                 pending_window_in_days: Some(7),
                 force_immediate: None,
+                confirm_key_id: None,
             },
         )
         .await;

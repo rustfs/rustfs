@@ -34,10 +34,14 @@
 //! values — operation names, classes, outcomes — never key identifiers, key
 //! material, ciphertext, or tokens.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use sha2::{Digest, Sha256};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +53,13 @@ const DEFAULT_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Default upper bound for a single backoff sleep.
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
+const DEFAULT_MAX_CONCURRENT_OPERATIONS: usize = 64;
+const RESERVED_CREDENTIAL_OPERATIONS: usize = 1;
+const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 64;
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+const DEFAULT_CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(30);
+const CIRCUIT_OPEN_MESSAGE: &str = "KMS backend circuit is open; waiting for the half-open recovery probe";
+const BACKPRESSURE_MESSAGE: &str = "KMS backend capacity and wait queue are full";
 
 /// Replay safety of a backend operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +115,9 @@ pub(crate) fn classify_vaultrs(error: &vaultrs::error::ClientError) -> ErrorClas
     }
 }
 
-fn classify_status(code: u16) -> ErrorClass {
+/// Retry classification of an HTTP status, shared by every backend that talks
+/// to an external KMS over HTTP.
+pub(crate) fn classify_status(code: u16) -> ErrorClass {
     match code {
         429 | 500 | 502 | 503 | 504 => ErrorClass::RetryableStatus,
         _ => ErrorClass::Fatal,
@@ -145,7 +158,7 @@ impl AttemptError {
 }
 
 /// Budgets applied by [`execute`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct RetryPolicy {
     /// Upper bound for one backend attempt.
     pub(crate) attempt_timeout: Duration,
@@ -158,6 +171,7 @@ pub(crate) struct RetryPolicy {
     pub(crate) base_backoff: Duration,
     /// Upper bound for a single backoff sleep.
     pub(crate) max_backoff: Duration,
+    runtime: Arc<BackendRuntime>,
 }
 
 impl RetryPolicy {
@@ -168,13 +182,47 @@ impl RetryPolicy {
     /// attempts plus backoff, so it bounds runaway loops without cutting any
     /// attempt short; an independently configurable deadline is left to the
     /// admin-API follow-up.
-    pub(crate) fn from_config(config: &KmsConfig) -> Self {
+    pub(crate) fn for_backend(
+        config: &KmsConfig,
+        backend: &'static str,
+        endpoint: &str,
+        namespace: Option<&str>,
+        scope: &'static str,
+    ) -> Self {
+        Self::for_capacity(config, backend, endpoint, namespace, scope, CapacityClass::Operations)
+    }
+
+    pub(crate) fn for_credentials(
+        config: &KmsConfig,
+        backend: &'static str,
+        endpoint: &str,
+        namespace: Option<&str>,
+        scope: &'static str,
+    ) -> Self {
+        Self::for_capacity(config, backend, endpoint, namespace, scope, CapacityClass::Credentials)
+    }
+
+    fn for_capacity(
+        config: &KmsConfig,
+        backend: &'static str,
+        endpoint: &str,
+        namespace: Option<&str>,
+        scope: &'static str,
+        capacity: CapacityClass,
+    ) -> Self {
+        let endpoint = url::Url::parse(endpoint).map_or_else(|_| endpoint.to_owned(), |url| url.to_string());
+        let mut identity = Sha256::new();
+        for part in [backend, endpoint.as_str(), namespace.unwrap_or_default()] {
+            identity.update(part.len().to_be_bytes());
+            identity.update(part.as_bytes());
+        }
         let mut policy = Self {
             attempt_timeout: config.effective_timeout(),
             op_deadline: Duration::ZERO,
             max_attempts: config.effective_retry_attempts(),
             base_backoff: DEFAULT_BASE_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            runtime: BackendRuntime::shared(identity.finalize().into(), backend, scope, capacity),
         };
         policy.op_deadline = policy.worst_case_budget();
         policy
@@ -189,6 +237,237 @@ impl RetryPolicy {
             budget = budget.saturating_add(backoff_cap(self, completed));
         }
         budget
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityClass {
+    Operations,
+    Credentials,
+}
+
+static ACTIVE_REGISTRY: LazyLock<Mutex<HashMap<[u8; 32], Weak<BackendCapacity>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+struct BackendCapacity {
+    total: Arc<Semaphore>,
+    operations: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+struct BackendRuntime {
+    capacity: Arc<BackendCapacity>,
+    capacity_class: CapacityClass,
+    queued: Arc<Semaphore>,
+    breaker: Mutex<CircuitState>,
+    in_flight: metrics::Gauge,
+    circuit_open: metrics::Gauge,
+}
+
+impl BackendRuntime {
+    fn shared(identity: [u8; 32], backend: &'static str, scope: &'static str, capacity: CapacityClass) -> Arc<Self> {
+        let mut registry = ACTIVE_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, active| active.strong_count() > 0);
+        let active = registry.get(&identity).and_then(Weak::upgrade).unwrap_or_else(|| {
+            Arc::new(BackendCapacity {
+                total: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_OPERATIONS)),
+                operations: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_OPERATIONS - RESERVED_CREDENTIAL_OPERATIONS)),
+            })
+        });
+        registry.insert(identity, Arc::downgrade(&active));
+        Arc::new(Self::new(backend, scope, active, capacity))
+    }
+
+    fn new(backend: &'static str, scope: &'static str, active: Arc<BackendCapacity>, capacity: CapacityClass) -> Self {
+        let in_flight = metrics::gauge!(METRIC_IN_FLIGHT, "backend" => backend, "scope" => scope);
+        let circuit_open = metrics::gauge!(METRIC_CIRCUIT_OPEN, "backend" => backend, "scope" => scope);
+        in_flight.increment(0.0);
+        circuit_open.increment(0.0);
+        Self {
+            capacity: active,
+            capacity_class: capacity,
+            queued: Arc::new(Semaphore::new(DEFAULT_MAX_QUEUED_OPERATIONS)),
+            breaker: Mutex::new(CircuitState::default()),
+            in_flight,
+            circuit_open,
+        }
+    }
+
+    fn try_acquire_active(&self) -> std::result::Result<ActivePermits, TryAcquireError> {
+        let operations = matches!(self.capacity_class, CapacityClass::Operations)
+            .then(|| Arc::clone(&self.capacity.operations).try_acquire_owned())
+            .transpose()?;
+        match Arc::clone(&self.capacity.total).try_acquire_owned() {
+            Ok(total) => Ok(ActivePermits {
+                _total: total,
+                _operations: operations,
+            }),
+            Err(error) => {
+                drop(operations);
+                Err(error)
+            }
+        }
+    }
+
+    async fn acquire_active(&self) -> std::result::Result<ActivePermits, AcquireError> {
+        let operations = match self.capacity_class {
+            CapacityClass::Operations => Some(Arc::clone(&self.capacity.operations).acquire_owned().await?),
+            CapacityClass::Credentials => None,
+        };
+        let total = Arc::clone(&self.capacity.total).acquire_owned().await?;
+        Ok(ActivePermits {
+            _total: total,
+            _operations: operations,
+        })
+    }
+
+    fn breaker_state(&self) -> Result<std::sync::MutexGuard<'_, CircuitState>> {
+        self.breaker
+            .lock()
+            .map_err(|_| KmsError::backend_error("KMS backend circuit state is unavailable"))
+    }
+
+    fn rejects(&self, now: Instant) -> Result<bool> {
+        let state = self.breaker_state()?;
+        Ok(matches!(state.open_until, Some(open_until) if now < open_until || state.probe_in_flight))
+    }
+
+    fn admit(&self, now: Instant) -> Result<Option<CircuitAdmission>> {
+        let mut state = self.breaker_state()?;
+        Ok(match state.open_until {
+            None => Some(CircuitAdmission {
+                generation: state.generation,
+                probe: false,
+            }),
+            Some(open_until) if now >= open_until && !state.probe_in_flight => {
+                state.probe_in_flight = true;
+                Some(CircuitAdmission {
+                    generation: state.generation,
+                    probe: true,
+                })
+            }
+            Some(_) => None,
+        })
+    }
+
+    fn transition(&self, state: &mut CircuitState, open: bool) {
+        let was_open = state.open_until.is_some();
+        state.generation = state.generation.saturating_add(1);
+        state.consecutive_failures = 0;
+        state.open_until = open.then(|| Instant::now() + DEFAULT_CIRCUIT_OPEN_DURATION);
+        state.probe_in_flight = false;
+        if was_open != open {
+            if open {
+                self.circuit_open.increment(1.0);
+            } else {
+                self.circuit_open.decrement(1.0);
+            }
+        }
+    }
+
+    fn complete(&self, admission: CircuitAdmission, failure: Option<ErrorClass>) -> bool {
+        let Ok(mut state) = self.breaker_state() else {
+            return true;
+        };
+        if state.generation != admission.generation {
+            return state.open_until.is_some();
+        }
+        match failure {
+            None | Some(ErrorClass::Fatal) => {
+                state.consecutive_failures = 0;
+                if admission.probe {
+                    self.transition(&mut state, false);
+                }
+            }
+            Some(ErrorClass::RetryableConn | ErrorClass::RetryableStatus) => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                if admission.probe || state.consecutive_failures >= DEFAULT_CIRCUIT_FAILURE_THRESHOLD {
+                    self.transition(&mut state, true);
+                }
+            }
+        }
+        state.open_until.is_some()
+    }
+
+    fn abandon(&self, admission: CircuitAdmission) {
+        if let Ok(mut state) = self.breaker_state()
+            && state.generation == admission.generation
+            && admission.probe
+        {
+            self.transition(&mut state, true);
+        }
+    }
+}
+
+impl Drop for BackendRuntime {
+    fn drop(&mut self) {
+        let state = self.breaker.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.open_until.is_some() {
+            self.circuit_open.decrement(1.0);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CircuitState {
+    generation: u64,
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    probe_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitAdmission {
+    generation: u64,
+    probe: bool,
+}
+
+struct RuntimePermit {
+    runtime: Arc<BackendRuntime>,
+    admission: Option<CircuitAdmission>,
+    _active: ActivePermits,
+}
+
+struct ActivePermits {
+    _total: OwnedSemaphorePermit,
+    _operations: Option<OwnedSemaphorePermit>,
+}
+
+impl RuntimePermit {
+    #[cfg(test)]
+    fn new(runtime: Arc<BackendRuntime>, admission: CircuitAdmission, active: OwnedSemaphorePermit) -> Self {
+        Self::with_active(
+            runtime,
+            admission,
+            ActivePermits {
+                _total: active,
+                _operations: None,
+            },
+        )
+    }
+
+    fn with_active(runtime: Arc<BackendRuntime>, admission: CircuitAdmission, active: ActivePermits) -> Self {
+        runtime.in_flight.increment(1.0);
+        Self {
+            runtime,
+            admission: Some(admission),
+            _active: active,
+        }
+    }
+
+    fn complete(&mut self, failure: Option<ErrorClass>) -> bool {
+        self.admission
+            .take()
+            .is_some_and(|admission| self.runtime.complete(admission, failure))
+    }
+}
+
+impl Drop for RuntimePermit {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            self.runtime.abandon(admission);
+        }
+        self.runtime.in_flight.decrement(1.0);
     }
 }
 
@@ -227,6 +506,10 @@ const METRIC_OPERATION_DURATION_SECONDS: &str = "rustfs_kms_backend_operation_du
 /// Histogram: attempts one operation used before completing, by `operation`
 /// and `outcome`.
 const METRIC_OPERATION_ATTEMPTS: &str = "rustfs_kms_backend_operation_attempts";
+/// Gauge: backend attempts currently in flight.
+const METRIC_IN_FLIGHT: &str = "rustfs_kms_backend_in_flight";
+/// Gauge: number of open or half-open backend circuits.
+const METRIC_CIRCUIT_OPEN: &str = "rustfs_kms_backend_circuit_open";
 
 impl OpClass {
     fn as_label(self) -> &'static str {
@@ -259,6 +542,12 @@ enum Outcome {
     BudgetExhausted,
     /// The operation deadline ran out before another attempt could complete.
     DeadlineExceeded,
+    /// The operation deadline ran out while waiting for backend capacity.
+    BackpressureTimeout,
+    /// Backend capacity and the bounded wait queue were both full.
+    BackpressureRejected,
+    /// A retryable failure opened the circuit, or an open circuit rejected the operation.
+    CircuitOpen,
     Cancelled,
 }
 
@@ -269,6 +558,9 @@ impl Outcome {
             Outcome::Fatal => "fatal",
             Outcome::BudgetExhausted => "budget_exhausted",
             Outcome::DeadlineExceeded => "deadline_exceeded",
+            Outcome::BackpressureTimeout => "backpressure_timeout",
+            Outcome::BackpressureRejected => "backpressure_rejected",
+            Outcome::CircuitOpen => "circuit_open",
             Outcome::Cancelled => "cancelled",
         }
     }
@@ -293,6 +585,11 @@ fn describe_metrics() {
         metrics::describe_histogram!(
             METRIC_OPERATION_ATTEMPTS,
             "Number of attempts a KMS backend operation used before completing"
+        );
+        metrics::describe_gauge!(METRIC_IN_FLIGHT, "KMS backend attempts currently in flight, by backend and policy scope");
+        metrics::describe_gauge!(
+            METRIC_CIRCUIT_OPEN,
+            "Number of open or half-open KMS backend circuits, by backend and policy scope"
         );
     });
 }
@@ -328,6 +625,83 @@ fn record_operation(operation: &'static str, class: OpClass, outcome: Outcome, a
         "outcome" => outcome.as_label()
     )
     .record(f64::from(attempts));
+}
+
+async fn acquire_attempt(
+    runtime: Arc<BackendRuntime>,
+    operation: &'static str,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> std::result::Result<RuntimePermit, (Outcome, KmsError)> {
+    if cancel.is_cancelled() {
+        return Err((
+            Outcome::Cancelled,
+            KmsError::operation_cancelled(format!("{operation} cancelled before backend admission")),
+        ));
+    }
+    match runtime.rejects(Instant::now()) {
+        Ok(false) => {}
+        Ok(true) => return Err((Outcome::CircuitOpen, KmsError::backend_error(CIRCUIT_OPEN_MESSAGE))),
+        Err(error) => return Err((Outcome::CircuitOpen, error)),
+    }
+
+    let active = match runtime.try_acquire_active() {
+        Ok(active) => active,
+        Err(TryAcquireError::Closed) => {
+            return Err((
+                Outcome::BackpressureRejected,
+                KmsError::backend_error("KMS backend admission is unavailable"),
+            ));
+        }
+        Err(TryAcquireError::NoPermits) => {
+            let queued = Arc::clone(&runtime.queued)
+                .try_acquire_owned()
+                .map_err(|_| (Outcome::BackpressureRejected, KmsError::backend_error(BACKPRESSURE_MESSAGE)))?;
+            let acquire = runtime.acquire_active();
+            let active = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err((Outcome::Cancelled, KmsError::operation_cancelled(format!(
+                        "{operation} cancelled while waiting for backend capacity"
+                    ))));
+                }
+                result = tokio::time::timeout_at(deadline, acquire) => match result {
+                    Ok(Ok(active)) => active,
+                    Ok(Err(_)) => {
+                        return Err((Outcome::BackpressureRejected, KmsError::backend_error(
+                            "KMS backend admission is unavailable"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err((Outcome::BackpressureTimeout, KmsError::operation_timed_out(format!(
+                            "{operation} exceeded its operation deadline while waiting for backend capacity"
+                        ))));
+                    }
+                }
+            };
+            drop(queued);
+            active
+        }
+    };
+
+    if cancel.is_cancelled() {
+        return Err((
+            Outcome::Cancelled,
+            KmsError::operation_cancelled(format!("{operation} cancelled before backend attempt")),
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err((
+            Outcome::BackpressureTimeout,
+            KmsError::operation_timed_out(format!("{operation} exceeded its operation deadline before backend attempt")),
+        ));
+    }
+    let admission = match runtime.admit(Instant::now()) {
+        Ok(Some(admission)) => admission,
+        Ok(None) => return Err((Outcome::CircuitOpen, KmsError::backend_error(CIRCUIT_OPEN_MESSAGE))),
+        Err(error) => return Err((Outcome::CircuitOpen, error)),
+    };
+    Ok(RuntimePermit::with_active(runtime, admission, active))
 }
 
 /// Run `attempt` under the policy.
@@ -421,8 +795,14 @@ where
             );
         }
 
+        let mut runtime_permit = match acquire_attempt(Arc::clone(&policy.runtime), operation, cancel, deadline).await {
+            Ok(permit) => permit,
+            Err((outcome, error)) => return (outcome, Err(error)),
+        };
+
         attempt_no += 1;
         *attempts_made = attempt_no;
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let attempt_budget = policy.attempt_timeout.min(remaining);
         let outcome = tokio::select! {
             biased;
@@ -436,7 +816,10 @@ where
         };
 
         let failure = match outcome {
-            Ok(Ok(value)) => return (Outcome::Success, Ok(value)),
+            Ok(Ok(value)) => {
+                runtime_permit.complete(None);
+                return (Outcome::Success, Ok(value));
+            }
             Ok(Err(failure)) => {
                 record_attempt_failure(operation, failure.class.as_label());
                 failure
@@ -452,8 +835,13 @@ where
             }
         };
 
+        let circuit_open = runtime_permit.complete(Some(failure.class));
         if failure.class == ErrorClass::Fatal {
             return (Outcome::Fatal, Err(failure.error));
+        }
+        drop(runtime_permit);
+        if circuit_open {
+            return (Outcome::CircuitOpen, Err(failure.error));
         }
         if attempt_no >= max_attempts {
             return (Outcome::BudgetExhausted, Err(failure.error));
@@ -485,21 +873,73 @@ where
 }
 
 #[cfg(test)]
+fn test_runtime(max_concurrent: usize, max_queued: usize) -> Arc<BackendRuntime> {
+    let capacity = Arc::new(BackendCapacity {
+        total: Arc::new(Semaphore::new(max_concurrent)),
+        operations: Arc::new(Semaphore::new(max_concurrent)),
+    });
+    let mut runtime = BackendRuntime::new("test-backend", "test-scope", capacity, CapacityClass::Credentials);
+    runtime.queued = Arc::new(Semaphore::new(max_queued));
+    Arc::new(runtime)
+}
+
+#[cfg(test)]
+impl RetryPolicy {
+    pub(crate) fn for_test(
+        attempt_timeout: Duration,
+        op_deadline: Duration,
+        max_attempts: u32,
+        base_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        Self {
+            attempt_timeout,
+            op_deadline,
+            max_attempts,
+            base_backoff,
+            max_backoff,
+            runtime: test_runtime(DEFAULT_MAX_CONCURRENT_OPERATIONS, DEFAULT_MAX_QUEUED_OPERATIONS),
+        }
+    }
+
+    pub(crate) fn shares_active_capacity_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.runtime.capacity, &other.runtime.capacity)
+    }
+
+    pub(crate) fn uses_credential_reserve(&self) -> bool {
+        matches!(self.runtime.capacity_class, CapacityClass::Credentials)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use tokio::sync::Notify;
 
     type AttemptResult<T> = std::result::Result<T, AttemptError>;
 
     fn policy_of(attempt_timeout_ms: u64, op_deadline_ms: u64, max_attempts: u32, base_ms: u64, max_ms: u64) -> RetryPolicy {
-        RetryPolicy {
-            attempt_timeout: Duration::from_millis(attempt_timeout_ms),
-            op_deadline: Duration::from_millis(op_deadline_ms),
+        RetryPolicy::for_test(
+            Duration::from_millis(attempt_timeout_ms),
+            Duration::from_millis(op_deadline_ms),
             max_attempts,
-            base_backoff: Duration::from_millis(base_ms),
-            max_backoff: Duration::from_millis(max_ms),
-        }
+            Duration::from_millis(base_ms),
+            Duration::from_millis(max_ms),
+        )
+    }
+
+    fn policy_with_limit(max_concurrent: usize, max_queued: usize) -> RetryPolicy {
+        let mut policy = policy_of(1_000, 60_000, 1, 10, 10);
+        policy.runtime = test_runtime(max_concurrent, max_queued);
+        policy
+    }
+
+    fn unique_endpoint(label: &str) -> String {
+        static NEXT_ENDPOINT_ID: AtomicU64 = AtomicU64::new(0);
+
+        format!("https://{label}-{}.example.invalid", NEXT_ENDPOINT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Deterministic jitter: always sleep the full backoff cap.
@@ -511,6 +951,20 @@ mod tests {
         AttemptError {
             class: ErrorClass::RetryableConn,
             error: KmsError::backend_error("connection reset by peer"),
+        }
+    }
+
+    fn is_circuit_open(error: &KmsError) -> bool {
+        matches!(error, KmsError::BackendError { message } if message.contains("circuit is open"))
+    }
+
+    fn trip_breaker(runtime: &BackendRuntime) {
+        for attempt in 1..=DEFAULT_CIRCUIT_FAILURE_THRESHOLD {
+            let admission = runtime.admit(Instant::now()).expect("state").expect("closed");
+            assert_eq!(
+                runtime.complete(admission, Some(ErrorClass::RetryableConn)),
+                attempt == DEFAULT_CIRCUIT_FAILURE_THRESHOLD
+            );
         }
     }
 
@@ -658,6 +1112,362 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn backend_generation_reuses_capacity_but_resets_queue_and_breaker() {
+        let endpoint = unique_endpoint("fresh-generation");
+        let config = KmsConfig::default();
+        let first = RetryPolicy::for_backend(&config, "vault", &endpoint, Some("namespace"), "operations");
+        let second = RetryPolicy::for_backend(&config, "vault", &endpoint, Some("namespace"), "operations");
+
+        assert!(!Arc::ptr_eq(&first.runtime, &second.runtime));
+        assert!(Arc::ptr_eq(&first.runtime.capacity, &second.runtime.capacity));
+        assert!(!Arc::ptr_eq(&first.runtime.queued, &second.runtime.queued));
+
+        let _first_queue = Arc::clone(&first.runtime.queued)
+            .try_acquire_owned()
+            .expect("first generation queue capacity");
+        assert_eq!(first.runtime.queued.available_permits(), DEFAULT_MAX_QUEUED_OPERATIONS - 1);
+        assert_eq!(second.runtime.queued.available_permits(), DEFAULT_MAX_QUEUED_OPERATIONS);
+
+        trip_breaker(&first.runtime);
+        assert!(first.runtime.rejects(Instant::now()).expect("first generation breaker state"));
+        assert!(
+            !second
+                .runtime
+                .rejects(Instant::now())
+                .expect("second generation breaker state")
+        );
+    }
+
+    #[test]
+    fn backend_capacity_domains_isolate_credentials_queue_and_breaker() {
+        let endpoint = unique_endpoint("shared-capacity");
+        let config = KmsConfig::default();
+        let operations = RetryPolicy::for_backend(&config, "vault", &endpoint, Some("namespace"), "operations");
+        let login = RetryPolicy::for_credentials(&config, "vault", &endpoint, Some("namespace"), "login");
+        let renew = RetryPolicy::for_credentials(&config, "vault", &endpoint, Some("namespace"), "renew");
+
+        assert!(!Arc::ptr_eq(&operations.runtime, &login.runtime));
+        assert!(Arc::ptr_eq(&operations.runtime.capacity, &login.runtime.capacity));
+        assert!(matches!(operations.runtime.capacity_class, CapacityClass::Operations));
+        assert!(matches!(login.runtime.capacity_class, CapacityClass::Credentials));
+        assert!(Arc::ptr_eq(&login.runtime.capacity, &renew.runtime.capacity));
+        assert!(!Arc::ptr_eq(&operations.runtime.queued, &login.runtime.queued));
+
+        let _operations_queue = Arc::clone(&operations.runtime.queued)
+            .try_acquire_owned()
+            .expect("operations queue capacity");
+        assert_eq!(operations.runtime.queued.available_permits(), DEFAULT_MAX_QUEUED_OPERATIONS - 1);
+        assert_eq!(login.runtime.queued.available_permits(), DEFAULT_MAX_QUEUED_OPERATIONS);
+
+        trip_breaker(&operations.runtime);
+        assert!(operations.runtime.rejects(Instant::now()).expect("operations breaker state"));
+        assert!(!login.runtime.rejects(Instant::now()).expect("login breaker state"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credential_refresh_is_not_starved_by_operations_capacity() {
+        let endpoint = unique_endpoint("credential-capacity");
+        let config = KmsConfig::default();
+        let operations = RetryPolicy::for_backend(&config, "vault", &endpoint, Some("namespace"), "operations");
+        let login = RetryPolicy::for_credentials(&config, "vault", &endpoint, Some("namespace"), "credentials-login");
+        let _operation_permits = (0..DEFAULT_MAX_CONCURRENT_OPERATIONS - RESERVED_CREDENTIAL_OPERATIONS)
+            .map(|_| operations.runtime.try_acquire_active().expect("operations capacity"))
+            .collect::<Vec<_>>();
+        assert_eq!(login.runtime.capacity.total.available_permits(), RESERVED_CREDENTIAL_OPERATIONS);
+
+        execute_with_jitter(
+            "credential_login",
+            OpClass::Auth,
+            &login,
+            &CancellationToken::new(),
+            full_jitter,
+            || async { Ok(()) },
+        )
+        .await
+        .expect("credential login must use reserved capacity");
+    }
+
+    #[test]
+    fn backend_identity_isolates_endpoint_and_namespace() {
+        let config = KmsConfig::default();
+        let endpoint_a = unique_endpoint("endpoint-a");
+        let endpoint_b = unique_endpoint("endpoint-b");
+        let first_endpoint = RetryPolicy::for_backend(&config, "vault", &endpoint_a, Some("namespace"), "operations");
+        let second_endpoint = RetryPolicy::for_backend(&config, "vault", &endpoint_b, Some("namespace"), "operations");
+        assert!(!Arc::ptr_eq(&first_endpoint.runtime.capacity, &second_endpoint.runtime.capacity));
+
+        let namespace_endpoint = unique_endpoint("namespace");
+        let first_namespace = RetryPolicy::for_backend(&config, "vault", &namespace_endpoint, Some("tenant-a"), "operations");
+        let second_namespace = RetryPolicy::for_backend(&config, "vault", &namespace_endpoint, Some("tenant-b"), "operations");
+        assert!(!Arc::ptr_eq(&first_namespace.runtime.capacity, &second_namespace.runtime.capacity));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_bounds_active_queue_and_deadline() {
+        let mut policy = policy_with_limit(1, 1);
+        policy.op_deadline = Duration::from_millis(100);
+        let active = Arc::clone(&policy.runtime.capacity.total)
+            .acquire_owned()
+            .await
+            .expect("active permit");
+        let queued = Arc::clone(&policy.runtime.queued)
+            .acquire_owned()
+            .await
+            .expect("queued permit");
+        let excess: Result<()> = execute_with_jitter(
+            "queue_full",
+            OpClass::ReadIdempotent,
+            &policy,
+            &CancellationToken::new(),
+            full_jitter,
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(matches!(&excess, Err(KmsError::BackendError { message }) if message == BACKPRESSURE_MESSAGE));
+        drop(queued);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            drop(active);
+        });
+        let started = Instant::now();
+        let timed_out: Result<()> = execute_with_jitter(
+            "queue_deadline",
+            OpClass::ReadIdempotent,
+            &policy,
+            &CancellationToken::new(),
+            full_jitter,
+            std::future::pending::<AttemptResult<()>>,
+        )
+        .await;
+        assert!(matches!(timed_out, Err(KmsError::OperationTimedOut { .. })));
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+
+        let active = Arc::clone(&policy.runtime.capacity.total)
+            .acquire_owned()
+            .await
+            .expect("active permit");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(active);
+        });
+        let boundary = acquire_attempt(
+            Arc::clone(&policy.runtime),
+            "deadline_boundary",
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(boundary, Err((Outcome::BackpressureTimeout, _))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_admission_cancellation_releases_queue_capacity() {
+        let policy = Arc::new(policy_with_limit(1, 1));
+        let active = Arc::clone(&policy.runtime.capacity.total)
+            .acquire_owned()
+            .await
+            .expect("active permit");
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let queued = tokio::spawn({
+            let policy = Arc::clone(&policy);
+            let cancel = cancel.clone();
+            let calls = Arc::clone(&calls);
+            async move {
+                execute_with_jitter("cancel_queued", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(()))
+                })
+                .await
+            }
+        });
+
+        for _ in 0..100 {
+            if policy.runtime.queued.available_permits() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(policy.runtime.queued.available_permits(), 0, "request must be queued");
+        cancel.cancel();
+
+        let result = queued.await.expect("queued task join");
+        assert!(matches!(result, Err(KmsError::OperationCancelled { .. })), "got {result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(policy.runtime.queued.available_permits(), 1);
+        drop(active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_admission_observes_circuit_opened_while_waiting() {
+        let policy = Arc::new(policy_with_limit(1, 1));
+        let active = Arc::clone(&policy.runtime.capacity.total)
+            .acquire_owned()
+            .await
+            .expect("active permit");
+        let calls = Arc::new(AtomicU32::new(0));
+        let queued = tokio::spawn({
+            let policy = Arc::clone(&policy);
+            let calls = Arc::clone(&calls);
+            async move {
+                execute_with_jitter(
+                    "open_while_queued",
+                    OpClass::ReadIdempotent,
+                    &policy,
+                    &CancellationToken::new(),
+                    full_jitter,
+                    move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await
+            }
+        });
+
+        for _ in 0..100 {
+            if policy.runtime.queued.available_permits() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(policy.runtime.queued.available_permits(), 0, "request must be queued");
+        trip_breaker(&policy.runtime);
+        drop(active);
+
+        let result = queued.await.expect("queued task join");
+        assert!(result.as_ref().is_err_and(is_circuit_open), "got {result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(policy.runtime.queued.available_permits(), 1);
+        assert_eq!(policy.runtime.capacity.total.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn breaker_bounds_attempts_and_recovers_with_one_probe() {
+        let mut policy = policy_with_limit(2, 2);
+        policy.max_attempts = 10;
+        let policy = Arc::new(policy);
+        let calls = Arc::new(AtomicU32::new(0));
+        let cancel = CancellationToken::new();
+        let failed: Result<()> = execute_with_jitter("breaker_open", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, {
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(retryable_conn_error())
+                }
+            }
+        })
+        .await;
+        failed.expect_err("breaker threshold must stop retries");
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        for _ in 0..3 {
+            let rejected: Result<()> =
+                execute_with_jitter("breaker_rejected", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, || async {
+                    Ok(())
+                })
+                .await;
+            assert!(rejected.as_ref().is_err_and(is_circuit_open), "got {rejected:?}");
+        }
+        let already_cancelled = CancellationToken::new();
+        already_cancelled.cancel();
+        let cancelled: Result<()> = execute_with_jitter(
+            "breaker_cancelled",
+            OpClass::ReadIdempotent,
+            &policy,
+            &already_cancelled,
+            full_jitter,
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(matches!(cancelled, Err(KmsError::OperationCancelled { .. })));
+
+        tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION).await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let probe = tokio::spawn({
+            let policy = Arc::clone(&policy);
+            let calls = Arc::clone(&calls);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                execute_with_jitter(
+                    "breaker_probe",
+                    OpClass::ReadIdempotent,
+                    &policy,
+                    &CancellationToken::new(),
+                    full_jitter,
+                    move || {
+                        let calls = Arc::clone(&calls);
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            started.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            }
+        });
+        started.notified().await;
+        let concurrent: Result<()> = execute_with_jitter(
+            "breaker_concurrent_probe",
+            OpClass::ReadIdempotent,
+            &policy,
+            &cancel,
+            full_jitter,
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(concurrent.as_ref().is_err_and(is_circuit_open), "got {concurrent:?}");
+        release.notify_one();
+        probe.await.expect("probe join").expect("successful probe must close circuit");
+        execute_with_jitter("breaker_recovered", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, || async {
+            Ok(())
+        })
+        .await
+        .expect("closed circuit must recover");
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn breaker_stale_and_failed_probes_preserve_state() {
+        let runtime = test_runtime(2, 2);
+        let stale = runtime.admit(Instant::now()).expect("state").expect("closed");
+        trip_breaker(&runtime);
+        tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION).await;
+        let active = Arc::clone(&runtime.capacity.total).try_acquire_owned().expect("capacity");
+        let probe = runtime.admit(Instant::now()).expect("state").expect("probe");
+        drop(RuntimePermit::new(Arc::clone(&runtime), probe, active));
+        tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION - Duration::from_millis(1)).await;
+        assert!(runtime.rejects(Instant::now()).expect("state"));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let probe = runtime.admit(Instant::now()).expect("state").expect("probe");
+        assert!(runtime.complete(probe, Some(ErrorClass::RetryableStatus)));
+        tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION).await;
+        let recovery = runtime.admit(Instant::now()).expect("state").expect("probe");
+        assert!(!runtime.complete(recovery, Some(ErrorClass::Fatal)));
+        assert!(!runtime.complete(stale, Some(ErrorClass::RetryableConn)));
+
+        let reset = test_runtime(2, 2);
+        for _ in 0..4 {
+            let admission = reset.admit(Instant::now()).expect("state").expect("closed");
+            assert!(!reset.complete(admission, Some(ErrorClass::RetryableConn)));
+        }
+        let fatal = reset.admit(Instant::now()).expect("state").expect("closed");
+        assert!(!reset.complete(fatal, Some(ErrorClass::Fatal)));
+        for _ in 0..4 {
+            let admission = reset.admit(Instant::now()).expect("state").expect("closed");
+            assert!(!reset.complete(admission, Some(ErrorClass::RetryableConn)));
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn total_duration_never_exceeds_deadline() {
         // Worst case without a deadline would be 5 * 10s + backoff; the 25s
@@ -748,7 +1558,7 @@ mod tests {
             retry_attempts: 50,
             ..KmsConfig::default()
         };
-        let policy = RetryPolicy::from_config(&config);
+        let policy = RetryPolicy::for_backend(&config, "test-backend", "https://example.invalid", None, "config-clamp");
         assert_eq!(policy.attempt_timeout, Duration::from_secs(300));
         assert_eq!(policy.max_attempts, 10);
         // The deadline must cover the full worst case so it never cuts a
@@ -756,7 +1566,7 @@ mod tests {
         assert!(policy.op_deadline >= policy.attempt_timeout.saturating_mul(policy.max_attempts));
 
         let in_range = KmsConfig::default();
-        let policy = RetryPolicy::from_config(&in_range);
+        let policy = RetryPolicy::for_backend(&in_range, "test-backend", "https://example.invalid", None, "config-in-range");
         assert_eq!(policy.attempt_timeout, in_range.timeout);
         assert_eq!(policy.max_attempts, in_range.retry_attempts);
     }
@@ -861,6 +1671,17 @@ mod tests {
                 }
             })
             .sum()
+    }
+
+    fn gauge_value(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        snapshot.iter().find_map(|(composite, _unit, _description, value)| {
+            let matches =
+                composite.kind() == MetricKind::Gauge && composite.key().name() == name && labels_match(composite.key(), labels);
+            match (matches, value) {
+                (true, DebugValue::Gauge(value)) => Some(value.into_inner()),
+                _ => None,
+            }
+        })
     }
 
     fn histogram_values(snapshot: &[MetricEntry], name: &str, labels: &[(&str, &str)]) -> Vec<f64> {
@@ -1113,5 +1934,175 @@ mod tests {
             ),
             vec![1.0]
         );
+    }
+
+    #[test]
+    fn metrics_record_backpressure_and_circuit_outcomes() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                let rejected = policy_with_limit(1, 0);
+                let rejected_active = Arc::clone(&rejected.runtime.capacity.total)
+                    .try_acquire_owned()
+                    .expect("active capacity");
+                let result: Result<()> = execute_with_jitter(
+                    "metrics_backpressure_rejected",
+                    OpClass::ReadIdempotent,
+                    &rejected,
+                    &CancellationToken::new(),
+                    full_jitter,
+                    || async { Ok(()) },
+                )
+                .await;
+                assert!(matches!(result, Err(KmsError::BackendError { .. })));
+                drop(rejected_active);
+
+                let mut timed_out = policy_with_limit(1, 1);
+                timed_out.op_deadline = Duration::from_millis(100);
+                let timeout_active = Arc::clone(&timed_out.runtime.capacity.total)
+                    .try_acquire_owned()
+                    .expect("active capacity");
+                let result: Result<()> = execute_with_jitter(
+                    "metrics_backpressure_timeout",
+                    OpClass::ReadIdempotent,
+                    &timed_out,
+                    &CancellationToken::new(),
+                    full_jitter,
+                    || async { Ok(()) },
+                )
+                .await;
+                assert!(matches!(result, Err(KmsError::OperationTimedOut { .. })));
+                drop(timeout_active);
+
+                let open = policy_with_limit(1, 1);
+                trip_breaker(&open.runtime);
+                let result: Result<()> = execute_with_jitter(
+                    "metrics_circuit_open",
+                    OpClass::ReadIdempotent,
+                    &open,
+                    &CancellationToken::new(),
+                    full_jitter,
+                    || async { Ok(()) },
+                )
+                .await;
+                assert!(result.as_ref().is_err_and(is_circuit_open), "got {result:?}");
+
+                let mut trip = policy_with_limit(1, 1);
+                trip.max_attempts = DEFAULT_CIRCUIT_FAILURE_THRESHOLD + 1;
+                let result: Result<()> = execute_with_jitter(
+                    "metrics_circuit_trip",
+                    OpClass::ReadIdempotent,
+                    &trip,
+                    &CancellationToken::new(),
+                    full_jitter,
+                    || async { Err(retryable_conn_error()) },
+                )
+                .await;
+                assert!(matches!(result, Err(KmsError::BackendError { .. })));
+            })
+        });
+
+        for (operation, outcome, attempts) in [
+            ("metrics_backpressure_rejected", "backpressure_rejected", 0.0),
+            ("metrics_backpressure_timeout", "backpressure_timeout", 0.0),
+            ("metrics_circuit_open", "circuit_open", 0.0),
+            ("metrics_circuit_trip", "circuit_open", f64::from(DEFAULT_CIRCUIT_FAILURE_THRESHOLD)),
+        ] {
+            assert_eq!(
+                counter_value(&snapshot, METRIC_OPERATIONS_TOTAL, &[("operation", operation), ("outcome", outcome)]),
+                1
+            );
+            assert_eq!(
+                histogram_values(&snapshot, METRIC_OPERATION_ATTEMPTS, &[("operation", operation), ("outcome", outcome)]),
+                vec![attempts]
+            );
+        }
+    }
+
+    #[test]
+    fn successful_and_fatal_half_open_probes_clear_the_open_gauge() {
+        for failure in [None, Some(ErrorClass::Fatal)] {
+            let (snapshot, runtime) = record_metrics(move || {
+                Box::pin(async move {
+                    let runtime = test_runtime(1, 1);
+                    trip_breaker(&runtime);
+                    tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION).await;
+                    let probe = runtime.admit(Instant::now()).expect("state").expect("half-open probe");
+                    assert!(!runtime.complete(probe, failure));
+                    runtime
+                })
+            });
+
+            assert!(!runtime.rejects(Instant::now()).expect("closed breaker state"));
+            assert_eq!(
+                gauge_value(&snapshot, METRIC_CIRCUIT_OPEN, &[("backend", "test-backend"), ("scope", "test-scope")]),
+                Some(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_half_open_attempt_releases_capacity_and_reopens_breaker() {
+        let (snapshot, policy) = record_metrics(|| {
+            Box::pin(async {
+                let policy = policy_with_limit(1, 1);
+                trip_breaker(&policy.runtime);
+                tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION).await;
+
+                let cancel = CancellationToken::new();
+                let canceller = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    canceller.cancel();
+                });
+                let result: Result<()> =
+                    execute_with_jitter("cancel_half_open_probe", OpClass::ReadIdempotent, &policy, &cancel, full_jitter, || {
+                        std::future::pending::<AttemptResult<()>>()
+                    })
+                    .await;
+
+                assert!(matches!(result, Err(KmsError::OperationCancelled { .. })));
+                assert_eq!(policy.runtime.capacity.total.available_permits(), 1);
+                assert_eq!(policy.runtime.queued.available_permits(), 1);
+                assert!(policy.runtime.rejects(Instant::now()).expect("reopened breaker state"));
+                tokio::time::advance(DEFAULT_CIRCUIT_OPEN_DURATION).await;
+                let probe = policy
+                    .runtime
+                    .admit(Instant::now())
+                    .expect("state")
+                    .expect("replacement half-open probe");
+                assert!(probe.probe);
+                policy
+            })
+        });
+
+        let labels = [("backend", "test-backend"), ("scope", "test-scope")];
+        assert_eq!(gauge_value(&snapshot, METRIC_IN_FLIGHT, &labels), Some(0.0));
+        assert_eq!(gauge_value(&snapshot, METRIC_CIRCUIT_OPEN, &labels), Some(1.0));
+        drop(policy);
+    }
+
+    #[test]
+    fn runtime_metrics_track_in_flight_and_open_lifecycle() {
+        let in_flight_recorder = DebuggingRecorder::new();
+        let in_flight_snapshotter = in_flight_recorder.snapshotter();
+        let in_flight = metrics::with_local_recorder(&in_flight_recorder, || {
+            let runtime = test_runtime(1, 1);
+            let active = Arc::clone(&runtime.capacity.total).try_acquire_owned().expect("capacity");
+            let admission = runtime.admit(Instant::now()).expect("state").expect("closed");
+            let _permit = RuntimePermit::new(Arc::clone(&runtime), admission, active);
+            in_flight_snapshotter.snapshot().into_vec()
+        });
+
+        let dropped_recorder = DebuggingRecorder::new();
+        let dropped_snapshotter = dropped_recorder.snapshotter();
+        let dropped = metrics::with_local_recorder(&dropped_recorder, || {
+            let runtime = test_runtime(1, 1);
+            trip_breaker(&runtime);
+            drop(runtime);
+            dropped_snapshotter.snapshot().into_vec()
+        });
+        let labels = [("backend", "test-backend"), ("scope", "test-scope")];
+        assert_eq!(gauge_value(&in_flight, METRIC_IN_FLIGHT, &labels), Some(1.0));
+        assert_eq!(gauge_value(&dropped, METRIC_CIRCUIT_OPEN, &labels), Some(0.0));
     }
 }

@@ -37,8 +37,9 @@ use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::service::ObjectEncryptionService;
 use crate::types::{
-    CancelKeyDeletionRequest, CreateKeyRequest, DecryptRequest, DeleteKeyRequest, DescribeKeyRequest, EncryptRequest,
-    GenerateDataKeyRequest, KeySpec, KeyState, KeyUsage, ObjectEncryptionContext,
+    CancelKeyDeletionRequest, CreateKeyRequest, DecryptRequest, DeleteKeyRequest, DescribeDataKeyWrappingRequest,
+    DescribeKeyRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KeyState, KeyUsage, ObjectEncryptionContext,
+    RewrapDataKeyRequest,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -58,6 +59,23 @@ fn expect_unsupported<T: std::fmt::Debug>(result: Result<T>) {
 async fn expect_rotate_rejected(backend: &dyn KmsBackend, key_id: &str) {
     let result = backend.rotate_key(key_id).await;
     if backend.capabilities().rotate {
+        expect_invalid_key_state(result, "");
+    } else {
+        expect_unsupported(result);
+    }
+}
+
+/// Rewrap while not Enabled: it produces a new wrapping, so backends that
+/// support it must gate it through the state machine exactly as encryption is
+/// gated; backends without version history report the capability gap instead.
+async fn expect_rewrap_rejected(backend: &dyn KmsBackend, ciphertext: Vec<u8>) {
+    let result = backend
+        .rewrap_data_key(RewrapDataKeyRequest {
+            ciphertext,
+            encryption_context: context(),
+        })
+        .await;
+    if backend.capabilities().rewrap {
         expect_invalid_key_state(result, "");
     } else {
         expect_unsupported(result);
@@ -108,6 +126,7 @@ fn schedule_request(key_id: &str) -> DeleteKeyRequest {
         key_id: key_id.to_string(),
         pending_window_in_days: Some(7),
         force_immediate: None,
+        confirm_key_id: None,
     }
 }
 
@@ -157,6 +176,7 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, key_id: &str) {
     expect_invalid_key_state(backend.encrypt(encrypt_request(key_id)).await, "disabled");
     expect_invalid_key_state(backend.generate_data_key(generate_request(key_id)).await, "disabled");
     expect_rotate_rejected(backend, key_id).await;
+    expect_rewrap_rejected(backend, data_key.ciphertext_blob.clone()).await;
     // ...but decryption of existing data keeps working (explicit AWS deviation)...
     let decrypted = backend
         .decrypt(decrypt_request(data_key.ciphertext_blob.clone()))
@@ -186,6 +206,7 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, key_id: &str) {
     expect_invalid_key_state(backend.enable_key(key_id).await, "pending deletion");
     expect_invalid_key_state(backend.disable_key(key_id).await, "pending deletion");
     expect_rotate_rejected(backend, key_id).await;
+    expect_rewrap_rejected(backend, data_key.ciphertext_blob.clone()).await;
     expect_invalid_key_state(backend.delete_key(schedule_request(key_id)).await, "pending deletion");
     let decrypted = backend
         .decrypt(decrypt_request(data_key.ciphertext_blob.clone()))
@@ -281,11 +302,30 @@ async fn static_backend_stateless_contract() {
     expect_invalid_key_state(backend.create_key(create_request("another-key".to_string())).await, "read-only");
     expect_invalid_key_state(backend.delete_key(schedule_request(key_id)).await, "read-only");
     expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "read-only");
-    // Enable/disable and rotation are capability gaps at the product
-    // surface, not state-machine rejections.
+    // Enable/disable, rotation and rewrap are capability gaps at the product
+    // surface, not state-machine rejections. A single fixed key has no second
+    // version to rewrap onto, so reporting the gap is the only honest answer —
+    // re-wrapping with the same material would look like progress while
+    // changing nothing.
     expect_unsupported(backend.enable_key(key_id).await);
     expect_unsupported(backend.disable_key(key_id).await);
     expect_unsupported(backend.rotate_key(key_id).await);
+    expect_unsupported(
+        backend
+            .rewrap_data_key(RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext_blob.clone(),
+                encryption_context: context(),
+            })
+            .await,
+    );
+    expect_unsupported(
+        backend
+            .describe_data_key_wrapping(DescribeDataKeyWrappingRequest {
+                ciphertext: data_key.ciphertext_blob,
+                encryption_context: context(),
+            })
+            .await,
+    );
 }
 
 fn vault_dev_config(constructor: fn(url::Url, String) -> KmsConfig) -> KmsConfig {

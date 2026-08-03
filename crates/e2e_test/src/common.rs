@@ -24,7 +24,12 @@
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
+use http::header::{CONTENT_TYPE, HOST};
 use reqwest::Client as HttpClient;
+use reqwest::StatusCode;
+use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use rustfs_signer::sign_v4;
+use s3s::Body;
 use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::path::{Path, PathBuf};
@@ -44,6 +49,21 @@ pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
+
+fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
+    let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
+    Some(log_dir.join(format!("{temp_name}.log")))
+}
+
+fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
+    let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR")?;
+    if stdfs::create_dir_all(&log_dir).is_err() {
+        warn!(?log_dir, "failed to create configured E2E server log directory");
+        return None;
+    }
+
+    capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
+}
 
 fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
     let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
@@ -73,6 +93,58 @@ pub fn local_http_client() -> HttpClient {
         .no_proxy()
         .build()
         .expect("failed to build local reqwest client")
+}
+
+/// Signs and sends an admin HTTP request with the given credentials.
+pub(crate) async fn admin_request(
+    base_url: &str,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{base_url}{path_and_query}");
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
+    let mut request = http::Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .header(HOST, authority)
+        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if body.is_some() {
+        request = request.header(CONTENT_TYPE, "application/json");
+    }
+
+    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "admin request body is too large")?;
+    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
+
+    let mut request = local_http_client().request(method, &url);
+    for (name, value) in signed.headers() {
+        request = request.header(name, value);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    Ok((status, body))
+}
+
+/// Sends a root-credential admin request and returns its successful response body.
+pub(crate) async fn admin_ok(
+    env: &RustFSTestEnvironment,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (status, response_body) =
+        admin_request(&env.url, method.clone(), path_and_query, body, &env.access_key, &env.secret_key).await?;
+    if !status.is_success() {
+        return Err(format!("{method} {path_and_query} failed: {status} {response_body}").into());
+    }
+    Ok(response_body)
 }
 
 /// Resolve the RustFS binary relative to the workspace.
@@ -304,6 +376,7 @@ impl RustFSTestEnvironment {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = format!("/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
+        let capture_log_path = configured_capture_log_path(&temp_dir);
 
         // Use a unique port for each test environment
         let port = Self::find_available_port().await?;
@@ -317,7 +390,7 @@ impl RustFSTestEnvironment {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
-            capture_log_path: None,
+            capture_log_path,
         })
     }
 
@@ -325,6 +398,7 @@ impl RustFSTestEnvironment {
     pub async fn with_address(address: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = format!("/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
+        let capture_log_path = configured_capture_log_path(&temp_dir);
 
         let url = format!("http://{address}");
 
@@ -335,7 +409,7 @@ impl RustFSTestEnvironment {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
-            capture_log_path: None,
+            capture_log_path,
         })
     }
 
@@ -1333,6 +1407,14 @@ mod tests {
             Some("sftp,ftps,webdav".to_string())
         );
         assert_eq!(normalize_rustfs_build_features(" , "), None);
+    }
+
+    #[test]
+    fn capture_log_path_uses_temp_directory_basename() {
+        assert_eq!(
+            capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
+            Some(PathBuf::from("/tmp/e2e-logs/rustfs_e2e_test_abc.log"))
+        );
     }
 
     #[test]

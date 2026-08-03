@@ -49,7 +49,13 @@ mod bucket_default_encryption_test;
 mod encryption_metadata_test;
 
 #[cfg(test)]
+mod copy_object_self_copy_sse_test;
+
+#[cfg(test)]
 mod copy_object_version_restore_sse_test;
 
 #[cfg(test)]
 mod configured_roundtrip_test;
+
+#[cfg(test)]
+mod kms_authorization_negative_matrix_test;

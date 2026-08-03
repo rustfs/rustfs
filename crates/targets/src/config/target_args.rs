@@ -624,6 +624,7 @@ mod tests {
         REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
         REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL, WEBHOOK_ENDPOINT,
     };
+    use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 
     fn absolute_test_path(path: &str) -> String {
         std::env::temp_dir().join(path).to_string_lossy().into_owned()
@@ -780,11 +781,29 @@ mod tests {
     #[test]
     fn build_webhook_args_rejects_loopback_endpoint() {
         let mut config = webhook_base_config();
-        config.insert(WEBHOOK_ENDPOINT.to_string(), "https://127.0.0.1/hook".to_string());
+        config.insert(WEBHOOK_ENDPOINT.to_string(), "https://127.0.0.1:8443/hook".to_string());
 
         let err = build_webhook_args(&config, "/tmp/webhook-queue", TargetType::NotifyEvent)
             .expect_err("loopback endpoint should be rejected");
-        assert!(err.to_string().contains("not allowed"));
+        let message = err.to_string();
+        assert!(message.contains(&format!("add https://127.0.0.1:8443 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+        assert!(message.contains("loopback address"));
+        assert!(message.contains("comma-separated"));
+        assert!(message.contains("restart RustFS"));
+        assert!(!message.contains("/hook"));
+        assert!(message.contains("origin only, no path"));
+    }
+
+    #[test]
+    fn build_webhook_args_does_not_offer_allowlist_for_metadata_endpoint() {
+        let mut config = webhook_base_config();
+        config.insert(WEBHOOK_ENDPOINT.to_string(), "http://169.254.169.254/latest/meta-data".to_string());
+
+        let err = build_webhook_args(&config, "/tmp/webhook-queue", TargetType::NotifyEvent)
+            .expect_err("metadata endpoint should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("not allowed"));
+        assert!(!message.contains(ENV_OUTBOUND_ALLOW_ORIGINS));
     }
 
     #[test]

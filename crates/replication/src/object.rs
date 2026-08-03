@@ -164,6 +164,7 @@ mod tests {
         replication_etags_match, target_is_newer_than_source_null_version,
     };
     use crate::filemeta::{ReplicationAction, ReplicationType};
+    use crate::http::AMZ_OBJECT_LOCK_MODE;
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
 
@@ -264,6 +265,29 @@ mod tests {
         let changed_metadata = target_object(&changed_target_metadata);
         assert_eq!(
             replication_action_for_target(&source, &changed_metadata, ReplicationType::ExistingObject),
+            ReplicationAction::Metadata
+        );
+    }
+
+    #[test]
+    fn replication_action_detects_tags_and_object_lock_metadata_differences() {
+        let mut source_metadata = HashMap::new();
+        source_metadata.insert(AMZ_OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string());
+        let source = ReplicationSourceObject {
+            user_tags: "a=1&b=2",
+            user_defined: &source_metadata,
+            ..source_object(&source_metadata)
+        };
+
+        let target_metadata = HashMap::new();
+        let target = ReplicationTargetObject {
+            tag_count: 1,
+            metadata: Some(&target_metadata),
+            ..target_object(&target_metadata)
+        };
+
+        assert_eq!(
+            replication_action_for_target(&source, &target, ReplicationType::Metadata),
             ReplicationAction::Metadata
         );
     }

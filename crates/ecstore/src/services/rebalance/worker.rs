@@ -10,8 +10,8 @@ use crate::disk::error::DiskError;
 use crate::error::{
     Error, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down,
 };
-use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
+use crate::store::ECStore;
 use rand::RngExt as _;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use std::sync::Arc;
@@ -376,7 +376,7 @@ pub(super) fn resolve_rebalance_optional_bucket_config_result<T>(
     }
 }
 
-pub(super) async fn load_rebalance_bucket_configs(bucket: &str) -> Result<RebalanceBucketConfigs> {
+pub(super) async fn load_rebalance_bucket_configs(api: &ECStore, bucket: &str) -> Result<RebalanceBucketConfigs> {
     if bucket == crate::disk::RUSTFS_META_BUCKET {
         return Ok(RebalanceBucketConfigs::default());
     }
@@ -387,9 +387,10 @@ pub(super) async fn load_rebalance_bucket_configs(bucket: &str) -> Result<Rebala
         crate::bucket::versioning_sys::BucketVersioningSys::get(bucket).await,
     )?;
 
+    let expiry_configs = crate::bucket::lifecycle::get_expiry_configs(api, bucket).await?;
     Ok(RebalanceBucketConfigs {
-        lifecycle_config: runtime_sources::bucket_lifecycle_config(bucket).await,
-        lock_retention: crate::bucket::object_lock::objectlock_sys::BucketObjectLockSys::get(bucket).await,
+        lifecycle_config: expiry_configs.lifecycle.map(|config| (*config).clone()),
+        object_lock_config: expiry_configs.object_lock.map(|config| (*config).clone()),
         replication_config: resolve_rebalance_optional_bucket_config_result(
             bucket,
             "replication",

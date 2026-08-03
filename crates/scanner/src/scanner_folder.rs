@@ -52,9 +52,9 @@ use tracing::{debug, error, warn};
 
 use crate::{
     BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, ScannerDiskExt as _,
-    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
-    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE,
+    ScannerDiskExt as _, ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule,
+    apply_transition_rule, enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
     path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
     scanner_replication_config_for_lifecycle_eval,
 };
@@ -75,9 +75,11 @@ const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
-const SCANNER_LIST_PATH_RAW_TIMEOUT: Duration = Duration::from_secs(60);
+const SCANNER_LIST_PATH_RAW_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_ENTRY_PROGRESS_BATCH: u64 = 32;
 const SCANNER_ENTRY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+// Erasure data directories contain direct part.N files; keep namespace probes bounded.
+const ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT: usize = 64;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
 const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
 const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
@@ -99,6 +101,21 @@ const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
 static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
 static SCANNER_INLINE_HEAL_METRICS_ONCE: Once = Once::new();
 static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
+
+#[cfg(test)]
+type ListPathRawTimeoutSnapshot = (bool, Option<Duration>, Option<Duration>);
+
+fn scanner_abandoned_child_list_options() -> ListPathRawOptions {
+    // A complete heal walk scales with bucket size and may legitimately take
+    // longer than a fixed wall-clock budget. Keep the total duration unbounded;
+    // Retain the scanner's per-read stall budget and keep cancellation controlled
+    // by the scanner cycle token.
+    ListPathRawOptions {
+        skip_walkdir_total_timeout: true,
+        walkdir_stall_timeout: Some(SCANNER_LIST_PATH_RAW_STALL_TIMEOUT),
+        ..Default::default()
+    }
+}
 
 pub fn data_usage_update_dir_cycles() -> u32 {
     rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES)
@@ -444,6 +461,8 @@ fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) 
             .pending_count
             .saturating_add(u64::try_from(st.pending_count).unwrap_or(u64::MAX));
     }
+
+    into.add_tier_sizes(&summary.tier_stats);
 }
 
 /// Cached folder information for scanning
@@ -1023,7 +1042,7 @@ impl ScannerItem {
     }
 
     async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
-        if oi.version_id.is_none_or(|v| v.is_nil()) {
+        if oi.version_id.is_none_or(|version| version.is_nil()) && !oi.delete_marker && oi.version_purge_status.is_empty() {
             return;
         }
 
@@ -1239,6 +1258,43 @@ fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) -> GetSizeF
     GetSizeFailureAction::RecordFailed
 }
 
+async fn contains_erasure_part_file(path: &str) -> Result<bool, ScannerError> {
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
+        Err(err) => return Err(ScannerError::Io(err)),
+    };
+
+    for _ in 0..ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return Ok(false),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
+            Err(err) => return Err(ScannerError::Io(err)),
+        };
+        let file_name = entry.file_name();
+        let Some(part_number) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix("part."))
+            .and_then(|number| number.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if part_number == 0 {
+            continue;
+        }
+
+        match entry.file_type().await {
+            Ok(file_type) if file_type.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => {}
+            Err(err) => return Err(ScannerError::Io(err)),
+        }
+    }
+
+    Ok(false)
+}
+
 fn data_usage_root_has_progress(root: &DataUsageEntry) -> bool {
     !root.children.is_empty()
         || root.size > 0
@@ -1263,6 +1319,7 @@ pub struct FolderScanner {
     data_usage_scanner_debug: bool,
     heal_object_select: u32,
     scan_mode: HealScanMode,
+    is_erasure_mode: bool,
 
     failed_object_ttl_secs: u64,
     failed_objects_max: usize,
@@ -1281,6 +1338,8 @@ pub struct FolderScanner {
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
     pending_heals_changed: bool,
+    #[cfg(test)]
+    list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
 }
 
 impl FolderScanner {
@@ -1835,7 +1894,8 @@ impl FolderScanner {
 
             let mut existing_folders: Vec<CachedFolder> = Vec::new();
             let mut new_folders: Vec<CachedFolder> = Vec::new();
-            let mut found_objects = false;
+            let mut found_object_metadata = false;
+            let mut erasure_data_directory_candidates: Vec<(CachedFolder, bool, String)> = Vec::new();
             let mut object_count: u64 = 0;
             let yield_every_objects = scanner_yield_every_n_objects();
 
@@ -1902,6 +1962,7 @@ impl FolderScanner {
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
                 }
+                let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;
 
                 let file_path = entry.path().to_string_lossy().to_string();
 
@@ -1945,6 +2006,14 @@ impl FolderScanner {
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
+
+                // Metadata presence establishes an erasure object boundary;
+                // parsing failures still belong to accounting and healing. A
+                // directory named `xl.meta` remains a valid namespace prefix,
+                // and symlinks are classified after resolving their target.
+                if is_storage_format_entry && !entry_type.is_dir() && !entry_type.is_symlink() {
+                    found_object_metadata = true;
+                }
 
                 if entry_type.is_symlink() {
                     let metadata = match tokio::fs::metadata(&file_path).await {
@@ -1992,6 +2061,9 @@ impl FolderScanner {
                     }
 
                     entry_type = metadata.file_type();
+                    if is_storage_format_entry {
+                        found_object_metadata = true;
+                    }
                 }
 
                 // ok
@@ -2023,6 +2095,11 @@ impl FolderScanner {
                         parent: Some(this_hash.clone()),
                         object_heal_prob_div: folder.object_heal_prob_div,
                     };
+
+                    if self.is_erasure_mode && uuid::Uuid::parse_str(&file_name).is_ok_and(|data_dir_id| !data_dir_id.is_nil()) {
+                        erasure_data_directory_candidates.push((this, exists, file_path));
+                        continue;
+                    }
 
                     abandoned_children.remove(&h.key());
 
@@ -2113,7 +2190,7 @@ impl FolderScanner {
                     }
                 };
 
-                found_objects = true;
+                found_object_metadata = true;
 
                 item.transform_meta_dir();
 
@@ -2139,11 +2216,70 @@ impl FolderScanner {
             }
             self.budget.record_entries_visited(pending_entry_progress);
 
+            let mut found_erasure_data_directory = false;
+            if self.is_erasure_mode && !found_object_metadata {
+                for (_, _, path) in &erasure_data_directory_candidates {
+                    if contains_erasure_part_file(path).await? {
+                        found_erasure_data_directory = true;
+                        break;
+                    }
+                }
+            }
+
+            if !found_object_metadata && !found_erasure_data_directory {
+                for (candidate, exists, _) in erasure_data_directory_candidates {
+                    let h = hash_path(&candidate.name);
+                    abandoned_children.remove(&h.key());
+                    if exists {
+                        self.update_cache.copy_with_children(&self.old_cache, &h, &candidate.parent);
+                        existing_folders.push(candidate);
+                    } else {
+                        new_folders.push(candidate);
+                    }
+                }
+            }
+
+            if self.is_erasure_mode && found_erasure_data_directory && !found_object_metadata {
+                found_object_metadata = true;
+                let metadata_path = path_join_buf(&[&dir_path, STORAGE_FORMAT_FILE]);
+
+                if !self.should_skip_failed(&metadata_path) {
+                    into.failed_objects = into.failed_objects.saturating_add(1);
+                    self.record_failed(&metadata_path);
+
+                    let failed_cache_entries = self.new_cache.info.failed_objects.len();
+                    if failed_cache_entries > 0 && should_log_failed_object(failed_cache_entries) {
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            path = %metadata_path,
+                            failed_objects = failed_cache_entries,
+                            state = "object_metadata_missing",
+                            "Scanner found erasure object data without metadata"
+                        );
+                    }
+
+                    let (bucket, object) = path2_bucket_object_with_base_path(&self.root, &folder.name);
+                    if !bucket.is_empty() && !object.is_empty() {
+                        self.send_required_scanner_heal_request(
+                            PendingScannerHealKind::Object,
+                            bucket.clone(),
+                            Some(object.clone()),
+                            None,
+                            build_object_heal_request(bucket, object, None, self.scan_mode, HealChannelPriority::High),
+                        )
+                        .await?;
+                    }
+                }
+            }
+
             if ctx.is_cancelled() {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
 
-            if found_objects && scanner_is_erasure().await {
+            if found_object_metadata && self.is_erasure_mode {
                 // If we found an object in erasure mode, we skip subdirs (only datadirs)...
                 debug!(
                     target: "rustfs::scanner::folder",
@@ -2410,75 +2546,79 @@ impl FolderScanner {
                 let bucket_clone = bucket.clone();
                 let prefix_clone = prefix.clone();
                 let child_ctx_clone = child_ctx.clone();
+                #[cfg(test)]
+                let list_path_raw_options_observer = self.list_path_raw_options_observer.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = list_path_raw(
-                        child_ctx_clone.clone(),
-                        ListPathRawOptions {
-                            disks,
-                            bucket: bucket_clone.clone(),
-                            path: prefix_clone.clone(),
-                            recursive: true,
-                            report_not_found: true,
-                            min_disks: disks_quorum,
-                            walkdir_timeout: Some(SCANNER_LIST_PATH_RAW_TIMEOUT),
-                            walkdir_stall_timeout: Some(SCANNER_LIST_PATH_RAW_TIMEOUT),
-                            agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                                let entry_name = entry.name.clone();
-                                let agreed_tx = agreed_tx.clone();
-                                Box::pin(async move {
-                                    if let Err(e) = agreed_tx.send(entry_name).await {
-                                        error!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_FOLDER_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                                            entry = %entry.name,
-                                            state = "list_path_agreed_send_failed",
-                                            error = %e,
-                                            "Scanner list_path_raw agreed callback failed"
-                                        );
-                                    }
-                                })
-                            })),
-                            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                                let partial_tx = partial_tx.clone();
-                                Box::pin(async move {
-                                    if let Err(e) = partial_tx.send(entries).await {
-                                        error!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_FOLDER_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                                            state = "list_path_partial_send_failed",
-                                            error = %e,
-                                            "Scanner list_path_raw partial callback failed"
-                                        );
-                                    }
-                                })
-                            })),
-                            finished: Some(Box::new(move |errs: &[Option<DiskError>]| {
-                                let finished_tx = finished_tx.clone();
-                                let errs_clone = errs.to_vec();
-                                Box::pin(async move {
-                                    if let Err(e) = finished_tx.send(errs_clone).await {
-                                        error!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_FOLDER_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                                            state = "list_path_finished_send_failed",
-                                            error = %e,
-                                            "Scanner list_path_raw finished callback failed"
-                                        );
-                                    }
-                                })
-                            })),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    {
+                    let options = ListPathRawOptions {
+                        disks,
+                        bucket: bucket_clone.clone(),
+                        path: prefix_clone.clone(),
+                        recursive: true,
+                        report_not_found: true,
+                        min_disks: disks_quorum,
+                        agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                            let entry_name = entry.name.clone();
+                            let agreed_tx = agreed_tx.clone();
+                            Box::pin(async move {
+                                if let Err(e) = agreed_tx.send(entry_name).await {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        entry = %entry.name,
+                                        state = "list_path_agreed_send_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw agreed callback failed"
+                                    );
+                                }
+                            })
+                        })),
+                        partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                            let partial_tx = partial_tx.clone();
+                            Box::pin(async move {
+                                if let Err(e) = partial_tx.send(entries).await {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        state = "list_path_partial_send_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw partial callback failed"
+                                    );
+                                }
+                            })
+                        })),
+                        finished: Some(Box::new(move |errs: &[Option<DiskError>]| {
+                            let finished_tx = finished_tx.clone();
+                            let errs_clone = errs.to_vec();
+                            Box::pin(async move {
+                                if let Err(e) = finished_tx.send(errs_clone).await {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        state = "list_path_finished_send_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw finished callback failed"
+                                    );
+                                }
+                            })
+                        })),
+                        ..scanner_abandoned_child_list_options()
+                    };
+                    #[cfg(test)]
+                    if let Some(observer) = list_path_raw_options_observer {
+                        let _ = observer.send((
+                            options.skip_walkdir_total_timeout,
+                            options.walkdir_timeout,
+                            options.walkdir_stall_timeout,
+                        ));
+                    }
+                    if let Err(e) = list_path_raw(child_ctx_clone.clone(), options).await {
                         if is_missing_path_disk_error(&e) {
                             debug!(
                                 target: "rustfs::scanner::folder",
@@ -2808,6 +2948,7 @@ pub async fn scan_data_folder(
         data_usage_scanner_debug: false,
         heal_object_select,
         scan_mode,
+        is_erasure_mode,
         failed_object_ttl_secs: failed_object_ttl,
         failed_objects_max,
         sleeper,
@@ -2820,6 +2961,8 @@ pub async fn scan_data_folder(
         skip_heal,
         local_disk,
         pending_heals_changed: false,
+        #[cfg(test)]
+        list_path_raw_options_observer: None,
     };
 
     // Check if context is cancelled
@@ -2908,7 +3051,7 @@ mod tests {
 
     use super::*;
     use crate::storage_api::VersionPurgeStatusType;
-    use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, new_disk};
+    use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
     use rustfs_filemeta::{FileInfo, FileMeta};
     use serial_test::serial;
     #[cfg(unix)]
@@ -2987,6 +3130,56 @@ mod tests {
         assert_eq!(target_stats.pending_count, u64::MAX);
     }
 
+    #[test]
+    fn scanner_size_summary_application_accumulates_tier_stats() {
+        let mut entry = DataUsageEntry::default();
+        let mut summary = SizeSummary::default();
+        summary.tier_stats.insert(
+            "WARM".to_string(),
+            TierStats {
+                total_size: 100,
+                num_versions: 2,
+                num_objects: 1,
+            },
+        );
+        // Scanners seed a zeroed entry for every configured tier; those must not
+        // reach the cache as empty keys.
+        summary
+            .tier_stats
+            .insert(storageclass::STANDARD.to_string(), TierStats::default());
+
+        apply_scanner_size_summary(&mut entry, &summary);
+        apply_scanner_size_summary(&mut entry, &summary);
+
+        let tiers = entry.all_tier_stats.as_ref().expect("tier stats should be recorded");
+        assert_eq!(
+            tiers.tiers.get("WARM"),
+            Some(&TierStats {
+                total_size: 200,
+                num_versions: 4,
+                num_objects: 2,
+            })
+        );
+        assert!(!tiers.tiers.contains_key(storageclass::STANDARD));
+    }
+
+    #[test]
+    fn scanner_size_summary_application_skips_untiered_summaries() {
+        let mut entry = DataUsageEntry::default();
+        let mut summary = SizeSummary {
+            total_size: 10,
+            ..Default::default()
+        };
+        summary
+            .tier_stats
+            .insert(storageclass::STANDARD.to_string(), TierStats::default());
+        summary.tier_stats.insert(storageclass::RRS.to_string(), TierStats::default());
+
+        apply_scanner_size_summary(&mut entry, &summary);
+
+        assert!(entry.all_tier_stats.is_none(), "zero-only tier maps must not allocate cache state");
+    }
+
     async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&temp_dir)
@@ -3014,6 +3207,7 @@ mod tests {
             data_usage_scanner_debug: false,
             heal_object_select: 0,
             scan_mode: HealScanMode::Normal,
+            is_erasure_mode: false,
             failed_object_ttl_secs: u64::MAX,
             failed_objects_max: usize::MAX,
             sleeper: SCANNER_SLEEPER.clone(),
@@ -3026,6 +3220,7 @@ mod tests {
             skip_heal: Arc::new(AtomicBool::new(false)),
             local_disk: disk,
             pending_heals_changed: false,
+            list_path_raw_options_observer: None,
         };
 
         (scanner, temp_dir)
@@ -3162,6 +3357,61 @@ mod tests {
             ..Default::default()
         };
         assert!(!ScannerItem::should_account_replication_stats(&purge_version));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_heal_replication_only_queues_pending_null_deletes() {
+        async fn replication_skipped_count() -> u64 {
+            global_metrics()
+                .report()
+                .await
+                .source_work
+                .iter()
+                .find(|work| work.source == ScannerWorkSource::BucketReplication.as_str())
+                .map(|work| work.skipped)
+                .unwrap_or_default()
+        }
+
+        let temp_dir = std::env::temp_dir();
+        let file_type = std::fs::metadata(&temp_dir)
+            .expect("temp dir metadata should be readable")
+            .file_type();
+        let mut item = ScannerItem {
+            path: temp_dir.join("object").to_string_lossy().to_string(),
+            bucket: "bucket".to_string(),
+            prefix: String::new(),
+            object_name: "object".to_string(),
+            file_type,
+            lifecycle: None,
+            object_lock: None,
+            replication: Some(Arc::new(ReplicationConfig::new(None, None))),
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+        let null_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::nil()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let mut size_summary = SizeSummary::default();
+        let before = replication_skipped_count().await;
+
+        item.heal_replication(&null_object, &mut size_summary).await;
+        assert_eq!(replication_skipped_count().await, before);
+
+        item.heal_replication(
+            &ObjectInfo {
+                version_purge_status: VersionPurgeStatusType::Pending,
+                ..null_object
+            },
+            &mut size_summary,
+        )
+        .await;
+        assert_eq!(replication_skipped_count().await, before + 1);
     }
 
     #[tokio::test]
@@ -4210,6 +4460,8 @@ mod tests {
         scanner.heal_object_select = 1;
         scanner.disks = disks;
         scanner.disks_quorum = 2;
+        let (options_tx, mut options_rx) = mpsc::unbounded_channel();
+        scanner.list_path_raw_options_observer = Some(options_tx);
         scanner.old_cache.replace(
             &format!("{bucket}/{object}"),
             bucket,
@@ -4231,6 +4483,11 @@ mod tests {
             .expect("scan_folder should not hang after list_path_raw finishes")
             .expect("scan_folder should finish successfully");
 
+        let observed_options = tokio::time::timeout(Duration::from_secs(1), options_rx.recv())
+            .await
+            .expect("abandoned-child listing options should be observed promptly")
+            .expect("abandoned-child listing options channel should remain open");
+        assert_eq!(observed_options, (true, None, Some(SCANNER_LIST_PATH_RAW_STALL_TIMEOUT)));
         let root = scanner
             .new_cache
             .checked_flatten(bucket)
@@ -4241,18 +4498,19 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_scan_folder_directory_budget_cancels_after_limit() {
+    async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
 
         let bucket_dir = temp_dir.join("bucket");
-        tokio::fs::create_dir_all(bucket_dir.join("child"))
+        tokio::fs::create_dir_all(bucket_dir.join(STORAGE_FORMAT_FILE))
             .await
-            .expect("failed to create child directory");
+            .expect("failed to create xl.meta namespace directory");
 
         scanner.old_cache.info.name = "bucket".to_string();
         scanner.new_cache.info.name = "bucket".to_string();
         scanner.update_cache.info.name = "bucket".to_string();
+        scanner.is_erasure_mode = true;
 
         let parent = CancellationToken::new();
         let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -4274,11 +4532,322 @@ mod tests {
         let mut into = DataUsageEntry::default();
         let result = scanner.scan_folder(ctx, folder, &mut into).await;
 
-        assert!(result.is_err(), "directory budget cancellation should make the scan partial");
+        assert!(
+            result.is_err(),
+            "an xl.meta namespace directory must be traversed instead of treated as object metadata"
+        );
         assert!(budget.budget_elapsed());
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
         assert!(budget.token().is_cancelled());
         assert!(budget.entries_visited() >= 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let object_dir = temp_dir.join("bucket").join("object");
+        let data_dir = object_dir.join(Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .expect("failed to create erasure data directory");
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+        tokio::fs::write(&metadata_path, b"")
+            .await
+            .expect("failed to create corrupt object metadata");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.is_erasure_mode = true;
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        scanner.budget = budget.clone();
+
+        let folder = CachedFolder {
+            name: "bucket/object".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut into = DataUsageEntry::default();
+
+        scanner
+            .scan_folder(budget.token(), folder, &mut into)
+            .await
+            .expect("failed metadata must not make scanner descend into erasure data directories");
+
+        assert_eq!(into.failed_objects, 1);
+        assert!(
+            scanner
+                .new_cache
+                .info
+                .failed_objects
+                .contains_key(metadata_path.to_string_lossy().as_ref())
+        );
+        assert!(!budget.budget_elapsed());
+        assert_eq!(budget.reason(), None);
+
+        let retry_budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        scanner.budget = retry_budget.clone();
+        let retry_folder = CachedFolder {
+            name: "bucket/object".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut retry_into = DataUsageEntry::default();
+
+        scanner
+            .scan_folder(retry_budget.token(), retry_folder, &mut retry_into)
+            .await
+            .expect("cached metadata failure must still stop erasure data directory descent");
+
+        assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
+        assert!(!retry_budget.budget_elapsed());
+        assert_eq!(retry_budget.reason(), None);
+
+        #[cfg(unix)]
+        {
+            tokio::fs::remove_file(&metadata_path)
+                .await
+                .expect("failed to remove corrupt object metadata");
+            tokio::fs::write(data_dir.join("part.1"), b"shard")
+                .await
+                .expect("failed to create erasure shard");
+            scanner.new_cache.info.failed_objects.clear();
+            let metadata_target = temp_dir.join("metadata-target");
+            tokio::fs::create_dir(&metadata_target)
+                .await
+                .expect("failed to create metadata symlink target");
+            std::os::unix::fs::symlink(&metadata_target, &metadata_path).expect("failed to create metadata directory symlink");
+
+            let symlink_budget = ScannerCycleBudget::new_with_progress_tracking(
+                &parent,
+                crate::scanner_budget::ScannerCycleBudgetConfig {
+                    max_directories: Some(1),
+                    ..Default::default()
+                },
+            );
+            scanner.budget = symlink_budget.clone();
+            let symlink_folder = CachedFolder {
+                name: "bucket/object".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            };
+            let mut symlink_into = DataUsageEntry::default();
+
+            scanner
+                .scan_folder(symlink_budget.token(), symlink_folder, &mut symlink_into)
+                .await
+                .expect("metadata symlink must still stop erasure data directory descent");
+
+            assert_eq!(symlink_into.failed_objects, 1);
+            assert!(
+                scanner
+                    .new_cache
+                    .info
+                    .failed_objects
+                    .contains_key(metadata_path.to_string_lossy().as_ref())
+            );
+            assert!(!symlink_budget.budget_elapsed());
+            assert_eq!(symlink_budget.reason(), None);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let object_dir = temp_dir.join("bucket").join("object");
+        let data_dir = object_dir.join(Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .expect("failed to create erasure data directory");
+        tokio::fs::write(data_dir.join("part.1"), b"shard")
+            .await
+            .expect("failed to create erasure shard");
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.is_erasure_mode = true;
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        scanner.budget = budget.clone();
+        let folder = CachedFolder {
+            name: "bucket/object".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut into = DataUsageEntry::default();
+
+        scanner
+            .scan_folder(budget.token(), folder, &mut into)
+            .await
+            .expect("missing metadata must not make scanner descend into erasure data directories");
+
+        assert_eq!(into.failed_objects, 1);
+        assert!(
+            scanner
+                .new_cache
+                .info
+                .failed_objects
+                .contains_key(metadata_path.to_string_lossy().as_ref())
+        );
+        assert!(!budget.budget_elapsed());
+        assert_eq!(budget.reason(), None);
+
+        let retry_budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        scanner.budget = retry_budget.clone();
+        let retry_folder = CachedFolder {
+            name: "bucket/object".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut retry_into = DataUsageEntry::default();
+
+        scanner
+            .scan_folder(retry_budget.token(), retry_folder, &mut retry_into)
+            .await
+            .expect("cached missing metadata must still stop erasure data directory descent");
+
+        assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
+        assert!(!retry_budget.budget_elapsed());
+        assert_eq!(retry_budget.reason(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let namespace_name = Uuid::new_v4().to_string();
+        let namespace = temp_dir.join("bucket").join(&namespace_name);
+        tokio::fs::create_dir_all(namespace.join("part.1"))
+            .await
+            .expect("failed to create UUID namespace with part-like child directory");
+        let nil_uuid_namespace = temp_dir.join("bucket").join(Uuid::nil().to_string());
+        tokio::fs::create_dir_all(&nil_uuid_namespace)
+            .await
+            .expect("failed to create nil UUID namespace");
+        tokio::fs::write(nil_uuid_namespace.join("part.1"), b"namespace object")
+            .await
+            .expect("failed to create object in nil UUID namespace");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.is_erasure_mode = true;
+        let namespace_hash = hash_path(&format!("bucket/{namespace_name}"));
+        scanner.old_cache.replace_hashed(
+            &namespace_hash,
+            &Some(hash_path("bucket")),
+            &DataUsageEntry {
+                objects: 1,
+                size: 16,
+                ..Default::default()
+            },
+        );
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        scanner.budget = budget.clone();
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut into = DataUsageEntry::default();
+
+        let result = scanner.scan_folder(budget.token(), folder, &mut into).await;
+
+        assert!(result.is_err(), "part.N directories and nil UUID namespaces must remain traversable");
+        assert!(budget.budget_elapsed());
+        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+        assert!(scanner.new_cache.info.failed_objects.is_empty());
+        assert!(
+            scanner.update_cache.find(&namespace_hash.key()).is_some(),
+            "an existing UUID namespace must retain its cached subtree"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let folder_path = temp_dir.join("bucket").join("object");
+        tokio::fs::create_dir_all(folder_path.join("child"))
+            .await
+            .expect("failed to create child namespace");
+        tokio::fs::write(folder_path.join(STORAGE_FORMAT_FILE), b"")
+            .await
+            .expect("failed to create metadata-shaped file");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.is_erasure_mode = false;
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        scanner.budget = budget.clone();
+        let folder = CachedFolder {
+            name: "bucket/object".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut into = DataUsageEntry::default();
+
+        let result = scanner.scan_folder(budget.token(), folder, &mut into).await;
+
+        assert!(result.is_err(), "non-erasure scans must not stop at metadata-shaped files");
+        assert!(budget.budget_elapsed());
+        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
     }
 
     #[tokio::test]

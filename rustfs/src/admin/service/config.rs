@@ -16,7 +16,9 @@ use crate::admin::runtime_sources::{
     AppContext, current_app_context, current_notification_system_for_context, current_object_store_handle_for_context,
     publish_server_config, publish_storage_class_config,
 };
-use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
+use crate::admin::storage_api::config::{
+    STORAGE_CLASS_SUB_SYS, read_existing_admin_server_config_no_lock, storageclass, with_admin_server_config_read_lock,
+};
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::server::{
@@ -42,6 +44,25 @@ use tracing::warn;
 use url::Url;
 
 static RUNTIME_CONFIG_RELOAD_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
+
+// Runtime publication lock order: reload mutex -> server-config local lock ->
+// transaction lock -> config object lock.
+pub(crate) async fn with_runtime_config_reload_lock<Fut, T>(operation: Fut) -> S3Result<T>
+where
+    Fut: Future<Output = S3Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
+    tokio::spawn(async move {
+        let _reload_guard = reload_guard;
+        operation.await
+    })
+    .await
+    .map_err(|err| {
+        let outcome = if err.is_cancelled() { "cancelled" } else { "panicked" };
+        internal_error(format!("runtime config reload task {outcome}"))
+    })?
+}
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     NOTIFY_SUB_SYSTEMS.contains(&sub_system)
@@ -120,11 +141,6 @@ impl PreparedRuntimeConfig {
 
     fn publish_storage_class_for_context(self, context: Option<&AppContext>) -> S3Result<()> {
         self.publish_storage_class_for_context_with(context, publish_storage_class_config)
-    }
-
-    pub(crate) fn publish_storage_class(self) -> S3Result<()> {
-        let context = current_app_context();
-        self.publish_storage_class_for_context(context.as_deref())
     }
 }
 
@@ -396,7 +412,18 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
 }
 
 pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
-    let _reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
+    let context = context.cloned();
+    let sub_system = sub_system.to_owned();
+    with_runtime_config_reload_lock(async move {
+        reload_dynamic_config_runtime_state_under_reload_lock_for_context(context.as_ref(), &sub_system).await
+    })
+    .await
+}
+
+async fn reload_dynamic_config_runtime_state_under_reload_lock_for_context(
+    context: Option<&AppContext>,
+    sub_system: &str,
+) -> S3Result<()> {
     if sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM {
         let store = resolve_runtime_config_store_for_context(context)?;
         let notify_result = reconcile_event_notifier_from_store(store).await;
@@ -414,18 +441,54 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
     }
 
     let store = resolve_runtime_config_store_for_context(context)?;
-    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
-        warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
-        internal_error(format!("failed to load server config: {err}"))
-    })?;
+    let read_store = store.clone();
+    let publication_context = context.cloned();
+    let publication_sub_system = sub_system.to_owned();
+    let notify_config = with_admin_server_config_read_lock(store, move || async move {
+        let config = read_existing_admin_server_config_no_lock(read_store).await.map_err(|err| {
+            warn!("peer reload_dynamic_config: failed to load server config for {publication_sub_system}: {err}");
+            internal_error(format!("failed to load server config: {err}"))
+        })?;
+        let prepared = prepare_server_config_for_context(publication_context.as_ref(), &config, Some(&publication_sub_system))
+            .await
+            .map_err(|err| {
+                if publication_sub_system == STORAGE_CLASS_SUB_SYS {
+                    internal_error(format!("failed to apply storage class config: {err}"))
+                } else {
+                    err
+                }
+            })?;
 
-    if matches!(sub_system, SCANNER_SUB_SYS | HEAL_SUB_SYS) {
-        validate_server_config_for_context(context, &config, Some(sub_system)).await?;
-        // Scanner cycles refresh from the process-wide server config before
-        // each pass. Publish the same validated snapshot first so that refresh
-        // cannot overwrite this peer's dynamic scanner update with stale data.
-        publish_server_config_for_context(context, config.clone());
-    }
+        if publication_sub_system == STORAGE_CLASS_SUB_SYS {
+            prepared.publish_storage_class_for_context(publication_context.as_ref())?;
+            return Ok::<Option<ServerConfig>, S3Error>(None);
+        }
+        if NOTIFY_SUB_SYSTEMS.contains(&publication_sub_system.as_str()) {
+            return Ok(Some(config));
+        }
+        if matches!(publication_sub_system.as_str(), SCANNER_SUB_SYS | HEAL_SUB_SYS) {
+            publish_server_config_for_context(publication_context.as_ref(), config.clone());
+        }
+        apply_dynamic_config_for_subsystem_for_context(publication_context.as_ref(), &config, &publication_sub_system)
+            .await
+            .inspect_err(|_| {
+                warn!(
+                    config_subsystem = publication_sub_system,
+                    reason = "apply_failed",
+                    "Peer dynamic config apply failed"
+                );
+            })?;
+        Ok(None)
+    })
+    .await
+    .map_err(|err| {
+        warn!("peer reload_dynamic_config: failed to acquire server config publication fence for {sub_system}: {err}");
+        internal_error(format!("failed to lock server config: {err}"))
+    })??;
+
+    let Some(config) = notify_config else {
+        return Ok(());
+    };
     apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
         .await
         .inspect_err(|_| {
@@ -439,23 +502,16 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
     reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await
 }
 
-async fn reload_runtime_config_snapshot_with<ReadFuture, Prepare, PrepareFuture, Publish, ApplyWorkers, ApplyWorkersFuture>(
-    read: ReadFuture,
-    prepare: Prepare,
-    publish: Publish,
+async fn reload_runtime_config_snapshot_with<PublishFuture, ApplyWorkers, ApplyWorkersFuture>(
+    publish_snapshot: PublishFuture,
     apply_workers: ApplyWorkers,
 ) -> S3Result<()>
 where
-    ReadFuture: Future<Output = S3Result<ServerConfig>>,
-    Prepare: FnOnce(ServerConfig) -> PrepareFuture,
-    PrepareFuture: Future<Output = S3Result<(ServerConfig, PreparedRuntimeConfig)>>,
-    Publish: FnOnce(&ServerConfig, PreparedRuntimeConfig) -> S3Result<()>,
+    PublishFuture: Future<Output = S3Result<ServerConfig>>,
     ApplyWorkers: FnOnce(ServerConfig) -> ApplyWorkersFuture,
     ApplyWorkersFuture: Future<Output = S3Result<()>>,
 {
-    let config = read.await?;
-    let (config, prepared) = prepare(config).await?;
-    publish(&config, prepared)?;
+    let config = publish_snapshot.await?;
 
     // Worker reloads mutate live state and have no rollback contract, so the
     // validated snapshots stay published. The RPC still reports convergence
@@ -474,55 +530,105 @@ where
     Ok(())
 }
 
-pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
-    let _reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
+async fn publish_latest_runtime_config_snapshot_under_reload_lock_for_context<ApplyWorkers, ApplyWorkersFuture>(
+    context: Option<&AppContext>,
+    sub_system: Option<&str>,
+    apply_workers: ApplyWorkers,
+) -> S3Result<()>
+where
+    ApplyWorkers: FnOnce(ServerConfig) -> ApplyWorkersFuture + Send + 'static,
+    ApplyWorkersFuture: Future<Output = S3Result<()>> + Send + 'static,
+{
     let store = resolve_runtime_config_store_for_context(context)?;
+    let read_store = store.clone();
+    let publication_context = context.cloned();
+    let publication_sub_system = sub_system.map(str::to_owned);
 
-    reload_runtime_config_snapshot_with(
-        async move {
-            read_admin_config_without_migrate(store).await.map_err(|err| {
-                warn!("peer reload_runtime_config_snapshot: failed to load server config: {err}");
-                internal_error(format!("failed to load server config: {err}"))
-            })
-        },
-        |config| async move {
-            let prepared = prepare_server_config_for_context(context, &config, None).await.map_err(|_| {
-                warn!("peer reload_runtime_config_snapshot: failed to prepare server config");
-                internal_error("failed to prepare server config")
-            })?;
-            Ok((config, prepared))
-        },
-        |config, prepared| {
-            prepared.publish_storage_class_for_context(context)?;
-            publish_server_config_for_context(context, config.clone());
-            Ok(())
-        },
-        |config| async move {
-            let mut failures = Vec::new();
-            for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
-                if apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
-                    .await
-                    .is_err()
+    with_admin_server_config_read_lock(store, move || async move {
+        let config = read_existing_admin_server_config_no_lock(read_store).await.map_err(|err| {
+            warn!("runtime config publication failed to load server config: {err}");
+            internal_error(format!("failed to load server config: {err}"))
+        })?;
+        let prepared =
+            prepare_server_config_for_context(publication_context.as_ref(), &config, publication_sub_system.as_deref())
+                .await
+                .map_err(|err| match publication_sub_system.as_deref() {
+                    None => {
+                        warn!("peer reload_runtime_config_snapshot: failed to prepare server config");
+                        internal_error("failed to prepare server config")
+                    }
+                    Some(STORAGE_CLASS_SUB_SYS) => internal_error(format!("failed to apply storage class config: {err}")),
+                    Some(_) => err,
+                })?;
+        reload_runtime_config_snapshot_with(
+            async move {
+                if publication_sub_system
+                    .as_deref()
+                    .is_none_or(|sub_system| sub_system == STORAGE_CLASS_SUB_SYS)
                 {
-                    failures.push(sub_system);
-                    warn!(
-                        event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_CONFIG,
-                        config_subsystem = sub_system,
-                        state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
-                        reason = "apply_failed",
-                        "Peer runtime config snapshot was published but a subsystem worker reload failed"
-                    );
+                    prepared.publish_storage_class_for_context(publication_context.as_ref())?;
                 }
+                publish_server_config_for_context(publication_context.as_ref(), config.clone());
+                Ok(config)
+            },
+            apply_workers,
+        )
+        .await
+    })
+    .await
+    .map_err(|err| {
+        warn!("runtime config publication failed to acquire server config publication fence: {err}");
+        internal_error(format!("failed to lock server config: {err}"))
+    })?
+}
+
+pub(crate) async fn publish_latest_runtime_config_snapshot(sub_system: &str) -> S3Result<()> {
+    let context = current_app_context();
+    let sub_system = sub_system.to_owned();
+    with_runtime_config_reload_lock(async move {
+        publish_latest_runtime_config_snapshot_under_reload_lock_for_context(context.as_deref(), Some(&sub_system), |_| async {
+            Ok(())
+        })
+        .await
+    })
+    .await
+}
+
+pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
+    let context = context.cloned();
+    with_runtime_config_reload_lock(async move {
+        reload_runtime_config_snapshot_under_reload_lock_for_context(context.as_ref()).await
+    })
+    .await
+}
+
+async fn reload_runtime_config_snapshot_under_reload_lock_for_context(context: Option<&AppContext>) -> S3Result<()> {
+    let worker_context = context.cloned();
+    publish_latest_runtime_config_snapshot_under_reload_lock_for_context(context, None, move |config| async move {
+        let mut failures = Vec::new();
+        for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
+            if apply_dynamic_config_for_subsystem_for_context(worker_context.as_ref(), &config, sub_system)
+                .await
+                .is_err()
+            {
+                failures.push(sub_system);
+                warn!(
+                    event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    config_subsystem = sub_system,
+                    state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
+                    reason = "apply_failed",
+                    "Peer runtime config snapshot was published but a subsystem worker reload failed"
+                );
             }
-            if failures.is_empty() {
-                Ok(())
-            } else {
-                Err(internal_error(format!("runtime worker reload failed: {}", failures.join("; "))))
-            }
-        },
-    )
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(internal_error(format!("runtime worker reload failed: {}", failures.join("; "))))
+        }
+    })
     .await
 }
 
@@ -697,6 +803,77 @@ mod tests {
         fn handle(&self) -> Option<Arc<NotificationSys>> {
             Some(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_waiter_cancellation_does_not_leave_queued_work() {
+        let _blocker = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
+        let (operation_started_tx, mut operation_started_rx) = tokio::sync::oneshot::channel();
+        let mut reload = Box::pin(with_runtime_config_reload_lock(async move {
+            let _ = operation_started_tx.send(());
+            Ok(())
+        }));
+
+        poll_fn(|cx| match reload.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("reload must wait while the mutex is held"),
+        })
+        .await;
+        drop(reload);
+
+        assert!(
+            matches!(operation_started_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)),
+            "cancelling a queued reload must drop its work instead of detaching it"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_lock_survives_waiter_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            with_runtime_config_reload_lock(async move {
+                started_tx.send(()).expect("signal runtime reload start");
+                release_rx.await.expect("release supervised runtime reload");
+                completed_tx.send(()).expect("signal runtime reload completion");
+                Ok(())
+            })
+            .await
+        });
+
+        started_rx.await.expect("supervised runtime reload started");
+        waiter.abort();
+        assert!(waiter.await.expect_err("reload waiter should be cancelled").is_cancelled());
+
+        let (contender_polled_tx, contender_polled_rx) = tokio::sync::oneshot::channel();
+        let (contender_entered_tx, mut contender_entered_rx) = tokio::sync::oneshot::channel();
+        let contender = tokio::spawn(async move {
+            let mut lock = Box::pin(RUNTIME_CONFIG_RELOAD_MUTEX.lock());
+            let mut contender_polled_tx = Some(contender_polled_tx);
+            let _guard = poll_fn(|cx| {
+                if let Some(tx) = contender_polled_tx.take() {
+                    let _ = tx.send(());
+                }
+                lock.as_mut().poll(cx)
+            })
+            .await;
+            let _ = contender_entered_tx.send(());
+        });
+
+        contender_polled_rx.await.expect("contending reload should be polled");
+        assert!(
+            matches!(contender_entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "a cancelled waiter must not release the reload mutex while its detached reload is still running"
+        );
+
+        release_tx.send(()).expect("release detached runtime reload");
+        completed_rx.await.expect("detached runtime reload should complete");
+        contender_entered_rx
+            .await
+            .expect("contending reload should enter after completion");
+        contender.await.expect("contending reload task should not panic");
     }
 
     #[tokio::test]
@@ -1221,6 +1398,123 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(storage_class_env)]
+    async fn full_reload_keeps_worker_apply_inside_durable_read_fence() {
+        temp_env::async_with_vars(
+            [
+                (storageclass::STANDARD_ENV, None::<&str>),
+                (storageclass::RRS_ENV, None::<&str>),
+                (storageclass::OPTIMIZE_ENV, None::<&str>),
+                (storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            async {
+                let fixture = runtime_config_reload_fixture().await;
+                let older = scanner_server_config("41");
+                save_admin_server_config(fixture.context.object_store(), &older)
+                    .await
+                    .expect("persist older scanner config");
+
+                let (worker_entered_tx, worker_entered_rx) = tokio::sync::oneshot::channel();
+                let (release_worker_tx, release_worker_rx) = tokio::sync::oneshot::channel();
+                let reload_context = fixture.context.clone();
+                let reload = tokio::spawn(async move {
+                    publish_latest_runtime_config_snapshot_under_reload_lock_for_context(
+                        Some(&reload_context),
+                        None,
+                        move |config| async move {
+                            worker_entered_tx.send(config).expect("signal runtime config worker entry");
+                            release_worker_rx.await.expect("release runtime config worker");
+                            Ok(())
+                        },
+                    )
+                    .await
+                });
+
+                let worker_config = tokio::time::timeout(REAL_STORE_TEST_TIMEOUT, worker_entered_rx)
+                    .await
+                    .expect("worker apply should enter")
+                    .expect("worker apply entry signal should be delivered");
+                assert_eq!(
+                    worker_config
+                        .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                        .expect("older scanner config should be loaded")
+                        .get(SCANNER_CYCLE),
+                    "41"
+                );
+
+                let latest = scanner_server_config("71");
+                let writer_store = fixture.context.object_store();
+                let (writer_polled_tx, writer_polled_rx) = tokio::sync::oneshot::channel();
+                let (writer_entered_tx, mut writer_entered_rx) = tokio::sync::oneshot::channel();
+                let writer = tokio::spawn(async move {
+                    let transaction_store = writer_store.clone();
+                    let transaction = with_admin_server_config_write_lock(writer_store, move || async move {
+                        writer_entered_tx.send(()).expect("signal writer entry");
+                        save_admin_server_config_no_lock(transaction_store, &latest).await
+                    });
+                    tokio::pin!(transaction);
+                    let mut writer_polled_tx = Some(writer_polled_tx);
+                    poll_fn(|cx| match transaction.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            if let Some(tx) = writer_polled_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            Poll::Ready(())
+                        }
+                        Poll::Ready(_) => panic!("writer entered before the worker apply released its read fence"),
+                    })
+                    .await;
+                    transaction
+                        .await
+                        .expect("writer should acquire the server-config locks")
+                        .expect("writer should persist the latest config");
+                });
+
+                tokio::time::timeout(REAL_STORE_TEST_TIMEOUT, writer_polled_rx)
+                    .await
+                    .expect("writer should be polled")
+                    .expect("writer poll signal should be delivered");
+                assert!(
+                    matches!(writer_entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                    "a server-config writer must wait until the old worker apply completes"
+                );
+
+                release_worker_tx.send(()).expect("release worker apply");
+                tokio::time::timeout(REAL_STORE_TEST_TIMEOUT, async {
+                    reload
+                        .await
+                        .expect("full reload task should not panic")
+                        .expect("full reload should finish");
+                    writer.await.expect("writer task should not panic");
+                })
+                .await
+                .expect("reload and writer should finish");
+
+                reload_runtime_config_snapshot_for_context(Some(&fixture.context))
+                    .await
+                    .expect("a later full reload should publish the latest durable config");
+                let snapshot = fixture
+                    .server_snapshot
+                    .lock()
+                    .expect("server config result lock")
+                    .clone()
+                    .expect("latest server config should be published");
+                assert_eq!(
+                    snapshot
+                        .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                        .expect("latest scanner config should be present")
+                        .get(SCANNER_CYCLE),
+                    "71"
+                );
+                assert_eq!(rustfs_scanner::scanner_runtime_config_status().cycle_interval_seconds.value, 71);
+
+                rustfs_scanner::apply_scanner_runtime_config(&ServerConfig::new()).expect("restore scanner runtime defaults");
+            },
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn peer_full_reload_rejects_later_pool_without_publishing() {
@@ -1251,11 +1545,9 @@ mod tests {
         let worker_events = events.clone();
 
         let err = reload_runtime_config_snapshot_with(
-            async { Ok(ServerConfig::new()) },
-            |config| async { Ok((config, PreparedRuntimeConfig::default())) },
-            move |_config, _prepared| {
+            async move {
                 publish_events.lock().expect("reload event lock").push("publish");
-                Ok(())
+                Ok(ServerConfig::new())
             },
             move |_config| async move {
                 let mut events = worker_events.lock().expect("reload event lock");

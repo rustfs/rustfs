@@ -29,8 +29,11 @@ mod storage_api;
 pub mod tagging;
 
 pub use config::{
-    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, active_replication_rule_destination_arns,
-    replication_target_arns, should_remove_replication_target, validate_replication_config_target_arns,
+    ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    ReplicationConfigurationExt, ReplicationTargetValidationError, active_replication_rule_destination_arns,
+    invalid_replication_config_status_field, replication_target_arns, should_remove_replication_target,
+    unsupported_replication_config_field, validate_replication_config_target_arns,
 };
 pub use delete::{
     DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
@@ -41,10 +44,14 @@ pub use filemeta::{
     REPLICATE_INCOMING_DELETE, REPLICATE_MRF, REPLICATE_QUEUED, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision,
     ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState,
     ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
-    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
-    version_purge_statuses_map,
+    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replicate_decision_for_admitted_targets,
+    replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
-pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
+pub use mrf::{
+    MRF_ENVELOPE_FORMAT, MRF_ENVELOPE_VERSION, MRF_V2_FILE, MRF_V2_FORMAT, MRF_V2_NAMESPACE, MRF_V2_VERSION, MrfCapabilities,
+    MrfCapability, MrfEnvelope, MrfEnvelopeError, MrfOpKind, MrfProtocolCapabilities, MrfReplicateEntry, MrfV2Capabilities,
+    MrfV2Envelope, MrfV2Error, MrfV2Reader, MrfV2Readiness, decode_mrf_file, encode_mrf_file,
+};
 pub use multipart::{
     ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError, ReplicationMultipartRange,
     replication_multipart_complete_actual_size, replication_multipart_part_plan,
@@ -61,9 +68,9 @@ pub use operation::{
     should_use_existing_delete_replication_source,
 };
 pub use queue::{
-    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
-    ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, mrf_save_admission, replication_heal_queue_action,
-    worker_queue_for_replication_type,
+    ReplicationBatchAdmission, ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes,
+    ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, mrf_save_admission,
+    replication_heal_queue_action, worker_queue_for_replication_type,
 };
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,

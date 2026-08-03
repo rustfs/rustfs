@@ -22,6 +22,9 @@ use crate::admin::runtime_sources::{
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
+use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
+#[cfg(test)]
+use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
 use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
 use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat};
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
@@ -49,6 +52,8 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::{debug, error, info, warn};
 use url::Host;
+
+const SUPPORTED_REMOTE_TARGET_API: &str = "s3v4";
 
 fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
@@ -78,7 +83,7 @@ fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteTargetCredentialsRequest {
     #[serde(rename = "accessKey")]
@@ -100,7 +105,7 @@ impl From<RemoteTargetCredentialsRequest> for TargetCredentials {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteTargetRequest {
     #[serde(rename = "sourcebucket", default)]
@@ -177,6 +182,46 @@ impl RemoteTargetRequest {
 
         if self.credentials.secret_key.trim().is_empty() {
             return Err(s3_error!(InvalidRequest, "credentials.secretKey is required"));
+        }
+
+        if self
+            .credentials
+            .session_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "remote target field credentials.session_token is not supported by this RustFS version"
+            ));
+        }
+
+        if self.credentials.expiration.is_some() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "remote target field credentials.expiration is not supported by this RustFS version"
+            ));
+        }
+
+        if !self.api.is_empty() && self.api != SUPPORTED_REMOTE_TARGET_API {
+            return Err(s3_error!(
+                InvalidRequest,
+                "remote target field api value is not supported by this RustFS version"
+            ));
+        }
+
+        for (unsupported, configured) in REMOTE_TARGET_UNSUPPORTED_FIELDS.iter().copied().zip([
+            self.disable_proxy,
+            self.health_check_duration != 0,
+            self.edge,
+            self.edge_sync_before_expiry,
+        ]) {
+            if configured {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "remote target field {unsupported} is not supported by this RustFS version"
+                ));
+            }
         }
 
         Ok(BucketTarget {
@@ -821,6 +866,10 @@ struct MrfTargetBacklog {
     failed_count: i64,
     #[serde(rename = "FailedSize")]
     failed_size: i64,
+    #[serde(rename = "DurableCount")]
+    durable_count: i64,
+    #[serde(rename = "DurableSize")]
+    durable_size: i64,
     #[serde(rename = "ObservationScope")]
     observation_scope: &'static str,
 }
@@ -828,7 +877,7 @@ struct MrfTargetBacklog {
 /// Response body for `GET /v3/replication/mrf`.
 ///
 /// Runtime failed/queued totals and the durable MRF recovery backlog are kept
-/// separate because persisted MRF entries do not contain a target ARN.
+/// separate because older persisted MRF entries do not contain a target ARN.
 #[derive(Debug, Serialize)]
 struct MrfResponse {
     #[serde(rename = "Bucket")]
@@ -874,32 +923,60 @@ fn build_mrf_response(
         "partial_cluster"
     };
     let mut targets: Vec<MrfTargetBacklog> = Vec::with_capacity(bucket_stats.replication_stats.stats.len());
+    let mut targets_by_arn: HashMap<String, usize> = HashMap::with_capacity(bucket_stats.replication_stats.stats.len());
     let mut total_failed_count: i64 = 0;
     let mut total_failed_size: i64 = 0;
     for (arn, stat) in &bucket_stats.replication_stats.stats {
         total_failed_count = total_failed_count.saturating_add(stat.failed.count);
         total_failed_size = total_failed_size.saturating_add(stat.failed.size);
+        targets_by_arn.insert(arn.clone(), targets.len());
         targets.push(MrfTargetBacklog {
             arn: arn.clone(),
             failed_count: stat.failed.count,
             failed_size: stat.failed.size,
+            durable_count: 0,
+            durable_size: 0,
             observation_scope,
         });
     }
-    targets.sort_by(|a, b| a.arn.cmp(&b.arn));
 
     let queued = &bucket_stats.replication_stats.q_stat.curr;
-    let (durable_count, durable_size) = if durable.available {
-        durable
-            .entries
-            .iter()
-            .filter(|entry| entry.bucket == bucket)
-            .fold((0i64, 0i64), |(count, size), entry| {
-                (count.saturating_add(1), size.saturating_add(entry.size))
-            })
+    let (durable_count, durable_size, missing_target_arns) = if durable.available {
+        durable.entries.iter().filter(|entry| entry.bucket == bucket).fold(
+            (0i64, 0i64, false),
+            |(count, size, missing_target_arns), entry| {
+                let mut missing_target_arns = missing_target_arns;
+                for target_arn in &entry.target_arns {
+                    if target_arn.is_empty() {
+                        continue;
+                    }
+                    let index = if let Some(index) = targets_by_arn.get(target_arn).copied() {
+                        index
+                    } else {
+                        targets_by_arn.insert(target_arn.clone(), targets.len());
+                        targets.push(MrfTargetBacklog {
+                            arn: target_arn.clone(),
+                            failed_count: 0,
+                            failed_size: 0,
+                            durable_count: 0,
+                            durable_size: 0,
+                            observation_scope,
+                        });
+                        targets.len() - 1
+                    };
+                    targets[index].durable_count = targets[index].durable_count.saturating_add(1);
+                    targets[index].durable_size = targets[index].durable_size.saturating_add(entry.size);
+                }
+                if entry.target_arns.is_empty() {
+                    missing_target_arns = true;
+                }
+                (count.saturating_add(1), size.saturating_add(entry.size), missing_target_arns)
+            },
+        )
     } else {
-        (0, 0)
+        (0, 0, false)
     };
+    targets.sort_by(|a, b| a.arn.cmp(&b.arn));
 
     MrfResponse {
         bucket,
@@ -916,7 +993,7 @@ fn build_mrf_response(
         durable_backlog_available: durable.available,
         durable_count,
         durable_size,
-        per_target_durable_entries_available: false,
+        per_target_durable_entries_available: durable.available && !missing_target_arns,
     }
 }
 
@@ -926,8 +1003,9 @@ fn build_mrf_response(
 ///
 /// Compatibility note: MinIO returns a stream of individual MRF entries. RustFS
 /// deliberately returns aggregate runtime and durable counters instead.
-/// `PerObjectEntriesAvailable` and `PerTargetDurableEntriesAvailable` remain
-/// false until an enumerable API and target-bearing durable format exist.
+/// `PerObjectEntriesAvailable` remains false until an enumerable API exists.
+/// `PerTargetDurableEntriesAvailable` is false when the durable backlog includes
+/// older entries that cannot be attributed to a target.
 pub struct ReplicationMrfHandler {}
 
 #[async_trait::async_trait]
@@ -974,8 +1052,8 @@ impl Operation for ReplicationMrfHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteTargetRequest, build_mrf_response, extract_query_params, unique_replication_peers,
-        validate_remote_target_tls_settings,
+        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetRequest, SUPPORTED_REMOTE_TARGET_API,
+        build_mrf_response, extract_query_params, unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::BucketTarget;
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -1042,9 +1120,12 @@ mod tests {
                     retry_count: 0,
                     size: 250,
                     op: MrfOpKind::Object,
+                    force_delete: false,
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    target_arns: vec!["arn-a".to_string(), "arn-durable-only".to_string()],
+                    ..Default::default()
                 },
                 MrfReplicateEntry {
                     bucket: "other-bucket".to_string(),
@@ -1053,9 +1134,12 @@ mod tests {
                     retry_count: 0,
                     size: 999,
                     op: MrfOpKind::Object,
+                    force_delete: false,
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    target_arns: Vec::new(),
+                    ..Default::default()
                 },
             ],
         };
@@ -1073,7 +1157,66 @@ mod tests {
         assert_eq!(json["ClusterComplete"], false);
         assert_eq!(json["Targets"][0]["ObservationScope"], "partial_cluster");
         assert_eq!(json["PerObjectEntriesAvailable"], false);
+        assert_eq!(json["PerTargetDurableEntriesAvailable"], true);
+
+        let targets = json["Targets"].as_array().expect("targets should serialize as an array");
+        let target_a = targets
+            .iter()
+            .find(|target| target["ARN"] == "arn-a")
+            .expect("runtime target should remain present");
+        assert_eq!(target_a["FailedCount"], 3);
+        assert_eq!(target_a["FailedSize"], 900);
+        assert_eq!(target_a["DurableCount"], 1);
+        assert_eq!(target_a["DurableSize"], 250);
+        let target_durable_only = targets
+            .iter()
+            .find(|target| target["ARN"] == "arn-durable-only")
+            .expect("durable-only target should be surfaced");
+        assert_eq!(target_durable_only["FailedCount"], 0);
+        assert_eq!(target_durable_only["FailedSize"], 0);
+        assert_eq!(target_durable_only["DurableCount"], 1);
+        assert_eq!(target_durable_only["DurableSize"], 250);
+    }
+
+    #[test]
+    fn mrf_response_keeps_legacy_durable_entries_bucket_only() {
+        let mut stats = BucketStats::default();
+        stats.replication_stats.provider_available = true;
+        stats.replication_stats.cluster_complete = true;
+        stats.replication_stats.observed_node_count = 1;
+        stats.replication_stats.expected_node_count = 1;
+        let durable = DurableMrfBacklog {
+            available: true,
+            entries: vec![MrfReplicateEntry {
+                bucket: "bucket-a".to_string(),
+                object: "legacy-object".to_string(),
+                version_id: None,
+                retry_count: 0,
+                size: 250,
+                op: MrfOpKind::Object,
+                force_delete: false,
+                delete_marker_version_id: None,
+                delete_marker: false,
+                delete_marker_mtime: None,
+                target_arns: Vec::new(),
+                ..Default::default()
+            }],
+        };
+
+        let response = build_mrf_response("bucket-a".to_string(), &stats, durable);
+        let json = serde_json::to_value(response).expect("MRF response should serialize");
+
+        assert_eq!(json["DurableBacklogAvailable"], true);
+        assert_eq!(json["DurableCount"], 1);
+        assert_eq!(json["DurableSize"], 250);
         assert_eq!(json["PerTargetDurableEntriesAvailable"], false);
+        assert_eq!(
+            json["Targets"]
+                .as_array()
+                .expect("targets should serialize as an array")
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -1101,6 +1244,7 @@ mod tests {
         assert_eq!(valid_empty_json["DurableBacklogAvailable"], true);
         assert_eq!(valid_empty_json["TotalFailedCount"], 0);
         assert_eq!(valid_empty_json["DurableCount"], 0);
+        assert_eq!(valid_empty_json["PerTargetDurableEntriesAvailable"], true);
     }
 
     #[test]
@@ -1169,8 +1313,10 @@ mod tests {
         let mut request = valid_remote_target_request();
         request["unexpected"] = serde_json::json!(true);
 
-        let err = serde_json::from_value::<RemoteTargetRequest>(request)
-            .expect_err("remote target request should reject unknown fields");
+        let err = match serde_json::from_value::<RemoteTargetRequest>(request) {
+            Ok(_) => panic!("remote target request should reject unknown fields"),
+            Err(err) => err,
+        };
 
         assert!(err.to_string().contains("unknown field"));
     }
@@ -1183,8 +1329,10 @@ mod tests {
             .expect("request should be an object")
             .remove("credentials");
 
-        let err =
-            serde_json::from_value::<RemoteTargetRequest>(request).expect_err("remote target request should require credentials");
+        let err = match serde_json::from_value::<RemoteTargetRequest>(request) {
+            Ok(_) => panic!("remote target request should require credentials"),
+            Err(err) => err,
+        };
 
         assert!(err.to_string().contains("missing field"));
     }
@@ -1202,6 +1350,84 @@ mod tests {
         };
 
         assert!(err.to_string().contains("credentials.secretKey is required"));
+    }
+
+    #[test]
+    fn remote_target_request_rejects_unimplemented_fields() {
+        for (field, value) in [
+            ("credentials.session_token", serde_json::json!("session-token")),
+            ("credentials.expiration", serde_json::json!("2026-01-01T00:00:00Z")),
+            ("api", serde_json::json!("s3v2")),
+            ("disableProxy", serde_json::json!(true)),
+            ("healthCheckDuration", serde_json::json!(5)),
+            ("edge", serde_json::json!(true)),
+            ("edgeSyncBeforeExpiry", serde_json::json!(true)),
+        ] {
+            let mut request = valid_remote_target_request();
+            if let Some((credential_field, credential_name)) = field.split_once('.') {
+                request[credential_field][credential_name] = value;
+            } else {
+                request[field] = value;
+            }
+            let request: RemoteTargetRequest =
+                serde_json::from_value(request).expect("unsupported field should still deserialize");
+            let err = request
+                .into_bucket_target()
+                .expect_err("unimplemented remote target fields must not be persisted");
+
+            assert!(err.to_string().contains(field));
+            assert!(err.to_string().contains("not supported by this RustFS version"));
+        }
+    }
+
+    #[test]
+    fn remote_target_request_accepts_static_credentials_and_supported_api() {
+        let mut request = valid_remote_target_request();
+        request["api"] = serde_json::json!("s3v4");
+        request["secure"] = serde_json::json!(true);
+        request["caCertPem"] = serde_json::json!("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+        request["credentials"]["session_token"] = serde_json::json!("");
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("supported remote target request should deserialize")
+            .into_bucket_target()
+            .expect("static credentials, SigV4 and custom CA should remain supported");
+
+        assert_eq!(target.api, SUPPORTED_REMOTE_TARGET_API);
+        assert_eq!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.session_token.as_deref()),
+            Some("")
+        );
+        assert!(!target.ca_cert_pem.is_empty());
+    }
+
+    #[test]
+    fn remote_target_request_validation_does_not_echo_credential_values() {
+        let mut request = valid_remote_target_request();
+        request["credentials"]["session_token"] = serde_json::json!("session-token-must-not-leak");
+
+        let request: RemoteTargetRequest = serde_json::from_value(request).expect("request should deserialize");
+        let err = request
+            .into_bucket_target()
+            .expect_err("session tokens must be rejected before persistence");
+        let message = err.to_string();
+
+        assert!(message.contains("credentials.session_token"));
+        assert!(!message.contains("session-token-must-not-leak"));
+        assert!(!message.contains("secret"));
+    }
+
+    #[test]
+    fn remote_target_capability_fields_do_not_overlap() {
+        for field in REMOTE_TARGET_UNSUPPORTED_FIELDS {
+            assert!(
+                !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
+                "remote target field {field} cannot be both writable and unsupported"
+            );
+        }
     }
 
     #[test]

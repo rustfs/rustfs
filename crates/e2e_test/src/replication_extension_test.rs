@@ -29,8 +29,9 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::{Client, Config};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
-use http::header::{CONTENT_TYPE, HOST};
+use http::header::{CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -38,6 +39,10 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use local_ip_address::local_ip;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{KeyValue, any_value::Value as AnyValue};
+use opentelemetry_proto::tonic::metrics::v1::{Metric, metric, number_data_point};
+use prost::Message;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     SanType, generate_simple_self_signed,
@@ -56,6 +61,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
@@ -64,11 +70,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep, timeout};
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+type BacklogMetricPoints = Arc<Mutex<BTreeMap<String, BTreeMap<String, (u64, f64)>>>>;
 
 /// A replication source server validates the remote target endpoint, and the e2e
 /// target runs on loopback (127.0.0.1), which RustFS's SSRF egress guard rejects by
@@ -107,6 +115,252 @@ const REPL17_KMS_KEY_ID: &str = "repl17-local-key";
 const REPL17_SSEC_KEY: &str = "01234567890123456789012345678901";
 const REPLICATION_FAILED_EVENT: &str = "s3:Replication:OperationFailedReplication";
 const REPLICATION_EVENT_MAX_BUFFER_BYTES: usize = 1024 * 1024;
+const OTLP_METRICS_BODY_LIMIT: u64 = 4 * 1024 * 1024;
+const BUCKET_LABEL: &str = "bucket";
+const TOTAL_FAILED_COUNT_METRIC: &str = "rustfs_bucket_replication_total_failed_count";
+const CURRENT_BACKLOG_COUNT_METRIC: &str = "rustfs_bucket_replication_current_backlog_count";
+const CURRENT_BACKLOG_BYTES_METRIC: &str = "rustfs_bucket_replication_current_backlog_bytes";
+const MRF_PENDING_COUNT_METRIC: &str = "rustfs_bucket_replication_mrf_pending_count";
+const MRF_PENDING_BYTES_METRIC: &str = "rustfs_bucket_replication_mrf_pending_bytes";
+
+struct ReplicationBacklogMetricCollector {
+    endpoint: String,
+    values: BacklogMetricPoints,
+    task: JoinHandle<()>,
+}
+
+impl ReplicationBacklogMetricCollector {
+    async fn start() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
+        let values = Arc::new(Mutex::new(BTreeMap::new()));
+        let task_values = values.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let values = task_values.clone();
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request| handle_backlog_metric_export(request, values.clone())),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        Ok(Self { endpoint, values, task })
+    }
+
+    fn root_endpoint(&self) -> &str {
+        self.endpoint.trim_end_matches("/v1/metrics")
+    }
+
+    async fn bucket_metric_value(&self, metric: &str, bucket: &str) -> f64 {
+        self.values
+            .lock()
+            .await
+            .get(metric)
+            .and_then(|buckets| buckets.get(bucket))
+            .map(|(_, value)| *value)
+            .unwrap_or_default()
+    }
+
+    async fn wait_for_bucket_metric(
+        &self,
+        metric: &str,
+        bucket: &str,
+        expected: impl Fn(f64) -> bool,
+        description: &str,
+    ) -> Result<f64, Box<dyn Error + Send + Sync>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let value = self.bucket_metric_value(metric, bucket).await;
+            if expected(value) {
+                return Ok(value);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let snapshot = self.values.lock().await.clone();
+                return Err(format!("timed out waiting for {metric} on bucket {bucket} to satisfy {description}; last={value}, snapshot={snapshot:?}").into());
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+impl Drop for ReplicationBacklogMetricCollector {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn handle_backlog_metric_export(
+    request: Request<Incoming>,
+    values: BacklogMetricPoints,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if request.uri().path() != "/v1/metrics" {
+        return Ok(empty_http_response(StatusCode::NOT_FOUND));
+    }
+
+    let gzip = request
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("gzip"));
+    let Ok(collected) = request.into_body().collect().await else {
+        return Ok(empty_http_response(StatusCode::BAD_REQUEST));
+    };
+    let body = collected.to_bytes();
+    if body.len() as u64 > OTLP_METRICS_BODY_LIMIT {
+        return Ok(empty_http_response(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let payload = if gzip {
+        let mut decoder = GzDecoder::new(body.as_ref());
+        let mut decoded = Vec::new();
+        if decoder
+            .by_ref()
+            .take(OTLP_METRICS_BODY_LIMIT + 1)
+            .read_to_end(&mut decoded)
+            .is_err()
+            || decoded.len() as u64 > OTLP_METRICS_BODY_LIMIT
+        {
+            return Ok(empty_http_response(StatusCode::BAD_REQUEST));
+        }
+        decoded
+    } else {
+        body.to_vec()
+    };
+
+    match ExportMetricsServiceRequest::decode(payload.as_slice()) {
+        Ok(export) => {
+            let mut values = values.lock().await;
+            record_backlog_metrics(&export, &mut values);
+            Ok(empty_http_response(StatusCode::OK))
+        }
+        Err(_) => Ok(empty_http_response(StatusCode::BAD_REQUEST)),
+    }
+}
+
+fn empty_http_response(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .expect("static HTTP response is valid")
+}
+
+fn record_backlog_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, BTreeMap<String, (u64, f64)>>) {
+    for resource_metrics in &export.resource_metrics {
+        for scope_metrics in &resource_metrics.scope_metrics {
+            for metric in &scope_metrics.metrics {
+                record_backlog_metric(metric, values);
+            }
+        }
+    }
+}
+
+fn record_backlog_metric(metric: &Metric, values: &mut BTreeMap<String, BTreeMap<String, (u64, f64)>>) {
+    if ![
+        TOTAL_FAILED_COUNT_METRIC,
+        CURRENT_BACKLOG_COUNT_METRIC,
+        CURRENT_BACKLOG_BYTES_METRIC,
+        MRF_PENDING_COUNT_METRIC,
+        MRF_PENDING_BYTES_METRIC,
+    ]
+    .contains(&metric.name.as_str())
+    {
+        return;
+    }
+
+    let points = match &metric.data {
+        Some(metric::Data::Gauge(gauge)) => gauge.data_points.as_slice(),
+        Some(metric::Data::Sum(sum)) => sum.data_points.as_slice(),
+        _ => return,
+    };
+    for point in points {
+        let Some(bucket) = attribute_string(&point.attributes, BUCKET_LABEL) else {
+            continue;
+        };
+        let Some(value) = number_point_value(point.value.as_ref()) else {
+            continue;
+        };
+        values
+            .entry(metric.name.clone())
+            .or_default()
+            .entry(bucket.to_string())
+            .and_modify(|current| {
+                if point.time_unix_nano >= current.0 {
+                    *current = (point.time_unix_nano, value);
+                }
+            })
+            .or_insert((point.time_unix_nano, value));
+    }
+}
+
+fn number_point_value(value: Option<&number_data_point::Value>) -> Option<f64> {
+    match value? {
+        number_data_point::Value::AsDouble(value) => Some(*value),
+        number_data_point::Value::AsInt(value) => Some(*value as f64),
+    }
+}
+
+fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<&'a str> {
+    attributes.iter().find_map(|attribute| {
+        if attribute.key != wanted_key {
+            return None;
+        }
+        match attribute.value.as_ref()?.value.as_ref()? {
+            AnyValue::StringValue(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+struct SlowReplicationTargetGuard {
+    task: Option<JoinHandle<()>>,
+}
+
+impl SlowReplicationTargetGuard {
+    async fn bind(address: &str, response_delay: Duration) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let listener = TcpListener::bind(address).await?;
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |_request| async move {
+                                sleep(response_delay).await;
+                                Ok::<_, Infallible>(empty_http_response(StatusCode::SERVICE_UNAVAILABLE))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        Ok(Self { task: Some(task) })
+    }
+
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SlowReplicationTargetGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
@@ -480,15 +734,19 @@ async fn get_bucket_replication(
 }
 
 async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    set_bucket_versioning(env, bucket, BucketVersioningStatus::Enabled).await
+}
+
+async fn set_bucket_versioning(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    status: BucketVersioningStatus,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = env.create_s3_client();
     client
         .put_bucket_versioning()
         .bucket(bucket)
-        .versioning_configuration(
-            VersioningConfiguration::builder()
-                .status(BucketVersioningStatus::Enabled)
-                .build(),
-        )
+        .versioning_configuration(VersioningConfiguration::builder().status(status).build())
         .send()
         .await?;
     Ok(())
@@ -1015,6 +1273,48 @@ async fn assert_replication_converged(
     }
 }
 
+async fn wait_for_replication_state<F>(
+    client: &Client,
+    bucket: &str,
+    description: &str,
+    predicate: F,
+) -> Result<Vec<ReplicatedVersion>, Box<dyn Error + Send + Sync>>
+where
+    F: Fn(&[ReplicatedVersion]) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = list_replication_state(client, bucket).await?;
+        if predicate(&state) {
+            return Ok(state);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{description}; last target state: {state:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn assert_replication_key_absent(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    observation: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + observation;
+    loop {
+        let state = list_replication_state(client, bucket).await?;
+        assert!(
+            state.iter().all(|entry| entry.key != key),
+            "unexpected replicated key {bucket}/{key}: {state:?}"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn get_version_body(
     client: &Client,
     bucket: &str,
@@ -1253,6 +1553,10 @@ async fn build_sse_replication_pair(
             ("RUSTFS_KMS_KEY_DIR", source_kms_key_dir.as_str()),
             ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
             ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+            // Per-key KMS authorization is on so this contract is pinned in the
+            // configuration replication will eventually ship with: the replication
+            // worker carries no request identity and must stay exempt.
+            ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ]);
     }
     source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
@@ -1265,6 +1569,7 @@ async fn build_sse_replication_pair(
             ("RUSTFS_KMS_KEY_DIR", target_kms_key_dir.as_str()),
             ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
             ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+            ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ]);
     }
     target_env
@@ -1684,6 +1989,28 @@ async fn wait_for_remote_target_arn(env: &RustFSTestEnvironment, bucket: &str) -
     }
 
     Err(format!("site replication did not configure a remote target for bucket {bucket} in time").into())
+}
+
+async fn wait_for_remote_target_health_check(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    arn: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for _ in 0..40 {
+        let response = list_replication_targets_request(env, Some(bucket)).await?;
+        if response.status() == StatusCode::OK {
+            let targets: Vec<serde_json::Value> = response.json().await?;
+            if targets.iter().any(|target| {
+                target.get("arn").and_then(|value| value.as_str()) == Some(arn)
+                    && target.get("lastOnline").is_some_and(|value| !value.is_null())
+            }) {
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("replication target {arn} did not complete a successful health check in time").into())
 }
 
 async fn site_replication_add(
@@ -2653,6 +2980,8 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
     let target_bucket = "replication-self-signed-ok-dst";
     let object_key = "self-signed-replication.txt";
     let body = "replication over self-signed https should succeed";
+    let post_health_check_key = "self-signed-replication-after-health-check.txt";
+    let post_health_check_body = "replication should remain available after the target health check";
 
     let source_client = source_env.create_s3_client();
     source_client
@@ -2700,6 +3029,24 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
         .await?;
 
     wait_for_replicated_object_over_https(&https_client, &target_env, target_bucket, object_key, body).await?;
+
+    wait_for_remote_target_health_check(&source_env, source_bucket, &target_arn).await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(post_health_check_key)
+        .body(ByteStream::from(post_health_check_body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object_over_https(
+        &https_client,
+        &target_env,
+        target_bucket,
+        post_health_check_key,
+        post_health_check_body,
+    )
+    .await?;
 
     Ok(())
 }
@@ -3323,6 +3670,326 @@ async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> 
     Ok(())
 }
 
+/// Bounded executable slice for backlog#1620. It deliberately uses real
+/// source and target RustFS processes and leaves the full MinIO
+/// interoperability profile for a runner that provisions MinIO credentials
+/// and a reachable endpoint.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env_a = RustFSTestEnvironment::new().await?;
+    target_env_a
+        .start_rustfs_server_without_cleanup_with_env(&source_env_vars)
+        .await?;
+    let mut target_env_b = RustFSTestEnvironment::new().await?;
+    target_env_b
+        .start_rustfs_server_without_cleanup_with_env(&source_env_vars)
+        .await?;
+
+    let source_bucket = "replication-acceptance-src";
+    let target_bucket_a = "replication-acceptance-dst-a";
+    let target_bucket_b = "replication-acceptance-dst-b";
+    let source_client = source_env.create_s3_client();
+    let target_client_a = target_env_a.create_s3_client();
+    let target_client_b = target_env_b.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client_a.create_bucket().bucket(target_bucket_a).send().await?;
+    target_client_b.create_bucket().bucket(target_bucket_b).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env_a, target_bucket_a).await?;
+    enable_bucket_versioning(&target_env_b, target_bucket_b).await?;
+
+    let target_a_arn = set_replication_target(&source_env, source_bucket, &target_env_a, target_bucket_a).await?;
+    let target_b_arn = set_replication_target(&source_env, source_bucket, &target_env_b, target_bucket_b).await?;
+    let body = format!(
+        r#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role></Role>
+  <Rule>
+    <ID>matrix-prefix</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>prefix/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-both-prefix</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>both/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-tag</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Tag><Key>route</Key><Value>tagged</Value></Tag></Filter>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_b_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-disabled</ID>
+    <Priority>100</Priority>
+    <Status>Disabled</Status>
+    <Filter><Prefix>disabled/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_b_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-priority-high</ID>
+    <Priority>200</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>priority/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
+    <ID>matrix-priority-low</ID>
+    <Priority>100</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix>priority/</Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_a_arn}</Bucket></Destination>
+  </Rule>
+</ReplicationConfiguration>"#
+    );
+    let url = format!("{}/{source_bucket}?replication", source_env.url);
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &source_env.access_key,
+        &source_env.secret_key,
+        Some(body.into_bytes()),
+        Some("application/xml"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("put replication acceptance matrix failed: {status} {body}").into());
+    }
+
+    let saved_config = get_bucket_replication(&source_env, source_bucket).await?.text().await?;
+    for expected in [
+        "matrix-prefix",
+        "matrix-tag",
+        "matrix-disabled",
+        "matrix-priority-high",
+        "Priority>200",
+        "<Status>Disabled</Status>",
+        "<Key>route</Key>",
+    ] {
+        assert!(saved_config.contains(expected), "replication config omitted {expected}: {saved_config}");
+    }
+
+    let version_one = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .body(ByteStream::from_static(b"version-one"))
+        .send()
+        .await?;
+    let version_one_id = version_one
+        .version_id()
+        .ok_or("first matrix PUT omitted version ID")?
+        .to_string();
+    let version_two = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .body(ByteStream::from_static(b"version-two"))
+        .send()
+        .await?;
+    let version_two_id = version_two
+        .version_id()
+        .ok_or("second matrix PUT omitted version ID")?
+        .to_string();
+    wait_for_replication_state(&target_client_a, target_bucket_a, "prefix object did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/versions.txt" && entry.version_id == version_two_id)
+    })
+    .await?;
+
+    let delete_marker = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .send()
+        .await?;
+    let delete_marker_id = delete_marker
+        .version_id()
+        .ok_or("matrix DELETE omitted marker version ID")?
+        .to_string();
+    wait_for_replication_state(&target_client_a, target_bucket_a, "enabled delete marker did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/versions.txt" && entry.delete_marker && entry.version_id == delete_marker_id)
+    })
+    .await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("prefix/versions.txt")
+        .version_id(&version_one_id)
+        .send()
+        .await?;
+    wait_for_replication_state(&target_client_a, target_bucket_a, "enabled version purge did not replicate", |state| {
+        state.iter().all(|entry| entry.version_id != version_one_id)
+    })
+    .await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("priority/object.txt")
+        .body(ByteStream::from_static(b"priority winner"))
+        .send()
+        .await?;
+    wait_for_user_get_object(&target_client_a, target_bucket_a, "priority/object.txt").await?;
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("priority/object.txt")
+        .send()
+        .await?;
+    sleep(Duration::from_secs(3)).await;
+    let priority_state = list_replication_state(&target_client_a, target_bucket_a).await?;
+    assert!(
+        priority_state
+            .iter()
+            .any(|entry| entry.key == "priority/object.txt" && !entry.delete_marker),
+        "priority rule did not retain the object version: {priority_state:?}"
+    );
+    assert!(
+        priority_state
+            .iter()
+            .all(|entry| !(entry.key == "priority/object.txt" && entry.delete_marker)),
+        "lower-priority delete-marker rule overrode the higher-priority disabled rule: {priority_state:?}"
+    );
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("tagged/object.txt")
+        .tagging("route=tagged")
+        .body(ByteStream::from_static(b"tag filter"))
+        .send()
+        .await?;
+    wait_for_user_get_object(&target_client_b, target_bucket_b, "tagged/object.txt").await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("tagged/no-match.txt")
+        .body(ByteStream::from_static(b"not tagged"))
+        .send()
+        .await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("both/object.txt")
+        .tagging("route=tagged")
+        .body(ByteStream::from_static(b"mixed targets"))
+        .send()
+        .await?;
+    tokio::try_join!(
+        wait_for_user_get_object(&target_client_a, target_bucket_a, "both/object.txt"),
+        wait_for_user_get_object(&target_client_b, target_bucket_b, "both/object.txt"),
+    )?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("disabled/object.txt")
+        .body(ByteStream::from_static(b"disabled"))
+        .send()
+        .await?;
+    assert_replication_key_absent(&target_client_a, target_bucket_a, "disabled/object.txt", Duration::from_secs(3)).await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "disabled/object.txt", Duration::from_secs(3)).await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("tagged/object.txt")
+        .send()
+        .await?;
+    sleep(Duration::from_secs(3)).await;
+    let tagged_state = list_replication_state(&target_client_b, target_bucket_b).await?;
+    assert!(
+        tagged_state
+            .iter()
+            .any(|entry| entry.key == "tagged/object.txt" && !entry.delete_marker),
+        "tag rule should retain the replicated data version: {tagged_state:?}"
+    );
+    assert!(
+        tagged_state
+            .iter()
+            .all(|entry| !(entry.key == "tagged/object.txt" && entry.delete_marker)),
+        "tag rule with disabled delete-marker replication created a marker: {tagged_state:?}"
+    );
+
+    set_bucket_versioning(&source_env, source_bucket, BucketVersioningStatus::Suspended).await?;
+    set_bucket_versioning(&target_env_a, target_bucket_a, BucketVersioningStatus::Suspended).await?;
+    let null_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("prefix/null.txt")
+        .body(ByteStream::from_static(b"null version"))
+        .send()
+        .await?;
+    assert!(null_put.version_id().is_none(), "suspended source PUT must create a null version");
+    wait_for_replication_state(&target_client_a, target_bucket_a, "null version did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && !entry.delete_marker)
+    })
+    .await?;
+    let null_delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key("prefix/null.txt")
+        .send()
+        .await?;
+    assert!(
+        null_delete.version_id().is_none(),
+        "suspended source DELETE must create a null delete marker"
+    );
+    wait_for_replication_state(&target_client_a, target_bucket_a, "null delete marker did not replicate", |state| {
+        state
+            .iter()
+            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && entry.delete_marker)
+    })
+    .await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -3653,6 +4320,139 @@ async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
         assert!(
             target_state.iter().any(|entry| entry.key == key && !entry.delete_marker),
             "target missing object {key} after outage recovery; state={target_state:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// backlog#1610 - black-box bucket replication backlog observability.
+///
+/// The source exports metrics through the same OTLP path production uses. A slow
+/// loopback target keeps replication workers occupied long enough for the metrics
+/// runtime to publish non-zero bucket backlog gauges; after the real target
+/// returns, replication must converge and the exported current/MRF pending gauges
+/// must settle back to zero even though the historical failed counter remains
+/// non-zero.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -> TestResult {
+    init_logging();
+
+    let collector = ReplicationBacklogMetricCollector::start().await?;
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let metric_root = collector.root_endpoint().to_string();
+    let metric_endpoint = collector.endpoint.clone();
+    let mut source_env_vars: Vec<(&str, &str)> = replication_fast_env().into_iter().collect();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env_vars.extend_from_slice(FAST_SCANNER_ENV);
+    source_env_vars.extend_from_slice(&[
+        ("RUSTFS_OBS_ENDPOINT", metric_root.as_str()),
+        ("RUSTFS_OBS_METRIC_ENDPOINT", metric_endpoint.as_str()),
+        ("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "true"),
+        ("RUSTFS_OBS_TRACES_EXPORT_ENABLED", "false"),
+        ("RUSTFS_OBS_LOGS_EXPORT_ENABLED", "false"),
+        ("RUSTFS_OBS_METER_INTERVAL", "1"),
+        ("RUSTFS_OBS_USE_STDOUT", "false"),
+        ("RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL_SEC", "1"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "repl-backlog-metrics-src";
+    let target_bucket = "repl-backlog-metrics-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("before-outage.txt")
+        .body(ByteStream::from_static(b"baseline written before backlog metrics outage"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    target_env.stop_server();
+    let slow_target = SlowReplicationTargetGuard::bind(&target_env.address, Duration::from_secs(5)).await?;
+
+    let outage_keys = ["metrics-outage-1.txt", "metrics-outage-2.txt", "metrics-outage-3.txt"];
+    for key in outage_keys {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from(
+                format!("written while backlog metrics target was slow: {key}").into_bytes(),
+            ))
+            .send()
+            .await?;
+    }
+
+    let current_backlog = collector
+        .wait_for_bucket_metric(
+            CURRENT_BACKLOG_COUNT_METRIC,
+            source_bucket,
+            |value| value >= 1.0,
+            "be at least 1 during outage",
+        )
+        .await?;
+    let current_bytes = collector
+        .wait_for_bucket_metric(
+            CURRENT_BACKLOG_BYTES_METRIC,
+            source_bucket,
+            |value| value > 0.0,
+            "report bytes during outage",
+        )
+        .await?;
+    assert!(
+        current_bytes >= current_backlog,
+        "backlog bytes should be at least the object count while queued; count={current_backlog}, bytes={current_bytes}"
+    );
+    let failed_count = collector
+        .wait_for_bucket_metric(
+            TOTAL_FAILED_COUNT_METRIC,
+            source_bucket,
+            |value| value >= 1.0,
+            "record at least one failed replication attempt during outage",
+        )
+        .await?;
+
+    slow_target.stop().await;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    for metric in [
+        CURRENT_BACKLOG_COUNT_METRIC,
+        CURRENT_BACKLOG_BYTES_METRIC,
+        MRF_PENDING_COUNT_METRIC,
+        MRF_PENDING_BYTES_METRIC,
+    ] {
+        collector
+            .wait_for_bucket_metric(metric, source_bucket, |value| value == 0.0, "settle back to zero after recovery")
+            .await?;
+    }
+    let final_failed_count = collector.bucket_metric_value(TOTAL_FAILED_COUNT_METRIC, source_bucket).await;
+    assert!(
+        final_failed_count >= failed_count,
+        "historical failed counter should remain non-zero after recovery while current backlog is zero; before={failed_count}, after={final_failed_count}"
+    );
+
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    for key in ["before-outage.txt"].into_iter().chain(outage_keys) {
+        assert!(
+            target_state.iter().any(|entry| entry.key == key && !entry.delete_marker),
+            "target missing object {key} after backlog metrics recovery; state={target_state:?}"
         );
     }
 

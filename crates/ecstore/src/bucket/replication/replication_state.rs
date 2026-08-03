@@ -22,9 +22,9 @@ use super::replication_stats_boundary::{
     QueueCache, ReplicationMetricScope, SRMetricsSummary, XferStats,
 };
 use super::runtime_boundary as runtime_sources;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
@@ -143,7 +143,7 @@ pub struct ReplicationStats {
     // Active worker statistics
     pub workers: Arc<Mutex<ActiveWorkerStat>>,
     // Queue statistics cache
-    pub q_cache: Arc<Mutex<QueueCache>>,
+    pub q_cache: Arc<StdMutex<QueueCache>>,
     // Proxy statistics cache
     pub p_cache: Arc<Mutex<ProxyStatsCache>>,
     // MRF backlog statistics (simplified)
@@ -153,12 +153,89 @@ pub struct ReplicationStats {
     pub most_recent_stats: Arc<Mutex<HashMap<String, BucketStats>>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeReplicationTargetBacklog {
+    pub bucket: String,
+    pub target_arn: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+type TargetQueueKey = (String, String);
+type TargetQueueCache = HashMap<TargetQueueKey, InQueueMetric>;
+
+struct TargetQueueCacheSlot {
+    owner: Weak<StdMutex<QueueCache>>,
+    metrics: TargetQueueCache,
+}
+
+impl TargetQueueCacheSlot {
+    fn new(owner: &Arc<StdMutex<QueueCache>>) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            metrics: TargetQueueCache::default(),
+        }
+    }
+
+    fn belongs_to(&self, owner: &Arc<StdMutex<QueueCache>>) -> bool {
+        self.owner.upgrade().is_some_and(|current| Arc::ptr_eq(&current, owner))
+    }
+}
+
+// Keep runtime target counters outside ReplicationStats to preserve its public struct shape.
+static TARGET_QUEUE_CACHES: LazyLock<StdMutex<Vec<TargetQueueCacheSlot>>> = LazyLock::new(|| StdMutex::new(Vec::new()));
+
+fn i64_to_u64_floor_zero(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(0)
+}
+
+fn normalized_target_arns(target_arns: &[String]) -> Vec<&str> {
+    let mut target_arns = target_arns
+        .iter()
+        .map(String::as_str)
+        .filter(|target_arn| !target_arn.is_empty())
+        .collect::<Vec<_>>();
+    target_arns.sort_unstable();
+    target_arns.dedup();
+    target_arns
+}
+
+fn target_queue_cache_snapshot(cache: &TargetQueueCache) -> Vec<RuntimeReplicationTargetBacklog> {
+    cache
+        .iter()
+        .filter_map(|((bucket, target_arn), metric)| {
+            let count = i64_to_u64_floor_zero(metric.curr.get_current_count());
+            let bytes = i64_to_u64_floor_zero(metric.curr.get_current_bytes());
+            (count > 0 || bytes > 0).then(|| RuntimeReplicationTargetBacklog {
+                bucket: bucket.clone(),
+                target_arn: target_arn.clone(),
+                count,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn prune_stale_target_queue_caches(caches: &mut Vec<TargetQueueCacheSlot>) {
+    caches.retain(|slot| slot.owner.strong_count() > 0);
+}
+
+fn with_target_queue_caches<T>(f: impl FnOnce(&mut Vec<TargetQueueCacheSlot>) -> T) -> T {
+    match TARGET_QUEUE_CACHES.lock() {
+        Ok(mut caches) => f(&mut caches),
+        Err(poisoned) => {
+            let mut caches = poisoned.into_inner();
+            f(&mut caches)
+        }
+    }
+}
+
 impl ReplicationStats {
     pub fn new() -> Self {
         Self {
             sr_stats: Arc::new(SRStats::new()),
             workers: Arc::new(Mutex::new(ActiveWorkerStat::new())),
-            q_cache: Arc::new(Mutex::new(QueueCache::new())),
+            q_cache: Arc::new(StdMutex::new(QueueCache::new())),
             p_cache: Arc::new(Mutex::new(ProxyStatsCache::new())),
             mrf_stats: HashMap::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -198,8 +275,9 @@ impl ReplicationStats {
             let mut interval = interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let mut cache = q_cache_clone.lock().await;
-                cache.update();
+                if let Ok(mut cache) = q_cache_clone.lock() {
+                    cache.update();
+                }
             }
         });
     }
@@ -391,12 +469,13 @@ impl ReplicationStats {
         drop(cache);
 
         {
-            let q_cache = self.q_cache.lock().await;
-            for (bucket, queue_stats) in &q_cache.bucket_stats {
-                let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
-                bucket_stats.q_stat = queue_stats.snapshot();
-                bucket_stats.mark_node_local_provider_available();
-                bucket_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+            if let Ok(q_cache) = self.q_cache.lock() {
+                for (bucket, queue_stats) in &q_cache.bucket_stats {
+                    let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+                    bucket_stats.q_stat = queue_stats.snapshot();
+                    bucket_stats.mark_node_local_provider_available();
+                    bucket_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+                }
             }
         }
 
@@ -429,8 +508,11 @@ impl ReplicationStats {
         let boot_time = SystemTime::UNIX_EPOCH; // simplified implementation
         let uptime = SystemTime::now().duration_since(boot_time).unwrap_or_default().as_secs() as i64;
 
-        let q_cache = self.q_cache.lock().await;
-        let queued = q_cache.get_site_stats();
+        let queued = self
+            .q_cache
+            .lock()
+            .map(|q_cache| q_cache.get_site_stats())
+            .unwrap_or_default();
 
         let p_cache = self.p_cache.lock().await;
         let proxied = p_cache.get_site_stats();
@@ -633,8 +715,9 @@ impl ReplicationStats {
         drop(cache);
 
         {
-            let q_cache = self.q_cache.lock().await;
-            if let Some(queue_stats) = q_cache.bucket_stats.get(bucket) {
+            if let Ok(q_cache) = self.q_cache.lock()
+                && let Some(queue_stats) = q_cache.bucket_stats.get(bucket)
+            {
                 replication_stats.q_stat = queue_stats.snapshot();
             }
         }
@@ -665,31 +748,79 @@ impl ReplicationStats {
     }
 
     /// Increase queue statistics
-    pub async fn inc_q(&self, bucket: &str, size: i64, _is_delete_repl: bool, _op_type: ReplicationType) {
-        let mut q_cache = self.q_cache.lock().await;
-        let stats = q_cache
-            .bucket_stats
-            .entry(bucket.to_string())
-            .or_insert_with(InQueueMetric::default);
-        stats.curr.now_bytes.fetch_add(size, Ordering::Relaxed);
-        stats.curr.now_count.fetch_add(1, Ordering::Relaxed);
-
-        q_cache.sr_queue_stats.curr.now_bytes.fetch_add(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.curr.now_count.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_q(&self, bucket: &str, size: i64, _is_delete_repl: bool, _op_type: ReplicationType) {
+        if let Ok(mut q_cache) = self.q_cache.lock() {
+            q_cache.inc(bucket, size);
+        }
     }
 
     /// Decrease queue statistics
-    pub async fn dec_q(&self, bucket: &str, size: i64, _is_del_marker: bool, _op_type: ReplicationType) {
-        let mut q_cache = self.q_cache.lock().await;
-        let stats = q_cache
-            .bucket_stats
-            .entry(bucket.to_string())
-            .or_insert_with(InQueueMetric::default);
-        stats.curr.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        stats.curr.now_count.fetch_sub(1, Ordering::Relaxed);
+    pub fn dec_q(&self, bucket: &str, size: i64, _is_del_marker: bool, _op_type: ReplicationType) {
+        if let Ok(mut q_cache) = self.q_cache.lock() {
+            q_cache.dec(bucket, size);
+        }
+    }
 
-        q_cache.sr_queue_stats.curr.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.curr.now_count.fetch_sub(1, Ordering::Relaxed);
+    pub(crate) fn inc_target_q(&self, bucket: &str, target_arns: &[String], size: i64) {
+        let target_arns = normalized_target_arns(target_arns);
+        if target_arns.is_empty() {
+            return;
+        }
+        with_target_queue_caches(|caches| {
+            prune_stale_target_queue_caches(caches);
+            let slot_index = match caches.iter().position(|slot| slot.belongs_to(&self.q_cache)) {
+                Some(index) => index,
+                None => {
+                    caches.push(TargetQueueCacheSlot::new(&self.q_cache));
+                    caches.len() - 1
+                }
+            };
+            let slot = &mut caches[slot_index];
+            let bucket = bucket.to_string();
+            for target_arn in target_arns {
+                let metric = match slot.metrics.entry((bucket.clone(), target_arn.to_string())) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(InQueueMetric::default()),
+                };
+                metric.curr.add_current(size, 1);
+            }
+        });
+    }
+
+    pub(crate) fn dec_target_q(&self, bucket: &str, target_arns: &[String], size: i64) {
+        let target_arns = normalized_target_arns(target_arns);
+        if target_arns.is_empty() {
+            return;
+        }
+        with_target_queue_caches(|caches| {
+            prune_stale_target_queue_caches(caches);
+            if let Some(slot) = caches.iter_mut().find(|slot| slot.belongs_to(&self.q_cache)) {
+                let bucket = bucket.to_string();
+                for target_arn in target_arns {
+                    if let Some(metric) = slot.metrics.get_mut(&(bucket.clone(), target_arn.to_string())) {
+                        metric.curr.subtract_current(size, 1);
+                    }
+                }
+                slot.metrics
+                    .retain(|_, metric| metric.curr.get_current_count() > 0 || metric.curr.get_current_bytes() > 0);
+            }
+        });
+    }
+
+    pub fn runtime_target_backlog_snapshot(&self) -> Vec<RuntimeReplicationTargetBacklog> {
+        let mut snapshot = with_target_queue_caches(|caches| {
+            caches
+                .iter()
+                .find(|slot| slot.belongs_to(&self.q_cache))
+                .map(|slot| target_queue_cache_snapshot(&slot.metrics))
+                .unwrap_or_default()
+        });
+        snapshot.sort_by(|left, right| {
+            left.bucket
+                .cmp(&right.bucket)
+                .then_with(|| left.target_arn.cmp(&right.target_arn))
+        });
+        snapshot
     }
 
     /// Increase proxy metrics
@@ -714,6 +845,94 @@ impl Default for ReplicationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_target_backlog_snapshot_tracks_targets() {
+        let stats = ReplicationStats::new();
+        stats.inc_target_q(
+            "photos",
+            &[
+                "arn:rustfs:replication:target-b".to_string(),
+                "arn:rustfs:replication:target-a".to_string(),
+                "arn:rustfs:replication:target-a".to_string(),
+            ],
+            1024,
+        );
+
+        let snapshot = stats.runtime_target_backlog_snapshot();
+
+        assert_eq!(
+            snapshot,
+            vec![
+                RuntimeReplicationTargetBacklog {
+                    bucket: "photos".to_string(),
+                    target_arn: "arn:rustfs:replication:target-a".to_string(),
+                    count: 1,
+                    bytes: 1024,
+                },
+                RuntimeReplicationTargetBacklog {
+                    bucket: "photos".to_string(),
+                    target_arn: "arn:rustfs:replication:target-b".to_string(),
+                    count: 1,
+                    bytes: 1024,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_target_backlog_ignores_empty_targets() {
+        let stats = ReplicationStats::new();
+        stats.inc_target_q("photos", &["".to_string()], 1024);
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_target_backlog_is_scoped_to_stats_instance() {
+        let first = ReplicationStats::new();
+        let second = ReplicationStats::new();
+        first.inc_target_q("photos", &["arn:rustfs:replication:target-a".to_string()], 1024);
+
+        assert!(second.runtime_target_backlog_snapshot().is_empty());
+        assert_eq!(first.runtime_target_backlog_snapshot()[0].count, 1);
+    }
+
+    #[test]
+    fn runtime_target_backlog_decrements_with_saturation() {
+        let stats = ReplicationStats::new();
+        let target_arns = ["arn:rustfs:replication:target-a".to_string()];
+        stats.inc_target_q("photos", &target_arns, 1024);
+        stats.dec_target_q("photos", &target_arns, 2048);
+
+        assert!(stats.runtime_target_backlog_snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_target_backlog_prunes_stale_sidecar_on_next_access() {
+        {
+            let stats = ReplicationStats::new();
+            stats.inc_target_q("photos", &["arn:rustfs:replication:target-a".to_string()], 1024);
+            assert!(
+                TARGET_QUEUE_CACHES
+                    .lock()
+                    .expect("target queue cache mutex")
+                    .iter()
+                    .any(|slot| slot.owner.strong_count() > 0)
+            );
+        }
+
+        let stats = ReplicationStats::new();
+        stats.inc_target_q("photos", &["arn:rustfs:replication:target-b".to_string()], 1024);
+
+        assert!(
+            TARGET_QUEUE_CACHES
+                .lock()
+                .expect("target queue cache mutex")
+                .iter()
+                .all(|slot| slot.owner.strong_count() > 0)
+        );
+    }
 
     #[tokio::test]
     async fn test_replication_stats_new() {
@@ -801,14 +1020,14 @@ mod tests {
     async fn latest_stats_include_queue_until_drained() {
         let stats = ReplicationStats::new();
 
-        stats.inc_q("queued-bucket", 4096, false, ReplicationType::Object).await;
+        stats.inc_q("queued-bucket", 4096, false, ReplicationType::Object);
         let queued = stats.get_latest_replication_stats("queued-bucket").await;
         assert!(queued.replication_stats.provider_available);
         assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
         assert_eq!(queued.replication_stats.q_stat.curr.bytes, 4096);
         assert_eq!(queued.replication_stats.queue_scope, ReplicationMetricScope::NodeLocal);
 
-        stats.dec_q("queued-bucket", 4096, false, ReplicationType::Object).await;
+        stats.dec_q("queued-bucket", 4096, false, ReplicationType::Object);
         let drained = stats.get_latest_replication_stats("queued-bucket").await;
         assert_eq!(drained.replication_stats.q_stat.curr.count, 0);
         assert_eq!(drained.replication_stats.q_stat.curr.bytes, 0);
@@ -911,7 +1130,7 @@ mod tests {
         for _ in 0..32 {
             let stats = Arc::clone(&stats);
             tasks.push(tokio::spawn(async move {
-                stats.inc_q("concurrent-bucket", 7, false, ReplicationType::Object).await;
+                stats.inc_q("concurrent-bucket", 7, false, ReplicationType::Object);
             }));
         }
         for task in tasks {

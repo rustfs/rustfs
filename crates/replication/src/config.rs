@@ -18,10 +18,60 @@ use crate::rule::ReplicationRuleExt as _;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;
-use s3s::dto::{ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRuleStatus, ReplicationRules};
+use s3s::dto::{
+    ExistingObjectReplicationStatus, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
+    ReplicationRuleStatus, ReplicationRules,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
+
+pub const REPLICATION_CAPABILITY_CONTRACT_VERSION: u32 = 1;
+
+pub const REPLICATION_WRITABLE_FIELDS: &[&str] = &[
+    "Role",
+    "Rule.ID",
+    "Rule.Status",
+    "Rule.Priority",
+    "Rule.Filter.Prefix",
+    "Rule.Filter.Tag",
+    "Rule.Filter.And",
+    "Rule.Destination.Bucket",
+    "Rule.ExistingObjectReplication.Status",
+    "Rule.DeleteMarkerReplication.Status",
+    "Rule.DeleteReplication.Status",
+    "Rule.SourceSelectionCriteria.ReplicaModifications.Status",
+];
+
+pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
+    "SourceSelectionCriteria.SseKmsEncryptedObjects",
+    "Destination.EncryptionConfiguration",
+    "Destination.Metrics",
+    "Destination.ReplicationTime",
+];
+
+pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 1;
+
+pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
+    "sourcebucket",
+    "endpoint",
+    "credentials.accessKey",
+    "credentials.secretKey",
+    "targetbucket",
+    "secure",
+    "path",
+    "api",
+    "arn",
+    "type",
+    "region",
+    "bandwidth",
+    "replicationSync",
+    "storage_class",
+    "skipTlsVerify",
+    "caCertPem",
+];
+
+pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["disableProxy", "healthCheckDuration", "edge", "edgeSyncBeforeExpiry"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectOpts {
@@ -43,12 +93,134 @@ pub trait ReplicationConfigurationExt {
     fn get_destination(&self) -> Destination;
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
+    fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String>;
+    fn filter_target_replication_decisions(&self, obj: &ObjectOpts) -> Vec<(String, bool)> {
+        self.filter_target_arns(obj)
+            .into_iter()
+            .map(|arn| {
+                let mut target = obj.clone();
+                target.target_arn = arn.clone();
+                (arn, self.replicate(&target))
+            })
+            .collect()
+    }
+}
+
+fn rule_replicates(rule: &ReplicationRule, obj: &ObjectOpts) -> bool {
+    if let Some(status) = &rule.existing_object_replication
+        && obj.existing_object
+        && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+    {
+        return false;
+    }
+
+    if obj.op_type != ReplicationType::Delete {
+        return rule.metadata_replicate(obj);
+    }
+
+    if !rule.metadata_replicate(obj) {
+        return false;
+    }
+
+    let version_purge = obj.version_id.is_some();
+    if version_purge {
+        rule.delete_replication
+            .as_ref()
+            .is_some_and(|delete| delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED))
+    } else {
+        rule.delete_marker_replication.as_ref().is_some_and(|delete_marker| {
+            delete_marker.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationTargetValidationError {
     RoleWithMultipleDestinations,
     StaleTarget,
+}
+
+pub fn unsupported_replication_config_field(config: &ReplicationConfiguration) -> Option<&'static str> {
+    for rule in &config.rules {
+        if rule
+            .source_selection_criteria
+            .as_ref()
+            .is_some_and(|criteria| criteria.sse_kms_encrypted_objects.is_some())
+        {
+            return Some("SourceSelectionCriteria.SseKmsEncryptedObjects");
+        }
+        if rule.destination.encryption_configuration.is_some() {
+            return Some("Destination.EncryptionConfiguration");
+        }
+        if rule.destination.access_control_translation.is_some() {
+            return Some("Destination.AccessControlTranslation");
+        }
+        if rule.destination.account.is_some() {
+            return Some("Destination.Account");
+        }
+        if rule.destination.metrics.is_some() {
+            return Some("Destination.Metrics");
+        }
+        if rule.destination.replication_time.is_some() {
+            return Some("Destination.ReplicationTime");
+        }
+        if rule.destination.storage_class.is_some() {
+            return Some("Destination.StorageClass");
+        }
+    }
+    None
+}
+
+pub fn invalid_replication_config_status_field(config: &ReplicationConfiguration) -> Option<&'static str> {
+    for rule in &config.rules {
+        if !matches!(rule.status.as_str(), ReplicationRuleStatus::ENABLED | ReplicationRuleStatus::DISABLED) {
+            return Some("Rule.Status");
+        }
+        if rule.existing_object_replication.as_ref().is_some_and(|existing| {
+            !matches!(
+                existing.status.as_str(),
+                ExistingObjectReplicationStatus::ENABLED | ExistingObjectReplicationStatus::DISABLED
+            )
+        }) {
+            return Some("Rule.ExistingObjectReplication.Status");
+        }
+        if rule.delete_replication.as_ref().is_some_and(|delete| {
+            !matches!(
+                delete.status.as_str(),
+                DeleteReplicationStatus::ENABLED | DeleteReplicationStatus::DISABLED
+            )
+        }) {
+            return Some("Rule.DeleteReplication.Status");
+        }
+        if rule
+            .delete_marker_replication
+            .as_ref()
+            .and_then(|delete| delete.status.as_ref())
+            .is_some_and(|status| {
+                !matches!(
+                    status.as_str(),
+                    DeleteMarkerReplicationStatus::ENABLED | DeleteMarkerReplicationStatus::DISABLED
+                )
+            })
+        {
+            return Some("Rule.DeleteMarkerReplication.Status");
+        }
+        if rule
+            .source_selection_criteria
+            .as_ref()
+            .and_then(|criteria| criteria.replica_modifications.as_ref())
+            .is_some_and(|modifications| {
+                !matches!(
+                    modifications.status.as_str(),
+                    ReplicaModificationsStatus::ENABLED | ReplicaModificationsStatus::DISABLED
+                )
+            })
+        {
+            return Some("Rule.SourceSelectionCriteria.ReplicaModifications.Status");
+        }
+    }
+
+    None
 }
 
 pub fn active_replication_rule_destination_arns(config: &ReplicationConfiguration) -> HashSet<String> {
@@ -198,45 +370,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
     /// Determine whether an object should be replicated
     fn replicate(&self, obj: &ObjectOpts) -> bool {
         let rules = self.filter_actionable_rules(obj);
-
-        for rule in rules.iter() {
-            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
-                continue;
-            }
-
-            if let Some(status) = &rule.existing_object_replication
-                && obj.existing_object
-                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
-            {
-                return false;
-            }
-
-            if obj.op_type == ReplicationType::Delete {
-                if !rule.metadata_replicate(obj) {
-                    return false;
-                }
-
-                if obj.version_id.is_some() {
-                    if obj.delete_marker {
-                        return rule.delete_marker_replication.clone().is_some_and(|d| {
-                            d.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
-                        });
-                    }
-                    return rule
-                        .delete_replication
-                        .clone()
-                        .is_some_and(|d| d.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED));
-                } else {
-                    return rule.delete_marker_replication.clone().is_some_and(|d| {
-                        d.status == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
-                    });
-                }
-            }
-
-            // Regular object/metadata replication
-            return rule.metadata_replicate(obj);
-        }
-        false
+        rules.first().is_some_and(|rule| rule_replicates(rule, obj))
     }
 
     /// Check for an active rule
@@ -300,12 +434,97 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         }
         arns
     }
+
+    fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String> {
+        let role = self.role.trim();
+        let mut selected = BTreeMap::<String, (&ReplicationRule, bool)>::new();
+
+        for rule in &self.rules {
+            if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+                continue;
+            }
+
+            let rule_prefix = rule.prefix();
+            if !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(prefix) {
+                continue;
+            }
+
+            let target = if role.is_empty() {
+                rule.destination.bucket.trim()
+            } else {
+                role
+            };
+            if target.is_empty() {
+                continue;
+            }
+
+            let delete_enabled =
+                rule.delete_replication.as_ref().is_some_and(|delete| {
+                    delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED)
+                }) || rule.delete_marker_replication.as_ref().is_some_and(|delete_marker| {
+                    delete_marker.status
+                        == Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED))
+                });
+
+            if selected
+                .get(target)
+                .is_none_or(|(current, _)| rule.priority > current.priority)
+            {
+                selected.insert(target.to_string(), (rule, delete_enabled));
+            }
+        }
+
+        selected
+            .into_iter()
+            .filter_map(|(target, (_, enabled))| enabled.then_some(target))
+            .collect()
+    }
+
+    fn filter_target_replication_decisions(&self, obj: &ObjectOpts) -> Vec<(String, bool)> {
+        let rules = self.filter_actionable_rules(obj);
+        let role = self.role.trim();
+        if !role.is_empty() {
+            let mut selected = None;
+            for rule in &rules {
+                if selected.is_none_or(|current: &ReplicationRule| rule.priority > current.priority) {
+                    selected = Some(rule);
+                }
+            }
+            return vec![(role.to_string(), selected.is_some_and(|rule| rule_replicates(rule, obj)))];
+        }
+
+        let mut target_indexes: HashMap<&str, usize> = HashMap::new();
+        let mut selected_rules: Vec<(&str, &ReplicationRule)> = Vec::new();
+        for rule in &rules {
+            let arn = rule.destination.bucket.trim();
+            if arn.is_empty() {
+                continue;
+            }
+            if let Some(index) = target_indexes.get(arn).copied() {
+                if rule.priority > selected_rules[index].1.priority {
+                    selected_rules[index].1 = rule;
+                }
+            } else {
+                target_indexes.insert(arn, selected_rules.len());
+                selected_rules.push((arn, rule));
+            }
+        }
+        selected_rules
+            .into_iter()
+            .map(|(arn, rule)| (arn.to_string(), rule_replicates(rule, obj)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::dto::{DeleteMarkerReplication, Destination, ExistingObjectReplication, ReplicationRule};
+    use s3s::dto::{
+        DeleteMarkerReplication, DeleteReplication, Destination, EncryptionConfiguration, ExistingObjectReplication, Metrics,
+        MetricsStatus, ReplicaModifications, ReplicationRule, ReplicationTime, ReplicationTimeStatus, ReplicationTimeValue,
+        SourceSelectionCriteria, SseKmsEncryptedObjects, SseKmsEncryptedObjectsStatus,
+    };
+    use s3s::xml::{Deserializer, Serializer};
 
     fn replication_rule(id: &str, arn: &str) -> ReplicationRule {
         ReplicationRule {
@@ -603,6 +822,319 @@ mod tests {
         assert!(
             !config.replicate(&opts),
             "highest-priority rule disables delete-marker replication, so the delete marker must not replicate"
+        );
+    }
+
+    #[test]
+    fn role_delete_decision_follows_highest_priority_rule() {
+        let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![
+                delete_marker_rule("low-priority-enabled", destination, "logs/", 1, true),
+                delete_marker_rule("high-priority-disabled", destination, "logs/2026/", 5, false),
+            ],
+        };
+        let opts = ObjectOpts {
+            name: "logs/2026/app.log".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.filter_target_replication_decisions(&opts),
+            vec![(role.to_string(), false)],
+            "the role target must use the highest-priority matching rule"
+        );
+    }
+
+    #[test]
+    fn version_purge_uses_delete_replication_for_object_and_marker_versions() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut rule = delete_marker_rule("delete-switches", arn, "", 1, true);
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+        });
+        let mut config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+
+        for version_id in [Some(Uuid::new_v4()), Some(Uuid::nil())] {
+            for delete_marker in [false, true] {
+                assert!(!config.replicate(&ObjectOpts {
+                    name: "object".to_string(),
+                    op_type: ReplicationType::Delete,
+                    version_id,
+                    delete_marker,
+                    ..Default::default()
+                }));
+            }
+        }
+
+        let stored_marker = ObjectOpts {
+            name: "object".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(config.replicate(&stored_marker), "stored markers must use DeleteMarkerReplication");
+        assert_eq!(config.filter_target_replication_decisions(&stored_marker), vec![(arn.to_string(), true)]);
+
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        assert!(config.replicate(&ObjectOpts {
+            name: "object".to_string(),
+            op_type: ReplicationType::Delete,
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            ..Default::default()
+        }));
+        assert!(config.replicate(&stored_marker));
+    }
+
+    #[test]
+    fn unsupported_replication_fields_are_reported_before_persistence() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule("unsupported", arn)],
+        };
+
+        config.rules[0].source_selection_criteria = Some(SourceSelectionCriteria {
+            replica_modifications: None,
+            sse_kms_encrypted_objects: Some(SseKmsEncryptedObjects {
+                status: SseKmsEncryptedObjectsStatus::from_static(SseKmsEncryptedObjectsStatus::ENABLED),
+            }),
+        });
+        assert_eq!(
+            unsupported_replication_config_field(&config),
+            Some("SourceSelectionCriteria.SseKmsEncryptedObjects")
+        );
+
+        config.rules[0].source_selection_criteria = None;
+        config.rules[0].destination.encryption_configuration = Some(EncryptionConfiguration {
+            replica_kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/opaque-key-id".to_string()),
+        });
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.EncryptionConfiguration"));
+
+        config.rules[0].destination.encryption_configuration = None;
+        config.rules[0].destination.access_control_translation = Some(s3s::dto::AccessControlTranslation {
+            owner: s3s::dto::OwnerOverride::from_static(s3s::dto::OwnerOverride::DESTINATION),
+        });
+        assert_eq!(
+            unsupported_replication_config_field(&config),
+            Some("Destination.AccessControlTranslation")
+        );
+
+        config.rules[0].destination.access_control_translation = None;
+        config.rules[0].destination.account = Some("123456789012".to_string());
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.Account"));
+
+        config.rules[0].destination.account = None;
+        config.rules[0].destination.metrics = Some(Metrics {
+            event_threshold: None,
+            status: MetricsStatus::from_static(MetricsStatus::ENABLED),
+        });
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.Metrics"));
+
+        config.rules[0].destination.metrics = None;
+        config.rules[0].destination.replication_time = Some(ReplicationTime {
+            status: ReplicationTimeStatus::from_static(ReplicationTimeStatus::ENABLED),
+            time: ReplicationTimeValue { minutes: Some(15) },
+        });
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.ReplicationTime"));
+
+        config.rules[0].destination.replication_time = None;
+        config.rules[0].destination.storage_class =
+            Some(s3s::dto::StorageClass::from_static(s3s::dto::StorageClass::STANDARD_IA));
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.StorageClass"));
+    }
+
+    #[test]
+    fn historical_destination_fields_survive_the_s3_xml_round_trip() {
+        let xml = br#"
+            <ReplicationConfiguration>
+              <Role></Role>
+              <Rule>
+                <ID>historical</ID>
+                <Status>Enabled</Status>
+                <Destination>
+                  <Bucket>arn:aws:s3:::destination</Bucket>
+                  <Account>123456789012</Account>
+                  <AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>
+                  <StorageClass>STANDARD_IA</StorageClass>
+                </Destination>
+              </Rule>
+            </ReplicationConfiguration>
+        "#;
+        let mut deserializer = Deserializer::new(xml);
+        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
+            .expect("historical config should parse");
+        deserializer
+            .expect_eof()
+            .expect("historical config should consume the whole body");
+
+        let mut encoded = Vec::new();
+        <ReplicationConfiguration as s3s::xml::Serialize>::serialize(&config, &mut Serializer::new(&mut encoded))
+            .expect("historical config should serialize");
+        let encoded = String::from_utf8(encoded).expect("serialized XML should be UTF-8");
+        for field in [
+            "<Account>123456789012</Account>",
+            "<Owner>Destination</Owner>",
+            "<StorageClass>STANDARD_IA</StorageClass>",
+        ] {
+            assert!(encoded.contains(field), "historical field {field} was lost: {encoded}");
+        }
+    }
+
+    #[test]
+    fn s3_xml_parser_discards_unknown_replication_elements_before_validation() {
+        let xml = br#"
+            <ReplicationConfiguration>
+              <Role></Role>
+              <FutureTopLevel>future</FutureTopLevel>
+              <Rule>
+                <ID>unknown</ID>
+                <Status>Enabled</Status>
+                <Destination>
+                  <Bucket>arn:aws:s3:::destination</Bucket>
+                </Destination>
+              </Rule>
+            </ReplicationConfiguration>
+        "#;
+        let mut deserializer = Deserializer::new(xml);
+        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
+            .expect("s3s should accept unknown elements");
+        deserializer.expect_eof().expect("unknown elements should still be consumed");
+
+        assert!(config.rules[0].destination.encryption_configuration.is_none());
+        assert_eq!(unsupported_replication_config_field(&config), None);
+    }
+
+    #[test]
+    fn capability_fields_match_validator_rejections() {
+        let rejected_fields = [
+            "SourceSelectionCriteria.SseKmsEncryptedObjects",
+            "Destination.EncryptionConfiguration",
+            "Destination.Metrics",
+            "Destination.ReplicationTime",
+        ];
+
+        for field in rejected_fields {
+            assert!(
+                REPLICATION_READ_ONLY_HISTORICAL_FIELDS.contains(&field),
+                "rejected field {field} must be advertised as readable historical data"
+            );
+            assert!(
+                !REPLICATION_WRITABLE_FIELDS.contains(&field),
+                "rejected field {field} must not be advertised as writable"
+            );
+        }
+
+        for field in REPLICATION_WRITABLE_FIELDS {
+            assert!(
+                !REPLICATION_READ_ONLY_HISTORICAL_FIELDS.contains(field),
+                "field {field} cannot be both writable and historical-only"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_replication_status_fields_are_reported_before_persistence() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule("invalid-status", arn)],
+        };
+
+        config.rules[0].status = ReplicationRuleStatus::from_static("Invalid");
+        assert_eq!(invalid_replication_config_status_field(&config), Some("Rule.Status"));
+
+        config.rules[0] = replication_rule("invalid-status", arn);
+        config.rules[0].existing_object_replication = Some(ExistingObjectReplication {
+            status: ExistingObjectReplicationStatus::from_static("Invalid"),
+        });
+        assert_eq!(
+            invalid_replication_config_status_field(&config),
+            Some("Rule.ExistingObjectReplication.Status")
+        );
+
+        config.rules[0] = replication_rule("invalid-status", arn);
+        config.rules[0].delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static("Invalid"),
+        });
+        assert_eq!(invalid_replication_config_status_field(&config), Some("Rule.DeleteReplication.Status"));
+
+        config.rules[0] = replication_rule("invalid-status", arn);
+        config.rules[0].delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static("Invalid")),
+        });
+        assert_eq!(
+            invalid_replication_config_status_field(&config),
+            Some("Rule.DeleteMarkerReplication.Status")
+        );
+
+        config.rules[0] = replication_rule("invalid-status", arn);
+        config.rules[0].source_selection_criteria = Some(SourceSelectionCriteria {
+            replica_modifications: Some(ReplicaModifications {
+                status: ReplicaModificationsStatus::from_static("Invalid"),
+            }),
+            sse_kms_encrypted_objects: None,
+        });
+        assert_eq!(
+            invalid_replication_config_status_field(&config),
+            Some("Rule.SourceSelectionCriteria.ReplicaModifications.Status")
+        );
+    }
+
+    #[test]
+    fn target_decisions_choose_highest_priority_rule_per_destination() {
+        let target_a = "arn:rustfs:replication:us-east-1:target:a";
+        let target_b = "arn:rustfs:replication:us-east-1:target:b";
+        let mut a_low = delete_marker_rule("a-low", target_a, "logs/", 1, true);
+        let b = delete_marker_rule("b", target_b, "logs/", 2, true);
+        let a_high = delete_marker_rule("a-high", target_a, "logs/2026/", 5, false);
+        a_low.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![a_low, b, a_high],
+        };
+
+        let decisions = config.filter_target_replication_decisions(&ObjectOpts {
+            name: "logs/2026/app.log".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            ..Default::default()
+        });
+
+        assert_eq!(decisions, vec![(target_a.to_string(), false), (target_b.to_string(), true)]);
+    }
+
+    #[test]
+    fn force_delete_targets_use_overlapping_rules_and_highest_priority_switch() {
+        let target_a = "arn:target:a";
+        let target_b = "arn:target:b";
+        let mut a_parent = delete_marker_rule("a-parent", target_a, "logs/", 1, true);
+        a_parent.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        let a_child_disabled = delete_marker_rule("a-child", target_a, "logs/2026/", 5, false);
+        let b_child = delete_marker_rule("b-child", target_b, "logs/2026/", 2, true);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![a_parent, a_child_disabled, b_child],
+        };
+
+        assert_eq!(
+            config.filter_force_delete_target_arns("logs/2026/app.log"),
+            vec![target_b.to_string()],
+            "the child rule must win for target A while the overlapping child target B remains eligible"
         );
     }
 }

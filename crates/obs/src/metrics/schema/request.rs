@@ -22,6 +22,15 @@ pub const NAME_LABEL: &str = "name";
 pub const TYPE_LABEL: &str = "type";
 /// le label (for histogram buckets)
 pub const LE_LABEL: &str = "le";
+/// server label
+pub const SERVER_LABEL: &str = "server";
+
+const API_NAME_TYPE_LABELS: [&str; 2] = [NAME_LABEL, TYPE_LABEL];
+const API_SERVER_NAME_TYPE_LABELS: [&str; 3] = [SERVER_LABEL, NAME_LABEL, TYPE_LABEL];
+const API_NAME_TYPE_LE_LABELS: [&str; 3] = [NAME_LABEL, TYPE_LABEL, LE_LABEL];
+const API_SERVER_NAME_TYPE_LE_LABELS: [&str; 4] = [SERVER_LABEL, NAME_LABEL, TYPE_LABEL, LE_LABEL];
+const API_TYPE_LABELS: [&str; 1] = [TYPE_LABEL];
+const API_SERVER_TYPE_LABELS: [&str; 2] = [SERVER_LABEL, TYPE_LABEL];
 
 pub static API_REJECTED_AUTH_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
@@ -81,7 +90,16 @@ pub static API_REQUESTS_IN_FLIGHT_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLoc
     new_gauge_md(
         MetricName::ApiRequestsInFlightTotal,
         "Total number of requests currently in flight",
-        &["name", "type"],
+        &API_NAME_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_IN_FLIGHT_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("requests_in_flight_total_by_server".to_string()),
+        "Total number of requests currently in flight by server",
+        &API_SERVER_NAME_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -90,7 +108,16 @@ pub static API_REQUESTS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| 
     new_counter_md(
         MetricName::ApiRequestsTotal,
         "Total number of requests",
-        &["name", "type"],
+        &API_NAME_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("requests_total_by_server".to_string()),
+        "Total number of requests by server",
+        &API_SERVER_NAME_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -99,7 +126,16 @@ pub static API_REQUESTS_ERRORS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::
     new_counter_md(
         MetricName::ApiRequestsErrorsTotal,
         "Total number of requests with (4xx and 5xx) errors",
-        &["name", "type"],
+        &API_NAME_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_ERRORS_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("requests_errors_total_by_server".to_string()),
+        "Total number of requests with (4xx and 5xx) errors by server",
+        &API_SERVER_NAME_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -108,7 +144,16 @@ pub static API_REQUESTS_5XX_ERRORS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLo
     new_counter_md(
         MetricName::ApiRequests5xxErrorsTotal,
         "Total number of requests with 5xx errors",
-        &["name", "type"],
+        &API_NAME_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_5XX_ERRORS_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("requests_5xx_errors_total_by_server".to_string()),
+        "Total number of requests with 5xx errors by server",
+        &API_SERVER_NAME_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -117,7 +162,16 @@ pub static API_REQUESTS_4XX_ERRORS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLo
     new_counter_md(
         MetricName::ApiRequests4xxErrorsTotal,
         "Total number of requests with 4xx errors",
-        &["name", "type"],
+        &API_NAME_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_4XX_ERRORS_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("requests_4xx_errors_total_by_server".to_string()),
+        "Total number of requests with 4xx errors by server",
+        &API_SERVER_NAME_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -126,7 +180,16 @@ pub static API_REQUESTS_CANCELED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock
     new_counter_md(
         MetricName::ApiRequestsCanceledTotal,
         "Total number of requests canceled by the client",
-        &["name", "type"],
+        &API_NAME_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_CANCELED_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("requests_canceled_total_by_server".to_string()),
+        "Total number of requests canceled by the client by server",
+        &API_SERVER_NAME_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -135,7 +198,16 @@ pub static API_REQUESTS_TTFB_SECONDS_DISTRIBUTION_MD: LazyLock<MetricDescriptor>
     new_counter_md(
         MetricName::ApiRequestsTTFBSecondsDistribution,
         "Distribution of time to first byte across API calls",
-        &["name", "type", "le"],
+        &API_NAME_TYPE_LE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_REQUESTS_TTFB_SECONDS_DISTRIBUTION_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("requests_ttfb_seconds_distribution_by_server".to_string()),
+        "Distribution of time to first byte across API calls by server",
+        &API_SERVER_NAME_TYPE_LE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -144,7 +216,16 @@ pub static API_TRAFFIC_SENT_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_counter_md(
         MetricName::ApiTrafficSentBytes,
         "Total number of bytes sent",
-        &["type"],
+        &API_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_TRAFFIC_SENT_BYTES_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("traffic_sent_bytes_by_server".to_string()),
+        "Total number of bytes sent by server",
+        &API_SERVER_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });
@@ -153,7 +234,16 @@ pub static API_TRAFFIC_RECV_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_counter_md(
         MetricName::ApiTrafficRecvBytes,
         "Total number of bytes received",
-        &["type"],
+        &API_TYPE_LABELS,
+        MetricSubsystem::ApiRequests,
+    )
+});
+
+pub static API_TRAFFIC_RECV_BYTES_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("traffic_recv_bytes_by_server".to_string()),
+        "Total number of bytes received by server",
+        &API_SERVER_TYPE_LABELS,
         MetricSubsystem::ApiRequests,
     )
 });

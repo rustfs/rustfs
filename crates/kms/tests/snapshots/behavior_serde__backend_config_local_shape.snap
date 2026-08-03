@@ -1,0 +1,8 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: shape_of(&local_backend)
+---
+Local:
+  file_permissions: "<number>"
+  key_dir: "<string>"
+  master_key: "<null>"

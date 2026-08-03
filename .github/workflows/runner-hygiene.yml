@@ -1,0 +1,81 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Asserts that the self-hosted runners are still ephemeral — one job per pod.
+#
+# This repository is public and its pull_request jobs run on those runners,
+# executing the PR's own build.rs, proc-macros and tests. The only thing keeping
+# that code from reaching a later job is that each ARC pod handles exactly one
+# job and is then destroyed. That guarantee lives in the ARC scale-set
+# configuration, outside this repository, where it can be changed without any PR
+# — so it is asserted here from the outside, against real run data, instead of
+# being assumed.
+#
+# Monthly rather than per-PR: the property changes only when someone
+# reconfigures the scale set, and the check costs a few dozen API calls.
+# See docs/ci/runners.md and rustfs/backlog#1602.
+
+name: Runner Hygiene
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # Monthly, 1st at 06:00 UTC (after the daily audit cron)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-hygiene
+  cancel-in-progress: false
+
+jobs:
+  check-ephemerality:
+    name: Check runner ephemerality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # Exit 2 (inconclusive / broken) is deliberately not a pass: a window
+      # where every sm-* job was still queued would otherwise look identical to
+      # a clean bill of health.
+      - name: Assert one job per self-hosted runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/ci/check_runner_ephemerality.sh 40
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [check-ephemerality]
+    # Same ci-8 mechanism as coverage.yml, audit.yml and the nightly lanes:
+    # scheduled runs file a tracking issue, manual dispatch stays quiet so
+    # debugging never produces a spurious alert.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

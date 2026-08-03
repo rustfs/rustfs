@@ -37,7 +37,7 @@ pub type RStats = Vec<Arc<RebalanceStats>>;
 #[derive(Debug, Default)]
 pub(super) struct RebalanceBucketConfigs {
     pub(super) lifecycle_config: Option<s3s::dto::BucketLifecycleConfiguration>,
-    pub(super) lock_retention: Option<s3s::dto::DefaultRetention>,
+    pub(super) object_lock_config: Option<s3s::dto::ObjectLockConfiguration>,
     pub(super) replication_config: Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
 }
 

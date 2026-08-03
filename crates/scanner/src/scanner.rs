@@ -949,7 +949,7 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
                 }
                 SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                     return Err(format!(
-                        "scanner activity peer {host} cannot acknowledge distributed dirty usage with protocol {}",
+                        "scanner activity peer {host} cannot safely share scanner cache locks with protocol {}",
                         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION
                     ));
                 }
@@ -7114,9 +7114,17 @@ mod tests {
                 ..scanner_node_activity("epoch-a", 7, 3)
             },
         )]);
+        let previous = BTreeMap::from([(
+            "node-2".to_string(),
+            ScannerNodeActivity {
+                protocol_version: SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+                ..scanner_node_activity("epoch-a", 7, 3)
+            },
+        )]);
         let current = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
 
         assert_ne!(scanner_activity_snapshot_digest(&legacy), scanner_activity_snapshot_digest(&current));
+        assert_ne!(scanner_activity_snapshot_digest(&previous), scanner_activity_snapshot_digest(&current));
     }
 
     #[test]

@@ -45,7 +45,10 @@
 
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
-use crate::bucket::object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification};
+use crate::bucket::metadata_sys::ObjectLockConfigState;
+use crate::bucket::object_lock::objectlock_sys::{
+    check_object_lock_for_deletion_with_config, check_object_lock_for_deletion_with_state, check_retention_for_modification,
+};
 use crate::bucket::replication::{
     ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
     replication_state_to_filemeta,
@@ -107,7 +110,7 @@ use crate::{
         SnapshotLeaseToken, UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
-    object_api::{GetObjectReader, ObjectInfo, PutObjReader},
+    object_api::{GetObjectReader, NamespaceLockFence, ObjectInfo, ObjectLockConfigSnapshot, PutObjReader},
     // event::name::EventName,
     services::event_notification::{EventArgs, send_event},
     store::init_format::{
@@ -155,9 +158,9 @@ use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
 use rustfs_utils::http::{
-    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_RESTORE_OPERATION_ID, contains_key_str, get_header_map, get_str, insert_str, is_object_encryption_marker,
-    remove_header_map,
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, contains_key_str, get_header_map, get_str, insert_str,
+    is_object_encryption_marker, remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -669,6 +672,7 @@ fn release_materialized_read_lock(bucket: &str, object: &str, read_lock_guard: O
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
     metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
+    rustfs_utils::http::metadata_compat::remove_str(metadata, SUFFIX_BUCKET_INCARNATION_ID);
 }
 
 fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
@@ -956,6 +960,8 @@ pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCl
 pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(test)]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
+#[cfg(test)]
+pub(crate) use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
 mod read;
 mod replication;
 pub(crate) mod shard_source;
@@ -3771,7 +3777,49 @@ pub(crate) fn object_lock_delete_check_required(bucket_meta: Option<&crate::buck
     bucket_meta.is_none_or(|meta| meta.object_locking())
 }
 
-async fn check_object_lock_delete(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+fn restore_expiry_snapshot_matches(obj_info: &ObjectInfo, opts: &ObjectOptions) -> bool {
+    let expected = &opts.transition;
+    expected.expire_restored
+        && expected.status == TRANSITION_COMPLETE
+        && obj_info.transitioned_object.status == TRANSITION_COMPLETE
+        && !obj_info.transitioned_object.name.is_empty()
+        && !obj_info.transitioned_object.tier.is_empty()
+        && expected.tier == obj_info.transitioned_object.tier
+        && expected.expected_remote_name == obj_info.transitioned_object.name
+        && expected.expected_remote_version_id == obj_info.transitioned_object.version_id
+        && !expected.etag.is_empty()
+        && obj_info.etag.as_deref() == Some(expected.etag.as_str())
+        && expected.expected_data_dir.is_some()
+        && expected.expected_data_dir == obj_info.data_dir
+        && obj_info.restore_expires == Some(expected.restore_expiry)
+        && !obj_info.restore_ongoing
+        // Deliberately no `restore_expiry <= now` clause. Whether the restored
+        // copy is due to expire is the ILM evaluator's decision, already made
+        // when it emitted DeleteRestoredAction; re-deriving it here only adds a
+        // way for a legitimate action to be rejected. The stale-event risk it
+        // looks like it covers is already covered above: a re-restore rewrites
+        // `restore_expires`, so a replayed event fails the equality check.
+        && match obj_info.version_id {
+            Some(version_id) => opts.version_id.as_deref().and_then(|value| Uuid::parse_str(value).ok()) == Some(version_id),
+            None => opts.version_id.is_none(),
+        }
+}
+
+async fn check_object_lock_delete(
+    ctx: &InstanceContext,
+    bucket: &str,
+    object: &str,
+    obj_info: &ObjectInfo,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    if crate::bucket::utils::is_meta_bucketname(bucket) {
+        return Ok(());
+    }
+    if opts.transition.expire_restored {
+        return restore_expiry_snapshot_matches(obj_info, opts)
+            .then_some(())
+            .ok_or(StorageError::PreconditionFailed);
+    }
     if set_disk_delete_creates_delete_marker(opts) {
         return Ok(());
     }
@@ -3780,11 +3828,43 @@ async fn check_object_lock_delete(bucket: &str, object: &str, obj_info: &ObjectI
         .object_lock_delete
         .as_ref()
         .is_some_and(|delete_opts| delete_opts.bypass_governance);
-    if check_object_lock_for_deletion(bucket, obj_info, bypass_governance)
-        .await
-        .is_some()
-    {
+    let blocked = match opts.object_lock_config_snapshot.as_deref() {
+        Some(snapshot) => check_object_lock_for_deletion_with_state(snapshot.state(), obj_info, bypass_governance)?.is_some(),
+        None => {
+            let state = metadata_sys::get_object_lock_config_state_in(ctx, bucket).await?;
+            check_object_lock_for_deletion_with_state(&state, obj_info, bypass_governance)?.is_some()
+        }
+    };
+    if blocked {
         return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+    }
+
+    Ok(())
+}
+
+fn ensure_delete_commit_locks_held(
+    lock_guard: Option<&ObjectLockDiagGuard>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    if lock_guard.is_some_and(ObjectLockDiagGuard::is_lock_lost)
+        || opts
+            .namespace_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        || opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+    {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "delete_object_commit",
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
     }
 
     Ok(())
@@ -4358,8 +4438,15 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
+            let cached_disk_id = disk.cached_disk_id().await;
             if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
-                match disk.disk_info(&DiskInfoOptions::default()).await {
+                match disk
+                    .disk_info(&DiskInfoOptions {
+                        metrics: true,
+                        ..Default::default()
+                    })
+                    .await
+                {
                     Ok(res) => {
                         disk.record_capacity_probe(res.total, res.used, res.free);
                         ret.push(rustfs_madmin::Disk {
@@ -4390,6 +4477,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             utilization: utilization_percent(res.total, res.used),
                             used_inodes: res.used_inodes,
                             free_inodes: res.free_inodes,
+                            metrics: Some(res.metrics),
                             ..Default::default()
                         });
                     }
@@ -4397,12 +4485,15 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                         let mut disk_info = rustfs_madmin::Disk {
                             state: err.to_string(),
                             endpoint: eps[i].to_string(),
+                            drive_path: eps[i].get_file_path(),
                             local: eps[i].is_local,
                             pool_index: eps[i].pool_idx,
                             set_index: eps[i].set_idx,
                             disk_index: eps[i].disk_idx,
                             runtime_state: Some(runtime_state.as_str().to_string()),
                             offline_duration_seconds,
+                            metrics: disk.metrics_snapshot(),
+                            uuid: cached_disk_id.map_or_else(String::new, |id| id.to_string()),
                             ..Default::default()
                         };
                         if let Some((total, used, free, _)) = capacity_snapshot {
@@ -4421,16 +4512,16 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     }
                 }
             } else {
-                ret.push(build_runtime_snapshot_disk(
-                    &eps[i],
-                    runtime_state,
-                    offline_duration_seconds,
-                    capacity_snapshot,
-                ));
+                let mut disk_info =
+                    build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds, capacity_snapshot);
+                disk_info.metrics = disk.metrics_snapshot();
+                disk_info.uuid = cached_disk_id.map_or_else(String::new, |id| id.to_string());
+                ret.push(disk_info);
             }
         } else {
             ret.push(rustfs_madmin::Disk {
                 endpoint: eps[i].to_string(),
+                drive_path: eps[i].get_file_path(),
                 local: eps[i].is_local,
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
@@ -4456,6 +4547,7 @@ fn build_runtime_snapshot_disk(
 ) -> rustfs_madmin::Disk {
     let mut disk = rustfs_madmin::Disk {
         endpoint: endpoint.to_string(),
+        drive_path: endpoint.get_file_path(),
         local: endpoint.is_local,
         pool_index: endpoint.pool_idx,
         set_index: endpoint.set_idx,
@@ -4698,6 +4790,7 @@ pub fn is_infrequent_access_class(storage_class: &str) -> bool {
 mod tests {
     use super::*;
     use crate::bucket::replication::{replication_statuses_map, version_purge_statuses_map};
+    use crate::cluster::rpc::{RemoteDisk, TcpHttpInternodeDataTransport};
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::DataDirDeleteStatus;
@@ -4714,6 +4807,7 @@ mod tests {
     use crate::layout::endpoints::SetupType;
     use crate::object_api::BLOCK_SIZE_V2;
     use crate::object_api::ObjectInfo;
+    use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         namespace::NamespaceLocking as _, object::ObjectIO as _, object::ObjectOperations as _,
@@ -4986,6 +5080,26 @@ mod tests {
             .expect("format should be saved");
 
         (dir, endpoint, disk)
+    }
+
+    async fn make_remote_disk_for_info_test(disk_idx: usize) -> (Endpoint, DiskStore) {
+        let endpoint_url = format!("http://remote-server:9000/data{disk_idx}");
+        let mut endpoint = Endpoint::try_from(endpoint_url.as_str()).expect("remote endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should be created");
+
+        (endpoint, Arc::new(disk::Disk::Remote(Box::new(remote_disk))))
     }
 
     #[tokio::test]
@@ -5638,7 +5752,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        timeout(
+        let result = timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -5650,8 +5764,14 @@ mod tests {
             ),
         )
         .await
-        .expect("broad prefix delete must not wait on a literal prefix namespace lock")
-        .expect("empty test disks should allow broad prefix cleanup");
+        .expect("broad prefix delete must not wait on a literal prefix namespace lock");
+
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().to_ascii_lowercase().contains("lock"),
+                "broad prefix delete returned a lock error: {err}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5671,7 +5791,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        timeout(
+        let result = timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -5685,8 +5805,14 @@ mod tests {
             ),
         )
         .await
-        .expect("no_lock exact prefix delete path must not wait for the outer lock")
-        .expect("empty test disks should allow exact prefix cleanup");
+        .expect("no_lock exact prefix delete path must not wait for the outer lock");
+
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().to_ascii_lowercase().contains("lock"),
+                "no_lock exact prefix delete returned a lock error: {err}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7697,6 +7823,13 @@ mod tests {
             .as_ref()
             .expect("disk 1 should exist")
             .force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+        let offline_disk_id = Uuid::new_v4();
+        disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .set_disk_id_state(Some(offline_disk_id))
+            .await
+            .expect("offline disk id should be cached");
         disks[2]
             .as_ref()
             .expect("disk 2 should exist")
@@ -7708,14 +7841,82 @@ mod tests {
         assert_eq!(info[0].state, "ok");
         assert_eq!(info[0].runtime_state.as_deref(), Some("online"));
         assert!(!info[0].drive_path.is_empty(), "online disk should keep immediate disk_info probe");
+        assert!(
+            info[0]
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.api_calls.get("disk_info"))
+                .copied()
+                .unwrap_or_default()
+                > 0,
+            "online disk should expose disk_info operation metrics"
+        );
 
         assert_eq!(info[1].state, "ok");
         assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
         assert!(!info[1].drive_path.is_empty(), "suspect disk should still probe for fresher disk info");
+        assert!(
+            info[1]
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.last_minute.get("disk_info"))
+                .map(|action| action.count)
+                .unwrap_or_default()
+                > 0,
+            "suspect disk should expose last-minute disk_info latency"
+        );
 
         assert_eq!(info[2].state, "offline");
         assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));
-        assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
+        assert_eq!(
+            info[2].drive_path,
+            endpoints[2].get_file_path(),
+            "offline disk should keep stable endpoint path"
+        );
+        assert_eq!(info[2].uuid, offline_disk_id.to_string());
+        assert!(
+            info[2].metrics.is_some(),
+            "offline runtime fallback should preserve disk metrics snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_preserves_remote_cached_disk_id_when_offline() {
+        let (endpoint, disk) = make_remote_disk_for_info_test(0).await;
+        let remote_disk_id = Uuid::new_v4();
+        disk.set_disk_id_state(Some(remote_disk_id))
+            .await
+            .expect("remote disk id should be cached");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].state, "offline");
+        assert_eq!(info[0].runtime_state.as_deref(), Some("offline"));
+        assert_eq!(info[0].uuid, remote_disk_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_preserves_cached_disk_id_after_failed_live_probe() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let cached_disk_id = Uuid::new_v4();
+        disk.set_disk_id_state(Some(cached_disk_id))
+            .await
+            .expect("disk id should be cached before the failed probe");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].runtime_state.as_deref(), Some("suspect"));
+        assert_eq!(info[0].uuid, cached_disk_id.to_string());
+        assert_eq!(
+            info[0].drive_path,
+            temp_dir.path().to_string_lossy(),
+            "failed live probe should still keep the endpoint path"
+        );
     }
 
     #[tokio::test]
@@ -8447,14 +8648,103 @@ mod tests {
         let opts = ObjectOptions {
             version_id: Some(Uuid::new_v4().to_string()),
             versioned: true,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
-        let err = check_object_lock_delete("bucket", "object", &obj_info, &opts)
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
             .expect_err("COMPLIANCE retention must block explicit version deletion");
 
         assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_allows_retained_restored_copy_expiry() {
+        let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
+        let restore_expiry = OffsetDateTime::now_utc() - Duration::from_secs(1);
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let obj_info = ObjectInfo {
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            etag: Some("etag".to_string()),
+            transitioned_object: TransitionedObject {
+                name: "remote-object".to_string(),
+                tier: "tier".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            restore_expires: Some(restore_expiry),
+            user_defined: Arc::new(HashMap::from([
+                (
+                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                ),
+                (
+                    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                    retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some(version_id.to_string()),
+            versioned: true,
+            transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                status: TRANSITION_COMPLETE.to_string(),
+                tier: "tier".to_string(),
+                etag: "etag".to_string(),
+                expected_data_dir: Some(data_dir),
+                expected_remote_name: "remote-object".to_string(),
+                restore_expiry,
+                expire_restored: true,
+                ..Default::default()
+            },
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+
+        check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect("restore expiry only strips the local copy and must preserve the retained logical version");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_rejects_stale_restored_copy_expiry() {
+        let restore_expiry = OffsetDateTime::now_utc() - Duration::from_secs(1);
+        let data_dir = Uuid::new_v4();
+        let obj_info = ObjectInfo {
+            data_dir: Some(data_dir),
+            etag: Some("etag".to_string()),
+            transitioned_object: TransitionedObject {
+                name: "remote-object".to_string(),
+                tier: "tier".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            restore_expires: Some(restore_expiry + Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                status: TRANSITION_COMPLETE.to_string(),
+                tier: "tier".to_string(),
+                etag: "etag".to_string(),
+                expected_data_dir: Some(data_dir),
+                expected_remote_name: "remote-object".to_string(),
+                restore_expiry,
+                expire_restored: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("a renewed restored copy must reject the stale expiry task");
+        assert!(matches!(err, StorageError::PreconditionFailed));
     }
 
     #[tokio::test]
@@ -8481,7 +8771,7 @@ mod tests {
             ..Default::default()
         };
 
-        check_object_lock_delete("bucket", "object", &obj_info, &opts)
+        check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
             .expect("versioned delete marker creation should not delete the locked version");
     }
@@ -9565,6 +9855,15 @@ mod tests {
         make_local_bucket_test_set_disks_with_drive_count(2).await
     }
 
+    fn assert_exclusive_object_lock_held(set_disks: &SetDisks, bucket: &str, object: &str) {
+        let lock = set_disks
+            .local_lock_manager_for_test()
+            .get_lock_info(&ObjectKey::new(bucket, object))
+            .expect("object lock should be visible while rename is paused");
+        assert!(matches!(lock.mode, rustfs_lock::LockMode::Exclusive));
+        assert_eq!(lock.owner.as_ref(), set_disks.locker_owner.as_str());
+    }
+
     async fn make_local_bucket_test_set_disks_with_drive_count(drive_count: usize) -> Arc<SetDisks> {
         let format = FormatV3::new(1, drive_count);
         let mut endpoints = Vec::new();
@@ -9599,7 +9898,9 @@ mod tests {
             disks.push(Some(disk));
         }
 
-        let set_disks = SetDisks::new(
+        let instance_ctx = Arc::new(InstanceContext::new());
+        instance_ctx.update_erasure_type(SetupType::Erasure).await;
+        let set_disks = SetDisks::new_with_instance_ctx(
             "test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
             drive_count,
@@ -9609,6 +9910,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            instance_ctx,
         )
         .await;
         set_disks.set_test_storage_class_config(
@@ -9760,6 +10062,7 @@ mod tests {
         let payload = (0..(BLOCK_SIZE_V2 + 17)).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
         let opts = ObjectOptions {
             no_lock: true,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
@@ -9885,7 +10188,12 @@ mod tests {
             let bucket = "snapshot-streaming-delete";
             let object = "object";
             let body = vec![0x41; 2 * 1024 * 1024];
-            let opts = ObjectOptions::default();
+            let opts = ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            };
 
             set_disks
                 .make_bucket(bucket, &MakeBucketOptions::default())
@@ -9937,7 +10245,12 @@ mod tests {
             let bucket = "snapshot-streaming-delete-objects";
             let object = "object";
             let body = vec![0x41; 2 * 1024 * 1024];
-            let opts = ObjectOptions::default();
+            let opts = ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            };
 
             set_disks
                 .make_bucket(bucket, &MakeBucketOptions::default())
@@ -10260,6 +10573,216 @@ mod tests {
                 .await,
             Some(StorageError::ObjectNotFound(_, _))
         ));
+    }
+
+    #[tokio::test]
+    async fn conditional_replace_holds_object_lock_through_rename() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-conditional-replace-fence";
+        let object = "config/conditional-replace.json";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut initial_reader = PutObjReader::from_vec(b"initial config".to_vec());
+        let initial = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial config should be written");
+        let initial_etag = initial.etag.expect("initial config should have an ETag");
+
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let writer_store = set_disks.clone();
+        let expected_etag = initial_etag.clone();
+        let writer = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"replacement config".to_vec());
+            writer_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        preserve_etag: Some("replacement-etag".to_string()),
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_match: Some(expected_etag),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("conditional replace should reach the rename barrier");
+        assert_exclusive_object_lock_held(&set_disks, bucket, object);
+        barrier.release();
+        writer
+            .await
+            .expect("conditional writer task should finish")
+            .expect("matching conditional replace should commit");
+        assert!(
+            set_disks
+                .local_lock_manager_for_test()
+                .get_lock_info(&ObjectKey::new(bucket, object))
+                .is_none(),
+            "conditional replace should release the object lock after commit"
+        );
+        let contender = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("contender namespace lock should be created");
+        let contender_guard = contender
+            .get_write_lock(std::time::Duration::from_secs(30))
+            .await
+            .expect("contender should acquire after conditional replace commits");
+        drop(contender_guard);
+
+        let mut stale_reader = PutObjReader::from_vec(b"stale config".to_vec());
+        let err = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut stale_reader,
+                &ObjectOptions {
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_match: Some(initial_etag),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the old ETag must fail after the fenced replacement commits");
+        assert_eq!(err, StorageError::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn repeated_body_write_keeps_etag_but_changes_data_dir_generation() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-write-generation";
+        let object = "config/write-generation.json";
+        let body = b"identical config body".to_vec();
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut first_reader = PutObjReader::from_vec(body.clone());
+        let first = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut first_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first config body should be written");
+        let mut second_reader = PutObjReader::from_vec(body);
+        let second = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut second_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("identical config body should be rewritten");
+
+        assert_eq!(first.etag, second.etag, "content ETag should expose the ABA collision");
+        assert_ne!(first.data_dir, second.data_dir, "each committed body write needs a unique generation");
+        assert!(first.data_dir.is_some() && second.data_dir.is_some());
+    }
+
+    #[tokio::test]
+    async fn conditional_create_holds_object_lock_through_rename() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-conditional-create-fence";
+        let object = "config/conditional-create.json";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let writer_store = set_disks.clone();
+        let writer = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"created config".to_vec());
+            writer_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("conditional create should reach the rename barrier");
+        assert_exclusive_object_lock_held(&set_disks, bucket, object);
+        barrier.release();
+        writer
+            .await
+            .expect("conditional writer task should finish")
+            .expect("first conditional create should commit");
+        assert!(
+            set_disks
+                .local_lock_manager_for_test()
+                .get_lock_info(&ObjectKey::new(bucket, object))
+                .is_none(),
+            "conditional create should release the object lock after commit"
+        );
+        let contender = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("contender namespace lock should be created");
+        let contender_guard = contender
+            .get_write_lock(std::time::Duration::from_secs(30))
+            .await
+            .expect("contender should acquire after conditional create commits");
+        drop(contender_guard);
+
+        let mut duplicate_reader = PutObjReader::from_vec(b"duplicate config".to_vec());
+        let err = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut duplicate_reader,
+                &ObjectOptions {
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a second create-only write must not replace the committed config");
+        assert_eq!(err, StorageError::PreconditionFailed);
     }
 
     #[tokio::test]
@@ -10588,6 +11111,71 @@ mod tests {
         assert_eq!(restored, payload);
     }
 
+    /// The other half of the suspended-versioning delete contract: a client
+    /// that drains such a bucket lists the null delete marker and then purges
+    /// it as `?versionId=null`, which is what `nuke_bucket` does before
+    /// `DeleteBucket`. That purge must succeed — if it is rejected the marker's
+    /// `xl.meta` survives, and `DeleteBucket`'s raw disk scan then reports
+    /// `BucketNotEmpty` for a bucket the client has already emptied.
+    #[tokio::test]
+    async fn set_level_explicit_null_version_delete_purges_the_null_delete_marker() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-null-marker-purge";
+        let object = "object.txt";
+        // The delete path reads versioned/suspended from the bucket-config
+        // snapshot, not from `opts`, so inject a real Suspended config —
+        // otherwise `from_file_info` never synthesizes the null version id and
+        // the branch under test is not reached.
+        let suspended = crate::bucket::replication::DeleteReplicationConfigSnapshot::from_configs_for_test(
+            s3s::dto::VersioningConfiguration {
+                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                ..Default::default()
+            },
+            None,
+        );
+        let opts = ObjectOptions {
+            no_lock: true,
+            version_suspended: true,
+            delete_replication_config_snapshot: Some(Arc::new(suspended)),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"suspended version body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("suspended-version object should be written");
+
+        let marker = set_disks
+            .delete_object(bucket, object, opts.clone())
+            .await
+            .expect("version-suspended delete should create a null marker");
+        assert!(marker.delete_marker);
+        assert_eq!(marker.version_id, Some(Uuid::nil()));
+
+        let (_deleted, errs) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(Uuid::nil()),
+                    ..Default::default()
+                }],
+                opts.clone(),
+            )
+            .await;
+
+        assert!(
+            errs.iter().all(Option::is_none),
+            "explicit null-version purge of the null delete marker must succeed, got {errs:?}"
+        );
+    }
+
     #[tokio::test]
     async fn set_level_version_suspended_delete_creates_null_delete_marker() {
         let set_disks = make_local_bucket_test_set_disks().await;
@@ -10596,6 +11184,7 @@ mod tests {
         let opts = ObjectOptions {
             no_lock: true,
             version_suspended: true,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
@@ -10685,6 +11274,9 @@ mod tests {
             let missing = "missing.txt";
             let opts = ObjectOptions {
                 no_lock: true,
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
                 ..Default::default()
             };
 

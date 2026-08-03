@@ -65,6 +65,7 @@
 
 // Core modules
 pub mod api_types;
+pub mod audit;
 pub mod backends;
 pub mod backup;
 mod cache;
@@ -72,25 +73,192 @@ pub mod config;
 pub mod deletion_worker;
 mod encryption;
 mod error;
+pub mod key_impact;
 pub mod manager;
+mod persisted_observability;
 mod policy;
+pub mod probe;
 pub mod service;
 pub mod service_manager;
 mod time_serde;
 pub mod types;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::persisted_observability::UNKNOWN_FIELDS_METRIC;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use serde::Deserializer;
+    use serde::de::value::MapDeserializer;
+    use serde::de::{self, DeserializeOwned, IntoDeserializer, Visitor};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    pub(crate) struct CapturedWriter(CapturedLogs);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.output.lock().expect("log buffer lock poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(self.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        pub(crate) fn output(&self) -> String {
+            String::from_utf8(self.output.lock().expect("log buffer lock poisoned").clone())
+                .expect("captured logs should be UTF-8")
+        }
+    }
+
+    pub(crate) fn unknown_field_metric(recorder: &DebuggingRecorder, record_kind: &str) -> u64 {
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                let matches = composite.kind() == MetricKind::Counter
+                    && composite.key().name() == UNKNOWN_FIELDS_METRIC
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "record_kind" && label.value() == record_kind);
+                match (matches, value) {
+                    (true, DebugValue::Counter(count)) => Some(count),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    enum IgnoredOnlyValue {
+        Json(serde_json::Value),
+        Unknown,
+    }
+
+    impl<'de> IntoDeserializer<'de, serde_json::Error> for IgnoredOnlyValue {
+        type Deserializer = Self;
+
+        fn into_deserializer(self) -> Self::Deserializer {
+            self
+        }
+    }
+
+    impl<'de> Deserializer<'de> for IgnoredOnlyValue {
+        type Error = serde_json::Error;
+
+        fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                Self::Json(value) => value.deserialize_any(visitor),
+                Self::Unknown => Err(de::Error::custom("unknown value was materialized")),
+            }
+        }
+
+        fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                Self::Json(value) => value.deserialize_option(visitor),
+                Self::Unknown => Err(de::Error::custom("unknown value was materialized")),
+            }
+        }
+
+        fn deserialize_newtype_struct<V>(self, name: &'static str, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                Self::Json(value) => value.deserialize_newtype_struct(name, visitor),
+                Self::Unknown => Err(de::Error::custom("unknown value was materialized")),
+            }
+        }
+
+        fn deserialize_enum<V>(
+            self,
+            name: &'static str,
+            variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                Self::Json(value) => value.deserialize_enum(name, variants, visitor),
+                Self::Unknown => Err(de::Error::custom("unknown value was materialized")),
+            }
+        }
+
+        fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                Self::Json(value) => value.deserialize_ignored_any(visitor),
+                Self::Unknown => visitor.visit_unit(),
+            }
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf unit unit_struct seq tuple tuple_struct map struct identifier
+        }
+    }
+
+    pub(crate) fn deserialize_with_ignored_only_unknown<T>(
+        record: serde_json::Value,
+        unknown_field: &str,
+    ) -> Result<T, serde_json::Error>
+    where
+        T: DeserializeOwned,
+    {
+        let object = record
+            .as_object()
+            .ok_or_else(|| de::Error::custom("test record must be an object"))?;
+        let entries = object
+            .iter()
+            .map(|(key, value)| (key.clone(), IgnoredOnlyValue::Json(value.clone())))
+            .chain([(unknown_field.to_owned(), IgnoredOnlyValue::Unknown)]);
+        T::deserialize(MapDeserializer::<_, serde_json::Error>::new(entries))
+    }
+}
+
 // Re-export public API
 pub use api_types::{
-    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureStaticKmsRequest,
-    ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest,
-    StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
+    CacheSummary, ConfigureAwsKmsRequest, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest,
+    ConfigureStaticKmsRequest, ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse,
+    StartKmsRequest, StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
     UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
+pub use audit::{KmsAuditOperation, KmsAuditOutcome, KmsAuditRecord, KmsAuditSink, redact_encryption_context};
+pub use cache::KmsCacheStats;
 pub use config::*;
 pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, KmsUnavailableError, Result};
+pub use key_impact::{KeyImpactReport, KeyReference, KeyReferenceKind, ReferenceCompleteness, ReferenceCoverage, ReferenceScope};
 pub use manager::KmsManager;
+pub use probe::{ProbeFailureKind, ProbeResult, ProbeStatus};
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{
     KmsServiceManager, KmsServiceStatus, KmsStartOutcome, get_global_encryption_service, get_global_kms_service_manager,
