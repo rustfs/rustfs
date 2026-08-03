@@ -548,6 +548,45 @@ mod tests {
         assert!(!state.release_exclusive());
     }
 
+    // Regression for the waiter-preserving exclusive CAS.
+    //
+    // The acquisition CAS used to demand a fully-zero state word, which
+    // includes the readers_waiting/writers_waiting counters. A free lock with
+    // registered waiters was then acquirable by *no one* — including the
+    // waiters themselves, each blocked by the others' registration — so
+    // contended acquisition only succeeded in windows where every waiter
+    // happened to be unregistered. Reverting to `expected = 0` must fail here.
+    #[test]
+    fn exclusive_acquisition_ignores_registered_waiters() {
+        let state = AtomicLockState::new();
+
+        // Waiters register while the lock is held, then the holder releases.
+        assert!(state.try_acquire_exclusive());
+        assert!(state.inc_writers_waiting());
+        assert!(state.inc_readers_waiting());
+        assert!(state.release_exclusive());
+
+        // The lock is now free — only the waiting counters are set.
+        assert!(
+            state.try_acquire_exclusive(),
+            "registered waiters must not block acquisition of a free lock"
+        );
+        // ...and the CAS must preserve those counters, not clobber them.
+        assert_eq!(state.writers_waiting_count(), 1);
+        assert_eq!(state.readers_waiting_count(), 1);
+
+        assert!(state.release_exclusive());
+        state.dec_writers_waiting();
+
+        // Ownership bits still block, registered waiters or not.
+        assert!(state.try_acquire_shared());
+        assert!(!state.try_acquire_exclusive(), "an active reader must still block");
+        assert!(state.release_shared());
+
+        state.dec_readers_waiting();
+        assert!(state.is_free());
+    }
+
     #[test]
     fn test_object_lock_state() {
         let state = ObjectLockState::new();
