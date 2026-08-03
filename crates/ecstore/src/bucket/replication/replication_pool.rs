@@ -81,6 +81,9 @@ const DELETE_BATCH_ADMISSION_CONCURRENCY: usize = 16;
 const METRIC_DELETE_BATCH_ITEMS_TOTAL: &str = "rustfs_replication_delete_batch_items_total";
 const METRIC_DELETE_BATCH_SIZE: &str = "rustfs_replication_delete_batch_size";
 const MRF_CORRUPT_FILE_PREFIX: &str = "config/replication/mrf.corrupt";
+const MRF_PENDING_CAP: usize = 200_000;
+const MRF_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const MRF_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 pub struct DurableMrfBacklog {
@@ -1320,38 +1323,44 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let recovery_result = self.mrf_recovery_result.clone();
 
         let handle = tokio::spawn(async move {
-            const MRF_PENDING_CAP: usize = 200_000;
             let mut staged = Vec::new();
             let mut staging_closed = false;
+            let retry_timer = tokio::time::sleep(Duration::ZERO);
+            tokio::pin!(retry_timer);
             let mut pending = loop {
-                match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
-                    Ok(data) => match decode_mrf_file(&data) {
-                        Ok(entries) => break entries,
-                        Err(error) => {
-                            warn!(
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                                error = %error,
-                                "Failed to seed MRF persister from the startup recovery file; retrying without overwriting it"
-                            );
-                        }
-                    },
-                    Err(EcstoreError::ConfigNotFound) => break Vec::new(),
-                    Err(error) => {
-                        warn!(
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_REPLICATION,
-                            error = %error,
-                            "Failed to read the startup MRF backlog for persister seeding; retrying without overwriting it"
-                        );
-                    }
-                };
                 tokio::select! {
                     entry = rx.recv(), if staged.len() < MRF_PENDING_CAP && !staging_closed => match entry {
-                        Some(entry) => staged.push(entry),
+                        Some(entry) => {
+                            observe_mrf_pending(&entry);
+                            staged.push(entry);
+                        },
                         None => staging_closed = true,
                     },
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    _ = &mut retry_timer => {
+                        match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
+                            Ok(data) => match decode_mrf_file(&data) {
+                                Ok(entries) => break entries,
+                                Err(error) => {
+                                    warn!(
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                        error = %error,
+                                        "Failed to seed MRF persister from the startup recovery file; retrying without overwriting it"
+                                    );
+                                }
+                            },
+                            Err(EcstoreError::ConfigNotFound) => break Vec::new(),
+                            Err(error) => {
+                                warn!(
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                    error = %error,
+                                    "Failed to read the startup MRF backlog for persister seeding; retrying without overwriting it"
+                                );
+                            }
+                        }
+                        retry_timer.as_mut().reset(tokio::time::Instant::now() + MRF_RETRY_INITIAL_DELAY);
+                    }
                 }
             };
             let initial_pending_len = pending.len();
@@ -1991,8 +2000,10 @@ async fn queue_mrf_save_entry(
 
 async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8]) {
     let quarantine_file = format!("{MRF_CORRUPT_FILE_PREFIX}.{}.bin", OffsetDateTime::now_utc().unix_timestamp_nanos());
+    let payload = data.to_vec();
+    let mut retry_delay = MRF_RETRY_INITIAL_DELAY;
     loop {
-        match ReplicationConfigStore::save(storage.clone(), &quarantine_file, data.to_vec()).await {
+        match ReplicationConfigStore::save(storage.clone(), &quarantine_file, payload.clone()).await {
             Ok(()) => {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
@@ -2010,23 +2021,79 @@ async fn quarantine_mrf_file<S: ReplicationStorage>(storage: &Arc<S>, data: &[u8
                 "Failed to quarantine corrupt MRF recovery file; retrying without overwriting it"
             ),
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(MRF_RETRY_MAX_DELAY);
     }
 
-    // Clear the active path only after the quarantine copy succeeds. An empty
-    // config is treated as absent, preventing the same corrupt bytes from being
-    // quarantined again on every restart while preserving the forensic copy.
+    // Clear the active path only if it still contains the bytes that were
+    // quarantined. The write lock closes the read/clear race with another node
+    // replacing the active generation while this node retries quarantine.
+    retry_delay = MRF_RETRY_INITIAL_DELAY;
     loop {
-        match ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, Vec::new()).await {
-            Ok(()) => return,
+        let lock = match storage
+            .new_ns_lock(
+                ReplicationMetadataStore::rustfs_meta_bucket(),
+                ReplicationMetadataStore::MRF_REPLICATION_FILE,
+            )
+            .await
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = %error,
+                    "Failed to acquire the MRF recovery lock before clearing quarantine source; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(MRF_RETRY_MAX_DELAY);
+                continue;
+            }
+        };
+        let _guard = match lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = %error,
+                    "Failed to acquire the MRF recovery lock before clearing quarantine source; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(MRF_RETRY_MAX_DELAY);
+                continue;
+            }
+        };
+        match ReplicationConfigStore::read_no_lock(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
+            Err(EcstoreError::ConfigNotFound) => return,
+            Ok(current) if current != data => return,
+            Ok(_) => {
+                match ReplicationConfigStore::save_no_lock(
+                    storage.clone(),
+                    ReplicationMetadataStore::MRF_REPLICATION_FILE,
+                    Vec::new(),
+                )
+                .await
+                {
+                    Ok(()) => return,
+                    Err(error) => warn!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                        error = %error,
+                        "Failed to clear the corrupt MRF recovery path after quarantine; retrying"
+                    ),
+                }
+            }
             Err(error) => warn!(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION,
                 error = %error,
-                "Failed to clear the corrupt MRF recovery path after quarantine; retrying"
+                "Failed to verify the corrupt MRF recovery path before clearing; retrying"
             ),
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(_guard);
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(MRF_RETRY_MAX_DELAY);
     }
 }
 
@@ -3896,7 +3963,7 @@ mod tests {
     async fn corrupt_mrf_quarantine_retries_without_blocking_new_failures() {
         temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
             let shared = empty_resync_shared_state();
-            shared.fail_next_write.store(true, Ordering::SeqCst);
+            shared.block_next_write.store(true, Ordering::SeqCst);
             *shared.data.lock().expect("test data lock should not be poisoned") = vec![0xde, 0xad, 0xbe, 0xef];
             let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-corrupt-retry", shared.clone()))).await;
 
@@ -3911,6 +3978,20 @@ mod tests {
                 })
                 .await
                 .expect("new failure should be staged during corrupt-file recovery");
+
+            tokio::time::timeout(Duration::from_secs(2), shared.write_started.notified())
+                .await
+                .expect("corrupt-file recovery should remain blocked while staging failures");
+            pool.mrf_save_tx
+                .send(MrfReplicateEntry {
+                    bucket: "mrf-corrupt-retry".to_string(),
+                    object: "second-failure".to_string(),
+                    op: MrfOpKind::Object,
+                    ..Default::default()
+                })
+                .await
+                .expect("persister should drain the first staged failure before recovery completes");
+            shared.allow_write.notify_one();
 
             let processor_handle = pool
                 .task_handles
@@ -4002,6 +4083,84 @@ mod tests {
             })
             .await
             .expect("persister flush should retain startup entries");
+
+            let persister_handle = pool
+                .task_handles
+                .lock()
+                .await
+                .pop()
+                .expect("MRF persister task should be registered");
+            persister_handle.abort();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mrf_capped_append_retries_and_retains_existing_backlog() {
+        assert!(
+            runtime_sources::replication_pool().is_none(),
+            "test requires the runtime replication pool to be unavailable"
+        );
+        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
+            let shared = empty_resync_shared_state();
+            let retained = (0..MRF_PENDING_CAP)
+                .map(|index| MrfReplicateEntry {
+                    bucket: "mrf-capped-retry".to_string(),
+                    object: format!("retained-{index}"),
+                    op: MrfOpKind::Object,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            *shared.data.lock().expect("test data lock should not be poisoned") =
+                encode_mrf_file(&retained).expect("MRF backlog should encode");
+            let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-capped-retry", shared.clone()))).await;
+
+            pool.start_mrf_persister().await;
+            pool.start_mrf_processor().await;
+            let processor_handle = pool
+                .task_handles
+                .lock()
+                .await
+                .pop()
+                .expect("MRF processor task should be registered");
+            processor_handle.await.expect("MRF processor should not panic");
+
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if shared.write_count.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup backlog should be flushed before appending a capped batch");
+            shared.fail_next_write.store(true, Ordering::SeqCst);
+            pool.mrf_save_tx
+                .send(MrfReplicateEntry {
+                    bucket: "mrf-capped-retry".to_string(),
+                    object: "new-capped-failure".to_string(),
+                    op: MrfOpKind::Object,
+                    ..Default::default()
+                })
+                .await
+                .expect("new capped failure should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let data = shared.data.lock().expect("test data lock should not be poisoned").clone();
+                    if decode_mrf_file(&data).is_ok_and(|entries| {
+                        entries.len() == MRF_PENDING_CAP + 1
+                            && entries.first().is_some_and(|entry| entry.object == "retained-0")
+                            && entries.last().is_some_and(|entry| entry.object == "new-capped-failure")
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("a failed capped append should be retried without dropping either batch");
 
             let persister_handle = pool
                 .task_handles
