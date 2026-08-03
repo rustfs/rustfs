@@ -1445,7 +1445,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                if pending.len() >= MRF_PENDING_CAP && recovery_applied {
+                if recovery_applied && (pending.len() >= MRF_PENDING_CAP || !capped_batch.is_empty()) {
                     if dirty {
                         if let Some(duration_millis) = flush_mrf_to_disk(&pending, &storage).await {
                             add_durable_mrf_suffix(&mut durable_tracker, &pending, new_entries_pending_stats);
@@ -4572,15 +4572,17 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), read_started)
                 .await
                 .expect("startup MRF read should be delayed");
-            pool.mrf_save_tx
-                .send(MrfReplicateEntry {
-                    bucket: "mrf-recovery-shrink".to_string(),
-                    object: "staged-overflow".to_string(),
-                    op: MrfOpKind::Object,
-                    ..Default::default()
-                })
-                .await
-                .expect("overflow entry should be staged before recovery completes");
+            for object in ["staged-overflow-1", "staged-overflow-2"] {
+                pool.mrf_save_tx
+                    .send(MrfReplicateEntry {
+                        bucket: "mrf-recovery-shrink".to_string(),
+                        object: object.to_string(),
+                        op: MrfOpKind::Object,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("overflow entry should be staged before recovery completes");
+            }
             *pool.mrf_recovery_result.lock().await = Some(vec![MrfReplicateEntry::default(); MRF_PENDING_CAP - 1]);
             pool.mrf_recovery_complete.notify_one();
 
@@ -4591,7 +4593,7 @@ mod tests {
                 decode_mrf_file(&shared.data.lock().expect("test data lock should not be poisoned"))
                     .expect("the blocked write should leave the old backlog readable")
                     .iter()
-                    .all(|entry| entry.object != "staged-overflow"),
+                    .all(|entry| !entry.object.starts_with("staged-overflow-")),
                 "the staged overflow must remain pending until the flush completes"
             );
             shared.allow_write.notify_one();
@@ -4600,7 +4602,9 @@ mod tests {
                 loop {
                     let data = shared.data.lock().expect("test data lock should not be poisoned").clone();
                     if decode_mrf_file(&data).is_ok_and(|entries| {
-                        entries.len() == MRF_PENDING_CAP && entries.last().is_some_and(|entry| entry.object == "staged-overflow")
+                        entries.len() == MRF_PENDING_CAP + 1
+                            && entries[MRF_PENDING_CAP - 1].object == "staged-overflow-1"
+                            && entries.last().is_some_and(|entry| entry.object == "staged-overflow-2")
                     }) {
                         break;
                     }
