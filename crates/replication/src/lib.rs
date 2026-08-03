@@ -47,7 +47,10 @@ pub use filemeta::{
     VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replicate_decision_for_admitted_targets,
     replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
-pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
+pub use mrf::{
+    MrfCapabilities, MrfCapability, MrfEnvelope, MrfEnvelopeError, MrfOpKind, MrfProtocolCapabilities, MrfReplicateEntry,
+    decode_mrf_file, encode_mrf_file,
+};
 pub use multipart::{
     ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError, ReplicationMultipartRange,
     replication_multipart_complete_actual_size, replication_multipart_part_plan,
