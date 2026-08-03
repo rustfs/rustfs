@@ -528,10 +528,15 @@ async fn save_force_delete_intents<S: ReplicationStorage>(
     entries: Vec<MrfReplicateEntry>,
     preconditions: HTTPPreconditions,
 ) -> Result<(), EcstoreError> {
-    if guard.is_lock_lost() {
+    ensure_force_delete_journal_lock_held(guard.is_lock_lost())?;
+    ReplicationConfigStore::save_conditional(storage, file, encode_mrf_file(&entries)?, preconditions).await
+}
+
+fn ensure_force_delete_journal_lock_held(lock_lost: bool) -> Result<(), EcstoreError> {
+    if lock_lost {
         return Err(EcstoreError::other("force-delete journal lock lost before conditional update"));
     }
-    ReplicationConfigStore::save_conditional(storage, file, encode_mrf_file(&entries)?, preconditions).await
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4685,6 +4690,13 @@ mod tests {
             .expect("journal should remain readable");
         let entries = decode_mrf_file(&data).expect("journal should decode");
         assert!(!entries[0].force_delete_local_commit);
+    }
+
+    #[test]
+    fn force_delete_journal_rejects_a_lost_transaction_lease() {
+        let err = ensure_force_delete_journal_lock_held(true).expect_err("lost transaction lease must fence the journal write");
+
+        assert!(err.to_string().contains("lock lost"));
     }
 
     #[tokio::test]
