@@ -625,7 +625,6 @@ pub(crate) mod bucket {
                     force_delete_id: Some(operation_id),
                     force_delete_generation: Some(i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX)),
                     force_delete_local_commit: false,
-                    ..Default::default()
                 },
             )
             .await
