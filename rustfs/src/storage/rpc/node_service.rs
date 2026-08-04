@@ -2165,7 +2165,7 @@ mod tests {
         previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
-    use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
+    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo, HealEndpoint};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
         Endpoint,

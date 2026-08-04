@@ -14,9 +14,8 @@
 
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
-    validate_batch_read_version_item_count,
+    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{PartTransactionAction, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
@@ -29,7 +28,7 @@ use rustfs_io_metrics::internode_metrics::{
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
-use std::{collections::HashMap, io::Cursor};
+use std::io::Cursor;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
