@@ -23,6 +23,7 @@ pub(crate) use rustfs_replication::{
 
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
+pub(crate) const RESYNC_FILE_MAX_BYTES: usize = rustfs_replication::RESYNC_FILE_MAX_BYTES;
 pub(crate) const WIRE_ZERO_TIME_UNIX: i64 = rustfs_replication::resync::WIRE_ZERO_TIME_UNIX;
 pub(crate) const MRF_META_FORMAT: u16 = rustfs_replication::mrf::MRF_META_FORMAT;
 pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSION;
