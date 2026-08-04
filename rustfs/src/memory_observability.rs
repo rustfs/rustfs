@@ -33,6 +33,12 @@ static MEMORY_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 const ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS: &str = "RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS";
 const DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS: u64 = 15;
 const MEMORY_OBSERVABILITY_SERVICE_NAME: &str = "memory_observability";
+const CGROUP_V2_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory.stat";
+const CGROUP_V2_MEMORY_CURRENT_PATH: &str = "/sys/fs/cgroup/memory.current";
+const CGROUP_V2_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
+const CGROUP_V1_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory/memory.stat";
+const CGROUP_V1_MEMORY_USAGE_PATH: &str = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
+const CGROUP_V1_MEMORY_LIMIT_PATH: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,16 +204,10 @@ fn parse_cgroup_memory_stat(content: &str) -> CgroupMemoryStatFields {
 }
 
 fn read_cgroup_v2() -> Option<CgroupMemorySnapshot> {
-    let root = Path::new("/sys/fs/cgroup");
-    let stat_path = root.join("memory.stat");
-    if !stat_path.exists() {
-        return None;
-    }
-
-    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(CGROUP_V2_MEMORY_STAT_PATH).ok()?);
     Some(CgroupMemorySnapshot {
-        current_bytes: read_optional_u64(&root.join("memory.current")),
-        limit_bytes: read_optional_u64(&root.join("memory.max")),
+        current_bytes: read_optional_u64(Path::new(CGROUP_V2_MEMORY_CURRENT_PATH)),
+        limit_bytes: read_optional_u64(Path::new(CGROUP_V2_MEMORY_MAX_PATH)),
         anon_bytes: stats.anon,
         file_bytes: stats.file,
         active_file_bytes: stats.active_file,
@@ -216,16 +216,10 @@ fn read_cgroup_v2() -> Option<CgroupMemorySnapshot> {
 }
 
 fn read_cgroup_v1() -> Option<CgroupMemorySnapshot> {
-    let root = Path::new("/sys/fs/cgroup/memory");
-    let stat_path = root.join("memory.stat");
-    if !stat_path.exists() {
-        return None;
-    }
-
-    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(CGROUP_V1_MEMORY_STAT_PATH).ok()?);
     Some(CgroupMemorySnapshot {
-        current_bytes: read_optional_u64(&root.join("memory.usage_in_bytes")),
-        limit_bytes: read_optional_u64(&root.join("memory.limit_in_bytes")),
+        current_bytes: read_optional_u64(Path::new(CGROUP_V1_MEMORY_USAGE_PATH)),
+        limit_bytes: read_optional_u64(Path::new(CGROUP_V1_MEMORY_LIMIT_PATH)),
         anon_bytes: stats.total_rss.or(stats.rss),
         file_bytes: stats.total_cache.or(stats.cache),
         active_file_bytes: stats.total_active_file.or(stats.active_file),
