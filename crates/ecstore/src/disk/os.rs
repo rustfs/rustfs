@@ -845,8 +845,9 @@ fn rename_into_existing_parent(
     };
     use windows_sys::{
         Wdk::Storage::FileSystem::{
-            FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
-            FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
+            FILE_RENAME_IGNORE_READONLY_ATTRIBUTE, FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
+            FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileRenameInformation, FileRenameInformationEx,
+            NtSetInformationFile,
         },
         Win32::{
             Foundation::{ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, RtlNtStatusToDosError},
@@ -932,7 +933,7 @@ fn rename_into_existing_parent(
     // destinations while retaining the guarded, handle-relative target.
     unsafe {
         (*rename_info).Anonymous = FILE_RENAME_INFORMATION_0 {
-            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
         };
     }
     let status = unsafe {
@@ -1213,7 +1214,6 @@ fn windows_file_attribute_tag(
 #[cfg(windows)]
 fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) -> io::Result<ExistingBaseDirectoryGuard> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     let relative = publication_root.relative_path(path)?;
     let mut handles = vec![publication_root.directory.clone()];
@@ -1231,7 +1231,7 @@ fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) 
         let parent = handles
             .last()
             .ok_or_else(|| io::Error::other("Windows directory guard lost its root handle"))?;
-        handles.push(open_windows_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ)?);
+        handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
     }
 
     Ok(ExistingBaseDirectoryGuard::new(handles))
@@ -1325,22 +1325,21 @@ fn open_windows_directory_component(
     parent: &WindowsDirectoryHandle,
     component: &std::ffi::OsStr,
     create_disposition: u32,
-    share_access: u32,
 ) -> io::Result<WindowsDirectoryHandle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT},
         Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_TRAVERSE,
         },
     };
 
-    // The caller selects the sharing needed for this component. Delete sharing
-    // is always omitted so the pinned directory entry cannot be replaced.
+    // Omitting write and delete sharing prevents the component from becoming a
+    // reparse point, being renamed, or being removed while publication uses it.
     let anchor = open_windows_relative(
         &parent.handle,
         component,
         FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-        share_access,
+        FILE_SHARE_READ,
         create_disposition,
         FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         FILE_ATTRIBUTE_DIRECTORY,
@@ -1510,7 +1509,6 @@ pub(crate) fn mkdir_all_below_existing_base_std(
     #[cfg(windows)]
     {
         use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
         let base_relative = publication_root.relative_path(base_dir)?;
         let mut guard = ExistingBaseDirectoryGuard::new(vec![publication_root.directory.clone()]);
@@ -1528,7 +1526,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows publication root guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ)?;
+            let child = open_windows_directory_component(parent, component, FILE_OPEN)?;
             guard.handles.push(child);
         }
         for component in relative.components() {
@@ -1539,30 +1537,8 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows base directory guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN_IF, FILE_SHARE_READ)?;
+            let child = open_windows_directory_component(parent, component, FILE_OPEN_IF)?;
             guard.handles.push(child);
-        }
-
-        // NtSetInformationFile opens the relative rename target for write. Keep
-        // every ancestor strict, but reopen the final parent with write sharing
-        // so that internal lookup can succeed. The lookup remains anchored to
-        // this retained identity, while omitted delete sharing prevents the
-        // directory entry itself from being replaced during publication.
-        if guard.handles.len() > 1 {
-            let component = dir_path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination parent must have a name"))?;
-            let parent_index = guard.handles.len() - 2;
-            let parent = guard
-                .handles
-                .get(parent_index)
-                .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
-            let rename_parent =
-                open_windows_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
-            *guard
-                .handles
-                .last_mut()
-                .ok_or_else(|| io::Error::other("Windows destination guard is empty"))? = rename_parent;
         }
 
         Ok(guard)
@@ -2418,7 +2394,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_rename_all_stays_anchored_during_parent_reparse_mutation() {
+    async fn windows_rename_all_blocks_parent_reparse_mutation_during_publication() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::{
             Foundation::GENERIC_WRITE,
@@ -2428,43 +2404,26 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         let base = temp_dir.path().join("bucket");
         let parent = base.join("object");
-        let outside = temp_dir.path().join("outside");
         std::fs::create_dir_all(&parent).expect("create destination parent");
-        std::fs::create_dir(&outside).expect("create outside target");
         let src = temp_dir.path().join("staged-object");
         let dst = parent.join("xl.meta");
         std::fs::write(&src, b"payload").expect("write staged object");
 
         let parent_for_hook = parent.clone();
-        let outside_for_hook = outside.clone();
-        let reparse_writer = Arc::new(std::sync::Mutex::new(None));
-        let reparse_writer_for_hook = Arc::clone(&reparse_writer);
         windows_rename_test_hooks::install_before_publication(&dst, move || {
-            let writable_parent = std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .access_mode(GENERIC_WRITE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&parent_for_hook)
-                .map(winapi_util::Handle::from_file)
-                .expect("the destination parent must permit the rename target's internal write open");
-            try_set_windows_mount_point(&writable_parent, &outside_for_hook)
-                .expect("redirect the destination parent after it is pinned");
-            *reparse_writer_for_hook.lock().expect("reparse writer mutex poisoned") = Some(writable_parent);
+                .expect_err("the destination guard must exclude a reparse writer");
         });
 
         rename_all(&src, &dst, &base)
             .await
-            .expect("publication must remain anchored to the retained parent identity");
+            .expect("publication must succeed while the parent identity is frozen");
 
-        assert!(!outside.join("xl.meta").exists(), "reparse mutation must not redirect publication");
-        let writable_parent = reparse_writer
-            .lock()
-            .expect("reparse writer mutex poisoned")
-            .take()
-            .expect("publication hook must retain the parent handle");
-        try_delete_windows_mount_point(&writable_parent).expect("remove destination parent mount point");
-        drop(writable_parent);
-        assert_eq!(std::fs::read(&dst).expect("read anchored publication"), b"payload");
+        assert_eq!(std::fs::read(&dst).expect("read protected publication"), b"payload");
     }
 
     #[cfg(windows)]
