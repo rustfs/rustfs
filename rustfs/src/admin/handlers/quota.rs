@@ -18,7 +18,7 @@ use crate::admin::auth::{validate_admin_request, validate_admin_request_with_buc
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_bucket_metadata_handle, current_object_store_handle};
-use crate::admin::storage_api::bucket::metadata_sys::BucketMetadataSys;
+use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
 use crate::admin::storage_api::bucket::quota::checker::QuotaChecker;
 use crate::admin::storage_api::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::auth::{check_key_valid, get_session_token};
@@ -277,6 +277,9 @@ impl Operation for SetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
             .input
@@ -297,7 +300,7 @@ impl Operation for SetBucketQuotaHandler {
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
         let updated_at = quota_checker
-            .set_quota_config(&bucket, quota.clone())
+            .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to set quota: {}", e))?;
 
@@ -369,7 +372,6 @@ impl Operation for GetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
-
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
@@ -452,6 +454,9 @@ impl Operation for ClearBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         info!(
             event = EVENT_ADMIN_QUOTA_STATE,
@@ -471,7 +476,7 @@ impl Operation for ClearBucketQuotaHandler {
         // Clear quota (set to None)
         let quota = BucketQuota::new(None);
         let updated_at = quota_checker
-            .set_quota_config(&bucket, quota.clone())
+            .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
 

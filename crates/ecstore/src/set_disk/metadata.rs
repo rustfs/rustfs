@@ -538,6 +538,8 @@ impl SetDisks {
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
             || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            // Raw compatibility keys are normalized and hashed separately below.
+            || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
     }
 
     fn update_hash_quorum_metadata_map(hasher: &mut Sha256, entries: &HashMap<String, String>) {
@@ -560,6 +562,22 @@ impl SetDisks {
         let mut key = [0u8; 32];
         key.copy_from_slice(digest.as_slice());
         key
+    }
+
+    /// Hash the per-target delete-marker versions through their normalized form
+    /// so the dual internal prefixes carrying the same mapping share one
+    /// identity, while a genuine disagreement between disks still changes the
+    /// hash and surfaces as a quorum difference.
+    fn update_hash_target_delete_marker_versions(hasher: &mut Sha256, metadata: &HashMap<String, String>) {
+        let (versions, corrupt) = http::target_delete_marker_versions(metadata);
+        hasher.update([u8::from(corrupt)]);
+        let mut versions = versions.iter().collect::<Vec<_>>();
+        versions.sort_by(|left, right| left.0.cmp(right.0));
+        hasher.update(versions.len().to_le_bytes());
+        for (arn, version_id) in versions {
+            Self::update_hash_str(hasher, arn);
+            Self::update_hash_str(hasher, version_id);
+        }
     }
 
     fn update_file_info_quorum_hash(hasher: &mut Sha256, meta: &FileInfo) {
@@ -592,6 +610,7 @@ impl SetDisks {
         Self::update_hash_optional_bytes(hasher, meta.checksum.as_ref());
 
         Self::update_hash_quorum_metadata_map(hasher, &meta.metadata);
+        Self::update_hash_target_delete_marker_versions(hasher, &meta.metadata);
 
         hasher.update(meta.parts.len().to_le_bytes());
         for part in meta.parts.iter() {
@@ -1413,5 +1432,40 @@ mod tests {
         let (fallback_disks, fallback_parts) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
         assert!(fallback_disks.iter().any(Option::is_none));
         assert!(fallback_parts.iter().any(|part| !part.is_valid()));
+    }
+
+    #[test]
+    fn target_delete_marker_version_metadata_is_included_in_quorum_hash() {
+        let suffix = "replication-delete-marker-version-arn:rustfs:replication::target:bucket";
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::RUSTFS_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::MINIO_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-unrelated"));
+
+        let mut left = metadata_quorum_test_fileinfo(OffsetDateTime::now_utc(), 1);
+        let mut right = left.clone();
+        left.metadata
+            .insert(format!("{}{}", http::RUSTFS_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        right
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-b".to_string());
+        assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+
+        let mut dual_prefixed = left.clone();
+        dual_prefixed
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&left),
+            SetDisks::file_info_quorum_hash(&dual_prefixed),
+            "compatible prefixes carrying the same mapping must share one identity"
+        );
     }
 }

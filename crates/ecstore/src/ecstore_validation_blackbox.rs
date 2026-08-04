@@ -1,9 +1,10 @@
+use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::disk::endpoint::Endpoint;
 use crate::disk::format::FormatV3;
 use crate::disk::{DiskAPI, DiskOption, DiskStore, WalkDirOptions, new_disk};
 use crate::error::Error;
 use crate::io_support::rio::HashReader;
-use crate::object_api::{BLOCK_SIZE_V2, ObjectOptions, PutObjReader};
+use crate::object_api::{BLOCK_SIZE_V2, ObjectLockConfigSnapshot, ObjectOptions, PutObjReader};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -357,6 +358,7 @@ async fn blackbox_delete_marker_hides_object_body_without_erasing_prior_version_
     let opts = ObjectOptions {
         no_lock: true,
         version_suspended: true,
+        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
         ..Default::default()
     };
 
@@ -624,6 +626,9 @@ mod old_current_size_backfill {
                 ObjectOptions {
                     no_lock: true,
                     versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )

@@ -17,6 +17,10 @@ use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Namespace-lock object reserved for bucket lifecycle generation fencing.
+/// Empty S3 object keys are invalid, so this cannot collide with an object lock.
+pub const BUCKET_LIFECYCLE_LOCK_OBJECT: &str = "";
+
 /// Options for creating a new bucket.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {

@@ -6667,6 +6667,7 @@ async fn ensure_site_replication_bucket_targets_with_runtime(
     local_peer: &PeerInfo,
     config: Option<&s3s::dto::ReplicationConfiguration>,
     service_account_secret_key: &str,
+    expected_incarnation_id: Uuid,
 ) -> S3Result<()> {
     let existing = match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => targets,
@@ -6690,11 +6691,9 @@ async fn ensure_site_replication_bucket_targets_with_runtime(
     if json_targets == existing_json {
         return Ok(());
     }
-    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+    metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(&updated)).await;
-
     Ok(())
 }
 
@@ -6707,6 +6706,9 @@ async fn bucket_replication_config_for_target_refresh(bucket: &str) -> S3Result<
 }
 
 async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
+    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+        .await
+        .map_err(ApiError::from)?;
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
@@ -6718,6 +6720,7 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         &runtime.local_peer,
         config.as_ref(),
         &runtime.service_account_secret_key,
+        expected_incarnation_id,
     )
     .await
 }
@@ -6727,6 +6730,7 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
+    expected_incarnation_id: Uuid,
 ) -> S3Result<()> {
     let existing = match metadata_sys::get_replication_config(bucket).await {
         Ok((existing, _)) => Some(existing),
@@ -6771,7 +6775,7 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
 
     let data = serialize(&ReplicationConfiguration { role, rules })
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
-    metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data)
+    metadata_sys::update_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
 
@@ -6782,11 +6786,33 @@ async fn ensure_site_replication_bucket_setup(bucket: &str) -> S3Result<bool> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(false);
     };
-    ensure_site_replication_bucket_setup_with_runtime(bucket, &runtime).await?;
+    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+        .await
+        .map_err(ApiError::from)?;
+    ensure_site_replication_bucket_setup_with_runtime_for_incarnation(bucket, &runtime, expected_incarnation_id).await?;
+    Ok(true)
+}
+
+async fn ensure_site_replication_bucket_setup_for_incarnation(bucket: &str, incarnation_id: Uuid) -> S3Result<bool> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(false);
+    };
+    ensure_site_replication_bucket_setup_with_runtime_for_incarnation(bucket, &runtime, incarnation_id).await?;
     Ok(true)
 }
 
 async fn ensure_site_replication_bucket_setup_with_runtime(bucket: &str, runtime: &SiteReplicationRuntime) -> S3Result<()> {
+    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+        .await
+        .map_err(ApiError::from)?;
+    ensure_site_replication_bucket_setup_with_runtime_for_incarnation(bucket, runtime, expected_incarnation_id).await
+}
+
+async fn ensure_site_replication_bucket_setup_with_runtime_for_incarnation(
+    bucket: &str,
+    runtime: &SiteReplicationRuntime,
+    expected_incarnation_id: Uuid,
+) -> S3Result<()> {
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
     ensure_site_replication_bucket_targets_with_runtime(
@@ -6795,6 +6821,7 @@ async fn ensure_site_replication_bucket_setup_with_runtime(bucket: &str, runtime
         &runtime.local_peer,
         config.as_ref(),
         &runtime.service_account_secret_key,
+        expected_incarnation_id,
     )
     .await?;
     ensure_site_replication_bucket_replication_config_with_runtime(
@@ -6802,12 +6829,16 @@ async fn ensure_site_replication_bucket_setup_with_runtime(bucket: &str, runtime
         &runtime.state,
         &runtime.local_peer,
         &runtime.service_account_secret_key,
+        expected_incarnation_id,
     )
     .await?;
     Ok(())
 }
 
 async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deployment_ids: &HashSet<String>) -> S3Result<usize> {
+    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+        .await
+        .map_err(ApiError::from)?;
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let mut removed = 0usize;
 
@@ -6819,12 +6850,9 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
                 let json_targets = serde_json::to_vec(&updated_targets).map_err(|e| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}"))
                 })?;
-                metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+                metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
                     .await
                     .map_err(ApiError::from)?;
-                BucketTargetSys::get()
-                    .update_all_targets(bucket, Some(&updated_targets))
-                    .await;
                 removed = removed.saturating_add(removed_targets);
             }
         }
@@ -6840,11 +6868,11 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
                     let data = serialize(&updated_config).map_err(|e| {
                         S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
                     })?;
-                    metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data)
+                    metadata_sys::update_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
                         .await
                         .map_err(ApiError::from)?;
                 } else {
-                    metadata_sys::delete(bucket, BUCKET_REPLICATION_CONFIG)
+                    metadata_sys::delete_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
                         .await
                         .map_err(ApiError::from)?;
                 }
@@ -7121,6 +7149,9 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
     let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
     for bucket in buckets {
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket.name)
+            .await
+            .map_err(ApiError::from)?;
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let state = load_site_replication_state().await?;
         let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
@@ -7136,6 +7167,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
             &local_peer,
             replication_config.as_ref(),
             service_account_secret_key,
+            expected_incarnation_id,
         )
         .await?;
     }
@@ -7205,7 +7237,7 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         return bucket_status;
     };
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let _transaction_guard = match metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await {
+    let transaction_guard = match metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await {
         Ok(guard) => guard,
         Err(_) => {
             bucket_status.status = "failed".to_string();
@@ -7273,12 +7305,12 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
     let opts = replication::resync_opts(bucket, target_arn.clone(), resync_id, reset_before);
     let admission_pool = pool.clone();
     let activation_pool = pool.clone();
-    let committed_targets = match replication::commit_resync_target(
+    let _committed_targets = match replication::commit_resync_target(
         targets,
         opts,
         move |opts| async move { admission_pool.admit_bucket_resync(opts).await },
         move |encoded| async move {
-            metadata_sys::update_bucket_targets_under_transaction_lock(bucket, encoded)
+            metadata_sys::update_bucket_targets_under_transaction_lock(&transaction_guard, bucket, encoded)
                 .await
                 .map(|_| ())
                 .map_err(|_| {
@@ -7304,10 +7336,6 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
             return bucket_status;
         }
     };
-    BucketTargetSys::get()
-        .update_all_targets(bucket, Some(&committed_targets))
-        .await;
-
     bucket_status
 }
 
@@ -7317,6 +7345,14 @@ async fn cancel_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &s
         target_arn: target_arn.to_string(),
         status: "canceled".to_string(),
         ..Default::default()
+    };
+    let expected_incarnation_id = match metadata_sys::capture_bucket_metadata_incarnation(bucket).await {
+        Ok(incarnation_id) => incarnation_id,
+        Err(err) => {
+            bucket_status.status = "failed".to_string();
+            bucket_status.err_detail = err.to_string();
+            return bucket_status;
+        }
     };
     let targets_guard = lock_bucket_targets_metadata(bucket).await;
 
@@ -7366,12 +7402,13 @@ async fn cancel_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &s
         }
     };
 
-    if let Err(err) = metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets).await {
+    if let Err(err) =
+        metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id).await
+    {
         bucket_status.status = "failed".to_string();
         bucket_status.err_detail = err.to_string();
         return bucket_status;
     }
-    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
     drop(targets_guard);
 
     bucket_status
@@ -7491,13 +7528,16 @@ fn bucket_versioning_xml() -> S3Result<Vec<u8>> {
 }
 
 async fn ensure_site_replication_bucket_versioning(bucket: &str) -> S3Result<()> {
+    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+        .await
+        .map_err(ApiError::from)?;
     match metadata_sys::get_versioning_config(bucket).await {
         Ok((config, _)) if config.enabled() => return Ok(()),
         Ok(_) | Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(ApiError::from(err).into()),
     }
 
-    metadata_sys::update(bucket, BUCKET_VERSIONING_CONFIG, bucket_versioning_xml()?)
+    metadata_sys::update_if_incarnation(bucket, BUCKET_VERSIONING_CONFIG, bucket_versioning_xml()?, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
 
@@ -7530,6 +7570,9 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
+    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&item.bucket)
+        .await
+        .map_err(ApiError::from)?;
 
     store
         .get_bucket_info(&item.bucket, &BucketOptions::default())
@@ -7630,11 +7673,11 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
 
     if !skip_config_write {
         if let Some(data) = data {
-            metadata_sys::update(&item.bucket, config_file, data)
+            metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
                 .await
                 .map_err(ApiError::from)?;
         } else {
-            metadata_sys::delete(&item.bucket, config_file)
+            metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
                 .await
                 .map_err(ApiError::from)?;
         }
@@ -7644,7 +7687,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     if item.r#type == "replication-config" {
         // Rebuild the local outbound rules too: a site that joined an already-replicated
         // bucket receives this item before it has any `site-repl-*` rule of its own.
-        ensure_site_replication_bucket_setup(&item.bucket).await?;
+        ensure_site_replication_bucket_setup_for_incarnation(&item.bucket, expected_incarnation_id).await?;
     }
 
     if item.r#type == "version-config"
@@ -7653,7 +7696,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             .ok()
             .is_some_and(|(config, _)| config.enabled())
     {
-        ensure_site_replication_bucket_setup(&item.bucket).await?;
+        ensure_site_replication_bucket_setup_for_incarnation(&item.bucket, expected_incarnation_id).await?;
     }
 
     Ok(())
@@ -8569,9 +8612,17 @@ impl Operation for SRPeerBucketOpsHandler {
                     )
                     .await
                     .map_err(ApiError::from)?;
-                metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, bucket_versioning_xml()?)
+                let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
                     .await
                     .map_err(ApiError::from)?;
+                metadata_sys::update_if_incarnation(
+                    &bucket,
+                    BUCKET_VERSIONING_CONFIG,
+                    bucket_versioning_xml()?,
+                    expected_incarnation_id,
+                )
+                .await
+                .map_err(ApiError::from)?;
             }
             "configure-replication" => {
                 store

@@ -60,6 +60,16 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the bucket-incarnation / lifecycle-fence tests. They drive
+# init_bucket_metadata_sys and bucket_metadata_sys_of, i.e. process-global
+# OnceLock state that serial_test's #[serial] cannot protect across nextest's
+# process boundary, and they delete+recreate buckets — the same shape that
+# raced into InsufficientWriteQuorum in backlog#937. Preventive only, no
+# retries. The matching ci-profile override is after [profile.ci].
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & (test(bucket_delete_waits_for_config_mutation_fence) | test(stale_config_request_cannot_mutate_a_recreated_bucket) | test(disk_incarnation_read_detects_stale_cache_until_peer_reload) | test(lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata) | test(expiry_configs_are_resolved_from_the_owning_store))'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the 4-disk reliability / degraded-read e2e tests (see the
 # e2e-reliability test-group note above). The matching ci-profile override is at
 # the end of the file, after [profile.ci] is declared.
@@ -137,6 +147,12 @@ test-group = 'ecstore-serial-flaky'
 # too. No retries: failures stay visible.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
+# too (see the matching default-profile override near the top). No retries.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & (test(bucket_delete_waits_for_config_mutation_fence) | test(stale_config_request_cannot_mutate_a_recreated_bucket) | test(disk_incarnation_read_detects_stale_cache_until_peer_reload) | test(lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata) | test(expiry_configs_are_resolved_from_the_owning_store))'
 test-group = 'ecstore-serial-flaky'
 
 # ---------------------------------------------------------------------------

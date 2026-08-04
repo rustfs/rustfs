@@ -28,6 +28,8 @@ use reqwest::StatusCode;
 #[cfg(feature = "e2e-test-hooks")]
 use rustfs::embedded::pause_embedded_startup_after_http_bind;
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+
+mod common;
 #[cfg(feature = "e2e-test-hooks")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "e2e-test-hooks")]
@@ -111,8 +113,12 @@ fn signed_admin_request(
 // startup pipeline lifts; a follow-up will widen the request path to route
 // per-server so the two servers can also serve different data planes end-to-
 // end without the shared-IAM caveat.
-#[tokio::test]
-async fn two_embedded_servers_start_and_shutdown_independently() {
+#[test]
+fn two_embedded_servers_start_and_shutdown_independently() {
+    common::run_embedded_test(two_embedded_servers_start_and_shutdown_independently_body);
+}
+
+async fn two_embedded_servers_start_and_shutdown_independently_body() {
     let port_a = match find_available_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -181,8 +187,12 @@ async fn two_embedded_servers_start_and_shutdown_independently() {
 // rejects the other's) AND data plane (each server's buckets/objects are
 // invisible to the other; each lists/creates/deletes only on its own disks
 // and bucket-metadata system).
-#[tokio::test]
-async fn two_embedded_servers_isolate_auth_and_data_planes() {
+#[test]
+fn two_embedded_servers_isolate_auth_and_data_planes() {
+    common::run_embedded_test(two_embedded_servers_isolate_auth_and_data_planes_body);
+}
+
+async fn two_embedded_servers_isolate_auth_and_data_planes_body() {
     let port_a = match find_available_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,

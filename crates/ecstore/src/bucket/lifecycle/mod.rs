@@ -19,6 +19,7 @@ pub mod core;
 pub mod evaluator;
 pub mod manual_transition_job;
 mod metadata_boundary;
+pub(crate) use metadata_boundary::get_expiry_configs;
 mod object_lock_boundary;
 pub use self::core as lifecycle;
 mod replication_sink;

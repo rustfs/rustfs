@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::disk::error_reduce::count_errs;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_all_volume_not_found, is_err_object_not_found, is_err_strict_volume_not_found};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
@@ -70,6 +70,10 @@ type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
+
+fn is_idempotent_delete_prefix_error(err: &Error) -> bool {
+    is_err_object_not_found(err) || is_err_strict_volume_not_found(err)
+}
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -339,8 +343,18 @@ impl Sets {
             futures.push(set.delete_object(bucket, object, opt.clone()));
         }
 
-        if let Some(err) = join_all(futures).await.into_iter().find_map(Result::err) {
-            return Err(err);
+        let errs = join_all(futures)
+            .await
+            .into_iter()
+            .map(|result| result.err())
+            .collect::<Vec<_>>();
+        if is_all_volume_not_found(&errs) {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        for err in errs.into_iter().flatten() {
+            if !is_idempotent_delete_prefix_error(&err) {
+                return Err(err);
+            }
         }
 
         Ok(())
@@ -816,8 +830,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
                 let upload_id_marker = upload_id_marker.clone();
                 let delimiter = delimiter.clone();
                 async move {
-                    set.list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, per_set_limit)
-                        .await
+                    // ECStore owns the bucket lifecycle fence and calls the
+                    // incarnation-aware pool helper. This lower-level trait
+                    // surface has no ECStore guard to propagate.
+                    set.list_multipart_uploads_for_incarnation(
+                        bucket,
+                        prefix,
+                        key_marker,
+                        upload_id_marker,
+                        delimiter,
+                        per_set_limit,
+                        None,
+                    )
+                    .await
                 }
             })
             .buffer_unordered(LIST_MULTIPART_SETS_CONCURRENCY)
@@ -1276,6 +1301,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delete_prefix_error_classification_only_ignores_absence() {
+        assert!(is_idempotent_delete_prefix_error(&StorageError::FileNotFound));
+        assert!(is_idempotent_delete_prefix_error(&StorageError::ObjectNotFound(
+            "bucket".to_string(),
+            "prefix".to_string()
+        )));
+        assert!(is_idempotent_delete_prefix_error(&StorageError::VolumeNotFound));
+        assert!(is_idempotent_delete_prefix_error(&StorageError::BucketNotFound("bucket".to_string())));
+        assert!(!is_idempotent_delete_prefix_error(&StorageError::DiskNotFound));
+        assert!(!is_idempotent_delete_prefix_error(&StorageError::ErasureWriteQuorum));
+    }
+
     #[tokio::test]
     async fn sets_get_pool_and_set_returns_matching_coordinates() {
         let format = FormatV3::new(2, 2);
@@ -1391,6 +1429,161 @@ mod tests {
             ctx: bootstrap_ctx(),
         });
         (temp_dirs, sets)
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_surfaces_a_hard_error_from_any_set() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created across both sets");
+
+        let healthy_disks = sets.disk_set[0].disks.read().await.clone();
+        for disk in healthy_disks.iter().flatten() {
+            disk.write_all(&bucket, "blocked/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("healthy set should contain the prefix");
+        }
+
+        let failing_disks = sets.disk_set[1].disks.read().await.clone();
+        for disk in failing_disks.iter().flatten() {
+            disk.write_all(&bucket, "blocked", bytes::Bytes::from_static(b"not-a-directory"))
+                .await
+                .expect("failing set should contain a parent file");
+        }
+
+        let err = sets
+            .delete_object(
+                &bucket,
+                "blocked/prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a hard failure from one set must not be reported as success");
+
+        match err {
+            StorageError::PrefixAccessDenied(error_bucket, error_prefix) => {
+                assert_eq!(error_bucket, bucket);
+                assert_eq!(error_prefix, "blocked/prefix");
+            }
+            other => panic!("unexpected recursive delete error: {other:?}"),
+        }
+        for disk in healthy_disks.iter().flatten() {
+            assert!(
+                matches!(disk.read_all(&bucket, "blocked/prefix/object").await, Err(DiskError::FileNotFound)),
+                "the healthy set should still complete its prefix deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_keeps_a_missing_bucket_idempotent_across_sets() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created across both sets");
+
+        let healthy_disks = sets.disk_set[0].disks.read().await.clone();
+        for disk in healthy_disks.iter().flatten() {
+            disk.write_all(&bucket, "existing/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("healthy set should contain the prefix");
+        }
+        let missing_bucket_disks = sets.disk_set[1].disks.read().await.clone();
+        for disk in missing_bucket_disks.iter().flatten() {
+            disk.delete_volume(&bucket, true)
+                .await
+                .expect("the bucket should be removed from one set");
+        }
+
+        sets.delete_object(
+            &bucket,
+            "existing/prefix",
+            ObjectOptions {
+                delete_prefix: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a missing bucket on one set should remain an idempotent success");
+        for disk in healthy_disks.iter().flatten() {
+            assert!(
+                matches!(disk.read_all(&bucket, "existing/prefix/object").await, Err(DiskError::FileNotFound)),
+                "the healthy set should still complete its prefix deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_preserves_a_completely_missing_bucket_error() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let bucket = format!("delete-prefix-missing-{}", Uuid::new_v4().simple());
+
+        let err = sets
+            .delete_object(
+                &bucket,
+                "missing/prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a completely missing bucket must not be reported as a successful object deletion");
+
+        assert_eq!(err, StorageError::BucketNotFound(bucket));
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_fails_when_one_set_is_entirely_offline() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created across both sets");
+
+        let online_disks = sets.disk_set[0].disks.read().await.clone();
+        let offline_disks = sets.disk_set[1].disks.read().await.clone();
+        for disk in online_disks.iter().chain(offline_disks.iter()).flatten() {
+            disk.write_all(&bucket, "offline/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("each set should contain the prefix before the outage");
+        }
+        *sets.disk_set[1].disks.write().await = vec![None, None];
+
+        let err = sets
+            .delete_object(
+                &bucket,
+                "offline/prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an entirely offline set must make the recursive delete fail");
+
+        assert!(
+            matches!(err, StorageError::InsufficientWriteQuorum(ref error_bucket, ref error_prefix)
+                if error_bucket == &bucket && error_prefix == "offline/prefix"),
+            "unexpected offline-set error: {err:?}"
+        );
+        for disk in online_disks.iter().flatten() {
+            assert!(matches!(
+                disk.read_all(&bucket, "offline/prefix/object").await,
+                Err(DiskError::FileNotFound)
+            ));
+        }
+        for disk in offline_disks.iter().flatten() {
+            disk.read_all(&bucket, "offline/prefix/object")
+                .await
+                .expect("the offline set's untouched prefix must still be present");
+        }
     }
 
     #[tokio::test]
