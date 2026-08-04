@@ -17,10 +17,10 @@
 # Two entry points, honestly scoped:
 #   * schedule (nightly, on main): post-merge detection — catches a regression
 #     within 24h of landing, not before merge.
-#   * pull_request labeled `perf-ab`: opt-in pre-merge gate for a specific PR.
-# The `perf-deliberate-tradeoff` label runs the gate with --allow-regression so
-# a deliberate correctness cost (e.g. the #4221 fsync durability fix) is
-# recorded but does not block (rustfs/backlog#935 correction 1).
+#   * workflow_dispatch: an explicitly selected trusted ref.
+# The dispatch input can run the gate with --allow-regression so a deliberate
+# correctness cost (e.g. the #4221 fsync durability fix) is recorded, not
+# blocked (rustfs/backlog#935 correction 1).
 
 # DISABLED. This workflow is switched off in the repository's Actions settings
 # (state: disabled_manually) and does not run on any trigger, including its cron
@@ -46,8 +46,6 @@ on:
         required: false
         default: false
         type: boolean
-  pull_request:
-    types: [labeled, synchronize, reopened]
   push:
     # Every main commit pre-builds and caches its release binary (perf-3) so the
     # nightly A/B restores a ready baseline instead of paying the double build.
@@ -55,14 +53,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
-
-# Per-PR: a new push cancels the previous (up to 90-minute) A/B run instead of
-# stacking them. Nightly schedule and manual dispatch get a unique group and
-# always run to completion.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,8 +60,8 @@ env:
 
 jobs:
   # perf-3: on every push to main, build the release binary once and cache it
-  # keyed by commit SHA (rustfs-baseline-<sha>). The nightly A/B (and, later, the
-  # perf-7 PR gate) restore this instead of paying the ~32min-per-side source
+  # keyed by commit SHA (rustfs-baseline-<sha>). The warp-ab measurements
+  # restore this instead of paying the ~32min-per-side source
   # build. That double build is what pushed the expanded 24-cell nightly past its
   # ceiling — 2026-07-11..07-14 all cancelled on the 120min timeout. Incremental
   # builds off the shared cargo cache keep each push cheap, and building on the
@@ -126,17 +116,11 @@ jobs:
 
   warp-ab:
     name: Warp A/B budget gate
-    # Always run on schedule / manual dispatch. Opt-in on PRs: only when the
-    # `perf-ab` label is present, and for `labeled` events only when the label
-    # being added is `perf-ab` itself (adding an unrelated label to an opted-in
-    # PR must not re-run the gate). Never on push — that event only feeds
-    # build-baseline-cache above.
+    # Always run on schedule / manual dispatch. Never on push — that event only
+    # feeds build-baseline-cache above.
     if: >-
       github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
-       (github.event.action != 'labeled' || github.event.label.name == 'perf-ab'))
+      github.event_name == 'workflow_dispatch'
     runs-on: sm-standard-2
     # With perf-3's cached baseline binary the common (cache-hit) nightly is
     # measurement-only and finishes well under 50min. This ceiling stays
@@ -174,10 +158,6 @@ jobs:
           INPUT_ALLOW_REGRESSION: ${{ github.event.inputs.allow_regression }}
         run: |
           allow="false"
-          if [[ "${{ github.event_name }}" == "pull_request" ]] \
-            && ${{ contains(github.event.pull_request.labels.*.name, 'perf-deliberate-tradeoff') }}; then
-            allow="true"
-          fi
           if [[ "$INPUT_ALLOW_REGRESSION" == "true" ]]; then
             allow="true"
           fi
@@ -314,10 +294,10 @@ jobs:
           echo "candidate binary: $cand_src"
 
           if [[ "${{ steps.exempt.outputs.allow_regression }}" == "true" ]]; then
-            args+=(--allow-regression --exemption-reason "labeled perf-deliberate-tradeoff / dispatch override")
+            args+=(--allow-regression --exemption-reason "workflow dispatch override")
           fi
           # Do not let a gate FAIL abort the job here; capture status and surface
-          # it after the PR comment is posted.
+          # it after the step summary is written.
           set +e
           bash scripts/run_hotpath_warp_abba.sh "${args[@]}"
           echo "status=$?" >> "$GITHUB_OUTPUT"
@@ -382,13 +362,6 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment gate result on PR
-        if: always() && github.event_name == 'pull_request' && steps.ab.outputs.gate_md != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file "${{ steps.ab.outputs.gate_md }}"
-
       # Scheduled failure alerting is handled by the alert-on-failure job below
       # (perf-2 consuming ci-8's schedule-failure-issue composite action).
 
@@ -397,7 +370,7 @@ jobs:
         run: |
           status="${{ steps.ab.outputs.status }}"
           if [[ "$status" != "0" ]]; then
-            echo "::error::warp A/B budget gate failed (exit $status). See the step summary / PR comment / gate.md artifact." >&2
+            echo "::error::warp A/B budget gate failed (exit $status). See the step summary / gate.md artifact." >&2
             exit "$status"
           fi
           echo "warp A/B budget gate passed."
@@ -407,14 +380,12 @@ jobs:
     needs: [warp-ab]
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
-    # ci-8); PR and manual dispatch failures are already watched by a human.
+    # ci-8); manual dispatch failures are already watched by a human.
     # `cancelled` is included alongside `failure` on purpose: a job that hits
     # timeout-minutes ends as `cancelled`, and the 2026-07-11..07-14 nightly
     # timeouts went silent precisely because the guard was failure-only. The
     # composite action already reports cancelled/timed-out jobs in the issue
-    # body. (Scheduled runs get a unique concurrency group with
-    # cancel-in-progress off, so a cancellation here means a timeout/manual
-    # abort, never a superseding run.)
+    # body.
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
