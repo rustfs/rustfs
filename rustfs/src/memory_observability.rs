@@ -323,18 +323,17 @@ fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservat
 fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
     // SAFETY: `mi_stats_get_json` returns a null-terminated JSON buffer owned by
     // mimalloc when called with a null input buffer. The mimalloc API requires
-    // freeing that buffer with `mi_free`, which is done before returning.
-    let stats = unsafe {
+    // freeing that buffer with `mi_free`; parsing finishes before the buffer is freed.
+    let observation = unsafe {
         let stats_ptr = libmimalloc_sys::mi_stats_get_json(0, std::ptr::null_mut());
         if stats_ptr.is_null() {
             return None;
         }
 
-        let stats = CStr::from_ptr(stats_ptr).to_str().ok().map(str::to_owned);
+        let observation = CStr::from_ptr(stats_ptr).to_str().ok().and_then(parse_mimalloc_stats_json);
         libmimalloc_sys::mi_free(stats_ptr.cast());
-        stats?
+        observation?
     };
-    let observation = parse_mimalloc_stats_json(&stats)?;
     Some(AllocatorMemorySnapshot {
         backend: crate::allocator_reclaim::allocator_backend(),
         observation,
