@@ -9722,10 +9722,10 @@ dependencies = [
 name = "rustfs-madmin"
 version = "1.0.0-beta.12"
 dependencies = [
- "chrono",
  "hotpath",
  "humantime",
  "hyper",
+ "jiff",
  "rmp-serde",
  "serde",
  "serde_json",
