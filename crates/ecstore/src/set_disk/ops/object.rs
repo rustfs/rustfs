@@ -637,7 +637,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 &self.ctx.tier_config_mgr(),
             )
             .await?;
-            return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), None, bucket, object));
+            return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), bucket, object));
         }
 
         // App-layer object data cache probe: metadata (etag/size) is resolved
@@ -764,18 +764,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        let snapshot_lease = if lock_optimization_enabled {
-            match fi.data_dir.filter(|data_dir| !data_dir.is_nil()) {
-                Some(data_dir) => {
-                    let data_dir_path = format!("{object}/{data_dir}");
-                    acquire_snapshot_leases(&disks, bucket, &data_dir_path, fi.erasure.data_blocks).await
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
                 match Self::get_object_decode_reader_with_fileinfo(
@@ -805,7 +793,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         // Carry the hook probe result so the app layer skips its
                         // now-redundant lookup on the streaming miss path (ODC-16).
                         reader.body_source = body_source;
-                        return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), snapshot_lease, bucket, object));
+                        return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), bucket, object));
                     }
                     core::io_primitives::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
@@ -845,22 +833,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        let producer_snapshot_lease = snapshot_lease.clone();
-        if let Some(lease) = snapshot_lease {
-            release_materialized_read_lock(&bucket, &object, read_lock_guard.take());
-            reader.stream = Box::new(SnapshotLeaseReader {
-                inner: reader.stream,
-                lease: Some(lease),
-                terminal_error: false,
-            });
-            debug!(bucket, object, "Lock optimization: replaced read lock with snapshot leases");
-        }
-
-        // The producer shares the lease lifetime with the body so cancellation
-        // cannot release the snapshot while the duplex task is still unwinding.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
-            let _snapshot_lease = producer_snapshot_lease;
             let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
