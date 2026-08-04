@@ -19,7 +19,6 @@ use rustfs_io_metrics::{
 use serde::Serialize;
 #[cfg(any(test, not(target_os = "windows")))]
 use serde_json::Value;
-use std::collections::HashMap;
 #[cfg(not(target_os = "windows"))]
 use std::ffi::CStr;
 use std::path::Path;
@@ -132,6 +131,20 @@ struct CgroupMemorySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CgroupMemoryStatFields {
+    anon: Option<u64>,
+    file: Option<u64>,
+    active_file: Option<u64>,
+    inactive_file: Option<u64>,
+    rss: Option<u64>,
+    cache: Option<u64>,
+    total_rss: Option<u64>,
+    total_cache: Option<u64>,
+    total_active_file: Option<u64>,
+    total_inactive_file: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AllocatorMemorySnapshot {
     backend: &'static str,
     observation: AllocatorMemoryObservation,
@@ -156,16 +169,32 @@ fn read_optional_u64(path: &Path) -> Option<u64> {
     trimmed.parse::<u64>().ok()
 }
 
-fn parse_kv_stats(content: &str) -> HashMap<String, u64> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let key = parts.next()?;
-            let value = parts.next()?.parse::<u64>().ok()?;
-            Some((key.to_string(), value))
-        })
-        .collect()
+fn parse_cgroup_memory_stat(content: &str) -> CgroupMemoryStatFields {
+    let mut fields = CgroupMemoryStatFields::default();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+
+        match key {
+            "anon" => fields.anon = Some(value),
+            "file" => fields.file = Some(value),
+            "active_file" => fields.active_file = Some(value),
+            "inactive_file" => fields.inactive_file = Some(value),
+            "rss" => fields.rss = Some(value),
+            "cache" => fields.cache = Some(value),
+            "total_rss" => fields.total_rss = Some(value),
+            "total_cache" => fields.total_cache = Some(value),
+            "total_active_file" => fields.total_active_file = Some(value),
+            "total_inactive_file" => fields.total_inactive_file = Some(value),
+            _ => {}
+        }
+    }
+    fields
 }
 
 fn read_cgroup_v2() -> Option<CgroupMemorySnapshot> {
@@ -175,14 +204,14 @@ fn read_cgroup_v2() -> Option<CgroupMemorySnapshot> {
         return None;
     }
 
-    let stats = parse_kv_stats(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(&stat_path).ok()?);
     Some(CgroupMemorySnapshot {
         current_bytes: read_optional_u64(&root.join("memory.current")),
         limit_bytes: read_optional_u64(&root.join("memory.max")),
-        anon_bytes: stats.get("anon").copied(),
-        file_bytes: stats.get("file").copied(),
-        active_file_bytes: stats.get("active_file").copied(),
-        inactive_file_bytes: stats.get("inactive_file").copied(),
+        anon_bytes: stats.anon,
+        file_bytes: stats.file,
+        active_file_bytes: stats.active_file,
+        inactive_file_bytes: stats.inactive_file,
     })
 }
 
@@ -193,20 +222,14 @@ fn read_cgroup_v1() -> Option<CgroupMemorySnapshot> {
         return None;
     }
 
-    let stats = parse_kv_stats(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(&stat_path).ok()?);
     Some(CgroupMemorySnapshot {
         current_bytes: read_optional_u64(&root.join("memory.usage_in_bytes")),
         limit_bytes: read_optional_u64(&root.join("memory.limit_in_bytes")),
-        anon_bytes: stats.get("total_rss").copied().or_else(|| stats.get("rss").copied()),
-        file_bytes: stats.get("total_cache").copied().or_else(|| stats.get("cache").copied()),
-        active_file_bytes: stats
-            .get("total_active_file")
-            .copied()
-            .or_else(|| stats.get("active_file").copied()),
-        inactive_file_bytes: stats
-            .get("total_inactive_file")
-            .copied()
-            .or_else(|| stats.get("inactive_file").copied()),
+        anon_bytes: stats.total_rss.or(stats.rss),
+        file_bytes: stats.total_cache.or(stats.cache),
+        active_file_bytes: stats.total_active_file.or(stats.active_file),
+        inactive_file_bytes: stats.total_inactive_file.or(stats.inactive_file),
     })
 }
 
@@ -456,17 +479,18 @@ mod tests {
         CgroupMemorySnapshot, MEMORY_OBSERVABILITY_SERVICE_NAME, MemoryObservabilityCancellationSource,
         MemoryObservabilityController, MemoryObservabilityDesiredState, MemoryObservabilityServiceState,
         MemoryObservabilityShutdownHandle, MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
-        build_memory_observability_status_snapshot, parse_kv_stats, parse_mimalloc_stats_json, read_optional_u64,
+        build_memory_observability_status_snapshot, parse_cgroup_memory_stat, parse_mimalloc_stats_json, read_optional_u64,
     };
     use std::fs;
     use std::path::PathBuf;
 
     #[test]
-    fn parse_kv_stats_extracts_numeric_pairs() {
-        let parsed = parse_kv_stats("anon 12\nfile 34\nactive_file 56\n");
-        assert_eq!(parsed.get("anon").copied(), Some(12));
-        assert_eq!(parsed.get("file").copied(), Some(34));
-        assert_eq!(parsed.get("active_file").copied(), Some(56));
+    fn parse_cgroup_memory_stat_extracts_tracked_numeric_fields() {
+        let parsed = parse_cgroup_memory_stat("anon 12\nfile 34\nactive_file 56\nignored 78\nmalformed nope\n");
+        assert_eq!(parsed.anon, Some(12));
+        assert_eq!(parsed.file, Some(34));
+        assert_eq!(parsed.active_file, Some(56));
+        assert_eq!(parsed.inactive_file, None);
     }
 
     #[test]
