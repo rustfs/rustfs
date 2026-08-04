@@ -51,6 +51,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -400,6 +401,14 @@ where
     Ok(data)
 }
 
+pub(crate) async fn read_config_limited<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
+where
+    S: EcstoreObjectIO,
+{
+    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), false, Some(max_bytes)).await?;
+    Ok(data)
+}
+
 /// Read an existing config object without treating an empty payload as absent.
 /// Callers that validate their own payload format need to distinguish corruption
 /// from `ConfigNotFound`.
@@ -407,7 +416,7 @@ pub(crate) async fn read_config_preserve_empty<S>(api: Arc<S>, file: &str) -> Re
 where
     S: EcstoreObjectIO,
 {
-    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true).await?;
+    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true, None).await?;
     Ok(data)
 }
 
@@ -447,6 +456,7 @@ where
             ..Default::default()
         },
         true,
+        None,
     )
     .await
 }
@@ -463,7 +473,7 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
-    read_config_with_metadata_inner(api, file, opts, false).await
+    read_config_with_metadata_inner(api, file, opts, false, None).await
 }
 
 async fn read_config_with_metadata_inner<S>(
@@ -471,6 +481,7 @@ async fn read_config_with_metadata_inner<S>(
     file: &str,
     opts: &ObjectOptions,
     preserve_empty: bool,
+    max_bytes: Option<usize>,
 ) -> Result<(Vec<u8>, ObjectInfo)>
 where
     S: ObjectIO<
@@ -496,7 +507,25 @@ where
             }
         })?;
 
-    let data = rd.read_all().await?;
+    let data = if let Some(max_bytes) = max_bytes {
+        let object_size = usize::try_from(rd.object_info.size).map_err(|_| Error::CorruptedFormat)?;
+        if object_size > max_bytes {
+            return Err(Error::CorruptedFormat);
+        }
+
+        let read_limit = max_bytes.checked_add(1).ok_or(Error::CorruptedFormat)?;
+        let mut data = Vec::with_capacity(read_limit.min(64 * 1024));
+        (&mut rd)
+            .take(u64::try_from(read_limit).map_err(|_| Error::CorruptedFormat)?)
+            .read_to_end(&mut data)
+            .await?;
+        if data.len() > max_bytes {
+            return Err(Error::CorruptedFormat);
+        }
+        data
+    } else {
+        rd.read_all().await?
+    };
 
     if data.is_empty() && !preserve_empty {
         return Err(Error::ConfigNotFound);
@@ -2354,7 +2383,7 @@ where
     let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
     let guard = lock.get_write_lock(get_lock_acquire_timeout()).await?;
     let read_options = ObjectOptions::default();
-    match read_config_with_metadata_inner(api, &config_file, &read_options, true).await {
+    match read_config_with_metadata_inner(api, &config_file, &read_options, true, None).await {
         Ok((raw, object_info)) => {
             let (config, seed) = decode_persisted_server_config_with_seed(&raw)?;
             Ok(ServerConfigSnapshot {
