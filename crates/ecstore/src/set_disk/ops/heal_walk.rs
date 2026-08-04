@@ -23,6 +23,7 @@
 //! per-version `SetDisks::heal_object`.
 
 use super::super::*;
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -130,6 +131,62 @@ impl HealWalkCollector {
             self.cancel.cancel();
         }
     }
+
+    /// Collect versions from ALL partial entries across disks, deduplicate by
+    /// `(name, version_id)`, and record a single merged object. This ensures
+    /// that a version present on only a minority of disks (e.g. stale data on a
+    /// returning node that was deleted on the quorum) is surfaced for healing.
+    fn ingest_merged(&self, entries: &MetaCacheEntries) {
+        let mut name = String::new();
+        let mut seen = HashSet::new();
+        let mut versions = Vec::new();
+
+        for entry in entries.0.iter().flatten() {
+            if entry.is_dir() || entry.name.is_empty() {
+                continue;
+            }
+            if name.is_empty() {
+                name = entry.name.clone();
+            }
+            let fiv = match entry.file_info_versions_with_free_versions(&self.bucket) {
+                Ok(fiv) => fiv,
+                Err(err) => {
+                    debug!(entry = %entry.name, error = ?err, "heal disk-walk merged skipped entry with unreadable versions");
+                    continue;
+                }
+            };
+            for fi in fiv.versions.iter().chain(fiv.free_versions.iter()) {
+                let vid = fi.version_id.filter(|u| !u.is_nil()).map(|u| u.to_string());
+                if seen.insert(vid.clone()) {
+                    versions.push(HealWalkVersion {
+                        name: entry.name.clone(),
+                        version_id: vid,
+                        is_delete_marker: fi.deleted,
+                    });
+                }
+            }
+        }
+
+        if versions.is_empty() || name.is_empty() {
+            return;
+        }
+
+        let added = versions.len();
+        let (objs_len, ver_total) = {
+            let Ok(mut objects) = self.lock_objects() else {
+                return;
+            };
+            objects.push(HealWalkObject { name, versions });
+            let objs_len = objects.len();
+            let ver_total = self.version_total.fetch_add(added, Ordering::SeqCst) + added;
+            (objs_len, ver_total)
+        };
+
+        if objs_len >= self.batch_objects || ver_total >= self.version_budget {
+            self.truncated.store(true, Ordering::SeqCst);
+            self.cancel.cancel();
+        }
+    }
 }
 
 /// Finalize a collected disk-walk page: compute the resume cursor and apply
@@ -198,7 +255,6 @@ impl SetDisks {
 
         let agreed_collector = collector.clone();
         let partial_collector = collector.clone();
-        let partial_bucket = bucket.to_string();
 
         let filter_prefix = if prefix.is_empty() { None } else { Some(prefix.to_string()) };
 
@@ -223,15 +279,13 @@ impl SetDisks {
             })),
             partial: Some(Box::new(move |entries: MetaCacheEntries, _errs: &[Option<DiskError>]| {
                 let collector = partial_collector.clone();
-                let bucket = partial_bucket.clone();
                 Box::pin(async move {
-                    // objQuorum = 1: take the cross-disk union of every version on
-                    // any disk. Fall back to the first present entry if the merge
-                    // somehow yields nothing.
-                    let entry = entries.resolve_union(&bucket).or_else(|| entries.first_found().0);
-                    if let Some(entry) = entry {
-                        collector.ingest(entry);
-                    }
+                    // Collect versions from ALL entries across disks, not just the
+                    // winner of resolve_union. When a returning node carries a stale
+                    // version that was deleted on the quorum, resolve_union would
+                    // pick only one entry and lose the stale version, preventing
+                    // its cleanup during heal.
+                    collector.ingest_merged(&entries);
                 })
             })),
             finished: None,
@@ -321,6 +375,76 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(next_forward, None, "a complete final page must not carry a resume cursor");
         assert!(!truncated);
+    }
+
+    /// `ingest_merged` must surface versions from ALL entries, not just the
+    /// winner of `resolve_union`. This covers the stale-object-after-reconnect
+    /// scenario (issue #5029): a returning node carries a data version that was
+    /// deleted on the quorum; `resolve_union` picks one entry and loses the
+    /// other, but `ingest_merged` must see both.
+    #[test]
+    fn ingest_merged_surfaces_versions_from_divergent_entries() {
+        use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntries, MetaCacheEntry};
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+
+        let t0 = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let t1 = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+
+        // Node3: stale data version (V1) — only present on one disk.
+        let make_entry = |name: &str, version_u128: u128, deleted: bool, ts: OffsetDateTime| -> MetaCacheEntry {
+            let mut fi = FileInfo::new(name, 4, 2);
+            fi.volume = "bucket".to_string();
+            fi.name = name.to_string();
+            fi.version_id = Some(Uuid::from_u128(version_u128));
+            fi.versioned = true;
+            fi.deleted = deleted;
+            fi.size = if deleted { 0 } else { 100 };
+            fi.mod_time = Some(ts);
+            fi.metadata = [("etag".to_string(), format!("etag-{version_u128:x}"))].into();
+
+            let mut meta = FileMeta::new();
+            meta.add_version(fi).expect("test metadata should accept version");
+            let encoded = meta.marshal_msg().expect("test metadata should marshal");
+
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: encoded,
+                cached: Some(meta),
+                reusable: false,
+            }
+        };
+
+        let stale_entry = make_entry("a.txt", 0xBEEF, false, t0); // data version on returning node
+        let delete_entry = make_entry("a.txt", 0xCAFE, true, t1); // delete marker on quorum nodes
+
+        let collector = Arc::new(HealWalkCollector {
+            bucket: "bucket".to_string(),
+            batch_objects: 1000,
+            version_budget: 10_000,
+            objects: Mutex::new(Vec::new()),
+            version_total: AtomicUsize::new(0),
+            truncated: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+        });
+
+        // Simulate the partial callback: two entries with different versions.
+        let entries = MetaCacheEntries(vec![Some(stale_entry), Some(delete_entry.clone()), Some(delete_entry)]);
+        collector.ingest_merged(&entries);
+
+        let objects = collector.lock_objects().expect("mutex should not be poisoned");
+        assert_eq!(objects.len(), 1, "both entries share the same object name");
+        let versions = &objects[0].versions;
+        let version_ids: std::collections::HashSet<Option<String>> = versions.iter().map(|v| v.version_id.clone()).collect();
+        assert!(
+            version_ids.contains(&Some("00000000-0000-0000-0000-00000000beef".to_string())),
+            "ingest_merged must surface the stale data version from the returning node: {version_ids:?}"
+        );
+        assert!(
+            version_ids.contains(&Some("00000000-0000-0000-0000-00000000cafe".to_string())),
+            "ingest_merged must also surface the delete marker from the quorum: {version_ids:?}"
+        );
+        assert_eq!(versions.len(), 2, "exactly two unique versions must be collected");
     }
 
     #[test]
