@@ -32,6 +32,7 @@ pub(crate) struct ReplicationMetadataStore;
 
 impl ReplicationMetadataStore {
     pub(crate) const MRF_REPLICATION_FILE: &'static str = "config/replication/mrf.bin";
+    pub(crate) const MRF_REPLICATION_RECOVERY_LOCK: &'static str = "config/replication/mrf.bin.recovery";
     pub(crate) const FORCE_DELETE_REPLICATION_FILE: &'static str = "config/replication/force-delete.bin";
     pub(crate) const FORCE_DELETE_REPLICATION_TRANSACTION_LOCK: &'static str = "config/replication/force-delete.bin.transaction";
 
@@ -111,6 +112,10 @@ mod tests {
             "buckets/bucket-a/.replication/resync.bin"
         );
         assert_eq!(ReplicationMetadataStore::MRF_REPLICATION_FILE, "config/replication/mrf.bin");
+        assert_eq!(
+            ReplicationMetadataStore::MRF_REPLICATION_RECOVERY_LOCK,
+            "config/replication/mrf.bin.recovery"
+        );
         assert_eq!(
             ReplicationMetadataStore::FORCE_DELETE_REPLICATION_FILE,
             "config/replication/force-delete.bin"
