@@ -8156,7 +8156,9 @@ impl DiskAPI for LocalDisk {
             }
 
             Ok(RenameDataResp {
-                old_data_dir: rollback_data_dir,
+                old_data_dir: has_old_data_dir,
+                rollback_data_dir,
+                cleanup_data_dir: has_old_data_dir,
                 sign: version_signature,
                 old_current_size,
             })
@@ -8347,8 +8349,9 @@ impl DiskAPI for LocalDisk {
                     let _ = remove_file_if_exists(backup_path);
                 }
 
-                Ok::<(Option<Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
+                Ok::<(Option<Uuid>, Option<Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
                     rollback_data_dir,
+                    old_data_dir,
                     version_signature,
                     old_current_size,
                 ))
@@ -8363,7 +8366,7 @@ impl DiskAPI for LocalDisk {
             // invalidate itself, so it is done here. Inline objects carry their
             // data in xl.meta rather than separate part inodes, so this is mostly
             // defensive, but it keeps the inline and streaming branches consistent.
-            let (old_data_dir, version_signature, old_current_size) = match inline_commit {
+            let (old_data_dir, cleanup_data_dir, version_signature, old_current_size) = match inline_commit {
                 Ok(committed) => committed,
                 Err(err) => {
                     for part_path in &invalidate_part_paths {
@@ -8396,7 +8399,9 @@ impl DiskAPI for LocalDisk {
             }
 
             Ok(RenameDataResp {
-                old_data_dir,
+                old_data_dir: cleanup_data_dir,
+                rollback_data_dir: old_data_dir,
+                cleanup_data_dir,
                 sign: version_signature,
                 old_current_size,
             })
@@ -9416,6 +9421,53 @@ mod test {
         let rollback_dir = inline_metadata_rollback_dir(target_version, &meta);
         assert_ne!(rollback_dir, colliding_dir);
         assert!(!rollback_dir.is_nil());
+    }
+
+    #[tokio::test]
+    async fn inline_overwrite_does_not_report_rollback_dir_for_cleanup() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "parent";
+        let tmp_object = "tmp-write";
+        let version_id = Uuid::nil();
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        fs::create_dir_all(dir.path().join(bucket).join(object))
+            .await
+            .expect("destination object directory should be created");
+        fs::write(
+            dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE),
+            test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"old")))),
+        )
+        .await
+        .expect("old inline metadata should be written");
+        fs::create_dir_all(dir.path().join(RUSTFS_META_TMP_BUCKET).join(tmp_object))
+            .await
+            .expect("staging object directory should be created");
+
+        let response = disk
+            .rename_data(
+                RUSTFS_META_TMP_BUCKET,
+                tmp_object,
+                test_file_info(object, version_id, None, Some(Bytes::from_static(b"new"))),
+                bucket,
+                object,
+            )
+            .await
+            .expect("inline overwrite should commit");
+
+        assert_eq!(response.old_data_dir, None);
+        assert_eq!(
+            response.rollback_data_dir,
+            Some(inline_metadata_rollback_dir(version_id, &FileMeta::new()))
+        );
+        assert_eq!(
+            response.cleanup_data_dir, None,
+            "synthetic rollback state must not be recursively reclaimed"
+        );
     }
 
     #[test]
