@@ -33,9 +33,9 @@ use std::{collections::HashMap, io::Cursor};
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-/// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
-/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+/// Initial capacity hint (bytes) for typical small msgpack requests and responses.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
 
 fn snapshot_lease_disabled_response() -> SnapshotLeaseResponse {
@@ -96,12 +96,24 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
     }
 }
 
-fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
+fn encode_msgpack_with_capacity<T: serde::Serialize>(
+    value: &T,
+    value_name: &str,
+    capacity: usize,
+) -> std::result::Result<Vec<u8>, DiskError> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(capacity));
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} msgpack failed: {err}")))?;
     Ok(serializer.into_inner())
+}
+
+fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
+    encode_msgpack_with_capacity(value, value_name, MSGPACK_ENCODE_CAPACITY_HINT)
+}
+
+fn encode_file_info_msgpack(value: &FileInfo) -> std::result::Result<Vec<u8>, DiskError> {
+    encode_msgpack_with_capacity(value, "FileInfo", FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
 }
 
 fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
@@ -168,7 +180,11 @@ fn encode_batch_read_version_response_payloads(
             compat_response_json(batch_read_version_resp)
                 .map_err(|err| DiskError::other(format!("encode BatchReadVersionResp json failed: {err}")))?,
         );
-        batch_read_version_resps_bin.push(Bytes::from(encode_msgpack(batch_read_version_resp, "BatchReadVersionResp")?));
+        batch_read_version_resps_bin.push(Bytes::from(encode_msgpack_with_capacity(
+            batch_read_version_resp,
+            "BatchReadVersionResp",
+            FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT,
+        )?));
     }
 
     Ok((batch_read_version_resps_json, batch_read_version_resps_bin))
@@ -619,7 +635,7 @@ impl NodeService {
             {
                 Ok(file_info) => {
                     let file_info_json = compat_response_json(&file_info);
-                    let file_info_bin = encode_msgpack(&file_info, "FileInfo");
+                    let file_info_bin = encode_file_info_msgpack(&file_info);
                     match (file_info_json, file_info_bin) {
                         (Ok(file_info), Ok(file_info_bin)) => Ok(Response::new(ReadVersionResponse {
                             success: true,

@@ -383,7 +383,12 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 Ok((fi, files, disks)) => (fi, files, disks, None),
                 Err(err) => {
                     rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
-                    record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
+                    let failure_path = if is_meta_bucketname(bucket) {
+                        GET_OBJECT_PATH_INTERNAL_META
+                    } else {
+                        GET_OBJECT_PATH_LEGACY_DUPLEX
+                    };
+                    record_get_object_pipeline_failure_for_path(failure_path, GET_STAGE_METADATA, classify_storage_error(&err));
                     return Err(to_object_err(err, vec![bucket, object]));
                 }
             }
@@ -5462,7 +5467,8 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
 mod get_object_downstream_close_accounting_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
-    use crate::diagnostics::get::{GET_STAGE_DECODE, GET_STAGE_EMIT, GetObjectFailureReason};
+    use crate::diagnostics::get::{GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT, GetObjectFailureReason};
+    use crate::disk::RUSTFS_META_BUCKET;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::test_metrics::CapturingRecorder;
@@ -5554,6 +5560,65 @@ mod get_object_downstream_close_accounting_tests {
 
         assert!(decode_failures > 0, "the producer must expose the downstream close at decode");
         assert_eq!(emit_failures, 0, "downstream closure must not be counted as an emit failure");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_internal_meta_reader_records_internal_meta_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let (internal_missing, legacy_unknown) = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let options = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+
+                let result = set_disks
+                    .get_object_reader(
+                        RUSTFS_META_BUCKET,
+                        "buckets/.usage-cache/nonexistent.bin",
+                        None,
+                        HeaderMap::new(),
+                        &options,
+                    )
+                    .await;
+                assert!(result.is_err(), "missing internal metadata must still return an error");
+
+                (
+                    recorder.counter_value(
+                        "rustfs_io_get_object_pipeline_failures_total",
+                        &[
+                            ("path", GET_OBJECT_PATH_INTERNAL_META),
+                            ("stage", GET_STAGE_METADATA),
+                            ("reason", GetObjectFailureReason::MetadataMissing.as_str()),
+                        ],
+                    ),
+                    recorder.counter_value(
+                        "rustfs_io_get_object_pipeline_failures_total",
+                        &[
+                            ("path", GET_OBJECT_PATH_LEGACY_DUPLEX),
+                            ("stage", GET_STAGE_METADATA),
+                            ("reason", GetObjectFailureReason::Unknown.as_str()),
+                        ],
+                    ),
+                )
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert!(internal_missing > 0, "internal metadata miss must use the internal_meta path");
+        assert_eq!(
+            legacy_unknown, 0,
+            "internal metadata miss must not be attributed to legacy_duplex/unknown"
+        );
     }
 }
 

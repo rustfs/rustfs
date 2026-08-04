@@ -777,9 +777,7 @@ impl Operation for ReplicationDiffHandler {
         // Optional prefix can be supplied either as a query parameter (MinIO
         // clients) or, for RustFS clients, as a small JSON body.
         let mut prefix = queries.get("prefix").cloned().unwrap_or_default();
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key)
-            .await
-            .unwrap_or_default();
+        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
         if prefix.is_empty() && !body.trim_ascii().is_empty() {
             match serde_json::from_slice::<ReplicationDiffRequest>(&body) {
                 Ok(parsed) => prefix = parsed.prefix,

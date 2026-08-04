@@ -2495,7 +2495,8 @@ impl HealManager {
                 queue.pop_next()
             };
 
-            if let Some(request) = selected_request {
+            if let Some(mut request) = selected_request {
+                request.options.timeout.get_or_insert(config.task_timeout);
                 let task_priority = request.priority;
                 let task_type_label = heal_request_type_label(&request).to_string();
                 let task_set_label = heal_request_set_metric_label(&request);
@@ -4923,6 +4924,75 @@ mod tests {
         process_manager_queue_once(&manager).await;
 
         assert_eq!(manager.get_queue_length().await, 0);
+    }
+
+    #[tokio::test]
+    async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                max_concurrent_heals: 1,
+                task_timeout: Duration::ZERO,
+                ..HealConfig::default()
+            }),
+        );
+
+        let mut defaulted = bucket_request("defaulted-timeout", HealPriority::Normal, HealRequestSource::Admin);
+        defaulted.options.timeout = None;
+        let defaulted_id = defaulted.id.clone();
+        manager
+            .submit_heal_request(defaulted)
+            .await
+            .expect("request without timeout should be queued");
+        process_manager_queue_once(&manager).await;
+        let defaulted_status = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(status @ HealTaskStatus::Retrying { .. }) = manager.get_task_status(&defaulted_id).await {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configured timeout should finish the task");
+        assert!(matches!(defaulted_status, HealTaskStatus::Retrying { .. }));
+        assert_eq!(
+            manager
+                .retrying_heals
+                .lock()
+                .await
+                .get(&defaulted_id)
+                .expect("timed out task should retain its retry request")
+                .request
+                .options
+                .timeout,
+            Some(Duration::ZERO)
+        );
+        manager
+            .cancel_task(&defaulted_id)
+            .await
+            .expect("retrying timeout task should be cancelled");
+
+        let mut explicit = bucket_request("explicit-timeout", HealPriority::Normal, HealRequestSource::Admin);
+        explicit.options.timeout = Some(Duration::from_secs(60));
+        let explicit_id = explicit.id.clone();
+        manager
+            .submit_heal_request(explicit)
+            .await
+            .expect("request with explicit timeout should be queued");
+        process_manager_queue_once(&manager).await;
+        let explicit_status = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(status @ HealTaskStatus::Failed { .. }) = manager.get_task_status(&explicit_id).await {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit timeout request should finish without using the zero default");
+        assert!(matches!(explicit_status, HealTaskStatus::Failed { .. }));
     }
 
     #[tokio::test]

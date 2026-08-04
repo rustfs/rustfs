@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! RustFS — high-performance S3-compatible object storage.
 //!
 //! This library exposes the [`embedded`] module which lets you start a
