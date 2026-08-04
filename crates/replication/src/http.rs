@@ -34,6 +34,7 @@ pub(crate) const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-cus
 pub(crate) const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
 pub(crate) const SSEC_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
 pub(crate) const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
+pub(crate) const SUFFIX_REPLICATION_STATUS: &str = "replication-status";
 pub(crate) const SUFFIX_REPLICATION_RESET_STATUS: &str = "replication-reset-status";
 
 fn internal_keys(suffix: &str) -> (String, String) {

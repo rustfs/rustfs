@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
-    SUFFIX_REPLICATION_RESET_STATUS, get_header_metadata,
+    SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_STATUS, get_header_metadata, get_internal_metadata,
 };
 use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
@@ -81,6 +81,22 @@ impl MustReplicateOptions {
 
     pub fn user_tags(&self) -> &str {
         self.meta.get(AMZ_OBJECT_TAGGING).map(String::as_str).unwrap_or_default()
+    }
+
+    pub fn metadata_target_is_eligible(&self, arn: &str) -> bool {
+        if !self.is_metadata_replication() {
+            return true;
+        }
+
+        get_internal_metadata(&self.meta, SUFFIX_REPLICATION_STATUS)
+            .as_deref()
+            .and_then(|statuses| {
+                statuses.split(';').find_map(|entry| {
+                    let (target_arn, status) = entry.split_once('=')?;
+                    (target_arn == arn).then(|| ReplicationStatusType::from(status))
+                })
+            })
+            == Some(ReplicationStatusType::Completed)
     }
 }
 
@@ -308,7 +324,9 @@ mod tests {
         is_ssec_encrypted, resync_target_for_object, should_schedule_delete_replication,
         should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     };
-    use crate::http::{AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER};
+    use crate::http::{
+        AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER, SUFFIX_REPLICATION_STATUS, insert_internal_metadata,
+    };
     use crate::storage_api::ObjectToDelete;
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
     use s3s::dto::{
@@ -344,6 +362,29 @@ mod tests {
             .with_replication_status(ReplicationStatusType::Replica);
 
         assert_eq!(options.replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn metadata_replication_requires_completed_target_state() {
+        let arn = "arn:rustfs:replication:target";
+        for status in ["PENDING", "FAILED"] {
+            let mut meta = HashMap::new();
+            insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}={status};"));
+            let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
+
+            assert!(!options.metadata_target_is_eligible(arn));
+        }
+
+        let mut meta = HashMap::new();
+        insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}=COMPLETED;"));
+        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
+
+        assert!(options.metadata_target_is_eligible(arn));
+        assert!(!options.metadata_target_is_eligible("arn:rustfs:replication:missing"));
+        assert!(
+            MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Object, false)
+                .metadata_target_is_eligible(arn)
+        );
     }
 
     #[test]
