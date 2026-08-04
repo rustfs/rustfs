@@ -95,17 +95,13 @@ struct RemoteTargetCredentialsRequest {
     expiration: Option<Timestamp>,
 }
 
-fn jiff_to_chrono_datetime(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::from(timestamp))
-}
-
 impl From<RemoteTargetCredentialsRequest> for TargetCredentials {
     fn from(value: RemoteTargetCredentialsRequest) -> Self {
         Self {
             access_key: value.access_key,
             secret_key: value.secret_key,
             session_token: value.session_token,
-            expiration: value.expiration.map(jiff_to_chrono_datetime),
+            expiration: value.expiration,
         }
     }
 }
@@ -1367,7 +1363,10 @@ mod tests {
         let credentials = crate::admin::storage_api::bucket::target::Credentials::from(credentials);
         let expiration = credentials.expiration.expect("expiration should be preserved");
 
-        assert_eq!(expiration.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "2026-01-01T00:00:00Z");
+        assert_eq!(
+            serde_json::to_value(expiration).expect("expiration should serialize to JSON"),
+            serde_json::json!("2026-01-01T00:00:00Z")
+        );
     }
 
     #[test]
