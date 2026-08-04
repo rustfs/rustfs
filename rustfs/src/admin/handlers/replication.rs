@@ -55,6 +55,55 @@ use url::Host;
 
 const SUPPORTED_REMOTE_TARGET_API: &str = "s3v4";
 
+/// Field groups a `set-remote-target?update=true` request may modify, mirroring
+/// MinIO's `TargetUpdateType` / `GetTargetUpdateOps` query contract: the update
+/// overlays only the requested groups onto the stored target, so a client can
+/// e.g. flip sync mode without knowing or re-sending the target credentials.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TargetUpdateOp {
+    /// Connection group: credentials plus endpoint, target bucket, and TLS settings.
+    Credentials,
+    Sync,
+    Bandwidth,
+    Path,
+}
+
+fn parse_remote_target_update_ops(queries: &HashMap<String, String>) -> S3Result<Vec<TargetUpdateOp>> {
+    const SUPPORTED_OPS: &[(&str, TargetUpdateOp)] = &[
+        ("creds", TargetUpdateOp::Credentials),
+        ("sync", TargetUpdateOp::Sync),
+        ("bandwidth", TargetUpdateOp::Bandwidth),
+        ("path", TargetUpdateOp::Path),
+    ];
+    // Present in the MinIO wire contract, but they drive target fields this
+    // version rejects as unsupported — fail loudly instead of silently ignoring.
+    const UNSUPPORTED_OPS: &[&str] = &["proxy", "healthcheck", "edge", "edgeSyncBeforeExpiry"];
+
+    for key in UNSUPPORTED_OPS {
+        if queries.get(*key).is_some_and(|value| value == "true") {
+            return Err(s3_error!(
+                InvalidRequest,
+                "remote target update op {key} is not supported by this RustFS version"
+            ));
+        }
+    }
+    Ok(SUPPORTED_OPS
+        .iter()
+        .filter(|(key, _)| queries.get(*key).is_some_and(|value| value == "true"))
+        .map(|(_, op)| *op)
+        .collect())
+}
+
+fn site_endpoint_for(endpoint: &str, secure: bool) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else if secure {
+        format!("https://{endpoint}")
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
 fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
 
@@ -83,14 +132,20 @@ fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RemoteTargetCredentialsRequest {
-    #[serde(rename = "accessKey")]
+    #[serde(rename = "accessKey", default)]
     access_key: String,
-    #[serde(rename = "secretKey")]
+    // madmin's BucketTarget::Clone() strips the secret before mc round-trips a
+    // target, so a non-creds `mc replicate update` body carries accessKey
+    // without secretKey; validate_connection_fields still rejects that shape
+    // for create and creds updates.
+    #[serde(rename = "secretKey", default)]
     secret_key: String,
+    #[serde(alias = "sessionToken", default)]
     session_token: Option<String>,
+    #[serde(default)]
     expiration: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -110,9 +165,14 @@ impl From<RemoteTargetCredentialsRequest> for TargetCredentials {
 struct RemoteTargetRequest {
     #[serde(rename = "sourcebucket", default)]
     source_bucket: String,
+    #[serde(default)]
     endpoint: String,
+    // Defaulted so a partial `update=true` body can omit credentials (or, as mc
+    // does, send accessKey without the secret); the create path and creds
+    // updates still reject incomplete ones.
+    #[serde(default)]
     credentials: RemoteTargetCredentialsRequest,
-    #[serde(rename = "targetbucket")]
+    #[serde(rename = "targetbucket", default)]
     target_bucket: String,
     #[serde(default)]
     secure: bool,
@@ -126,11 +186,12 @@ struct RemoteTargetRequest {
     target_type: BucketTargetType,
     #[serde(default)]
     region: String,
-    #[serde(alias = "bandwidth", default)]
+    // The extra aliases accept madmin's JSON tags so mc bodies deserialize.
+    #[serde(alias = "bandwidth", alias = "bandwidthlimit", default)]
     bandwidth_limit: i64,
     #[serde(rename = "replicationSync", default)]
     replication_sync: bool,
-    #[serde(default)]
+    #[serde(alias = "storageclass", default)]
     storage_class: String,
     #[serde(rename = "skipTlsVerify", default)]
     skip_tls_verify: bool,
@@ -142,7 +203,7 @@ struct RemoteTargetRequest {
     disable_proxy: bool,
     #[serde(rename = "resetBeforeDate", with = "time::serde::rfc3339::option", default)]
     reset_before_date: Option<OffsetDateTime>,
-    #[serde(default)]
+    #[serde(alias = "resetID", default)]
     reset_id: String,
     #[serde(rename = "totalDowntime", default)]
     total_downtime: u64,
@@ -152,7 +213,7 @@ struct RemoteTargetRequest {
     online: bool,
     #[serde(default)]
     latency: LatencyStat,
-    #[serde(default)]
+    #[serde(alias = "deploymentID", default)]
     deployment_id: String,
     #[serde(default)]
     edge: bool,
@@ -163,7 +224,9 @@ struct RemoteTargetRequest {
 }
 
 impl RemoteTargetRequest {
-    fn into_bucket_target(self) -> S3Result<BucketTarget> {
+    /// Connection-group requirements: enforced on create and on `creds` updates,
+    /// where the endpoint/credentials in the body replace the stored ones.
+    fn validate_connection_fields(&self) -> S3Result<()> {
         if self.endpoint.trim().is_empty() {
             return Err(s3_error!(InvalidRequest, "endpoint is required"));
         }
@@ -172,16 +235,37 @@ impl RemoteTargetRequest {
             return Err(s3_error!(InvalidRequest, "targetbucket is required"));
         }
 
-        if !self.target_type.is_valid() {
-            return Err(s3_error!(InvalidRequest, "type is invalid"));
-        }
-
         if self.credentials.access_key.trim().is_empty() {
             return Err(s3_error!(InvalidRequest, "credentials.accessKey is required"));
         }
 
         if self.credentials.secret_key.trim().is_empty() {
             return Err(s3_error!(InvalidRequest, "credentials.secretKey is required"));
+        }
+
+        Ok(())
+    }
+
+    fn into_bucket_target(self) -> S3Result<BucketTarget> {
+        self.validate_connection_fields()?;
+        self.into_bucket_target_common()
+    }
+
+    /// Partial-update parse: only the field groups named by `ops` are validated;
+    /// everything else may be absent from the body (MinIO clients omit it).
+    fn into_update_bucket_target(self, ops: &[TargetUpdateOp]) -> S3Result<BucketTarget> {
+        if self.arn.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "arn is required for update"));
+        }
+        if ops.contains(&TargetUpdateOp::Credentials) {
+            self.validate_connection_fields()?;
+        }
+        self.into_bucket_target_common()
+    }
+
+    fn into_bucket_target_common(self) -> S3Result<BucketTarget> {
+        if !self.target_type.is_valid() {
+            return Err(s3_error!(InvalidRequest, "type is invalid"));
         }
 
         if self
@@ -454,40 +538,56 @@ impl Operation for SetRemoteTargetHandler {
                 }
             };
 
-        let mut remote_target = serde_json::from_slice::<RemoteTargetRequest>(&body)
-            .map_err(|e| {
-                error!("Failed to parse remote target request body: {}", e);
-                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid remote target request: {e}"))
-            })?
-            .into_bucket_target()?;
-        validate_remote_target_tls_settings(&remote_target)?;
+        let request = serde_json::from_slice::<RemoteTargetRequest>(&body).map_err(|e| {
+            error!("Failed to parse remote target request body: {}", e);
+            S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid remote target request: {e}"))
+        })?;
 
-        let Ok(target_url) = remote_target.url() else {
-            return Err(s3_error!(InvalidRequest, "invalid target url"));
-        };
-
-        let same_target = rustfs_utils::net::is_local_host(
-            target_url.host().unwrap_or(Host::Domain("localhost")),
-            target_url.port().unwrap_or(80),
-            current_runtime_port(),
-        )
-        .unwrap_or_default();
-
-        if same_target && bucket == &remote_target.target_bucket {
-            return Err(S3Error::with_message(S3ErrorCode::IncorrectEndpoint, "Same target".to_string()));
-        }
-
-        remote_target.source_bucket = bucket.clone();
-        let site_endpoint = if remote_target.endpoint.starts_with("http://") || remote_target.endpoint.starts_with("https://") {
-            remote_target.endpoint.clone()
-        } else if remote_target.secure {
-            format!("https://{}", remote_target.endpoint)
+        let update_ops = if update {
+            parse_remote_target_update_ops(&queries)?
         } else {
-            format!("http://{}", remote_target.endpoint)
+            Vec::new()
         };
-        if let Some(deployment_id) = site_replication_peer_deployment_id_for_endpoint(&site_endpoint).await {
-            remote_target.deployment_id = deployment_id;
+        let replacing_connection = !update || update_ops.contains(&TargetUpdateOp::Credentials);
+
+        let mut remote_target = if update {
+            request.into_update_bucket_target(&update_ops)?
+        } else {
+            request.into_bucket_target()?
+        };
+
+        // Endpoint, TLS, and credential fields from the body only take effect on
+        // create or a `creds` update; a partial update body may omit them.
+        if replacing_connection {
+            validate_remote_target_tls_settings(&remote_target)?;
+
+            let Ok(target_url) = remote_target.url() else {
+                return Err(s3_error!(InvalidRequest, "invalid target url"));
+            };
+
+            let same_target = rustfs_utils::net::is_local_host(
+                target_url.host().unwrap_or(Host::Domain("localhost")),
+                target_url.port().unwrap_or(80),
+                current_runtime_port(),
+            )
+            .unwrap_or_default();
+
+            if same_target && bucket == &remote_target.target_bucket {
+                return Err(S3Error::with_message(S3ErrorCode::IncorrectEndpoint, "Same target".to_string()));
+            }
+
+            if update {
+                // Never trust a body-supplied deployment id on update: it is a
+                // peer-identity anchor, so derive it from the new endpoint's peer
+                // lookup below (empty when the endpoint is not a peer).
+                remote_target.deployment_id = String::new();
+            }
+            let site_endpoint = site_endpoint_for(&remote_target.endpoint, remote_target.secure);
+            if let Some(deployment_id) = site_replication_peer_deployment_id_for_endpoint(&site_endpoint).await {
+                remote_target.deployment_id = deployment_id;
+            }
         }
+        remote_target.source_bucket = bucket.clone();
 
         let bucket_target_sys = BucketTargetSys::get();
 
@@ -519,17 +619,50 @@ impl Operation for SetRemoteTargetHandler {
                 return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Target not found".to_string()));
             };
 
-            target.credentials = remote_target.credentials;
-            target.endpoint = remote_target.endpoint;
-            target.secure = remote_target.secure;
-            target.target_bucket = remote_target.target_bucket;
-
-            target.path = remote_target.path;
-            target.replication_sync = remote_target.replication_sync;
-            target.bandwidth_limit = remote_target.bandwidth_limit;
-            target.skip_tls_verify = remote_target.skip_tls_verify;
-            target.ca_cert_pem = remote_target.ca_cert_pem;
-            target.health_check_duration = remote_target.health_check_duration;
+            // Overlay only the requested field groups onto the stored target
+            // (MinIO `TargetUpdateType` semantics); everything else — including
+            // credentials — stays as persisted.
+            for op in &update_ops {
+                match op {
+                    TargetUpdateOp::Credentials => {
+                        // Mirror MinIO: an operator never knows the site
+                        // replicator's credentials, so overwriting a peer-owned
+                        // target's connection settings would silently break sync.
+                        // Peer ownership is probed three ways — either scheme
+                        // derivation of the stored endpoint (a stale `secure` flag
+                        // must not bypass the guard via a default-port mismatch)
+                        // and the stored deployment id (covers peers registered
+                        // under an alternate NAT/rewritten address).
+                        let https_endpoint = site_endpoint_for(&target.endpoint, true);
+                        let http_endpoint = site_endpoint_for(&target.endpoint, false);
+                        let peer_owned = !target.deployment_id.trim().is_empty()
+                            || site_replication_peer_deployment_id_for_endpoint(&https_endpoint)
+                                .await
+                                .is_some()
+                            || site_replication_peer_deployment_id_for_endpoint(&http_endpoint)
+                                .await
+                                .is_some();
+                        if peer_owned {
+                            warn!(
+                                bucket = %bucket,
+                                arn = %target.arn,
+                                "skip credentials update for site-replication peer target"
+                            );
+                            continue;
+                        }
+                        target.credentials = remote_target.credentials.clone();
+                        target.endpoint = remote_target.endpoint.clone();
+                        target.secure = remote_target.secure;
+                        target.target_bucket = remote_target.target_bucket.clone();
+                        target.skip_tls_verify = remote_target.skip_tls_verify;
+                        target.ca_cert_pem = remote_target.ca_cert_pem.clone();
+                        target.deployment_id = remote_target.deployment_id.clone();
+                    }
+                    TargetUpdateOp::Sync => target.replication_sync = remote_target.replication_sync,
+                    TargetUpdateOp::Bandwidth => target.bandwidth_limit = remote_target.bandwidth_limit,
+                    TargetUpdateOp::Path => target.path = remote_target.path.clone(),
+                }
+            }
 
             warn!(
                 bucket = %bucket,
@@ -538,6 +671,7 @@ impl Operation for SetRemoteTargetHandler {
                 secure = target.secure,
                 skip_tls_verify = target.skip_tls_verify,
                 has_custom_ca = !target.ca_cert_pem.trim().is_empty(),
+                ops = ?update_ops,
                 "update remote target"
             );
             remote_target = target;
@@ -1051,7 +1185,8 @@ impl Operation for ReplicationMrfHandler {
 mod tests {
     use super::{
         REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetRequest, SUPPORTED_REMOTE_TARGET_API,
-        build_mrf_response, extract_query_params, unique_replication_peers, validate_remote_target_tls_settings,
+        TargetUpdateOp, build_mrf_response, extract_query_params, parse_remote_target_update_ops, unique_replication_peers,
+        validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::BucketTarget;
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -1068,6 +1203,113 @@ mod tests {
             "secure": true,
             "type": "replication"
         })
+    }
+
+    fn query_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn update_ops_parse_minio_query_contract() {
+        let ops = parse_remote_target_update_ops(&query_map(&[
+            ("update", "true"),
+            ("creds", "true"),
+            ("sync", "true"),
+            ("bandwidth", "true"),
+            ("path", "true"),
+        ]))
+        .expect("supported ops should parse");
+        assert_eq!(
+            ops,
+            vec![
+                TargetUpdateOp::Credentials,
+                TargetUpdateOp::Sync,
+                TargetUpdateOp::Bandwidth,
+                TargetUpdateOp::Path
+            ]
+        );
+
+        assert!(
+            parse_remote_target_update_ops(&query_map(&[("update", "true")]))
+                .expect("no ops should parse")
+                .is_empty()
+        );
+
+        let err = parse_remote_target_update_ops(&query_map(&[("update", "true"), ("healthcheck", "true")]))
+            .expect_err("unsupported op must be rejected");
+        assert!(err.to_string().contains("not supported"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn update_body_without_creds_op_may_omit_credentials() {
+        let body = serde_json::json!({
+            "arn": "arn:rustfs:replication:us-east-1:dep:target",
+            "type": "replication",
+            "replicationSync": true
+        });
+        let request: RemoteTargetRequest = serde_json::from_value(body).expect("partial update body should deserialize");
+        let target = request
+            .into_update_bucket_target(&[TargetUpdateOp::Sync])
+            .expect("sync-only update must not require credentials");
+        assert!(target.replication_sync);
+
+        // The same partial body must stay rejected when it claims a creds update.
+        let body = serde_json::json!({
+            "arn": "arn:rustfs:replication:us-east-1:dep:target",
+            "type": "replication"
+        });
+        let request: RemoteTargetRequest = serde_json::from_value(body).expect("body should deserialize");
+        let err = request
+            .into_update_bucket_target(&[TargetUpdateOp::Credentials])
+            .expect_err("creds update requires connection fields");
+        assert!(err.to_string().contains("endpoint is required"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn update_body_accepts_mc_wire_shape() {
+        // What `mc replicate update --sync` actually sends: a madmin
+        // BucketTarget round-trip with the secret stripped by Clone() and
+        // madmin's own JSON tags (bandwidthlimit, deploymentID, ...).
+        let body = serde_json::json!({
+            "sourcebucket": "src",
+            "endpoint": "192.168.1.10:9000",
+            "credentials": { "accessKey": "access" },
+            "targetbucket": "target",
+            "secure": false,
+            "path": "auto",
+            "api": "s3v4",
+            "arn": "arn:rustfs:replication:us-east-1:dep:target",
+            "type": "replication",
+            "bandwidthlimit": 1073741824i64,
+            "replicationSync": true,
+            "totalDowntime": 0,
+            "lastOnline": "2024-01-01T00:00:00Z",
+            "isOnline": true,
+            "latency": { "curr": 0, "avg": 0, "max": 0 },
+            "deploymentID": "dep",
+            "edge": false,
+            "edgeSyncBeforeExpiry": false,
+            "offlineCount": 0
+        });
+        let request: RemoteTargetRequest = serde_json::from_value(body).expect("mc-shaped body should deserialize");
+        let target = request
+            .into_update_bucket_target(&[TargetUpdateOp::Sync, TargetUpdateOp::Bandwidth])
+            .expect("non-creds update must not require the stripped secret");
+        assert!(target.replication_sync);
+        assert_eq!(target.bandwidth_limit, 1073741824);
+    }
+
+    #[test]
+    fn update_body_requires_arn() {
+        let body = serde_json::json!({
+            "type": "replication",
+            "replicationSync": true
+        });
+        let request: RemoteTargetRequest = serde_json::from_value(body).expect("body should deserialize");
+        let err = request
+            .into_update_bucket_target(&[TargetUpdateOp::Sync])
+            .expect_err("update without arn must fail");
+        assert!(err.to_string().contains("arn is required"), "unexpected error: {err}");
     }
 
     #[test]
@@ -1321,18 +1563,19 @@ mod tests {
 
     #[test]
     fn remote_target_request_rejects_missing_credentials() {
+        // Credentials may be absent at the serde layer (partial update bodies omit
+        // them), but the create path must still reject their absence.
         let mut request = valid_remote_target_request();
         request
             .as_object_mut()
             .expect("request should be an object")
             .remove("credentials");
 
-        let err = match serde_json::from_value::<RemoteTargetRequest>(request) {
-            Ok(_) => panic!("remote target request should require credentials"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("missing field"));
+        let request: RemoteTargetRequest = serde_json::from_value(request).expect("body without credentials should deserialize");
+        let err = request
+            .into_bucket_target()
+            .expect_err("create without credentials must fail");
+        assert!(err.to_string().contains("credentials.accessKey is required"), "unexpected error: {err}");
     }
 
     #[test]
