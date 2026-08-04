@@ -1,10 +1,10 @@
 use super::storage_api::select_object::contract::object::ObjectOperations as _;
 use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
+use super::storage_api::select_object::sse::{SseKmsPrincipal, authorize_sse_kms_object_read};
 use super::storage_api::select_object::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 use crate::app::runtime_sources::current_s3select_db;
 use crate::error::ApiError;
-use crate::storage::sse::{SseKmsPrincipal, authorize_sse_kms_object_read};
 use bytes::Bytes;
 use datafusion::arrow::{
     csv::{QuoteStyle, WriterBuilder as CsvWriterBuilder, writer::Terminator},
