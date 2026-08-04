@@ -110,7 +110,7 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
 
     let reason = params.reason.unwrap_or_else(|| "Reason not provided".to_string());
     println!("Reset webhook count, reason: {reason}");
-    let time_now = chrono::offset::Utc::now().to_string();
+    let time_now = jiff::Timestamp::now().to_string();
     for header in headers {
         let (key, value) = header;
         println!("Header: {key:?}: {value:?}, time: {time_now}");
@@ -120,7 +120,7 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
     // Reset the counter to 0
     WEBHOOK_COUNT.store(0, Ordering::SeqCst);
     println!("Webhook count has been reset to 0.");
-    let time_now = chrono::offset::Utc::now().to_string();
+    let time_now = jiff::Timestamp::now().to_string();
     Response::builder()
         .header("Foo", "Bar")
         .status(StatusCode::OK)
@@ -171,7 +171,7 @@ async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
     println!(
         "Total webhook requests received: {} , Time: {}",
         WEBHOOK_COUNT.load(Ordering::SeqCst),
-        chrono::offset::Utc::now()
+        jiff::Timestamp::now()
     );
     StatusCode::OK
 }
