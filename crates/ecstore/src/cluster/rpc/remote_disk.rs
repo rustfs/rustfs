@@ -1117,13 +1117,29 @@ impl RemoteDisk {
 }
 
 /// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
-/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+/// request without repeated growth reallocations. Larger payloads still grow as needed.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 
-fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
+fn encode_msgpack_with_capacity<T: Serialize>(value: &T, capacity: usize) -> Result<Vec<u8>> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(capacity));
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
+}
+
+fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    encode_msgpack_with_capacity(value, MSGPACK_ENCODE_CAPACITY_HINT)
+}
+
+fn encode_file_info_msgpack(value: &FileInfo) -> Result<Vec<u8>> {
+    encode_msgpack_with_capacity(value, FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
+}
+
+fn encode_file_info_versions_msgpack(value: &FileInfoVersions) -> Result<Vec<u8>> {
+    let version_count = value.versions.len().saturating_add(value.free_versions.len());
+    let capacity =
+        MSGPACK_ENCODE_CAPACITY_HINT.saturating_add(FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT.saturating_mul(version_count));
+    encode_msgpack_with_capacity(value, capacity)
 }
 
 /// JSON compatibility string for a dual-encoded (`_bin` + text) request field. Returns an empty
@@ -1134,12 +1150,6 @@ fn compat_json<T: Serialize>(value: &T) -> Result<String> {
         return Ok(String::new());
     }
     Ok(serde_json::to_string(value)?)
-}
-
-fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
-    value.serialize(&mut serializer)?;
-    Ok(serializer.into_inner())
 }
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
@@ -1580,7 +1590,7 @@ impl DiskAPI for RemoteDisk {
             || async {
                 // `_bin` support for DeleteVersion is new (grpc-optimization P2); always dual-write
                 // JSON + msgpack until its fallback counter has read zero across a release window.
-                let file_info_bin = encode_msgpack(&fi)?;
+                let file_info_bin = encode_file_info_msgpack(&fi)?;
                 let opts_bin = encode_msgpack(&opts)?;
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
@@ -1670,7 +1680,7 @@ impl DiskAPI for RemoteDisk {
                     return errors;
                 }
             });
-            versions_bin.push(match encode_msgpack(file_info_versions) {
+            versions_bin.push(match encode_file_info_versions_msgpack(file_info_versions) {
                 Ok(versions_bin) => Bytes::from(versions_bin),
                 Err(err) => {
                     let mut errors = Vec::with_capacity(versions.len());
@@ -1886,7 +1896,7 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
         let file_info = compat_json(&fi)?;
-        let file_info_bin = encode_msgpack(&fi)?;
+        let file_info_bin = encode_file_info_msgpack(&fi)?;
 
         self.execute_with_timeout_for_op(
             "write_metadata",
@@ -1965,7 +1975,7 @@ impl DiskAPI for RemoteDisk {
         );
         let file_info = compat_json(&fi)?;
         let opts_str = compat_json(&opts)?;
-        let file_info_bin = encode_msgpack(&fi)?;
+        let file_info_bin = encode_file_info_msgpack(&fi)?;
         let opts_bin = encode_msgpack(opts)?;
 
         self.execute_with_timeout_for_op(
@@ -2229,7 +2239,7 @@ impl DiskAPI for RemoteDisk {
             "rename_data",
             || async {
                 let file_info = compat_json(&fi)?;
-                let file_info_bin = encode_msgpack_named(&fi)?;
+                let file_info_bin = encode_file_info_msgpack(&fi)?;
                 let mut client = self
                     .get_client()
                     .await
@@ -3733,26 +3743,13 @@ mod tests {
     fn rename_data_file_info_named_msgpack_is_smaller_than_json() {
         let file_info = sample_rename_data_file_info();
         let json = serde_json::to_vec(&file_info).expect("file info json should encode");
-        let named_msgpack = encode_msgpack_named(&file_info).expect("file info named msgpack should encode");
+        let named_msgpack = encode_file_info_msgpack(&file_info).expect("file info named msgpack should encode");
 
         assert!(
-            named_msgpack.len() < json.len(),
-            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
-            named_msgpack.len(),
-            json.len()
+            named_msgpack.len() <= FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT,
+            "typical FileInfo should fit the msgpack capacity hint (msgpack={}, hint={FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT})",
+            named_msgpack.len()
         );
-    }
-
-    #[test]
-    fn rename_data_resp_named_msgpack_is_smaller_than_json() {
-        let response = RenameDataResp {
-            old_data_dir: Some(Uuid::new_v4()),
-            sign: Some(vec![1_u8; 32]),
-            old_current_size: Some(crate::disk::OldCurrentSize::Present(4096)),
-        };
-        let json = serde_json::to_vec(&response).expect("rename data response json should encode");
-        let named_msgpack = encode_msgpack_named(&response).expect("rename data response named msgpack should encode");
-
         assert!(
             named_msgpack.len() < json.len(),
             "expected named msgpack payload to be smaller than json (msgpack={}, json={})",

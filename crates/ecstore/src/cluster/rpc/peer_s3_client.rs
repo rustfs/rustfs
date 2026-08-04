@@ -99,6 +99,69 @@ impl DeleteBucketEmptyScanBarrier {
 #[cfg(test)]
 static DELETE_BUCKET_EMPTY_SCAN_BARRIER: StdMutex<Option<Arc<DeleteBucketEmptyScanBarrier>>> = StdMutex::new(None);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum HealBucketOperation {
+    Make,
+    Delete,
+}
+
+#[cfg(test)]
+struct HealBucketOperationFailure {
+    bucket: String,
+    disk_index: usize,
+    operation: HealBucketOperation,
+}
+
+#[cfg(test)]
+type HealBucketOperationFailureKey = (String, usize, HealBucketOperation);
+
+#[cfg(test)]
+fn heal_bucket_operation_failures() -> &'static StdMutex<HashMap<HealBucketOperationFailureKey, Error>> {
+    static FAILURES: std::sync::OnceLock<StdMutex<HashMap<HealBucketOperationFailureKey, Error>>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl HealBucketOperationFailure {
+    fn install(bucket: &str, disk_index: usize, operation: HealBucketOperation, error: Error) -> Self {
+        let key = (bucket.to_string(), disk_index, operation);
+        let previous = heal_bucket_operation_failures()
+            .lock()
+            .expect("heal bucket failure registry should not poison")
+            .insert(key, error);
+        assert!(previous.is_none(), "heal bucket operation failure already installed");
+        Self {
+            bucket: bucket.to_string(),
+            disk_index,
+            operation,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HealBucketOperationFailure {
+    fn drop(&mut self) {
+        heal_bucket_operation_failures()
+            .lock()
+            .expect("heal bucket failure registry should not poison")
+            .remove(&(self.bucket.clone(), self.disk_index, self.operation));
+    }
+}
+
+#[cfg(test)]
+fn injected_heal_bucket_operation_error(bucket: &str, disk_index: usize, operation: HealBucketOperation) -> Option<Error> {
+    heal_bucket_operation_failures()
+        .lock()
+        .expect("heal bucket failure registry should not poison")
+        .get(&(bucket.to_string(), disk_index, operation))
+        .cloned()
+}
+
+#[cfg(not(test))]
+fn injected_heal_bucket_operation_error(_bucket: &str, _disk_index: usize, _operation: HealBucketOperation) -> Option<Error> {
+    None
+}
+
 #[cfg(test)]
 pub(crate) fn install_delete_bucket_empty_scan_barrier() -> Arc<DeleteBucketEmptyScanBarrier> {
     let barrier = Arc::new(DeleteBucketEmptyScanBarrier::default());
@@ -1207,10 +1270,6 @@ pub(crate) async fn heal_bucket_local_on_disks(
         ..Default::default()
     };
 
-    if opts.dry_run {
-        return Ok(res);
-    }
-
     for (disk, state) in disks.iter().zip(before_state.read().await.iter()) {
         res.before.drives.push(HealDriveInfo {
             uuid: "".to_string(),
@@ -1219,35 +1278,68 @@ pub(crate) async fn heal_bucket_local_on_disks(
         });
     }
 
+    if opts.dry_run {
+        for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
+            res.after.drives.push(HealDriveInfo {
+                uuid: "".to_string(),
+                endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
+                state: state.to_string(),
+            });
+        }
+        return Ok(res);
+    }
+
+    let mut operation_error = errs
+        .iter()
+        .filter_map(|err| match err {
+            Some(Error::VolumeNotFound) | None => None,
+            Some(err) => Some(err.clone()),
+        })
+        .next();
+
     if opts.remove && !bucket.starts_with(disk::RUSTFS_META_BUCKET) && !is_all_buckets_not_found(&errs) {
         let mut futures = Vec::new();
-        for disk in disks.iter() {
-            let disk = disk.clone();
+        for (index, disk) in disks.iter().enumerate() {
+            if matches!(errs[index].as_ref(), Some(Error::DiskNotFound | Error::VolumeNotFound)) {
+                continue;
+            }
+            let Some(disk) = disk.clone() else {
+                continue;
+            };
             let bucket = bucket.to_string();
-            info!("heal_bucket_local, errs: {:?}, opts: {:?}", errs, opts);
             futures.push(async move {
-                match disk {
-                    Some(disk) => {
-                        // Non-force: a bucket that still holds object data refuses
-                        // deletion (VolumeNotEmpty) instead of being recursively
-                        // wiped, so a misclassified "dangling" bucket cannot lose
-                        // data (backlog#799 B1). Surface that refusal instead of
-                        // discarding it — it signals the bucket is not dangling.
-                        match disk.delete_volume(&bucket, false).await {
-                            Ok(()) => None,
-                            Err(Error::VolumeNotEmpty) => {
-                                warn!("heal declined to remove non-empty bucket {bucket} (not dangling)");
-                                None
-                            }
-                            Err(e) => Some(e),
-                        }
-                    }
-                    None => Some(Error::DiskNotFound),
+                if let Some(err) = injected_heal_bucket_operation_error(&bucket, index, HealBucketOperation::Delete) {
+                    return (index, Err(err));
                 }
+                (index, disk.delete_volume(&bucket, false).await)
             });
         }
 
-        let _ = join_all(futures).await;
+        for (index, result) in join_all(futures).await {
+            match result {
+                Ok(()) | Err(Error::VolumeNotFound) => {
+                    after_state.write().await[index] = DriveState::Missing.to_string();
+                }
+                Err(Error::VolumeNotEmpty) => {
+                    warn!(
+                        bucket,
+                        operation = "heal_bucket_delete_volume",
+                        result = "preserved_non_empty_bucket",
+                        "heal declined to remove non-empty bucket"
+                    );
+                    after_state.write().await[index] = DriveState::Ok.to_string();
+                }
+                Err(err) => {
+                    after_state.write().await[index] = match &err {
+                        Error::DiskNotFound => DriveState::Offline.to_string(),
+                        _ => DriveState::Corrupt.to_string(),
+                    };
+                    if operation_error.is_none() {
+                        operation_error = Some(err);
+                    }
+                }
+            }
+        }
     }
 
     if !opts.remove {
@@ -1256,41 +1348,56 @@ pub(crate) async fn heal_bucket_local_on_disks(
             let disk = disk.clone();
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
-            let as_clone = after_state.clone();
-            let errs_clone = errs.to_vec();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DriveState::Missing.to_string() {
                     let Some(disk) = disk.as_ref() else {
-                        return Some(Error::DiskNotFound);
+                        return (idx, Some(Error::DiskNotFound));
                     };
 
-                    info!("bucket not find, will recreate");
+                    if let Some(err) = injected_heal_bucket_operation_error(&bucket, idx, HealBucketOperation::Make) {
+                        return (idx, Some(err));
+                    }
                     match disk.make_volume(&bucket).await {
-                        Ok(_) => {
-                            as_clone.write().await[idx] = DriveState::Ok.to_string();
-                            return None;
-                        }
-                        Err(err) => {
-                            return Some(err);
-                        }
+                        Ok(()) | Err(Error::VolumeExists) => return (idx, None),
+                        Err(err) => return (idx, Some(err)),
                     }
                 }
-                errs_clone[idx].clone()
+                (idx, None)
             });
         }
 
-        let _ = join_all(futures).await;
+        for (index, result) in join_all(futures).await {
+            match result {
+                None => {
+                    if before_state.read().await[index] == DriveState::Missing.to_string() {
+                        after_state.write().await[index] = DriveState::Ok.to_string();
+                    }
+                }
+                Some(err) => {
+                    after_state.write().await[index] = match &err {
+                        Error::DiskNotFound => DriveState::Offline.to_string(),
+                        _ => DriveState::Corrupt.to_string(),
+                    };
+                    if operation_error.is_none() {
+                        operation_error = Some(err);
+                    }
+                }
+            }
+        }
     }
 
     for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
-        res.before.drives.push(HealDriveInfo {
+        res.after.drives.push(HealDriveInfo {
             uuid: "".to_string(),
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),
         });
     }
 
-    Ok(res)
+    match operation_error {
+        Some(err) => Err(err),
+        None => Ok(res),
+    }
 }
 
 async fn clone_drives() -> Vec<Option<DiskStore>> {
@@ -1756,7 +1863,7 @@ mod tests {
             .await
             .expect_err("second disk should start missing the bucket");
 
-        heal_bucket_local(
+        let result = heal_bucket_local(
             bucket,
             &HealOpts {
                 recreate: true,
@@ -1766,9 +1873,188 @@ mod tests {
         .await
         .expect("bucket heal should recreate missing volumes");
 
+        assert_eq!(result.before.drives.len(), 2);
+        assert_eq!(result.after.drives.len(), 2);
+        assert!(
+            result
+                .before
+                .drives
+                .iter()
+                .any(|drive| drive.state == DriveState::Missing.to_string()),
+            "one bucket volume must be reported missing before heal"
+        );
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .all(|drive| drive.state == DriveState::Ok.to_string()),
+            "all bucket volumes must be reported healthy after heal"
+        );
+
         for disk in disks {
             disk.stat_volume(bucket).await.expect("bucket should exist after heal");
         }
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_dry_run_reports_discovered_drive_states() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket heal dry-run regression");
+        let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-dry-run-reports-state").await;
+        let bucket = "dry-run-healed-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+
+        let result = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                dry_run: true,
+                ..Default::default()
+            },
+            vec![Some(disks[0].clone()), Some(disks[1].clone()), None],
+        )
+        .await
+        .expect("dry-run bucket heal should inspect disks");
+
+        assert_eq!(result.before.drives.len(), 3);
+        assert_eq!(result.after.drives.len(), 3);
+        assert_eq!(result.before.drives[0].state, DriveState::Ok.to_string());
+        assert_eq!(result.before.drives[1].state, DriveState::Missing.to_string());
+        assert_eq!(result.before.drives[2].state, DriveState::Offline.to_string());
+        for (before, after) in result.before.drives.iter().zip(&result.after.drives) {
+            assert_eq!(after.endpoint, before.endpoint);
+            assert_eq!(after.state, before.state);
+        }
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_propagates_recreate_failure() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket recreate failure regression");
+        let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-propagates-recreate-failure").await;
+        let bucket = "recreate-failure-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+        let _failure = HealBucketOperationFailure::install(bucket, 1, HealBucketOperation::Make, Error::DiskAccessDenied);
+
+        let error = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+        )
+        .await
+        .expect_err("failed volume recreation must fail bucket heal");
+
+        assert_eq!(error, Error::DiskAccessDenied);
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_propagates_delete_failure() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket delete failure regression");
+        let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-propagates-delete-failure").await;
+        let bucket = "delete-failure-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+        let _failure = HealBucketOperationFailure::install(bucket, 0, HealBucketOperation::Delete, Error::DiskAccessDenied);
+
+        let error = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                remove: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+        )
+        .await
+        .expect_err("failed volume deletion must fail bucket heal");
+
+        assert_eq!(error, Error::DiskAccessDenied);
+        disks[0]
+            .stat_volume(bucket)
+            .await
+            .expect("failed deletion must leave the bucket volume present");
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_preserves_non_empty_bucket() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for non-empty bucket heal regression");
+        let disks = init_test_local_disks(&temp_dir, 1, "heal-bucket-local-preserves-non-empty").await;
+        let bucket = "non-empty-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+        let _failure = HealBucketOperationFailure::install(bucket, 0, HealBucketOperation::Delete, Error::VolumeNotEmpty);
+
+        let result = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                remove: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+        )
+        .await
+        .expect("a non-empty bucket refusal is an expected safety result");
+
+        assert_eq!(result.after.drives.len(), 1);
+        assert_eq!(result.after.drives[0].state, DriveState::Ok.to_string());
+        disks[0]
+            .stat_volume(bucket)
+            .await
+            .expect("the non-empty bucket must remain present");
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_propagates_preexisting_offline_disk() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for offline bucket heal regression");
+        let disks = init_test_local_disks(&temp_dir, 1, "heal-bucket-local-preexisting-offline").await;
+        let bucket = "offline-disk-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the online disk");
+
+        let error = heal_bucket_local_on_disks(bucket, &HealOpts::default(), vec![Some(disks[0].clone()), None])
+            .await
+            .expect_err("a prepass offline disk must keep the bucket heal incomplete");
+
+        assert_eq!(error, Error::DiskNotFound);
 
         reset_local_disk_test_state().await;
     }

@@ -144,6 +144,9 @@ pub struct HealOptions {
     pub recursive: bool,
     /// Whether to dry run
     pub dry_run: bool,
+    /// Whether to skip namespace locking
+    #[serde(default)]
+    pub no_lock: bool,
     /// Timeout
     pub timeout: Option<Duration>,
     /// pool index
@@ -161,7 +164,8 @@ impl Default for HealOptions {
             update_parity: true,
             recursive: false,
             dry_run: false,
-            timeout: Some(Duration::from_secs(300)), // 5 minutes default timeout
+            no_lock: false,
+            timeout: None,
             pool_index: None,
             set_index: None,
         }
@@ -896,7 +900,7 @@ impl HealTask {
             recreate: self.options.recreate_missing,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -1104,7 +1108,7 @@ impl HealTask {
             recreate: true,
             scan_mode: HealScanMode::Deep,
             update_parity: true,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: None,
             set: None,
         };
@@ -1260,7 +1264,7 @@ impl HealTask {
             recreate: self.options.recreate_missing,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -1426,7 +1430,7 @@ impl HealTask {
             recreate: self.options.recreate_missing,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -1680,7 +1684,7 @@ impl HealTask {
             recreate: false,
             scan_mode: HealScanMode::Deep,
             update_parity: false,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -1809,7 +1813,7 @@ impl HealTask {
             recreate: self.options.recreate_missing,
             scan_mode: HealScanMode::Deep,
             update_parity: true,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: None,
             set: None,
         };
@@ -1973,7 +1977,7 @@ impl HealTask {
             recreate: true,
             scan_mode: HealScanMode::Deep,
             update_parity: true,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: None,
             set: None,
         };
@@ -2214,7 +2218,7 @@ impl HealTask {
             recreate: self.options.recreate_missing,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -2230,10 +2234,6 @@ impl HealTask {
                     self.record_result_item(result).await;
                 }
                 Err(err) => {
-                    // Check if error is due to cancellation or timeout
-                    if matches!(err, Error::TaskCancelled | Error::TaskTimeout) {
-                        return Err(err);
-                    }
                     warn!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_ERASURE_SET_RESULT,
@@ -2246,6 +2246,7 @@ impl HealTask {
                         error = %err,
                         "Heal erasure set bucket prepass failed"
                     );
+                    return Err(err);
                 }
             }
         }
@@ -2268,7 +2269,7 @@ impl HealTask {
             recreate: self.options.recreate_missing,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
-            no_lock: false,
+            no_lock: self.options.no_lock,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -2297,7 +2298,9 @@ impl HealTask {
             stage = "execute_resumable_heal",
             "Heal erasure set stage entered"
         );
-        let result = erasure_healer.heal_erasure_set(&buckets, &set_disk_id).await;
+        let result = self
+            .await_with_control(erasure_healer.heal_erasure_set(&buckets, &set_disk_id))
+            .await;
 
         // Keep the markers on failure: the resume state also persists, and the
         // next run of this set heal re-marks and eventually clears them.
@@ -2360,12 +2363,13 @@ impl std::fmt::Debug for HealTask {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DiskStore, Endpoint};
+    use super::super::{DiskOption, DiskStore, Endpoint, HealDiskExt as _, new_disk};
     use super::*;
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo};
     use rustfs_madmin::heal_commands::HealResultItem;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     use super::super::storage_api::status::BucketInfo;
     #[derive(Default)]
@@ -2388,6 +2392,8 @@ mod tests {
         listed_buckets: Mutex<Option<Vec<String>>>,
         bucket_heal_errors: Mutex<HashMap<String, VecDeque<&'static str>>>,
         bucket_heal_calls: Mutex<Vec<String>>,
+        block_heal_object: Mutex<bool>,
+        resume_disk: Mutex<Option<DiskStore>>,
     }
 
     /// Build a latest, non-delete-marker heal list item with no version id.
@@ -2520,6 +2526,10 @@ mod tests {
                 .unwrap()
                 .push(version_id.map(ToString::to_string));
             self.object_heal_opts.lock().unwrap().push(*opts);
+            let block_heal_object = *self.block_heal_object.lock().unwrap();
+            if block_heal_object {
+                std::future::pending::<()>().await;
+            }
             if let Some(outcome) = self
                 .heal_object_outcomes
                 .lock()
@@ -2635,8 +2645,33 @@ mod tests {
         }
 
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
-            Err(Error::other("not implemented in tests"))
+            self.resume_disk
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| Error::other("not implemented in tests"))
         }
+    }
+
+    async fn make_resume_disk(temp: &TempDir) -> DiskStore {
+        let disk_path = temp.path().join("test_disk");
+        std::fs::create_dir_all(&disk_path).expect("test disk directory should be created");
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).expect("test disk endpoint should be valid");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("test disk should initialize");
+        let metadata_volume = disk.make_volume(RUSTFS_META_BUCKET).await;
+        assert!(
+            matches!(metadata_volume, Ok(()) | Err(DiskError::VolumeExists)),
+            "metadata volume should exist: {metadata_volume:?}"
+        );
+        disk
     }
 
     #[tokio::test]
@@ -2932,6 +2967,7 @@ mod tests {
                 remove_corrupted: true,
                 recreate_missing: true,
                 scan_mode: HealScanMode::Deep,
+                no_lock: true,
                 timeout: None,
                 ..Default::default()
             },
@@ -2948,12 +2984,14 @@ mod tests {
         assert!(!bucket_opts[0].remove);
         assert!(bucket_opts[0].recreate);
         assert_eq!(bucket_opts[0].scan_mode, HealScanMode::Deep);
+        assert!(bucket_opts[0].no_lock);
 
         let object_opts = storage.object_heal_opts.lock().unwrap();
         assert_eq!(object_opts.len(), 2);
         assert!(object_opts.iter().all(|opts| opts.remove));
         assert!(object_opts.iter().all(|opts| opts.recreate));
         assert!(object_opts.iter().all(|opts| opts.scan_mode == HealScanMode::Deep));
+        assert!(object_opts.iter().all(|opts| opts.no_lock));
     }
 
     #[tokio::test]
@@ -3583,5 +3621,88 @@ mod tests {
             err.to_string().contains("not implemented in tests"),
             "erasure-set heal should continue past NoHealRequired format result, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn erasure_set_bucket_prepass_failure_stops_before_object_heal() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            bucket_heal_errors: Mutex::new(HashMap::from([(
+                "bucket-a".to_string(),
+                VecDeque::from(["injected bucket prepass failure"]),
+            )])),
+            resume_disk: Mutex::new(Some(disk)),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let error = task
+            .heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect_err("bucket prepass failure must stop the erasure-set heal");
+
+        assert!(error.to_string().contains("injected bucket prepass failure"));
+        assert_eq!(storage.bucket_heal_calls.lock().unwrap().as_slice(), ["bucket-a".to_string()]);
+        assert!(storage.object_heal_opts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resumable_erasure_set_execution_is_cancelled_while_object_heal_is_pending() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            block_heal_object: Mutex::new(true),
+            resume_disk: Mutex::new(Some(disk)),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                no_lock: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = Arc::new(HealTask::from_request(request, storage.clone()));
+        let execution = tokio::spawn({
+            let task = task.clone();
+            async move { task.execute().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !storage.object_heal_opts.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resumable object heal should start");
+        task.cancel().await.expect("task cancellation should succeed");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("cancellation should interrupt the pending resumable heal")
+            .expect("task execution should join");
+        assert!(matches!(result, Err(Error::TaskCancelled)));
+        assert!(storage.bucket_heal_opts.lock().unwrap().iter().all(|opts| opts.no_lock));
+        assert!(storage.object_heal_opts.lock().unwrap().iter().all(|opts| opts.no_lock));
     }
 }

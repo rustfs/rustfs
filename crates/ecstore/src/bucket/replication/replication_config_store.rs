@@ -30,6 +30,13 @@ impl ReplicationConfigStore {
         com::read_config(api, file).await
     }
 
+    pub(crate) async fn read_limited<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::read_config_limited(api, file, max_bytes).await
+    }
+
     pub(crate) async fn read_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
     where
         S: ReplicationObjectIO,

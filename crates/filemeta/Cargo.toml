@@ -54,6 +54,7 @@ arc-swap.workspace = true
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 proptest = "1"
+serde_json.workspace = true
 
 [[bench]]
 name = "xl_meta_bench"

@@ -168,9 +168,9 @@ pub fn internode_rpc_max_message_size() -> usize {
 }
 
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
-pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
-pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
@@ -250,7 +250,7 @@ pub fn canonical_heal_control_request_body(
     topology_fingerprint: &str,
     command: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-v2\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-v3\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len());
@@ -270,7 +270,7 @@ pub fn canonical_heal_control_capability_ack(
     topology_fingerprint: &str,
     probe: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v2\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v3\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
@@ -289,7 +289,7 @@ pub fn canonical_heal_control_response_body(
     command: &[u8],
     result: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-response-v2\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-response-v3\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len() + 8 + result.len());
@@ -1713,7 +1713,7 @@ mod heal_control_tests {
     #[test]
     fn canonical_heal_control_body_binds_every_field_and_boundary() {
         let baseline = canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode");
-        let mut golden = b"rustfs-heal-control-v2\0".to_vec();
+        let mut golden = b"rustfs-heal-control-v3\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -1741,11 +1741,11 @@ mod heal_control_tests {
 
     #[test]
     fn canonical_capability_ack_binds_version_and_topology() {
-        assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 2);
-        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v2"));
+        assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v3"));
         let probe = heal_control_capability_probe(&[7; 16]);
         let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
-        let mut golden = b"rustfs-heal-control-capability-ack-v2\0".to_vec();
+        let mut golden = b"rustfs-heal-control-capability-ack-v3\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
