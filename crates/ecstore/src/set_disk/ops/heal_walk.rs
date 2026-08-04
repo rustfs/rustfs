@@ -63,6 +63,7 @@ struct HealWalkCollector {
     batch_objects: usize,
     version_budget: usize,
     objects: Mutex<Vec<HealWalkObject>>,
+    decode_error: Mutex<Option<DiskError>>,
     version_total: AtomicUsize,
     truncated: AtomicBool,
     cancel: CancellationToken,
@@ -71,6 +72,22 @@ struct HealWalkCollector {
 impl HealWalkCollector {
     fn lock_objects(&self) -> disk::error::Result<std::sync::MutexGuard<'_, Vec<HealWalkObject>>> {
         self.objects.lock().map_err(|_| {
+            self.cancel.cancel();
+            DiskError::FileCorrupt
+        })
+    }
+
+    fn record_decode_error(&self, error: rustfs_filemeta::Error) {
+        if let Ok(mut first_error) = self.decode_error.lock()
+            && first_error.is_none()
+        {
+            *first_error = Some(error.into());
+        }
+        self.cancel.cancel();
+    }
+
+    fn take_decode_error(&self) -> disk::error::Result<Option<DiskError>> {
+        self.decode_error.lock().map(|mut error| error.take()).map_err(|_| {
             self.cancel.cancel();
             DiskError::FileCorrupt
         })
@@ -91,7 +108,7 @@ impl HealWalkCollector {
         let fiv = match entry.file_info_versions_with_free_versions(&self.bucket) {
             Ok(fiv) => fiv,
             Err(err) => {
-                debug!(entry = %entry.name, error = ?err, "heal disk-walk skipped entry with unreadable versions");
+                self.record_decode_error(err);
                 return;
             }
         };
@@ -191,6 +208,7 @@ impl SetDisks {
             batch_objects,
             version_budget: version_budget.max(1),
             objects: Mutex::new(Vec::new()),
+            decode_error: Mutex::new(None),
             version_total: AtomicUsize::new(0),
             truncated: AtomicBool::new(false),
             cancel: CancellationToken::new(),
@@ -240,7 +258,12 @@ impl SetDisks {
 
         // Drive the walk. A tolerated missing-path / not-found is treated as an
         // empty page rather than an error (nothing to heal on this prefix).
-        match list_path_raw(collector.cancel.clone(), opts).await {
+        let walk_result = list_path_raw(collector.cancel.clone(), opts).await;
+        if let Some(err) = collector.take_decode_error()? {
+            return Err(err);
+        }
+
+        match walk_result {
             Ok(()) => {}
             Err(DiskError::FileNotFound) | Err(DiskError::VolumeNotFound) => {
                 debug!(bucket, prefix, "heal disk-walk treated missing path as empty page");
@@ -260,6 +283,52 @@ impl SetDisks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use rustfs_filemeta::{ChecksumAlgo, ErasureAlgo, FileMetaVersion, MetaObject, VersionType};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    fn test_collector() -> Arc<HealWalkCollector> {
+        Arc::new(HealWalkCollector {
+            bucket: "bucket".to_string(),
+            batch_objects: 2,
+            version_budget: 2,
+            objects: Mutex::new(Vec::new()),
+            decode_error: Mutex::new(None),
+            version_total: AtomicUsize::new(0),
+            truncated: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+        })
+    }
+
+    fn crc_valid_semantically_corrupt_entry(name: &str) -> MetaCacheEntry {
+        let mut metadata = FileMeta::new();
+        metadata
+            .add_version_filemata(FileMetaVersion {
+                version_type: VersionType::Object,
+                object: Some(MetaObject {
+                    version_id: Some(Uuid::new_v4()),
+                    erasure_algorithm: ErasureAlgo::ReedSolomon,
+                    erasure_m: 2,
+                    erasure_n: 2,
+                    erasure_block_size: 1 << 20,
+                    bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                    part_numbers: vec![1, 2],
+                    part_sizes: vec![10],
+                    part_actual_sizes: vec![10, 20],
+                    mod_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("corrupt test version should be accepted before semantic decoding");
+
+        MetaCacheEntry {
+            name: name.to_string(),
+            metadata: metadata.marshal_msg().expect("test metadata should encode with a valid CRC"),
+            ..Default::default()
+        }
+    }
 
     fn version(name: &str, id: &str, dm: bool) -> HealWalkVersion {
         HealWalkVersion {
@@ -325,15 +394,7 @@ mod tests {
 
     #[test]
     fn poisoned_collector_state_cancels_the_walk() {
-        let collector = Arc::new(HealWalkCollector {
-            bucket: "bucket".to_string(),
-            batch_objects: 2,
-            version_budget: 2,
-            objects: Mutex::new(Vec::new()),
-            version_total: AtomicUsize::new(0),
-            truncated: AtomicBool::new(false),
-            cancel: CancellationToken::new(),
-        });
+        let collector = test_collector();
         let poison_target = Arc::clone(&collector);
         let _ = std::thread::spawn(move || {
             let _guard = poison_target.objects.lock().expect("fresh mutex should lock");
@@ -345,5 +406,46 @@ mod tests {
         assert_eq!(error, DiskError::FileCorrupt);
         assert!(collector.cancel.is_cancelled(), "a poisoned page collector must cancel its walk");
         assert!(collector.objects.lock().is_err(), "poisoned state must remain fail-closed");
+    }
+
+    #[test]
+    fn semantic_decode_failure_records_error_and_cancels_walk() {
+        let collector = test_collector();
+        let entry = crc_valid_semantically_corrupt_entry("corrupt-object");
+
+        collector.ingest(entry);
+
+        let error = collector
+            .take_decode_error()
+            .expect("decode error state should remain readable")
+            .expect("semantic metadata corruption must be recorded");
+        assert_eq!(error, DiskError::FileCorrupt);
+        assert!(collector.cancel.is_cancelled(), "semantic metadata corruption must cancel the disk walk");
+    }
+
+    #[tokio::test]
+    async fn heal_walk_returns_crc_valid_semantic_decode_failure() {
+        let bucket = "bucket";
+        let object = "corrupt-object";
+        let (temp_dirs, disks, set_disks) = hermetic_set_disks_isolated(1).await;
+        disks[0].make_volume(bucket).await.expect("test bucket should be created");
+
+        let object_dir = temp_dirs[0].path().join(bucket).join(object);
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("test object directory should be created");
+        tokio::fs::write(
+            object_dir.join(crate::disk::STORAGE_FORMAT_FILE),
+            crc_valid_semantically_corrupt_entry(object).metadata,
+        )
+        .await
+        .expect("corrupt test metadata should be written");
+
+        let error = set_disks
+            .heal_walk_versions_page(bucket, "", None, 2, 2)
+            .await
+            .expect_err("semantic metadata corruption must fail the heal disk walk");
+
+        assert_eq!(error, DiskError::FileCorrupt);
     }
 }
