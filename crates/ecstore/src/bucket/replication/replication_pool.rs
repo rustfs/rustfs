@@ -5247,7 +5247,7 @@ mod tests {
         };
         let mut changed = original.clone();
         changed.retry_count = 2;
-        assert!(!mrf_prefix_matches(&[changed], &[original.clone()]));
+        assert!(!mrf_prefix_matches(&[changed], std::slice::from_ref(&original)));
 
         let mut suffix = original.clone();
         suffix.object = "suffix".to_string();

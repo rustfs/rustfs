@@ -1461,12 +1461,15 @@ fn test_replication_diff_body_read_errors_are_not_ignored() {
         handler_block.contains("read_compatible_admin_body("),
         "replication diff must read the optional body through the compatible admin payload reader"
     );
+
+    let body_read_block =
+        extract_block_between_markers(handler_block, "let body = read_compatible_admin_body(", "if prefix.is_empty()");
     assert!(
-        handler_block.contains(".await?;"),
+        body_read_block.contains(".await?;"),
         "replication diff must fail closed when body read or MinIO-compatible decryption fails"
     );
     assert!(
-        !handler_block.contains(".unwrap_or_default()"),
+        !body_read_block.contains(".unwrap_or_default()"),
         "replication diff must not silently treat body read/decryption failures as an empty request"
     );
 }
