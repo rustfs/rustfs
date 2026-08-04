@@ -24,6 +24,7 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
@@ -36,6 +37,7 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
@@ -140,6 +142,9 @@ jobs:
 
       - name: Check preview release workflow policy
         run: ./scripts/security/check_preview_release_workflow.sh
+
+      - name: Check performance A/B workflow trust boundary
+        run: ./scripts/security/check_performance_ab_workflow.sh
 
   dependency-review:
     name: Dependency Review
