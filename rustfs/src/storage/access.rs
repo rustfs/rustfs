@@ -677,7 +677,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let version_id = req_info.version_id.clone();
 
     if let Some(cred) = &cred {
-        let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
+        let iam_store = match req.extensions.get::<std::sync::Arc<ServerContextSlot>>() {
+            Some(server_ctx) => server_ctx
+                .installed_app_context()
+                .filter(|context| context.iam().is_ready())
+                .map(|context| context.iam().handle())
+                .ok_or(()),
+            None => runtime_sources::current_ready_iam_handle().map_err(|_| ()),
+        };
+        let Ok(iam_store) = iam_store else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),

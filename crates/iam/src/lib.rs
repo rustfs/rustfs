@@ -168,6 +168,15 @@ pub async fn build_iam_sys(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectSt
     Ok(Arc::new(IamSys::new(cache_manager)))
 }
 
+/// Build an IAM system for an application context and publish the first one
+/// as the ambient compatibility default.
+#[instrument(skip(ecstore))]
+pub async fn init_iam_sys_for_context(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectStore>>> {
+    let iam_instance = build_iam_sys(ecstore).await?;
+    let _ = IAM_SYS.set(iam_instance.clone());
+    Ok(iam_instance)
+}
+
 #[instrument(skip(ecstore))]
 pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectStore>>> {
     if let Some(existing) = IAM_SYS.get() {

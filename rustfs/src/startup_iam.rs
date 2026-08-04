@@ -16,7 +16,7 @@ use crate::runtime_sources::{AppContext, ServerContextSlot};
 use crate::server::{ServiceStateManager, publish_ready_when_runtime_ready};
 use crate::storage_api::startup::iam::ECStore;
 use rustfs_common::{GlobalReadiness, SystemStage};
-use rustfs_iam::init_iam_sys;
+use rustfs_iam::init_iam_sys_for_context;
 use rustfs_kms::KmsServiceManager;
 use std::future::Future;
 use std::io::Result;
@@ -86,15 +86,13 @@ where
 }
 
 async fn finalize_iam_recovery(
+    iam: Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>,
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<()> {
-    // Resolve the globally published system directly (not context-first —
-    // the AppContext does not exist yet; creating it is this function's job).
-    let iam = rustfs_iam::get().map_err(|_| std::io::Error::other("IAM recovered but unavailable"))?;
     let endpoint_pools = heal_control_endpoint_pools(store.as_ref())?;
     AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx, iam)?;
     let topology_ready =
@@ -147,6 +145,8 @@ fn spawn_iam_recovery_task(
     let finalize_readiness = readiness;
     let finalize_state_manager = state_manager;
     let finalize_server_ctx = server_ctx;
+    let recovered_iam = Arc::new(std::sync::Mutex::new(None));
+    let init_recovered_iam = recovered_iam.clone();
     tokio::spawn(async move {
         run_iam_recovery_loop(
             initial_interval,
@@ -154,7 +154,14 @@ fn spawn_iam_recovery_task(
             shutdown_token,
             move || {
                 let store = init_store.clone();
-                Box::pin(async move { attempt_init_iam_sys(store).await.map(|_| ()) })
+                let recovered_iam = init_recovered_iam.clone();
+                Box::pin(async move {
+                    let iam = attempt_init_iam_sys(store).await?;
+                    *recovered_iam
+                        .lock()
+                        .map_err(|_| std::io::Error::other("IAM recovery state poisoned"))? = Some(iam);
+                    Ok(())
+                })
             },
             move || {
                 let store = finalize_store.clone();
@@ -162,7 +169,11 @@ fn spawn_iam_recovery_task(
                 let readiness = finalize_readiness.clone();
                 let state_manager = finalize_state_manager.clone();
                 let server_ctx = finalize_server_ctx.clone();
-                Box::pin(async move { finalize_iam_recovery(store, kms_interface, readiness, state_manager, server_ctx).await })
+                let iam = recovered_iam.lock().ok().and_then(|mut recovered| recovered.take());
+                Box::pin(async move {
+                    let iam = iam.ok_or_else(|| std::io::Error::other("IAM recovered but unavailable"))?;
+                    finalize_iam_recovery(iam, store, kms_interface, readiness, state_manager, server_ctx).await
+                })
             },
         )
         .await;
@@ -359,7 +370,7 @@ async fn attempt_init_iam_sys(
         return Err(std::io::Error::other("forced test IAM bootstrap failure"));
     }
 
-    init_iam_sys(store).await.map_err(std::io::Error::other)
+    init_iam_sys_for_context(store).await.map_err(std::io::Error::other)
 }
 
 /// Attempt IAM bootstrap at startup. If it fails, enter degraded mode and
