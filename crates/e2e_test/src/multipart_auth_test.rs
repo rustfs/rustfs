@@ -3584,8 +3584,8 @@ async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_co
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_accepts_object_lock_retention_fields() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+async fn test_anonymous_post_object_rejects_object_lock_retention_without_permission()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -3594,8 +3594,6 @@ async fn test_anonymous_post_object_accepts_object_lock_retention_fields() -> Re
     let bucket = "anon-post-policy-object-lock-retention";
     let object_key = "uploads/object-lock-retention.txt";
     let retain_until = "2037-10-21T07:28:00Z";
-    let expected_body = b"post-policy-object-lock-retention-body".to_vec();
-
     let admin_client = env.create_s3_client();
     admin_client
         .create_bucket()
@@ -3620,7 +3618,7 @@ async fn test_anonymous_post_object_accepts_object_lock_retention_fields() -> Re
         .text("x-amz-object-lock-retain-until-date", retain_until)
         .part(
             "file",
-            reqwest::multipart::Part::bytes(expected_body.clone())
+            reqwest::multipart::Part::bytes(b"post-policy-object-lock-retention-body".to_vec())
                 .file_name("upload.txt")
                 .mime_str("text/plain")?,
         );
@@ -3634,26 +3632,8 @@ async fn test_anonymous_post_object_accepts_object_lock_retention_fields() -> Re
     let status = post_resp.status();
     let response_body = post_resp.text().await?;
 
-    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
-    assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
-
-    let retention = admin_client
-        .get_object_retention()
-        .bucket(bucket)
-        .key(object_key)
-        .send()
-        .await?;
-    let retention = retention.retention().expect("retention should be present");
-    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
-    let retain_until_out = retention
-        .retain_until_date()
-        .expect("retain_until_date should be present")
-        .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?;
-    assert_eq!(retain_until_out, retain_until);
-
-    let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
-    let uploaded = get_out.body.collect().await?.into_bytes();
-    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
 
     Ok(())
 }
@@ -3842,8 +3822,8 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_p
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+async fn test_anonymous_post_object_rejects_object_lock_legal_hold_without_permission()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -3851,8 +3831,6 @@ async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field() -> Re
 
     let bucket = "anon-post-policy-object-lock-legal-hold";
     let object_key = "uploads/object-lock-legal-hold.txt";
-    let expected_body = b"post-policy-object-lock-legal-hold-body".to_vec();
-
     let admin_client = env.create_s3_client();
     admin_client
         .create_bucket()
@@ -3875,7 +3853,7 @@ async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field() -> Re
         .text("x-amz-object-lock-legal-hold", "ON")
         .part(
             "file",
-            reqwest::multipart::Part::bytes(expected_body.clone())
+            reqwest::multipart::Part::bytes(b"post-policy-object-lock-legal-hold-body".to_vec())
                 .file_name("upload.txt")
                 .mime_str("text/plain")?,
         );
@@ -3889,26 +3867,8 @@ async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field() -> Re
     let status = post_resp.status();
     let response_body = post_resp.text().await?;
 
-    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
-    assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
-
-    let legal_hold = admin_client
-        .get_object_legal_hold()
-        .bucket(bucket)
-        .key(object_key)
-        .send()
-        .await?;
-    assert_eq!(
-        legal_hold
-            .legal_hold()
-            .and_then(|value| value.status())
-            .map(|value| value.as_str()),
-        Some("ON")
-    );
-
-    let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
-    let uploaded = get_out.body.collect().await?.into_bytes();
-    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
 
     Ok(())
 }
