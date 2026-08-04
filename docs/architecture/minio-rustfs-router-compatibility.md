@@ -157,7 +157,7 @@ maps MinIO admin route families to RustFS status.
 | TLS debug (`/debug/tls/status`) | 已实现 | `rustfs/src/admin/handlers/tls_debug.rs`, `profile.rs` |
 | KMS management / dynamic / keys | 已实现 | `rustfs/src/admin/handlers/kms_management.rs`, `kms_dynamic.rs`, `kms_keys.rs` |
 | OIDC public + config | 已实现 | `rustfs/src/admin/handlers/oidc.rs` |
-| Table catalog (Iceberg) | 已实现 | `rustfs/src/admin/handlers/table_catalog.rs` |
+| Table catalog (Iceberg) | 已实现 | `rustfs/src/admin/handlers/table_catalog/mod.rs` |
 
 ### Registered-but-incomplete
 
