@@ -831,8 +831,8 @@ fn rename_into_existing_parent(
 }
 
 #[cfg(windows)]
-// SAFETY: this helper builds the variable-length FILE_RENAME_INFO buffer with
-// checked sizes and passes borrowed live handles only to synchronous Win32 calls.
+// SAFETY: this helper builds the variable-length FILE_RENAME_INFORMATION buffer
+// with checked sizes and passes borrowed live handles only to synchronous NT calls.
 #[allow(unsafe_code)]
 fn rename_into_existing_parent(
     dst_file_path: &Path,
@@ -843,12 +843,15 @@ fn rename_into_existing_parent(
         mem::size_of,
         os::windows::{ffi::OsStrExt, io::AsRawHandle},
     };
-    use windows_sys::Win32::{
-        Foundation::{ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, GetLastError},
-        Storage::FileSystem::{
-            FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle,
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+            FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
         },
-        System::WindowsProgramming::{FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS},
+        Win32::{
+            Foundation::{ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, RtlNtStatusToDosError},
+            System::IO::IO_STATUS_BLOCK,
+        },
     };
 
     let parent_guard = parent_guard
@@ -873,20 +876,20 @@ fn rename_into_existing_parent(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination file name is too long"))?;
     let file_name_length = u32::try_from(file_name_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination file name is too long"))?;
-    let buffer_size = size_of::<FILE_RENAME_INFO>()
+    let buffer_size = size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(file_name_bytes)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename information buffer is too large"))?;
     let buffer_size_u32 = u32::try_from(buffer_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename information buffer is too large"))?;
     let words = buffer_size.div_ceil(size_of::<usize>());
     let mut buffer = vec![0usize; words];
-    let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
 
-    // SAFETY: `buffer` is aligned for FILE_RENAME_INFO and large enough for
+    // SAFETY: `buffer` is aligned for FILE_RENAME_INFORMATION and large enough for
     // its header, the complete UTF-16 name, and trailing zeroed storage.
     // `dst_parent` and `source` remain live until the synchronous call returns.
     unsafe {
-        (*rename_info).Anonymous = FILE_RENAME_INFO_0 { ReplaceIfExists: true };
+        (*rename_info).Anonymous = FILE_RENAME_INFORMATION_0 { ReplaceIfExists: true };
         (*rename_info).RootDirectory = dst_parent.as_raw_handle();
         (*rename_info).FileNameLength = file_name_length;
         std::ptr::copy_nonoverlapping(
@@ -898,14 +901,29 @@ fn rename_into_existing_parent(
 
     // Keep the target relative to the retained parent handle so publication
     // cannot be redirected by replacing a pathname component.
-    let renamed =
-        unsafe { SetFileInformationByHandle(source.as_raw_handle(), FileRenameInfo, rename_info.cast(), buffer_size_u32) };
-    if renamed != 0 {
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut io_status,
+            rename_info.cast(),
+            buffer_size_u32,
+            FileRenameInformation,
+        )
+    };
+    if status >= 0 {
         return Ok(());
     }
 
-    let legacy_error_code = unsafe { GetLastError() };
-    let legacy_error = io::Error::from_raw_os_error(legacy_error_code as i32);
+    let status_error = |status| {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        let error = match i32::try_from(code) {
+            Ok(code) => io::Error::from_raw_os_error(code),
+            Err(_) => io::Error::other(format!("Windows rename failed with NTSTATUS {status:#x}")),
+        };
+        (code, error)
+    };
+    let (legacy_error_code, legacy_error) = status_error(status);
     if legacy_error_code != ERROR_ACCESS_DENIED {
         return Err(legacy_error);
     }
@@ -913,19 +931,26 @@ fn rename_into_existing_parent(
     // Match std::fs::rename's Windows 10 fallback for read-only or open
     // destinations while retaining the guarded, handle-relative target.
     unsafe {
-        (*rename_info).Anonymous = FILE_RENAME_INFO_0 {
-            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        (*rename_info).Anonymous = FILE_RENAME_INFORMATION_0 {
+            Flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
         };
     }
-    let renamed =
-        unsafe { SetFileInformationByHandle(source.as_raw_handle(), FileRenameInfoEx, rename_info.cast(), buffer_size_u32) };
-    if renamed != 0 {
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut io_status,
+            rename_info.cast(),
+            buffer_size_u32,
+            FileRenameInformationEx,
+        )
+    };
+    if status >= 0 {
         return Ok(());
     }
 
-    let extended_error_code = unsafe { GetLastError() };
+    let (extended_error_code, extended_error) = status_error(status);
     if extended_error_code == ERROR_DIR_NOT_EMPTY {
-        Err(io::Error::from_raw_os_error(extended_error_code as i32))
+        Err(extended_error)
     } else {
         Err(legacy_error)
     }
@@ -1188,6 +1213,7 @@ fn windows_file_attribute_tag(
 #[cfg(windows)]
 fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) -> io::Result<ExistingBaseDirectoryGuard> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     let relative = publication_root.relative_path(path)?;
     let mut handles = vec![publication_root.directory.clone()];
@@ -1205,7 +1231,7 @@ fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) 
         let parent = handles
             .last()
             .ok_or_else(|| io::Error::other("Windows directory guard lost its root handle"))?;
-        handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
+        handles.push(open_windows_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ)?);
     }
 
     Ok(ExistingBaseDirectoryGuard::new(handles))
@@ -1299,21 +1325,22 @@ fn open_windows_directory_component(
     parent: &WindowsDirectoryHandle,
     component: &std::ffi::OsStr,
     create_disposition: u32,
+    share_access: u32,
 ) -> io::Result<WindowsDirectoryHandle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT},
         Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_TRAVERSE,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
         },
     };
 
-    // Omitting write and delete sharing prevents the component from becoming a
-    // reparse point, being renamed, or being removed while publication uses it.
+    // The caller selects the sharing needed for this component. Delete sharing
+    // is always omitted so the pinned directory entry cannot be replaced.
     let anchor = open_windows_relative(
         &parent.handle,
         component,
         FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ,
+        share_access,
         create_disposition,
         FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         FILE_ATTRIBUTE_DIRECTORY,
@@ -1483,6 +1510,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
     #[cfg(windows)]
     {
         use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
         let base_relative = publication_root.relative_path(base_dir)?;
         let mut guard = ExistingBaseDirectoryGuard::new(vec![publication_root.directory.clone()]);
@@ -1500,7 +1528,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows publication root guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN)?;
+            let child = open_windows_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ)?;
             guard.handles.push(child);
         }
         for component in relative.components() {
@@ -1511,8 +1539,30 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows base directory guard is empty"))?;
-            let child = open_windows_directory_component(parent, component, FILE_OPEN_IF)?;
+            let child = open_windows_directory_component(parent, component, FILE_OPEN_IF, FILE_SHARE_READ)?;
             guard.handles.push(child);
+        }
+
+        // NtSetInformationFile opens the relative rename target for write. Keep
+        // every ancestor strict, but reopen the final parent with write sharing
+        // so that internal lookup can succeed. The lookup remains anchored to
+        // this retained identity, while omitted delete sharing prevents the
+        // directory entry itself from being replaced during publication.
+        if guard.handles.len() > 1 {
+            let component = dir_path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination parent must have a name"))?;
+            let parent_index = guard.handles.len() - 2;
+            let parent = guard
+                .handles
+                .get(parent_index)
+                .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
+            let rename_parent =
+                open_windows_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+            *guard
+                .handles
+                .last_mut()
+                .ok_or_else(|| io::Error::other("Windows destination guard is empty"))? = rename_parent;
         }
 
         Ok(guard)
@@ -2368,7 +2418,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_rename_all_blocks_parent_reparse_mutation_during_publication() {
+    async fn windows_rename_all_stays_anchored_during_parent_reparse_mutation() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::{
             Foundation::GENERIC_WRITE,
@@ -2378,26 +2428,43 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         let base = temp_dir.path().join("bucket");
         let parent = base.join("object");
+        let outside = temp_dir.path().join("outside");
         std::fs::create_dir_all(&parent).expect("create destination parent");
+        std::fs::create_dir(&outside).expect("create outside target");
         let src = temp_dir.path().join("staged-object");
         let dst = parent.join("xl.meta");
         std::fs::write(&src, b"payload").expect("write staged object");
 
         let parent_for_hook = parent.clone();
+        let outside_for_hook = outside.clone();
+        let reparse_writer = Arc::new(std::sync::Mutex::new(None));
+        let reparse_writer_for_hook = Arc::clone(&reparse_writer);
         windows_rename_test_hooks::install_before_publication(&dst, move || {
-            std::fs::OpenOptions::new()
+            let writable_parent = std::fs::OpenOptions::new()
                 .access_mode(GENERIC_WRITE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&parent_for_hook)
-                .expect_err("the destination guard must exclude a reparse writer");
+                .map(winapi_util::Handle::from_file)
+                .expect("the destination parent must permit the rename target's internal write open");
+            try_set_windows_mount_point(&writable_parent, &outside_for_hook)
+                .expect("redirect the destination parent after it is pinned");
+            *reparse_writer_for_hook.lock().expect("reparse writer mutex poisoned") = Some(writable_parent);
         });
 
         rename_all(&src, &dst, &base)
             .await
-            .expect("publication must succeed while the parent identity is frozen");
+            .expect("publication must remain anchored to the retained parent identity");
 
-        assert_eq!(std::fs::read(&dst).expect("read protected publication"), b"payload");
+        assert!(!outside.join("xl.meta").exists(), "reparse mutation must not redirect publication");
+        let writable_parent = reparse_writer
+            .lock()
+            .expect("reparse writer mutex poisoned")
+            .take()
+            .expect("publication hook must retain the parent handle");
+        try_delete_windows_mount_point(&writable_parent).expect("remove destination parent mount point");
+        drop(writable_parent);
+        assert_eq!(std::fs::read(&dst).expect("read anchored publication"), b"payload");
     }
 
     #[cfg(windows)]
