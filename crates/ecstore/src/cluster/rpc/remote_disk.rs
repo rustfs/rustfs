@@ -3371,6 +3371,8 @@ mod tests {
         crate::cluster::rpc::runtime_sources::reset_internode_metrics_for_test();
         let response = RenameDataResp {
             old_data_dir: Some(Uuid::new_v4()),
+            rollback_data_dir: Some(Uuid::new_v4()),
+            cleanup_data_dir: Some(Uuid::new_v4()),
             sign: Some(vec![0x14, 0x35]),
             old_current_size: Some(crate::disk::OldCurrentSize::Present(64 * 1024)),
         };
@@ -3384,6 +3386,8 @@ mod tests {
         let decode_errors_after = crate::cluster::rpc::runtime_sources::internode_msgpack_json_decode_error_total_for_test();
 
         assert_eq!(decoded.old_data_dir, response.old_data_dir);
+        assert_eq!(decoded.rollback_data_dir, response.rollback_data_dir);
+        assert_eq!(decoded.cleanup_data_dir, response.cleanup_data_dir);
         assert_eq!(decoded.sign, response.sign);
         assert_eq!(decoded.old_current_size, response.old_current_size);
         assert!(
@@ -3747,6 +3751,8 @@ mod tests {
     fn rename_data_resp_named_msgpack_is_smaller_than_json() {
         let response = RenameDataResp {
             old_data_dir: Some(Uuid::new_v4()),
+            rollback_data_dir: Some(Uuid::new_v4()),
+            cleanup_data_dir: Some(Uuid::new_v4()),
             sign: Some(vec![1_u8; 32]),
             old_current_size: Some(crate::disk::OldCurrentSize::Present(4096)),
         };

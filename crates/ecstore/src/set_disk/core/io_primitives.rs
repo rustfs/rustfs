@@ -2837,6 +2837,7 @@ impl SetDisks {
 
         let mut disk_versions = vec![None; disks.len()];
         let mut data_dirs = vec![None; disks.len()];
+        let mut cleanup_data_dirs = vec![None; disks.len()];
         let mut old_current_sizes = vec![None; disks.len()];
 
         let results = join_all(futures).await;
@@ -2844,7 +2845,8 @@ impl SetDisks {
         for (idx, result) in results.iter().enumerate() {
             match result.as_ref().map_err(|_| DiskError::Unexpected)? {
                 Ok(res) => {
-                    data_dirs[idx] = res.old_data_dir;
+                    data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
+                    cleanup_data_dirs[idx] = res.cleanup_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
                     old_current_sizes[idx] = res.old_current_size;
                     errs.push(None);
@@ -2948,7 +2950,7 @@ impl SetDisks {
             return Err(ret_err);
         }
 
-        let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+        let data_dir = Self::reduce_common_data_dir(&cleanup_data_dirs, write_quorum);
         let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
@@ -2956,7 +2958,7 @@ impl SetDisks {
             disks
                 .iter()
                 .zip(errs.iter())
-                .zip(data_dirs.iter())
+                .zip(cleanup_data_dirs.iter())
                 .map(|((disk, err), old_data_dir)| {
                     if err.is_none() && *old_data_dir == Some(data_dir) {
                         disk.clone()

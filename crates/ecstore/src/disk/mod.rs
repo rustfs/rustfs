@@ -1080,7 +1080,16 @@ pub enum OldCurrentSize {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
+    /// Dereferenced erasure data directory retained for older coordinators.
     pub old_data_dir: Option<Uuid>,
+    /// Directory containing rollback metadata. This may be synthetic and must
+    /// not be used for post-commit data cleanup.
+    #[serde(default)]
+    pub rollback_data_dir: Option<Uuid>,
+    /// Dereferenced erasure data directory that is safe to reclaim after the
+    /// rename commits. Older peers omit this field, so missing means no cleanup.
+    #[serde(default)]
+    pub cleanup_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,
     /// `None` means unknown — the disk could not determine the previous
     /// current version (pre-#1009 peer on the wire, or an existing dst
@@ -1477,11 +1486,15 @@ mod tests {
 
         let resp = RenameDataResp {
             old_data_dir: Some(uuid),
+            rollback_data_dir: Some(uuid),
+            cleanup_data_dir: Some(uuid),
             sign: Some(signature.clone()),
             old_current_size: Some(OldCurrentSize::Present(42)),
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
+        assert_eq!(resp.rollback_data_dir, Some(uuid));
+        assert_eq!(resp.cleanup_data_dir, Some(uuid));
         assert_eq!(resp.sign, Some(signature));
         assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(42)));
     }
@@ -1493,6 +1506,8 @@ mod tests {
         for old_current_size in [None, Some(OldCurrentSize::Absent), Some(OldCurrentSize::Present(1337))] {
             let resp = RenameDataResp {
                 old_data_dir: Some(Uuid::new_v4()),
+                rollback_data_dir: Some(Uuid::new_v4()),
+                cleanup_data_dir: Some(Uuid::new_v4()),
                 sign: Some(vec![0x01, 0x02, 0x03]),
                 old_current_size,
             };
@@ -1501,6 +1516,8 @@ mod tests {
             let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("named msgpack should decode");
 
             assert_eq!(decoded.old_data_dir, resp.old_data_dir);
+            assert_eq!(decoded.rollback_data_dir, resp.rollback_data_dir);
+            assert_eq!(decoded.cleanup_data_dir, resp.cleanup_data_dir);
             assert_eq!(decoded.sign, resp.sign);
             assert_eq!(decoded.old_current_size, resp.old_current_size);
         }
@@ -1526,6 +1543,8 @@ mod tests {
         let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("legacy payload should decode");
 
         assert_eq!(decoded.old_data_dir, legacy.old_data_dir);
+        assert_eq!(decoded.rollback_data_dir, None);
+        assert_eq!(decoded.cleanup_data_dir, None);
         assert_eq!(decoded.sign, legacy.sign);
         assert_eq!(decoded.old_current_size, None);
     }
