@@ -840,7 +840,7 @@ fn rename_into_existing_parent(
     source: &winapi_util::Handle,
 ) -> io::Result<()> {
     use std::{
-        mem::{offset_of, size_of},
+        mem::size_of,
         os::windows::{ffi::OsStrExt, io::AsRawHandle},
     };
     use windows_sys::Win32::{
@@ -873,9 +873,8 @@ fn rename_into_existing_parent(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination file name is too long"))?;
     let file_name_length = u32::try_from(file_name_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination file name is too long"))?;
-    let buffer_size = offset_of!(FILE_RENAME_INFO, FileName)
+    let buffer_size = size_of::<FILE_RENAME_INFO>()
         .checked_add(file_name_bytes)
-        .and_then(|size| size.checked_add(size_of::<u16>()))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename information buffer is too large"))?;
     let buffer_size_u32 = u32::try_from(buffer_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename information buffer is too large"))?;
