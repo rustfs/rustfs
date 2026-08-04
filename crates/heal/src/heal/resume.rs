@@ -14,6 +14,8 @@
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -32,7 +34,7 @@ const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 /// resume state file constants
 const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
-const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
+pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
 /// older schema (which tracked latest-only object names and a positional
@@ -90,6 +92,64 @@ impl PersistThrottle {
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {path:?}")))
+}
+
+#[cfg(test)]
+pub(super) struct ResumeDeleteFailure {
+    path: String,
+}
+
+#[cfg(test)]
+fn resume_delete_failures() -> &'static Mutex<HashMap<String, DiskError>> {
+    static FAILURES: std::sync::OnceLock<Mutex<HashMap<String, DiskError>>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl ResumeDeleteFailure {
+    pub(super) fn install(path: String, error: DiskError) -> Self {
+        let previous = resume_delete_failures()
+            .lock()
+            .expect("resume delete failure registry should not poison")
+            .insert(path.clone(), error);
+        assert!(previous.is_none(), "resume delete failure already installed");
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ResumeDeleteFailure {
+    fn drop(&mut self) {
+        resume_delete_failures()
+            .lock()
+            .expect("resume delete failure registry should not poison")
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn injected_resume_delete_error(path: &str) -> Option<DiskError> {
+    resume_delete_failures()
+        .lock()
+        .expect("resume delete failure registry should not poison")
+        .get(path)
+        .cloned()
+}
+
+#[cfg(not(test))]
+fn injected_resume_delete_error(_path: &str) -> Option<DiskError> {
+    None
+}
+
+async fn delete_resume_file(disk: &DiskStore, path: &Path) -> Result<()> {
+    let path_str = path_to_str(path)?;
+    if let Some(err) = injected_resume_delete_error(path_str) {
+        return Err(err.into());
+    }
+    match disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await {
+        Ok(()) | Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// resume state
@@ -407,7 +467,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.mark_completed();
         drop(state);
-        self.save_state_throttled().await
+        self.save_state().await
     }
 
     /// set error message
@@ -444,24 +504,14 @@ impl ResumeManager {
 
     /// cleanup resume state
     pub async fn cleanup(&self) -> Result<()> {
-        let state = self.state.read().await;
-        let task_id = &state.task_id;
+        let task_id = self.state.read().await.task_id.clone();
 
-        // delete state files
         let state_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
         let progress_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_PROGRESS_FILE}"));
-        let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
 
-        // ignore delete errors, files may not exist
-        if let Ok(path_str) = path_to_str(&state_file) {
-            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
-        }
-        if let Ok(path_str) = path_to_str(&progress_file) {
-            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
-        }
-        if let Ok(path_str) = path_to_str(&checkpoint_file) {
-            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
-        }
+        delete_resume_file(&self.disk, &progress_file).await?;
+        // Delete the state file last so a partial cleanup remains discoverable.
+        delete_resume_file(&self.disk, &state_file).await?;
 
         debug!(
             target: "rustfs::heal::resume",
@@ -763,13 +813,10 @@ impl CheckpointManager {
 
     /// cleanup checkpoint
     pub async fn cleanup(&self) -> Result<()> {
-        let checkpoint = self.checkpoint.read().await;
-        let task_id = &checkpoint.task_id;
+        let task_id = self.checkpoint.read().await.task_id.clone();
 
         let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
-        if let Ok(path_str) = path_to_str(&checkpoint_file) {
-            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
-        }
+        delete_resume_file(&self.disk, &checkpoint_file).await?;
 
         debug!(
             target: "rustfs::heal::resume",
@@ -1209,6 +1256,83 @@ mod tests {
         assert!(throttle.record(), "must flush at the mutation threshold");
         throttle.mark_saved();
         assert!(!throttle.record(), "counter must reset after a save");
+    }
+
+    #[tokio::test]
+    async fn completion_persists_immediately_and_cleanup_propagates_delete_errors() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create resume persistence test directory");
+        let endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create test disk endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create resume persistence test disk");
+        match disk.make_volume(RUSTFS_META_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("create metadata volume for resume persistence test: {err}"),
+        }
+
+        let task_id = "completion-persistence".to_string();
+        let manager = ResumeManager::new(
+            disk.clone(),
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        )
+        .await
+        .expect("create resume manager");
+        manager
+            .update_progress(1, 1, 0, 0)
+            .await
+            .expect("buffer progress below the persistence threshold");
+        manager.mark_completed().await.expect("persist completed resume state");
+
+        let persisted = ResumeManager::load_from_disk(disk.clone(), &task_id)
+            .await
+            .expect("reload completed resume state")
+            .get_state()
+            .await;
+        assert!(persisted.completed, "completion must be persisted without waiting for the throttle");
+        assert_eq!(persisted.processed_objects, 1, "the completion write must include buffered progress");
+
+        let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+        let failure = ResumeDeleteFailure::install(state_path, DiskError::DiskAccessDenied);
+        let error = manager
+            .cleanup()
+            .await
+            .expect_err("resume cleanup must propagate a real delete failure");
+        assert!(matches!(error, Error::Disk(DiskError::DiskAccessDenied)));
+        drop(failure);
+        manager.cleanup().await.expect("resume cleanup must be retryable");
+        manager
+            .cleanup()
+            .await
+            .expect("missing resume files must be idempotent success");
+
+        let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone())
+            .await
+            .expect("create checkpoint manager");
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let failure = ResumeDeleteFailure::install(checkpoint_path, DiskError::DiskAccessDenied);
+        let error = checkpoint
+            .cleanup()
+            .await
+            .expect_err("checkpoint cleanup must propagate a real delete failure");
+        assert!(matches!(error, Error::Disk(DiskError::DiskAccessDenied)));
+        drop(failure);
+        checkpoint.cleanup().await.expect("checkpoint cleanup must be retryable");
+        checkpoint
+            .cleanup()
+            .await
+            .expect("missing checkpoint must be idempotent success");
     }
 
     #[tokio::test]
