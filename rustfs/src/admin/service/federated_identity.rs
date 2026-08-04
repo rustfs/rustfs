@@ -429,13 +429,15 @@ mod tests {
 
     #[test]
     fn issued_credentials_and_replication_item_use_minio_parent_shape() {
+        const EXPECTED_PARENT_USER: &str = "HwDfWftzOy4jiuS3WjKytC_Sg_A2hKhrRAFtBDhoBr0";
+
         let transaction = transaction();
         let secret = "federated-session-test-signing-secret";
         let selected_policy_names = vec!["readonly".to_string()];
 
         let credentials =
             issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
-        assert_eq!(credentials.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
+        assert_eq!(credentials.parent_user, EXPECTED_PARENT_USER);
         assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
         assert_eq!(credentials.status, "on");
         assert!(!credentials.access_key.is_empty());
@@ -468,11 +470,8 @@ mod tests {
                 ("preferred_username".to_string(), serde_json::json!("user")),
                 ("groups".to_string(), serde_json::json!(["devs"])),
                 ("roles".to_string(), serde_json::json!(["admin", "reader"])),
-                ("parent".to_string(), serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA")),
-                (
-                    OIDC_VIRTUAL_PARENT_CLAIM.to_string(),
-                    serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"),
-                ),
+                ("parent".to_string(), serde_json::json!(EXPECTED_PARENT_USER)),
+                (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), serde_json::json!(EXPECTED_PARENT_USER),),
                 ("policy".to_string(), serde_json::json!("readonly")),
             ])
         );
@@ -499,7 +498,7 @@ mod tests {
                     "accessKey": "<access-key>",
                     "secretKey": "<secret-key>",
                     "sessionToken": "<session-token>",
-                    "parentUser": "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA",
+                    "parentUser": EXPECTED_PARENT_USER,
                     "parentPolicyMapping": OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY,
                     "apiVersion": SITE_REPL_API_VERSION,
                 },
