@@ -14,9 +14,8 @@
 
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
-    validate_batch_read_version_item_count,
+    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{PartTransactionAction, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
@@ -29,9 +28,7 @@ use rustfs_io_metrics::internode_metrics::{
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
-use std::{collections::HashMap, io::Cursor, time::Duration};
-use tokio::sync::mpsc;
-use tokio_util::time::DelayQueue;
+use std::io::Cursor;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
@@ -39,87 +36,15 @@ use tracing::debug;
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
 const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
-const SNAPSHOT_LEASE_MIN_TTL: Duration = Duration::from_secs(5);
-const SNAPSHOT_LEASE_MAX_TTL: Duration = Duration::from_secs(5 * 60);
 
-struct SnapshotLeaseExpiry {
-    disk: DiskStore,
-    volume: String,
-    path: String,
-    token: SnapshotLeaseToken,
-}
-
-pub(super) struct SnapshotLeaseExpiryScheduler {
-    tx: mpsc::UnboundedSender<SnapshotLeaseExpiryCommand>,
-}
-
-enum SnapshotLeaseExpiryCommand {
-    Schedule(SnapshotLeaseExpiry, Duration),
-    Cancel(SnapshotLeaseToken),
-}
-
-impl SnapshotLeaseExpiryScheduler {
-    pub(super) fn new() -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut expirations: DelayQueue<SnapshotLeaseExpiry> = DelayQueue::new();
-            let mut keys = HashMap::new();
-            loop {
-                tokio::select! {
-                    Some(command) = rx.recv() => {
-                        match command {
-                            SnapshotLeaseExpiryCommand::Schedule(expiry, ttl) => {
-                                if let Some(key) = keys.remove(&expiry.token) {
-                                    expirations.remove(&key);
-                                }
-                                let token = expiry.token;
-                                let key = expirations.insert(expiry, ttl);
-                                keys.insert(token, key);
-                            }
-                            SnapshotLeaseExpiryCommand::Cancel(token) => {
-                                if let Some(key) = keys.remove(&token) {
-                                    expirations.remove(&key);
-                                }
-                            }
-                        }
-                    }
-                    Some(expired) = futures_util::StreamExt::next(&mut expirations), if !expirations.is_empty() => {
-                        let expiry = expired.into_inner();
-                        keys.remove(&expiry.token);
-                        let _ = expiry
-                            .disk
-                            .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
-                            .await;
-                    }
-                    else => break,
-                }
-            }
-        });
-        Self { tx }
-    }
-
-    fn schedule(&self, expiry: SnapshotLeaseExpiry, ttl: Duration) -> Result<(), SnapshotLeaseExpiry> {
-        self.tx
-            .send(SnapshotLeaseExpiryCommand::Schedule(expiry, ttl))
-            .map_err(|err| match err.0 {
-                SnapshotLeaseExpiryCommand::Schedule(expiry, _) => expiry,
-                SnapshotLeaseExpiryCommand::Cancel(_) => unreachable!(),
-            })
-    }
-
-    fn cancel(&self, token: SnapshotLeaseToken) {
-        let _ = self.tx.send(SnapshotLeaseExpiryCommand::Cancel(token));
+fn snapshot_lease_disabled_response() -> SnapshotLeaseResponse {
+    SnapshotLeaseResponse {
+        success: false,
+        token: Bytes::new(),
+        protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+        error: Some(DiskError::UnsupportedDisk.into()),
     }
 }
-
-fn snapshot_lease_ttl(ttl_ms: u64) -> Result<Duration, Status> {
-    let ttl = Duration::from_millis(ttl_ms);
-    if !(SNAPSHOT_LEASE_MIN_TTL..=SNAPSHOT_LEASE_MAX_TTL).contains(&ttl) {
-        return Err(Status::invalid_argument("snapshot lease TTL is outside the supported range"));
-    }
-    Ok(ttl)
-}
-
 fn decode_msgpack_or_json<T: DeserializeOwned>(
     binary: &[u8],
     json: &str,
@@ -274,47 +199,7 @@ impl NodeService {
             rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()),
             "acquire_snapshot_lease",
         )?;
-        let request = request.into_inner();
-        let ttl = snapshot_lease_ttl(request.ttl_ms)?;
-        let Some(disk) = self.find_disk(&request.disk).await else {
-            return Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(DiskError::other("cannot find disk").into()),
-            }));
-        };
-        match disk.acquire_snapshot_lease(&request.volume, &request.path).await {
-            Ok(token) => {
-                if let Err(expiry) = self.snapshot_lease_expiry.schedule(
-                    SnapshotLeaseExpiry {
-                        disk,
-                        volume: request.volume,
-                        path: request.path,
-                        token,
-                    },
-                    ttl,
-                ) {
-                    let _ = expiry
-                        .disk
-                        .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
-                        .await;
-                    return Err(Status::internal("snapshot lease expiry scheduler is unavailable"));
-                }
-                Ok(Response::new(SnapshotLeaseResponse {
-                    success: true,
-                    token: Bytes::copy_from_slice(token.as_bytes()),
-                    protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                    error: None,
-                }))
-            }
-            Err(err) => Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(err.into()),
-            })),
-        }
+        Ok(Response::new(snapshot_lease_disabled_response()))
     }
 
     pub(super) async fn handle_renew_snapshot_lease(
@@ -326,50 +211,7 @@ impl NodeService {
             rustfs_protos::canonical_snapshot_lease_renew_request_body(request.get_ref()),
             "renew_snapshot_lease",
         )?;
-        let request = request.into_inner();
-        let ttl = snapshot_lease_ttl(request.ttl_ms)?;
-        let token =
-            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
-        let Some(disk) = self.find_disk(&request.disk).await else {
-            return Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(DiskError::other("cannot find disk").into()),
-            }));
-        };
-        match disk.renew_snapshot_lease(&request.volume, &request.path, token).await {
-            Ok(renewed) => {
-                if let Err(expiry) = self.snapshot_lease_expiry.schedule(
-                    SnapshotLeaseExpiry {
-                        disk,
-                        volume: request.volume,
-                        path: request.path,
-                        token: renewed,
-                    },
-                    ttl,
-                ) {
-                    let _ = expiry
-                        .disk
-                        .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
-                        .await;
-                    return Err(Status::internal("snapshot lease expiry scheduler is unavailable"));
-                }
-                self.snapshot_lease_expiry.cancel(token);
-                Ok(Response::new(SnapshotLeaseResponse {
-                    success: true,
-                    token: Bytes::copy_from_slice(renewed.as_bytes()),
-                    protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                    error: None,
-                }))
-            }
-            Err(err) => Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(err.into()),
-            })),
-        }
+        Ok(Response::new(snapshot_lease_disabled_response()))
     }
 
     pub(super) async fn handle_release_snapshot_lease(
@@ -391,13 +233,10 @@ impl NodeService {
             }));
         };
         match disk.release_snapshot_lease(&request.volume, &request.path, token).await {
-            Ok(()) => {
-                self.snapshot_lease_expiry.cancel(token);
-                Ok(Response::new(SnapshotLeaseMutationResponse {
-                    success: true,
-                    error: None,
-                }))
-            }
+            Ok(()) => Ok(Response::new(SnapshotLeaseMutationResponse {
+                success: true,
+                error: None,
+            })),
             Err(err) => Ok(Response::new(SnapshotLeaseMutationResponse {
                 success: false,
                 error: Some(err.into()),
@@ -1608,10 +1447,10 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        SNAPSHOT_LEASE_MAX_TTL, SNAPSHOT_LEASE_MIN_TTL, compat_response_json, decode_msgpack_or_json,
-        encode_batch_read_version_response_payloads, encode_msgpack, encode_msgpack_named,
-        encode_read_multiple_response_payloads, snapshot_lease_ttl,
+        compat_response_json, decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads, snapshot_lease_disabled_response,
     };
+    use crate::storage::storage_api::DiskError;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -1624,11 +1463,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_lease_ttl_rejects_values_outside_server_bounds() {
-        assert!(snapshot_lease_ttl(4_999).is_err());
-        assert_eq!(snapshot_lease_ttl(5_000).unwrap(), SNAPSHOT_LEASE_MIN_TTL);
-        assert_eq!(snapshot_lease_ttl(300_000).unwrap(), SNAPSHOT_LEASE_MAX_TTL);
-        assert!(snapshot_lease_ttl(300_001).is_err());
+    fn snapshot_lease_acquire_and_renew_fail_closed() {
+        let response = snapshot_lease_disabled_response();
+        let expected_error = DiskError::UnsupportedDisk.into();
+
+        assert!(!response.success);
+        assert!(response.token.is_empty());
+        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.error, Some(expected_error));
     }
 
     #[test]

@@ -380,7 +380,6 @@ mod metrics;
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
     context: Option<Arc<runtime_sources::AppContext>>,
-    snapshot_lease_expiry: disk::SnapshotLeaseExpiryScheduler,
 }
 
 impl std::fmt::Debug for NodeService {
@@ -399,11 +398,7 @@ pub fn make_server() -> NodeService {
 
 pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService {
-        local_peer,
-        context,
-        snapshot_lease_expiry: disk::SnapshotLeaseExpiryScheduler::new(),
-    }
+    NodeService { local_peer, context }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2170,7 +2165,7 @@ mod tests {
         previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
-    use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
+    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo, HealEndpoint};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
         Endpoint,
@@ -2908,6 +2903,52 @@ mod tests {
             covered_methods, expected_methods,
             "the disk mutation exclusion set must exactly match handlers exercised by the independent digest test",
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed() {
+        let service = make_server();
+        let disk = "http://node-a:9000/data/rustfs0".to_string();
+
+        let mut acquire = Request::new(SnapshotLeaseRequest {
+            disk: disk.clone(),
+            volume: "v".into(),
+            path: "p".into(),
+            ttl_ms: 60_000,
+        });
+        let acquire_body =
+            rustfs_protos::canonical_snapshot_lease_request_body(acquire.get_ref()).expect("acquire request body should encode");
+        set_tonic_canonical_body_digest(&mut acquire, &acquire_body).expect("acquire digest metadata should encode");
+        mark_v2_authenticated(&mut acquire);
+        let acquire = service
+            .acquire_snapshot_lease(acquire)
+            .await
+            .expect("disabled acquire should return a protocol response")
+            .into_inner();
+
+        let mut renew = Request::new(SnapshotLeaseRenewRequest {
+            disk,
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+            ttl_ms: 60_000,
+        });
+        let renew_body = rustfs_protos::canonical_snapshot_lease_renew_request_body(renew.get_ref())
+            .expect("renew request body should encode");
+        set_tonic_canonical_body_digest(&mut renew, &renew_body).expect("renew digest metadata should encode");
+        mark_v2_authenticated(&mut renew);
+        let renew = service
+            .renew_snapshot_lease(renew)
+            .await
+            .expect("disabled renew should return a protocol response")
+            .into_inner();
+
+        for response in [acquire, renew] {
+            assert!(!response.success);
+            assert!(response.token.is_empty());
+            assert_eq!(response.protocol_version, 1);
+            assert_eq!(response.error, Some(DiskError::UnsupportedDisk.into()));
+        }
     }
 
     #[tokio::test]

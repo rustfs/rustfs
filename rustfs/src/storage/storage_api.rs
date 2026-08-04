@@ -1099,8 +1099,6 @@ pub(crate) trait StorageDiskRpcExt {
     ) -> DiskResult<()>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
-    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken>;
-    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken>;
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()>;
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo>;
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
@@ -1226,14 +1224,6 @@ where
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()> {
         ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
-    }
-
-    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken> {
-        ecstore_disk::DiskAPI::acquire_snapshot_lease(self, volume, path).await
-    }
-
-    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken> {
-        ecstore_disk::DiskAPI::renew_snapshot_lease(self, volume, path, token).await
     }
 
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()> {
