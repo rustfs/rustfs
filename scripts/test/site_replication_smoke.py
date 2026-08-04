@@ -386,13 +386,13 @@ def smoke(site_a: Site, site_b: Site, timeout: float) -> None:
     else:
         raise SystemExit(f"[fail] bucket {bucket} did not replicate to {site_b.name} within {timeout:.0f}s")
 
-    payload_ab = f"hello from {site_a.name} {uuid.uuid4()}".encode()
-    put_object(site_a, bucket, "from-a.txt", payload_ab)
-    wait_object(site_b, bucket, "from-a.txt", payload_ab, timeout)
+    payload_a_to_b = f"hello from {site_a.name} {uuid.uuid4()}".encode()
+    put_object(site_a, bucket, "from-a.txt", payload_a_to_b)
+    wait_object(site_b, bucket, "from-a.txt", payload_a_to_b, timeout)
 
-    payload_ba = f"hello from {site_b.name} {uuid.uuid4()}".encode()
-    put_object(site_b, bucket, "from-b.txt", payload_ba)
-    wait_object(site_a, bucket, "from-b.txt", payload_ba, timeout)
+    payload_b_to_a = f"hello from {site_b.name} {uuid.uuid4()}".encode()
+    put_object(site_b, bucket, "from-b.txt", payload_b_to_a)
+    wait_object(site_a, bucket, "from-b.txt", payload_b_to_a, timeout)
 
     print(f"[ok] bidirectional replication verified via bucket {bucket}")
 
