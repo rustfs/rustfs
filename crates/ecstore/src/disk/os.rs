@@ -958,6 +958,8 @@ struct WindowsDirectoryHandle {
 pub(crate) struct PublicationRoot {
     path: PathBuf,
     #[cfg(windows)]
+    configured_path: PathBuf,
+    #[cfg(windows)]
     directory: WindowsDirectoryHandle,
 }
 
@@ -968,10 +970,15 @@ impl PublicationRoot {
         }
 
         #[cfg(windows)]
-        let (path, directory) = open_windows_publication_root(path)?;
+        let (resolved_path, directory) = open_windows_publication_root(path)?;
 
         Ok(Self {
+            #[cfg(not(windows))]
             path: path.to_path_buf(),
+            #[cfg(windows)]
+            path: resolved_path,
+            #[cfg(windows)]
+            configured_path: path.to_path_buf(),
             #[cfg(windows)]
             directory,
         })
@@ -979,6 +986,14 @@ impl PublicationRoot {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(windows)]
+    fn relative_path<'a>(&self, path: &'a Path) -> io::Result<&'a Path> {
+        // The configured path only derives a suffix; traversal stays rooted at the pinned directory handle.
+        path.strip_prefix(&self.path)
+            .or_else(|_| path.strip_prefix(&self.configured_path))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
     }
 }
 
@@ -1175,9 +1190,7 @@ fn windows_file_attribute_tag(
 fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) -> io::Result<ExistingBaseDirectoryGuard> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 
-    let relative = path.strip_prefix(&publication_root.path).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "guarded Windows path must remain below its publication root")
-    })?;
+    let relative = publication_root.relative_path(path)?;
     let mut handles = vec![publication_root.directory.clone()];
 
     for component in relative.components() {
@@ -1472,12 +1485,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
     {
         use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
 
-        let base_relative = base_dir.strip_prefix(&publication_root.path).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "rename base directory must remain below its publication root",
-            )
-        })?;
+        let base_relative = publication_root.relative_path(base_dir)?;
         let mut guard = ExistingBaseDirectoryGuard::new(vec![publication_root.directory.clone()]);
         for component in base_relative.components() {
             let Component::Normal(component) = component else {
@@ -2232,16 +2240,32 @@ mod tests {
             resolved_root,
             rustfs_utils::canonicalize(&target).expect("canonicalize configured target")
         );
-        let base = resolved_root.join("bucket");
-        let src = resolved_root.join("staging");
-        let dst = base.join("object");
-        std::fs::create_dir(&base).expect("create bucket through configured root");
-        std::fs::write(&src, b"payload").expect("write staged object through configured root");
-        super::rename_all(&src, &dst, &base, &publication_root)
+        let configured_base = mount.join("configured-bucket");
+        let configured_src = mount.join("configured-staging");
+        let configured_dst = configured_base.join("object");
+        std::fs::create_dir(&configured_base).expect("create bucket through configured root");
+        std::fs::write(&configured_src, b"configured").expect("write staged object through configured root");
+        super::rename_all(&configured_src, &configured_dst, &configured_base, &publication_root)
             .await
-            .expect("publish relative to the pinned configured root");
+            .expect("publish a configured path relative to the pinned root");
+        assert_eq!(
+            std::fs::read(target.join("configured-bucket/object")).expect("read configured-path publication"),
+            b"configured"
+        );
 
-        assert_eq!(std::fs::read(target.join("bucket/object")).expect("read target publication"), b"payload");
+        let resolved_base = resolved_root.join("resolved-bucket");
+        let resolved_src = resolved_root.join("resolved-staging");
+        let resolved_dst = resolved_base.join("object");
+        std::fs::create_dir(&resolved_base).expect("create bucket through resolved root");
+        std::fs::write(&resolved_src, b"resolved").expect("write staged object through resolved root");
+        super::rename_all(&resolved_src, &resolved_dst, &resolved_base, &publication_root)
+            .await
+            .expect("publish a resolved path relative to the pinned root");
+
+        assert_eq!(
+            std::fs::read(target.join("resolved-bucket/object")).expect("read resolved-path publication"),
+            b"resolved"
+        );
         drop(publication_root);
         let mount_writer = std::fs::OpenOptions::new()
             .access_mode(GENERIC_WRITE)
@@ -2404,10 +2428,11 @@ mod tests {
         try_set_windows_mount_point(&writable_base, &outside).expect("redirect the destination base");
         drop(writable_base);
 
-        rename_all(&src, &dst, &base)
+        let err = rename_all(&src, &dst, &base)
             .await
             .expect_err("a reparse destination base must be rejected");
 
+        assert!(matches!(err, DiskError::FileAccessDenied));
         assert!(src.exists(), "rejected publication must preserve the staged source");
         assert!(!outside.join("object").exists(), "reparse base must not redirect parent creation");
         let writable_base = std::fs::OpenOptions::new()
@@ -2449,10 +2474,11 @@ mod tests {
         try_set_windows_mount_point(&writable_intermediate, &outside).expect("redirect the intermediate directory");
         drop(writable_intermediate);
 
-        rename_all(&src, &dst, &base)
+        let err = rename_all(&src, &dst, &base)
             .await
             .expect_err("a reparse destination intermediate must be rejected");
 
+        assert!(matches!(err, DiskError::FileAccessDenied));
         assert!(src.exists(), "rejected publication must preserve the staged source");
         assert!(!outside.join("object").exists(), "reparse intermediate must not redirect parent creation");
         let writable_intermediate = std::fs::OpenOptions::new()
@@ -2497,10 +2523,11 @@ mod tests {
         try_set_windows_mount_point(&writable_ancestor, &outside).expect("redirect the base ancestor");
         drop(writable_ancestor);
 
-        rename_all(&src, &dst, &base)
+        let err = rename_all(&src, &dst, &base)
             .await
             .expect_err("a reparse ancestor before a nested base must be rejected");
 
+        assert!(matches!(err, DiskError::FileAccessDenied));
         assert!(src.exists(), "rejected publication must preserve the staged source");
         assert!(
             !outside_base.join("object").exists(),
@@ -2549,10 +2576,11 @@ mod tests {
         try_set_windows_mount_point(&writable_ancestor, &outside).expect("redirect the source ancestor");
         drop(writable_ancestor);
 
-        rename_all(&src, &dst, &base)
+        let err = rename_all(&src, &dst, &base)
             .await
             .expect_err("a reparse ancestor before the source parent must be rejected");
 
+        assert!(matches!(err, DiskError::FileAccessDenied));
         assert!(!dst.exists(), "rejected publication must not create a destination");
         assert_eq!(
             std::fs::read(outside_parent.join("staged-object")).expect("read unchanged redirected source"),
@@ -2706,7 +2734,10 @@ mod tests {
         let source = src.clone();
         let destination = dst.clone();
         let mut rename = tokio::spawn(async move { rename_all(&src, &dst, &base).await });
-        entered_rx.await.expect("preparation must start before cancellation");
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("timed out waiting for preparation to start before cancellation")
+            .expect("preparation hook sender dropped before cancellation");
         rename.abort();
         for _ in 0..10 {
             tokio::task::yield_now().await;
@@ -2749,7 +2780,10 @@ mod tests {
 
         let destination = dst.clone();
         let mut rename = tokio::spawn(async move { rename_all(&src, &dst, &base).await });
-        entered_rx.await.expect("publication must start before cancellation");
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("timed out waiting for publication to start before cancellation")
+            .expect("publication hook sender dropped before cancellation");
         rename.abort();
         for _ in 0..10 {
             tokio::task::yield_now().await;
