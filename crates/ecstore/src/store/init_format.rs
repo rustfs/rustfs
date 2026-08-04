@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
@@ -91,7 +92,12 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
 
     check_disk_fatal_errs(&errs)?;
 
-    let all_unformatted = should_init_erasure_disks(&errs);
+    // Treat transient network errors (connection refused, timeout, etc.) as
+    // equivalent to UnformattedDisk for the bootstrap decision. During
+    // fresh-cluster startup a remote peer that cannot be reached is
+    // indistinguishable from an unformatted disk — the peer may simply not
+    // have started its gRPC server yet.
+    let all_unformatted = errs.iter().all(is_unformatted_or_transient_network);
     let formats_present = formats.iter().flatten().count();
     let mut format_quorum = (formats_present > 0).then(|| select_format_erasure_in_quorum(&formats, 0));
     if format_quorum.as_ref().is_none_or(Result::is_err)
@@ -144,7 +150,7 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
         should_init_erasure_disks(&errs)
     );
 
-    let unformatted = quorum_unformatted_disks(&errs);
+    let unformatted = errs.iter().filter(|e| is_unformatted_or_transient_network(e)).count() > (errs.len() / 2);
     if unformatted && !first_disk {
         return Err(Error::NotFirstDisk);
     }
@@ -248,12 +254,17 @@ async fn retain_format_quorum_members(
     Ok(())
 }
 
-pub fn quorum_unformatted_disks(errs: &[Option<DiskError>]) -> bool {
-    count_errs(errs, &DiskError::UnformattedDisk) > (errs.len() / 2)
-}
-
 pub fn should_init_erasure_disks(errs: &[Option<DiskError>]) -> bool {
     count_errs(errs, &DiskError::UnformattedDisk) == errs.len()
+}
+
+/// Returns `true` if the error represents a disk that is either unformatted
+/// or unreachable due to a transient network failure. During fresh-cluster
+/// bootstrap a remote peer that cannot be reached is indistinguishable from
+/// an unformatted disk — the peer may simply not have started its gRPC
+/// server yet.
+fn is_unformatted_or_transient_network(err: &Option<DiskError>) -> bool {
+    matches!(err, Some(DiskError::UnformattedDisk)) || err.as_ref().is_some_and(is_network_like_disk_error)
 }
 
 pub fn check_disk_fatal_errs(errs: &[Option<DiskError>]) -> disk::error::Result<()> {
@@ -1611,6 +1622,24 @@ mod tests {
         ));
         let (formats, _) = load_format_erasure_all(&disks, false).await;
         assert!(formats.iter().all(Option::is_none), "a legacy split vote must not write RustFS formats");
+    }
+
+    #[test]
+    fn is_unformatted_or_transient_network_classifies_errors() {
+        // UnformattedDisk is recognized.
+        assert!(is_unformatted_or_transient_network(&Some(DiskError::UnformattedDisk)));
+        // None (healthy disk) is not.
+        assert!(!is_unformatted_or_transient_network(&None));
+        // Transient network errors are recognized.
+        assert!(is_unformatted_or_transient_network(&Some(DiskError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused"
+        )))));
+        assert!(is_unformatted_or_transient_network(&Some(DiskError::Timeout)));
+        // Non-network errors are not.
+        assert!(!is_unformatted_or_transient_network(&Some(DiskError::FileNotFound)));
+        assert!(!is_unformatted_or_transient_network(&Some(DiskError::CorruptedFormat)));
+        assert!(!is_unformatted_or_transient_network(&Some(DiskError::DiskFull)));
     }
 }
 
