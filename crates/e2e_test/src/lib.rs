@@ -298,4 +298,32 @@ mod create_bucket_region_test;
 #[cfg(test)]
 mod copy_source_invalid_date_test;
 
+// P0 regression: event notification startup race (rustfs#5387, #5681, #5401, #5183, #5115, #4796)
+#[cfg(test)]
+mod notification_startup_regression_test;
+
+// P0 regression: lifecycle/ILM object expiration (rustfs#5407, #5167, #4963, #5615, #4879)
+#[cfg(test)]
+mod lifecycle_regression_test;
+
+// P0 regression: delete operations consistency (rustfs#5375, #5349, #5339, #5029, #4978, #760)
+#[cfg(test)]
+mod delete_regression_test;
+
+// P1 regression: listing/metacache completeness (rustfs#5166, #5156, #5051, #4810, #4648, #3191)
+#[cfg(test)]
+mod listing_regression_test;
+
+// P1 regression: bucket statistics accuracy (rustfs#5615, #5008, #5116, #5055, #3898, #1012)
+#[cfg(test)]
+mod bucket_stats_regression_test;
+
+// P1 regression: distributed startup/quorum (rustfs#5416, #2945, #2794, #2601, #4040, #5655)
+#[cfg(test)]
+mod distributed_startup_regression_test;
+
+// P1 regression: tier/ILM transition (rustfs#5218, #5130, #5011, #4826, #5024)
+#[cfg(test)]
+mod tier_transition_regression_test;
+
 pub mod tls_gen;
