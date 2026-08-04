@@ -66,7 +66,7 @@
 | multipart_storage_class_test | 3 | ✅ |
 | namespace_lock_quorum_test | 2 |  |
 | negative_sigv4_test | 6 | ✅ |
-| notification_webhook_test | 2 | ✅ |
+| notification_webhook_test | 3 | ✅ |
 | object_lambda_test | 16 |  |
 | object_lock | 33 |  |
 | overwrite_cleanup_regression_test | 1 |  |
@@ -88,6 +88,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-`notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
-
-**Total listed: 527 tests across 70 modules · PR smoke subset: 147 tests / 33 modules** (31 full modules + 18 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 28 tests** · generated 2026-07-30.
+**Total listed: 528 tests across 70 modules · PR smoke subset: 148 tests / 33 modules** (31 full modules + 18 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 28 tests** · generated 2026-08-04.

@@ -260,15 +260,31 @@ fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
 }
 
 #[cfg(any(test, not(target_os = "windows")))]
+fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64> {
+    metrics
+        .iter()
+        .map(|metric| mimalloc_stat_field(value, metric, field))
+        .try_fold(0_u64, |sum, value| value.map(|value| sum.saturating_add(value)))
+        .filter(|value| *value > 0)
+}
+
+#[cfg(any(test, not(target_os = "windows")))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
+    let malloc_metrics = ["malloc_normal", "malloc_huge"];
     let observation = AllocatorMemoryObservation {
         reserved_bytes: mimalloc_stat_current(&value, "reserved"),
         committed_bytes: mimalloc_stat_current(&value, "committed"),
         page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
-        malloc_requested_bytes: mimalloc_stat_current(&value, "malloc_requested"),
-        malloc_requested_peak_bytes: mimalloc_stat_field(&value, "malloc_requested", "peak"),
-        malloc_requested_total_bytes: mimalloc_stat_field(&value, "malloc_requested", "total"),
+        malloc_requested_bytes: mimalloc_stat_current(&value, "malloc_requested")
+            .filter(|value| *value > 0)
+            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "current")),
+        malloc_requested_peak_bytes: mimalloc_stat_field(&value, "malloc_requested", "peak")
+            .filter(|value| *value > 0)
+            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "peak")),
+        malloc_requested_total_bytes: mimalloc_stat_field(&value, "malloc_requested", "total")
+            .filter(|value| *value > 0)
+            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "total")),
         heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
     };
 
@@ -502,6 +518,30 @@ mod tests {
         assert_eq!(parsed.malloc_requested_peak_bytes, Some(196_608));
         assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
         assert_eq!(parsed.heap_count, Some(8));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_falls_back_to_allocated_bytes_when_requested_is_zero() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "stat_version": 1,
+                "mimalloc_version": 300,
+                "reserved": { "total": 1048576, "peak": 1048576, "current": 1048576 },
+                "committed": { "total": 524288, "peak": 524288, "current": 524288 },
+                "malloc_normal": { "total": 7340032, "peak": 262144, "current": 196608 },
+                "malloc_huge": { "total": 3145728, "peak": 131072, "current": 65536 },
+                "malloc_requested": { "total": 0, "peak": 0, "current": 0 },
+                "heaps": { "total": 1, "peak": 1, "current": 1 }
+            }"#,
+        )
+        .expect("mimalloc v3 stats should parse");
+
+        assert_eq!(parsed.reserved_bytes, Some(1_048_576));
+        assert_eq!(parsed.committed_bytes, Some(524_288));
+        assert_eq!(parsed.malloc_requested_bytes, Some(262_144));
+        assert_eq!(parsed.malloc_requested_peak_bytes, Some(393_216));
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        assert_eq!(parsed.heap_count, Some(1));
     }
 
     #[test]
