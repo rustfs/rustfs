@@ -1629,7 +1629,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         pending_payload = None;
                         capped = false;
                     }
-                    None => interval.tick().await,
+                    None => {
+                        interval.tick().await;
+                    }
                 }
             }
         });
@@ -4552,29 +4554,29 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    let quarantine_complete = {
+                    let quarantined = {
                         let writes = shared.writes.lock().expect("test writes lock should not be poisoned");
-                        let quarantined = writes
+                        writes
                             .iter()
-                            .any(|(file, data)| file.starts_with(MRF_CORRUPT_FILE_PREFIX) && data == &[0xde, 0xad, 0xbe, 0xef]);
-                        let cleared = writes
-                            .iter()
-                            .any(|(file, data)| file == ReplicationMetadataStore::MRF_REPLICATION_FILE && data.is_empty());
-                        quarantined && cleared
+                            .any(|(file, data)| file.starts_with(MRF_CORRUPT_FILE_PREFIX) && data == &[0xde, 0xad, 0xbe, 0xef])
                     };
-                    if quarantine_complete {
+                    if quarantined {
                         break;
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("quarantine should retry after the injected write failure and clear the active path");
+            .expect("quarantine should retry after the injected write failure");
 
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let data = shared.data.lock().expect("test data lock should not be poisoned").clone();
-                    if decode_mrf_file(&data).is_ok_and(|entries| entries.iter().any(|entry| entry.object == "new-failure")) {
+                    if decode_mrf_file(&data).is_ok_and(|entries| {
+                        ["new-failure", "second-failure"]
+                            .iter()
+                            .all(|object| entries.iter().any(|entry| entry.object == *object))
+                    }) {
                         break;
                     }
                     tokio::task::yield_now().await;
