@@ -15,7 +15,9 @@
 use crate::diagnostics::admin_server_info::get_local_server_property;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::admin::StorageAdminApi;
+#[cfg(test)]
 use chrono::Utc;
+use jiff::Timestamp;
 use rustfs_common::{heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
@@ -67,20 +69,25 @@ impl MetricType {
     }
 }
 
-fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
-    let jiff_timestamp_to_chrono =
-        |timestamp: jiff::Timestamp| chrono::DateTime::<Utc>::from(std::time::SystemTime::from(timestamp));
+fn unix_millis_to_jiff_timestamp(millis: u64, fallback: Timestamp) -> Timestamp {
+    let millis = match i64::try_from(millis) {
+        Ok(millis) => millis,
+        Err(_) => return fallback,
+    };
 
+    match Timestamp::from_millisecond(millis) {
+        Ok(timestamp) => timestamp,
+        Err(_) => fallback,
+    }
+}
+
+fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
     MadminScannerMetrics {
-        collected_at: jiff_timestamp_to_chrono(metrics.collected_at),
+        collected_at: metrics.collected_at,
         current_cycle: metrics.current_cycle,
         current_cycle_active: Some(metrics.current_cycle_active),
-        current_started: jiff_timestamp_to_chrono(metrics.current_started),
-        cycles_completed_at: metrics
-            .cycles_completed_at
-            .into_iter()
-            .map(jiff_timestamp_to_chrono)
-            .collect(),
+        current_started: metrics.current_started,
+        cycles_completed_at: metrics.cycles_completed_at,
         ongoing_buckets: metrics.ongoing_buckets,
         active_scan_paths: metrics.active_scan_paths,
         oldest_active_path_age_seconds: metrics.oldest_active_path_age_seconds,
@@ -393,7 +400,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     if types.contains(&MetricType::DISK) {
         debug!("start get disk metrics");
         let mut aggr = DiskMetric {
-            collected_at: Utc::now(),
+            collected_at: Timestamp::now(),
             ..Default::default()
         };
         for (name, disk) in collect_local_disks_metrics(&opts.disks).await.into_iter() {
@@ -419,7 +426,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     if types.contains(&MetricType::NET) {
         let snapshot = global_internode_metrics().snapshot();
         real_time_metrics.aggregated.net = Some(NetMetrics {
-            collected_at: Utc::now(),
+            collected_at: Timestamp::now(),
             interface_name: "internode".to_string(),
             net_stats: NetDevLine {
                 name: "internode".to_string(),
@@ -435,10 +442,9 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     // if types.contains(&MetricType::CPU) {}
 
     if types.contains(&MetricType::RPC) {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let snapshot = global_internode_metrics().snapshot();
-        let last_connect_time =
-            chrono::DateTime::<Utc>::from_timestamp_millis(snapshot.last_dial_unix_millis as i64).unwrap_or(collected_at);
+        let last_connect_time = unix_millis_to_jiff_timestamp(snapshot.last_dial_unix_millis, collected_at);
 
         real_time_metrics.aggregated.rpc = Some(RPCMetrics {
             collected_at,
@@ -613,7 +619,7 @@ mod test {
         });
 
         assert_eq!(scanner.current_cycle_active, Some(true));
-        assert_eq!(scanner.current_started, current_started);
+        assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(current_started));
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
         let usage = scanner
@@ -654,7 +660,7 @@ mod test {
         aggregated.merge(decoded);
         let scanner = aggregated.aggregated.scanner.expect("scanner metrics");
         assert_eq!(scanner.current_cycle_active, Some(true));
-        assert_eq!(scanner.current_started, cycle_started);
+        assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(cycle_started));
     }
 
     #[test]
