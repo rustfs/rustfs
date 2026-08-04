@@ -566,7 +566,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
 
-        let replicate = cfg.replicate(&sopts);
+        let replicate = cfg.replicate(&sopts) && mopts.metadata_target_is_eligible(&arn);
         let synchronous = if let Some(cli) = cli { cli.replicate_sync } else { false };
 
         dsc.set(ReplicateTargetDecision::new(arn, replicate, synchronous));
