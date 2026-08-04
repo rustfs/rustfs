@@ -20,6 +20,7 @@ checked_files=(
   "rustfs/src/admin/handlers/table_catalog/refs.rs"
   "rustfs/src/admin/handlers/table_catalog/routes.rs"
   "rustfs/src/admin/handlers/table_catalog/table.rs"
+  "rustfs/src/admin/handlers/table_catalog/tests.rs"
   "rustfs/src/admin/handlers/table_catalog/view.rs"
   "rustfs/src/admin/handlers/service_account.rs"
   "rustfs/src/admin/handlers/kms_audit.rs"
