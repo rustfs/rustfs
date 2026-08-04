@@ -29,13 +29,10 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, admin_ok, init_logging};
-    use aws_sdk_s3::Client;
-    use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use serde_json::Value;
     use serial_test::serial;
     use std::error::Error;
-    use tracing::{info, warn};
+    use tracing::info;
 
     type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
