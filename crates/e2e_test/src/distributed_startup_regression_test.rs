@@ -34,8 +34,8 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
     use std::error::Error;
-    use tokio::time::{Duration, sleep, timeout};
-    use tracing::{info, warn};
+    use tokio::time::{Duration, sleep};
+    use tracing::info;
 
     type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 

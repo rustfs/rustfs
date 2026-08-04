@@ -30,7 +30,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
-    use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
     use std::collections::HashSet;
