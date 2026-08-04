@@ -1128,7 +1128,7 @@ pub(crate) mod select_object {
         }
     }
 
-    pub(crate) use super::{options, request_context};
+    pub(crate) use super::{options, request_context, sse};
     pub(crate) use crate::storage::storage_api::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 }
 

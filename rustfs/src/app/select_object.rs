@@ -1,6 +1,7 @@
 use super::storage_api::select_object::contract::object::ObjectOperations as _;
 use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
+use super::storage_api::select_object::sse::{SseKmsPrincipal, authorize_sse_kms_object_read};
 use super::storage_api::select_object::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 use crate::app::runtime_sources::current_s3select_db;
 use crate::error::ApiError;
@@ -62,10 +63,11 @@ enum SelectProducerOutcome {
 pub async fn execute_select_object_content(
     req: S3Request<SelectObjectContentInput>,
 ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+    let read_principal = SseKmsPrincipal::from_request(&req);
     let mut input = req.input;
     let validation = validate_select_request(&req.headers, &mut input)?;
     log_select_request_summary(&input, &validation);
-    let metadata = preflight_select_object(&req.headers, &input).await?;
+    let metadata = preflight_select_object(&req.headers, &input, read_principal.as_ref()).await?;
     validate_scan_range_for_object_size(&input.request, metadata.size)?;
 
     let input = Arc::new(input);
@@ -386,7 +388,11 @@ fn validate_input_delimiter_pair(field_delimiter: Option<&str>, record_delimiter
     Ok(())
 }
 
-async fn preflight_select_object(headers: &http::HeaderMap, input: &SelectObjectContentInput) -> S3Result<SelectObjectMetadata> {
+async fn preflight_select_object(
+    headers: &http::HeaderMap,
+    input: &SelectObjectContentInput,
+    read_principal: Option<&SseKmsPrincipal>,
+) -> S3Result<SelectObjectMetadata> {
     let opts = get_opts(&input.bucket, &input.key, None, None, headers)
         .await
         .map_err(ApiError::from)?;
@@ -397,6 +403,7 @@ async fn preflight_select_object(headers: &http::HeaderMap, input: &SelectObject
         .map_err(ApiError::from)?;
     validate_sse_headers_for_read(&info.user_defined, headers)?;
     validate_ssec_for_read(&info.user_defined, input.sse_customer_key.as_ref(), input.sse_customer_key_md5.as_ref())?;
+    authorize_sse_kms_object_read(read_principal, &info.user_defined).await?;
     Ok(SelectObjectMetadata {
         size: info.size.max(0) as u64,
     })
