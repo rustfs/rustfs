@@ -24,6 +24,15 @@ use time::OffsetDateTime;
 pub const RESYNC_META_FORMAT: u16 = 1;
 pub const RESYNC_META_VERSION: u16 = 1;
 
+// A resync snapshot contains small fixed-shape records for configured targets. These
+// limits leave room for thousands of targets while bounding corrupt MessagePack work.
+const RESYNC_FILE_HEADER_LEN: usize = 4;
+pub const RESYNC_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const RESYNC_MSGP_MAX_BYTES: usize = RESYNC_FILE_MAX_BYTES - RESYNC_FILE_HEADER_LEN;
+const RESYNC_MSGP_MAX_ELEMENT_BYTES: usize = 1024 * 1024;
+const RESYNC_MSGP_MAX_COLLECTION_ITEMS: usize = 4096;
+const RESYNC_MSGP_MAX_VALUES: usize = 131_072;
+const RESYNC_MSGP_MAX_DEPTH: usize = 32;
 const MSGP_TIME_EXT_TYPE: i8 = 5;
 const MSGP_TIME_LEN: u8 = 12;
 pub const WIRE_ZERO_TIME_UNIX: i64 = -62_135_596_800;
@@ -326,7 +335,8 @@ impl BucketReplicationResyncStatus {
         rmp::encode::write_str(&mut wr, "v")?;
         rmp::encode::write_i32(&mut wr, i32::from(self.version))?;
         rmp::encode::write_str(&mut wr, "brs")?;
-        rmp::encode::write_map_len(&mut wr, self.targets_map.len() as u32)?;
+        let target_count = u32::try_from(self.targets_map.len()).map_err(|_| Error::CorruptedFormat)?;
+        rmp::encode::write_map_len(&mut wr, target_count)?;
         for (arn, status) in &self.targets_map {
             rmp::encode::write_str(&mut wr, arn)?;
             status.marshal_wire_msg(&mut wr)?;
@@ -335,10 +345,12 @@ impl BucketReplicationResyncStatus {
         rmp::encode::write_i32(&mut wr, self.id)?;
         rmp::encode::write_str(&mut wr, "lu")?;
         write_msgp_time(&mut wr, wire_time_or_default(self.last_update))?;
+        validate_msgp_payload(&wr)?;
         Ok(wr)
     }
 
     pub fn unmarshal_msg(data: &[u8]) -> Result<Self> {
+        validate_msgp_payload(data)?;
         let mut rd = Cursor::new(data);
         let mut out = Self::new();
         let mut fields = rmp::decode::read_map_len(&mut rd)?;
@@ -353,7 +365,8 @@ impl BucketReplicationResyncStatus {
                 }
                 "brs" => {
                     let map_len = rmp::decode::read_map_len(&mut rd)?;
-                    let mut targets = HashMap::with_capacity(map_len as usize);
+                    let target_count = usize::try_from(map_len).map_err(|_| Error::CorruptedFormat)?;
+                    let mut targets = HashMap::with_capacity(target_count);
                     for _ in 0..map_len {
                         let arn = read_msgp_str(&mut rd)?;
                         let status = TargetReplicationResyncStatus::unmarshal_wire_msg(&mut rd)?;
@@ -374,6 +387,7 @@ impl BucketReplicationResyncStatus {
     }
 
     pub fn unmarshal_legacy_msg(data: &[u8]) -> Result<Self> {
+        validate_msgp_payload(data)?;
         let mut status: Self = rmp_serde::from_slice(data)?;
         for target in status.targets_map.values_mut() {
             target.error = target.error.as_deref().and_then(sanitize_resync_error_detail);
@@ -384,7 +398,7 @@ impl BucketReplicationResyncStatus {
 
 pub fn encode_resync_file(status: &BucketReplicationResyncStatus) -> Result<Vec<u8>> {
     let payload = status.marshal_msg()?;
-    let mut data = Vec::with_capacity(4 + payload.len());
+    let mut data = Vec::with_capacity(RESYNC_FILE_HEADER_LEN + payload.len());
     let mut major = [0u8; 2];
     LittleEndian::write_u16(&mut major, RESYNC_META_FORMAT);
     data.extend_from_slice(&major);
@@ -396,7 +410,7 @@ pub fn encode_resync_file(status: &BucketReplicationResyncStatus) -> Result<Vec<
 }
 
 pub fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
-    if data.len() <= 4 {
+    if data.len() <= RESYNC_FILE_HEADER_LEN || data.len() > RESYNC_FILE_MAX_BYTES {
         return Err(Error::CorruptedFormat);
     }
 
@@ -435,6 +449,113 @@ fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> 
 
 fn wire_zero_time() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(WIRE_ZERO_TIME_UNIX).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn validate_msgp_payload(data: &[u8]) -> Result<()> {
+    if data.len() > RESYNC_MSGP_MAX_BYTES {
+        return Err(Error::CorruptedFormat);
+    }
+
+    let mut rd = Cursor::new(data);
+    let mut values = 0usize;
+    validate_msgp_value(&mut rd, 0, &mut values)?;
+    if usize::try_from(rd.position()).ok() != Some(data.len()) {
+        return Err(Error::CorruptedFormat);
+    }
+    Ok(())
+}
+
+fn validate_msgp_value<R: Read>(rd: &mut R, depth: usize, values: &mut usize) -> Result<()> {
+    if depth > RESYNC_MSGP_MAX_DEPTH {
+        return Err(Error::CorruptedFormat);
+    }
+    *values = values.checked_add(1).ok_or(Error::CorruptedFormat)?;
+    if *values > RESYNC_MSGP_MAX_VALUES {
+        return Err(Error::CorruptedFormat);
+    }
+
+    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let skip_len = match marker {
+        Marker::Null | Marker::False | Marker::True | Marker::FixPos(_) | Marker::FixNeg(_) => 0,
+        Marker::U8 | Marker::I8 => 1,
+        Marker::U16 | Marker::I16 => 2,
+        Marker::U32 | Marker::I32 | Marker::F32 => 4,
+        Marker::U64 | Marker::I64 | Marker::F64 => 8,
+        Marker::FixStr(len) => usize::from(len),
+        Marker::Str8 | Marker::Bin8 => read_skip_len(rd, 1)?,
+        Marker::Str16 | Marker::Bin16 => read_skip_len(rd, 2)?,
+        Marker::Str32 | Marker::Bin32 => read_skip_len(rd, 4)?,
+        Marker::FixArray(len) => {
+            validate_msgp_collection(rd, usize::from(len), depth, values, false)?;
+            return Ok(());
+        }
+        Marker::Array16 => {
+            let len = read_skip_len(rd, 2)?;
+            validate_msgp_collection(rd, len, depth, values, false)?;
+            return Ok(());
+        }
+        Marker::Array32 => {
+            let len = read_skip_len(rd, 4)?;
+            validate_msgp_collection(rd, len, depth, values, false)?;
+            return Ok(());
+        }
+        Marker::FixMap(len) => {
+            validate_msgp_collection(rd, usize::from(len), depth, values, true)?;
+            return Ok(());
+        }
+        Marker::Map16 => {
+            let len = read_skip_len(rd, 2)?;
+            validate_msgp_collection(rd, len, depth, values, true)?;
+            return Ok(());
+        }
+        Marker::Map32 => {
+            let len = read_skip_len(rd, 4)?;
+            validate_msgp_collection(rd, len, depth, values, true)?;
+            return Ok(());
+        }
+        Marker::FixExt1 => 2,
+        Marker::FixExt2 => 3,
+        Marker::FixExt4 => 5,
+        Marker::FixExt8 => 9,
+        Marker::FixExt16 => 17,
+        Marker::Ext8 => {
+            let len = validate_msgp_element_len(read_skip_len(rd, 1)?)?;
+            skip_exact(rd, 1)?;
+            return skip_exact(rd, len);
+        }
+        Marker::Ext16 => {
+            let len = validate_msgp_element_len(read_skip_len(rd, 2)?)?;
+            skip_exact(rd, 1)?;
+            return skip_exact(rd, len);
+        }
+        Marker::Ext32 => {
+            let len = validate_msgp_element_len(read_skip_len(rd, 4)?)?;
+            skip_exact(rd, 1)?;
+            return skip_exact(rd, len);
+        }
+        Marker::Reserved => return Err(Error::CorruptedFormat),
+    };
+    let skip_len = validate_msgp_element_len(skip_len)?;
+    skip_exact(rd, skip_len)
+}
+
+fn validate_msgp_collection<R: Read>(rd: &mut R, len: usize, depth: usize, values: &mut usize, is_map: bool) -> Result<()> {
+    if len > RESYNC_MSGP_MAX_COLLECTION_ITEMS {
+        return Err(Error::CorruptedFormat);
+    }
+    let values_per_item = if is_map { 2 } else { 1 };
+    let child_count = len.checked_mul(values_per_item).ok_or(Error::CorruptedFormat)?;
+    for _ in 0..child_count {
+        validate_msgp_value(rd, depth + 1, values)?;
+    }
+    Ok(())
+}
+
+fn validate_msgp_element_len(len: usize) -> Result<usize> {
+    if len > RESYNC_MSGP_MAX_ELEMENT_BYTES {
+        return Err(Error::CorruptedFormat);
+    }
+    Ok(len)
 }
 
 fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
@@ -485,81 +606,8 @@ fn write_msgp_time<W: Write>(wr: &mut W, time: OffsetDateTime) -> Result<()> {
 }
 
 fn skip_msgp_value<R: Read>(rd: &mut R) -> Result<()> {
-    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
-    let skip_len: usize = match marker {
-        Marker::Null | Marker::False | Marker::True => 0,
-        Marker::FixPos(_) | Marker::FixNeg(_) => 0,
-        Marker::U8 => 1,
-        Marker::U16 => 2,
-        Marker::U32 => 4,
-        Marker::U64 => 8,
-        Marker::I8 => 1,
-        Marker::I16 => 2,
-        Marker::I32 => 4,
-        Marker::I64 => 8,
-        Marker::F32 => 4,
-        Marker::F64 => 8,
-        Marker::FixStr(n) => n as usize,
-        Marker::Str8 | Marker::Bin8 => read_skip_len(rd, 1)?,
-        Marker::Str16 | Marker::Bin16 => read_skip_len(rd, 2)?,
-        Marker::Str32 | Marker::Bin32 => read_skip_len(rd, 4)?,
-        Marker::FixArray(n) => {
-            for _ in 0..n {
-                skip_msgp_value(rd)?;
-            }
-            return Ok(());
-        }
-        Marker::Array16 => {
-            let n = read_skip_len(rd, 2)?;
-            for _ in 0..n {
-                skip_msgp_value(rd)?;
-            }
-            return Ok(());
-        }
-        Marker::Array32 => {
-            let n = read_skip_len(rd, 4)?;
-            for _ in 0..n {
-                skip_msgp_value(rd)?;
-            }
-            return Ok(());
-        }
-        Marker::FixMap(n) => {
-            for _ in 0..n {
-                skip_msgp_value(rd)?;
-                skip_msgp_value(rd)?;
-            }
-            return Ok(());
-        }
-        Marker::Map16 => {
-            let n = read_skip_len(rd, 2)?;
-            for _ in 0..n {
-                skip_msgp_value(rd)?;
-                skip_msgp_value(rd)?;
-            }
-            return Ok(());
-        }
-        Marker::Map32 => {
-            let n = read_skip_len(rd, 4)?;
-            for _ in 0..n {
-                skip_msgp_value(rd)?;
-                skip_msgp_value(rd)?;
-            }
-            return Ok(());
-        }
-        Marker::FixExt1 => 1 + 1,
-        Marker::FixExt2 => 1 + 2,
-        Marker::FixExt4 => 1 + 4,
-        Marker::FixExt8 => 1 + 8,
-        Marker::FixExt16 => 1 + 16,
-        Marker::Ext8 => 1 + read_skip_len(rd, 1)?,
-        Marker::Ext16 => 1 + read_skip_len(rd, 2)?,
-        Marker::Ext32 => 1 + read_skip_len(rd, 4)?,
-        Marker::Reserved => 0,
-    };
-    if skip_len > 0 {
-        skip_exact(rd, skip_len)?;
-    }
-    Ok(())
+    let mut values = 0usize;
+    validate_msgp_value(rd, 0, &mut values)
 }
 
 fn skip_exact<R: Read>(rd: &mut R, mut len: usize) -> Result<()> {
@@ -573,15 +621,24 @@ fn skip_exact<R: Read>(rd: &mut R, mut len: usize) -> Result<()> {
 }
 
 fn read_skip_len<R: Read>(rd: &mut R, bytes: usize) -> Result<usize> {
-    let mut buf = vec![0u8; bytes];
-    rd.read_exact(&mut buf)?;
-    let len = match bytes {
-        1 => buf[0] as usize,
-        2 => u16::from_be_bytes([buf[0], buf[1]]) as usize,
-        4 => u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize,
-        _ => return Err(Error::other("invalid MessagePack length width")),
-    };
-    Ok(len)
+    match bytes {
+        1 => {
+            let mut buf = [0u8; 1];
+            rd.read_exact(&mut buf)?;
+            Ok(usize::from(buf[0]))
+        }
+        2 => {
+            let mut buf = [0u8; 2];
+            rd.read_exact(&mut buf)?;
+            Ok(usize::from(u16::from_be_bytes(buf)))
+        }
+        4 => {
+            let mut buf = [0u8; 4];
+            rd.read_exact(&mut buf)?;
+            usize::try_from(u32::from_be_bytes(buf)).map_err(|_| Error::CorruptedFormat)
+        }
+        _ => Err(Error::other("invalid MessagePack length width")),
+    }
 }
 
 fn resync_status_to_i32(status: ResyncStatusType) -> i32 {
@@ -610,6 +667,33 @@ fn resync_status_from_i32(code: i32) -> Result<ResyncStatusType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wrap_resync_payload(payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(RESYNC_FILE_HEADER_LEN + payload.len());
+        data.extend_from_slice(&RESYNC_META_FORMAT.to_le_bytes());
+        data.extend_from_slice(&RESYNC_META_VERSION.to_le_bytes());
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn resync_file_with_unknown_value(value: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(32 + value.len());
+        rmp::encode::write_map_len(&mut payload, 2).expect("test payload map length should encode");
+        rmp::encode::write_str(&mut payload, "v").expect("test version key should encode");
+        rmp::encode::write_i32(&mut payload, i32::from(RESYNC_META_VERSION)).expect("test version value should encode");
+        rmp::encode::write_str(&mut payload, "future").expect("test unknown key should encode");
+        payload.extend_from_slice(value);
+        wrap_resync_payload(&payload)
+    }
+
+    fn msgp_str32(len: usize) -> Vec<u8> {
+        let wire_len = u32::try_from(len).expect("test string length should fit u32");
+        let mut value = Vec::with_capacity(5 + len);
+        value.push(0xdb);
+        value.extend_from_slice(&wire_len.to_be_bytes());
+        value.resize(5 + len, b'x');
+        value
+    }
 
     #[test]
     fn resync_status_display_matches_admin_contract() {
@@ -717,6 +801,212 @@ mod tests {
     }
 
     #[test]
+    fn resync_file_rejects_trailing_messagepack_value() {
+        let status = BucketReplicationResyncStatus::new();
+        let mut data = encode_resync_file(&status).expect("resync status should encode");
+        data.push(0xc0);
+
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_rejects_reserved_messagepack_marker() {
+        let data = resync_file_with_unknown_value(&[0xc1]);
+
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_rejects_oversized_messagepack_element() {
+        let accepted = decode_resync_file(&resync_file_with_unknown_value(&msgp_str32(RESYNC_MSGP_MAX_ELEMENT_BYTES)))
+            .expect("element ending at the byte limit should decode");
+        assert_eq!(accepted.version, RESYNC_META_VERSION);
+
+        let value = msgp_str32(RESYNC_MSGP_MAX_ELEMENT_BYTES + 1);
+        let data = resync_file_with_unknown_value(&value);
+
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_rejects_oversized_messagepack_collection() {
+        let accepted_wire_len = u32::try_from(RESYNC_MSGP_MAX_COLLECTION_ITEMS).expect("test collection length should fit u32");
+        let mut accepted = Vec::with_capacity(5 + RESYNC_MSGP_MAX_COLLECTION_ITEMS);
+        accepted.push(0xdd);
+        accepted.extend_from_slice(&accepted_wire_len.to_be_bytes());
+        accepted.resize(5 + RESYNC_MSGP_MAX_COLLECTION_ITEMS, 0xc0);
+        let mut accepted_map = Vec::with_capacity(5 + RESYNC_MSGP_MAX_COLLECTION_ITEMS * 2);
+        accepted_map.push(0xdf);
+        accepted_map.extend_from_slice(&accepted_wire_len.to_be_bytes());
+        accepted_map.resize(5 + RESYNC_MSGP_MAX_COLLECTION_ITEMS * 2, 0xc0);
+        for value in [accepted, accepted_map] {
+            let accepted = decode_resync_file(&resync_file_with_unknown_value(&value))
+                .expect("collection ending at the item limit should decode");
+            assert_eq!(accepted.version, RESYNC_META_VERSION);
+        }
+
+        let collection_len = RESYNC_MSGP_MAX_COLLECTION_ITEMS + 1;
+        let wire_len = u32::try_from(collection_len).expect("test collection length should fit u32");
+        let mut array = Vec::with_capacity(5 + collection_len);
+        array.push(0xdd);
+        array.extend_from_slice(&wire_len.to_be_bytes());
+        array.resize(5 + collection_len, 0xc0);
+        let mut map = Vec::with_capacity(5 + collection_len * 2);
+        map.push(0xdf);
+        map.extend_from_slice(&wire_len.to_be_bytes());
+        map.resize(5 + collection_len * 2, 0xc0);
+
+        for value in [array, map] {
+            let data = resync_file_with_unknown_value(&value);
+            assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        }
+    }
+
+    #[test]
+    fn resync_file_rejects_oversized_messagepack_extension() {
+        let extension = |len: usize| {
+            let wire_len = u32::try_from(len).expect("test extension length should fit u32");
+            let mut extension = Vec::with_capacity(6 + len);
+            extension.push(0xc9);
+            extension.extend_from_slice(&wire_len.to_be_bytes());
+            extension.push(u8::try_from(MSGP_TIME_EXT_TYPE).expect("test extension type should fit u8"));
+            extension.resize(6 + len, 0xaa);
+            extension
+        };
+
+        let accepted = decode_resync_file(&resync_file_with_unknown_value(&extension(RESYNC_MSGP_MAX_ELEMENT_BYTES)))
+            .expect("extension ending at the byte limit should decode");
+        assert_eq!(accepted.version, RESYNC_META_VERSION);
+
+        let data = resync_file_with_unknown_value(&extension(RESYNC_MSGP_MAX_ELEMENT_BYTES + 1));
+
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_enforces_messagepack_depth_limit() {
+        let mut accepted = vec![0x91; RESYNC_MSGP_MAX_DEPTH - 1];
+        accepted.push(0xc0);
+        let accepted = decode_resync_file(&resync_file_with_unknown_value(&accepted))
+            .expect("payload ending at the depth limit should decode");
+        assert_eq!(accepted.version, RESYNC_META_VERSION);
+
+        let mut rejected = vec![0x91; RESYNC_MSGP_MAX_DEPTH];
+        rejected.push(0xc0);
+        let data = resync_file_with_unknown_value(&rejected);
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_rejects_excessive_messagepack_values() {
+        const ENVELOPE_VALUES: usize = 4;
+        const INNER_ARRAYS: usize = 32;
+
+        let nested_arrays = |leaf_count: usize| {
+            let base_len = leaf_count / INNER_ARRAYS;
+            let longer_arrays = leaf_count % INNER_ARRAYS;
+            assert!(base_len + usize::from(longer_arrays > 0) <= RESYNC_MSGP_MAX_COLLECTION_ITEMS);
+
+            let mut value = Vec::new();
+            rmp::encode::write_array_len(
+                &mut value,
+                u32::try_from(INNER_ARRAYS).expect("test outer array length should fit u32"),
+            )
+            .expect("test outer array should encode");
+            for index in 0..INNER_ARRAYS {
+                let inner_len = base_len + usize::from(index < longer_arrays);
+                rmp::encode::write_array_len(
+                    &mut value,
+                    u32::try_from(inner_len).expect("test inner array length should fit u32"),
+                )
+                .expect("test inner array should encode");
+                value.resize(value.len() + inner_len, 0xc0);
+            }
+            value
+        };
+
+        let accepted_leaf_count = RESYNC_MSGP_MAX_VALUES - ENVELOPE_VALUES - 1 - INNER_ARRAYS;
+        let accepted = decode_resync_file(&resync_file_with_unknown_value(&nested_arrays(accepted_leaf_count)))
+            .expect("payload ending at the value limit should decode");
+        assert_eq!(accepted.version, RESYNC_META_VERSION);
+
+        let data = resync_file_with_unknown_value(&nested_arrays(accepted_leaf_count + 1));
+
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_rejects_payload_over_file_limit() {
+        const FULL_CHUNKS: usize = 15;
+
+        let field_count = u32::try_from(FULL_CHUNKS + 2).expect("test field count should fit u32");
+        let chunk = msgp_str32(RESYNC_MSGP_MAX_ELEMENT_BYTES);
+        let mut payload = Vec::with_capacity(RESYNC_MSGP_MAX_BYTES);
+        rmp::encode::write_map_len(&mut payload, field_count).expect("test payload map should encode");
+        rmp::encode::write_str(&mut payload, "v").expect("test version key should encode");
+        rmp::encode::write_i32(&mut payload, i32::from(RESYNC_META_VERSION)).expect("test version value should encode");
+        for _ in 0..FULL_CHUNKS {
+            rmp::encode::write_str(&mut payload, "future").expect("test unknown key should encode");
+            payload.extend_from_slice(&chunk);
+        }
+        rmp::encode::write_str(&mut payload, "future").expect("test final unknown key should encode");
+        let remaining = RESYNC_MSGP_MAX_BYTES
+            .checked_sub(payload.len() + 5)
+            .expect("test payload should leave room for the final string");
+        assert!(remaining <= RESYNC_MSGP_MAX_ELEMENT_BYTES);
+        payload.extend_from_slice(&msgp_str32(remaining));
+
+        let mut data = wrap_resync_payload(&payload);
+        assert_eq!(data.len(), RESYNC_FILE_MAX_BYTES);
+        let accepted = decode_resync_file(&data).expect("payload ending at the file limit should decode");
+        assert_eq!(accepted.version, RESYNC_META_VERSION);
+
+        data.push(0xc0);
+        assert_eq!(data.len(), RESYNC_FILE_MAX_BYTES + 1);
+        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_encoder_rejects_payload_over_file_limit() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:replication:0".to_string(),
+            TargetReplicationResyncStatus {
+                object: "x".repeat(RESYNC_MSGP_MAX_ELEMENT_BYTES),
+                ..Default::default()
+            },
+        );
+        assert!(encode_resync_file(&status).is_ok(), "a single maximum-sized element should encode");
+
+        let target_count = RESYNC_FILE_MAX_BYTES / RESYNC_MSGP_MAX_ELEMENT_BYTES + 1;
+        for index in 1..target_count {
+            status.targets_map.insert(
+                format!("arn:replication:{index}"),
+                TargetReplicationResyncStatus {
+                    object: "x".repeat(RESYNC_MSGP_MAX_ELEMENT_BYTES),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(matches!(encode_resync_file(&status), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
+    fn resync_file_encoder_rejects_oversized_messagepack_element() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:replication:oversized-element".to_string(),
+            TargetReplicationResyncStatus {
+                object: "x".repeat(RESYNC_MSGP_MAX_ELEMENT_BYTES + 1),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(encode_resync_file(&status), Err(Error::CorruptedFormat)));
+    }
+
+    #[test]
     fn resync_error_detail_is_bounded_and_unicode_safe() {
         let detail = format!("{}尾", "x".repeat(RESYNC_ERROR_DETAIL_MAX_CHARS + 32));
 
@@ -768,6 +1058,24 @@ mod tests {
 
         assert_eq!(direct.targets_map["arn:replication:a"].error.as_deref(), Some(RESYNC_ERROR_REDACTED));
         assert_eq!(decoded.targets_map["arn:replication:a"].error.as_deref(), Some(RESYNC_ERROR_REDACTED));
+    }
+
+    #[test]
+    fn legacy_resync_payload_rejects_oversized_messagepack_element() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:replication:legacy-oversized".to_string(),
+            TargetReplicationResyncStatus {
+                object: "x".repeat(RESYNC_MSGP_MAX_ELEMENT_BYTES + 1),
+                ..Default::default()
+            },
+        );
+        let payload = rmp_serde::to_vec(&status).expect("legacy test status should encode");
+
+        assert!(matches!(
+            BucketReplicationResyncStatus::unmarshal_legacy_msg(&payload),
+            Err(Error::CorruptedFormat)
+        ));
     }
 
     #[test]
