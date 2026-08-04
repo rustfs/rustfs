@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{DateTime, Utc};
 use hashbrown::HashMap;
+use jiff::Timestamp;
 use rustfs_s3_types::EventName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -151,8 +151,8 @@ pub struct AuditEntry {
     pub deployment_id: Option<String>,
     #[serde(rename = "siteName", skip_serializing_if = "Option::is_none")]
     pub site_name: Option<String>,
-    #[serde(with = "chrono::serde::ts_milliseconds")]
-    pub time: DateTime<Utc>,
+    #[serde(with = "jiff::fmt::serde::timestamp::millisecond::required")]
+    pub time: Timestamp,
     pub event: EventName,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub entry_type: Option<String>,
@@ -198,7 +198,7 @@ impl AuditEntryBuilder {
     pub fn new(version: impl Into<String>, event: EventName, trigger: impl Into<String>, api: ApiDetails) -> Self {
         Self(AuditEntry {
             version: version.into(),
-            time: Utc::now(),
+            time: Timestamp::now(),
             event,
             trigger: trigger.into(),
             api,
@@ -232,7 +232,7 @@ impl AuditEntryBuilder {
         self
     }
 
-    pub fn time(mut self, time: DateTime<Utc>) -> Self {
+    pub fn time(mut self, time: Timestamp) -> Self {
         self.0.time = time;
         self
     }
@@ -341,5 +341,24 @@ mod tests {
         let value = serde_json::to_value(entry).expect("audit entry should serialize");
         assert_eq!(value["requestID"], Value::String("req-audit-123".to_string()));
         assert!(value.get("request_id").is_none(), "historical audit contract must not expose request_id");
+    }
+
+    #[test]
+    fn audit_entry_time_serializes_as_epoch_milliseconds() {
+        let entry = AuditEntryBuilder::new(
+            "1",
+            EventName::ObjectCreatedPut,
+            "s3",
+            ApiDetailsBuilder::new()
+                .name("PutObject")
+                .status("OK")
+                .status_code(200)
+                .build(),
+        )
+        .time(Timestamp::from_millisecond(1_711_423_698_870).expect("timestamp should be valid"))
+        .build();
+
+        let value = serde_json::to_value(entry).expect("audit entry should serialize");
+        assert_eq!(value["time"], Value::Number(1_711_423_698_870_i64.into()));
     }
 }

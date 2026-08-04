@@ -492,8 +492,8 @@ mod tests {
             batch_objects: 1000,
             version_budget: 10_000,
             objects: Mutex::new(Vec::new()),
-            decode_error: Mutex::new(None),
             version_total: AtomicUsize::new(0),
+            decode_error: Mutex::new(None),
             truncated: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         });

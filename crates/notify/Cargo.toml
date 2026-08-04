@@ -68,9 +68,9 @@ rustfs-targets = { workspace = true }
 rustfs-utils = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
+jiff = { workspace = true, features = ["serde"] }
 percent-encoding = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
