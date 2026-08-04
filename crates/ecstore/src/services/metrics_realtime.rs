@@ -68,12 +68,19 @@ impl MetricType {
 }
 
 fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
+    let jiff_timestamp_to_chrono =
+        |timestamp: jiff::Timestamp| chrono::DateTime::<Utc>::from(std::time::SystemTime::from(timestamp));
+
     MadminScannerMetrics {
-        collected_at: metrics.collected_at,
+        collected_at: jiff_timestamp_to_chrono(metrics.collected_at),
         current_cycle: metrics.current_cycle,
         current_cycle_active: Some(metrics.current_cycle_active),
-        current_started: metrics.current_started,
-        cycles_completed_at: metrics.cycles_completed_at,
+        current_started: jiff_timestamp_to_chrono(metrics.current_started),
+        cycles_completed_at: metrics
+            .cycles_completed_at
+            .into_iter()
+            .map(jiff_timestamp_to_chrono)
+            .collect(),
         ongoing_buckets: metrics.ongoing_buckets,
         active_scan_paths: metrics.active_scan_paths,
         oldest_active_path_age_seconds: metrics.oldest_active_path_age_seconds,
@@ -543,6 +550,10 @@ mod test {
     use serial_test::serial;
     use std::time::Duration;
 
+    fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<Utc>) -> jiff::Timestamp {
+        jiff::Timestamp::try_from(std::time::SystemTime::from(timestamp)).expect("test timestamp should fit in jiff")
+    }
+
     #[test]
     fn tes_types() {
         let t = MetricType::ALL;
@@ -591,7 +602,7 @@ mod test {
         let current_started = Utc::now() - chrono::Duration::seconds(5);
         let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
             current_cycle_active: true,
-            current_started,
+            current_started: chrono_to_jiff_timestamp(current_started),
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
             partial_cycles_by_source: vec![rustfs_common::metrics::ScannerSourceCycleSnapshot {
