@@ -3716,7 +3716,7 @@ impl ECStore {
         }
 
         // Optimization: use get for single object lookup with exact prefix
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -3728,17 +3728,16 @@ impl ECStore {
                 )
                 .await
             {
-                Ok(res) => {
+                Ok(res) if !res.delete_marker => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
                     });
                 }
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(err);
-                    }
+                Err(err) if is_err_bucket_not_found(&err) => {
+                    return Err(err);
                 }
+                _ => {}
             };
         };
 
@@ -5059,7 +5058,7 @@ impl Sets {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -5071,17 +5070,16 @@ impl Sets {
                 )
                 .await
             {
-                Ok(res) => {
+                Ok(res) if !res.delete_marker => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
                     });
                 }
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(err);
-                    }
+                Err(err) if is_err_bucket_not_found(&err) => {
+                    return Err(err);
                 }
+                _ => {}
             };
         }
 
