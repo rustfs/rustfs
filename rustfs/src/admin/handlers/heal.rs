@@ -845,6 +845,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     heal_request.update_parity = Some(hip.hs.update_parity);
     heal_request.recursive = Some(recursive || root_cluster_target);
     heal_request.dry_run = Some(hip.hs.dry_run);
+    heal_request.no_lock = Some(hip.hs.no_lock);
     heal_request.source = HealRequestSource::Admin;
     heal_request
 }
@@ -2123,6 +2124,23 @@ mod tests {
         assert_eq!(request.update_parity, Some(false));
         assert_eq!(request.recursive, Some(true));
         assert_eq!(request.dry_run, Some(true));
+        assert_eq!(request.no_lock, Some(true));
+
+        let envelope = rustfs_protos::heal_control::Envelope::start(
+            request,
+            rustfs_protos::heal_control::RequestMetadata::new([1; 16], 1_000, 2_000, 1),
+        )
+        .expect("admin heal request should encode through heal-control v2");
+        let encoded =
+            rustfs_protos::heal_control::encode_envelope(&envelope).expect("admin heal-control envelope should serialize");
+        let decoded =
+            rustfs_protos::heal_control::decode_envelope(&encoded).expect("admin heal-control envelope should deserialize");
+        let (_, _, rustfs_protos::heal_control::ExecutableCommand::Start { request }) =
+            decoded.into_execution().expect("admin heal start should decode")
+        else {
+            panic!("expected admin heal start command");
+        };
+        assert_eq!(request.no_lock, Some(true));
     }
 
     #[test]

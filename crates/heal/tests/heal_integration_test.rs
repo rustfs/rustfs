@@ -306,6 +306,7 @@ mod serial_tests {
                 recreate_missing: false,
                 scan_mode: HealScanMode::Normal,
                 update_parity: false,
+                no_lock: false,
                 timeout: Some(Duration::from_secs(300)),
                 pool_index: None,
                 set_index: None,
