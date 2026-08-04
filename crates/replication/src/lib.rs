@@ -73,9 +73,9 @@ pub use queue::{
     replication_heal_queue_action, worker_queue_for_replication_type,
 };
 pub use resync::{
-    BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
-    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, sanitize_resync_error_detail,
-    should_auto_resume_resync, should_count_head_proxy_failure,
+    BucketReplicationResyncStatus, Error, RESYNC_FILE_MAX_BYTES, Result, ResyncOpts, ResyncStatusType,
+    TargetReplicationResyncStatus, decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update,
+    sanitize_resync_error_detail, should_auto_resume_resync, should_count_head_proxy_failure,
 };
 pub use rule::ReplicationRuleExt;
 pub use runtime::{
