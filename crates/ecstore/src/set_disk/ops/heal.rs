@@ -155,6 +155,60 @@ fn injected_dangling_check_parts_error(bucket: &str, object: &str, disk_index: u
         .cloned()
 }
 
+#[cfg(test)]
+struct DanglingDeleteFailure {
+    key: DanglingDeleteFailureKey,
+}
+
+#[cfg(test)]
+type DanglingDeleteFailureKey = (String, String, usize);
+
+#[cfg(test)]
+type DanglingDeleteFailures = HashMap<DanglingDeleteFailureKey, DiskError>;
+
+#[cfg(test)]
+fn dangling_delete_failures() -> &'static std::sync::Mutex<DanglingDeleteFailures> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<DanglingDeleteFailures>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl DanglingDeleteFailure {
+    fn install(bucket: &str, object: &str, disk_index: usize, error: DiskError) -> Self {
+        let key = (bucket.to_string(), object.to_string(), disk_index);
+        let previous = dangling_delete_failures()
+            .lock()
+            .expect("dangling delete failure registry should not poison")
+            .insert(key.clone(), error);
+        assert!(previous.is_none(), "dangling delete failure already installed");
+        Self { key }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DanglingDeleteFailure {
+    fn drop(&mut self) {
+        dangling_delete_failures()
+            .lock()
+            .expect("dangling delete failure registry should not poison")
+            .remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+fn injected_dangling_delete_error(bucket: &str, object: &str, disk_index: usize) -> Option<DiskError> {
+    dangling_delete_failures()
+        .lock()
+        .expect("dangling delete failure registry should not poison")
+        .get(&(bucket.to_string(), object.to_string(), disk_index))
+        .cloned()
+}
+
+#[cfg(not(test))]
+fn injected_dangling_delete_error(_bucket: &str, _object: &str, _disk_index: usize) -> Option<DiskError> {
+    None
+}
+
 fn first_unhealthy_part_summary(
     data_errs_by_part: &HashMap<usize, Vec<usize>>,
     parts: &[ObjectPartInfo],
@@ -1181,30 +1235,37 @@ impl SetDisks {
 
         let errs = stat_all_dirs(&disks, bucket, object).await;
         let dangling_object = is_object_dir_dangling(&errs);
-        if dangling_object && !dry_run && remove {
+        let delete_errs = if dangling_object && !dry_run && remove {
             let mut futures = Vec::with_capacity(disks.len());
-            for disk in disks.iter().flatten() {
+            for (disk_index, disk) in disks.iter().enumerate() {
                 let disk = disk.clone();
-                let bucket = bucket.to_string();
-                let object = object.to_string();
-                futures.push(tokio::spawn(async move {
-                    let _ = disk
-                        .delete(
-                            &bucket,
-                            &object,
+                futures.push(async move {
+                    let Some(disk) = disk else {
+                        return (disk_index, Some(DiskError::DiskNotFound));
+                    };
+                    if let Some(error) = injected_dangling_delete_error(bucket, object, disk_index) {
+                        return (disk_index, Some(error));
+                    }
+                    (
+                        disk_index,
+                        disk.delete(
+                            bucket,
+                            object,
                             DeleteOptions {
                                 recursive: false,
                                 immediate: false,
                                 ..Default::default()
                             },
                         )
-                        .await;
-                }));
+                        .await
+                        .err(),
+                    )
+                });
             }
-
-            // ignore errors
-            let _ = join_all(futures).await;
-        }
+            Some(join_all(futures).await)
+        } else {
+            None
+        };
 
         for (err, drive) in errs.iter().zip(self.set_endpoints.iter()) {
             let endpoint = drive.to_string();
@@ -1227,6 +1288,28 @@ impl SetDisks {
                 endpoint,
                 state: drive_state.to_string(),
             });
+        }
+
+        if let Some(delete_errs) = delete_errs {
+            let mut delete_failure = None;
+            for (index, err) in delete_errs {
+                match err {
+                    None | Some(DiskError::FileNotFound) => {
+                        result.after.drives[index].state = DriveState::Missing.to_string();
+                    }
+                    Some(err) => {
+                        result.after.drives[index].state = if matches!(&err, DiskError::DiskNotFound) {
+                            DriveState::Offline.to_string()
+                        } else {
+                            DriveState::Corrupt.to_string()
+                        };
+                        if delete_failure.is_none() {
+                            delete_failure = Some(err);
+                        }
+                    }
+                }
+            }
+            return Ok((result, Some(delete_failure.unwrap_or(DiskError::FileNotFound))));
         }
 
         if dangling_object || DiskError::is_all_not_found(&errs) {
@@ -1553,7 +1636,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
 #[cfg(test)]
 mod heal_result_report_tests {
-    use super::{DanglingCheckPartsFailure, DanglingDeleteSafety, SetDisks};
+    use super::{DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, SetDisks};
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope};
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
@@ -2018,6 +2101,67 @@ mod heal_result_report_tests {
         assert_eq!(result.before.drives[1].state, DriveState::Ok.to_string());
         assert_eq!(result.before.drives[2].state, DriveState::Offline.to_string());
         assert_eq!(result.before.drives[3].state, DriveState::Ok.to_string());
+    }
+
+    #[tokio::test]
+    async fn dangling_object_dir_delete_preserves_results_and_propagates_failure() {
+        let bucket = "bucket-dangling-dir-delete";
+        let object = "dangling__XLDIR__";
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for _ in 0..8 {
+            let (temp_dir, endpoint, disk) = real_disk().await;
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        disks[0] = None;
+        let set = set_disks_with(disks, endpoints, 4).await;
+        for disk_index in [1, 2] {
+            tokio::fs::create_dir_all(temp_dirs[disk_index].path().join(bucket).join(object))
+                .await
+                .expect("dangling object directory should be created");
+        }
+
+        let _delete_failure = DanglingDeleteFailure::install(bucket, object, 2, DiskError::DiskAccessDenied);
+        let _file_missing = DanglingDeleteFailure::install(bucket, object, 3, DiskError::FileNotFound);
+        let _version_missing = DanglingDeleteFailure::install(bucket, object, 4, DiskError::FileVersionNotFound);
+        let _path_missing = DanglingDeleteFailure::install(bucket, object, 5, DiskError::PathNotFound);
+        let _volume_missing = DanglingDeleteFailure::install(bucket, object, 6, DiskError::VolumeNotFound);
+        let _disk_missing = DanglingDeleteFailure::install(bucket, object, 7, DiskError::DiskNotFound);
+
+        let (result, err) = set
+            .heal_object_dir_locked(bucket, object, false, true)
+            .await
+            .expect("dangling directory heal should report its per-disk delete results");
+
+        assert_eq!(err, Some(DiskError::DiskNotFound));
+        assert_eq!(result.before.drives.len(), 8);
+        assert_eq!(result.after.drives.len(), 8);
+        assert_eq!(result.before.drives[0].state, DriveState::Offline.to_string());
+        assert_eq!(result.after.drives[0].state, DriveState::Offline.to_string());
+        assert_eq!(result.before.drives[1].state, DriveState::Ok.to_string());
+        assert_eq!(result.after.drives[1].state, DriveState::Missing.to_string());
+        assert_eq!(result.before.drives[2].state, DriveState::Ok.to_string());
+        assert_eq!(result.after.drives[2].state, DriveState::Corrupt.to_string());
+        assert_eq!(result.before.drives[3].state, DriveState::Missing.to_string());
+        assert_eq!(result.after.drives[3].state, DriveState::Missing.to_string());
+        for disk_index in [4, 5, 6] {
+            assert_eq!(result.before.drives[disk_index].state, DriveState::Missing.to_string());
+            assert_eq!(result.after.drives[disk_index].state, DriveState::Corrupt.to_string());
+        }
+        assert_eq!(result.before.drives[7].state, DriveState::Missing.to_string());
+        assert_eq!(result.after.drives[7].state, DriveState::Offline.to_string());
+        assert!(
+            !temp_dirs[1].path().join(bucket).join(object).exists(),
+            "successful delete must remove the dangling directory"
+        );
+        assert!(
+            temp_dirs[2].path().join(bucket).join(object).is_dir(),
+            "failed delete must leave the dangling directory for retry"
+        );
     }
 
     #[tokio::test]

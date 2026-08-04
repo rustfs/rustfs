@@ -107,13 +107,21 @@ impl Error {
             Error::TaskTimeout | Error::TransientSkip { .. } => true,
             Error::Storage(err) => {
                 err.is_quorum_error()
-                    || matches!(err, EcstoreError::SlowDown | EcstoreError::OperationCanceled | EcstoreError::Lock(_))
+                    || matches!(
+                        err,
+                        EcstoreError::DiskNotFound
+                            | EcstoreError::VolumeNotFound
+                            | EcstoreError::SlowDown
+                            | EcstoreError::OperationCanceled
+                            | EcstoreError::Lock(_)
+                    )
                     || is_recoverable_heal_error_message(&err.to_string())
             }
             Error::Disk(err) => {
                 matches!(
                     err,
-                    DiskError::ErasureReadQuorum
+                    DiskError::DiskNotFound
+                        | DiskError::ErasureReadQuorum
                         | DiskError::ErasureWriteQuorum
                         | DiskError::Timeout
                         | DiskError::SourceStalled
@@ -159,7 +167,7 @@ impl From<Error> for std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::Error;
-    use crate::heal::EcstoreError;
+    use crate::heal::{DiskError, EcstoreError};
 
     #[test]
     fn incomplete_target_rename_is_recoverable() {
@@ -172,5 +180,12 @@ mod tests {
 
         assert!(task_error.is_recoverable_heal());
         assert!(storage_error.is_recoverable_heal());
+    }
+
+    #[test]
+    fn offline_disk_errors_are_recoverable() {
+        assert!(Error::Disk(DiskError::DiskNotFound).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::DiskNotFound).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
     }
 }

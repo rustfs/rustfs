@@ -356,6 +356,8 @@ pub struct HealChannelRequest {
     pub recursive: Option<bool>,
     /// Whether to dry run
     pub dry_run: Option<bool>,
+    /// Whether to skip namespace locking
+    pub no_lock: Option<bool>,
     /// Timeout in seconds (optional)
     pub timeout_seconds: Option<u64>,
     /// Origin of the request for operational status and queue accounting
@@ -560,6 +562,7 @@ pub fn create_heal_request(
         update_parity: None,
         recursive: None,
         dry_run: None,
+        no_lock: None,
         timeout_seconds: None,
         source: HealRequestSource::Internal,
         disk: None,
@@ -718,6 +721,7 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         update_parity: None,
         recursive: None,
         dry_run: None,
+        no_lock: None,
         timeout_seconds: None,
         source: HealRequestSource::AutoHeal,
     };

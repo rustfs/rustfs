@@ -24,6 +24,7 @@ pub(crate) const GET_OBJECT_PATH_EMPTY: &str = "empty";
 pub(crate) const GET_OBJECT_PATH_DIRECT_MEMORY: &str = "direct_memory";
 pub(crate) const GET_OBJECT_PATH_BODY_CACHE: &str = "body_cache";
 pub(crate) const GET_OBJECT_PATH_INLINE_DIRECT: &str = "inline_direct";
+pub(crate) const GET_OBJECT_PATH_INTERNAL_META: &str = "internal_meta";
 pub(crate) const GET_OBJECT_PATH_LEGACY_DUPLEX: &str = "legacy_duplex";
 pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
 pub(crate) const GET_OBJECT_PATH_SET_DISK: &str = "set_disk";
@@ -163,6 +164,7 @@ pub(crate) enum GetObjectFailureReason {
     DecodeError,
     DownstreamClosed,
     Io,
+    MetadataMissing,
     RangeOrLengthInvalid,
     ReadQuorum,
     ShortRead,
@@ -177,6 +179,7 @@ impl GetObjectFailureReason {
             Self::DecodeError => "decode_error",
             Self::DownstreamClosed => "downstream_closed",
             Self::Io => "io",
+            Self::MetadataMissing => "metadata_missing",
             Self::RangeOrLengthInvalid => "range_or_length_invalid",
             Self::ReadQuorum => "read_quorum",
             Self::ShortRead => "short_read",
@@ -190,6 +193,13 @@ pub(crate) fn classify_storage_error(err: &StorageError) -> GetObjectFailureReas
     match err {
         StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => GetObjectFailureReason::ReadQuorum,
         StorageError::FileCorrupt => GetObjectFailureReason::BitrotMismatch,
+        StorageError::FileNotFound
+        | StorageError::FileVersionNotFound
+        | StorageError::VolumeNotFound
+        | StorageError::BucketNotFound(_)
+        | StorageError::ObjectNotFound(_, _)
+        | StorageError::VersionNotFound(_, _, _)
+        | StorageError::ConfigNotFound => GetObjectFailureReason::MetadataMissing,
         StorageError::InvalidRangeSpec(_) => GetObjectFailureReason::RangeOrLengthInvalid,
         StorageError::Io(io_err) => classify_io_error(io_err),
         _ => GetObjectFailureReason::Unknown,
@@ -293,6 +303,34 @@ mod tests {
             classify_storage_error(&StorageError::InvalidRangeSpec("bad range".to_string())),
             GetObjectFailureReason::RangeOrLengthInvalid
         );
+        assert_eq!(
+            classify_storage_error(&StorageError::FileNotFound),
+            GetObjectFailureReason::MetadataMissing
+        );
+        assert_eq!(
+            classify_storage_error(&StorageError::VolumeNotFound),
+            GetObjectFailureReason::MetadataMissing
+        );
+        assert_eq!(
+            classify_storage_error(&StorageError::ObjectNotFound("bucket".to_string(), "object".to_string())),
+            GetObjectFailureReason::MetadataMissing
+        );
+        assert_eq!(
+            classify_storage_error(&StorageError::BucketNotFound("bucket".to_string())),
+            GetObjectFailureReason::MetadataMissing
+        );
+        assert_eq!(
+            classify_storage_error(&StorageError::VersionNotFound(
+                "bucket".to_string(),
+                "object".to_string(),
+                "version".to_string()
+            )),
+            GetObjectFailureReason::MetadataMissing
+        );
+        assert_eq!(
+            classify_storage_error(&StorageError::ConfigNotFound),
+            GetObjectFailureReason::MetadataMissing
+        );
 
         let internal_broken_pipe = StorageError::Io(io::Error::from(io::ErrorKind::BrokenPipe));
         assert_eq!(classify_storage_error(&internal_broken_pipe), GetObjectFailureReason::Io);
@@ -354,10 +392,12 @@ mod tests {
         assert_eq!(GetObjectFailureReason::DownstreamClosed.as_str(), "downstream_closed");
         assert_eq!(GetObjectFailureReason::BitrotMismatch.as_str(), "bitrot_mismatch");
         assert_eq!(GetObjectFailureReason::DecodeError.as_str(), "decode_error");
+        assert_eq!(GetObjectFailureReason::MetadataMissing.as_str(), "metadata_missing");
         assert_eq!(GET_READER_BUFFER_OUTPUT, "output");
         assert_eq!(GET_READER_BUFFER_PREFETCH, "prefetch");
         assert_eq!(GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, "codec_streaming_legacy_engine");
         assert_eq!(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, "codec_streaming_rustfs_engine");
+        assert_eq!(GET_OBJECT_PATH_INTERNAL_META, "internal_meta");
         assert_eq!(GET_DIRECT_MEMORY_DECISION_USE, "use");
         assert_eq!(GET_DIRECT_MEMORY_DECISION_FALLBACK, "fallback");
         assert_eq!(GET_DIRECT_MEMORY_REASON_NONE, "none");
