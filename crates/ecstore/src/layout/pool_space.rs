@@ -14,6 +14,8 @@
 
 use std::slice::Iter;
 
+use tracing::warn;
+
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::DiskInfo;
 use crate::error::{Error, Result};
@@ -135,13 +137,31 @@ pub(crate) async fn build_server_pools_available_space(
             continue;
         }
 
-        if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
+        if !is_meta_bucketname(bucket) {
+            match has_space_for(zinfo, size).await {
+                Ok(false) => {
+                    server_pools[i] = PoolAvailableSpace {
+                        index: i,
+                        ..Default::default()
+                    };
+                    continue;
+                }
+                Err(err) => {
+                    // Not enough online disks to reliably determine space
+                    // (e.g. transient disk_info failures during decommission
+                    // I/O).  Do NOT exclude the pool — compute available
+                    // space from whatever disks responded.  The actual write
+                    // will enforce its own quorum; a premature zero here
+                    // causes spurious "Disk full" errors when only the
+                    // decommission source pool is suspended.
+                    warn!(
+                        pool_index = i,
+                        error = %err,
+                        "Pool space check incomplete; falling back to online-disk estimate"
+                    );
+                }
+                Ok(true) => {}
+            }
         }
 
         let mut available = 0;
@@ -269,5 +289,56 @@ mod tests {
         assert_eq!(spaces.0.len(), 1);
         assert_eq!(spaces.0[0].available, 2);
         assert_eq!(spaces.0[0].max_used_pct, 90);
+    }
+
+    /// When some disks are offline (disk_info returned None), `has_space_for`
+    /// returns an error instead of a definitive "no space".  The pool must NOT
+    /// be excluded — available space should be estimated from the disks that
+    /// did respond.  This covers the decommission scenario where the active
+    /// pool is the only write target but some of its disks transiently fail
+    /// their disk_info check under heavy migration I/O.
+    #[tokio::test]
+    async fn build_server_pools_available_space_estimates_from_online_disks_when_some_offline() {
+        // 4-disk set, only2 online — has_space_for returns Err (need >=2).
+        let infos = vec![vec![
+            Some(disk_info(1_000, 200, 800)),
+            None,
+            None,
+            Some(disk_info(1_000, 300, 700)),
+        ]];
+
+        let spaces = build_server_pools_available_space("bucket-a", 64, &[1], &infos).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        // available = (800 + 700) * n_sets(1) = 1500
+        assert_eq!(spaces.0[0].available, 1_500);
+        assert_eq!(spaces.0[0].max_used_pct, 30);
+    }
+
+    /// In a 2-pool decommission scenario, pool 0 is empty (suspended) and
+    /// pool 1 has some offline disks but still reports available space.
+    /// `get_available_pool_idx` must find pool 1.
+    #[tokio::test]
+    async fn build_server_pools_available_space_active_pool_with_partial_disk_failure_during_decommission() {
+        // Pool 0: suspended → empty zinfo (handled by get_server_pools_available_space)
+        // Pool 1: 4-disk set, 2 online (has_space_for returns Err)
+        let infos = vec![
+            Vec::new(), // pool 0: suspended, empty
+            vec![
+                Some(disk_info(2_000, 500, 1_500)),
+                None,
+                None,
+                Some(disk_info(2_000, 600, 1_400)),
+            ],
+        ];
+
+        let spaces = build_server_pools_available_space("bucket-a", 64, &[1, 1], &infos).await;
+
+        assert_eq!(spaces.0.len(), 2);
+        // Pool 0: empty zinfo → available=0
+        assert_eq!(spaces.0[0].available, 0);
+        // Pool 1: (1500 + 1400) * 1 = 2900
+        assert_eq!(spaces.0[1].available, 2_900);
+        assert_eq!(spaces.total_available(), 2_900);
     }
 }
