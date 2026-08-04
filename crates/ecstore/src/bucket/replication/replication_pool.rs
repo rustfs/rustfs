@@ -3270,7 +3270,7 @@ mod tests {
 
     async fn new_test_replication_pool(storage: Arc<LoadResyncNodeStore>) -> Arc<ReplicationPool<LoadResyncNodeStore>> {
         let (mrf_replica_tx, mrf_replica_rx) = mpsc::channel(1);
-        let (mrf_save_tx, mrf_save_rx) = mpsc::channel(1);
+        let (mrf_save_tx, mrf_save_rx) = mpsc::channel(10);
         let (mrf_worker_kill_tx, _) = mpsc::channel(1);
         let (mrf_stop_tx, _) = mpsc::channel(1);
 
@@ -4875,8 +4875,9 @@ mod tests {
                 })
                 .await
                 .expect("overflow entry should be staged before startup recovery completes");
-            *pool.mrf_recovery_result.lock().await = Some(Vec::new());
+            *pool.mrf_recovery_result.lock().await = Some(retained);
             pool.mrf_recovery_complete.notify_one();
+            shared.allow_first_read.notify_one();
 
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
@@ -4887,7 +4888,7 @@ mod tests {
                     }) {
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
@@ -4910,7 +4911,7 @@ mod tests {
             runtime_sources::replication_pool().is_none(),
             "test requires the runtime replication pool to be unavailable"
         );
-        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", Some("10"))], async {
             let shared = empty_resync_shared_state();
             let retained = vec![MrfReplicateEntry::default(); MRF_PENDING_CAP];
             *shared.data.lock().expect("test data lock should not be poisoned") =
@@ -4938,6 +4939,7 @@ mod tests {
             }
             *pool.mrf_recovery_result.lock().await = Some(vec![MrfReplicateEntry::default(); MRF_PENDING_CAP - 2]);
             pool.mrf_recovery_complete.notify_one();
+            shared.allow_first_read.notify_one();
 
             tokio::time::timeout(Duration::from_secs(5), write_started)
                 .await
@@ -4956,7 +4958,7 @@ mod tests {
                     if shared.write_count.load(Ordering::SeqCst) >= 2 {
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
@@ -4972,8 +4974,8 @@ mod tests {
                 .map(|(_, data)| decode_mrf_file(data).expect("persisted MRF data should decode"))
                 .expect("the capped suffix should be persisted after the pending flush");
             assert_eq!(persisted.len(), MRF_PENDING_CAP + 1);
-            assert_eq!(persisted[MRF_PENDING_CAP - 1].object, "staged-overflow-1");
-            assert_eq!(persisted[MRF_PENDING_CAP].object, "staged-overflow-2");
+            assert_eq!(persisted[MRF_PENDING_CAP - 2].object, "staged-overflow-1");
+            assert_eq!(persisted[MRF_PENDING_CAP - 1].object, "staged-overflow-2");
             assert_eq!(persisted.last().expect("capped suffix should be present").object, "staged-overflow-3");
 
             let handle = pool
