@@ -4333,7 +4333,7 @@ impl ECStore {
                             filter_prefix: Some(filter_prefix.clone()),
                             forward_to: opts.marker.clone(),
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
-                            skip_total_timeout: false,
+                            skip_total_timeout: opts.walkdir_timeout.is_none(),
                             walkdir_timeout: opts.walkdir_timeout,
                             walkdir_stall_timeout: opts.walkdir_stall_timeout,
                         },
@@ -4356,6 +4356,12 @@ impl ECStore {
                             forward_to: opts.marker.clone(),
                             min_disks: raw_min_disks,
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
+                            // Skip the total walkdir timeout for listing operations.
+                            // Large buckets (millions of objects) can take longer than
+                            // the default 5s walkdir timeout to produce the first page
+                            // of results. The stall timeout still protects against
+                            // drives that stop making forward progress.
+                            skip_walkdir_total_timeout: opts.walkdir_timeout.is_none(),
                             walkdir_timeout: opts.walkdir_timeout,
                             walkdir_stall_timeout: opts.walkdir_stall_timeout,
                             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
@@ -5554,7 +5560,7 @@ impl Sets {
                         filter_prefix: Some(filter_prefix.clone()),
                         forward_to: opts.marker.clone(),
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
-                        skip_total_timeout: false,
+                        skip_total_timeout: opts.walkdir_timeout.is_none(),
                         walkdir_timeout: opts.walkdir_timeout,
                         walkdir_stall_timeout: opts.walkdir_stall_timeout,
                     },
@@ -5577,6 +5583,12 @@ impl Sets {
                         forward_to: opts.marker.clone(),
                         min_disks: raw_min_disks,
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
+                        // Skip the total walkdir timeout for listing operations.
+                        // Large buckets (millions of objects) can take longer than
+                        // the default 5s walkdir timeout to produce the first page
+                        // of results. The stall timeout still protects against
+                        // drives that stop making forward progress.
+                        skip_walkdir_total_timeout: opts.walkdir_timeout.is_none(),
                         walkdir_timeout: opts.walkdir_timeout,
                         walkdir_stall_timeout: opts.walkdir_stall_timeout,
                         agreed: Some(Box::new(move |entry: MetaCacheEntry| {
